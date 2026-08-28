@@ -252,48 +252,13 @@ jobs:
           fi
           python3 scripts/check_tbench_results.py "${args[@]}"
 
-      - name: Set artifact name
-        if: always()
-        id: artifact-name
-        env:
-          MODEL_NAME: ${{ inputs.model_name }}
-          DATASET: ${{ inputs.dataset }}
-          TASK_NAMES: ${{ inputs.task_names }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          # actions/upload-artifact@v7 requires artifact names to be unique per workflow run.
-          # Nightly workflows can run multiple jobs with the same model (e.g. Harbor smoke tests),
-          # so include dataset + task selection in the artifact name.
-          sanitize() { printf "%s" "$1" | tr ' :/@' '-' | tr -cd 'A-Za-z0-9._-'; }
-
-          SAFE_MODEL=$(sanitize "${MODEL_NAME:-no-model}")
-          SAFE_DATASET=$(sanitize "${DATASET:-unknown-dataset}")
-          if [ -n "${TASK_NAMES:-}" ]; then
-            SAFE_TASKS=$(sanitize "$TASK_NAMES")
-            # GitHub caps artifact names at 256 chars; embedding many task
-            # names made CreateArtifact fail with "invalid length for
-            # artifact name". Truncate and disambiguate with a short hash of
-            # the full selection.
-            if [ "${#SAFE_TASKS}" -gt 80 ]; then
-              TASKS_HASH=$(printf "%s" "$TASK_NAMES" | sha256sum | cut -c1-8)
-              SAFE_TASKS="${SAFE_TASKS:0:80}-h${TASKS_HASH}"
-            fi
-          else
-            SAFE_TASKS="all-tasks"
-          fi
-
-          ARTIFACT_NAME="terminal-bench-results-${SAFE_MODEL}-${SAFE_DATASET}-${SAFE_TASKS}-${RUN_ID}-a${RUN_ATTEMPT}"
-          # model_name and dataset are unbounded workflow inputs, so bounding
-          # SAFE_TASKS alone cannot guarantee the 256-char artifact-name limit.
-          # Cap the final composed name and disambiguate with a hash of the
-          # full name (which embeds RUN_ID/RUN_ATTEMPT, preserving uniqueness).
-          if [ "${#ARTIFACT_NAME}" -gt 200 ]; then
-            NAME_HASH=$(printf "%s" "$ARTIFACT_NAME" | sha256sum | cut -c1-8)
-            ARTIFACT_NAME="${ARTIFACT_NAME:0:200}-h${NAME_HASH}"
-          fi
-          echo "name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-          echo "Artifact name: $ARTIFACT_NAME"
+      # SECURITY: do not add an actions/upload-artifact step for jobs/ or
+      # benchmark.log. Agent stdout under jobs/ can capture provider API keys
+      # (Harbor serialises the run env as `env NAME=value ...` on the process
+      # argv, which task-side `ps` output copies into agent stdout), and
+      # artifacts on a public repo are downloadable by any authenticated
+      # GitHub user. Run output must stay on the runner; aggregate results go
+      # to BigQuery below.
 
       - name: Upload Terminal-Bench results to BigQuery
         if: always() && github.repository == 'coder/mux' && startsWith(inputs.dataset, 'terminal-bench@')
@@ -332,14 +297,3 @@ jobs:
           pip install --quiet google-cloud-bigquery
           python scripts/upload-harbor-results.py
           rm -f /tmp/gcp-sa.json
-
-      - name: Upload benchmark results
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: ${{ steps.artifact-name.outputs.name }}
-          path: |
-            jobs/
-            benchmark.log
-          if-no-files-found: warn
-          retention-days: 30
