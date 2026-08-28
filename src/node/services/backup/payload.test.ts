@@ -1758,6 +1758,8 @@ describe("backup payload", () => {
       `node < ${muxRoot}/skills/launch.txt`,
       `sh 0< ${muxRoot}/skills/launch.txt`,
       `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
+      `systemd-run --pipe --working-directory=${muxRoot} python3 skills/launch.txt`,
+      `systemd-run --working-directory ${muxRoot}/skills tclsh launch.txt`,
       // start-stop-daemon executes the pathname supplied by --exec/--startas.
       `start-stop-daemon --start --exec ${muxRoot}/skills/launch.txt --`,
       `start-stop-daemon --start --startas=${muxRoot}/agents/launch.md --`,
@@ -1833,6 +1835,11 @@ describe("backup payload", () => {
       `python3 -- /tmp/main.py ${muxRoot}/skills/config.txt`,
       "ruby -C /opt app.rb --config skills/config.txt",
       "ruby -C/opt app.rb",
+      "ruby -S /opt/tool.rb",
+      "php -c/tmp/php.ini /opt/server.php",
+      `java -cp /opt/app.jar Main ${muxRoot}/skills/config.txt`,
+      "systemd-run --working-directory=/opt node server.js",
+      `mcp-server --launcher systemd-run --working-directory=${muxRoot}`,
       // Two-segment merge/diff keys hold settings, not driver commands.
       "git config merge.conflictstyle diff3",
       "java @/tmp/opts.txt Main --port 8080",
@@ -1933,6 +1940,8 @@ describe("backup payload", () => {
     try {
       for (const [command, expected] of [
         ["launch.txt --serve", REDACTED_BACKUP_VALUE],
+        ["ruby -S launch.txt", REDACTED_BACKUP_VALUE],
+        ["rubyw -S launch.txt", REDACTED_BACKUP_VALUE],
         // A name that does not resolve to a published document stays portable.
         ["mcp-server --transport stdio", "mcp-server --transport stdio"],
       ] as const) {
@@ -2094,6 +2103,66 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes JVM launchers under inherited published Java agents", async () => {
+    const variableNames = ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, command, expected] of [
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-javaagent:${muxRoot}/skills/launch.txt`,
+          "java com.example.Server",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "_JAVA_OPTIONS",
+          `-agentpath:${muxRoot}/agents/launch.md=debug`,
+          "javaw com.example.Server",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "JDK_JAVA_OPTIONS",
+          `-javaagent:${muxRoot}/skills/launch.txt`,
+          "jshell --version",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A non-JVM command never loads the agent.
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-javaagent:${muxRoot}/skills/launch.txt`,
+          "python3 /opt/server.py",
+          "python3 /opt/server.py",
+        ],
+        // A foreign agent archive is not published by this backup.
+        ["JAVA_TOOL_OPTIONS", "-javaagent:/opt/agent.jar", "java Main", "java Main"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
   it("localizes the pre-rename spelling of a renamed settings root", async () => {
     const xumRoot = path.join(tempDir, ".xum");
     await fs.mkdir(xumRoot);
@@ -2223,6 +2292,8 @@ describe("backup payload", () => {
     // -jar executes the archive operand regardless of its filename extension.
     ["Java jar", "java -jar <root>/skills/launch.txt"],
     ["Java jar (javaw)", "javaw -jar <root>/agents/launch.md"],
+    ["Java class path", "java -cp <root>/skills/launch.txt Leak"],
+    ["Java long class path", "java --class-path=<root>/agents/launch.md Leak"],
     ["JShell", "jshell <root>/skills/launch.txt"],
     ["JShell attached startup file", "jshell --startup=<root>/skills/launch.txt"],
     ["JShell separate startup file", "jshell --startup <root>/skills/launch.txt"],
@@ -2232,6 +2303,7 @@ describe("backup payload", () => {
     ["R attached file option", "R --file=<root>/skills/launch.txt"],
     ["R separate file option", "R -f <root>/skills/launch.txt"],
     ["PHP attached file option", "php --file=<root>/skills/launch.mdx"],
+    ["PHP attached config option", "php -c<root>/skills/config.txt /opt/server.php"],
     ["PHP separate file option", "php -f <root>/memory/global/launch.markdown"],
     ["PHP process-file option", "php -F<root>/skills/launch.txt"],
     ["PHP long process-file option", "php --process-file=<root>/skills/launch.txt"],

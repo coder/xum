@@ -1749,11 +1749,22 @@ function gitConfigOptionTakesSeparateValue(unquoted: string): boolean {
   return /^(?:-[ft]|--(?:file|blob|type|comment|default))$/.test(unquoted);
 }
 
-/** Java launcher options whose following word is an option value, not the source file. */
+/** Java class-path options whose value may itself be an executable archive. */
+function isJavaClassPathOption(unquoted: string): boolean {
+  return /^(?:-cp|-classpath|--class-path)$/.test(unquoted);
+}
+
+/** Java launcher options whose following word is opaque, not the source file. */
 function javaOptionTakesSeparateValue(unquoted: string): boolean {
-  return /^(?:-cp|-classpath|-p|--(?:class-path|module-path|upgrade-module-path|add-modules|enable-native-access|describe-module|add-reads|add-exports|add-opens|limit-modules|patch-module))$/.test(
+  return /^(?:-p|--(?:module-path|upgrade-module-path|add-modules|enable-native-access|describe-module|add-reads|add-exports|add-opens|limit-modules|patch-module))$/.test(
     unquoted
   );
+}
+
+function javaClassPathPublishesExecutable(value: string, rootPrefixes: readonly string[]): boolean {
+  return value
+    .split(path.delimiter)
+    .some((entry) => isAutoPublishedScriptOperand(entry, rootPrefixes));
 }
 
 /**
@@ -2185,6 +2196,8 @@ interface LanguageInterpreter {
   evalWord?: RegExp;
   attachedScriptFile?: RegExp;
   separateScriptFileOption?: RegExp;
+  /** Option whose following script name is resolved through inherited PATH. */
+  pathScriptFileOption?: RegExp;
   /** Captures an attached cwd, or an empty string when the next word is the cwd. */
   workingDirectoryOption?: RegExp;
   /**
@@ -2194,12 +2207,11 @@ interface LanguageInterpreter {
    */
   interactiveOption?: RegExp;
   /**
-   * Attached option naming an auxiliary file the interpreter executes before its
-   * main operands (jshell --startup=FILE). Unlike attachedScriptFile it is not a
-   * script boundary: a positional load file can still follow, so tracking stays
-   * armed and the option word keeps its ordinary ambiguous-dash handling. The
-   * separate spelling needs no matcher, because after any dash option a published
-   * operand already localizes through the armed tracking.
+   * Attached option naming an auxiliary file consumed before the main operand
+   * (jshell --startup=FILE, PHP -cFILE). Such a file can inject executable behavior,
+   * but it is not the script boundary: a positional script can still follow, so
+   * interpreter tracking stays armed. Separate spellings need no matcher because
+   * the following published operand already localizes through armed tracking.
    */
   attachedStartupFile?: RegExp;
 }
@@ -2210,6 +2222,7 @@ interface LanguageInterpreter {
  */
 const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "corepack"]);
 const PHP_LAUNCHER_NAME = /^(?:php[0-9.]*|php-win)$/;
+const JAVA_RUNTIME_LAUNCHER_NAME = /^(?:javaw?|jshell[0-9.]*)$/;
 
 const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
@@ -2260,6 +2273,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
     name: /^rubyw?[0-9.]*$/,
     evalWord: /^-(?:(?:0[0-7]*|W[0-2]?)|[acdlnpsvwy])*e/,
     workingDirectoryOption: /^-C(.*)$/,
+    pathScriptFileOption: /^-S$/,
   },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
   {
@@ -2267,6 +2281,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
     evalWord: /^-[nq]*[rRBE]/,
     attachedScriptFile: /^(?:--file=|--process-file=|-[fF])(.+)$/,
     separateScriptFileOption: /^(?:-[fF]|--file|--process-file)$/,
+    attachedStartupFile: /^-c(.+)$/,
   },
   // make evaluates recipes from an explicit makefile through a shell, and --eval/-E
   // evaluates the option operand as makefile syntax; plain target launchers stay portable.
@@ -2363,9 +2378,12 @@ function hasDisguisedAssignment(
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
   let pendingJavaOptionValue = false;
+  let pendingJavaClassPathValue = false;
   let pendingHashOptions = false;
   let pendingStartStopDaemonOptions = false;
   let pendingStartStopDaemonExecutable = false;
+  let pendingSystemdRunOptions = false;
+  let pendingSystemdRunWorkingDirectory = false;
   let pendingCdBuiltin: "cd" | "pushd" | null = null;
   // Lexical spelling of the working directory once a cd/pushd chain makes it known;
   // it survives separators because the moved directory outlives the command.
@@ -2374,6 +2392,7 @@ function hasDisguisedAssignment(
   let commandConsumesStdin = false;
   let commandPublishedStdin = false;
   let pendingScriptFileOperand = false;
+  let pendingScriptFileUsesPath = false;
   let evalOperandAmbiguous = false;
   // Static table entries keep the pending set bounded, so repeated interpreter words
   // cannot make these checks superlinear in command length.
@@ -2389,6 +2408,11 @@ function hasDisguisedAssignment(
       const resolved = resolveKnownDirectory(value, directory);
       if (resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes)) return true;
     }
+    if (pendingScriptFileUsesPath && !/[/\\]/.test(value)) {
+      for (const directory of inherited.publishedPathDirs) {
+        if (isAutoPublishedScriptOperand(`${directory}/${value}`, rootPrefixes)) return true;
+      }
+    }
     return false;
   }
 
@@ -2397,6 +2421,7 @@ function hasDisguisedAssignment(
     languageWorkingDirectories.clear();
     pendingLanguageWorkingDirectory = null;
     pendingScriptFileOperand = false;
+    pendingScriptFileUsesPath = false;
     evalOperandAmbiguous = false;
   }
   const words = [...redacted.matchAll(SHELL_WORD)];
@@ -2444,9 +2469,12 @@ function hasDisguisedAssignment(
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
+      pendingJavaClassPathValue = false;
       pendingHashOptions = false;
       pendingStartStopDaemonOptions = false;
       pendingStartStopDaemonExecutable = false;
+      pendingSystemdRunOptions = false;
+      pendingSystemdRunWorkingDirectory = false;
       // A bare cd goes home; a bare pushd swaps to a stack entry this scan
       // cannot resolve.
       if (pendingCdBuiltin === "cd") trackedCwd = "~";
@@ -2533,6 +2561,8 @@ function hasDisguisedAssignment(
         sawEnv = false;
         pendingStartStopDaemonOptions = false;
         pendingStartStopDaemonExecutable = false;
+        pendingSystemdRunOptions = false;
+        pendingSystemdRunWorkingDirectory = false;
       }
       pendingEnvOptionValue = false;
       pendingEnvWorkingDirectory = false;
@@ -2542,6 +2572,7 @@ function hasDisguisedAssignment(
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
+      pendingJavaClassPathValue = false;
       continue;
     }
     if (pendingBodyName !== null) {
@@ -2717,7 +2748,10 @@ function hasDisguisedAssignment(
         pendingDenoRunScript = false;
       }
     }
-    if (pendingJavaOptionValue) {
+    if (pendingJavaClassPathValue) {
+      pendingJavaClassPathValue = false;
+      if (javaClassPathPublishesExecutable(unquoted, rootPrefixes)) return true;
+    } else if (pendingJavaOptionValue) {
       pendingJavaOptionValue = false;
     } else if (pendingJavaSourceVersion) {
       pendingJavaSourceVersion = false;
@@ -2729,6 +2763,14 @@ function hasDisguisedAssignment(
         // localizes, and any other @-file leaves tracking armed because the options
         // it expands to are not visible here.
         if (isAutoPublishedScriptOperand(unquoted.slice(1), rootPrefixes)) return true;
+      } else if (isJavaClassPathOption(unquoted)) {
+        pendingJavaClassPathValue = true;
+      } else if (unquoted.startsWith("--class-path=")) {
+        if (
+          javaClassPathPublishesExecutable(unquoted.slice("--class-path=".length), rootPrefixes)
+        ) {
+          return true;
+        }
       } else if (javaOptionTakesSeparateValue(unquoted)) {
         pendingJavaOptionValue = true;
       } else if (unquoted === "--source") {
@@ -2802,6 +2844,19 @@ function hasDisguisedAssignment(
     // prevents interpreter option tracking from reaching them.
     if (/^data:[^,]*(?:javascript|ecmascript|typescript)/i.test(unquoted)) return true;
     if (pendingFindPrimaries && FIND_EXEC_PRIMARY.test(unquoted)) return true;
+    if (pendingSystemdRunWorkingDirectory) {
+      pendingSystemdRunWorkingDirectory = false;
+      const directory = resolveKnownDirectory(unquoted, trackedCwd);
+      if (directory !== null && isUnderCollectedRoot(directory, rootPrefixes)) return true;
+    } else if (pendingSystemdRunOptions) {
+      const directory = /^--working-directory=(.*)$/.exec(unquoted)?.[1];
+      if (directory !== undefined) {
+        const resolved = resolveKnownDirectory(directory, trackedCwd);
+        if (resolved !== null && isUnderCollectedRoot(resolved, rootPrefixes)) return true;
+      } else if (unquoted === "--working-directory") {
+        pendingSystemdRunWorkingDirectory = true;
+      }
+    }
     let executableWord = unquoted;
     if (pendingStartStopDaemonExecutable) {
       pendingStartStopDaemonExecutable = false;
@@ -2834,12 +2889,14 @@ function hasDisguisedAssignment(
       }
       if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
       if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.javaAgentHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
+      if (executable === "systemd-run") pendingSystemdRunOptions = true;
       // Builtins, so matched on the quote-removed word like the state words above.
       if (unquoted === "hash") pendingHashOptions = true;
       if (unquoted === "cd" || unquoted === "pushd") pendingCdBuiltin = unquoted;
@@ -2884,8 +2941,12 @@ function hasDisguisedAssignment(
         attachedScriptBoundary = true;
         break;
       }
-      if (pending.separateScriptFileOption?.test(unquoted) === true) {
+      if (pending.pathScriptFileOption?.test(unquoted) === true) {
         pendingScriptFileOperand = true;
+        pendingScriptFileUsesPath = true;
+      } else if (pending.separateScriptFileOption?.test(unquoted) === true) {
+        pendingScriptFileOperand = true;
+        pendingScriptFileUsesPath = false;
       }
       // An inherited startup hook naming a published document executes on any
       // interactive spelling before the first prompt.
@@ -3322,6 +3383,8 @@ interface InheritedLaunchContext {
   pythonStartupHook: boolean;
   /** PHPRC names an auto-published configuration document. */
   phpConfigHook: boolean;
+  /** A JVM environment variable names an auto-published Java agent archive. */
+  javaAgentHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3331,6 +3394,21 @@ function hasInheritedNodeCodeOptions(value: unknown): boolean {
     const option = unquoteShellWord(match[0]);
     if (/^(?:-r(?:.*)|--(?:require|import|loader|experimental-loader)(?:=|$))/.test(option)) {
       return true;
+    }
+  }
+  return false;
+}
+
+function hasInheritedJavaAgent(
+  values: readonly unknown[],
+  rootPrefixes: readonly string[]
+): boolean {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    for (const match of value.matchAll(SHELL_WORD)) {
+      const option = unquoteShellWord(match[0]);
+      const agent = /^-(?:javaagent|agentpath):([^=]+)/.exec(option)?.[1];
+      if (agent !== undefined && isAutoPublishedScriptOperand(agent, rootPrefixes)) return true;
     }
   }
   return false;
@@ -3355,6 +3433,10 @@ function redactMcpConfig(
     nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
     pythonStartupHook: isAutoPublishedScriptOperand(process.env.PYTHONSTARTUP ?? "", rootPrefixes),
     phpConfigHook: isAutoPublishedScriptOperand(process.env.PHPRC ?? "", rootPrefixes),
+    javaAgentHook: hasInheritedJavaAgent(
+      [process.env.JAVA_TOOL_OPTIONS, process.env._JAVA_OPTIONS, process.env.JDK_JAVA_OPTIONS],
+      rootPrefixes
+    ),
   };
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
