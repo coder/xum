@@ -4896,7 +4896,8 @@ export class AgentSession {
     this.activeTurnStreamHandle = handle;
     void handle.completion
       .then(async (outcome) => {
-        if (outcome.status !== "failed") return;
+        // A disposed session must not persist retry/goal state post-teardown.
+        if (outcome.status !== "failed" || this.disposed) return;
 
         try {
           await this.handleStreamError(outcome.streamError);

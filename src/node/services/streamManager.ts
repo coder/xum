@@ -218,12 +218,12 @@ export interface TurnStreamHandle {
   completion: Promise<TurnCompletion>;
 }
 
-interface TurnCompletionController {
+export interface TurnCompletionController {
   promise: Promise<TurnCompletion>;
   settle: (completion: TurnCompletion) => void;
 }
 
-function createTurnCompletionController(): TurnCompletionController {
+export function createTurnCompletionController(): TurnCompletionController {
   let settled = false;
   let resolveCompletion!: (completion: TurnCompletion) => void;
   const promise = new Promise<TurnCompletion>((resolve) => {

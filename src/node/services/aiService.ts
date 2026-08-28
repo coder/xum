@@ -1373,9 +1373,9 @@ export class AIService extends EventEmitter {
         if (combinedAbortSignal.aborted) {
           return Ok(this.createAbortedTurnHandle(syntheticMessageId));
         }
-        // play() resolves after the scripted playback (including any error
-        // events, which the session drains from its in-flight capture), so the
-        // handle can settle immediately.
+        // play() resolves at stream-start; the scripted turn settles its own
+        // completion from the terminal scripted event, which arrives later.
+        // Pre-start aborts never schedule a turn and settle aborted here.
         const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
           agentId,
@@ -1386,9 +1386,7 @@ export class AIService extends EventEmitter {
         if (!result.success) {
           return result;
         }
-        return Ok(
-          this.createSettledTurnHandle({ status: "completed", messageId: syntheticMessageId })
-        );
+        return Ok(result.data ?? this.createAbortedTurnHandle(syntheticMessageId));
       }
 
       // DEBUG: Log streamMessage call
