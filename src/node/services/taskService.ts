@@ -1672,6 +1672,23 @@ export class TaskService {
      */
     { handleId: string; ownerWorkspaceId: string; accepted: boolean }
   >();
+
+  /** See nextWorkspaceTurnCreatedAt. */
+  private lastWorkspaceTurnCreatedAtMs = 0;
+
+  /**
+   * Strictly increasing createdAt for workspace-turn handles issued by this
+   * process: listAllWorkspaceTurns() orders records by createdAt, and the
+   * immediate-predecessor announcement in createWorkspaceTurn (newest-first
+   * scan in findActiveWorkspaceTurnForWorkspace) must be deterministic even
+   * when two follow-ups are created within the same millisecond — an equal
+   * ISO timestamp would otherwise fall back to filesystem readdir order.
+   */
+  private nextWorkspaceTurnCreatedAt(): string {
+    const nowMs = Math.max(Date.now(), this.lastWorkspaceTurnCreatedAtMs + 1);
+    this.lastWorkspaceTurnCreatedAtMs = nowMs;
+    return new Date(nowMs).toISOString();
+  }
   private readonly taskHandleStore: TaskHandleStore;
   private readonly terminalAttentionStore: TerminalAttentionStore;
   private readonly userBackgroundedTaskIds = new Set<string>();
@@ -4340,7 +4357,7 @@ export class TaskService {
 
     const handleId = `${WORKSPACE_TURN_TASK_ID_PREFIX}${this.config.generateStableId()}`;
     const turnId = this.config.generateStableId();
-    const createdAt = getIsoNow();
+    const createdAt = this.nextWorkspaceTurnCreatedAt();
     // New workspace turns use exec. Follow-ups in a persistent agent-task workspace preserve that
     // child's original agent identity and task-level model settings. An explicit args.agentId
     // (validated above/below) overrides either default for this turn only.
@@ -8325,25 +8342,15 @@ export class TaskService {
     const workspaceTurnNotifications = pending.filter(
       (notification) => notification.sourceKind === "workspace_turn"
     );
-    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
-    const publicAwaitIds: string[] = [];
+    const workspaceTurnCandidates: Array<{
+      notification: (typeof pending)[number];
+      publicAwaitId: string;
+    }> = [];
     for (const notification of workspaceTurnNotifications) {
       const record = await this.taskHandleStore.getWorkspaceTurn(
         ownerWorkspaceId,
         notification.sourceId
       );
-      // Revalidate suppression against the just-read record before delivery: a
-      // quiet owner-follow-up resettle deletes its notification files, but
-      // cannot retract this drain's already-taken listPending() snapshot. The
-      // handle record is the source of truth, so a handle that has since
-      // settled into the quiet flavor is dropped here instead of waking the
-      // owner from the stale snapshot. (A resettle persisting after this read
-      // can still lose the race — full serializability would require holding
-      // the settlement lock across sendMessage, which the drain must not do.)
-      if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
-        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
-        continue;
-      }
       const isPersistentChildContinuation =
         record != null &&
         this.isDescendantAgentTaskUsingParentById(
@@ -8367,20 +8374,17 @@ export class TaskService {
         }
       }
 
-      deliverableWorkspaceTurnNotificationIds.add(notification.id);
-      publicAwaitIds.push(
-        isPersistentChildContinuation ? record.workspaceId : notification.sourceId
-      );
+      workspaceTurnCandidates.push({
+        notification,
+        publicAwaitId: isPersistentChildContinuation ? record.workspaceId : notification.sourceId,
+      });
     }
     const workflowNotifications = pending.filter(
       (notification) => notification.sourceKind === "workflow_run"
     );
     const deliverableWorkflowNotificationIds = new Set<string>();
 
-    const promptSections: string[] = [];
-    if (publicAwaitIds.length > 0) {
-      promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
-    }
+    const workflowPromptSections: string[] = [];
     for (const notification of workflowNotifications) {
       const workflowPrompt = await this.buildWorkflowTerminalPrompt(
         ownerWorkspaceId,
@@ -8391,11 +8395,50 @@ export class TaskService {
         continue;
       }
       deliverableWorkflowNotificationIds.add(notification.id);
-      promptSections.push(workflowPrompt);
+      workflowPromptSections.push(workflowPrompt);
+    }
+
+    const resumeOptions = await this.resolveParentAutoResumeOptions(
+      ownerWorkspaceId,
+      entry,
+      defaultModel
+    );
+    const workspaceTurnMuxMetadata =
+      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
+
+    // Last-moment suppression revalidation: a quiet owner-follow-up resettle
+    // deletes its notification files, but cannot retract this drain's
+    // already-taken listPending() snapshot, so the handle record (re-read here,
+    // after every await except delivery itself) is the source of truth. A
+    // suppressed handle is dropped instead of waking the owner from the stale
+    // snapshot. The residual window is the sendMessage call below — closing it
+    // would require holding settlement locks across delivery, which the drain
+    // must not do; worst case is one redundant wake (fail toward notify).
+    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
+    const publicAwaitIds: string[] = [];
+    for (const candidate of workspaceTurnCandidates) {
+      const record = await this.taskHandleStore.getWorkspaceTurn(
+        ownerWorkspaceId,
+        candidate.notification.sourceId
+      );
+      if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
+        await this.terminalAttentionStore.markSuperseded(
+          ownerWorkspaceId,
+          candidate.notification.id
+        );
+        continue;
+      }
+      deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
+      publicAwaitIds.push(candidate.publicAwaitId);
     }
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
     // directly instead of injecting a second user turn that merely tells the model they exist.
+    const promptSections: string[] = [];
+    if (publicAwaitIds.length > 0) {
+      promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
+    }
+    promptSections.push(...workflowPromptSections);
     const prompt = promptSections.join("\n\n");
     const effectivePending = pending.filter((notification) => {
       if (notification.sourceKind === "agent_task") {
@@ -8419,14 +8462,6 @@ export class TaskService {
         await this.terminalAttentionStore.markPending(ownerWorkspaceId, notification.id);
       }
     };
-
-    const resumeOptions = await this.resolveParentAutoResumeOptions(
-      ownerWorkspaceId,
-      entry,
-      defaultModel
-    );
-    const workspaceTurnMuxMetadata =
-      await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
 
     const sendOptions = {
       model: resumeOptions.model,
@@ -9102,6 +9137,16 @@ export class TaskService {
           });
           delete nextRecord.terminalAttentionNotifiedAt;
         }
+        if (suppressedQuietSettlement) {
+          // Downgrade-compatible suppression marker (upgrade↔downgrade rule):
+          // older builds' startup recovery knows only terminalAttentionNotifiedAt,
+          // not the quiet error prefix, and would otherwise resurrect exactly
+          // the wake this flavor suppresses. Nothing was actually delivered —
+          // on this build the pure suppression predicate governs the
+          // settle/recovery/drain paths, and a self-heal resettle deletes the
+          // marker above to re-arm the corrected wake.
+          nextRecord.terminalAttentionNotifiedAt ??= getIsoNow();
+        }
         const requiresDirectParentDelivery =
           this.workspaceTurnRequiresDirectParentDelivery(nextRecord);
         if (requiresDirectParentDelivery) {
@@ -9376,7 +9421,10 @@ export class TaskService {
           return;
         }
         if (record.status === "interrupted") {
-          waiterEntry.reject(new Error("Workspace turn interrupted"));
+          // Preserve the persisted reason like the live settlement path does:
+          // a handle that settled quietly before this waiter's initial read
+          // must still surface the successor handle id to the awaiting caller.
+          waiterEntry.reject(new Error(record.error ?? "Workspace turn interrupted"));
         }
       })().catch((error: unknown) => {
         waiterEntry.reject(error instanceof Error ? error : new Error(String(error)));

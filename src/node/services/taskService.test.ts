@@ -7360,8 +7360,10 @@ describe("TaskService", () => {
     });
     expect(settled.error?.startsWith(OWNER_FOLLOW_UP_SUPERSEDE_PREFIX)).toBe(true);
     expect(settled.error).toContain("wst_successor");
-    // Quiet: no wake enqueued, no delivered marker invented, no parent envelope required.
-    expect(settled.terminalAttentionNotifiedAt).toBeUndefined();
+    // Quiet: no wake enqueued, no parent envelope required. The notified
+    // marker IS stamped as the downgrade-compatible suppression marker so an
+    // older build's startup recovery also skips this record.
+    expect(settled.terminalAttentionNotifiedAt).toBeDefined();
     expect(settled.directParentResultDeliveryRequiredAt).toBeUndefined();
     const attentionStore = new TerminalAttentionStore(config);
     expect(
@@ -7526,6 +7528,35 @@ describe("TaskService", () => {
     const error = await waited;
     expect(error).toBeInstanceOf(Error);
     expect((error as Error).message).toContain("wst_successor");
+  });
+
+  test("late foreground waiters read the persisted quiet supersede reason", async () => {
+    // Codex P2: a waiter whose initial record read completes after the quiet
+    // settlement misses the live waiter path; the terminal `interrupted`
+    // branch must preserve the persisted reason (and its successor handle id)
+    // instead of a generic message.
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
+      ownerFollowUpCutter(parentId, "wst_successor")
+    );
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_late_waiter_cut"));
+
+    let error: unknown;
+    try {
+      await taskService.waitForWorkspaceTurn("wst_handle", {
+        requestingWorkspaceId: parentId,
+        timeoutMs: 5_000,
+      });
+      expect.unreachable("late waiter must reject");
+    } catch (caught) {
+      error = caught;
+    }
+    assert(error instanceof Error, "late waiter must reject with an Error");
+    expect(error.message.startsWith(OWNER_FOLLOW_UP_SUPERSEDE_PREFIX)).toBe(true);
+    expect(error.message).toContain("wst_successor");
   });
 
   test("late correlated completion self-heals a quiet supersede and re-arms the corrected wake", async () => {
@@ -8009,7 +8040,9 @@ describe("TaskService", () => {
     assert(resettled, "resettled handle must exist");
     expect(resettled.status).toBe("interrupted");
     expect(resettled.error?.startsWith(OWNER_FOLLOW_UP_SUPERSEDE_PREFIX)).toBe(true);
-    expect(resettled.terminalAttentionNotifiedAt).toBeUndefined();
+    // Stale delivered marker cleared by the resettle, then re-stamped as the
+    // quiet flavor's downgrade-compatible suppression marker.
+    expect(resettled.terminalAttentionNotifiedAt).toBeDefined();
     expect(await attentionStore.get(parentId, staleVersionedId)).toBeNull();
     expect(
       await attentionStore.get(
@@ -8037,7 +8070,7 @@ describe("TaskService", () => {
     const hasPendingQueuedOrPreparingTurn = mock(
       (workspaceId: string) => workspaceId === "childworkspace"
     );
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
       stableIds: ["handle", "turn", "handle2", "turn2", "handle3", "turn3"],
       hasPendingQueuedOrPreparingTurn,
     });
@@ -8055,18 +8088,9 @@ describe("TaskService", () => {
     if (!followUpB.success) throw new Error(followUpB.error);
     expect(followUpB.data.maySupersedeTaskId).toBe("wst_handle");
 
-    // Pin strictly increasing createdAt: a same-millisecond tie between the
-    // original turn and follow-up B would make the newest-first scan ambiguous.
-    const taskHandleStore = new TaskHandleStore(config);
-    const original = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
-    assert(original, "original handle record must exist");
-    const followUpBRecord = await taskHandleStore.getWorkspaceTurn(parentId, followUpB.data.taskId);
-    assert(followUpBRecord, "follow-up B record must exist");
-    await taskHandleStore.upsertWorkspaceTurn({
-      ...followUpBRecord,
-      createdAt: new Date(Date.parse(original.createdAt) + 1000).toISOString(),
-    });
-
+    // createdAt is per-process monotonic (nextWorkspaceTurnCreatedAt), so the
+    // newest-first predecessor scan is deterministic even when the original
+    // turn and follow-up B are created within the same millisecond.
     const followUpC = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
       prompt: "Follow up C",
