@@ -1,63 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import type { ExecOptions, ExecStream } from "./Runtime";
-import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
+import type { SpawnResult } from "./RemoteRuntime";
+import { TestRemoteRuntime } from "./testRemoteRuntime";
 
-class RecordingRemoteRuntime extends RemoteRuntime {
+class RecordingRemoteRuntime extends TestRemoteRuntime {
   spawnCount = 0;
 
-  protected readonly commandPrefix = "Recording";
-
-  protected getBasePath(): string {
-    return "/workspace";
-  }
-
-  protected quoteForRemote(filePath: string): string {
-    return `'${filePath}'`;
-  }
-
-  protected cdCommand(cwd: string): string {
-    return `cd '${cwd}'`;
-  }
-
-  protected spawnRemoteProcess(): Promise<SpawnResult> {
+  protected override spawnRemoteProcess(): Promise<SpawnResult> {
     this.spawnCount += 1;
     throw new Error("spawn should not be called");
-  }
-
-  resolvePath(filePath: string): Promise<string> {
-    return Promise.resolve(filePath);
-  }
-
-  getWorkspacePath(): string {
-    return "/workspace";
-  }
-
-  createWorkspace() {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  initWorkspace() {
-    return Promise.resolve({ success: true });
-  }
-
-  deleteWorkspace() {
-    return Promise.resolve({ success: true as const, deletedPath: "/workspace" });
-  }
-
-  renameWorkspace() {
-    return Promise.resolve({
-      success: true as const,
-      oldPath: "/workspace",
-      newPath: "/workspace",
-    });
-  }
-
-  forkWorkspace() {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  ensureReady() {
-    return Promise.resolve({ ready: true as const });
   }
 }
 

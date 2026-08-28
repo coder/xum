@@ -104,33 +104,22 @@ describe("LocalBaseRuntime.resolvePath", () => {
 });
 
 describe("LocalBaseRuntime.exec PATH handling", () => {
-  it("canonicalizes pathEnv values before command execution", async () => {
-    const runtime = new TestLocalRuntime();
-    const stream = await runtime.exec('printf "%s" "$XUM_TEST_PATH"', {
-      cwd: os.tmpdir(),
-      pathEnv: { XUM_TEST_PATH: "~/runtime-path" },
-      timeout: 5,
-    });
-    await stream.stdin.close();
-
-    expect(await readStreamAsString(stream.stdout)).toBe(path.join(os.homedir(), "runtime-path"));
-    expect(await stream.exitCode).toBe(0);
-  });
-
-  it("expands product-home pathEnv values through getXumHome like file I/O", async () => {
+  it("canonicalizes pathEnv values with file I/O semantics (tilde and product home)", async () => {
     const xumRoot = await fs.mkdtemp(path.join(os.tmpdir(), "xum-root-"));
     const originalRoot = process.env.XUM_ROOT;
     process.env.XUM_ROOT = xumRoot;
     try {
       const runtime = new TestLocalRuntime();
-      const stream = await runtime.exec('printf "%s" "$XUM_TEST_PATH"', {
+      const stream = await runtime.exec('printf "%s\\n%s" "$XUM_TEST_PATH" "$XUM_TEST_HOME"', {
         cwd: os.tmpdir(),
-        pathEnv: { XUM_TEST_PATH: "~/.xum/plans" },
+        pathEnv: { XUM_TEST_PATH: "~/runtime-path", XUM_TEST_HOME: "~/.xum/plans" },
         timeout: 5,
       });
       await stream.stdin.close();
 
-      expect(await readStreamAsString(stream.stdout)).toBe(path.join(xumRoot, "plans"));
+      expect(await readStreamAsString(stream.stdout)).toBe(
+        `${path.join(os.homedir(), "runtime-path")}\n${path.join(xumRoot, "plans")}`
+      );
       expect(await stream.exitCode).toBe(0);
     } finally {
       if (originalRoot === undefined) {

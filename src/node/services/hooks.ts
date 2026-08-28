@@ -11,6 +11,7 @@ import {
   withLegacyMuxEnvironmentAliases,
 } from "@/common/compat/legacyMux";
 import { flattenToolHookValueToEnv } from "@/common/utils/tools/toolHookEnv";
+import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
@@ -26,12 +27,6 @@ const FLATTENED_TOOL_ENV_MAX_ARRAY_LENGTH = 50;
 const DEFAULT_HOOK_PHASE_TIMEOUT_MS = 10_000; // 10 seconds
 const EXEC_MARKER_PREFIX = "MUX_EXEC_";
 const HOOK_PATH_ENV = "XUM_INTERNAL_HOOK_PATH";
-
-/** Shell-escape a string for safe use in bash -c commands */
-function shellEscape(str: string): string {
-  // Wrap in single quotes and escape any embedded single quotes
-  return `'${str.replace(/'/g, "'\\''")}'`;
-}
 
 function buildHookCommand(): string {
   return `hook_path="$${HOOK_PATH_ENV}"; unset ${HOOK_PATH_ENV}; "$hook_path"`;
@@ -332,7 +327,7 @@ export async function runWithHook<T>(
     log.error("[hooks] Failed to spawn hook", { hookPath, error: err });
     if (toolInputPath) {
       try {
-        await execBuffered(runtime, `rm -f ${shellEscape(toolInputPath)}`, {
+        await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
           cwd: context.projectDir,
           timeout: 5,
         });
@@ -512,7 +507,7 @@ export async function runWithHook<T>(
 
   if (toolInputPath) {
     try {
-      await execBuffered(runtime, `rm -f ${shellEscape(toolInputPath)}`, {
+      await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
         cwd: context.projectDir,
         timeout: 5,
       });
@@ -736,7 +731,7 @@ export async function runPostHook(
     if (!resultPathForEnv) return;
 
     try {
-      await execBuffered(runtime, `rm -f ${shellEscape(resultPathForEnv)}`, {
+      await execBuffered(runtime, `rm -f ${shellQuote(resultPathForEnv)}`, {
         cwd: context.projectDir,
         timeout: 5,
       });
@@ -805,7 +800,7 @@ async function prepareToolInput(
   const cleanup = async () => {
     if (toolInputPath) {
       try {
-        await execBuffered(runtime, `rm -f ${shellEscape(toolInputPath)}`, {
+        await execBuffered(runtime, `rm -f ${shellQuote(toolInputPath)}`, {
           cwd: projectDir,
           timeout: 5,
         });

@@ -239,40 +239,6 @@ export async function movePlanFile(
 }
 
 /**
- * Copy a plan file from one workspace to another (e.g., during fork).
- * Checks both new path format and legacy path format for the source.
- * Silently succeeds if source file doesn't exist at either location.
- */
-export async function copyPlanFile(
-  runtime: Runtime,
-  sourceWorkspaceName: string,
-  sourceWorkspaceId: string,
-  targetWorkspaceName: string,
-  projectName: string
-): Promise<void> {
-  const xumHome = runtime.getXumHome();
-  const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, xumHome);
-  const legacySourcePath = getLegacyPlanFilePath(sourceWorkspaceId, xumHome);
-  const targetPath = getPlanFilePath(targetWorkspaceName, projectName, xumHome);
-
-  // Prefer the new layout, but fall back to the legacy layout.
-  //
-  // Note: we intentionally use runtime file I/O instead of `cp` because:
-  // 1) bash doesn't expand ~ inside quotes
-  // 2) the target per-project plan directory may not exist yet
-  // 3) runtime.writeFile() already handles directory creation + tilde expansion
-  for (const candidatePath of [sourcePath, legacySourcePath]) {
-    try {
-      const content = await readFileString(runtime, candidatePath);
-      await writeFileString(runtime, targetPath, content);
-      return;
-    } catch {
-      // Try next candidate
-    }
-  }
-}
-
-/**
  * Copy a plan file across runtimes (e.g., during fork where source/target may be
  * different containers). Uses separate runtime handles to avoid the identity mutation
  * bug where DockerRuntime.forkWorkspace() changes this.containerName to the target.

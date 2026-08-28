@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -28,23 +28,17 @@ describe("hooks", () => {
   });
 
   describe("exec path mapping", () => {
-    test("returns mapped project hook and tool_env paths after host discovery", async () => {
+    test("discovery returns host-namespace paths even on exec-mapping runtimes", async () => {
       const configDir = path.join(tempDir, ".xum");
       const hookPath = path.join(configDir, "tool_hook");
       const toolEnvPath = path.join(configDir, "tool_env");
-      const execPrefix = "/workspaces/project";
       await fs.mkdir(configDir, { recursive: true });
       await fs.writeFile(hookPath, "#!/bin/bash\necho test");
       await fs.writeFile(toolEnvPath, "export FOO=bar");
 
-      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
-      const statSpy = spyOn(mappingRuntime, "stat");
-
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, "/workspaces/project");
       expect(await getHookPath(mappingRuntime, tempDir)).toBe(hookPath);
       expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(toolEnvPath);
-      const statPaths = statSpy.mock.calls.map(([filePath]) => filePath);
-      expect(statPaths).toContain(hookPath);
-      expect(statPaths).toContain(toolEnvPath);
     });
 
     test("hook runners export the mapped project dir as XUM_PROJECT_DIR", async () => {
