@@ -2092,6 +2092,11 @@ const COMMAND_CARRIER_OPERANDS = new Map<string, number>([
   ["setpriv", 0],
   ["numactl", 0],
   ["eatmydata", 0],
+  // systemd executors share the [OPTIONS...] COMMAND grammar; a dash option makes
+  // the walk sticky below, which also covers their separate-value option spellings.
+  ["systemd-run", 0],
+  ["systemd-inhibit", 0],
+  ["systemd-cat", 0],
   ["timeout", 1],
   ["chrt", 1],
   ["taskset", 1],

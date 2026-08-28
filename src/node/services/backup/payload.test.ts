@@ -1714,6 +1714,9 @@ describe("backup payload", () => {
     ["setpriv-wrapped shells", "setpriv --reuid 1000 bash -c exit"],
     // setarch's leading arch operand is optional, so every operand is checked.
     ["setarch-wrapped shells", "setarch linux64 bash -c exit"],
+    ["systemd-run-wrapped shells", "systemd-run --user --scope bash -c exit"],
+    ["systemd-inhibit-wrapped shells", "systemd-inhibit --what=idle bash -c exit"],
+    ["systemd-cat-wrapped shells", "systemd-cat -t mcp bash -c exit"],
   ] as const) {
     it(`localizes ${name}`, async () => {
       await writeFixtureFile(
@@ -1749,6 +1752,7 @@ describe("backup payload", () => {
       // Redirected stdin hands the same executable input to an interpreter.
       `node < ${muxRoot}/skills/launch.txt`,
       `sh 0< ${muxRoot}/skills/launch.txt`,
+      `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1780,6 +1784,7 @@ describe("backup payload", () => {
       "mcp-server --mode find -exec /tmp/plugin",
       "mcp-server --wrap prlimit --mode coproc",
       "mcp-server < /tmp/input.json",
+      "mcp-server --launcher systemd-run",
     ]) {
       await writeFixtureFile(
         muxRoot,
