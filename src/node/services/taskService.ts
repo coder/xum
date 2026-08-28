@@ -2308,26 +2308,29 @@ export class TaskService {
     // Compaction is internal bookkeeping, not an identity for resuming user work.
     let agentId = hint?.agentId === "compact" ? undefined : hint?.agentId;
 
-    // Durable history preserves the parent identity across process restarts.
+    // Durable history preserves the parent identity across process restarts. The walk is
+    // unbounded: synthetic rows without an agent identity (drain-appended sub-agent reports,
+    // heartbeat scaffolding) can push the newest agent-bearing assistant row past any fixed
+    // tail, and a truncated read would silently recompose terminal-wake sends from the exec
+    // fallback, lifting a restricted agent's tool policy.
     if (!agentId) {
-      try {
-        const historyResult = await this.historyService.getLastMessages(parentWorkspaceId, 20);
-        if (historyResult.success) {
-          for (let i = historyResult.data.length - 1; i >= 0; i--) {
-            const msg = historyResult.data[i];
-            if (
-              msg?.role === "assistant" &&
-              msg.metadata?.agentId &&
-              msg.metadata.agentId !== "compact"
-            ) {
-              agentId = msg.metadata.agentId;
-              break;
-            }
+      const found: { agentId?: string } = {};
+      await this.historyService.iterateFullHistory(parentWorkspaceId, "backward", (messages) => {
+        for (const msg of messages) {
+          if (
+            msg.role === "assistant" &&
+            msg.metadata?.agentId &&
+            msg.metadata.agentId !== "compact"
+          ) {
+            found.agentId = msg.metadata.agentId;
+            return false;
           }
         }
-      } catch {
-        // Best-effort; fall through to defaults
-      }
+        return undefined;
+      });
+      // A failed read falls through to defaults (best-effort); the terminal drain separately
+      // fails closed on unreadable history via resolveTerminalWakeCallerSendRestrictions.
+      agentId = found.agentId;
     }
 
     // 3) Default

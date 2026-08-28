@@ -6433,7 +6433,7 @@ describe("TaskService", () => {
     expect(liftedOptions.toolPolicy).toBeUndefined();
   });
 
-  test("wake restriction restore walks past a long synthetic tail and carries the agent disable flag", async () => {
+  test("wake restoration walks a long agent-less tail: caller policy, agent identity, disable flag", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
@@ -6472,6 +6472,10 @@ describe("TaskService", () => {
         disableWorkspaceAgents: true,
       })
     );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("agent-turn", "assistant", "on it", { timestamp: 1_000, agentId: "plan" })
+    );
     // A tail longer than any bounded history read: the launch turn's restrictions must still
     // be found, not silently lifted once enough rows accumulate after the manual turn.
     for (let i = 0; i < 60; i++) {
@@ -6488,6 +6492,7 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
       toolPolicy: restrictedPolicy,
       disableWorkspaceAgents: true,
     });
