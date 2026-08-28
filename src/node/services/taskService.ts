@@ -1569,6 +1569,19 @@ export class TaskService {
     ReturnType<typeof setTimeout>
   >();
   private terminalAttentionDeferRetryDelayMs = TERMINAL_ATTENTION_DEFER_RETRY_DELAY_MS;
+  // Workflow terminal callbacks are single-attempt (WorkflowService swallows callback
+  // rejections), so a transient outbox write failure would otherwise silence the wake for
+  // the life of the process. Retain failed enqueue params (owner -> runId -> status) and
+  // retry on the defer-retry cadence; reset drops the entry so a resumed run cannot
+  // resurrect its stale terminal wake.
+  private readonly retainedWorkflowTerminalEnqueues = new Map<
+    string,
+    Map<string, WorkflowRunStatus>
+  >();
+  private readonly workflowTerminalEnqueueRetryTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
@@ -7748,12 +7761,55 @@ export class TaskService {
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
-    await this.enqueueTerminalAttention({
-      ownerWorkspaceId: params.ownerWorkspaceId,
-      sourceKind: "workflow_run",
-      terminalOutcome: terminalAttentionOutcome(params.status),
-      sourceId: params.runId,
-    });
+    try {
+      await this.enqueueTerminalAttention({
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        sourceKind: "workflow_run",
+        terminalOutcome: terminalAttentionOutcome(params.status),
+        sourceId: params.runId,
+      });
+    } catch (error) {
+      log.error("Workflow terminal attention enqueue failed; retrying on bounded timer", {
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        runId: params.runId,
+        error,
+      });
+      this.retainWorkflowTerminalEnqueue(params);
+    }
+  }
+
+  private retainWorkflowTerminalEnqueue(params: {
+    ownerWorkspaceId: string;
+    runId: string;
+    status: WorkflowRunStatus;
+  }): void {
+    let byRun = this.retainedWorkflowTerminalEnqueues.get(params.ownerWorkspaceId);
+    if (byRun == null) {
+      byRun = new Map();
+      this.retainedWorkflowTerminalEnqueues.set(params.ownerWorkspaceId, byRun);
+    }
+    byRun.set(params.runId, params.status);
+    if (this.workflowTerminalEnqueueRetryTimers.has(params.ownerWorkspaceId)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.workflowTerminalEnqueueRetryTimers.delete(params.ownerWorkspaceId);
+      void this.retryRetainedWorkflowTerminalEnqueues(params.ownerWorkspaceId);
+    }, this.terminalAttentionDeferRetryDelayMs);
+    timer.unref?.();
+    this.workflowTerminalEnqueueRetryTimers.set(params.ownerWorkspaceId, timer);
+  }
+
+  private async retryRetainedWorkflowTerminalEnqueues(ownerWorkspaceId: string): Promise<void> {
+    const byRun = this.retainedWorkflowTerminalEnqueues.get(ownerWorkspaceId);
+    if (byRun == null) {
+      return;
+    }
+    this.retainedWorkflowTerminalEnqueues.delete(ownerWorkspaceId);
+    for (const [runId, status] of byRun) {
+      // A re-attempt that fails again re-retains the entry and re-arms the timer.
+      await this.enqueueWorkflowRunTerminalAttention({ ownerWorkspaceId, runId, status });
+    }
   }
 
   async resetWorkflowRunTerminalAttention(params: {
@@ -7765,6 +7821,7 @@ export class TaskService {
       "resetWorkflowRunTerminalAttention requires ownerWorkspaceId"
     );
     assert(params.runId.length > 0, "resetWorkflowRunTerminalAttention requires runId");
+    this.retainedWorkflowTerminalEnqueues.get(params.ownerWorkspaceId)?.delete(params.runId);
     await this.terminalAttentionStore.delete(
       params.ownerWorkspaceId,
       TerminalAttentionStore.notificationId("workflow_run", params.runId)

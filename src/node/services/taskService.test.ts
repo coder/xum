@@ -6355,6 +6355,135 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("failed terminal attention enqueue is retained and retried on the bounded timer", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_terminal_enqueue_retry";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendNextEvent(runId, {
+      type: "result",
+      at: "2026-06-19T00:00:02.000Z",
+      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
+    });
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    (
+      taskService as unknown as { terminalAttentionDeferRetryDelayMs: number }
+    ).terminalAttentionDeferRetryDelayMs = 10;
+
+    // The workflow terminal callback driving this enqueue is single-attempt, so when the
+    // first outbox write fails only the retained in-process retry can persist the wake.
+    const internalStore = (
+      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
+    ).terminalAttentionStore;
+    spyOn(internalStore, "enqueueIfAbsent").mockRejectedValueOnce(
+      new Error("EIO: outbox write failed")
+    );
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+
+    // Real timers: poll until the armed retry re-enqueues and the follow-up drain delivers.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && sendMessage.mock.calls.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await flushTerminalAttentionDrains(taskService);
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
+  test("reset drops a retained terminal attention enqueue", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_terminal_enqueue_reset";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendNextEvent(runId, {
+      type: "result",
+      at: "2026-06-19T00:00:02.000Z",
+      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
+    });
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internalStore = (
+      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
+    ).terminalAttentionStore;
+    spyOn(internalStore, "enqueueIfAbsent").mockRejectedValueOnce(
+      new Error("EIO: outbox write failed")
+    );
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    // The run was reset (e.g. resumed) before the retry fired; the retained stale wake
+    // must be dropped instead of resurrected by the retry.
+    await taskService.resetWorkflowRunTerminalAttention({ ownerWorkspaceId: parentId, runId });
+
+    // Drive the armed retry directly so the outcome is deterministic under real timers.
+    await (
+      taskService as unknown as {
+        retryRetainedWorkflowTerminalEnqueues(ownerWorkspaceId: string): Promise<void>;
+      }
+    ).retryRetainedWorkflowTerminalEnqueues(parentId);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
   test("workflow wakes restore the caller tool policy from the newest manual row", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
