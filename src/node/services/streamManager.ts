@@ -3878,6 +3878,7 @@ export class StreamManager {
       });
 
       if (streamInfo.terminalCompletion != null) {
+        // Optional-chained: whitebox test fixtures register stream infos without a controller.
         streamInfo.completionController?.settle(streamInfo.terminalCompletion);
       }
     }

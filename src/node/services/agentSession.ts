@@ -66,10 +66,6 @@ import {
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-
-type AgentSessionResult<T> =
-  | { success: true; data: T }
-  | { success: false; error: SendMessageError; failureHandled?: true };
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -196,6 +192,15 @@ import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
+
+/**
+ * Result shape for turn-starting session methods. failureHandled marks errors
+ * whose retry/abandon bookkeeping already ran inside streamWithHistory, so
+ * callers must not re-handle them (would double-increment backoff attempts).
+ */
+type AgentSessionResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: SendMessageError; failureHandled?: true };
 
 /**
  * Tracked file state for detecting external edits.
