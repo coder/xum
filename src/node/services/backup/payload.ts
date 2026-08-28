@@ -2188,6 +2188,12 @@ interface LanguageInterpreter {
   /** Captures an attached cwd, or an empty string when the next word is the cwd. */
   workingDirectoryOption?: RegExp;
   /**
+   * Interactive-mode spelling that executes the interpreter's inherited startup
+   * file (PYTHONSTARTUP). The cluster prefix excludes E and I, which disable
+   * environment inspection, and letters that consume an attached argument.
+   */
+  interactiveOption?: RegExp;
+  /**
    * Attached option naming an auxiliary file the interpreter executes before its
    * main operands (jshell --startup=FILE). Unlike attachedScriptFile it is not a
    * script boundary: a positional load file can still follow, so tracking stays
@@ -2198,12 +2204,22 @@ interface LanguageInterpreter {
   attachedStartupFile?: RegExp;
 }
 
+/**
+ * Launchers the Node distribution itself ships as `#!/usr/bin/env node` scripts,
+ * so inherited NODE_OPTIONS preloads execute for them exactly as for node.
+ */
+const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "corepack"]);
+
 const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
   // windowed `pythonw`/`rubyw`/`wperl`/`php-win` builds run the same evaluation
   // grammars under different executable names. Short eval flags can follow only flags
   // that consume no attached operand: `-Bc` evaluates, while `-Wsource` does not.
-  { name: /^(?:py|pyw|pythonw?[0-9.]*)$/, evalWord: /^-[bBdEhiIOPqRsuSvVx]*c/ },
+  {
+    name: /^(?:py|pyw|pythonw?[0-9.]*)$/,
+    evalWord: /^-[bBdEhiIOPqRsuSvVx]*c/,
+    interactiveOption: /^-[bBdhOPqRsuv]*i/,
+  },
   {
     name: /^(?:node|nodejs)$/,
     evalWord:
@@ -2313,9 +2329,7 @@ const SHELL_STATE_WORDS = new Set([
 function hasDisguisedAssignment(
   redacted: string,
   rootPrefixes: readonly string[],
-  publishedPathDirs: readonly string[],
-  cdPathDirs: readonly string[],
-  inheritedNodeCodeOptions: boolean
+  inherited: InheritedLaunchContext
 ): boolean {
   let commandPosition = true;
   let envCommandExpected = false;
@@ -2727,7 +2741,7 @@ function hasDisguisedAssignment(
         // Bash searches inherited CDPATH before its ordinary relative target. A
         // candidate inside the collected root localizes even when the server's
         // original cwd is unknown (CDPATH=<root>; cd skills).
-        for (const entry of cdPathDirs) {
+        for (const entry of inherited.cdPathDirs) {
           const base = entry === "" ? trackedCwd : resolveKnownDirectory(entry, trackedCwd);
           const candidate = base === null ? null : resolveKnownDirectory(unquoted, base);
           if (candidate !== null && isUnderCollectedRoot(candidate, rootPrefixes)) return true;
@@ -2785,13 +2799,11 @@ function hasDisguisedAssignment(
       // A bare name resolves through the inherited PATH, so an entry inside the
       // collected root reaches the same documents without spelling the root.
       if (!/[/\\]/.test(executableWord)) {
-        for (const dir of publishedPathDirs) {
+        for (const dir of inherited.publishedPathDirs) {
           if (isAutoPublishedScriptOperand(`${dir}/${executableWord}`, rootPrefixes)) return true;
         }
       }
-      if (inheritedNodeCodeOptions && (executable === "node" || executable === "nodejs")) {
-        return true;
-      }
+      if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
@@ -2844,6 +2856,11 @@ function hasDisguisedAssignment(
       }
       if (pending.separateScriptFileOption?.test(unquoted) === true) {
         pendingScriptFileOperand = true;
+      }
+      // An inherited startup hook naming a published document executes on any
+      // interactive spelling before the first prompt.
+      if (inherited.pythonStartupHook && pending.interactiveOption?.test(unquoted) === true) {
+        return true;
       }
       // An evaluation word after a language interpreter hands that grammar a script.
       if (pending.evalWord?.test(unquoted) === true) return true;
@@ -3196,9 +3213,7 @@ export const MAX_TOTAL_ANALYZED_COMMAND_LENGTH = 8 * MAX_ANALYZED_COMMAND_LENGTH
 function redactCommandEnvAssignments(
   command: string,
   rootPrefixes: readonly string[],
-  publishedPathDirs: readonly string[],
-  cdPathDirs: readonly string[],
-  inheritedNodeCodeOptions: boolean
+  inherited: InheritedLaunchContext
 ): string {
   if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
   // Analysis mirrors execution: active continuations vanish first, so every analyzer
@@ -3219,13 +3234,7 @@ function redactCommandEnvAssignments(
   const constructs = findActiveShellConstructs(analyzed);
   if (
     UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
-    hasDisguisedAssignment(
-      redactedCode,
-      rootPrefixes,
-      publishedPathDirs,
-      cdPathDirs,
-      inheritedNodeCodeOptions
-    ) ||
+    hasDisguisedAssignment(redactedCode, rootPrefixes, inherited) ||
     constructs.carrier ||
     constructs.heredoc ||
     constructs.processSubstitution ||
@@ -3268,6 +3277,21 @@ function isBashStartupHookVariable(name: string, value: unknown): boolean {
   return name === "BASH_ENV" && value !== "" && value !== undefined;
 }
 
+/**
+ * Ambient facts from the exporting process environment that the spawned server
+ * inherits (see isBashStartupHookVariable for the channel).
+ */
+interface InheritedLaunchContext {
+  /** PATH entries resolving into the collected root. */
+  publishedPathDirs: readonly string[];
+  /** CDPATH entries Bash searches before a relative cd target. */
+  cdPathDirs: readonly string[];
+  /** NODE_OPTIONS carries an executable preload/import option. */
+  nodeCodeOptions: boolean;
+  /** PYTHONSTARTUP names an auto-published document. */
+  pythonStartupHook: boolean;
+}
+
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
 function hasInheritedNodeCodeOptions(value: unknown): boolean {
   if (typeof value !== "string" || value === "") return false;
@@ -3291,11 +3315,14 @@ function redactMcpConfig(
   // The stdio launch inherits this process's environment (see
   // isBashStartupHookVariable), so a PATH entry inside the collected root makes
   // published executable documents reachable as bare command names.
-  const publishedPathDirs = (process.env.PATH ?? "")
-    .split(path.delimiter)
-    .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes));
-  const cdPathDirs = (process.env.CDPATH ?? "").split(path.delimiter);
-  const inheritedNodeCodeOptions = hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS);
+  const inherited: InheritedLaunchContext = {
+    publishedPathDirs: (process.env.PATH ?? "")
+      .split(path.delimiter)
+      .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes)),
+    cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter),
+    nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
+    pythonStartupHook: isAutoPublishedScriptOperand(process.env.PYTHONSTARTUP ?? "", rootPrefixes),
+  };
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
   const redactionPaths: BackupRedactionPath[] = [];
@@ -3321,13 +3348,7 @@ function redactMcpConfig(
       redacted = REDACTED_BACKUP_VALUE;
     } else {
       analysisBudget -= command.length;
-      redacted = redactCommandEnvAssignments(
-        command,
-        rootPrefixes,
-        publishedPathDirs,
-        cdPathDirs,
-        inheritedNodeCodeOptions
-      );
+      redacted = redactCommandEnvAssignments(command, rootPrefixes, inherited);
     }
     if (redacted === command) return;
     edits.push({ path: jsonPath, value: redacted });

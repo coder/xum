@@ -1985,6 +1985,10 @@ describe("backup payload", () => {
       for (const [nodeOptions, command, expected] of [
         [`--require=${muxRoot}/skills/launch.txt`, "node /opt/server.js", REDACTED_BACKUP_VALUE],
         [`--import ${muxRoot}/agents/launch.md`, "nodejs /opt/server.js", REDACTED_BACKUP_VALUE],
+        // npm-shipped launchers are node scripts and inherit the same preloads.
+        [`--require=${muxRoot}/skills/launch.txt`, "npx -y mcp-server", REDACTED_BACKUP_VALUE],
+        [`--require=${muxRoot}/skills/launch.txt`, "npm exec mcp-server", REDACTED_BACKUP_VALUE],
+        [`--require=${muxRoot}/skills/launch.txt`, "corepack pnpm start", REDACTED_BACKUP_VALUE],
         ["--require=/opt/register.js", "python3 /opt/server.py", "python3 /opt/server.py"],
         ["--max-old-space-size=4096", "node /opt/server.js", "node /opt/server.js"],
       ] as const) {
@@ -2008,6 +2012,41 @@ describe("backup payload", () => {
     } finally {
       if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = originalNodeOptions;
+    }
+  });
+
+  it("localizes interactive Python under an inherited published startup file", async () => {
+    const originalStartup = process.env.PYTHONSTARTUP;
+    try {
+      for (const [startup, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "python3 -i", REDACTED_BACKUP_VALUE],
+        // The interactive letter clusters like the eval letter does.
+        [`${muxRoot}/skills/launch.txt`, "python3 -qi", REDACTED_BACKUP_VALUE],
+        // A non-interactive launcher never reads the startup file.
+        [`${muxRoot}/skills/launch.txt`, "python3 /opt/server.py", "python3 /opt/server.py"],
+        // A foreign startup file is not collected, so nothing published executes.
+        ["/tmp/rc.py", "python3 -i", "python3 -i"],
+      ] as const) {
+        process.env.PYTHONSTARTUP = startup;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalStartup === undefined) delete process.env.PYTHONSTARTUP;
+      else process.env.PYTHONSTARTUP = originalStartup;
     }
   });
 
