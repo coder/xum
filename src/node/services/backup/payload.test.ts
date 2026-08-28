@@ -1762,6 +1762,12 @@ describe("backup payload", () => {
       // operand name a published document without spelling the root.
       `cd ${muxRoot} && python3 skills/launch.txt`,
       `pushd ${muxRoot}/skills; tclsh launch.txt`,
+      // A relative cd resolves against the tracked directory of an earlier cd.
+      `cd ${path.dirname(muxRoot)} && cd ${path.basename(muxRoot)} && python3 skills/launch.txt`,
+      // The command word can follow the redirection, and an interpreter later in
+      // the same command still executes the redirected document.
+      `< ${muxRoot}/skills/launch.txt sh`,
+      `timeout 30 < ${muxRoot}/skills/launch.txt node`,
       `cmake -P ${muxRoot}/skills/launch.txt`,
       `ctest -S ${muxRoot}/skills/launch.txt`,
       // Redundant separators and dot segments name the same collected file.
@@ -1815,6 +1821,13 @@ describe("backup payload", () => {
       "jshell --startup=/tmp/snippets.jsh /tmp/main.jsh",
       "hash -r; mcp-server",
       "cd /app && node server.js",
+      // A relative cd from the server's own unknown cwd stays portable, matching
+      // the relative-operand policy.
+      "cd .xum && python3 skills/launch.txt",
+      // A non-interpreter consumes redirected documents as data.
+      `mcp-server < ${muxRoot}/skills/config.txt`,
+      // A foreign jar ends option tracking; later published paths are its data.
+      `java -jar /opt/app.jar ${muxRoot}/skills/config.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1841,6 +1854,10 @@ describe("backup payload", () => {
       for (const command of [
         `python3 ~/${path.basename(homeRoot)}/skills/launch.txt`,
         `python3 ~${os.userInfo().username}/${path.basename(homeRoot)}/skills/launch.txt`,
+        // Relative cd chains resolve against the tracked directory, and a bare
+        // cd goes home.
+        `cd ~ && cd ${path.basename(homeRoot)} && python3 skills/launch.txt`,
+        `cd && cd ${path.basename(homeRoot)}/skills && tclsh launch.txt`,
       ]) {
         await writeFixtureFile(
           homeRoot,
@@ -2011,6 +2028,9 @@ describe("backup payload", () => {
       "Java source mode with option values",
       "java --class-path libs --source 17 --module-path mods <root>/skills/launch.txt",
     ],
+    // -jar executes the archive operand regardless of its filename extension.
+    ["Java jar", "java -jar <root>/skills/launch.txt"],
+    ["Java jar (javaw)", "javaw -jar <root>/agents/launch.md"],
     ["JShell", "jshell <root>/skills/launch.txt"],
     ["JShell attached startup file", "jshell --startup=<root>/skills/launch.txt"],
     ["JShell separate startup file", "jshell --startup <root>/skills/launch.txt"],

@@ -2329,7 +2329,13 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
   let pendingJavaSourceFile = false;
   let pendingJavaOptionValue = false;
   let pendingHashOptions = false;
-  let pendingCdDirectory = false;
+  let pendingCdBuiltin: "cd" | "pushd" | null = null;
+  // Lexical spelling of the working directory once a cd/pushd chain makes it known;
+  // it survives separators because the moved directory outlives the command.
+  let trackedCwd: string | null = null;
+  let commandWordSeen = false;
+  let commandConsumesStdin = false;
+  let commandPublishedStdin = false;
   let pendingScriptFileOperand = false;
   let evalOperandAmbiguous = false;
   // Static table entries keep the pending set bounded, so repeated interpreter words
@@ -2386,7 +2392,14 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
       pendingHashOptions = false;
-      pendingCdDirectory = false;
+      // A bare cd goes home; a bare pushd swaps to a stack entry this scan
+      // cannot resolve.
+      if (pendingCdBuiltin === "cd") trackedCwd = "~";
+      if (pendingCdBuiltin === "pushd") trackedCwd = null;
+      pendingCdBuiltin = null;
+      commandWordSeen = false;
+      commandConsumesStdin = false;
+      commandPublishedStdin = false;
       clearInterpreterTracking();
     }
     // The word after `<` is a read redirection's filename, never a command or an
@@ -2394,7 +2407,16 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
     // document as redirected input is executable to a stdin-reading interpreter
     // (`node < launch.txt` runs it as a script), so that filename localizes.
     if (gap.includes("<")) {
-      if (isAutoPublishedScriptOperand(unquoteShellWord(word), rootPrefixes)) return true;
+      if (isAutoPublishedScriptOperand(unquoteShellWord(word), rootPrefixes)) {
+        // Published input localizes only when something can execute it: a
+        // stdin-running interpreter in this command or a command word not yet
+        // seen (`< input sh -c x`), which fails closed. A non-interpreter
+        // consumes the document as data (`mcp-server < config.txt` stays
+        // portable). An interpreter can still follow the redirection, so the
+        // published filename stays remembered for that case.
+        if (commandConsumesStdin || !commandWordSeen) return true;
+        commandPublishedStdin = true;
+      }
       continue;
     }
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
@@ -2409,7 +2431,7 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
     // (`2<file cmd`, `{fd}<file cmd`), so it does not occupy a command position.
     if (
       /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(unquoted) &&
-      redacted.slice(previousEnd, words[index + 1]?.index ?? redacted.length).includes("<")
+      redacted.slice(previousEnd, words[index + 1]?.index ?? redacted.length).startsWith("<")
     ) {
       continue;
     }
@@ -2423,6 +2445,11 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
     // argument is never mistaken for an evaluator. They also terminate env options,
     // npm exec call options, and git rebase options at this parse level.
     if (unquoted === "-" || unquoted === "--") {
+      if (unquoted === "-" && pendingCdBuiltin !== null) {
+        // `cd -` returns to OLDPWD, which this scan cannot resolve.
+        pendingCdBuiltin = null;
+        trackedCwd = null;
+      }
       const scriptOperandFollows = unquoted === "--" && pendingLanguages.size > 0;
       clearInterpreterTracking();
       // `--` only ends option parsing, so an armed interpreter's next positional
@@ -2607,6 +2634,10 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
         pendingJavaSourceVersion = true;
       } else if (unquoted.startsWith("--source=")) {
         pendingJavaSourceFile = true;
+      } else if (unquoted === "-jar") {
+        // -jar's operand is executed like a --source script: the archive itself
+        // runs, and the launcher opens it regardless of filename extension.
+        pendingJavaSourceFile = true;
       } else if (pendingJavaSourceFile && !unquoted.startsWith("-")) {
         const autoPublished = isAutoPublishedScriptOperand(unquoted, rootPrefixes);
         pendingJavaOptions = false;
@@ -2624,13 +2655,25 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
         pendingDenoSubcommand = false;
       }
     }
-    if (pendingCdDirectory && !unquoted.startsWith("-")) {
-      pendingCdDirectory = false;
-      // Once the working directory moves into the collected root, any relative
-      // operand can name a published document without spelling the root at all
-      // (`cd <root> && python3 skills/launch.txt`), so the move itself localizes;
-      // dash words are cd's own options and keep the target pending.
-      if (isUnderCollectedRoot(unquoted, rootPrefixes)) return true;
+    if (pendingCdBuiltin !== null && !unquoted.startsWith("-")) {
+      pendingCdBuiltin = null;
+      // An absolute or home-anchored target replaces the working directory, and a
+      // relative target resolves against the last tracked one, staying unknown
+      // when the chain starts from the server's own cwd (a plain `cd build`
+      // launcher stays portable). Once the directory reaches the collected root,
+      // any relative operand can name a published document without spelling the
+      // root at all (`cd ~ && cd .xum && python3 skills/launch.txt`), so the
+      // move itself localizes. Dash words are cd's own options and keep the
+      // target pending.
+      // Annotated because inference would cycle through the loop back-edge
+      // (target -> trackedCwd narrowing -> this assignment).
+      const target: string | null = /^(?:\/|\\|~|[a-z]:)/i.test(unquoted)
+        ? unquoted
+        : trackedCwd !== null
+          ? `${trackedCwd}/${unquoted}`
+          : null;
+      trackedCwd = target === null ? null : normalizeComparablePath(target);
+      if (trackedCwd !== null && isUnderCollectedRoot(trackedCwd, rootPrefixes)) return true;
     }
     // `hash -p PATHNAME NAME` binds NAME to any full pathname, so every remap
     // changes what a later word executes (`hash -p /usr/bin/python3 launch` hands
@@ -2660,6 +2703,7 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       .toLowerCase()
       .replace(/\.exe$/, "");
     if (executesHere) {
+      commandWordSeen = true;
       // A directly executed auto-published document runs through its shebang,
       // publishing an executable relationship no marker can rehydrate elsewhere.
       if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
@@ -2667,10 +2711,10 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
-      if (executable === "java") pendingJavaOptions = true;
+      if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       // Builtins, so matched on the quote-removed word like the state words above.
       if (unquoted === "hash") pendingHashOptions = true;
-      if (unquoted === "cd" || unquoted === "pushd") pendingCdDirectory = true;
+      if (unquoted === "cd" || unquoted === "pushd") pendingCdBuiltin = unquoted;
       if (FIND_EXECUTABLE_NAMES.has(executable)) pendingFindPrimaries = true;
       const carrierSkips = COMMAND_CARRIER_OPERANDS.get(executable);
       if (carrierSkips === -1) {
@@ -2711,6 +2755,10 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       ? LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable))
       : undefined;
     if (language) {
+      // Without a script operand these interpreters execute standard input, so a
+      // published document already redirected into this command localizes here.
+      commandConsumesStdin = true;
+      if (commandPublishedStdin) return true;
       pendingLanguages.add(language);
       evalOperandAmbiguous = false;
     } else if (pendingLanguages.size > 0) {
