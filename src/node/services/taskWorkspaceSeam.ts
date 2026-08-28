@@ -11,6 +11,7 @@ import type {
   WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
+import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
@@ -25,45 +26,119 @@ import type { QueueCutCutter } from "@/node/services/messageQueue";
 
 export type AgentTaskStatus = NonNullable<WorkspaceConfigEntry["taskStatus"]>;
 
-type StreamErrorRecoveryOutcome = "retry-started" | "terminal";
-
-interface WorkspaceHostArchiveOptions {
+export interface ArchiveWorkspaceOptions {
+  /**
+   * Refuse to archive when the effective worktree archive behavior would delete the checkout
+   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
+   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
+   * behavior read that drives the snapshot/deletion decisions.
+   */
   forbidWorktreeCheckoutDeletion?: boolean;
+  /**
+   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
+   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
+   * session). Model-facing callers set this so an agent-driven archive fails closed instead
+   * of silently terminating user work that started after the caller's earlier activity check.
+   * Checked synchronously in the same block that marks the workspace as archiving, pairing
+   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
+   * other. Also holds the session's turn admission for the rest of the archive so a queued
+   * entry cannot dispatch through AgentSession's internal send path (which bypasses
+   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
+   * path intentionally omits this and keeps its stop-activity semantics.
+   */
   refuseLiveUserActivity?: boolean;
+  /**
+   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
+   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
+   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
+   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
+   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
+   */
   worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
+  /**
+   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
+   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
+   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
+   * fail closed instead; route that policy through user-mediated archive.
+   */
   forbidCoderWorkspaceDeletion?: boolean;
+  /**
+   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
+   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
+   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
+   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
+   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
+   * otherwise strand already-interrupted turns behind a failed archive.
+   */
   coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
 }
 
-interface WorkspaceHostLiveActivity {
+export interface WorkspaceLiveActivity {
   streaming: boolean;
+  /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
   queuedMessages: boolean;
+  /**
+   * Detached background bash processes still running (sync snapshot; may briefly read
+   * stale-running until the next lazy refresh — callers wanting freshness should await
+   * hasRunningBackgroundBashProcesses first).
+   */
   backgroundBashProcesses: boolean;
   terminalSessions: boolean;
   desktopSession: boolean;
 }
 
-interface WorkspaceHostSendInternalOptions {
+export interface SendMessageInternalOptions {
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
   synthetic?: boolean;
+  /** Marks a synthetic send as an active-goal continuation turn. */
   goalContinuation?: boolean;
+  /** Specific active-goal synthetic turn kind to persist on the user message. */
   goalKind?: GoalSyntheticMessageKind;
+  /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
   goalId?: string;
+  /** Force Copilot billing classification to "agent" for internal sends. */
   agentInitiated?: boolean;
   onAccepted?: () => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   cancelState?: { canceledBeforeAcceptance: boolean };
+  /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
   cancelSignal?: AbortSignal;
+  /**
+   * Synchronous staleness probe from the caller, re-evaluated at the real admission points
+   * (the enqueue block and the session's turn-admission gates) in addition to the
+   * context-mutation epoch. Peer agent sends use it so a user Stop or task_stop landing
+   * during this method's awaits refuses the send instead of queueing a wake or resurrecting
+   * the stopped task via markInterruptedTaskRunning.
+   */
   admissionStale?: () => boolean;
+  /**
+   * Synthetic assistant rows persisted just before the turn's user row
+   * (family-message payloads). Delivered atomically with the message —
+   * queued alongside it when the workspace is busy — so they never land
+   * inside another turn's PREPARING window (see AgentSession.sendMessage).
+   */
   preTurnMessages?: MuxMessage[];
+  /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
   onPreTurnRowsPersisted?: () => void;
+  /** Return once the user message is accepted; stream startup continues asynchronously. */
   startStreamInBackground?: boolean;
+  /** When true, reject instead of queueing if the workspace is busy. */
   requireIdle?: boolean;
+  /** Preserve workspace-turn correlation only when this send is the next continuation. */
   workspaceTurnContinuation?: boolean;
+  /** Coalescing for queued sends: drop the message when the same key is already queued. */
   queueDedupeKey?: string;
+  /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
   removableQueueDedupeKey?: boolean;
+  /**
+   * For queued sends: quietly drop the message (success) when other messages are already
+   * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
+   * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
+   * options, so merging a heartbeat in would run the user's queued turn with the
+   * heartbeat's model/agent.
+   */
   yieldToQueuedMessages?: boolean;
 }
 
@@ -78,12 +153,12 @@ export interface WorkspaceHost {
   archive(
     workspaceId: string,
     acknowledgedUntrackedPaths?: string[],
-    options?: WorkspaceHostArchiveOptions
+    options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>>;
   archiveWhileTaskTreeLocked(
     workspaceId: string,
     acknowledgedUntrackedPaths?: string[],
-    options?: WorkspaceHostArchiveOptions
+    options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>>;
   clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
   countQueuedAgentPeerMessages(workspaceId: string): number;
@@ -125,7 +200,7 @@ export interface WorkspaceHost {
     metadata?: WorkspaceMetadata
   ): boolean;
   isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
-  listLiveWorkspaceActivity(workspaceId: string): WorkspaceHostLiveActivity;
+  listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;
   preflightArchive(
     workspaceId: string,
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
@@ -170,7 +245,7 @@ export interface WorkspaceHost {
     workspaceId: string,
     message: string,
     options: SendMessageOptions & { fileParts?: FilePart[] },
-    internal?: WorkspaceHostSendInternalOptions
+    internal?: SendMessageInternalOptions
   ): Promise<Result<void, SendMessageError>>;
   unarchiveWhileTaskTreeLocked(workspaceId: string): Promise<Result<void>>;
   updateTitle(workspaceId: string, title: string): Promise<Result<void>>;

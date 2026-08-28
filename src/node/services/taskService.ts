@@ -230,8 +230,6 @@ export class AgentReportWaitTimeoutError extends Error {
   }
 }
 
-export type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
-
 /**
  * Resolved per-agent AI settings (canonical model + optional thinking level).
  *
@@ -6679,8 +6677,7 @@ export class TaskService implements AgentTaskIntegration {
       };
     }
 
-    // Optional chaining: test harnesses mock the host port with a narrow method surface.
-    const queuedCount = this.workspaceService.countQueuedAgentPeerMessages?.(targetId) ?? 0;
+    const queuedCount = this.workspaceService.countQueuedAgentPeerMessages(targetId);
     if (queuedCount >= MAX_QUEUED_PEER_MESSAGES_PER_TARGET) {
       return {
         code: "refused",

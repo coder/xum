@@ -8,7 +8,6 @@ import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
-import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
@@ -309,7 +308,10 @@ import {
   areArchiveUntrackedPathListsEqual,
   normalizeArchiveUntrackedPaths,
   type AgentTaskIntegration,
+  type ArchiveWorkspaceOptions,
+  type SendMessageInternalOptions,
   type WorkspaceHost,
+  type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
@@ -612,53 +614,6 @@ const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
-export interface ArchiveWorkspaceOptions {
-  /**
-   * Refuse to archive when the effective worktree archive behavior would delete the checkout
-   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
-   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
-   * behavior read that drives the snapshot/deletion decisions.
-   */
-  forbidWorktreeCheckoutDeletion?: boolean;
-  /**
-   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
-   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
-   * session). Model-facing callers set this so an agent-driven archive fails closed instead
-   * of silently terminating user work that started after the caller's earlier activity check.
-   * Checked synchronously in the same block that marks the workspace as archiving, pairing
-   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
-   * other. Also holds the session's turn admission for the rest of the archive so a queued
-   * entry cannot dispatch through AgentSession's internal send path (which bypasses
-   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
-   * path intentionally omits this and keeps its stop-activity semantics.
-   */
-  refuseLiveUserActivity?: boolean;
-  /**
-   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
-   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
-   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
-   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
-   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
-   */
-  worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
-  /**
-   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
-   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
-   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
-   * fail closed instead; route that policy through user-mediated archive.
-   */
-  forbidCoderWorkspaceDeletion?: boolean;
-  /**
-   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
-   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
-   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
-   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
-   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
-   * otherwise strand already-interrupted turns behind a failed archive.
-   */
-  coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
-}
-
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
@@ -6188,7 +6143,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     operation: () => Promise<T>
   ): Promise<T> {
     const integration = this.agentTaskIntegration;
-    const withLock = integration?.withTaskTreeLifecycleLock?.bind(integration);
+    const withLock = integration?.withTaskTreeLifecycleLock.bind(integration);
     return withLock == null ? await operation() : await withLock(workspaceId, operation);
   }
 
@@ -6237,7 +6192,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     // Try to remove from runtime (filesystem)
     try {
-      if (this.agentTaskIntegration?.hasDescendantAgentTasks?.(workspaceId) === true) {
+      if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
@@ -8862,19 +8817,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
    * archiving instead of killing activity that has no delegated workspace-turn handle.
    */
-  listLiveWorkspaceActivity(workspaceId: string): {
-    streaming: boolean;
-    /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
-    queuedMessages: boolean;
-    /**
-     * Detached background bash processes still running (sync snapshot; may briefly read
-     * stale-running until the next lazy refresh — callers wanting freshness should await
-     * hasRunningBackgroundBashProcesses first).
-     */
-    backgroundBashProcesses: boolean;
-    terminalSessions: boolean;
-    desktopSession: boolean;
-  } {
+  listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity {
     return {
       streaming: this.aiService.isStreaming(workspaceId),
       queuedMessages:
@@ -11178,60 +11121,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     options: SendMessageOptions & {
       fileParts?: FilePart[];
     },
-    internal?: {
-      allowQueuedAgentTask?: boolean;
-      skipAutoResumeReset?: boolean;
-      synthetic?: boolean;
-      /** Marks a synthetic send as an active-goal continuation turn. */
-      goalContinuation?: boolean;
-      /** Specific active-goal synthetic turn kind to persist on the user message. */
-      goalKind?: GoalSyntheticMessageKind;
-      /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
-      goalId?: string;
-      /** Force Copilot billing classification to "agent" for internal sends. */
-      agentInitiated?: boolean;
-      onAccepted?: () => Promise<void> | void;
-      onCanceled?: (reason: string) => Promise<void> | void;
-      onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
-      /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
-      cancelSignal?: AbortSignal;
-      /**
-       * Synchronous staleness probe from the caller, re-evaluated at the real admission points
-       * (the enqueue block and the session's turn-admission gates) in addition to the
-       * context-mutation epoch. Peer agent sends use it so a user Stop or task_stop landing
-       * during this method's awaits refuses the send instead of queueing a wake or resurrecting
-       * the stopped task via markInterruptedTaskRunning.
-       */
-      admissionStale?: () => boolean;
-      /**
-       * Synthetic assistant rows persisted just before the turn's user row
-       * (family-message payloads). Delivered atomically with the message —
-       * queued alongside it when the workspace is busy — so they never land
-       * inside another turn's PREPARING window (see AgentSession.sendMessage).
-       */
-      preTurnMessages?: MuxMessage[];
-      /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
-      onPreTurnRowsPersisted?: () => void;
-      /** Return once the user message is accepted; stream startup continues asynchronously. */
-      startStreamInBackground?: boolean;
-      /** When true, reject instead of queueing if the workspace is busy. */
-      requireIdle?: boolean;
-      /** Preserve workspace-turn correlation only when this send is the next continuation. */
-      workspaceTurnContinuation?: boolean;
-      /** Coalescing for queued sends: drop the message when the same key is already queued. */
-      queueDedupeKey?: string;
-      /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
-      removableQueueDedupeKey?: boolean;
-      /**
-       * For queued sends: quietly drop the message (success) when other messages are already
-       * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
-       * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
-       * options, so merging a heartbeat in would run the user's queued turn with the
-       * heartbeat's model/agent.
-       */
-      yieldToQueuedMessages?: boolean;
-    }
+    internal?: SendMessageInternalOptions
   ): Promise<Result<void, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
       workspaceId,
@@ -11520,7 +11410,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         if (internal?.admissionStale?.() === true) {
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
-        const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus?.(workspaceId);
+        const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         if (taskStatus === "interrupted") {
           return Err({
             type: "unknown",
@@ -11624,11 +11514,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
-          this.agentTaskIntegration?.resetAutoResumeCount?.(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         }
 
         if (effectiveQueueDispatchMode === "tool-end") {
-          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace?.(workspaceId);
+          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
         return Ok(undefined);
@@ -11657,7 +11547,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (internal?.admissionStale == null) {
         try {
           resumedInterruptedTask =
-            (await this.agentTaskIntegration?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+            (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
         } catch (error: unknown) {
           log.error("Failed to restore interrupted task status before sendMessage", {
             workspaceId,
@@ -11670,9 +11560,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
-              workspaceId
-            );
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (restoreError: unknown) {
             log.error(
               "Failed to restore interrupted task status after accepted edit startup failure",
@@ -11741,9 +11629,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
-              workspaceId
-            );
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
               workspaceId,
@@ -11778,7 +11664,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       if (resumedInterruptedTask) {
         try {
-          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
             workspaceId,
@@ -11918,7 +11804,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       const session = this.getOrCreateSession(workspaceId);
 
-      const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus?.(workspaceId);
+      const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
       if (taskStatus === "interrupted" && session.isBusy()) {
         return Err({
           type: "unknown",
@@ -11946,7 +11832,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // handling does not early-return on interrupted status.
       try {
         resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       } catch (error: unknown) {
         log.error("Failed to restore interrupted task status before resumeStream", {
           workspaceId,
@@ -11973,9 +11859,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
-              workspaceId
-            );
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
               workspaceId,
@@ -11991,9 +11875,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!result.data.started) {
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
-              workspaceId
-            );
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
               workspaceId,
@@ -12008,7 +11890,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       if (resumedInterruptedTask) {
         try {
-          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
             workspaceId,
@@ -12095,8 +11977,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // ancestor epoch as its clean baseline and wake workspaces outside the stopped
         // subtree. Released in the finally, after the descendant cascade persisted terminal
         // statuses.
-        // Optional call: test harnesses mock the task integration port with a narrow method surface.
-        releaseHardStopLatch = this.agentTaskIntegration?.latchHardInterruptCascade?.(workspaceId);
+        releaseHardStopLatch = this.agentTaskIntegration?.latchHardInterruptCascade(workspaceId);
       }
 
       const session = this.getOrCreateSession(workspaceId);
@@ -12122,7 +12003,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!options?.soft) {
         try {
           const interruptedTaskIds =
-            await this.agentTaskIntegration?.terminateAllDescendantAgentTasks?.(workspaceId);
+            await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
           if (interruptedTaskIds && interruptedTaskIds.length > 0) {
             log.debug("Cascade-interrupted descendant tasks on interrupt", {
               workspaceId,
