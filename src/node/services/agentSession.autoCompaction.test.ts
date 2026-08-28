@@ -95,10 +95,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       getThreshold: mock(() => 0.85),
     } as unknown as CompactionMonitor;
 
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
     const result = await session.sendMessage("please inspect @foo.ts", {
       model: "openai:gpt-4o",
       agentId: "exec",
       disableWorkspaceAgents: true,
+      toolPolicy: restrictedPolicy,
     });
 
     expect(result.success).toBe(true);
@@ -120,6 +122,15 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     expect(persistedCompactionMessage).toBeDefined();
     expect(persistedCompactionMessage?.metadata?.disableWorkspaceAgents).toBe(true);
+    // The durable follow-up must keep the caller's restrictions: the redispatched turn
+    // reconstructs its options from this persisted request, and dropping the policy there
+    // would resume the conversation allow-all after compaction.
+    const followUpContent =
+      persistedCompactionMessage?.metadata?.muxMetadata?.type === "compaction-request"
+        ? persistedCompactionMessage.metadata.muxMetadata.parsed.followUpContent
+        : undefined;
+    expect(followUpContent?.toolPolicy).toEqual(restrictedPolicy);
+    expect(followUpContent?.disableWorkspaceAgents).toBe(true);
 
     const emittedSnapshot = events.some(
       (message) =>

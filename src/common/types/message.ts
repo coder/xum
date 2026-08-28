@@ -63,6 +63,7 @@ type PreservedSendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "toolPolicy"
   | "strictAgentResolution"
   | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
@@ -82,6 +83,9 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     // can persist across restarts and build versions.
     experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Security: a restricted turn (including a terminal-wake send restoring the caller's
+    // policy) that triggers on-send compaction must not redispatch its follow-up allow-all.
+    toolPolicy: options.toolPolicy,
     // Delegated turns with explicit agent overrides must stay loud across the
     // compaction replay too — dropping this would let the follow-up silently
     // fall back to exec if the agent vanished in the meantime.
