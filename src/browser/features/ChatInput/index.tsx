@@ -2554,21 +2554,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       void result.backgroundTask().then(applyCommandActions);
     }
 
-    // Async command phases can outlive the invoking render, so the disposition
-    // must be evaluated against the live persisted draft: the getDraft closure
-    // captured here still reports this render's input and would clear or refuse
-    // to restore a newer draft typed while the command ran.
-    const liveDraftText = () => readPersistedState(storageKeys.inputKey, "");
     switch (result.inputDisposition) {
       case "consume":
-        if (liveDraftText() === restoreInput) setInput("");
+        // Commands clear the composer through their own clear-input actions;
+        // clearing again here would wipe a draft typed while phases ran.
         setDraftReviews(null);
         break;
       case "restore":
         setInput(restoreInput);
         break;
       case "restore-if-empty":
-        if (liveDraftText().trim().length === 0) {
+        // Async phases can outlive the invoking render, so check the live
+        // persisted draft: the getDraft closure captured here still reports
+        // this render's input and would refuse to restore over a newer draft.
+        if (readPersistedState(storageKeys.inputKey, "").trim().length === 0) {
           setInput(restoreInput);
         } else {
           setDraftReviews(null);
