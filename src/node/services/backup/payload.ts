@@ -1786,62 +1786,6 @@ const NPM_SUBCOMMANDS = new Set(
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
 /**
- * A directly named auto-published document can be executable through its shebang. Track
- * command starts through assignments and active shell operators, but leave the same path
- * portable when it is merely an argument to another program.
- */
-function hasDirectAutoPublishedCommand(redacted: string): boolean {
-  let commandPosition = true;
-  let envWrapper = false;
-  let envOptionValue = false;
-  let previousEnd = 0;
-  for (const match of redacted.matchAll(SHELL_WORD)) {
-    const start = match.index;
-    if (/[;&|()\n]/.test(redacted.slice(previousEnd, start))) {
-      commandPosition = true;
-      envWrapper = false;
-      envOptionValue = false;
-    }
-    previousEnd = start + match[0].length;
-    if (!commandPosition) continue;
-    if (CONSUMED_ASSIGNMENT.test(match[0])) continue;
-    const unquoted = unquoteShellWord(match[0]);
-    if (envWrapper) {
-      if (envOptionValue) {
-        envOptionValue = false;
-        continue;
-      }
-      if (unquoted === "-" || unquoted === "--") continue;
-      if (envOptionTakesSeparateValue(unquoted)) {
-        envOptionValue = true;
-        continue;
-      }
-      if (unquoted.startsWith("-")) continue;
-      const executable = unquoted
-        .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
-        .toLowerCase()
-        .replace(/\.exe$/, "");
-      if (executable === "env") continue;
-      if (isAutoPublishedScriptOperand(unquoted)) return true;
-      commandPosition = false;
-      envWrapper = false;
-      continue;
-    }
-    const executable = unquoted
-      .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
-      .toLowerCase()
-      .replace(/\.exe$/, "");
-    if (executable === "env") {
-      envWrapper = true;
-      continue;
-    }
-    if (isAutoPublishedScriptOperand(unquoted)) return true;
-    commandPosition = false;
-  }
-  return false;
-}
-
-/**
  * The word with every quoted or escaped character reduced to one placeholder, so a
  * syntax test sees only the regions Bash parses as syntax: a quoted comma cannot
  * trigger brace expansion and a quoted bracket cannot open a glob class. The
@@ -2035,6 +1979,62 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
 ]);
 
 /**
+ * Reserved words that leave the following word in command position
+ * (`if sh -c x; then`). A quoted spelling is a keyword to no shell, but treating it
+ * alike only widens the checked positions, failing closed. `for`, `case`, and
+ * `select` bind a name or pattern next, not a command, so they end command position
+ * like any operand.
+ */
+const SHELL_COMMAND_KEYWORDS = new Set([
+  "if",
+  "then",
+  "elif",
+  "else",
+  "do",
+  "while",
+  "until",
+  "!",
+  "{",
+  "}",
+]);
+
+/**
+ * Wrappers that run their first operand as a command under this same shell parse: the
+ * name itself evaluates nothing, so a portable launcher merely named in an argument
+ * stays published, but the wrapped command word is checked exactly like a command
+ * start. The count is the leading non-option operands the wrapper consumes first
+ * (`timeout 30 CMD`, `chroot /root CMD`).
+ */
+const COMMAND_CARRIER_OPERANDS = new Map<string, number>([
+  ["nohup", 0],
+  ["setsid", 0],
+  ["stdbuf", 0],
+  ["nice", 0],
+  ["ionice", 0],
+  ["doas", 0],
+  ["unshare", 0],
+  ["nsenter", 0],
+  ["strace", 0],
+  ["ltrace", 0],
+  ["time", 0],
+  ["command", 0],
+  ["builtin", 0],
+  ["exec", 0],
+  ["timeout", 1],
+  ["chrt", 1],
+  ["taskset", 1],
+  ["chroot", 1],
+]);
+
+/**
+ * find's -exec family hands the operands that follow to execvp as a command.
+ * Localizing on the primary itself skips modeling the `;`/`+` terminator grammar,
+ * accepting the portability cost like the program-operand interpreters.
+ */
+const FIND_EXECUTABLE_NAMES = new Set(["find", "gfind"]);
+const FIND_EXEC_PRIMARY = /^-(?:exec|execdir|ok|okdir)$/;
+
+/**
  * Language interpreters whose script-evaluation spellings reparse an operand under the
  * language's own grammar, where quoted fragments concatenate into one runtime value
  * (`python3 -c '..."ghp_a"+"b"...'`, `node -e "...'ghp_a'+'b'..."`, `deno eval ...`).
@@ -2136,9 +2136,7 @@ const SHELL_STATE_WORDS = new Set([
   "history",
   "fc",
   // `source`/`.` run a file in this shell with the remaining words as positionals
-  // (`source ./launch ghp_aaa bbb` can join them into one runtime token). A bare `.`
-  // argument (the cwd) localizes with it: keywords like `do` make command-position
-  // detection undecidable here, so the dot fails closed like every ambiguous form.
+  // (`source ./launch ghp_aaa bbb` can join them into one runtime token).
   "source",
   ".",
 ]);
@@ -2150,7 +2148,12 @@ const SHELL_STATE_WORDS = new Set([
  * about the rest of that word.
  */
 function hasDisguisedAssignment(redacted: string): boolean {
-  if (hasDirectAutoPublishedCommand(redacted)) return true;
+  let commandPosition = true;
+  let envCommandExpected = false;
+  let carrierArmed = false;
+  let carrierSticky = false;
+  let carrierOperandSkips = 0;
+  let pendingFindPrimaries = false;
   let envOperandsOnly = false;
   let pendingPrintfVariableOption = false;
   let sawEnv = false;
@@ -2182,7 +2185,29 @@ function hasDisguisedAssignment(redacted: string): boolean {
     pendingScriptFileOperand = false;
     evalOperandAmbiguous = false;
   }
-  for (const word of redacted.match(SHELL_WORD) ?? []) {
+  const words = [...redacted.matchAll(SHELL_WORD)];
+  let previousEnd = 0;
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]?.[0] ?? "";
+    const wordStart = words[index]?.index ?? previousEnd;
+    const gap = redacted.slice(previousEnd, wordStart);
+    previousEnd = wordStart + word.length;
+    // Control and grouping operators start a new command. Of the other break
+    // characters, a live backtick localizes upstream as a carrier and a write
+    // redirection localizes on its own, so only `<` still needs position handling.
+    if (/[;&|()\n]/.test(gap)) {
+      commandPosition = true;
+      envCommandExpected = false;
+      carrierArmed = false;
+      carrierSticky = false;
+      carrierOperandSkips = 0;
+      pendingFindPrimaries = false;
+      sawEnv = false;
+      pendingEnvOptionValue = false;
+    }
+    // The word after `<` is a read redirection's filename, never a command or an
+    // operand; the command word can still follow it (`< input sh -c x`).
+    if (gap.includes("<")) continue;
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
     // Bash expands neither syntax from quoted or escaped text (`--config
     // '{"a":1,"b":2}'` stays a literal argument). The brace test runs on the active
@@ -2191,6 +2216,14 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
     if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
+    // A bare descriptor immediately before `<` belongs to that redirection
+    // (`2<file cmd`, `{fd}<file cmd`), so it does not occupy a command position.
+    if (
+      /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(unquoted) &&
+      redacted.slice(previousEnd, words[index + 1]?.index ?? redacted.length).includes("<")
+    ) {
+      continue;
+    }
     if (pendingScriptFileOperand) {
       const autoPublished = isAutoPublishedScriptOperand(unquoted);
       clearInterpreterTracking();
@@ -2203,7 +2236,12 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (unquoted === "-" || unquoted === "--") {
       clearInterpreterTracking();
       envOperandsOnly ||= sawEnv;
-      sawEnv = false;
+      // `--` ends env option parsing, so the next word is the utility; a bare `-`
+      // is `-i`, leaving option parsing armed.
+      if (unquoted === "--") {
+        envCommandExpected ||= sawEnv;
+        sawEnv = false;
+      }
       pendingEnvOptionValue = false;
       pendingNpmExecOptions = false;
       pendingGitRebaseOptions = false;
@@ -2213,18 +2251,45 @@ function hasDisguisedAssignment(redacted: string): boolean {
       pendingJavaOptionValue = false;
       continue;
     }
+    // Reserved words leave the following word in command position.
+    if (commandPosition && SHELL_COMMAND_KEYWORDS.has(unquoted)) continue;
+    // Whether this word can execute: a command start, env's utility operand, or a
+    // carrier's wrapped command. Only such words can name an interpreter, a wrapper,
+    // or a state-changing builtin; everywhere else the same spelling is an ordinary
+    // argument (`mcp-server --shell bash` stays published).
+    let executesHere = commandPosition || carrierSticky;
+    commandPosition = false;
+    if (envCommandExpected) {
+      envCommandExpected = false;
+      executesHere = true;
+    }
     // GNU env reparses its split-string value even without an assignment or literal
     // whitespace, so this runs before the assignment-only exit below. Stop tracking at
     // its command operand: the target program may use -S for an ordinary option.
     if (sawEnv) {
       if (pendingEnvOptionValue) {
         pendingEnvOptionValue = false;
+        executesHere = false;
       } else if (isSplitStringOption(unquoted)) {
         return true;
       } else if (envOptionTakesSeparateValue(unquoted)) {
         pendingEnvOptionValue = true;
       } else if (!unquoted.startsWith("-")) {
         sawEnv = false;
+        executesHere = true;
+      }
+    } else if (carrierArmed) {
+      if (unquoted.startsWith("-")) {
+        // The option may take a separate value this scan cannot pair (the same
+        // boundary as `python3 -W ignore -c x` below), so from here any word may be
+        // the wrapped command and all of them are checked, failing closed.
+        carrierSticky = true;
+        executesHere = true;
+      } else if (carrierOperandSkips > 0) {
+        carrierOperandSkips -= 1;
+      } else {
+        carrierArmed = false;
+        executesHere = true;
       }
     }
     if (pendingGitAliasValue) {
@@ -2319,30 +2384,43 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
     // builds even when this command contains no explicit export/set/shopt word.
     if (pendingPrintfVariableOption && unquoted.startsWith("-v")) return true;
-    pendingPrintfVariableOption = unquoted === "printf";
+    pendingPrintfVariableOption = executesHere && unquoted === "printf";
     // `eval` concatenates its arguments and reparses the result, dissolving one more
     // layer of quoting than any single-pass scan models (`ghp_a\\\\b` reaches the
-    // process as `ghp_ab`), wherever the word sits: even mid-command it still names
-    // the builtin to some consumer (`env eval ...`, `bash -c 'eval ...'`). The
-    // export-family builtins move a shell-built variable into the environment with
-    // no `=` or `$` in the text (`printf -v TOKEN ...; export TOKEN`), and `set`
-    // reaches the same end through `-a` or the positional parameters.
-    if (SHELL_STATE_WORDS.has(unquoted)) return true;
+    // process as `ghp_ab`). The export-family builtins move a shell-built variable
+    // into the environment with no `=` or `$` in the text (`printf -v TOKEN ...;
+    // export TOKEN`), and `set` reaches the same end through `-a` or the positional
+    // parameters. Each is a builtin only where a command can start: `env eval ...`
+    // arrives through env's utility operand and `bash -c 'eval ...'` localized at
+    // `bash`, so an argument merely named `eval` stays published.
+    if (executesHere && SHELL_STATE_WORDS.has(unquoted)) return true;
     // Executable-MIME data URLs are inline modules even when a runner subcommand
     // prevents interpreter option tracking from reaching them.
     if (/^data:[^,]*(?:javascript|ecmascript|typescript)/i.test(unquoted)) return true;
+    if (pendingFindPrimaries && FIND_EXEC_PRIMARY.test(unquoted)) return true;
     const executable = unquoted
       .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
       .toLowerCase()
       .replace(/\.exe$/, "");
-    if (executable === "env") sawEnv = true;
-    if (executable === "npm") pendingNpmSubcommand = true;
-    if (executable === "git") pendingGitSubcommand = true;
-    if (executable === "deno") pendingDenoSubcommand = true;
-    if (executable === "java") pendingJavaOptions = true;
-    if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
-    if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
-    if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
+    if (executesHere) {
+      // A directly executed auto-published document runs through its shebang,
+      // publishing an executable relationship no marker can rehydrate elsewhere.
+      if (isAutoPublishedScriptOperand(unquoted)) return true;
+      if (executable === "env") sawEnv = true;
+      if (executable === "npm") pendingNpmSubcommand = true;
+      if (executable === "git") pendingGitSubcommand = true;
+      if (executable === "deno") pendingDenoSubcommand = true;
+      if (executable === "java") pendingJavaOptions = true;
+      if (FIND_EXECUTABLE_NAMES.has(executable)) pendingFindPrimaries = true;
+      const carrierSkips = COMMAND_CARRIER_OPERANDS.get(executable);
+      if (carrierSkips !== undefined) {
+        carrierArmed = true;
+        carrierOperandSkips = carrierSkips;
+      }
+      if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
+      if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
+      if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
+    }
     // Attached/separate R/PHP file options name the same script boundary as a
     // positional operand, but their leading dash would otherwise look merely
     // ambiguous. Either form ends tracking so later script arguments are not mistaken
@@ -2363,7 +2441,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
     }
     if (attachedScriptBoundary) clearInterpreterTracking();
 
-    const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
+    const language = executesHere
+      ? LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable))
+      : undefined;
     if (language) {
       pendingLanguages.add(language);
       evalOperandAmbiguous = false;

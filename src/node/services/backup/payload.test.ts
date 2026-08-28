@@ -1696,6 +1696,16 @@ describe("backup payload", () => {
       `env -S'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`,
     ],
     ["GNU env clustered split strings", `env -ivS'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`],
+    // find's -exec family hands its operands to execvp as a command.
+    ["GNU find exec callbacks", "find /tmp -maxdepth 0 -exec ~/.xum/skills/launch.txt \\;"],
+    ["GNU find execdir callbacks", "gfind /tmp -execdir mcp --token {} +"],
+    // Carriers run their operand as the command, so the wrapped word is checked
+    // like a command start; a dash option may take a separate value this scan
+    // cannot pair, so later words stay checked.
+    ["timeout-wrapped shells", "timeout 30 bash -c exit"],
+    ["option-carrying carrier wrappers", "nice -n 10 bash -c exit"],
+    ["env-terminated option lists", "env -- bash -c exit"],
+    ["keyword-guarded shells", "if bash -c exit; then mcp; fi"],
   ] as const) {
     it(`localizes ${name}`, async () => {
       await writeFixtureFile(
@@ -1724,6 +1734,8 @@ describe("backup payload", () => {
       "env -u TOKEN ~/.xum/skills/launch.txt",
       "env env /home/user/.xum/agents/launch.md",
       "true; /home/user/.xum/agents/launch.md",
+      "timeout 30 ~/.xum/skills/launch.txt",
+      "nohup ~/.xum/skills/launch.txt",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1740,6 +1752,35 @@ describe("backup payload", () => {
         servers: { private: { command: string } };
       };
       expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("keeps executable names in argument positions portable", async () => {
+    // Only a word that can execute names an interpreter or wrapper; the same
+    // spelling as another program's argument is data, and localizing it would
+    // remove an otherwise portable server on a fresh-device restore.
+    for (const command of [
+      "mcp-server --shell bash --transport ssh --filter sed",
+      "mcp-server --runtime python3 -c config.toml",
+      "mcp-server --tool git config core.sshCommand ssh",
+      "nohup mcp-server --shell bash",
+      "mcp-server --mode find -exec /tmp/plugin",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(command);
     }
   });
 
