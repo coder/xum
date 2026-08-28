@@ -230,11 +230,19 @@ export async function spawnProcess(
     };
   }
 
+  // The outer spawn shell exports the translated pathEnv (and cwd var) before
+  // the wrapper runs; wrapper-level env exports would overwrite those
+  // translations, so pathEnv-owned keys are stripped from the wrapper env.
+  const wrapperEnv: Record<string, string> = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+  for (const key of [...Object.keys(options.pathEnv ?? {}), BACKGROUND_CWD_ENV]) {
+    delete wrapperEnv[key];
+  }
+
   const wrapperScript = buildWrapperScript({
     exitCodePath,
     cwd: options.cwd,
     cwdEnvVar: BACKGROUND_CWD_ENV,
-    env: { ...options.env, ...NON_INTERACTIVE_ENV_VARS },
+    env: wrapperEnv,
     script,
   });
 

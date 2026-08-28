@@ -32,7 +32,7 @@ import {
 } from "./initHook";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
-import { buildShellExport, buildShellPathExport } from "./shellEnv";
+import { buildShellExport } from "./shellEnv";
 import { sanitizeXumChildEnv } from "./childProcessEnv";
 
 /**
@@ -85,8 +85,12 @@ export abstract class LocalBaseRuntime implements Runtime {
       .map(([key, value]) => buildShellExport(key, value))
       .join("\n");
 
+    // Expand host-side with the same semantics as local file I/O: expandTilde
+    // routes ~/.xum (and legacy homes) through getXumHome, which in-shell $HOME
+    // expansion would miss (XUM_ROOT, dev suffix), and relative values resolve
+    // against the exec cwd, matching the shell's $PWD when the exports run.
     const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
-      .map(([key, value]) => buildShellPathExport(key, value))
+      .map(([key, value]) => buildShellExport(key, path.resolve(cwd, expandTilde(value))))
       .join("\n");
     const spawnArgs = ["-c", `${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`];
 
