@@ -951,6 +951,45 @@ export default function workflow() { return { reportMarkdown: "should not run" }
     expect(result.result).toBeNull();
     await waitForRouterWorkflowStatus(client, "workspace-1", result.runId, "completed");
   });
+
+  test("crash-resumed background runs enqueue terminal attention on settle", async () => {
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
+    await runStore.createRun({
+      id: "wfr_crash_wake",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo", scope: "built-in", executable: true },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    // Orphaned by a crash: durable status says running, but no live runner.
+    await runStore.appendStatus("wfr_crash_wake", "running", "2026-05-29T00:00:01.000Z");
+
+    const enqueueWorkflowRunTerminalAttention = mock(async () => undefined);
+    const context = createContext({ enabled: true });
+    (context as unknown as Record<string, unknown>).taskService = {
+      enqueueWorkflowRunTerminalAttention,
+    };
+    (
+      context.workspaceService as unknown as Record<string, unknown>
+    ).repairWorkflowRunReferenceBoundary = mock(async () => undefined);
+    const client = createRouterClient(router(), { context });
+
+    // A read path triggers crash recovery; the resumed run's settle must land in the
+    // terminal-attention outbox instead of waiting for the next restart's sweep.
+    await client.workflows.listRuns({ workspaceId: "workspace-1" });
+    await waitForRouterWorkflowStatus(client, "workspace-1", "wfr_crash_wake", "completed");
+    const deadline = Date.now() + 5_000;
+    while (enqueueWorkflowRunTerminalAttention.mock.calls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(enqueueWorkflowRunTerminalAttention).toHaveBeenCalledWith({
+      ownerWorkspaceId: "workspace-1",
+      runId: "wfr_crash_wake",
+      status: "completed",
+    });
+  });
 });
 
 describe("router config.saveConfig", () => {

@@ -6964,6 +6964,59 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
   });
 
+  test("wake defers when the launch-identity read fails after currentness succeeds", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_identity_unreadable";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // Currentness succeeds without the sidecar (e.g. a direct invocation row)...
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+
+    // ...but the launch-identity read fails transiently (EISDIR). Delivering without the
+    // recorded identity would bind the wake to the newest agent-bearing history row, so the
+    // wake must stay pending for the retry drain.
+    await fsPromises.mkdir(path.join(config.getSessionDir(parentId), "agent-workflow-runs.json"), {
+      recursive: true,
+    });
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: runId,
+    });
+    await drain(parentId);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+  });
+
   test("wake re-pins the selected group's recorded launch pin, not the newest row's", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

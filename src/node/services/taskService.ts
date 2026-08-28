@@ -8122,8 +8122,12 @@ export class TaskService {
         };
       }
     } catch {
-      // Identity is advisory; an unreadable sidecar already deferred delivery above whenever
-      // currentness itself depended on it.
+      // Currentness can succeed (e.g. a direct invocation row) and this identity read still
+      // fail transiently. Delivering without the recorded identity would bind the wake to the
+      // newest agent-bearing history row, handing the run's output to an unrelated later
+      // synthetic turn's agent; defer to the bounded retry instead, like an unreadable run
+      // record.
+      return { outcome: "defer" };
     }
     const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
     return {

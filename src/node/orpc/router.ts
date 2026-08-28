@@ -586,9 +586,24 @@ export async function resolveWorkflowContext(
       onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
       onRunCrashResumed: (event) =>
         context.workspaceService.repairWorkflowRunReferenceBoundary(event.workspaceId, event.runId),
-      ...(options.onBackgroundRunTerminal != null
-        ? { onBackgroundRunTerminal: options.onBackgroundRunTerminal }
-        : {}),
+      // Read paths (listRuns / stream subscribe) create services purely to observe runs, but
+      // crash recovery can resume an orphaned background run on them: without a terminal
+      // callback the settled run would enqueue no terminal attention until the next restart's
+      // sweep. Default to the standard outbox enqueue (idempotent via enqueueIfAbsent);
+      // explicit callbacks (slash-command continuations, retry) keep their custom behavior.
+      onBackgroundRunTerminal:
+        options.onBackgroundRunTerminal ??
+        (async (event) => {
+          // Nested runs surface through their parent workflow, not their own wake.
+          if (event.run.parentWorkflow != null) {
+            return;
+          }
+          await context.taskService.enqueueWorkflowRunTerminalAttention({
+            ownerWorkspaceId: workspaceId,
+            runId: event.runId,
+            status: event.status,
+          });
+        }),
       getCurrentProjectTrusted: resolveWorkflowProjectTrusted,
       runnerId: `workflow-runner:${workspaceId}`,
     }),
