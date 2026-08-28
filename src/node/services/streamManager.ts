@@ -800,8 +800,6 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
  * - Only one active stream per workspace at any time
  * - Atomic stream creation/cancellation operations
  * - Guaranteed resource cleanup in all code paths
- *
- * Physical inlining into AIService is intentionally deferred to a mechanical follow-up.
  */
 export class StreamManager {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();

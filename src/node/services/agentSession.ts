@@ -1156,13 +1156,10 @@ export class AgentSession {
   private activeTurnStreamHandle: TurnStreamHandle | null = null;
 
   /**
-   * Capture list for error events observed while this session's streamMessage
-   * call is in flight and no turn handle owns them (pre-start failures such as
-   * runtime readiness or strict agent resolution). AIService emits these for
-   * fire-and-forget senders and then returns Err, so no completion will ever
-   * deliver them; the Err path handles each exactly once via the event's own
-   * messageId. Null outside the in-flight window so unrelated error events
-   * (e.g. a later mid-turn failure) are never captured.
+   * Error events observed while this session's streamMessage call is in
+   * flight and no turn handle owns them (pre-start failures such as runtime
+   * readiness). No completion will ever deliver them, so the Err path handles
+   * each exactly once. Null outside the in-flight window.
    */
   private preStartErrorCapture: StreamErrorPayload[] | null = null;
 
@@ -4850,11 +4847,8 @@ export class AgentSession {
     acpPromptId?: string,
     preStartErrors?: StreamErrorPayload[] | null
   ): Promise<AgentSessionResult<void>> {
-    // Pre-start and synthetic failures that AIService announced as error
-    // events (for fire-and-forget senders) have no turn handle, so their
-    // handling and recovery-decision resolution run here, keyed by each
-    // event's own messageId. When any were captured they own this failure:
-    // the branches below only cover failures that produced no error event.
+    // Captured pre-start error events own this failure; the branches below
+    // only cover failures that produced no error event.
     if (await this.handleCapturedStreamErrors(preStartErrors, acpPromptId)) {
       return { success: false, error, failureHandled: true };
     }
@@ -5191,10 +5185,8 @@ export class AgentSession {
     }
 
     this.consumeTurnCompletion(streamResult.data);
-    // Mock playback returns Ok after emitting synthetic error events under its
-    // own message IDs; drain those so the failures are still handled. Events
-    // owned by the returned handle are excluded: completion delivers them, so
-    // a stream failing inside the capture window is not handled twice.
+    // Drain mock playback's synthetic error events (emitted under their own
+    // message IDs); events owned by the returned handle stay with completion.
     await this.handleCapturedStreamErrors(
       capturedPreStartErrors?.filter((event) => event.messageId !== streamResult.data.messageId),
       acpPromptId
