@@ -6504,6 +6504,79 @@ describe("TaskService", () => {
     });
   });
 
+  test("workflow wakes bind to the initiating agent, not a later synthetic turn's agent", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_initiating_agent";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("launch-turn", "assistant", "starting", {
+        timestamp: 1_001,
+        agentId: "plan",
+      })
+    );
+    // A heartbeat is synthetic, not a manual supersession boundary: the run stays current, but
+    // its agent-bearing assistant row is now the newest one in history. The wake must use the
+    // launch turn's agent from the sidecar, not the heartbeat's.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("heartbeat", "user", "heartbeat", { timestamp: 1_002, synthetic: true })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("heartbeat-turn", "assistant", "idle check", {
+        timestamp: 1_003,
+        agentId: "exec",
+      })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+      agentId: "plan",
+    });
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
+    });
+  });
+
   test("a malformed persisted toolPolicy cannot block the wake or leak into the send", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

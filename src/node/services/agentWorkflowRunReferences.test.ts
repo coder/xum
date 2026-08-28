@@ -58,6 +58,41 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("roundtrips the initiating agent and drops invalid persisted shapes", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_agent",
+        createdAtMs: 1_000,
+        agentId: "plan",
+      });
+      let references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references).toContainEqual({
+        runId: "wfr_agent",
+        createdAtMs: 1_000,
+        agentId: "plan",
+      });
+
+      // Identity is advisory: a malformed persisted agentId drops the field, not the entry,
+      // so the run keeps its wake and identity falls back to the history walk.
+      await fs.writeFile(
+        path.join(workspaceSessionDir, "agent-workflow-runs.json"),
+        JSON.stringify({
+          references: [
+            { runId: "wfr_agent_number", createdAtMs: 1_000, agentId: 7 },
+            { runId: "wfr_agent_empty", createdAtMs: 1_000, agentId: "" },
+          ],
+        })
+      );
+      references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references).toContainEqual({ runId: "wfr_agent_number", createdAtMs: 1_000 });
+      expect(references).toContainEqual({ runId: "wfr_agent_empty", createdAtMs: 1_000 });
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("drops persisted future-dated references and repairs them on the next record", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {

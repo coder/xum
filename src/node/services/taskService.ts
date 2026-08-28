@@ -8021,7 +8021,13 @@ export class TaskService {
     ownerWorkspaceId: string,
     runId: string
   ): Promise<
-    { outcome: "deliver"; prompt: string } | { outcome: "superseded" } | { outcome: "defer" }
+    | {
+        outcome: "deliver";
+        prompt: string;
+        initiatingAgent?: { agentId: string; createdAtMs: number };
+      }
+    | { outcome: "superseded" }
+    | { outcome: "defer" }
   > {
     assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
     assert(runId.length > 0, "buildWorkflowTerminalPrompt requires runId");
@@ -8058,9 +8064,27 @@ export class TaskService {
     if (currentness === "not_current") {
       return { outcome: "superseded" };
     }
+    // Bind the wake to the agent recorded at launch: the newest agent-bearing assistant row
+    // can belong to an unrelated later synthetic turn (a heartbeat is not a supersession
+    // boundary), which would pair a different agent's tool surface with the launch turn's
+    // caller policy. Advisory: legacy references fall back to the history walk.
+    let initiatingAgent: { agentId: string; createdAtMs: number } | undefined;
+    try {
+      const references = await readAgentWorkflowRunReferences(
+        this.config.getSessionDir(ownerWorkspaceId)
+      );
+      const reference = references.find((candidate) => candidate.runId === run.id);
+      if (reference?.agentId != null) {
+        initiatingAgent = { agentId: reference.agentId, createdAtMs: reference.createdAtMs };
+      }
+    } catch {
+      // Identity is advisory; an unreadable sidecar already deferred delivery above whenever
+      // currentness itself depended on it.
+    }
     const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
     return {
       outcome: "deliver",
+      ...(initiatingAgent != null ? { initiatingAgent } : {}),
       prompt: buildWorkflowResultContextMessage({
         rawCommand: `workflow_run ${scriptPath}`,
         name: scriptPath,
@@ -8375,6 +8399,7 @@ export class TaskService {
       (notification) => notification.sourceKind === "workflow_run"
     );
     const deliverableWorkflowNotificationIds = new Set<string>();
+    let workflowInitiatingAgent: { agentId: string; createdAtMs: number } | undefined;
 
     const promptSections: string[] = [];
     if (publicAwaitIds.length > 0) {
@@ -8406,6 +8431,14 @@ export class TaskService {
         continue;
       }
       deliverableWorkflowNotificationIds.add(notification.id);
+      // Newest launch wins when several current runs coalesce into one wake.
+      if (
+        workflowPrompt.initiatingAgent != null &&
+        (workflowInitiatingAgent == null ||
+          workflowPrompt.initiatingAgent.createdAtMs > workflowInitiatingAgent.createdAtMs)
+      ) {
+        workflowInitiatingAgent = workflowPrompt.initiatingAgent;
+      }
       promptSections.push(workflowPrompt.prompt);
     }
 
@@ -8438,7 +8471,8 @@ export class TaskService {
     const resumeOptions = await this.resolveParentAutoResumeOptions(
       ownerWorkspaceId,
       entry,
-      defaultModel
+      defaultModel,
+      workflowInitiatingAgent != null ? { agentId: workflowInitiatingAgent.agentId } : undefined
     );
     const workspaceTurnMuxMetadata =
       await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);

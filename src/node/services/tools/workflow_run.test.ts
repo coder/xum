@@ -672,6 +672,7 @@ describe("workflow_run tool", () => {
     const tool = createWorkflowRunTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
       trusted: true,
+      agentId: "plan",
       taskService: { getWorkflowInvocationBoundaryMessageId } as unknown as TaskService,
       workflowService: {
         startWorkflow,
@@ -693,6 +694,8 @@ describe("workflow_run tool", () => {
     expect(references[0]).toMatchObject({
       runId: "wfr_background",
       afterBoundaryMessageId: "boundary-row-1",
+      // The wake binds to the launching agent, so the reference must carry its identity.
+      agentId: "plan",
     });
     expect(getWorkflowInvocationBoundaryMessageId).toHaveBeenCalledWith(
       "workspace-1",

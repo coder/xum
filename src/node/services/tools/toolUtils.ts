@@ -126,6 +126,7 @@ export async function recordBackgroundWorkflowRunReference(
       runId,
       createdAtMs,
       ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
+      ...(config.agentId != null && config.agentId.length > 0 ? { agentId: config.agentId } : {}),
     });
   } catch (error: unknown) {
     log.warn("Failed to record agent workflow run reference", {

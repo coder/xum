@@ -17,6 +17,13 @@ export interface AgentWorkflowRunReference {
    * Absent on legacy entries, which fail safe to not-current.
    */
   afterBoundaryMessageId?: string | null;
+  /**
+   * Agent identity of the turn that launched/resumed the run. The terminal wake binds to this
+   * instead of the newest agent-bearing assistant row, which a later synthetic turn (e.g. a
+   * heartbeat) can own without superseding the run. Advisory: absent on legacy entries, which
+   * fall back to the history walk.
+   */
+  agentId?: string;
 }
 
 const AGENT_WORKFLOW_RUN_REFERENCES_FILE = "agent-workflow-runs.json";
@@ -81,6 +88,10 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
         ? boundaryRaw
         : null
       : undefined;
+    // Identity is advisory (the wake falls back to the history walk), so an invalid shape
+    // drops only the field, not the entry.
+    const agentId =
+      typeof record.agentId === "string" && record.agentId.length > 0 ? record.agentId : undefined;
     // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
     // consumers cannot pick a stale duplicate and declare a legitimately re-recorded run
     // superseded. The chosen record is kept wholesale, including its boundary snapshot.
@@ -90,6 +101,7 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
         runId: record.runId,
         createdAtMs: record.createdAtMs,
         ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
+        ...(agentId !== undefined ? { agentId } : {}),
       });
     }
   }
@@ -139,6 +151,7 @@ export async function recordAgentWorkflowRunReference(input: {
   runId: string;
   createdAtMs?: number;
   afterBoundaryMessageId?: string | null;
+  agentId?: string;
 }): Promise<void> {
   assert(input.runId.length > 0, "agent workflow reference requires runId");
   const filePath = referencesPath(input.workspaceSessionDir);
@@ -165,6 +178,7 @@ export async function recordAgentWorkflowRunReference(input: {
       ...(input.afterBoundaryMessageId !== undefined
         ? { afterBoundaryMessageId: input.afterBoundaryMessageId }
         : {}),
+      ...(input.agentId != null && input.agentId.length > 0 ? { agentId: input.agentId } : {}),
     });
 
     await fs.mkdir(path.dirname(filePath), { recursive: true });

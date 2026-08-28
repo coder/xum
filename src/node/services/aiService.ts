@@ -2646,6 +2646,7 @@ export class AIService extends EventEmitter {
         planFilePath,
         ancestorPlanFilePaths,
         workspaceId,
+        agentId: effectiveAgentId,
         xumScope,
         timelineService: timelineExperimentEnabled ? this.timelineService : undefined,
         workspaceHeartbeatService: this.workspaceHeartbeatService,

@@ -184,6 +184,8 @@ export interface ToolConfiguration {
   workspaceSessionDir?: string;
   /** Workspace ID for tracking background processes and plan storage */
   workspaceId?: string;
+  /** Resolved agent identity of the turn executing the tools (workflow wake provenance). */
+  agentId?: string;
   /** Pre-resolved mux-managed resource scope (global ~/.xum vs project root). */
   xumScope?: XumToolScope;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */
