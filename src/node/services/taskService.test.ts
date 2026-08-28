@@ -6498,6 +6498,62 @@ describe("TaskService", () => {
     });
   });
 
+  test("a malformed persisted toolPolicy cannot block the wake or leak into the send", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_policy_corrupt";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Persisted metadata is untrusted disk state: a corrupt toolPolicy shape must be dropped
+    // (not copied into the send, where it would throw during resolution and permanently block
+    // the wake), while the intact disable flag on the same row still applies.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-corrupt", "user", "run the audit", {
+        timestamp: 1_000,
+        toolPolicy: { bogus: true },
+        disableWorkspaceAgents: true,
+      } as unknown as Parameters<typeof createMuxMessage>[3])
+    );
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const options = sendMessage.mock.calls[0]?.[2] as {
+      toolPolicy?: unknown;
+      disableWorkspaceAgents?: unknown;
+    };
+    expect(options.toolPolicy).toBeUndefined();
+    expect(options.disableWorkspaceAgents).toBe(true);
+  });
+
   test("initialize replays and clears persisted pending task guidance", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

@@ -118,6 +118,7 @@ import {
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import {
   normalizeAgentId,
@@ -2319,7 +2320,8 @@ export class TaskService {
         for (const msg of messages) {
           if (
             msg.role === "assistant" &&
-            msg.metadata?.agentId &&
+            typeof msg.metadata?.agentId === "string" &&
+            msg.metadata.agentId.length > 0 &&
             msg.metadata.agentId !== "compact"
           ) {
             found.agentId = msg.metadata.agentId;
@@ -7937,9 +7939,21 @@ export class TaskService {
           }
           const metadata = message.metadata;
           if (metadata?.toolPolicy != null || metadata?.disableWorkspaceAgents != null) {
+            // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
+            // inside send resolution and leave the wake permanently blocked on the same corrupt
+            // row. Sanitize instead of trusting the JSON shape; an unparseable policy restores
+            // nothing while a valid disable flag still applies (self-healing doctrine).
+            const parsedPolicy =
+              metadata.toolPolicy != null ? ToolPolicySchema.safeParse(metadata.toolPolicy) : null;
+            if (parsedPolicy != null && !parsedPolicy.success) {
+              log.warn("Ignoring malformed persisted toolPolicy on terminal wake", {
+                ownerWorkspaceId,
+                messageId: message.id,
+              });
+            }
             state.found = {
-              ...(metadata.toolPolicy != null ? { toolPolicy: metadata.toolPolicy } : {}),
-              ...(metadata.disableWorkspaceAgents != null
+              ...(parsedPolicy?.success ? { toolPolicy: parsedPolicy.data } : {}),
+              ...(typeof metadata.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
             };
