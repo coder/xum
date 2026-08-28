@@ -2422,6 +2422,8 @@ function hasDisguisedAssignment(
   let pendingDenoRunAmbiguous = false;
   let pendingSqliteOptions = false;
   let pendingSqliteInitFile = false;
+  let pendingOpensslOptions = false;
+  let pendingOpensslConfigFile = false;
   let pendingJavaOptions = false;
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
@@ -2525,6 +2527,8 @@ function hasDisguisedAssignment(
       pendingDenoRunAmbiguous = false;
       pendingSqliteOptions = false;
       pendingSqliteInitFile = false;
+      pendingOpensslOptions = false;
+      pendingOpensslConfigFile = false;
       pendingJavaOptions = false;
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
@@ -2853,6 +2857,14 @@ function hasDisguisedAssignment(
       // quoting), so it localizes like other eval words.
       return true;
     }
+    if (pendingOpensslConfigFile) {
+      pendingOpensslConfigFile = false;
+      // A published OpenSSL config can load another collected document as a
+      // dynamic engine object, executing it inside the launcher.
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingOpensslOptions && /^--?config$/.test(unquoted)) {
+      pendingOpensslConfigFile = true;
+    }
     if (pendingJavaClassPathValue) {
       pendingJavaClassPathValue = false;
       if (javaClassPathPublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
@@ -3021,12 +3033,15 @@ function hasDisguisedAssignment(
       // The dynamic loader injects an inherited published preload into every
       // dynamically linked launcher, ahead of whatever the command runs.
       if (inherited.loaderPreloadHook) return true;
+      if (inherited.gitConfigHook && executable === "git") return true;
+      if (inherited.opensslConfigHook && executable === "openssl") return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "mise") pendingMiseSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
       if (/^sqlite3[0-9.]*$/.test(executable)) pendingSqliteOptions = true;
+      if (executable === "openssl") pendingOpensslOptions = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
       if (executable === "systemd-run") pendingSystemdRunOptions = true;
@@ -3526,6 +3541,10 @@ interface InheritedLaunchContext {
   luaStartupHook: boolean;
   /** An inherited dynamic-loader preload list names an auto-published document. */
   loaderPreloadHook: boolean;
+  /** Inherited Git config overrides name a sensitive key or a published file. */
+  gitConfigHook: boolean;
+  /** OPENSSL_CONF names an auto-published configuration document. */
+  opensslConfigHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3632,6 +3651,28 @@ function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * Inherited Git config overrides apply to every git invocation: the
+ * GIT_CONFIG_COUNT/KEY/VALUE family injects command-scope entries, and
+ * GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM replace the files Git reads. A sensitive
+ * key or a published replacement file localizes git launchers.
+ */
+function hasInheritedGitConfig(rootPrefixes: readonly string[]): boolean {
+  const count = Number.parseInt(process.env.GIT_CONFIG_COUNT ?? "", 10);
+  if (Number.isFinite(count) && count > 0) {
+    for (const [name, value] of Object.entries(process.env)) {
+      const index = /^GIT_CONFIG_KEY_(\d+)$/.exec(name)?.[1];
+      if (index === undefined || Number.parseInt(index, 10) >= count) continue;
+      if (typeof value === "string" && gitConfigOverrideNamesSensitiveKey(value)) return true;
+    }
+  }
+  for (const file of [process.env.GIT_CONFIG_GLOBAL, process.env.GIT_CONFIG_SYSTEM]) {
+    if (typeof file !== "string") continue;
+    if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(file), rootPrefixes)) return true;
+  }
+  return false;
+}
+
 function redactMcpConfig(
   content: Buffer,
   muxRoot: string
@@ -3677,6 +3718,11 @@ function redactMcpConfig(
     ),
     luaStartupHook: hasInheritedLuaStartupFile(rootPrefixes),
     loaderPreloadHook: hasInheritedLoaderPreload(rootPrefixes),
+    gitConfigHook: hasInheritedGitConfig(rootPrefixes),
+    opensslConfigHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.OPENSSL_CONF ?? ""),
+      rootPrefixes
+    ),
   };
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");

@@ -2590,6 +2590,156 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes git launchers under inherited config overrides", async () => {
+    const variableNames = [
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_SYSTEM",
+    ] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, command, expected] of [
+        // An inherited command-scope entry with a sensitive key fails closed.
+        [
+          {
+            GIT_CONFIG_COUNT: "1",
+            GIT_CONFIG_KEY_0: "core.sshCommand",
+            GIT_CONFIG_VALUE_0: `${muxRoot}/skills/launch.txt`,
+          },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A published replacement config file is read and applied by Git.
+        [
+          { GIT_CONFIG_GLOBAL: `${muxRoot}/skills/gitconfig.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_CONFIG_SYSTEM: `${muxRoot}/skills/gitconfig.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A data key stays portable.
+        [
+          { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "xum" },
+          "git fetch origin",
+          "git fetch origin",
+        ],
+        // Git ignores entries at or past the declared count.
+        [
+          {
+            GIT_CONFIG_COUNT: "0",
+            GIT_CONFIG_KEY_0: "core.sshCommand",
+            GIT_CONFIG_VALUE_0: "probe",
+          },
+          "git fetch origin",
+          "git fetch origin",
+        ],
+        // A foreign config file is not a collected document.
+        [{ GIT_CONFIG_GLOBAL: "/etc/gitconfig" }, "git fetch origin", "git fetch origin"],
+        // Other launchers do not read Git configuration.
+        [
+          { GIT_CONFIG_GLOBAL: `${muxRoot}/skills/gitconfig.txt` },
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes openssl configuration operands", async () => {
+    for (const [command, expected] of [
+      [`openssl req -config ${muxRoot}/skills/config.txt -new`, REDACTED_BACKUP_VALUE],
+      [`openssl req --config ${muxRoot}/skills/config.txt -new`, REDACTED_BACKUP_VALUE],
+      // A foreign config is not a collected document.
+      [
+        "openssl req -config /etc/ssl/openssl.cnf -new",
+        "openssl req -config /etc/ssl/openssl.cnf -new",
+      ],
+      ["openssl x509 -in cert.pem -noout", "openssl x509 -in cert.pem -noout"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes openssl launchers under an inherited published OPENSSL_CONF", async () => {
+    const originalConf = process.env.OPENSSL_CONF;
+    try {
+      for (const [conf, command, expected] of [
+        [`${muxRoot}/skills/config.txt`, "openssl req -new", REDACTED_BACKUP_VALUE],
+        // Other launchers do not read OPENSSL_CONF.
+        [
+          `${muxRoot}/skills/config.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign config is not a collected document.
+        ["/etc/ssl/openssl.cnf", "openssl req -new", "openssl req -new"],
+      ] as const) {
+        process.env.OPENSSL_CONF = conf;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalConf === undefined) delete process.env.OPENSSL_CONF;
+      else process.env.OPENSSL_CONF = originalConf;
+    }
+  });
+
   it("localizes command-valued git -c and --config-env overrides", async () => {
     for (const [command, expected] of [
       // The assignment redaction replaces an unquoted `-c` value before the
