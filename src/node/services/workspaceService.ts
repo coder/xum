@@ -6,7 +6,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
   clearAgentWorkflowRunReferences,
   readAgentWorkflowRunReferences,
-  recordAgentWorkflowRunReference,
+  repairAgentWorkflowRunReferenceBoundary,
   type AgentWorkflowRunReference,
 } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
@@ -11156,20 +11156,14 @@ export class WorkspaceService extends EventEmitter {
     }
     // Supersession-free evidence only: no decision row at all (verified-empty null), or the
     // newest decision row is this run's own invocation/consumed row, which no manual row can
-    // postdate (the backward walk would have found that manual row first).
-    await recordAgentWorkflowRunReference({
+    // postdate (the backward walk would have found that manual row first). The write is a
+    // compare-and-set under the sidecar lock: a full clear landing after the reads above
+    // deletes the sidecar, and an unconditional record would recreate it with a
+    // verified-empty boundary, resurrecting the retired pre-clear result as "current".
+    await repairAgentWorkflowRunReferenceBoundary({
       workspaceSessionDir: sessionDir,
       runId,
-      createdAtMs: reference.createdAtMs,
       afterBoundaryMessageId: decision.status === "found" ? decision.messageId : null,
-      ...(reference.agentId != null
-        ? {
-            agentId: reference.agentId,
-            ...(reference.strictAgentResolution !== undefined
-              ? { strictAgentResolution: reference.strictAgentResolution }
-              : {}),
-          }
-        : {}),
     });
   }
 

@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import {
   readAgentWorkflowRunReferences,
   recordAgentWorkflowRunReference,
+  repairAgentWorkflowRunReferenceBoundary,
 } from "@/node/services/agentWorkflowRunReferences";
 
 describe("agent workflow run references", () => {
@@ -294,6 +295,82 @@ describe("agent workflow run references", () => {
 
       const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
       expect(references).toEqual([{ runId, createdAtMs: 2_000 }]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("boundary repair is a compare-and-set on a surviving boundaryless reference", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      const runId = "wfr_repairable";
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId,
+        createdAtMs: 1_000,
+        agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
+      });
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_bystander",
+        createdAtMs: 1_100,
+        afterBoundaryMessageId: "row-1",
+      });
+
+      // Repairs in place, preserving the rest of the entry and its neighbors.
+      expect(
+        await repairAgentWorkflowRunReferenceBoundary({
+          workspaceSessionDir,
+          runId,
+          afterBoundaryMessageId: null,
+        })
+      ).toBe(true);
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references.find((reference) => reference.runId === runId)).toEqual({
+        runId,
+        createdAtMs: 1_000,
+        afterBoundaryMessageId: null,
+        agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
+      });
+      expect(references.find((reference) => reference.runId === "wfr_bystander")).toEqual({
+        runId: "wfr_bystander",
+        createdAtMs: 1_100,
+        afterBoundaryMessageId: "row-1",
+      });
+
+      // A reference that already carries a boundary (here the one just repaired) is never
+      // overwritten: a concurrent explicit re-record must win over a stale repair.
+      expect(
+        await repairAgentWorkflowRunReferenceBoundary({
+          workspaceSessionDir,
+          runId,
+          afterBoundaryMessageId: "stale-row",
+        })
+      ).toBe(false);
+      const unchanged = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(unchanged.find((reference) => reference.runId === runId)?.afterBoundaryMessageId).toBe(
+        null
+      );
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("boundary repair refuses to recreate a cleared sidecar", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // A full-history clear deleted the sidecar between the repair's reads and its write:
+      // the stale repair must not resurrect the retired reference as verified-empty current.
+      expect(
+        await repairAgentWorkflowRunReferenceBoundary({
+          workspaceSessionDir,
+          runId: "wfr_cleared",
+          afterBoundaryMessageId: null,
+        })
+      ).toBe(false);
+      expect(await fs.readdir(workspaceSessionDir)).toEqual([]);
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }
