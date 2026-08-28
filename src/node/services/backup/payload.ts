@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { Dirent, Stats } from "node:fs";
+import { realpathSync, type Dirent, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1762,7 +1762,7 @@ function javaOptionTakesSeparateValue(unquoted: string): boolean {
  * so those middles match greedily.
  */
 const GIT_COMMAND_CONFIG_KEY =
-  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(?:external|.+\.(?:command|textconv))|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|gpg\.ssh\.defaultkeycommand|pager\.[^.]+|(?:diff|merge)tool\..+\.cmd|guitool\..+\.cmd|merge\..+\.driver|hook\..+\.command|browser\..+\.(?:cmd|path)|filter\..+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\..+\.cmd|tar\..+\.command|sendemail\.(?:sendmailcmd|cccmd|tocmd)|uploadpack\.packobjectshook)$/i;
+  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(?:external|.+\.(?:command|textconv))|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|gpg\.ssh\.defaultkeycommand|pager\.[^.]+|(?:diff|merge)tool\..+\.cmd|guitool\..+\.cmd|merge\..+\.driver|hook\..+\.command|browser\..+\.(?:cmd|path)|filter\..+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\..+\.cmd|tar\..+\.command|sendemail\.(?:sendmailcmd|cccmd|tocmd)|uploadpack\.packobjectshook|gc\.recentobjectshook)$/i;
 
 /**
  * core.fsmonitor doubles as a boolean toggle for the built-in monitor; only a
@@ -1802,8 +1802,18 @@ function normalizeComparablePath(value: string): string {
  */
 function collectedDocumentRootPrefixes(muxRoot: string): string[] {
   const absolute = new Set<string>();
-  const root = normalizeComparablePath(muxRoot);
-  if (root !== "") {
+  // Collection follows a symlinked root to its target, so a command can name the
+  // same collected files through the canonical spelling; when resolution fails the
+  // configured spelling still covers the common case.
+  const spellings = [muxRoot];
+  try {
+    spellings.push(realpathSync(muxRoot));
+  } catch {
+    // Ignored: an unresolvable root keeps only its configured spelling.
+  }
+  for (const spelling of spellings) {
+    const root = normalizeComparablePath(spelling);
+    if (root === "") continue;
     absolute.add(root);
     const basename = root.slice(root.lastIndexOf("/") + 1);
     const renamed = basename.startsWith(".xum")
@@ -1856,6 +1866,14 @@ function isAutoPublishedScriptOperand(unquoted: string, rootPrefixes: readonly s
     }
   }
   return false;
+}
+
+/** Whether the operand names the collected root itself or a directory inside it. */
+function isUnderCollectedRoot(unquoted: string, rootPrefixes: readonly string[]): boolean {
+  const normalized = normalizeComparablePath(unquoted);
+  return rootPrefixes.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`)
+  );
 }
 
 /** Known npm commands and aliases terminate global-option parsing. */
@@ -2311,6 +2329,7 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
   let pendingJavaSourceFile = false;
   let pendingJavaOptionValue = false;
   let pendingHashOptions = false;
+  let pendingCdDirectory = false;
   let pendingScriptFileOperand = false;
   let evalOperandAmbiguous = false;
   // Static table entries keep the pending set bounded, so repeated interpreter words
@@ -2367,6 +2386,7 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
       pendingHashOptions = false;
+      pendingCdDirectory = false;
       clearInterpreterTracking();
     }
     // The word after `<` is a read redirection's filename, never a command or an
@@ -2604,6 +2624,14 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
         pendingDenoSubcommand = false;
       }
     }
+    if (pendingCdDirectory && !unquoted.startsWith("-")) {
+      pendingCdDirectory = false;
+      // Once the working directory moves into the collected root, any relative
+      // operand can name a published document without spelling the root at all
+      // (`cd <root> && python3 skills/launch.txt`), so the move itself localizes;
+      // dash words are cd's own options and keep the target pending.
+      if (isUnderCollectedRoot(unquoted, rootPrefixes)) return true;
+    }
     // `hash -p PATHNAME NAME` binds NAME to any full pathname, so every remap
     // changes what a later word executes (`hash -p /usr/bin/python3 launch` hands
     // launch's arguments to an installed evaluator); the pathname's location proves
@@ -2640,8 +2668,9 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
       if (executable === "java") pendingJavaOptions = true;
-      // A builtin, so matched on the quote-removed word like the state words above.
+      // Builtins, so matched on the quote-removed word like the state words above.
       if (unquoted === "hash") pendingHashOptions = true;
+      if (unquoted === "cd" || unquoted === "pushd") pendingCdDirectory = true;
       if (FIND_EXECUTABLE_NAMES.has(executable)) pendingFindPrimaries = true;
       const carrierSkips = COMMAND_CARRIER_OPERANDS.get(executable);
       if (carrierSkips === -1) {

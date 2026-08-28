@@ -1758,6 +1758,10 @@ describe("backup payload", () => {
       `linux32 ${muxRoot}/skills/launch.txt`,
       `linux64 ${muxRoot}/agents/launch.md`,
       `uname26 ${muxRoot}/skills/launch.txt`,
+      // Moving the working directory into the collected root lets any relative
+      // operand name a published document without spelling the root.
+      `cd ${muxRoot} && python3 skills/launch.txt`,
+      `pushd ${muxRoot}/skills; tclsh launch.txt`,
       `cmake -P ${muxRoot}/skills/launch.txt`,
       `ctest -S ${muxRoot}/skills/launch.txt`,
       // Redundant separators and dot segments name the same collected file.
@@ -1810,6 +1814,7 @@ describe("backup payload", () => {
       "java @/tmp/opts.txt Main --port 8080",
       "jshell --startup=/tmp/snippets.jsh /tmp/main.jsh",
       "hash -r; mcp-server",
+      "cd /app && node server.js",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1856,6 +1861,31 @@ describe("backup payload", () => {
     } finally {
       await fs.rm(homeRoot, { recursive: true, force: true });
     }
+  });
+
+  it("localizes the canonical target spelling of a symlinked settings root", async () => {
+    // Collection follows a symlinked root to its target, so a command can name the
+    // same collected files through the canonical spelling.
+    const canonicalRoot = await fs.realpath(muxRoot);
+    const linkedRoot = path.join(tempDir, "linked-root");
+    await fs.symlink(canonicalRoot, linkedRoot, "dir");
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { private: { command: `python3 ${canonicalRoot}/skills/launch.txt` } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot: linkedRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
   it("localizes the pre-rename spelling of a renamed settings root", async () => {
@@ -2051,6 +2081,8 @@ describe("backup payload", () => {
       "git config alias.x '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git x",
       "git config --global --add alias.launch '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
       "git config core.sshCommand 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git fetch origin",
+      // git gc runs the configured recent-objects hook while pruning cruft.
+      "git config gc.recentObjectsHook /tmp/hook.sh; git gc --cruft --prune=now",
       "git config credential.helper '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
       "git config filter.secret.process 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
       "git config merge.leak.driver 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git merge side",
