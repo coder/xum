@@ -1786,1173 +1786,6 @@ const BashMonitorSchema = z
  * Tool definitions: single source of truth
  * Key = tool name, Value = { description, schema }
  */
-export const TOOL_DEFINITIONS = {
-  bash: {
-    description:
-      "Execute a bash command with a configurable timeout. " +
-      `Output is strictly limited to ${BASH_HARD_MAX_LINES} lines, ${BASH_MAX_LINE_BYTES} bytes per line, and ${BASH_MAX_TOTAL_BYTES} bytes total. ` +
-      "Commands that exceed these limits will FAIL with an error (no partial output returned). " +
-      "Be conservative: use 'head', 'tail', 'grep', or other filters to limit output before running commands. " +
-      "Large outputs may be automatically filtered; when this happens, the result includes a note explaining what was kept and (if available) where the full output was saved.\n" +
-      "On Windows this runs in Git Bash; to discard output use `>/dev/null` (not `>nul`). " +
-      "Background commands can include a monitor block with a regex filter; matching complete output lines wake this workspace, including after the current response, so no polling is required. Terminate monitors that are no longer relevant before finishing.",
-    schema: z.preprocess(
-      (value) => {
-        // Compatibility shims for models that emit alias fields:
-        // - some models emit `command` instead of `script`
-        // - DeepSeek v4 emits `description` instead of `display_name`
-        // Normalize both so downstream code (tool runner + UI) sees canonical args.
-        // Aliases are intentionally undocumented in the public schema; we don't
-        // want to invite other models to use the wrong field.
-        if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
-
-        let obj = value as Record<string, unknown>;
-        obj = renameAliasField(obj, "command", "script");
-        obj = renameAliasField(obj, "description", "display_name");
-        return obj;
-      },
-      z
-        .object({
-          script: z.string().describe("The bash script/command to execute"),
-          model_intent: z
-            .string()
-            .nullish()
-            .describe(
-              "Optional. Short user-facing purpose for this command, shown next to the command in collapsed chat. " +
-                "Use a present-participle phrase in plain English, under 100 characters. " +
-                "Do not repeat the command or include duration, because Xum appends those. " +
-                "Examples: 'Running the unit tests', 'Checking repository state', 'Inspecting build output'."
-            ),
-          timeout_secs: z
-            .number()
-            .positive()
-            .describe(
-              "Timeout in seconds. For foreground: max execution time before kill. " +
-                "For background: max lifetime before auto-termination. " +
-                "Start small and increase on retry; avoid large initial values to keep UX responsive"
-            ),
-          run_in_background: z
-            .boolean()
-            .default(false)
-            .describe(
-              "Run this command in the background without blocking. " +
-                "Use for processes running >5s (dev servers, builds, file watchers). " +
-                "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
-                "or processes requiring real-time output (use foreground with larger timeout instead). " +
-                "Returns immediately with a taskId (bash:<processId>) and backgroundProcessId. " +
-                "Read output with task_await (returns only new output since last check). " +
-                "Stop with task_stop using the taskId. " +
-                "List active tasks with task_list. " +
-                "Process persists until timeout_secs expires, terminated, or workspace is removed." +
-                "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
-                "Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. " +
-                "With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); use task_await only if you need surrounding/full output. " +
-                "Before finishing, terminate monitored tasks that are no longer relevant so stale output cannot trigger a follow-up turn. " +
-                "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
-                "When you actually need the output, read it with task_await; do not poll task_await just because the process is still running."
-            ),
-          monitor: BashMonitorSchema.nullish().describe(
-            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling, even after the current response, and the workspace also wakes when the monitored process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); terminate it before finishing if future wakes are no longer useful."
-          ),
-          display_name: z
-            .string()
-            .describe(
-              "Human-readable name for the process (e.g., 'Dev Server', 'TypeCheck Watch'). " +
-                "Required for all bash invocations since any process can be sent to background."
-            ),
-        })
-        .refine((args) => args.monitor == null || args.run_in_background === true, {
-          path: ["monitor"],
-          message: "monitor requires run_in_background=true",
-        })
-    ),
-  },
-  file_read: {
-    description:
-      "Read the contents of a file from the file system. Read as little as possible to complete the task. " +
-      "Content is returned with line numbers prepended in the format '<line_number>\\t<content>'. " +
-      "These line numbers are NOT part of the actual file content and must not be included when editing files.",
-    schema: z.preprocess(
-      normalizeFilePath,
-      z.object({
-        path: z.string().describe("The path to the file to read (absolute or relative)"),
-        offset: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("1-based starting line number (optional, defaults to 1)"),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe(
-            "Number of lines to return from offset (optional, returns all if not specified)"
-          ),
-      })
-    ),
-  },
-  memory: {
-    description:
-      "Manage your persistent memory directory (experiment). " +
-      "MEMORY PROTOCOL: check relevant memories before acting on a task; record durable facts, preferences, and lessons as you learn them; update or delete memories that turn out to be wrong or stale.\n" +
-      "Scopes (all paths are virtual):\n" +
-      "- /memories/global/... — personal, permanent, shared across all projects\n" +
-      "- /memories/project/... — private notes about this project; host-local, never committed, survives workspaces\n" +
-      "- /memories/workspace/... — scratch state for this workspace; deleted with the workspace\n" +
-      "Commands:\n" +
-      "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
-      "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +
-      "- str_replace: replace a unique occurrence of old_str with new_str (errors with matching line numbers when ambiguous)\n" +
-      "- insert: insert insert_text after line insert_line (0 = top of file)\n" +
-      "- delete: delete a file or directory (recursive)\n" +
-      "- rename: move old_path to new_path within the same scope\n" +
-      "Files are Markdown; optional YAML frontmatter with a one-line `description:` is surfaced in your memory index.",
-    schema: z.preprocess(
-      (value) => {
-        // Compatibility shims (same mechanism as bash command->script): models
-        // trained on our file tools may emit file tool field names.
-        const normalized = normalizeFilePath(value); // file_path/filePath -> path
-        if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized)) {
-          return normalized;
-        }
-        let obj = normalized as Record<string, unknown>;
-        obj = renameAliasField(obj, "content", "file_text");
-        obj = renameAliasField(obj, "old_string", "old_str");
-        obj = renameAliasField(obj, "new_string", "new_str");
-        return obj;
-      },
-      z.object({
-        command: z
-          .enum(["view", "create", "str_replace", "insert", "delete", "rename"])
-          .describe("The memory operation to perform."),
-        path: z
-          .string()
-          .nullish()
-          .describe(
-            "Virtual memory path (e.g. /memories/global/notes.md). Required for every command except rename."
-          ),
-        file_text: z.string().nullish().describe("create: full contents of the new file."),
-        old_str: z
-          .string()
-          .nullish()
-          .describe("str_replace: exact text to replace (must be unique in the file)."),
-        new_str: z.string().nullish().describe("str_replace: replacement text."),
-        insert_line: z
-          .number()
-          .int()
-          .nonnegative()
-          .nullish()
-          .describe("insert: line number to insert after (0 = top of file)."),
-        insert_text: z.string().nullish().describe("insert: text to insert."),
-        old_path: z.string().nullish().describe("rename: current virtual path."),
-        new_path: z.string().nullish().describe("rename: new virtual path (same scope)."),
-        offset: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("view on a file: 1-based starting line number (optional)."),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("view on a file: number of lines to return from offset (optional)."),
-      })
-    ),
-  },
-  attach_file: {
-    description:
-      "Attach a file from the filesystem so later model steps receive it as a real attachment instead of a huge base64 JSON blob. " +
-      "Accepts absolute or relative paths, including files outside the workspace. Accepts any file type. " +
-      "Raster images, SVG, and PDF are sent to the model as real attachments. Every other file type (text, source, diffs, logs, video, audio, archives, etc.) is shown to the user in chat for preview/download, but its contents are NOT sent to the model — you only receive a notice. Use file_read when you need to read a text file's contents yourself.",
-    schema: z.preprocess(
-      normalizeFilePath,
-      z
-        .object({
-          path: z.string().describe("The path to the file to attach (absolute or relative)"),
-          mediaType: z
-            .string()
-            .nullish()
-            .describe("Optional media type override when the filename/extension is ambiguous."),
-          filename: z
-            .string()
-            .nullish()
-            .describe("Optional filename override to present to the model."),
-        })
-        .strict()
-    ),
-  },
-  desktop_screenshot: {
-    description:
-      "Capture a screenshot of the desktop. " +
-      "Optionally accepts scaledWidth and scaledHeight hints for downstream consumers while still capturing at the desktop's actual resolution.",
-    schema: z
-      .object({
-        scaledWidth: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("Optional scaled width hint in pixels for downstream consumers."),
-        scaledHeight: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("Optional scaled height hint in pixels for downstream consumers."),
-      })
-      .strict(),
-  },
-  desktop_move_mouse: {
-    description: "Move the desktop mouse cursor to the provided screen coordinates.",
-    schema: z
-      .object({
-        x: z.number().int().describe("Target X coordinate in screen pixels."),
-        y: z.number().int().describe("Target Y coordinate in screen pixels."),
-      })
-      .strict(),
-  },
-  desktop_click: {
-    description:
-      "Click on the desktop at the provided screen coordinates. Defaults to the left mouse button when button is omitted.",
-    schema: z
-      .object({
-        x: z.number().int().describe("Target X coordinate in screen pixels."),
-        y: z.number().int().describe("Target Y coordinate in screen pixels."),
-        button: z
-          .enum(["left", "right"])
-          .nullish()
-          .describe("Optional mouse button to click. Defaults to left."),
-      })
-      .strict(),
-  },
-  desktop_double_click: {
-    description:
-      "Double-click on the desktop at the provided screen coordinates. Defaults to the left mouse button when button is omitted.",
-    schema: z
-      .object({
-        x: z.number().int().describe("Target X coordinate in screen pixels."),
-        y: z.number().int().describe("Target Y coordinate in screen pixels."),
-        button: z
-          .enum(["left"])
-          .nullish()
-          .describe("Optional mouse button to double-click. Defaults to left."),
-      })
-      .strict(),
-  },
-  desktop_drag: {
-    description: "Drag on the desktop from one screen position to another.",
-    schema: z
-      .object({
-        startX: z.number().int().describe("Starting X coordinate in screen pixels."),
-        startY: z.number().int().describe("Starting Y coordinate in screen pixels."),
-        endX: z.number().int().describe("Ending X coordinate in screen pixels."),
-        endY: z.number().int().describe("Ending Y coordinate in screen pixels."),
-      })
-      .strict(),
-  },
-  desktop_scroll: {
-    description: "Scroll on the desktop at the provided screen coordinates.",
-    schema: z
-      .object({
-        x: z.number().int().describe("Target X coordinate in screen pixels."),
-        y: z.number().int().describe("Target Y coordinate in screen pixels."),
-        deltaX: z.number().int().nullish().describe("Optional horizontal scroll delta in pixels."),
-        deltaY: z.number().int().describe("Vertical scroll delta in pixels."),
-      })
-      .strict(),
-  },
-  desktop_type: {
-    description: "Type text into the active desktop input target.",
-    schema: z
-      .object({
-        text: z.string().describe("Text to type into the active desktop target."),
-      })
-      .strict(),
-  },
-  desktop_key_press: {
-    description:
-      'Press a desktop key or key combination such as "ctrl+c", "Return", or "cmd+shift+p".',
-    schema: z
-      .object({
-        key: z.string().describe("Key or key combination to press on the desktop."),
-      })
-      .strict(),
-  },
-  mux_agents_read: {
-    description:
-      "Read the AGENTS.md instructions file. In a project workspace, reads the project's AGENTS.md. " +
-      "In the system workspace, reads the global ~/.xum/AGENTS.md.",
-    schema: z.object({}).strict(),
-  },
-  mux_agents_write: {
-    description:
-      "Write the AGENTS.md instructions file. In a project workspace, writes the project's AGENTS.md. " +
-      "In the system workspace, writes the global ~/.xum/AGENTS.md. " +
-      "Requires explicit confirmation via confirm: true.",
-    schema: z
-      .object({
-        newContent: z.string().describe("The full new contents of the AGENTS.md file"),
-        confirm: z
-          .boolean()
-          .describe(
-            "Must be true to apply the write. The agent should ask the user for confirmation first."
-          ),
-      })
-      .strict(),
-  },
-  mux_config_read: {
-    description:
-      "Read the Xum configuration file. Returns the current configuration with secrets redacted. " +
-      "Use 'providers' for ~/.xum/providers.jsonc (API provider settings) or 'config' for ~/.xum/config.json (app settings).",
-    schema: z
-      .object({
-        file: XumConfigFileSchema.describe("Which configuration file to read"),
-        path: ConfigMutationPathSchema.nullish().describe(
-          "Optional path segments to read a specific nested value. If omitted, returns the full config."
-        ),
-      })
-      .strict(),
-  },
-  mux_config_write: {
-    description:
-      "Write to the Xum configuration file. Applies one or more set/delete operations and validates the full document before writing. " +
-      "Use 'providers' for ~/.xum/providers.jsonc or 'config' for ~/.xum/config.json. " +
-      "Requires explicit confirmation via confirm: true.",
-    schema: z
-      .object({
-        file: XumConfigFileSchema.describe("Which configuration file to write"),
-        operations: ConfigOperationsSchema.describe("Operations to apply to the config document"),
-        confirm: z
-          .boolean()
-          .describe("Must be true to apply the write. Ask the user for confirmation first."),
-      })
-      .strict(),
-  },
-  agent_skill_read: {
-    description:
-      "Load an Agent Skill's SKILL.md (YAML frontmatter + markdown body) by name. " +
-      "Skills are discovered from <projectRoot>/.xum/skills/<name>/SKILL.md, <projectRoot>/.agents/skills/<name>/SKILL.md, ~/.xum/skills/<name>/SKILL.md, and ~/.agents/skills/<name>/SKILL.md.",
-    schema: z
-      .object({
-        name: SkillNameSchema.describe("Skill name (directory name under the skills root)"),
-      })
-      .strict(),
-  },
-  agent_skill_read_file: {
-    description:
-      "Read a file within an Agent Skill directory. " +
-      "filePath must be relative to the skill directory (no absolute paths, no ~, no .. traversal). " +
-      "Supports offset/limit like file_read.",
-    schema: z
-      .object({
-        name: SkillNameSchema.describe("Skill name (directory name under the skills root)"),
-        filePath: z
-          .string()
-          .min(1)
-          .describe("Path to the file within the skill directory (relative)"),
-        offset: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("1-based starting line number (optional, defaults to 1)"),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe(
-            "Number of lines to return from offset (optional, returns all if not specified)"
-          ),
-      })
-      .strict(),
-  },
-  agent_skill_list: {
-    description:
-      "List available skills. In a project workspace, lists project skills from .xum/skills/ and legacy/universal .agents/skills/, plus global skills from ~/.xum/skills/ and legacy/universal ~/.agents/skills/, each tagged with its scope. In the system workspace, lists global skills only.",
-    schema: z
-      .object({
-        includeUnadvertised: z
-          .boolean()
-          .nullish()
-          .describe(
-            "When true, includes skills hidden from the index (advertise: false or disable-model-invocation: true)"
-          ),
-      })
-      .strict(),
-  },
-  agent_skill_write: {
-    description:
-      "Create or update a file within the contextual skills directory. In a project workspace, writes under .xum/skills/<name>/. In the system workspace, writes under ~/.xum/skills/<name>/. " +
-      "When writing SKILL.md, content is validated as a skill definition and frontmatter.name is aligned to the skill name argument.",
-    schema: z
-      .object({
-        name: SkillNameSchema.describe("Skill name (directory name under the global skills root)"),
-        filePath: z
-          .string()
-          .min(1)
-          .nullish()
-          .describe("Relative path within skill directory. Defaults to SKILL.md"),
-        content: z.string().min(1).describe("File content to write"),
-      })
-      .strict(),
-  },
-  agent_skill_delete: {
-    description:
-      "Delete either a file within the contextual skills directory or the entire skill directory. In a project workspace, deletes from .xum/skills/. In the system workspace, deletes from ~/.xum/skills/. " +
-      "Requires confirm: true.",
-    schema: z
-      .object({
-        name: SkillNameSchema.describe("Skill name to delete"),
-        target: z
-          .enum(["file", "skill"])
-          .nullish()
-          .describe(
-            "Deletion target: 'file' to delete a specific file, 'skill' to remove the entire skill directory (defaults to file)"
-          ),
-        filePath: z
-          .string()
-          .min(1)
-          .nullish()
-          .describe(
-            "Relative file path within the skill directory to delete. Required when target is 'file'"
-          ),
-        confirm: z.boolean().describe("Must be true to confirm deletion"),
-      })
-      .strict(),
-  },
-
-  skills_catalog_search: {
-    description:
-      "Search the skills.sh community catalog for agent skills. " +
-      "Returns a list of matching skills with their IDs, names, source repos, and install counts. " +
-      "Use skills_catalog_read to preview a skill's full content before installing.",
-    schema: z
-      .object({
-        query: z.string().describe("Search query to find skills in the catalog"),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(50)
-          .nullish()
-          .describe("Maximum number of results to return (default: 10)"),
-      })
-      .strict(),
-  },
-
-  skills_catalog_read: {
-    description:
-      "Read the full SKILL.md content for a skill from the skills.sh community catalog. " +
-      "Use this to preview a skill's documentation before installing it with agent_skill_write. " +
-      "The owner and repo come from skills_catalog_search results.",
-    schema: z
-      .object({
-        owner: z.string().describe("GitHub owner from the search result (e.g. 'vercel-labs')"),
-        repo: z
-          .string()
-          .describe("GitHub repository name from the search result (e.g. 'agent-skills')"),
-        skillId: SkillNameSchema.describe("Skill ID from the search result"),
-      })
-      .strict(),
-  },
-
-  file_edit_replace_string: {
-    description:
-      "⚠️ CRITICAL: Always check tool results - edits WILL fail if old_string is not found or unique. Do not proceed with dependent operations (commits, pushes, builds) until confirming success.\n\n" +
-      "Apply one or more edits to a file by replacing exact text matches. All edits are applied sequentially. Each old_string must be unique in the file unless replace_count > 1 or replace_count is -1.",
-    schema: z.preprocess(
-      normalizeFilePath,
-      z.object({
-        path: FILE_TOOL_PATH,
-        old_string: z
-          .string()
-          .describe(
-            "The exact text to replace (must be unique in file if replace_count is 1). Include enough context (indentation, surrounding lines) to make it unique."
-          ),
-        new_string: z.string().describe("The replacement text"),
-        replace_count: z
-          .number()
-          .int()
-          .nullish()
-          .describe(
-            "Number of occurrences to replace (default: 1). Use -1 to replace all occurrences. If 1, old_string must be unique in the file."
-          ),
-      })
-    ),
-  },
-  file_edit_replace_lines: {
-    description:
-      "⚠️ CRITICAL: Always check tool results - edits WILL fail if line numbers are invalid or file content has changed. Do not proceed with dependent operations (commits, pushes, builds) until confirming success.\n\n" +
-      "Replace a range of lines in a file. Use this for line-based edits when you know the exact line numbers to modify.",
-    schema: z.preprocess(
-      normalizeFilePath,
-      z.object({
-        path: FILE_TOOL_PATH,
-        start_line: z.number().int().min(1).describe("1-indexed start line (inclusive) to replace"),
-        end_line: z.number().int().min(1).describe("1-indexed end line (inclusive) to replace"),
-        new_lines: z
-          .array(z.string())
-          .describe("Replacement lines. Provide an empty array to delete the specified range."),
-        expected_lines: z
-          .array(z.string())
-          .nullish()
-          .describe(
-            "Optional safety check. When provided, the current lines in the specified range must match exactly."
-          ),
-      })
-    ),
-  },
-  file_edit_insert: {
-    description:
-      "Insert content into a file using substring guards. " +
-      "Provide exactly one of insert_before or insert_after to anchor the operation when editing an existing file. " +
-      "When the file does not exist or is empty, it is populated automatically without guards. " +
-      "Optional before/after substrings must uniquely match surrounding content. " +
-      "Avoid short guards like `}` or `}\\n` that match multiple locations — " +
-      `use longer patterns like full function signatures or unique comments. ${TOOL_EDIT_WARNING}`,
-    schema: z.preprocess(
-      normalizeFilePath,
-      z
-        .object({
-          path: FILE_TOOL_PATH,
-          insert_before: z
-            .string()
-            .min(1)
-            .nullish()
-            .describe(
-              "Anchor text to insert before. Content will be placed immediately before this substring."
-            ),
-          insert_after: z
-            .string()
-            .min(1)
-            .nullish()
-            .describe(
-              "Anchor text to insert after. Content will be placed immediately after this substring."
-            ),
-          content: z.string().describe("The content to insert"),
-        })
-        .refine((data) => !(data.insert_before != null && data.insert_after != null), {
-          message: "Provide only one of insert_before or insert_after (not both).",
-          path: ["insert_before"],
-        })
-    ),
-  },
-  advisor: {
-    description: ADVISOR_TOOL_DESCRIPTION,
-    schema: AdvisorToolInputSchema,
-  },
-  ask_user_question: {
-    description:
-      "Ask 1–4 multiple-choice questions (with optional multi-select) and wait for the user's answers. " +
-      "This tool is intended for plan mode. " +
-      "Use it ONLY for genuinely balanced decisions that hinge on user-specific context, preference, or information not present in the conversation or repo. " +
-      "Do NOT use it when you already have a reasonable recommendation: if one option is clearly best, proceed with it (stating the assumption) instead of asking — surfacing a question you can answer yourself defeats the purpose. " +
-      "When you do ask, keep the options genuinely open; do not steer toward a single 'recommended' choice. " +
-      "Do not output a list of open questions; ask them via this tool instead. " +
-      "Each question must include 2–4 options; an 'Other' choice is provided automatically.",
-    schema: AskUserQuestionToolArgsSchema,
-  },
-  // `internal` tools are excluded from user-facing tool docs (hooks/tools.mdx
-  // env-var tables) because users can't write hooks for them — they run via
-  // bespoke streamText paths in their own services, not the standard tool
-  // execution pipeline. See gen_docs.ts.
-  propose_name: {
-    description:
-      "Propose a workspace name and title. You MUST call this tool exactly once with your chosen name and title. " +
-      "Do not emit a text response; call this tool immediately.",
-    schema: ProposeNameToolArgsSchema,
-    internal: true,
-  },
-  propose_status: {
-    description:
-      "Propose a short sidebar status (emoji + 2-6 word verb-led phrase) summarizing what the agent is currently doing. " +
-      "You MUST call this tool exactly once. Do not emit a text response; call this tool immediately.",
-    schema: ProposeStatusToolArgsSchema,
-    internal: true,
-  },
-  propose_plan: {
-    description:
-      "Signal that your plan is complete and ready for user approval. " +
-      "This tool reads the plan from the plan file you wrote. " +
-      "You must write your plan to the plan file before calling this tool. " +
-      "After calling this tool, do not paste the plan contents or mention the plan file path; the UI already shows the full plan.",
-    schema: z.object({}),
-  },
-  task: {
-    description: buildTaskToolDescription(undefined),
-    schema: TaskToolArgsSchema,
-  },
-  task_apply_git_patch: {
-    description:
-      "Apply a completed sub-agent task's git-format-patch artifact to the current workspace using `git am`. " +
-      "This is an explicit integration step: Xum will not auto-apply patches.",
-    schema: TaskApplyGitPatchToolArgsSchema,
-  },
-  task_await: {
-    description:
-      "Wait for one or more tasks or workflow runs to produce output. " +
-      "\n\nWHEN TO USE: only call task_await when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
-      "Do not call task_await solely because active tasks exist; for unrelated user messages, respond directly and let tasks continue in the background. " +
-      "If a synthetic/system follow-up explicitly says active background tasks or workflow runs block your turn, treat that as a dependency and await the listed IDs. " +
-      "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly — do NOT call task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
-      "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task, bash, or workflow_run — " +
-      "the taskId/runId is not available until the spawning tool returns. " +
-      "Always wait for the task/bash/workflow_run tool result first, then call task_await in a subsequent step. " +
-      "When omitting task_ids to await active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. Omitted task_ids discover top-level workflow runs only and exclude workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs. " +
-      "\n\nAgent tasks and workflow runs return reports when completed. " +
-      "Completed reports are persisted on disk and survive context compaction: calling task_await on an already-completed task/workflow run ID (timeout_secs: 0 for non-blocking) re-fetches the full report instead of re-running the work. " +
-      "Bash tasks return incremental output while running and a final reportMarkdown when they exit. " +
-      "For bash tasks, you may optionally pass filter/filter_exclude to include/exclude output lines by regex. " +
-      "WARNING: when using filter, non-matching lines are permanently discarded. " +
-      "Use this tool to WAIT; do not poll task_list in a loop to wait for task completion (that is misuse and wastes tool calls). " +
-      "\n\nBy default (min_completed=1) this returns as soon as the FIRST awaited task completes, so you can begin dependent work on that result while the rest keep running — then call task_await again for the remainder. " +
-      "This is ideal for independent tasks or any case where per-result work exists. " +
-      "Set min_completed higher (up to the number of awaited tasks) when you genuinely need more before proceeding — e.g. best-of-N synthesis that must compare every candidate should pass min_completed equal to the batch size. " +
-      "The result always includes every task complete at the moment it returns, plus current status for the rest; not-yet-completed tasks keep running and stay re-awaitable on a later call. " +
-      "Active workflow-run results may include compact `workflowProgress` (latest phase, last progress timestamp, and step counts); use that to see that phased progress is still happening instead of treating elapsed time alone as a hang. " +
-      "You always get per-task results (like Promise.allSettled), just possibly before every task has finished. " +
-      "Possible statuses: completed, queued, starting, running, backgrounded, awaiting_report, interrupted, not_found, invalid_scope, error. " +
-      "Bash task outputs may be automatically filtered; when this happens, check each result's note for details and (if available) where the full output was saved.",
-    schema: TaskAwaitToolArgsSchema,
-  },
-  task_send_message: {
-    description:
-      'Send a plain-text message to another agent workspace in this task tree: a descendant sub-agent, a sibling/cousin, or an ancestor (including the root workspace). The relationship is computed server-side from the tree — you can never claim parent authority you do not have. Discover addressable peers with task_list scope:"tree". ' +
-      "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
-      "Sibling and ancestor targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; they must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only). Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
-      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces outside this task tree.",
-    schema: TaskSendMessageToolArgsSchema,
-  },
-  task_message_parent: {
-    description:
-      "Send a message up to your parent workspace (RLM family messaging). It is appended to the parent's queue as a clearly-labeled child message and coalesces behind a busy parent turn, dispatching at the parent's next tool boundary. " +
-      "The parent has no obligation to reply and no delivery receipt is produced. Keep using agent_report for progress updates and your final report.",
-    schema: TaskMessageParentToolArgsSchema,
-  },
-  task_message_sibling: {
-    description:
-      "Send a message to a sibling sub-agent that shares your DIRECT parent (nuclear-family scoping: exactly one hop up plus one hop down). Any other target — grandparent, grandchild, uncle, or unrelated task — is refused with invalid_scope. " +
-      "The message arrives in the sibling's queue as a clearly-labeled message; a busy sibling picks it up at its next tool boundary.",
-    schema: TaskMessageSiblingToolArgsSchema,
-  },
-  task_retitle: {
-    description:
-      "Change the short, friendly role name of a persistent descendant sub-agent without changing its stable task identity or workspace. Active and inactive user-owned children can be retitled; workflow-owned internal workers cannot.",
-    schema: TaskRetitleToolArgsSchema,
-  },
-  task_stop: {
-    description:
-      "Stop one or more tasks without removing persistent child workspaces. Sub-agent trees are stopped leaf-first and unfinished children become interrupted; workspace turns and workflow runs are interrupted; bash processes are terminated. Use this to cancel or abandon work, not to mark useful progress as completed—ask a child to finalize with task_send_message and await its report instead. Stopping an already-inactive task is idempotent.",
-    schema: TaskStopToolArgsSchema,
-  },
-  task_remove: {
-    description:
-      "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
-    schema: TaskRemoveToolArgsSchema,
-  },
-  task_workspace_lifecycle: {
-    description:
-      'Reversibly archive or unarchive full workspaces that the current workspace created via task(kind="workspace"). ' +
-      "Scoped by durable workspace-turn ownership records: it cannot act on arbitrary user workspaces or sub-agent children (non-wst_ task IDs are invalid_scope). " +
-      'Use action="archive" when a peer workspace\'s work is complete; archived targets refuse task(kind="workspace", mode="existing") follow-ups until unarchived. ' +
-      "Active workspace turns involving the target (delegated to it, or owned by it for nested delegation) are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
-      "Live user activity in the target (a manual stream, terminal, or desktop session) also refuses archive and is never interrupted by this tool. " +
-      "Archive may return requires_confirmation with untracked paths when a snapshot would be lossy — the confirmation is checked before any interruption; re-call with acknowledged_untracked_paths to confirm. " +
-      'Archive of a managed-worktree target is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation; targets the worktree policy cannot delete (SSH/Coder, Docker, project-dir local, or shared isolation-none checkouts) stay archivable. ' +
-      "For irreversible removal of inactive sub-agent children, use task_remove instead.",
-    schema: TaskWorkspaceLifecycleToolInputSchema,
-  },
-  task_list: {
-    description:
-      "List descendant tasks for the current workspace, including status + metadata. " +
-      "This includes sub-agent tasks, background bash tasks, and top-level workflow runs, but omits workflow-owned sub-agents/background bash tasks whose reports are consumed through parent workflow runs. " +
-      "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. Sub-agent rows from grouped runs include `bestOf` metadata so they can be distinguished from the standalone reusable bench. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
-      "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
-      "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
-      'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are addressable via task_send_message except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to keep candidates independent), and non-descendant rows in terminal states (peers cannot reactivate an inactive task — only its parent can); the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
-      "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
-      "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
-    schema: TaskListToolArgsSchema,
-  },
-  workflow_run: {
-    // Prefer foreground workflows so callers do not waste a turn polling when no other work can proceed.
-    description:
-      "Start a durable workflow run from exactly one launch source: script_path for a JavaScript file/skill workflow, or script_source for compact one-off inline workflow source. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
-      "An active run of the same script in this workspace blocks a duplicate start unless allow_concurrent=true; reattach to the reported run with task_await or workflow_resume instead of relaunching it. " +
-      "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source for one-off conductors whose exact source should be snapshotted into the durable run. " +
-      "When a skill, instruction block, or plan describes a multi-phase, looping, or multi-agent process in prose and ships no packaged workflow script, prefer codifying that process as a one-off script_source workflow over executing every phase in-context: " +
-      "the conductor follows the documented phases more faithfully and gains durable checkpoints, resume, and fresh delegated context per phase. " +
-      "Use agent_skill_read / agent_skill_read_file to discover and inspect skill-packaged workflows; non-skill workflow files must be addressed by an explicit known path and can be inspected with normal file tools. " +
-      "Prefer the default foreground mode (`run_in_background` omitted or false) so completed workflows return their result without an extra task_await round-trip. " +
-      "If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using or reporting the workflow output. " +
-      "After a previous workflow_run error, abort, timeout, or uncertain result, do not start a fresh run until you rediscover existing workflow runs: either omit task_list statuses first, or query pending/running/backgrounded/interrupted/failed/completed together. " +
-      "Use task_await for running/backgrounded runs, workflow_resume for pending/interrupted runs, workflow_resume({ mode: 'retry_from_checkpoint' }) only for eligible failed runs, and inspect/refetch completed results instead of rerunning. " +
-      "Use background mode only when you intend to start another workflow/task or do independent work while the workflow runs; a background run is non-blocking and Xum wakes this workspace with the terminal workflow result, so call task_await only when the current request depends on the output before you can answer.",
-    schema: WorkflowRunToolArgsSchema,
-  },
-  workflow_resume: {
-    description:
-      "Resume an existing durable workflow run by run ID (wfr_...). Use this for runs that were interrupted (by the user, task_stop, or an app crash/restart) — " +
-      "resume replays the durable event log and continues from the last checkpoint without re-executing completed steps. " +
-      "Discover resumable runs with task_list (statuses pending/interrupted/failed). Pending runs left by post-create aborts and interrupted runs can be resumed in default mode; running/backgrounded workflows do not need resume, await them with task_await. " +
-      "For failed runs, pass mode='retry_from_checkpoint' explicitly; it re-executes work after the last checkpoint, so only use it when that is acceptable, and start a fresh workflow_run when it is rejected as unsafe. " +
-      "Calling this on a completed run returns its existing result without re-running anything. " +
-      "Prefer foreground mode (run_in_background omitted or false) to get the final result directly; " +
-      "if the returned status is running or backgrounded, await the runId with task_await before using the result.",
-    schema: WorkflowResumeToolArgsSchema,
-  },
-  agent_report: {
-    description:
-      "Send an incremental update from a sub-agent to its parent workspace and wake the parent. " +
-      "Call this whenever the parent should see important progress or a finding before the task is complete; it may be called multiple times. " +
-      "Do not use it for the final result—the final assistant message completes the sub-agent task.",
-    schema: AgentReportToolArgsSchema,
-  },
-  timeline_event: {
-    description:
-      "Record one notable step on the durable workspace timeline, which is a birds-eye record of the work rather than a tool log. " +
-      "Call it when: a notable implementation step landed; work was committed, pushed, or opened as a PR; " +
-      "external input was picked up, such as a review comment, CI failure, or issue; " +
-      "the approach changed, including why; a blocker was hit or resolved; work was handed off. " +
-      "Describe what happened in one plain sentence. " +
-      "Prompts, goals, heartbeats, sub-agents, and workflows are already recorded automatically, so do not restate them or narrate routine tool use.",
-    schema: z
-      .object({
-        description: z.string().min(1).max(300).describe("One sentence describing what happened."),
-        category: z
-          .enum(["picked_up", "milestone", "decision", "blocker", "handoff"])
-          .nullish()
-          .describe("Optional event category."),
-      })
-      .strict(),
-  },
-  set_goal: {
-    description:
-      "Create or replace a durable goal for this current parent workspace when the user explicitly asks for multi-turn, verifiable work. " +
-      "Do not use this for one-shot questions. Objectives must be concrete, measurable, and verifiable. " +
-      "Omitted or null budget/turn fields use the effective workspace goal defaults; model-created goals must resolve to at least one budget or turn bound. " +
-      "Do not replace an active, paused, or budget-limited goal unless the user explicitly asked to replace it; when replacing, first call get_goal and pass replaceExistingGoal=true with the current expectedGoalId. " +
-      "After setting a goal during your own turn, let subsequent automatic continuation turns do the substantial goal work, then call complete_goal only after verification.",
-    schema: z
-      .object({
-        objective: z
-          .string()
-          .trim()
-          .min(1)
-          .describe("Concrete, measurable objective to pursue over automatic goal continuations."),
-        budgetCents: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe(
-            "Optional positive budget in cents. Omit/null to apply the effective workspace goal default."
-          ),
-        turnCap: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe(
-            "Optional positive maximum automatic continuation turns. Omit/null to apply the effective workspace goal default."
-          ),
-        replaceExistingGoal: z
-          .boolean()
-          .nullish()
-          .describe("Set true only when the user explicitly asked to replace the current goal."),
-        expectedGoalId: z
-          .string()
-          .uuid()
-          .nullish()
-          .describe(
-            "Optimistic-concurrency token required when replacing an active, paused, or budget-limited goal. Use the goalId from get_goal."
-          ),
-      })
-      .strict(),
-  },
-  get_goal: {
-    description:
-      "Read the current workspace goal. Returns null when no goal is available in this turn.",
-    schema: z.object({}).strict(),
-  },
-  complete_goal: {
-    description:
-      "Mark the current workspace goal complete with a concise 1-2 sentence summary of why the goal is done. " +
-      "This tool only completes goals; it cannot pause, resume, replace, or change goal budgets. " +
-      "Pass the `goalId` returned by `get_goal` so the completion is rejected with a typed conflict " +
-      "error if the user clears or replaces the goal mid-stream rather than throwing a confusing " +
-      "validation error.",
-    schema: z
-      .object({
-        summary: z
-          .string()
-          .trim()
-          .min(1)
-          .describe("Required 1-2 sentence justification for completing the current goal."),
-        goalId: z
-          .string()
-          .nullish()
-          .describe(
-            "Optional optimistic-concurrency token. Pass the `goalId` returned by `get_goal` to " +
-              "ensure the completion is rejected with a typed conflict error if the user clears " +
-              "or replaces the goal mid-stream."
-          ),
-      })
-      .strict(),
-  },
-
-  heartbeat: {
-    description:
-      "Read or change this workspace's scheduled heartbeat. " +
-      "The tool only affects the current workspace; it does not accept a workspaceId. " +
-      "Use action='set' to enable or configure the heartbeat interval, custom message, context mode, trigger, when-busy behavior, or enabled flag. " +
-      "trigger chooses the countdown anchor: 'idle' (default) fires only after the workspace has been quiet for a full interval; 'interval' fires on a fixed wall-clock cadence. " +
-      "whenBusy chooses what happens when a heartbeat fires while the workspace is busy: 'skip' misses the slot, 'tool-end'/'turn-end' queue the heartbeat for the matching boundary. " +
-      "Unset whenBusy defaults to 'skip' for trigger 'idle' and 'turn-end' for trigger 'interval'. " +
-      "Use action='unset' to remove this workspace's heartbeat settings entirely. " +
-      "Use action='get' before changing settings when you need to preserve existing values.",
-    schema: HeartbeatToolArgsSchema,
-  },
-  todo_write: {
-    description:
-      "Create or update the todo list for tracking multi-step tasks (limit: 7 items). " +
-      "The TODO list is displayed to the user at all times. " +
-      "Replace the entire list on each call - the AI tracks which tasks are completed.\n" +
-      "\n" +
-      "Mark tasks as in_progress when actively being worked on (multiple allowed for parallel work). " +
-      "Order tasks as: completed first, then in_progress, then pending last. " +
-      "Use appropriate tense in content: past tense for completed (e.g., 'Added tests'), " +
-      "present progressive for in_progress (e.g., 'Adding tests'), " +
-      "and imperative/infinitive for pending (e.g., 'Add tests').\n" +
-      "\n" +
-      "If you hit the 7-item limit, summarize older completed items into one line " +
-      "(e.g., 'Completed initial setup (3 tasks)').\n" +
-      "\n" +
-      "Update the list as work progresses. If work fails or the approach changes, update " +
-      "the list to reflect reality - only mark tasks complete when they actually succeed.",
-    schema: z.object({
-      todos: z.array(
-        z.object({
-          content: z
-            .string()
-            .describe(
-              "Task description with tense matching status: past for completed, present progressive for in_progress, imperative for pending"
-            ),
-          status: z.enum(["pending", "in_progress", "completed"]).describe("Task status"),
-        })
-      ),
-    }),
-  },
-  todo_read: {
-    description: "Read the current todo list",
-    schema: z.object({}),
-  },
-  review_pane_update: {
-    description:
-      "Flag specific code regions in the Review pane for the user to review next. " +
-      "Use this to draw the user's attention to critical changes you want reviewed first. " +
-      "Each hunk references a project-relative file path with an optional inclusive line " +
-      'range using familiar syntax: "src/foo.ts" (whole file), "src/foo.ts:42" (single line), ' +
-      'or "src/foo.ts:42-58" (range, new-file line numbers). Project-relative paths are ' +
-      "preferred; use './' or '../' for paths that must resolve from the current tool cwd. " +
-      "Attach a short comment to each " +
-      "hunk explaining what to look at and why.\n\n" +
-      "operation:\n" +
-      "  - 'replace' (default): overwrite the current assisted set\n" +
-      "  - 'add': append to the existing set, deduplicating exact path:range matches\n\n" +
-      "Flagged hunks appear pinned at the top of the Review pane; the user can toggle " +
-      "'Assisted' to hide everything else. Pass an empty hunks array with operation='replace' " +
-      "to clear the set when review is no longer needed.",
-    schema: z
-      .object({
-        operation: z
-          .enum(["add", "replace"])
-          .describe("'replace' overwrites the assisted set; 'add' appends to it."),
-        hunks: z
-          .array(
-            z
-              .object({
-                path: z
-                  .string()
-                  .min(1)
-                  .describe(
-                    'Filter in `path[:range]` form, e.g. "src/foo.ts" or "src/foo.ts:42-58". ' +
-                      "Path is project-relative; use './' or '../' when the path must resolve from the current tool working directory. Range uses new-file line numbers (inclusive)."
-                  ),
-                comment: z
-                  .string()
-                  .nullish()
-                  .describe("Short note (~1 sentence) telling the user what to look at and why."),
-              })
-              .strict()
-          )
-          .describe("List of hunks to flag for review."),
-      })
-      .strict(),
-  },
-  review_pane_get: {
-    description:
-      "Return the current set of agent-flagged hunks in the Review pane, in declared order. " +
-      "Use this to inspect what you've already pinned before adding more.",
-    schema: z.object({}).strict(),
-  },
-  bash_output: {
-    description:
-      'DEPRECATED: use task_await instead (pass bash-prefixed taskId like "bash:<processId>"). ' +
-      "Retrieve output from a running or completed background bash process. " +
-      "Returns only NEW output since the last check (incremental). " +
-      "Returns stdout and stderr output along with process status. " +
-      "Supports optional regex filtering to show only lines matching a pattern. " +
-      "WARNING: When using filter, non-matching lines are permanently discarded. " +
-      "Use timeout to wait for output instead of polling repeatedly. " +
-      "Large outputs may be automatically filtered; when this happens, the result includes a note explaining what was kept and (if available) where the full output was saved.",
-    schema: z.object({
-      process_id: z.string().describe("The ID of the background process to retrieve output from"),
-      filter: z
-        .string()
-        .nullish()
-        .describe(
-          "Optional regex to filter output lines. By default, only matching lines are returned. " +
-            "When filter_exclude is true, matching lines are excluded instead. " +
-            "Non-matching lines are permanently discarded and cannot be retrieved later."
-        ),
-      filter_exclude: z
-        .boolean()
-        .nullish()
-        .describe(
-          "When true, lines matching 'filter' are excluded instead of kept. " +
-            "Key behavior: excluded lines do NOT cause early return from timeout - " +
-            "waiting continues until non-excluded output arrives or process exits. " +
-            "Use to avoid busy polling on progress spam (e.g., filter='⏳|waiting|\\.\\.\\.' with filter_exclude=true " +
-            "lets you set a long timeout and only wake on meaningful output). " +
-            "Requires 'filter' to be set."
-        ),
-      timeout_secs: z
-        .number()
-        .min(0)
-        .describe(
-          "Seconds to wait for new output. " +
-            "If no output is immediately available and process is still running, " +
-            "blocks up to this duration. Returns early when output arrives or process exits. " +
-            "Only use long timeouts (>15s) when no other useful work can be done in parallel."
-        ),
-    }),
-  },
-  bash_background_list: {
-    description:
-      "DEPRECATED: use task_list instead. " +
-      "List all background processes started with bash(run_in_background=true). " +
-      "Returns process_id, status, script for each process. " +
-      "Use to find process_id for termination or check output with bash_output.",
-    schema: z.object({}),
-  },
-  bash_background_terminate: {
-    description:
-      "DEPRECATED: use task_stop instead. " +
-      "Terminate a background process started with bash(run_in_background=true). " +
-      "Use process_id from the original bash response or from bash_background_list. " +
-      "Sends SIGTERM, waits briefly, then SIGKILL if needed. " +
-      "Output remains available via bash_output after termination.",
-    schema: z.object({
-      process_id: z.string().describe("Background process ID to terminate"),
-    }),
-  },
-  analytics_query: {
-    description: `Execute a DuckDB SQL query against Xum analytics tables and optionally provide visualization hints.
-Use read-only SELECT queries over analytics data.
-
-DuckDB SQL guidelines:
-- Use SELECT queries only; do not write, alter, or drop tables.
-- Prefer explicit column lists and aliases so result sets are easy to understand.
-- Use ORDER BY and LIMIT for exploratory queries over large datasets.
-- Use DuckDB date/time helpers (for example date_trunc, CAST(... AS DATE), and interval arithmetic) for time series.
-
-Available tables:
-
-CREATE TABLE IF NOT EXISTS events (
-  workspace_id VARCHAR NOT NULL,
-  project_path VARCHAR,
-  project_name VARCHAR,
-  workspace_name VARCHAR,
-  parent_workspace_id VARCHAR,
-  agent_id VARCHAR,
-  timestamp BIGINT,
-  date DATE,
-  model VARCHAR,
-  thinking_level VARCHAR,
-  input_tokens INTEGER DEFAULT 0,
-  output_tokens INTEGER DEFAULT 0,
-  reasoning_tokens INTEGER DEFAULT 0,
-  cached_tokens INTEGER DEFAULT 0,
-  cache_create_tokens INTEGER DEFAULT 0,
-  input_cost_usd DOUBLE DEFAULT 0,
-  output_cost_usd DOUBLE DEFAULT 0,
-  reasoning_cost_usd DOUBLE DEFAULT 0,
-  cached_cost_usd DOUBLE DEFAULT 0,
-  total_cost_usd DOUBLE DEFAULT 0,
-  duration_ms DOUBLE,
-  ttft_ms DOUBLE,
-  streaming_ms DOUBLE,
-  tool_execution_ms DOUBLE,
-  output_tps DOUBLE,
-  response_index INTEGER,
-  is_sub_agent BOOLEAN DEFAULT false
-)
-
-CREATE TABLE IF NOT EXISTS delegation_rollups (
-  parent_workspace_id VARCHAR NOT NULL,
-  child_workspace_id VARCHAR NOT NULL,
-  project_path VARCHAR,
-  project_name VARCHAR,
-  agent_type VARCHAR,
-  model VARCHAR,
-  total_tokens INTEGER DEFAULT 0,
-  context_tokens INTEGER DEFAULT 0,
-  input_tokens INTEGER DEFAULT 0,
-  output_tokens INTEGER DEFAULT 0,
-  reasoning_tokens INTEGER DEFAULT 0,
-  cached_tokens INTEGER DEFAULT 0,
-  cache_create_tokens INTEGER DEFAULT 0,
-  report_token_estimate INTEGER DEFAULT 0,
-  total_cost_usd DOUBLE DEFAULT 0,
-  rolled_up_at_ms BIGINT,
-  date DATE,
-  PRIMARY KEY (parent_workspace_id, child_workspace_id)
-)`,
-    schema: z.object({
-      sql: z.string().min(1).describe("DuckDB SQL query to execute"),
-      visualization: z
-        .enum(["table", "bar", "line", "pie", "area", "stacked_bar"])
-        .nullish()
-        .describe("Optional visualization type for rendering the query result"),
-      title: z.string().nullish().describe("Optional chart title"),
-      x_axis: z.string().nullish().describe("Optional column name for the visualization X axis"),
-      y_axis: z
-        .array(z.string())
-        .nullish()
-        .describe("Optional column name(s) for the visualization Y axis"),
-    }),
-  },
-  web_fetch: {
-    description:
-      `Fetch a web page and extract its main content as clean markdown. ` +
-      `Uses the workspace's network context (requests originate from the workspace, not Xum host). ` +
-      `Requires curl to be installed in the workspace. ` +
-      `Output is truncated to ${Math.floor(WEB_FETCH_MAX_OUTPUT_BYTES / 1024)}KB.`,
-    schema: z.object({
-      url: z.string().url().describe("The URL to fetch (http or https)"),
-    }),
-  },
-  code_execution: {
-    description:
-      "Execute JavaScript code in a sandboxed environment with access to Xum tools. " +
-      "Available for multi-tool workflows when PTC experiment is enabled.",
-    schema: z.object({
-      code: z.string().min(1).describe("JavaScript code to execute in the PTC sandbox"),
-    }),
-  },
-  refinement_rollback: {
-    description:
-      "Roll back a journaled harness self-modification (a memory or skill edit) by its refinement row id, " +
-      "restoring the exact prior file contents recorded in the session's refinement journal. " +
-      "The rollback is journaled as a refinement row of its own, so it can be rolled back again. " +
-      "Refuses rows that were already rolled back and rows whose files changed since (divergence). " +
-      "Available only in RLM mode.",
-    schema: z
-      .object({
-        id: z.string().min(1).describe("Refinement row id (envelope id) to roll back"),
-        reason: z
-          .string()
-          .min(1)
-          .describe("Why this refinement is being rolled back (recorded in the journal)"),
-      })
-      .strict(),
-  },
-  // #region NOTIFY_DOCS
-  notify: {
-    description:
-      "Send a system notification to the user. Use this to alert the user about important events that require their attention, such as long-running task completion, errors requiring intervention, or questions. " +
-      "Notifications appear as OS-native notifications (macOS Notification Center, Windows Toast, Linux). " +
-      "Infer whether to send notifications from user instructions. If no instructions provided, reserve notifications for major wins or blocking issues. Do not use for routine progress updates — keep the todo list current instead.",
-    schema: z
-      .object({
-        title: z
-          .string()
-          .min(1)
-          .max(64)
-          .describe("Short notification title (max 64 chars). Should be concise and actionable."),
-        message: z
-          .string()
-          .max(200)
-          .nullish()
-          .describe(
-            "Optional notification body with more details (max 200 chars). " +
-              "Keep it brief - users may only see a preview."
-          ),
-      })
-      .strict(),
-  },
-  // #endregion NOTIFY_DOCS
-  tool_catalog_search: {
-    description:
-      "Search the catalog of deferred tools. Some tools (provided by MCP servers) are deferred: " +
-      "they exist but are not currently visible in your tool list. " +
-      "Call tool_catalog_search with task/capability keywords to discover them; matched tools become available on the next step. " +
-      "Returns matched tool names and descriptions plus the total number of deferred tools (there may be more undiscovered — refine the query to find them).",
-    schema: z
-      .object({
-        query: z
-          .string()
-          .min(1)
-          .describe(
-            "Task or capability keywords to search for (matched against tool names, descriptions, and parameter names)"
-          ),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(25)
-          .nullish()
-          .describe("Maximum number of matches to return (default 10, max 25)"),
-      })
-      .strict(),
-  },
-  mcp_prompt_get: {
-    description:
-      "Fetch a prompt template from a connected MCP server, expanded with the given arguments. " +
-      "MCP prompts are reusable instructions or workflows the user has made available through MCP servers. " +
-      "The result contains the prompt text; follow it as task guidance in the current conversation. " +
-      "Available prompts are listed in this description when connected servers advertise them.",
-    schema: z
-      .object({
-        name: z
-          .string()
-          .min(1)
-          .describe('Prompt name from the available list, e.g. "mcp__server__prompt"'),
-        arguments: z
-          .record(z.string(), z.string())
-          .nullish()
-          .describe(
-            "Prompt argument values by argument name. Arguments marked with ? are optional; all others are required."
-          ),
-        list_offset: z
-          .number()
-          .int()
-          .min(0)
-          .nullish()
-          .describe(
-            "When an unknown-name error truncates the prompt listing, repeat the call with the suggested list_offset to page through the remaining prompt names."
-          ),
-      })
-      .strict(),
-  },
-} as const;
-
 // -----------------------------------------------------------------------------
 // Result Schemas for Bridgeable Tools (PTC Type Generation)
 // -----------------------------------------------------------------------------
@@ -3369,76 +2202,1225 @@ export const MemoryToolResultSchema = z.union([
   }),
 ]);
 
-/**
- * Names of tools that are bridgeable to PTC sandbox.
- * If adding a new tool here, you must also add its result schema below.
- */
-export type BridgeableToolName =
-  | "bash"
-  | "bash_output"
-  | "bash_background_list"
-  | "bash_background_terminate"
-  | "file_read"
-  | "attach_file"
-  | "agent_skill_read"
-  | "agent_skill_read_file"
-  | "file_edit_insert"
-  | "file_edit_replace_string"
-  // Note: for Anthropic models, web_fetch is replaced by a provider-native tool
-  // (webFetch_20250910) that has no execute(). ToolBridge's hasExecute filter will drop it
-  // from the PTC sandbox for those sessions. That silent absence is intentional and accepted.
-  | "web_fetch"
-  | "task"
-  | "task_await"
-  | "task_apply_git_patch"
-  | "task_list"
-  | "task_send_message"
-  // Family messaging tools are bridged when the RLM experiment enables them;
-  // registering their result schemas keeps generateXumTypes from declaring
-  // them as returning unknown inside the kernel.
-  | "task_message_parent"
-  | "task_message_sibling"
-  | "task_retitle"
-  | "task_stop"
-  | "task_remove"
-  | "task_workspace_lifecycle"
-  | "heartbeat"
-  | "memory"
-  | "mcp_prompt_get";
+interface ToolDefinition {
+  description: string;
+  schema: z.ZodType;
+  internal?: boolean;
+  resultSchema?: z.ZodType;
+  ptcExcluded?: string;
+}
 
-/**
- * Lookup map for result schemas by tool name.
- * Used by PTC type generator to get result types for bridgeable tools.
- *
- * Type-level enforcement ensures all BridgeableToolName entries have schemas.
- */
-export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
-  bash: BashToolResultSchema,
-  bash_output: BashOutputToolResultSchema,
-  bash_background_list: BashBackgroundListResultSchema,
-  bash_background_terminate: BashBackgroundTerminateResultSchema,
-  file_read: FileReadToolResultSchema,
-  attach_file: AttachFileToolResultSchema,
-  agent_skill_read: AgentSkillReadToolResultSchema,
-  agent_skill_read_file: AgentSkillReadFileToolResultSchema,
-  file_edit_insert: FileEditInsertToolResultSchema,
-  file_edit_replace_string: FileEditReplaceStringToolResultSchema,
-  web_fetch: WebFetchToolResultSchema,
-  task: TaskToolResultSchema,
-  task_await: TaskAwaitToolResultSchema,
-  task_apply_git_patch: TaskApplyGitPatchToolResultSchema,
-  task_list: TaskListToolResultSchema,
-  task_send_message: TaskSendMessageToolResultSchema,
-  task_message_parent: TaskMessageParentToolResultSchema,
-  task_message_sibling: TaskMessageSiblingToolResultSchema,
-  task_retitle: TaskRetitleToolResultSchema,
-  task_stop: TaskStopToolResultSchema,
-  task_remove: TaskRemoveToolResultSchema,
-  task_workspace_lifecycle: TaskWorkspaceLifecycleToolResultSchema,
-  heartbeat: HeartbeatToolResultSchema,
-  memory: MemoryToolResultSchema,
-  mcp_prompt_get: MCPPromptGetToolResultSchema,
-};
+export const TOOL_DEFINITIONS = {
+  bash: {
+    resultSchema: BashToolResultSchema,
+    description:
+      "Execute a bash command with a configurable timeout. " +
+      `Output is strictly limited to ${BASH_HARD_MAX_LINES} lines, ${BASH_MAX_LINE_BYTES} bytes per line, and ${BASH_MAX_TOTAL_BYTES} bytes total. ` +
+      "Commands that exceed these limits will FAIL with an error (no partial output returned). " +
+      "Be conservative: use 'head', 'tail', 'grep', or other filters to limit output before running commands. " +
+      "Large outputs may be automatically filtered; when this happens, the result includes a note explaining what was kept and (if available) where the full output was saved.\n" +
+      "On Windows this runs in Git Bash; to discard output use `>/dev/null` (not `>nul`). " +
+      "Background commands can include a monitor block with a regex filter; matching complete output lines wake this workspace, including after the current response, so no polling is required. Terminate monitors that are no longer relevant before finishing.",
+    schema: z.preprocess(
+      (value) => {
+        // Compatibility shims for models that emit alias fields:
+        // - some models emit `command` instead of `script`
+        // - DeepSeek v4 emits `description` instead of `display_name`
+        // Normalize both so downstream code (tool runner + UI) sees canonical args.
+        // Aliases are intentionally undocumented in the public schema; we don't
+        // want to invite other models to use the wrong field.
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+
+        let obj = value as Record<string, unknown>;
+        obj = renameAliasField(obj, "command", "script");
+        obj = renameAliasField(obj, "description", "display_name");
+        return obj;
+      },
+      z
+        .object({
+          script: z.string().describe("The bash script/command to execute"),
+          model_intent: z
+            .string()
+            .nullish()
+            .describe(
+              "Optional. Short user-facing purpose for this command, shown next to the command in collapsed chat. " +
+                "Use a present-participle phrase in plain English, under 100 characters. " +
+                "Do not repeat the command or include duration, because Xum appends those. " +
+                "Examples: 'Running the unit tests', 'Checking repository state', 'Inspecting build output'."
+            ),
+          timeout_secs: z
+            .number()
+            .positive()
+            .describe(
+              "Timeout in seconds. For foreground: max execution time before kill. " +
+                "For background: max lifetime before auto-termination. " +
+                "Start small and increase on retry; avoid large initial values to keep UX responsive"
+            ),
+          run_in_background: z
+            .boolean()
+            .default(false)
+            .describe(
+              "Run this command in the background without blocking. " +
+                "Use for processes running >5s (dev servers, builds, file watchers). " +
+                "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
+                "or processes requiring real-time output (use foreground with larger timeout instead). " +
+                "Returns immediately with a taskId (bash:<processId>) and backgroundProcessId. " +
+                "Read output with task_await (returns only new output since last check). " +
+                "Stop with task_stop using the taskId. " +
+                "List active tasks with task_list. " +
+                "Process persists until timeout_secs expires, terminated, or workspace is removed." +
+                "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
+                "Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. " +
+                "With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); use task_await only if you need surrounding/full output. " +
+                "Before finishing, terminate monitored tasks that are no longer relevant so stale output cannot trigger a follow-up turn. " +
+                "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
+                "When you actually need the output, read it with task_await; do not poll task_await just because the process is still running."
+            ),
+          monitor: BashMonitorSchema.nullish().describe(
+            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling, even after the current response, and the workspace also wakes when the monitored process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); terminate it before finishing if future wakes are no longer useful."
+          ),
+          display_name: z
+            .string()
+            .describe(
+              "Human-readable name for the process (e.g., 'Dev Server', 'TypeCheck Watch'). " +
+                "Required for all bash invocations since any process can be sent to background."
+            ),
+        })
+        .refine((args) => args.monitor == null || args.run_in_background === true, {
+          path: ["monitor"],
+          message: "monitor requires run_in_background=true",
+        })
+    ),
+  },
+  file_read: {
+    resultSchema: FileReadToolResultSchema,
+    description:
+      "Read the contents of a file from the file system. Read as little as possible to complete the task. " +
+      "Content is returned with line numbers prepended in the format '<line_number>\\t<content>'. " +
+      "These line numbers are NOT part of the actual file content and must not be included when editing files.",
+    schema: z.preprocess(
+      normalizeFilePath,
+      z.object({
+        path: z.string().describe("The path to the file to read (absolute or relative)"),
+        offset: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("1-based starting line number (optional, defaults to 1)"),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe(
+            "Number of lines to return from offset (optional, returns all if not specified)"
+          ),
+      })
+    ),
+  },
+  memory: {
+    resultSchema: MemoryToolResultSchema,
+    ptcExcluded: "Top-level presence supplies the memory index and hot-set context",
+    description:
+      "Manage your persistent memory directory (experiment). " +
+      "MEMORY PROTOCOL: check relevant memories before acting on a task; record durable facts, preferences, and lessons as you learn them; update or delete memories that turn out to be wrong or stale.\n" +
+      "Scopes (all paths are virtual):\n" +
+      "- /memories/global/... — personal, permanent, shared across all projects\n" +
+      "- /memories/project/... — private notes about this project; host-local, never committed, survives workspaces\n" +
+      "- /memories/workspace/... — scratch state for this workspace; deleted with the workspace\n" +
+      "Commands:\n" +
+      "- view: list a directory (up to 2 levels, dotfiles excluded) or show a file with line numbers (offset/limit supported)\n" +
+      "- create: create a new file; ERRORS if the file already exists (to overwrite: delete first, then create)\n" +
+      "- str_replace: replace a unique occurrence of old_str with new_str (errors with matching line numbers when ambiguous)\n" +
+      "- insert: insert insert_text after line insert_line (0 = top of file)\n" +
+      "- delete: delete a file or directory (recursive)\n" +
+      "- rename: move old_path to new_path within the same scope\n" +
+      "Files are Markdown; optional YAML frontmatter with a one-line `description:` is surfaced in your memory index.",
+    schema: z.preprocess(
+      (value) => {
+        // Compatibility shims (same mechanism as bash command->script): models
+        // trained on our file tools may emit file tool field names.
+        const normalized = normalizeFilePath(value); // file_path/filePath -> path
+        if (typeof normalized !== "object" || normalized === null || Array.isArray(normalized)) {
+          return normalized;
+        }
+        let obj = normalized as Record<string, unknown>;
+        obj = renameAliasField(obj, "content", "file_text");
+        obj = renameAliasField(obj, "old_string", "old_str");
+        obj = renameAliasField(obj, "new_string", "new_str");
+        return obj;
+      },
+      z.object({
+        command: z
+          .enum(["view", "create", "str_replace", "insert", "delete", "rename"])
+          .describe("The memory operation to perform."),
+        path: z
+          .string()
+          .nullish()
+          .describe(
+            "Virtual memory path (e.g. /memories/global/notes.md). Required for every command except rename."
+          ),
+        file_text: z.string().nullish().describe("create: full contents of the new file."),
+        old_str: z
+          .string()
+          .nullish()
+          .describe("str_replace: exact text to replace (must be unique in the file)."),
+        new_str: z.string().nullish().describe("str_replace: replacement text."),
+        insert_line: z
+          .number()
+          .int()
+          .nonnegative()
+          .nullish()
+          .describe("insert: line number to insert after (0 = top of file)."),
+        insert_text: z.string().nullish().describe("insert: text to insert."),
+        old_path: z.string().nullish().describe("rename: current virtual path."),
+        new_path: z.string().nullish().describe("rename: new virtual path (same scope)."),
+        offset: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("view on a file: 1-based starting line number (optional)."),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("view on a file: number of lines to return from offset (optional)."),
+      })
+    ),
+  },
+  attach_file: {
+    resultSchema: AttachFileToolResultSchema,
+    description:
+      "Attach a file from the filesystem so later model steps receive it as a real attachment instead of a huge base64 JSON blob. " +
+      "Accepts absolute or relative paths, including files outside the workspace. Accepts any file type. " +
+      "Raster images, SVG, and PDF are sent to the model as real attachments. Every other file type (text, source, diffs, logs, video, audio, archives, etc.) is shown to the user in chat for preview/download, but its contents are NOT sent to the model — you only receive a notice. Use file_read when you need to read a text file's contents yourself.",
+    schema: z.preprocess(
+      normalizeFilePath,
+      z
+        .object({
+          path: z.string().describe("The path to the file to attach (absolute or relative)"),
+          mediaType: z
+            .string()
+            .nullish()
+            .describe("Optional media type override when the filename/extension is ambiguous."),
+          filename: z
+            .string()
+            .nullish()
+            .describe("Optional filename override to present to the model."),
+        })
+        .strict()
+    ),
+  },
+  desktop_screenshot: {
+    description:
+      "Capture a screenshot of the desktop. " +
+      "Optionally accepts scaledWidth and scaledHeight hints for downstream consumers while still capturing at the desktop's actual resolution.",
+    schema: z
+      .object({
+        scaledWidth: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("Optional scaled width hint in pixels for downstream consumers."),
+        scaledHeight: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("Optional scaled height hint in pixels for downstream consumers."),
+      })
+      .strict(),
+  },
+  desktop_move_mouse: {
+    description: "Move the desktop mouse cursor to the provided screen coordinates.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+      })
+      .strict(),
+  },
+  desktop_click: {
+    description:
+      "Click on the desktop at the provided screen coordinates. Defaults to the left mouse button when button is omitted.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+        button: z
+          .enum(["left", "right"])
+          .nullish()
+          .describe("Optional mouse button to click. Defaults to left."),
+      })
+      .strict(),
+  },
+  desktop_double_click: {
+    description:
+      "Double-click on the desktop at the provided screen coordinates. Defaults to the left mouse button when button is omitted.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+        button: z
+          .enum(["left"])
+          .nullish()
+          .describe("Optional mouse button to double-click. Defaults to left."),
+      })
+      .strict(),
+  },
+  desktop_drag: {
+    description: "Drag on the desktop from one screen position to another.",
+    schema: z
+      .object({
+        startX: z.number().int().describe("Starting X coordinate in screen pixels."),
+        startY: z.number().int().describe("Starting Y coordinate in screen pixels."),
+        endX: z.number().int().describe("Ending X coordinate in screen pixels."),
+        endY: z.number().int().describe("Ending Y coordinate in screen pixels."),
+      })
+      .strict(),
+  },
+  desktop_scroll: {
+    description: "Scroll on the desktop at the provided screen coordinates.",
+    schema: z
+      .object({
+        x: z.number().int().describe("Target X coordinate in screen pixels."),
+        y: z.number().int().describe("Target Y coordinate in screen pixels."),
+        deltaX: z.number().int().nullish().describe("Optional horizontal scroll delta in pixels."),
+        deltaY: z.number().int().describe("Vertical scroll delta in pixels."),
+      })
+      .strict(),
+  },
+  desktop_type: {
+    description: "Type text into the active desktop input target.",
+    schema: z
+      .object({
+        text: z.string().describe("Text to type into the active desktop target."),
+      })
+      .strict(),
+  },
+  desktop_key_press: {
+    description:
+      'Press a desktop key or key combination such as "ctrl+c", "Return", or "cmd+shift+p".',
+    schema: z
+      .object({
+        key: z.string().describe("Key or key combination to press on the desktop."),
+      })
+      .strict(),
+  },
+  mux_agents_read: {
+    description:
+      "Read the AGENTS.md instructions file. In a project workspace, reads the project's AGENTS.md. " +
+      "In the system workspace, reads the global ~/.xum/AGENTS.md.",
+    schema: z.object({}).strict(),
+  },
+  mux_agents_write: {
+    description:
+      "Write the AGENTS.md instructions file. In a project workspace, writes the project's AGENTS.md. " +
+      "In the system workspace, writes the global ~/.xum/AGENTS.md. " +
+      "Requires explicit confirmation via confirm: true.",
+    schema: z
+      .object({
+        newContent: z.string().describe("The full new contents of the AGENTS.md file"),
+        confirm: z
+          .boolean()
+          .describe(
+            "Must be true to apply the write. The agent should ask the user for confirmation first."
+          ),
+      })
+      .strict(),
+  },
+  mux_config_read: {
+    description:
+      "Read the Xum configuration file. Returns the current configuration with secrets redacted. " +
+      "Use 'providers' for ~/.xum/providers.jsonc (API provider settings) or 'config' for ~/.xum/config.json (app settings).",
+    schema: z
+      .object({
+        file: XumConfigFileSchema.describe("Which configuration file to read"),
+        path: ConfigMutationPathSchema.nullish().describe(
+          "Optional path segments to read a specific nested value. If omitted, returns the full config."
+        ),
+      })
+      .strict(),
+  },
+  mux_config_write: {
+    description:
+      "Write to the Xum configuration file. Applies one or more set/delete operations and validates the full document before writing. " +
+      "Use 'providers' for ~/.xum/providers.jsonc or 'config' for ~/.xum/config.json. " +
+      "Requires explicit confirmation via confirm: true.",
+    schema: z
+      .object({
+        file: XumConfigFileSchema.describe("Which configuration file to write"),
+        operations: ConfigOperationsSchema.describe("Operations to apply to the config document"),
+        confirm: z
+          .boolean()
+          .describe("Must be true to apply the write. Ask the user for confirmation first."),
+      })
+      .strict(),
+  },
+  agent_skill_read: {
+    resultSchema: AgentSkillReadToolResultSchema,
+    description:
+      "Load an Agent Skill's SKILL.md (YAML frontmatter + markdown body) by name. " +
+      "Skills are discovered from <projectRoot>/.xum/skills/<name>/SKILL.md, <projectRoot>/.agents/skills/<name>/SKILL.md, ~/.xum/skills/<name>/SKILL.md, and ~/.agents/skills/<name>/SKILL.md.",
+    schema: z
+      .object({
+        name: SkillNameSchema.describe("Skill name (directory name under the skills root)"),
+      })
+      .strict(),
+  },
+  agent_skill_read_file: {
+    resultSchema: AgentSkillReadFileToolResultSchema,
+    description:
+      "Read a file within an Agent Skill directory. " +
+      "filePath must be relative to the skill directory (no absolute paths, no ~, no .. traversal). " +
+      "Supports offset/limit like file_read.",
+    schema: z
+      .object({
+        name: SkillNameSchema.describe("Skill name (directory name under the skills root)"),
+        filePath: z
+          .string()
+          .min(1)
+          .describe("Path to the file within the skill directory (relative)"),
+        offset: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("1-based starting line number (optional, defaults to 1)"),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe(
+            "Number of lines to return from offset (optional, returns all if not specified)"
+          ),
+      })
+      .strict(),
+  },
+  agent_skill_list: {
+    description:
+      "List available skills. In a project workspace, lists project skills from .xum/skills/ and legacy/universal .agents/skills/, plus global skills from ~/.xum/skills/ and legacy/universal ~/.agents/skills/, each tagged with its scope. In the system workspace, lists global skills only.",
+    schema: z
+      .object({
+        includeUnadvertised: z
+          .boolean()
+          .nullish()
+          .describe(
+            "When true, includes skills hidden from the index (advertise: false or disable-model-invocation: true)"
+          ),
+      })
+      .strict(),
+  },
+  agent_skill_write: {
+    description:
+      "Create or update a file within the contextual skills directory. In a project workspace, writes under .xum/skills/<name>/. In the system workspace, writes under ~/.xum/skills/<name>/. " +
+      "When writing SKILL.md, content is validated as a skill definition and frontmatter.name is aligned to the skill name argument.",
+    schema: z
+      .object({
+        name: SkillNameSchema.describe("Skill name (directory name under the global skills root)"),
+        filePath: z
+          .string()
+          .min(1)
+          .nullish()
+          .describe("Relative path within skill directory. Defaults to SKILL.md"),
+        content: z.string().min(1).describe("File content to write"),
+      })
+      .strict(),
+  },
+  agent_skill_delete: {
+    description:
+      "Delete either a file within the contextual skills directory or the entire skill directory. In a project workspace, deletes from .xum/skills/. In the system workspace, deletes from ~/.xum/skills/. " +
+      "Requires confirm: true.",
+    schema: z
+      .object({
+        name: SkillNameSchema.describe("Skill name to delete"),
+        target: z
+          .enum(["file", "skill"])
+          .nullish()
+          .describe(
+            "Deletion target: 'file' to delete a specific file, 'skill' to remove the entire skill directory (defaults to file)"
+          ),
+        filePath: z
+          .string()
+          .min(1)
+          .nullish()
+          .describe(
+            "Relative file path within the skill directory to delete. Required when target is 'file'"
+          ),
+        confirm: z.boolean().describe("Must be true to confirm deletion"),
+      })
+      .strict(),
+  },
+
+  skills_catalog_search: {
+    description:
+      "Search the skills.sh community catalog for agent skills. " +
+      "Returns a list of matching skills with their IDs, names, source repos, and install counts. " +
+      "Use skills_catalog_read to preview a skill's full content before installing.",
+    schema: z
+      .object({
+        query: z.string().describe("Search query to find skills in the catalog"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .nullish()
+          .describe("Maximum number of results to return (default: 10)"),
+      })
+      .strict(),
+  },
+
+  skills_catalog_read: {
+    description:
+      "Read the full SKILL.md content for a skill from the skills.sh community catalog. " +
+      "Use this to preview a skill's documentation before installing it with agent_skill_write. " +
+      "The owner and repo come from skills_catalog_search results.",
+    schema: z
+      .object({
+        owner: z.string().describe("GitHub owner from the search result (e.g. 'vercel-labs')"),
+        repo: z
+          .string()
+          .describe("GitHub repository name from the search result (e.g. 'agent-skills')"),
+        skillId: SkillNameSchema.describe("Skill ID from the search result"),
+      })
+      .strict(),
+  },
+
+  file_edit_replace_string: {
+    resultSchema: FileEditReplaceStringToolResultSchema,
+    description:
+      "⚠️ CRITICAL: Always check tool results - edits WILL fail if old_string is not found or unique. Do not proceed with dependent operations (commits, pushes, builds) until confirming success.\n\n" +
+      "Apply one or more edits to a file by replacing exact text matches. All edits are applied sequentially. Each old_string must be unique in the file unless replace_count > 1 or replace_count is -1.",
+    schema: z.preprocess(
+      normalizeFilePath,
+      z.object({
+        path: FILE_TOOL_PATH,
+        old_string: z
+          .string()
+          .describe(
+            "The exact text to replace (must be unique in file if replace_count is 1). Include enough context (indentation, surrounding lines) to make it unique."
+          ),
+        new_string: z.string().describe("The replacement text"),
+        replace_count: z
+          .number()
+          .int()
+          .nullish()
+          .describe(
+            "Number of occurrences to replace (default: 1). Use -1 to replace all occurrences. If 1, old_string must be unique in the file."
+          ),
+      })
+    ),
+  },
+  file_edit_replace_lines: {
+    description:
+      "⚠️ CRITICAL: Always check tool results - edits WILL fail if line numbers are invalid or file content has changed. Do not proceed with dependent operations (commits, pushes, builds) until confirming success.\n\n" +
+      "Replace a range of lines in a file. Use this for line-based edits when you know the exact line numbers to modify.",
+    schema: z.preprocess(
+      normalizeFilePath,
+      z.object({
+        path: FILE_TOOL_PATH,
+        start_line: z.number().int().min(1).describe("1-indexed start line (inclusive) to replace"),
+        end_line: z.number().int().min(1).describe("1-indexed end line (inclusive) to replace"),
+        new_lines: z
+          .array(z.string())
+          .describe("Replacement lines. Provide an empty array to delete the specified range."),
+        expected_lines: z
+          .array(z.string())
+          .nullish()
+          .describe(
+            "Optional safety check. When provided, the current lines in the specified range must match exactly."
+          ),
+      })
+    ),
+  },
+  file_edit_insert: {
+    resultSchema: FileEditInsertToolResultSchema,
+    description:
+      "Insert content into a file using substring guards. " +
+      "Provide exactly one of insert_before or insert_after to anchor the operation when editing an existing file. " +
+      "When the file does not exist or is empty, it is populated automatically without guards. " +
+      "Optional before/after substrings must uniquely match surrounding content. " +
+      "Avoid short guards like `}` or `}\\n` that match multiple locations — " +
+      `use longer patterns like full function signatures or unique comments. ${TOOL_EDIT_WARNING}`,
+    schema: z.preprocess(
+      normalizeFilePath,
+      z
+        .object({
+          path: FILE_TOOL_PATH,
+          insert_before: z
+            .string()
+            .min(1)
+            .nullish()
+            .describe(
+              "Anchor text to insert before. Content will be placed immediately before this substring."
+            ),
+          insert_after: z
+            .string()
+            .min(1)
+            .nullish()
+            .describe(
+              "Anchor text to insert after. Content will be placed immediately after this substring."
+            ),
+          content: z.string().describe("The content to insert"),
+        })
+        .refine((data) => !(data.insert_before != null && data.insert_after != null), {
+          message: "Provide only one of insert_before or insert_after (not both).",
+          path: ["insert_before"],
+        })
+    ),
+  },
+  advisor: {
+    ptcExcluded: "Top-level presence supplies proactive advisor guidance",
+    description: ADVISOR_TOOL_DESCRIPTION,
+    schema: AdvisorToolInputSchema,
+  },
+  ask_user_question: {
+    ptcExcluded: "Requires UI interaction",
+    description:
+      "Ask 1–4 multiple-choice questions (with optional multi-select) and wait for the user's answers. " +
+      "This tool is intended for plan mode. " +
+      "Use it ONLY for genuinely balanced decisions that hinge on user-specific context, preference, or information not present in the conversation or repo. " +
+      "Do NOT use it when you already have a reasonable recommendation: if one option is clearly best, proceed with it (stating the assumption) instead of asking — surfacing a question you can answer yourself defeats the purpose. " +
+      "When you do ask, keep the options genuinely open; do not steer toward a single 'recommended' choice. " +
+      "Do not output a list of open questions; ask them via this tool instead. " +
+      "Each question must include 2–4 options; an 'Other' choice is provided automatically.",
+    schema: AskUserQuestionToolArgsSchema,
+  },
+  // `internal` tools are excluded from user-facing tool docs (hooks/tools.mdx
+  // env-var tables) because users can't write hooks for them — they run via
+  // bespoke streamText paths in their own services, not the standard tool
+  // execution pipeline. See gen_docs.ts.
+  propose_name: {
+    description:
+      "Propose a workspace name and title. You MUST call this tool exactly once with your chosen name and title. " +
+      "Do not emit a text response; call this tool immediately.",
+    schema: ProposeNameToolArgsSchema,
+    internal: true,
+  },
+  propose_status: {
+    description:
+      "Propose a short sidebar status (emoji + 2-6 word verb-led phrase) summarizing what the agent is currently doing. " +
+      "You MUST call this tool exactly once. Do not emit a text response; call this tool immediately.",
+    schema: ProposeStatusToolArgsSchema,
+    internal: true,
+  },
+  propose_plan: {
+    ptcExcluded: "Mode-specific, call directly",
+    description:
+      "Signal that your plan is complete and ready for user approval. " +
+      "This tool reads the plan from the plan file you wrote. " +
+      "You must write your plan to the plan file before calling this tool. " +
+      "After calling this tool, do not paste the plan contents or mention the plan file path; the UI already shows the full plan.",
+    schema: z.object({}),
+  },
+  task: {
+    resultSchema: TaskToolResultSchema,
+    description: buildTaskToolDescription(undefined),
+    schema: TaskToolArgsSchema,
+  },
+  task_apply_git_patch: {
+    resultSchema: TaskApplyGitPatchToolResultSchema,
+    description:
+      "Apply a completed sub-agent task's git-format-patch artifact to the current workspace using `git am`. " +
+      "This is an explicit integration step: Xum will not auto-apply patches.",
+    schema: TaskApplyGitPatchToolArgsSchema,
+  },
+  task_await: {
+    resultSchema: TaskAwaitToolResultSchema,
+    description:
+      "Wait for one or more tasks or workflow runs to produce output. " +
+      "\n\nWHEN TO USE: only call task_await when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
+      "Do not call task_await solely because active tasks exist; for unrelated user messages, respond directly and let tasks continue in the background. " +
+      "If a synthetic/system follow-up explicitly says active background tasks or workflow runs block your turn, treat that as a dependency and await the listed IDs. " +
+      "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly — do NOT call task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
+      "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task, bash, or workflow_run — " +
+      "the taskId/runId is not available until the spawning tool returns. " +
+      "Always wait for the task/bash/workflow_run tool result first, then call task_await in a subsequent step. " +
+      "When omitting task_ids to await active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. Omitted task_ids discover top-level workflow runs only and exclude workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs. " +
+      "\n\nAgent tasks and workflow runs return reports when completed. " +
+      "Completed reports are persisted on disk and survive context compaction: calling task_await on an already-completed task/workflow run ID (timeout_secs: 0 for non-blocking) re-fetches the full report instead of re-running the work. " +
+      "Bash tasks return incremental output while running and a final reportMarkdown when they exit. " +
+      "For bash tasks, you may optionally pass filter/filter_exclude to include/exclude output lines by regex. " +
+      "WARNING: when using filter, non-matching lines are permanently discarded. " +
+      "Use this tool to WAIT; do not poll task_list in a loop to wait for task completion (that is misuse and wastes tool calls). " +
+      "\n\nBy default (min_completed=1) this returns as soon as the FIRST awaited task completes, so you can begin dependent work on that result while the rest keep running — then call task_await again for the remainder. " +
+      "This is ideal for independent tasks or any case where per-result work exists. " +
+      "Set min_completed higher (up to the number of awaited tasks) when you genuinely need more before proceeding — e.g. best-of-N synthesis that must compare every candidate should pass min_completed equal to the batch size. " +
+      "The result always includes every task complete at the moment it returns, plus current status for the rest; not-yet-completed tasks keep running and stay re-awaitable on a later call. " +
+      "Active workflow-run results may include compact `workflowProgress` (latest phase, last progress timestamp, and step counts); use that to see that phased progress is still happening instead of treating elapsed time alone as a hang. " +
+      "You always get per-task results (like Promise.allSettled), just possibly before every task has finished. " +
+      "Possible statuses: completed, queued, starting, running, backgrounded, awaiting_report, interrupted, not_found, invalid_scope, error. " +
+      "Bash task outputs may be automatically filtered; when this happens, check each result's note for details and (if available) where the full output was saved.",
+    schema: TaskAwaitToolArgsSchema,
+  },
+  task_send_message: {
+    resultSchema: TaskSendMessageToolResultSchema,
+    description:
+      'Send a plain-text message to another agent workspace in this task tree: a descendant sub-agent, a sibling/cousin, or an ancestor (including the root workspace). The relationship is computed server-side from the tree — you can never claim parent authority you do not have. Discover addressable peers with task_list scope:"tree". ' +
+      "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
+      "Sibling and ancestor targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; they must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only). Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
+      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces outside this task tree.",
+    schema: TaskSendMessageToolArgsSchema,
+  },
+  task_message_parent: {
+    resultSchema: TaskMessageParentToolResultSchema,
+    description:
+      "Send a message up to your parent workspace (RLM family messaging). It is appended to the parent's queue as a clearly-labeled child message and coalesces behind a busy parent turn, dispatching at the parent's next tool boundary. " +
+      "The parent has no obligation to reply and no delivery receipt is produced. Keep using agent_report for progress updates and your final report.",
+    schema: TaskMessageParentToolArgsSchema,
+  },
+  task_message_sibling: {
+    resultSchema: TaskMessageSiblingToolResultSchema,
+    description:
+      "Send a message to a sibling sub-agent that shares your DIRECT parent (nuclear-family scoping: exactly one hop up plus one hop down). Any other target — grandparent, grandchild, uncle, or unrelated task — is refused with invalid_scope. " +
+      "The message arrives in the sibling's queue as a clearly-labeled message; a busy sibling picks it up at its next tool boundary.",
+    schema: TaskMessageSiblingToolArgsSchema,
+  },
+  task_retitle: {
+    resultSchema: TaskRetitleToolResultSchema,
+    description:
+      "Change the short, friendly role name of a persistent descendant sub-agent without changing its stable task identity or workspace. Active and inactive user-owned children can be retitled; workflow-owned internal workers cannot.",
+    schema: TaskRetitleToolArgsSchema,
+  },
+  task_stop: {
+    resultSchema: TaskStopToolResultSchema,
+    description:
+      "Stop one or more tasks without removing persistent child workspaces. Sub-agent trees are stopped leaf-first and unfinished children become interrupted; workspace turns and workflow runs are interrupted; bash processes are terminated. Use this to cancel or abandon work, not to mark useful progress as completed—ask a child to finalize with task_send_message and await its report instead. Stopping an already-inactive task is idempotent.",
+    schema: TaskStopToolArgsSchema,
+  },
+  task_remove: {
+    resultSchema: TaskRemoveToolResultSchema,
+    description:
+      "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
+    schema: TaskRemoveToolArgsSchema,
+  },
+  task_workspace_lifecycle: {
+    resultSchema: TaskWorkspaceLifecycleToolResultSchema,
+    description:
+      'Reversibly archive or unarchive full workspaces that the current workspace created via task(kind="workspace"). ' +
+      "Scoped by durable workspace-turn ownership records: it cannot act on arbitrary user workspaces or sub-agent children (non-wst_ task IDs are invalid_scope). " +
+      'Use action="archive" when a peer workspace\'s work is complete; archived targets refuse task(kind="workspace", mode="existing") follow-ups until unarchived. ' +
+      "Active workspace turns involving the target (delegated to it, or owned by it for nested delegation) are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
+      "Live user activity in the target (a manual stream, terminal, or desktop session) also refuses archive and is never interrupted by this tool. " +
+      "Archive may return requires_confirmation with untracked paths when a snapshot would be lossy — the confirmation is checked before any interruption; re-call with acknowledged_untracked_paths to confirm. " +
+      'Archive of a managed-worktree target is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation; targets the worktree policy cannot delete (SSH/Coder, Docker, project-dir local, or shared isolation-none checkouts) stay archivable. ' +
+      "For irreversible removal of inactive sub-agent children, use task_remove instead.",
+    schema: TaskWorkspaceLifecycleToolInputSchema,
+  },
+  task_list: {
+    resultSchema: TaskListToolResultSchema,
+    description:
+      "List descendant tasks for the current workspace, including status + metadata. " +
+      "This includes sub-agent tasks, background bash tasks, and top-level workflow runs, but omits workflow-owned sub-agents/background bash tasks whose reports are consumed through parent workflow runs. " +
+      "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. Sub-agent rows from grouped runs include `bestOf` metadata so they can be distinguished from the standalone reusable bench. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
+      "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
+      "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
+      'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are addressable via task_send_message except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to keep candidates independent), and non-descendant rows in terminal states (peers cannot reactivate an inactive task — only its parent can); the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
+      "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
+      "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
+    schema: TaskListToolArgsSchema,
+  },
+  workflow_run: {
+    // Prefer foreground workflows so callers do not waste a turn polling when no other work can proceed.
+    description:
+      "Start a durable workflow run from exactly one launch source: script_path for a JavaScript file/skill workflow, or script_source for compact one-off inline workflow source. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
+      "An active run of the same script in this workspace blocks a duplicate start unless allow_concurrent=true; reattach to the reported run with task_await or workflow_resume instead of relaunching it. " +
+      "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source for one-off conductors whose exact source should be snapshotted into the durable run. " +
+      "When a skill, instruction block, or plan describes a multi-phase, looping, or multi-agent process in prose and ships no packaged workflow script, prefer codifying that process as a one-off script_source workflow over executing every phase in-context: " +
+      "the conductor follows the documented phases more faithfully and gains durable checkpoints, resume, and fresh delegated context per phase. " +
+      "Use agent_skill_read / agent_skill_read_file to discover and inspect skill-packaged workflows; non-skill workflow files must be addressed by an explicit known path and can be inspected with normal file tools. " +
+      "Prefer the default foreground mode (`run_in_background` omitted or false) so completed workflows return their result without an extra task_await round-trip. " +
+      "If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using or reporting the workflow output. " +
+      "After a previous workflow_run error, abort, timeout, or uncertain result, do not start a fresh run until you rediscover existing workflow runs: either omit task_list statuses first, or query pending/running/backgrounded/interrupted/failed/completed together. " +
+      "Use task_await for running/backgrounded runs, workflow_resume for pending/interrupted runs, workflow_resume({ mode: 'retry_from_checkpoint' }) only for eligible failed runs, and inspect/refetch completed results instead of rerunning. " +
+      "Use background mode only when you intend to start another workflow/task or do independent work while the workflow runs; a background run is non-blocking and Xum wakes this workspace with the terminal workflow result, so call task_await only when the current request depends on the output before you can answer.",
+    schema: WorkflowRunToolArgsSchema,
+  },
+  workflow_resume: {
+    description:
+      "Resume an existing durable workflow run by run ID (wfr_...). Use this for runs that were interrupted (by the user, task_stop, or an app crash/restart) — " +
+      "resume replays the durable event log and continues from the last checkpoint without re-executing completed steps. " +
+      "Discover resumable runs with task_list (statuses pending/interrupted/failed). Pending runs left by post-create aborts and interrupted runs can be resumed in default mode; running/backgrounded workflows do not need resume, await them with task_await. " +
+      "For failed runs, pass mode='retry_from_checkpoint' explicitly; it re-executes work after the last checkpoint, so only use it when that is acceptable, and start a fresh workflow_run when it is rejected as unsafe. " +
+      "Calling this on a completed run returns its existing result without re-running anything. " +
+      "Prefer foreground mode (run_in_background omitted or false) to get the final result directly; " +
+      "if the returned status is running or backgrounded, await the runId with task_await before using the result.",
+    schema: WorkflowResumeToolArgsSchema,
+  },
+  agent_report: {
+    ptcExcluded: "Must be top-level for taskService to read args from history",
+    description:
+      "Send an incremental update from a sub-agent to its parent workspace and wake the parent. " +
+      "Call this whenever the parent should see important progress or a finding before the task is complete; it may be called multiple times. " +
+      "Do not use it for the final result—the final assistant message completes the sub-agent task.",
+    schema: AgentReportToolArgsSchema,
+  },
+  timeline_event: {
+    description:
+      "Record one notable step on the durable workspace timeline, which is a birds-eye record of the work rather than a tool log. " +
+      "Call it when: a notable implementation step landed; work was committed, pushed, or opened as a PR; " +
+      "external input was picked up, such as a review comment, CI failure, or issue; " +
+      "the approach changed, including why; a blocker was hit or resolved; work was handed off. " +
+      "Describe what happened in one plain sentence. " +
+      "Prompts, goals, heartbeats, sub-agents, and workflows are already recorded automatically, so do not restate them or narrate routine tool use.",
+    schema: z
+      .object({
+        description: z.string().min(1).max(300).describe("One sentence describing what happened."),
+        category: z
+          .enum(["picked_up", "milestone", "decision", "blocker", "handoff"])
+          .nullish()
+          .describe("Optional event category."),
+      })
+      .strict(),
+  },
+  set_goal: {
+    description:
+      "Create or replace a durable goal for this current parent workspace when the user explicitly asks for multi-turn, verifiable work. " +
+      "Do not use this for one-shot questions. Objectives must be concrete, measurable, and verifiable. " +
+      "Omitted or null budget/turn fields use the effective workspace goal defaults; model-created goals must resolve to at least one budget or turn bound. " +
+      "Do not replace an active, paused, or budget-limited goal unless the user explicitly asked to replace it; when replacing, first call get_goal and pass replaceExistingGoal=true with the current expectedGoalId. " +
+      "After setting a goal during your own turn, let subsequent automatic continuation turns do the substantial goal work, then call complete_goal only after verification.",
+    schema: z
+      .object({
+        objective: z
+          .string()
+          .trim()
+          .min(1)
+          .describe("Concrete, measurable objective to pursue over automatic goal continuations."),
+        budgetCents: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe(
+            "Optional positive budget in cents. Omit/null to apply the effective workspace goal default."
+          ),
+        turnCap: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe(
+            "Optional positive maximum automatic continuation turns. Omit/null to apply the effective workspace goal default."
+          ),
+        replaceExistingGoal: z
+          .boolean()
+          .nullish()
+          .describe("Set true only when the user explicitly asked to replace the current goal."),
+        expectedGoalId: z
+          .string()
+          .uuid()
+          .nullish()
+          .describe(
+            "Optimistic-concurrency token required when replacing an active, paused, or budget-limited goal. Use the goalId from get_goal."
+          ),
+      })
+      .strict(),
+  },
+  get_goal: {
+    description:
+      "Read the current workspace goal. Returns null when no goal is available in this turn.",
+    schema: z.object({}).strict(),
+  },
+  complete_goal: {
+    description:
+      "Mark the current workspace goal complete with a concise 1-2 sentence summary of why the goal is done. " +
+      "This tool only completes goals; it cannot pause, resume, replace, or change goal budgets. " +
+      "Pass the `goalId` returned by `get_goal` so the completion is rejected with a typed conflict " +
+      "error if the user clears or replaces the goal mid-stream rather than throwing a confusing " +
+      "validation error.",
+    schema: z
+      .object({
+        summary: z
+          .string()
+          .trim()
+          .min(1)
+          .describe("Required 1-2 sentence justification for completing the current goal."),
+        goalId: z
+          .string()
+          .nullish()
+          .describe(
+            "Optional optimistic-concurrency token. Pass the `goalId` returned by `get_goal` to " +
+              "ensure the completion is rejected with a typed conflict error if the user clears " +
+              "or replaces the goal mid-stream."
+          ),
+      })
+      .strict(),
+  },
+
+  heartbeat: {
+    resultSchema: HeartbeatToolResultSchema,
+    description:
+      "Read or change this workspace's scheduled heartbeat. " +
+      "The tool only affects the current workspace; it does not accept a workspaceId. " +
+      "Use action='set' to enable or configure the heartbeat interval, custom message, context mode, trigger, when-busy behavior, or enabled flag. " +
+      "trigger chooses the countdown anchor: 'idle' (default) fires only after the workspace has been quiet for a full interval; 'interval' fires on a fixed wall-clock cadence. " +
+      "whenBusy chooses what happens when a heartbeat fires while the workspace is busy: 'skip' misses the slot, 'tool-end'/'turn-end' queue the heartbeat for the matching boundary. " +
+      "Unset whenBusy defaults to 'skip' for trigger 'idle' and 'turn-end' for trigger 'interval'. " +
+      "Use action='unset' to remove this workspace's heartbeat settings entirely. " +
+      "Use action='get' before changing settings when you need to preserve existing values.",
+    schema: HeartbeatToolArgsSchema,
+  },
+  todo_write: {
+    ptcExcluded: "UI-specific",
+    description:
+      "Create or update the todo list for tracking multi-step tasks (limit: 7 items). " +
+      "The TODO list is displayed to the user at all times. " +
+      "Replace the entire list on each call - the AI tracks which tasks are completed.\n" +
+      "\n" +
+      "Mark tasks as in_progress when actively being worked on (multiple allowed for parallel work). " +
+      "Order tasks as: completed first, then in_progress, then pending last. " +
+      "Use appropriate tense in content: past tense for completed (e.g., 'Added tests'), " +
+      "present progressive for in_progress (e.g., 'Adding tests'), " +
+      "and imperative/infinitive for pending (e.g., 'Add tests').\n" +
+      "\n" +
+      "If you hit the 7-item limit, summarize older completed items into one line " +
+      "(e.g., 'Completed initial setup (3 tasks)').\n" +
+      "\n" +
+      "Update the list as work progresses. If work fails or the approach changes, update " +
+      "the list to reflect reality - only mark tasks complete when they actually succeed.",
+    schema: z.object({
+      todos: z.array(
+        z.object({
+          content: z
+            .string()
+            .describe(
+              "Task description with tense matching status: past for completed, present progressive for in_progress, imperative for pending"
+            ),
+          status: z.enum(["pending", "in_progress", "completed"]).describe("Task status"),
+        })
+      ),
+    }),
+  },
+  todo_read: {
+    ptcExcluded: "UI-specific",
+    description: "Read the current todo list",
+    schema: z.object({}),
+  },
+  review_pane_update: {
+    description:
+      "Flag specific code regions in the Review pane for the user to review next. " +
+      "Use this to draw the user's attention to critical changes you want reviewed first. " +
+      "Each hunk references a project-relative file path with an optional inclusive line " +
+      'range using familiar syntax: "src/foo.ts" (whole file), "src/foo.ts:42" (single line), ' +
+      'or "src/foo.ts:42-58" (range, new-file line numbers). Project-relative paths are ' +
+      "preferred; use './' or '../' for paths that must resolve from the current tool cwd. " +
+      "Attach a short comment to each " +
+      "hunk explaining what to look at and why.\n\n" +
+      "operation:\n" +
+      "  - 'replace' (default): overwrite the current assisted set\n" +
+      "  - 'add': append to the existing set, deduplicating exact path:range matches\n\n" +
+      "Flagged hunks appear pinned at the top of the Review pane; the user can toggle " +
+      "'Assisted' to hide everything else. Pass an empty hunks array with operation='replace' " +
+      "to clear the set when review is no longer needed.",
+    schema: z
+      .object({
+        operation: z
+          .enum(["add", "replace"])
+          .describe("'replace' overwrites the assisted set; 'add' appends to it."),
+        hunks: z
+          .array(
+            z
+              .object({
+                path: z
+                  .string()
+                  .min(1)
+                  .describe(
+                    'Filter in `path[:range]` form, e.g. "src/foo.ts" or "src/foo.ts:42-58". ' +
+                      "Path is project-relative; use './' or '../' when the path must resolve from the current tool working directory. Range uses new-file line numbers (inclusive)."
+                  ),
+                comment: z
+                  .string()
+                  .nullish()
+                  .describe("Short note (~1 sentence) telling the user what to look at and why."),
+              })
+              .strict()
+          )
+          .describe("List of hunks to flag for review."),
+      })
+      .strict(),
+  },
+  review_pane_get: {
+    description:
+      "Return the current set of agent-flagged hunks in the Review pane, in declared order. " +
+      "Use this to inspect what you've already pinned before adding more.",
+    schema: z.object({}).strict(),
+  },
+  bash_output: {
+    resultSchema: BashOutputToolResultSchema,
+    description:
+      'DEPRECATED: use task_await instead (pass bash-prefixed taskId like "bash:<processId>"). ' +
+      "Retrieve output from a running or completed background bash process. " +
+      "Returns only NEW output since the last check (incremental). " +
+      "Returns stdout and stderr output along with process status. " +
+      "Supports optional regex filtering to show only lines matching a pattern. " +
+      "WARNING: When using filter, non-matching lines are permanently discarded. " +
+      "Use timeout to wait for output instead of polling repeatedly. " +
+      "Large outputs may be automatically filtered; when this happens, the result includes a note explaining what was kept and (if available) where the full output was saved.",
+    schema: z.object({
+      process_id: z.string().describe("The ID of the background process to retrieve output from"),
+      filter: z
+        .string()
+        .nullish()
+        .describe(
+          "Optional regex to filter output lines. By default, only matching lines are returned. " +
+            "When filter_exclude is true, matching lines are excluded instead. " +
+            "Non-matching lines are permanently discarded and cannot be retrieved later."
+        ),
+      filter_exclude: z
+        .boolean()
+        .nullish()
+        .describe(
+          "When true, lines matching 'filter' are excluded instead of kept. " +
+            "Key behavior: excluded lines do NOT cause early return from timeout - " +
+            "waiting continues until non-excluded output arrives or process exits. " +
+            "Use to avoid busy polling on progress spam (e.g., filter='⏳|waiting|\\.\\.\\.' with filter_exclude=true " +
+            "lets you set a long timeout and only wake on meaningful output). " +
+            "Requires 'filter' to be set."
+        ),
+      timeout_secs: z
+        .number()
+        .min(0)
+        .describe(
+          "Seconds to wait for new output. " +
+            "If no output is immediately available and process is still running, " +
+            "blocks up to this duration. Returns early when output arrives or process exits. " +
+            "Only use long timeouts (>15s) when no other useful work can be done in parallel."
+        ),
+    }),
+  },
+  bash_background_list: {
+    resultSchema: BashBackgroundListResultSchema,
+    description:
+      "DEPRECATED: use task_list instead. " +
+      "List all background processes started with bash(run_in_background=true). " +
+      "Returns process_id, status, script for each process. " +
+      "Use to find process_id for termination or check output with bash_output.",
+    schema: z.object({}),
+  },
+  bash_background_terminate: {
+    resultSchema: BashBackgroundTerminateResultSchema,
+    description:
+      "DEPRECATED: use task_stop instead. " +
+      "Terminate a background process started with bash(run_in_background=true). " +
+      "Use process_id from the original bash response or from bash_background_list. " +
+      "Sends SIGTERM, waits briefly, then SIGKILL if needed. " +
+      "Output remains available via bash_output after termination.",
+    schema: z.object({
+      process_id: z.string().describe("Background process ID to terminate"),
+    }),
+  },
+  analytics_query: {
+    description: `Execute a DuckDB SQL query against Xum analytics tables and optionally provide visualization hints.
+Use read-only SELECT queries over analytics data.
+
+DuckDB SQL guidelines:
+- Use SELECT queries only; do not write, alter, or drop tables.
+- Prefer explicit column lists and aliases so result sets are easy to understand.
+- Use ORDER BY and LIMIT for exploratory queries over large datasets.
+- Use DuckDB date/time helpers (for example date_trunc, CAST(... AS DATE), and interval arithmetic) for time series.
+
+Available tables:
+
+CREATE TABLE IF NOT EXISTS events (
+  workspace_id VARCHAR NOT NULL,
+  project_path VARCHAR,
+  project_name VARCHAR,
+  workspace_name VARCHAR,
+  parent_workspace_id VARCHAR,
+  agent_id VARCHAR,
+  timestamp BIGINT,
+  date DATE,
+  model VARCHAR,
+  thinking_level VARCHAR,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0,
+  cached_tokens INTEGER DEFAULT 0,
+  cache_create_tokens INTEGER DEFAULT 0,
+  input_cost_usd DOUBLE DEFAULT 0,
+  output_cost_usd DOUBLE DEFAULT 0,
+  reasoning_cost_usd DOUBLE DEFAULT 0,
+  cached_cost_usd DOUBLE DEFAULT 0,
+  total_cost_usd DOUBLE DEFAULT 0,
+  duration_ms DOUBLE,
+  ttft_ms DOUBLE,
+  streaming_ms DOUBLE,
+  tool_execution_ms DOUBLE,
+  output_tps DOUBLE,
+  response_index INTEGER,
+  is_sub_agent BOOLEAN DEFAULT false
+)
+
+CREATE TABLE IF NOT EXISTS delegation_rollups (
+  parent_workspace_id VARCHAR NOT NULL,
+  child_workspace_id VARCHAR NOT NULL,
+  project_path VARCHAR,
+  project_name VARCHAR,
+  agent_type VARCHAR,
+  model VARCHAR,
+  total_tokens INTEGER DEFAULT 0,
+  context_tokens INTEGER DEFAULT 0,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0,
+  cached_tokens INTEGER DEFAULT 0,
+  cache_create_tokens INTEGER DEFAULT 0,
+  report_token_estimate INTEGER DEFAULT 0,
+  total_cost_usd DOUBLE DEFAULT 0,
+  rolled_up_at_ms BIGINT,
+  date DATE,
+  PRIMARY KEY (parent_workspace_id, child_workspace_id)
+)`,
+    schema: z.object({
+      sql: z.string().min(1).describe("DuckDB SQL query to execute"),
+      visualization: z
+        .enum(["table", "bar", "line", "pie", "area", "stacked_bar"])
+        .nullish()
+        .describe("Optional visualization type for rendering the query result"),
+      title: z.string().nullish().describe("Optional chart title"),
+      x_axis: z.string().nullish().describe("Optional column name for the visualization X axis"),
+      y_axis: z
+        .array(z.string())
+        .nullish()
+        .describe("Optional column name(s) for the visualization Y axis"),
+    }),
+  },
+  web_fetch: {
+    resultSchema: WebFetchToolResultSchema,
+    description:
+      `Fetch a web page and extract its main content as clean markdown. ` +
+      `Uses the workspace's network context (requests originate from the workspace, not Xum host). ` +
+      `Requires curl to be installed in the workspace. ` +
+      `Output is truncated to ${Math.floor(WEB_FETCH_MAX_OUTPUT_BYTES / 1024)}KB.`,
+    schema: z.object({
+      url: z.string().url().describe("The URL to fetch (http or https)"),
+    }),
+  },
+  code_execution: {
+    ptcExcluded: "Prevent recursive sandbox creation",
+    description:
+      "Execute JavaScript code in a sandboxed environment with access to Xum tools. " +
+      "Available for multi-tool workflows when PTC experiment is enabled.",
+    schema: z.object({
+      code: z.string().min(1).describe("JavaScript code to execute in the PTC sandbox"),
+    }),
+  },
+  refinement_rollback: {
+    description:
+      "Roll back a journaled harness self-modification (a memory or skill edit) by its refinement row id, " +
+      "restoring the exact prior file contents recorded in the session's refinement journal. " +
+      "The rollback is journaled as a refinement row of its own, so it can be rolled back again. " +
+      "Refuses rows that were already rolled back and rows whose files changed since (divergence). " +
+      "Available only in RLM mode.",
+    schema: z
+      .object({
+        id: z.string().min(1).describe("Refinement row id (envelope id) to roll back"),
+        reason: z
+          .string()
+          .min(1)
+          .describe("Why this refinement is being rolled back (recorded in the journal)"),
+      })
+      .strict(),
+  },
+  // #region NOTIFY_DOCS
+  notify: {
+    description:
+      "Send a system notification to the user. Use this to alert the user about important events that require their attention, such as long-running task completion, errors requiring intervention, or questions. " +
+      "Notifications appear as OS-native notifications (macOS Notification Center, Windows Toast, Linux). " +
+      "Infer whether to send notifications from user instructions. If no instructions provided, reserve notifications for major wins or blocking issues. Do not use for routine progress updates — keep the todo list current instead.",
+    schema: z
+      .object({
+        title: z
+          .string()
+          .min(1)
+          .max(64)
+          .describe("Short notification title (max 64 chars). Should be concise and actionable."),
+        message: z
+          .string()
+          .max(200)
+          .nullish()
+          .describe(
+            "Optional notification body with more details (max 200 chars). " +
+              "Keep it brief - users may only see a preview."
+          ),
+      })
+      .strict(),
+  },
+  // #endregion NOTIFY_DOCS
+  tool_catalog_search: {
+    description:
+      "Search the catalog of deferred tools. Some tools (provided by MCP servers) are deferred: " +
+      "they exist but are not currently visible in your tool list. " +
+      "Call tool_catalog_search with task/capability keywords to discover them; matched tools become available on the next step. " +
+      "Returns matched tool names and descriptions plus the total number of deferred tools (there may be more undiscovered — refine the query to find them).",
+    schema: z
+      .object({
+        query: z
+          .string()
+          .min(1)
+          .describe(
+            "Task or capability keywords to search for (matched against tool names, descriptions, and parameter names)"
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(25)
+          .nullish()
+          .describe("Maximum number of matches to return (default 10, max 25)"),
+      })
+      .strict(),
+  },
+  mcp_prompt_get: {
+    resultSchema: MCPPromptGetToolResultSchema,
+    description:
+      "Fetch a prompt template from a connected MCP server, expanded with the given arguments. " +
+      "MCP prompts are reusable instructions or workflows the user has made available through MCP servers. " +
+      "The result contains the prompt text; follow it as task guidance in the current conversation. " +
+      "Available prompts are listed in this description when connected servers advertise them.",
+    schema: z
+      .object({
+        name: z
+          .string()
+          .min(1)
+          .describe('Prompt name from the available list, e.g. "mcp__server__prompt"'),
+        arguments: z
+          .record(z.string(), z.string())
+          .nullish()
+          .describe(
+            "Prompt argument values by argument name. Arguments marked with ? are optional; all others are required."
+          ),
+        list_offset: z
+          .number()
+          .int()
+          .min(0)
+          .nullish()
+          .describe(
+            "When an unknown-name error truncates the prompt listing, repeat the call with the suggested list_offset to page through the remaining prompt names."
+          ),
+      })
+      .strict(),
+  },
+} as const satisfies Record<string, ToolDefinition>;
+
+export type ToolName = keyof typeof TOOL_DEFINITIONS;
+
+export type BridgeableToolName = {
+  [K in ToolName]: (typeof TOOL_DEFINITIONS)[K] extends { resultSchema: z.ZodType } ? K : never;
+}[ToolName];
+
+export function getToolResultSchema(toolName: string): z.ZodType | undefined {
+  if (!Object.hasOwn(TOOL_DEFINITIONS, toolName)) return undefined;
+  const definition = TOOL_DEFINITIONS[toolName as ToolName];
+  return "resultSchema" in definition ? definition.resultSchema : undefined;
+}
 
 /**
  * Get tool definition schemas for token counting

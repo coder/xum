@@ -920,7 +920,7 @@ export async function getToolsForModel(
         //
         // Known limitations when the native override is active:
         // - Cannot reach private/localhost URLs (Anthropic's servers can't see workspace network).
-        // - Not bridgeable in the PTC sandbox (no execute()); see BridgeableToolName comment.
+        // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
         // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
         //   early when execute() is absent — same limitation as web_search (provider-native).
         if (supportsAnthropicNativeWebFetch(capabilityModelId)) {

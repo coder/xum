@@ -22,6 +22,7 @@ import {
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
 import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import {
@@ -149,27 +150,14 @@ function parseLoadArgs(args: unknown): { path: string; key: string } {
   return { path, key };
 }
 
-/** Tools excluded from sandbox - UI-specific or would cause recursion */
-const EXCLUDED_TOOLS = new Set([
-  "code_execution", // Prevent recursive sandbox creation
-  "ask_user_question", // Requires UI interaction
-  "propose_plan", // Mode-specific, call directly
-  "todo_write", // UI-specific
-  "todo_read", // UI-specific
-  "status_set", // UI-specific
-  "agent_report", // Must be top-level for taskService to read args from history
-  // Context-coupled tools: AIService keys system-prompt context off their
-  // top-level presence (memory index / hot-set block for `memory`, proactive
-  // guidance for `advisor`). Bridging them would silently drop that context
-  // in the exclusive posture.
-  "memory",
-  "advisor",
-  // Media-producing built-ins (attach_file, desktop_screenshot) are
-  // deliberately bridgeable: stripAttachmentParts removes their base64 from
-  // sandbox-visible values and the code_execution attachments carrier delivers
-  // the real bytes to request-time extraction, so guest code like
-  // xum.attach_file(...) works without retaining media in QuickJS memory.
-]);
+const ptcExcludedTools = new Set(
+  Object.entries(TOOL_DEFINITIONS).flatMap(([name, definition]) =>
+    "ptcExcluded" in definition ? [name] : []
+  )
+);
+
+// Media-producing built-ins (attach_file, desktop_screenshot) are deliberately
+// bridgeable because attachment bytes stay outside QuickJS memory.
 
 /**
  * Bridge that exposes Xum tools in the QuickJS sandbox under canonical `xum.*` and legacy `mux.*` namespaces.
@@ -204,7 +192,9 @@ export class ToolBridge {
       // code_execution is the tool that uses the bridge, not a candidate for bridging
       if (name === "code_execution") continue;
 
-      const isBridgeable = !EXCLUDED_TOOLS.has(name) && this.hasExecute(tool);
+      // status_set is dynamic and UI-specific, so it has no catalog entry.
+      const isBridgeable =
+        name !== "status_set" && !ptcExcludedTools.has(name) && this.hasExecute(tool);
       if (!isBridgeable) {
         this.nonBridgeableTools.set(name, tool);
       } else if (isBridgeToolGranted(this.grants, name)) {
