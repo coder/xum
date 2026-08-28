@@ -1815,9 +1815,20 @@ function collectedDocumentRootPrefixes(muxRoot: string): string[] {
   }
   const prefixes = new Set<string>(absolute);
   const home = normalizeComparablePath(os.homedir());
+  // Bash also expands the current user's named-home form (`~alice/...`) to the same
+  // directory. userInfo can throw on systems without a passwd entry; the bare `~`
+  // spelling still covers the common case then.
+  let username = "";
+  try {
+    username = os.userInfo().username.toLowerCase();
+  } catch {
+    username = "";
+  }
   if (home !== "") {
     for (const candidate of absolute) {
-      if (candidate.startsWith(`${home}/`)) prefixes.add(`~${candidate.slice(home.length)}`);
+      if (!candidate.startsWith(`${home}/`)) continue;
+      prefixes.add(`~${candidate.slice(home.length)}`);
+      if (username !== "") prefixes.add(`~${username}${candidate.slice(home.length)}`);
     }
   }
   return [...prefixes];

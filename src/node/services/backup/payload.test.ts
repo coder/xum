@@ -1824,25 +1824,27 @@ describe("backup payload", () => {
   it("resolves ~ spellings against a settings root under the home directory", async () => {
     const homeRoot = await fs.mkdtemp(path.join(os.homedir(), ".xum-backup-test-"));
     try {
-      await writeFixtureFile(
-        homeRoot,
-        "mcp.jsonc",
-        JSON.stringify({
-          servers: {
-            private: { command: `python3 ~/${path.basename(homeRoot)}/skills/launch.txt` },
-          },
-        })
-      );
-      const payload = await createBackupPayload({
-        muxRoot: homeRoot,
-        muxVersion: "1.2.3",
-        sourceLabel: "test-host",
-        reportSecrets: true,
-      });
-      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
-        servers: { private: { command: string } };
-      };
-      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+      // Both the bare and the named-home spellings expand to the same directory.
+      for (const command of [
+        `python3 ~/${path.basename(homeRoot)}/skills/launch.txt`,
+        `python3 ~${os.userInfo().username}/${path.basename(homeRoot)}/skills/launch.txt`,
+      ]) {
+        await writeFixtureFile(
+          homeRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot: homeRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+      }
     } finally {
       await fs.rm(homeRoot, { recursive: true, force: true });
     }
