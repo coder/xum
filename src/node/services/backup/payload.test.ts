@@ -2592,6 +2592,8 @@ describe("backup payload", () => {
 
   it("localizes git launchers under inherited config overrides", async () => {
     const variableNames = [
+      "GIT_CONFIG",
+      "GIT_CONFIG_PARAMETERS",
       "GIT_CONFIG_COUNT",
       "GIT_CONFIG_KEY_0",
       "GIT_CONFIG_VALUE_0",
@@ -2613,6 +2615,22 @@ describe("backup payload", () => {
     const originals = variableNames.map((name) => process.env[name]);
     try {
       for (const [env, command, expected] of [
+        // The deprecated carrier has a private quoting grammar, so any
+        // non-empty value conservatively localizes Git launchers.
+        [
+          {
+            GIT_CONFIG_PARAMETERS: `'core.sshCommand'='${muxRoot}/skills/launch.txt'`,
+          },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [{ GIT_CONFIG_PARAMETERS: "'user.name'='xum'" }, "git fetch origin", REDACTED_BACKUP_VALUE],
+        // GIT_CONFIG replaces the file Git reads, like the global/system selectors.
+        [
+          { GIT_CONFIG: `${muxRoot}/skills/gitconfig.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
         // An inherited command-scope entry with a sensitive key fails closed.
         [
           {
@@ -2721,6 +2739,38 @@ describe("backup payload", () => {
         if (original === undefined) delete process.env[name];
         else process.env[name] = original;
       }
+    }
+  });
+
+  it("localizes LLDB source and one-line command options", async () => {
+    for (const [command, expected] of [
+      [`lldb -s ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb -S${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb --source=${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb --source-before-file ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb -K ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      // One-line options execute LLDB commands directly.
+      ["lldb -o run app", REDACTED_BACKUP_VALUE],
+      ["lldb --one-line-before-file=run app", REDACTED_BACKUP_VALUE],
+      // A foreign source file and a plain invocation stay portable.
+      ["lldb -s /opt/init.lldb app", "lldb -s /opt/init.lldb app"],
+      ["lldb app", "lldb app"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
     }
   });
 

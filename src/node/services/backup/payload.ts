@@ -2424,6 +2424,8 @@ function hasDisguisedAssignment(
   let pendingSqliteInitFile = false;
   let pendingOpensslOptions = false;
   let pendingOpensslConfigFile = false;
+  let pendingLldbOptions = false;
+  let pendingLldbSourceFile = false;
   let pendingJavaOptions = false;
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
@@ -2529,6 +2531,8 @@ function hasDisguisedAssignment(
       pendingSqliteInitFile = false;
       pendingOpensslOptions = false;
       pendingOpensslConfigFile = false;
+      pendingLldbOptions = false;
+      pendingLldbSourceFile = false;
       pendingJavaOptions = false;
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
@@ -2865,6 +2869,28 @@ function hasDisguisedAssignment(
     } else if (pendingOpensslOptions && /^--?config$/.test(unquoted)) {
       pendingOpensslConfigFile = true;
     }
+    if (pendingLldbSourceFile) {
+      pendingLldbSourceFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingLldbOptions) {
+      const attachedSource = /^--(?:source|source-before-file|source-on-crash)=(.+)$/.exec(
+        unquoted
+      )?.[1];
+      const attachedShortSource = /^-[sSK](.+)$/.exec(unquoted)?.[1];
+      const source = attachedSource ?? attachedShortSource;
+      if (source !== undefined && isShellResolvedPublishedOperand(source)) return true;
+      if (/^(?:-[sSK]|--(?:source|source-before-file|source-on-crash))$/.test(unquoted)) {
+        pendingLldbSourceFile = true;
+      }
+      // One-line options execute the following LLDB command, and attached long
+      // forms execute their value. Either is an eval boundary this scan cannot
+      // safely reinterpret.
+      if (
+        /^(?:-[oOk]|--(?:one-line|one-line-before-file|one-line-on-crash)(?:=|$))/.test(unquoted)
+      ) {
+        return true;
+      }
+    }
     if (pendingJavaClassPathValue) {
       pendingJavaClassPathValue = false;
       if (javaClassPathPublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
@@ -3042,6 +3068,7 @@ function hasDisguisedAssignment(
       if (executable === "deno") pendingDenoSubcommand = true;
       if (/^sqlite3[0-9.]*$/.test(executable)) pendingSqliteOptions = true;
       if (executable === "openssl") pendingOpensslOptions = true;
+      if (/^lldb(?:-[0-9.]+)?$/.test(executable)) pendingLldbOptions = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
       if (executable === "systemd-run") pendingSystemdRunOptions = true;
@@ -3658,6 +3685,10 @@ function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
  * key or a published replacement file localizes git launchers.
  */
 function hasInheritedGitConfig(rootPrefixes: readonly string[]): boolean {
+  // This deprecated carrier has a private shell-quoted grammar and takes
+  // precedence over the numbered family. Any non-empty value can inject a
+  // command-valued key, so affected Git launchers fail closed.
+  if ((process.env.GIT_CONFIG_PARAMETERS ?? "").trim() !== "") return true;
   const count = Number.parseInt(process.env.GIT_CONFIG_COUNT ?? "", 10);
   if (Number.isFinite(count) && count > 0) {
     for (const [name, value] of Object.entries(process.env)) {
@@ -3666,7 +3697,11 @@ function hasInheritedGitConfig(rootPrefixes: readonly string[]): boolean {
       if (typeof value === "string" && gitConfigOverrideNamesSensitiveKey(value)) return true;
     }
   }
-  for (const file of [process.env.GIT_CONFIG_GLOBAL, process.env.GIT_CONFIG_SYSTEM]) {
+  for (const file of [
+    process.env.GIT_CONFIG,
+    process.env.GIT_CONFIG_GLOBAL,
+    process.env.GIT_CONFIG_SYSTEM,
+  ]) {
     if (typeof file !== "string") continue;
     if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(file), rootPrefixes)) return true;
   }
