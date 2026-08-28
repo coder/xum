@@ -2193,6 +2193,10 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   { name: /^deno$/, evalWord: /^eval$/ },
   { name: /^(?:lua|luajit)[0-9.]*$/, evalWord: /^-e/ },
   { name: /^(?:elixir|iex)[0-9.]*$/, evalWord: /^(?:-e$|--eval(?:=|$)|--rpc-eval(?:=|$))/ },
+  // erl's -eval runs an expression, and -run/-s call Mod:Func with the remaining
+  // words as arguments (`-run os cmd "..."` reaches a shell; os:cmd also accepts
+  // the atoms -s passes), so each hands the grammar executable code.
+  { name: /^w?erl[0-9.]*$/, evalWord: /^-(?:eval|run|s)$/ },
   // These launchers execute a positional script but need no inline-eval matcher here;
   // auto-published script operands still localize through the shared check.
   { name: /^(?:swift|tclsh|wish|expectk?|jimsh|escript)[0-9.]*$/ },

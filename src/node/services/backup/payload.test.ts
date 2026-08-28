@@ -2259,6 +2259,10 @@ describe("backup payload", () => {
       `node --loader=data:text/javascript,import%7BspawnSync%7Dfrom%22node%3Achild_process%22%3BspawnSync%28%22mcp%22%2C%5B%22--token%22%2C%22ghp_Abcdef1234%22%2B%22Klmno56789%22%5D%29 server.js`,
       `deno run 'data:text/javascript,new(Deno.Command)("mcp",{args:["--token","ghp_Abcdef1234"+"Klmno56789"]}).outputSync()'`,
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
+      // erl evaluates -eval expressions, and -run/-s hand Mod:Func the remaining
+      // words (os:cmd reaches a shell from either spelling).
+      'erl -noshell -eval \'os:cmd("mcp${IFS}--token${IFS}ghp_Abcdef1234"++"Klmno56789")\' -s init stop',
+      "erl -noshell -run os cmd 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       // Perl and Ruby cluster the numeric `-0[octal]` switch before the eval
       // letter, so digits count as cluster characters alongside letters.
       'perl -0e \'exec("mcp","--token","ghp_Abcdef1234"."Klmno56789")\'',
