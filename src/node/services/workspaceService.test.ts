@@ -3,7 +3,7 @@ import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./w
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { askUserQuestionManager } from "./askUserQuestionManager";
@@ -9752,7 +9752,9 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   test("start-here replacement does not auto-compact the next send from stale usage", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "start-here-clears-usage-state";
-    const streamMessage = mock((..._args: unknown[]) => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock((..._args: unknown[]) =>
+      Promise.resolve(Ok(createStartedTurnHandle()))
+    );
     const harness = await createAgentSessionHarness({
       workspaceId,
       config,

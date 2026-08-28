@@ -15,6 +15,16 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
 import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
 
+function contextExceededResult(messageId: string) {
+  return {
+    success: true as const,
+    data: createFailedTurnHandle(messageId, {
+      error: "Context length exceeded",
+      errorType: "context_exceeded",
+    }),
+  };
+}
+
 function createPersistedPostCompactionState(options: {
   filePath: string;
   diffs: Array<{ path: string; diff: string; truncated: boolean }>;
@@ -92,13 +102,7 @@ describe("AgentSession post-compaction context retry", () => {
           errorType: "context_exceeded",
         });
 
-        return Promise.resolve({
-          success: true as const,
-          data: createFailedTurnHandle("assistant-ctx-exceeded", {
-            error: "Context length exceeded",
-            errorType: "context_exceeded",
-          }),
-        });
+        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
       }
 
       resolveSecondCall?.();
@@ -247,13 +251,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return {
-          success: true as const,
-          data: createFailedTurnHandle("assistant-ctx-exceeded", {
-            error: "Context length exceeded",
-            errorType: "context_exceeded",
-          }),
-        };
+        return contextExceededResult("assistant-ctx-exceeded");
       }
       // Retry startup in flight: hold it until the test releases, then fail
       // pre-stream (e.g. commitPartial / history read failure).
@@ -388,13 +386,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return Promise.resolve({
-          success: true as const,
-          data: createFailedTurnHandle("assistant-attempt-1", {
-            error: "Context length exceeded",
-            errorType: "context_exceeded",
-          }),
-        });
+        return Promise.resolve(contextExceededResult("assistant-attempt-1"));
       }
       // The retry's startup succeeds, but the stream dies immediately with a
       // terminal error — emitted before the original retry path resumes.

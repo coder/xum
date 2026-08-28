@@ -23,6 +23,19 @@ interface AutoRetryResumeRequest {
   goalKind?: typeof GOAL_CONTINUATION_KIND;
 }
 
+interface RetryableSessionForTests {
+  retryActiveStream: () => Promise<void>;
+  lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+  resumeStream: (options: SendMessageOptions) => Promise<
+    | { success: true; data: { started: boolean } }
+    | {
+        success: false;
+        error: { type: "runtime_start_failed"; message: string };
+        failureHandled?: true;
+      }
+  >;
+}
+
 interface SessionBundle {
   session: AgentSession;
   config: Config;
@@ -1177,18 +1190,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     const { session, events, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      resumeStream: (options: SendMessageOptions) => Promise<
-        | { success: true; data: { started: boolean } }
-        | {
-            success: false;
-            error: { type: "runtime_start_failed"; message: string };
-            failureHandled?: true;
-          }
-      >;
-    };
+    const privateSession = session as unknown as RetryableSessionForTests;
 
     privateSession.lastAutoRetryResumeRequest = {
       options: {
@@ -1225,18 +1227,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     const { session, events, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      resumeStream: (options: SendMessageOptions) => Promise<
-        | { success: true; data: { started: boolean } }
-        | {
-            success: false;
-            error: { type: "runtime_start_failed"; message: string };
-            failureHandled?: true;
-          }
-      >;
-    };
+    const privateSession = session as unknown as RetryableSessionForTests;
 
     privateSession.lastAutoRetryResumeRequest = {
       options: {

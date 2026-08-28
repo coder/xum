@@ -3,7 +3,7 @@ import { describe, expect, mock, spyOn, test } from "bun:test";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
@@ -99,7 +99,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
             turnId: "turn-different",
           }) === true,
       };
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "queue-dispatch-preparing-predecessor",
