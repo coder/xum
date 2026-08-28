@@ -1053,6 +1053,23 @@ interface QueueCutAttributionSnapshot {
 }
 
 /**
+ * The snapshot's active stream when it is a DIFFERENT (uncorrelated) message
+ * than the ended one: input that had already taken over the session at this
+ * cut, so its metadata — not the queue's — attributes the cut. Shared by cut
+ * attribution and disposable-ownership forwarding so the two cannot drift on
+ * what counts as "already streaming at the cut".
+ */
+function findQueueCutTakeoverStream(
+  event: StreamEndEvent,
+  snapshot: QueueCutAttributionSnapshot
+): { messageId: string; muxMetadata: unknown } | undefined {
+  const { activeStream } = snapshot;
+  return activeStream != null && activeStream.messageId !== event.messageId
+    ? activeStream
+    : undefined;
+}
+
+/**
  * Settled workspace-turn records eligible for self-heal correction (resettle from a
  * correlated stream-end, or read-time repair/revive): transient stream-error settlements
  * (status "error"), stale restart-recovery interrupts, and queue-cut supersedes (late
@@ -15035,10 +15052,11 @@ export class TaskService implements AgentTaskIntegration {
     };
     // Already streaming at the cut: the uncorrelated active stream is the
     // engaged cutter.
-    const { activeStream, cutter } = snapshot;
-    if (activeStream != null && activeStream.messageId !== event.messageId) {
-      return classifyMetadata(activeStream.muxMetadata);
+    const takeoverStream = findQueueCutTakeoverStream(event, snapshot);
+    if (takeoverStream != null) {
+      return classifyMetadata(takeoverStream.muxMetadata);
     }
+    const { cutter } = snapshot;
     if (cutter?.stage === "preparing" || cutter?.stage === "dispatching") {
       // Engaged stages report even with undefined metadata (manual message) so
       // a same-owner follow-up queued BEHIND the engaged cutter cannot be
@@ -15083,10 +15101,11 @@ export class TaskService implements AgentTaskIntegration {
     record: WorkspaceTurnTaskHandleRecord,
     snapshot: QueueCutAttributionSnapshot
   ): string | undefined {
-    const { activeStream, cutter } = snapshot;
-    if (activeStream != null && activeStream.messageId !== event.messageId) {
-      return this.sameOwnerFollowUpHandleIdFromMetadata(record, activeStream.muxMetadata);
+    const takeoverStream = findQueueCutTakeoverStream(event, snapshot);
+    if (takeoverStream != null) {
+      return this.sameOwnerFollowUpHandleIdFromMetadata(record, takeoverStream.muxMetadata);
     }
+    const { cutter } = snapshot;
     return cutter != null
       ? this.sameOwnerFollowUpHandleIdFromMetadata(record, cutter.muxMetadata)
       : undefined;
