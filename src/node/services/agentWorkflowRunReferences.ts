@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import writeFileAtomic from "write-file-atomic";
 
+import { AgentIdSchema } from "@/common/schemas/ids";
 import assert from "@/common/utils/assert";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 
@@ -89,9 +90,11 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
         : null
       : undefined;
     // Identity is advisory (the wake falls back to the history walk), so an invalid shape
-    // drops only the field, not the entry.
-    const agentId =
-      typeof record.agentId === "string" && record.agentId.length > 0 ? record.agentId : undefined;
+    // drops only the field, not the entry. Schema-validate rather than accepting any string:
+    // stream resolution normalizes an unknown requested agent to exec, so a corrupt persisted
+    // ID would silently swap a restricted agent's wake onto exec's tool surface.
+    const agentIdParse = AgentIdSchema.safeParse(record.agentId);
+    const agentId = agentIdParse.success ? agentIdParse.data : undefined;
     // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
     // consumers cannot pick a stale duplicate and declare a legitimately re-recorded run
     // superseded. The chosen record is kept wholesale, including its boundary snapshot.

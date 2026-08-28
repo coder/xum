@@ -82,12 +82,16 @@ describe("agent workflow run references", () => {
           references: [
             { runId: "wfr_agent_number", createdAtMs: 1_000, agentId: 7 },
             { runId: "wfr_agent_empty", createdAtMs: 1_000, agentId: "" },
+            // Non-empty but schema-invalid: stream resolution would normalize it to exec,
+            // silently swapping a restricted agent's wake onto exec's tool surface.
+            { runId: "wfr_agent_malformed", createdAtMs: 1_000, agentId: "bad id" },
           ],
         })
       );
       references = await readAgentWorkflowRunReferences(workspaceSessionDir);
       expect(references).toContainEqual({ runId: "wfr_agent_number", createdAtMs: 1_000 });
       expect(references).toContainEqual({ runId: "wfr_agent_empty", createdAtMs: 1_000 });
+      expect(references).toContainEqual({ runId: "wfr_agent_malformed", createdAtMs: 1_000 });
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }
