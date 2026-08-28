@@ -2742,6 +2742,131 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes Perl debugger invocations under inherited PERL5DB", async () => {
+    const originalPerl5db = process.env.PERL5DB;
+    try {
+      for (const [perl5db, command, expected] of [
+        [
+          `BEGIN { do q(${muxRoot}/skills/launch.txt) }`,
+          "perl -d /opt/server.pl",
+          REDACTED_BACKUP_VALUE,
+        ],
+        ["sub DB::DB {}", "wperl -dt /opt/server.pl", REDACTED_BACKUP_VALUE],
+        // Without a debugger option, PERL5DB is not executed.
+        [
+          `BEGIN { do q(${muxRoot}/skills/launch.txt) }`,
+          "perl /opt/server.pl",
+          "perl /opt/server.pl",
+        ],
+        // An empty hook is inert.
+        ["", "perl -d /opt/server.pl", "perl -d /opt/server.pl"],
+      ] as const) {
+        process.env.PERL5DB = perl5db;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPerl5db === undefined) delete process.env.PERL5DB;
+      else process.env.PERL5DB = originalPerl5db;
+    }
+  });
+
+  it("localizes uv run command invocations", async () => {
+    for (const [command, expected] of [
+      [`uv run python3 ${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
+      ["uv --directory /opt run python3 /opt/server.py", REDACTED_BACKUP_VALUE],
+      ["uv tool run probe", REDACTED_BACKUP_VALUE],
+      // Other subcommands do not hand their later operands to exec.
+      ["uv pip install run", "uv pip install run"],
+      ["uv sync", "uv sync"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes GDB command files and eval options", async () => {
+    for (const [command, expected] of [
+      [`gdb -nx -batch -x ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`gdb --command=${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`gdb-multiarch -ix ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      ["gdb -ex run app", REDACTED_BACKUP_VALUE],
+      ["gdb --eval-command=run app", REDACTED_BACKUP_VALUE],
+      // A foreign command file and a plain invocation stay portable.
+      ["gdb -x /opt/init.gdb app", "gdb -x /opt/init.gdb app"],
+      ["gdb app", "gdb app"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes Ninja build-file operands", async () => {
+    for (const [command, expected] of [
+      [`ninja -f ${muxRoot}/skills/launch.txt leak`, REDACTED_BACKUP_VALUE],
+      [`ninja -f${muxRoot}/skills/launch.txt leak`, REDACTED_BACKUP_VALUE],
+      [`ninja-build -f ${muxRoot}/skills/launch.txt leak`, REDACTED_BACKUP_VALUE],
+      // A foreign build file and a plain invocation stay portable.
+      ["ninja -f /opt/build.ninja leak", "ninja -f /opt/build.ninja leak"],
+      ["ninja leak", "ninja leak"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
   it("localizes LLDB source and one-line command options", async () => {
     for (const [command, expected] of [
       [`lldb -s ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],

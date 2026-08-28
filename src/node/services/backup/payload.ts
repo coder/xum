@@ -1941,6 +1941,19 @@ const NPM_SUBCOMMANDS = new Set(
   )
 );
 
+const UV_SUBCOMMANDS = new Set(
+  "auth run init add remove version sync lock export tree format tool python pip venv build publish cache self generate-shell-completion help".split(
+    " "
+  )
+);
+const UV_TOOL_SUBCOMMANDS = new Set("run install upgrade uninstall update list dir".split(" "));
+
+function uvGlobalOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:--(?:cache-dir|color|directory|project|config-file|python-preference|allow-insecure-host))$/.test(
+    unquoted
+  );
+}
+
 /** Exactly one replaced assignment, nothing else riding along in the same word. */
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
@@ -2246,6 +2259,8 @@ interface LanguageInterpreter {
    * environment inspection, and letters that consume an attached argument.
    */
   interactiveOption?: RegExp;
+  /** Option that enables an inherited debugger program (PERL5DB). */
+  debuggerOption?: RegExp;
   /**
    * Attached option naming an auxiliary file consumed before the main operand
    * (jshell --startup=FILE, PHP -cFILE). Such a file can inject executable behavior,
@@ -2310,6 +2325,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   {
     name: /^w?perl[0-9.]*$/,
     evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
+    debuggerOption: /^-d(?:$|[:t])/,
   },
   {
     name: /^rubyw?[0-9.]*$/,
@@ -2403,6 +2419,9 @@ function hasDisguisedAssignment(
   let pendingEnvWorkingDirectory = false;
   let pendingNpmSubcommand = false;
   let pendingNpmExecOptions = false;
+  let pendingUvSubcommand = false;
+  let pendingUvOptionValue = false;
+  let pendingUvToolSubcommand = false;
   let pendingMiseSubcommand = false;
   let pendingMiseExecOptions = false;
   let pendingGitSubcommand = false;
@@ -2426,6 +2445,10 @@ function hasDisguisedAssignment(
   let pendingOpensslConfigFile = false;
   let pendingLldbOptions = false;
   let pendingLldbSourceFile = false;
+  let pendingGdbOptions = false;
+  let pendingGdbCommandFile = false;
+  let pendingNinjaOptions = false;
+  let pendingNinjaBuildFile = false;
   let pendingJavaOptions = false;
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
@@ -2510,6 +2533,9 @@ function hasDisguisedAssignment(
       pendingPrintfVariableOption = false;
       pendingNpmSubcommand = false;
       pendingNpmExecOptions = false;
+      pendingUvSubcommand = false;
+      pendingUvOptionValue = false;
+      pendingUvToolSubcommand = false;
       pendingMiseSubcommand = false;
       pendingMiseExecOptions = false;
       pendingGitSubcommand = false;
@@ -2533,6 +2559,10 @@ function hasDisguisedAssignment(
       pendingOpensslConfigFile = false;
       pendingLldbOptions = false;
       pendingLldbSourceFile = false;
+      pendingGdbOptions = false;
+      pendingGdbCommandFile = false;
+      pendingNinjaOptions = false;
+      pendingNinjaBuildFile = false;
       pendingJavaOptions = false;
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
@@ -2813,6 +2843,26 @@ function hasDisguisedAssignment(
         }
       }
     }
+    if (pendingUvToolSubcommand) {
+      if (unquoted === "run") return true;
+      if (UV_TOOL_SUBCOMMANDS.has(unquoted)) pendingUvToolSubcommand = false;
+    }
+    if (pendingUvSubcommand) {
+      if (pendingUvOptionValue) {
+        pendingUvOptionValue = false;
+      } else if (uvGlobalOptionTakesSeparateValue(unquoted)) {
+        pendingUvOptionValue = true;
+      } else if (unquoted === "run") {
+        // uv run executes the command that follows after its own option parse.
+        // Localizing at the subcommand avoids duplicating that evolving grammar.
+        return true;
+      } else if (unquoted === "tool") {
+        pendingUvSubcommand = false;
+        pendingUvToolSubcommand = true;
+      } else if (UV_SUBCOMMANDS.has(unquoted)) {
+        pendingUvSubcommand = false;
+      }
+    }
     if (pendingMiseExecOptions && /^(?:-c(?:.+)?|--command(?:=|$))/.test(unquoted)) {
       return true;
     }
@@ -2868,6 +2918,31 @@ function hasDisguisedAssignment(
       if (isShellResolvedPublishedOperand(unquoted)) return true;
     } else if (pendingOpensslOptions && /^--?config$/.test(unquoted)) {
       pendingOpensslConfigFile = true;
+    }
+    if (pendingGdbCommandFile) {
+      pendingGdbCommandFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingGdbOptions) {
+      const attachedCommandFile = /^-(?:x|ix)(.+)$/.exec(unquoted)?.[1];
+      const longCommandFile = /^--?(?:command|init-command)=(.+)$/.exec(unquoted)?.[1];
+      const commandFile = attachedCommandFile ?? longCommandFile;
+      if (commandFile !== undefined && isShellResolvedPublishedOperand(commandFile)) return true;
+      if (/^(?:-x|-ix|--?(?:command|init-command))$/.test(unquoted)) {
+        pendingGdbCommandFile = true;
+      }
+      if (/^(?:-ex|-iex|--?(?:eval-command|init-eval-command)(?:=.*)?)$/.test(unquoted)) {
+        return true;
+      }
+    }
+    if (pendingNinjaBuildFile) {
+      pendingNinjaBuildFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingNinjaOptions) {
+      const attachedBuildFile = /^-f(.+)$/.exec(unquoted)?.[1];
+      if (attachedBuildFile !== undefined && isShellResolvedPublishedOperand(attachedBuildFile)) {
+        return true;
+      }
+      if (unquoted === "-f") pendingNinjaBuildFile = true;
     }
     if (pendingLldbSourceFile) {
       pendingLldbSourceFile = false;
@@ -3063,12 +3138,15 @@ function hasDisguisedAssignment(
       if (inherited.opensslConfigHook && executable === "openssl") return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
+      if (executable === "uv") pendingUvSubcommand = true;
       if (executable === "mise") pendingMiseSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
       if (/^sqlite3[0-9.]*$/.test(executable)) pendingSqliteOptions = true;
       if (executable === "openssl") pendingOpensslOptions = true;
       if (/^lldb(?:-[0-9.]+)?$/.test(executable)) pendingLldbOptions = true;
+      if (/^(?:.*-)?gdb(?:-multiarch)?(?:-[0-9.]+)?$/.test(executable)) pendingGdbOptions = true;
+      if (/^ninja(?:-build)?$/.test(executable)) pendingNinjaOptions = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
       if (executable === "systemd-run") pendingSystemdRunOptions = true;
@@ -3126,6 +3204,9 @@ function hasDisguisedAssignment(
       // An inherited startup hook naming a published document executes on any
       // interactive spelling before the first prompt.
       if (inherited.pythonStartupHook && pending.interactiveOption?.test(unquoted) === true) {
+        return true;
+      }
+      if (inherited.perlDebuggerHook && pending.debuggerOption?.test(unquoted) === true) {
         return true;
       }
       // An evaluation word after a language interpreter hands that grammar a script.
@@ -3572,6 +3653,8 @@ interface InheritedLaunchContext {
   gitConfigHook: boolean;
   /** OPENSSL_CONF names an auto-published configuration document. */
   opensslConfigHook: boolean;
+  /** A non-empty PERL5DB program runs when Perl's debugger is enabled. */
+  perlDebuggerHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3796,6 +3879,7 @@ function redactMcpConfig(
       canonicalizeInheritedPath(process.env.OPENSSL_CONF ?? ""),
       rootPrefixes
     ),
+    perlDebuggerHook: (process.env.PERL5DB ?? "").trim() !== "",
   };
   inherited.gitConfigHook ||= hasInheritedGitExecutionHook(rootPrefixes, inherited);
   const text = content.toString("utf-8");
