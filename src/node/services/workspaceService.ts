@@ -10959,11 +10959,11 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Three-state currentness: "indeterminate" means history could not be read, so the answer is
-   * unknown rather than no. Callers that would permanently drop a terminal wake on a negative
-   * answer (the terminal-attention drain tombstones notifications) must retain and retry on
-   * "indeterminate" instead; boolean callers treat it as not-current, the pre-existing
-   * fail-safe for non-destructive decisions.
+   * Three-state currentness: "indeterminate" means history/provenance could not be read or
+   * ordered, so the answer is unknown rather than no. Callers that would permanently drop a
+   * terminal wake on a negative answer (the terminal-attention drain tombstones notifications)
+   * must retain and retry on "indeterminate" instead; boolean callers treat it as not-current,
+   * the pre-existing fail-safe for non-destructive decisions.
    */
   async getWorkflowInvocationCurrentness(
     workspaceId: string,
@@ -10990,7 +10990,8 @@ export class WorkspaceService extends EventEmitter {
     // a legitimate wake nor let a pre-supersession reference outrank a newer boundary. For a
     // consumed boundary, equality means a background resume/retry was recorded after the prior
     // result was delivered. References without a boundary snapshot (pre-upgrade entries,
-    // record-time read failures) take a wall-clock migration fallback below.
+    // record-time read failures) cannot be ordered against the decision row at all and defer
+    // as indeterminate below.
     let references: AgentWorkflowRunReference[];
     try {
       references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
@@ -11021,15 +11022,13 @@ export class WorkspaceService extends EventEmitter {
       return "not_current";
     }
     if (reference.afterBoundaryMessageId === undefined) {
-      // Migration fallback: entries written before boundary snapshots existed (or after a
-      // record-time history read failure) carry only a timestamp, and an in-flight run must not
-      // lose its wake across the upgrade. Fall back to wall-clock ordering against a datable
-      // boundary; an undatable boundary fails safe. All new records take the identity path
-      // above, so clock-correction edge cases are confined to this shrinking population.
-      if (decision.timestampMs == null) {
-        return "not_current";
-      }
-      return reference.createdAtMs > decision.timestampMs ? "current" : "not_current";
+      // No boundary snapshot (pre-upgrade entry or record-time history read failure): row
+      // identity cannot be verified, and wall-clock ordering is the exact hole the identity
+      // path exists to close (a backward clock correction would let a pre-supersession
+      // reference outrank a newer manual turn and deliver its output under that turn's tool
+      // policy). Defer like an unreadable history: the wake stays pending, a workflow_resume
+      // re-record repairs provenance, and an explicit resume/await still consumes the run.
+      return "indeterminate";
     }
     if (reference.afterBoundaryMessageId === null) {
       // Verified-empty snapshot: a decision row now exists, so it appeared after the record.
@@ -11052,7 +11051,6 @@ export class WorkspaceService extends EventEmitter {
         status: "found";
         outcome: "invocation" | "consumed" | "superseded";
         messageId: string;
-        timestampMs: number | null;
       }
     | { status: "none" }
     | { status: "error" }
@@ -11061,7 +11059,6 @@ export class WorkspaceService extends EventEmitter {
       found: {
         outcome: "invocation" | "consumed" | "superseded";
         messageId: string;
-        timestampMs: number | null;
       } | null;
     } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
@@ -11069,10 +11066,8 @@ export class WorkspaceService extends EventEmitter {
       "backward",
       (messages) => {
         for (const message of messages) {
-          const timestamp = message.metadata?.timestamp;
-          const timestampMs = typeof timestamp === "number" ? timestamp : null;
           if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
-            state.found = { outcome: "superseded", messageId: message.id, timestampMs };
+            state.found = { outcome: "superseded", messageId: message.id };
             return false;
           }
           if (
@@ -11081,11 +11076,11 @@ export class WorkspaceService extends EventEmitter {
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
-            state.found = { outcome: "consumed", messageId: message.id, timestampMs };
+            state.found = { outcome: "consumed", messageId: message.id };
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
-            state.found = { outcome: "invocation", messageId: message.id, timestampMs };
+            state.found = { outcome: "invocation", messageId: message.id };
             return false;
           }
         }
@@ -11101,12 +11096,7 @@ export class WorkspaceService extends EventEmitter {
       return { status: "error" };
     }
     return state.found != null
-      ? {
-          status: "found",
-          outcome: state.found.outcome,
-          messageId: state.found.messageId,
-          timestampMs: state.found.timestampMs,
-        }
+      ? { status: "found", outcome: state.found.outcome, messageId: state.found.messageId }
       : { status: "none" };
   }
 

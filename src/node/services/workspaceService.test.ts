@@ -6406,7 +6406,7 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
-  test("migrates legacy sidecar references through the wall-clock fallback", async () => {
+  test("defers boundaryless sidecar references instead of trusting wall-clock order", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-legacy";
     const runId = "wfr_currentness_legacy";
@@ -6438,30 +6438,31 @@ describe("WorkspaceService workflow invocation events", () => {
         workspaceId,
         createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
       );
-      // Entries written before boundary snapshots existed carry only a timestamp. An in-flight
-      // run recorded after the newest boundary must keep its wake across the upgrade.
+      // A reference without a boundary snapshot (pre-upgrade entry or record-time history read
+      // failure) cannot be ordered against the decision row by identity: the wake defers
+      // instead of delivering, and the boolean caller stays fail-safe.
       await recordAgentWorkflowRunReference({
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId,
         createdAtMs: 1_150,
       });
-      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+      expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
+        "indeterminate"
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
 
-      // A newer boundary still supersedes a legacy entry.
+      // A backward clock correction gives the newer superseding turn an OLDER timestamp than
+      // the reference. Wall-clock ordering would resurrect the superseded reference as current
+      // and deliver its output under the newer turn's tool policy; it must stay deferred.
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("manual-user-2", "user", "never mind, answer something else", {
-          timestamp: 1_200,
+          timestamp: 1_100,
         })
       );
-      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-
-      // An undatable boundary cannot be ordered against a legacy timestamp: fail safe.
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("manual-user-undated", "user", "another instruction", {})
+      expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
+        "indeterminate"
       );
-      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();

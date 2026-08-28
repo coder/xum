@@ -92,9 +92,9 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     const hasBoundary = "afterBoundaryMessageId" in record;
     const boundaryRaw = record.afterBoundaryMessageId;
     // A present-but-invalid snapshot ("" or a non-string) is corruption, not a legacy record:
-    // migrating it into the wall-clock fallback could let a stale reference outrank a newer
-    // boundary within the tolerated clock skew. Reject the entry; absence stays reserved for
-    // records that genuinely predate the field.
+    // demoting it to a boundaryless entry would misclassify a recorded boundary as unknowable
+    // provenance (parking its wake as indeterminate). Reject the entry; absence stays reserved
+    // for records that genuinely predate the field.
     if (
       hasBoundary &&
       boundaryRaw !== null &&
