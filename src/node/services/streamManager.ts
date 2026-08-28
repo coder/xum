@@ -983,8 +983,8 @@ export class StreamManager extends EventEmitter {
     const tempDir = `~/.xum-tmp/${streamToken}`;
 
     // Resolve ~ in the runtime's context: callers need the canonical absolute
-    // path as a value. ensureDir canonicalizes internally, so the unresolved
-    // form is passed there directly.
+    // path as a value, and reusing it for ensureDir avoids a second remote
+    // resolution round trip per stream on SSH runtimes.
     let resolvedPath = (await runtime.resolvePath(tempDir)).trim();
 
     // In the main process, PlatformPaths defaults to POSIX behavior (no navigator),
@@ -994,7 +994,7 @@ export class StreamManager extends EventEmitter {
     }
 
     try {
-      await runtime.ensureDir(tempDir);
+      await runtime.ensureDir(resolvedPath);
     } catch (err) {
       const msg = getErrorMessage(err);
       throw new Error(`Failed to create temp directory ${resolvedPath}: ${msg}`);
