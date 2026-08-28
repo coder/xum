@@ -94,7 +94,6 @@ export abstract class LocalBaseRuntime implements Runtime {
     const mergedEnv = sanitizeXumChildEnv({
       ...process.env,
       ...(options.env ?? {}),
-      ...(options.pathEnv ?? {}),
     });
     const basePath =
       (options.env?.PATH && options.env.PATH.length > 0

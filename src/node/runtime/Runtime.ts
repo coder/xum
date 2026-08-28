@@ -394,7 +394,7 @@ export interface Runtime {
   readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array>;
 
   /**
-   * Write file contents atomically from a stream
+   * Write file contents atomically from a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
    * @returns Writable stream for file contents
@@ -403,7 +403,7 @@ export interface Runtime {
   writeFile(path: string, abortSignal?: AbortSignal): WritableStream<Uint8Array>;
 
   /**
-   * Get file statistics
+   * Get file statistics. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file/directory
    * @param abortSignal Optional abort signal for cancellation
    * @returns File statistics
@@ -412,7 +412,7 @@ export interface Runtime {
   stat(path: string, abortSignal?: AbortSignal): Promise<FileStat>;
 
   /**
-   * Ensure a directory exists (mkdir -p semantics).
+   * Ensure a directory exists (mkdir -p semantics). Adapters canonicalize tilde and relative paths.
    *
    * This intentionally lives on the Runtime abstraction so local runtimes can use
    * Node fs APIs (Windows-safe) while remote runtimes can use shell commands.

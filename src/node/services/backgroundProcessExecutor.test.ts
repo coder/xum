@@ -3,33 +3,10 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { BackgroundHandle, ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
+import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor";
-
-class ExecPathMappingRuntime extends LocalRuntime {
-  constructor(
-    projectPath: string,
-    private readonly hostPrefix: string,
-    private readonly execPrefix: string
-  ) {
-    super(projectPath);
-  }
-
-  override exec(command: string, options: ExecOptions): Promise<ExecStream> {
-    const mapPath = (filePath: string) =>
-      filePath.startsWith(this.hostPrefix)
-        ? this.execPrefix + filePath.slice(this.hostPrefix.length)
-        : filePath;
-    return super.exec(command, {
-      ...options,
-      cwd: mapPath(options.cwd),
-      pathEnv: Object.fromEntries(
-        Object.entries(options.pathEnv ?? {}).map(([key, value]) => [key, mapPath(value)])
-      ),
-    });
-  }
-}
 
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so

@@ -38,7 +38,7 @@ export interface WrapperScriptOptions {
   exitCodePath: string;
   /** Working directory for the script */
   cwd: string;
-  /** Name of the environment variable containing the translated cwd. */
+  /** Name of the environment variable containing the translated cwd; takes precedence over cwd. */
   cwdEnvVar?: string;
   /** Environment variables to export */
   env?: Record<string, string>;

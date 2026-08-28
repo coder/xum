@@ -230,7 +230,6 @@ export async function spawnProcess(
     };
   }
 
-  // Note: buildWrapperScript handles quoting internally via shellQuote
   const wrapperScript = buildWrapperScript({
     exitCodePath,
     cwd: options.cwd,

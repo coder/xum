@@ -280,7 +280,6 @@ export async function runWithHook<T>(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: context.projectDir,
     XUM_EXEC: execMarker,
   };
   if (toolInputPath) {
@@ -626,7 +625,6 @@ export async function runPreHook(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: context.projectDir,
   };
   if (toolInputPath) {
     canonicalHookEnv.XUM_TOOL_INPUT_PATH = toolInputPath;
@@ -723,7 +721,6 @@ export async function runPostHook(
     // Ensure base JSON env vars cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: context.projectDir,
     XUM_TOOL_RESULT: resultEnv,
   };
   if (toolInputPath) {
