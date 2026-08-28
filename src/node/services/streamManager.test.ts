@@ -1044,7 +1044,7 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
     providerOptions?: Record<string, unknown>;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
 
   test("applies anthropicCacheTtlOverride to manual cache markers without top-level cacheControl", () => {
     const streamManager = new StreamManager(historyService);
@@ -1058,8 +1058,8 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
     }
     // Rebind: buildStreamRequestConfig reads this.getProvidersConfig for
     // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-    const buildRequestConfigBound: BuildStreamRequestConfig = (...args) =>
-      buildRequestConfig.apply(streamManager, args);
+    const buildRequestConfigBound: BuildStreamRequestConfig = (input) =>
+      buildRequestConfig.call(streamManager, input);
 
     const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
     const modelString = KNOWN_MODELS.SONNET.id;
@@ -1083,21 +1083,15 @@ describe("StreamManager - Anthropic cache TTL overrides", () => {
       }),
     };
 
-    const request = buildRequestConfigBound(
+    const request = buildRequestConfigBound({
       model,
       modelString,
       messages,
-      "You are a helpful assistant",
-      undefined, // routeProvider
+      system: "You are a helpful assistant",
       tools,
       providerOptions,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      "1h"
-    );
+      anthropicCacheTtlOverride: "1h",
+    });
 
     expect(request.system).toBeUndefined();
     expect(request.providerOptions).toEqual(providerOptions);
@@ -1156,7 +1150,7 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     system?: string | { role: string; content: string; providerOptions?: unknown };
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
 
   const eligibleProvidersConfig: ProvidersConfigMap = {
     openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
@@ -1179,14 +1173,13 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
       "buildStreamRequestConfig"
     );
     // .call: the transform reads this.getProvidersConfig for route eligibility.
-    return buildRequestConfig.call(
-      streamManager,
-      createTestLanguageModel(),
+    return buildRequestConfig.call(streamManager, {
+      model: createTestLanguageModel(),
       modelString,
-      [{ role: "user", content: "hello" }],
-      "You are a helpful assistant",
-      routeProvider
-    );
+      messages: [{ role: "user", content: "hello" }],
+      system: "You are a helpful assistant",
+      routeProvider,
+    });
   }
 
   test("direct GPT-5.6 replaces the system string with a structured cached message", () => {
@@ -1383,7 +1376,7 @@ describe("StreamManager - sequential tool execution", () => {
     toolChoice?: { type: "tool"; toolName: string };
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -1425,7 +1418,7 @@ describe("StreamManager - sequential tool execution", () => {
     return {
       // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
       // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1481,22 +1474,14 @@ describe("StreamManager - sequential tool execution", () => {
       steps: Promise.resolve([]),
     } as unknown as ReturnType<typeof aiSdk.streamText>);
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
-      [{ role: "user", content: "hello" }],
-      "system",
-      undefined, // routeProvider
+      modelString: KNOWN_MODELS.SONNET.id,
+      messages: [{ role: "user", content: "hello" }],
+      system: "system",
       tools,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-      () => false,
-      undefined,
-      undefined
-    );
+      hasQueuedMessages: () => false,
+    });
     createStreamResult(request, new AbortController());
 
     expect(streamTextSpy).toHaveBeenCalledTimes(1);
@@ -1543,7 +1528,7 @@ describe("StreamManager - call settings overrides", () => {
     onChunk?: NonNullable<Parameters<typeof aiSdk.streamText>[0]["onChunk"]>;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -1574,7 +1559,7 @@ describe("StreamManager - call settings overrides", () => {
     return {
       // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
       // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -1591,21 +1576,14 @@ describe("StreamManager - call settings overrides", () => {
       };
     }
   ): StreamRequestConfigForTests {
-    return buildRequestConfig(
+    return buildRequestConfig({
       model,
       modelString,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      options.maxOutputTokens,
-      options.callSettingsOverrides,
-      undefined,
-      undefined,
-      undefined,
-      undefined
-    );
+      system: "system",
+      maxOutputTokens: options.maxOutputTokens,
+      callSettingsOverrides: options.callSettingsOverrides,
+    });
   }
 
   function setupStreamTextSpy() {
@@ -1693,23 +1671,7 @@ describe("StreamManager - call settings overrides", () => {
     const streamTextSpy = setupStreamTextSpy();
     const onChunk = mock(() => undefined);
 
-    const request = buildRequestConfig(
-      model,
-      modelString,
-      messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      onChunk,
-      undefined
-    );
+    const request = buildRequestConfig({ model, modelString, messages, system: "system", onChunk });
 
     createStreamResult(request, new AbortController());
 
@@ -5758,7 +5720,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
     toolSearchState?: ToolSearchStreamState;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => StreamRequestConfigForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
   type CreateStreamResult = (
     request: StreamRequestConfigForTests,
     abortController: AbortController
@@ -5794,7 +5756,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
     return {
       // .apply: buildStreamRequestConfig reads this.getProvidersConfig for
       // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -5887,24 +5849,13 @@ describe("StreamManager - tool search activeTools scoping", () => {
       activatedToolNames: new Set(),
     };
 
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      toolSearchState
-    );
+      system: "system",
+      toolSearchState,
+    });
 
     // Same reference, not a copy. tool_catalog_search.execute mutations must be
     // visible to prepareStep.
@@ -5924,7 +5875,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     onStepMessages?: (stepMessages: ModelMessage[]) => void;
   }
 
-  type BuildStreamRequestConfig = (...args: unknown[]) => OverrideRequestForTests;
+  type BuildStreamRequestConfig = (input: Record<string, unknown>) => OverrideRequestForTests;
   type CreateStreamResult = (
     request: OverrideRequestForTests,
     abortController: AbortController
@@ -5949,7 +5900,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     createStreamResult: CreateStreamResult;
   } {
     const buildRequestConfig = Reflect.get(streamManager, "buildStreamRequestConfig") as
-      | ((...args: unknown[]) => OverrideRequestForTests)
+      | ((input: Record<string, unknown>) => OverrideRequestForTests)
       | undefined;
     const createStreamResultMethod = Reflect.get(streamManager, "createStreamResult") as
       | CreateStreamResult
@@ -5960,7 +5911,7 @@ describe("StreamManager - mid-turn thinking override", () => {
       throw new Error("Expected StreamManager private helpers to exist");
     }
     return {
-      buildRequestConfig: (...args) => buildRequestConfig.apply(streamManager, args),
+      buildRequestConfig: (input) => buildRequestConfig.call(streamManager, input),
       createStreamResult: (request, abortController) =>
         createStreamResultMethod.call(streamManager, request, abortController),
     };
@@ -6140,50 +6091,26 @@ describe("StreamManager - mid-turn thinking override", () => {
     const rebuild: RebuildProviderOptionsForThinkingLevel = () => null;
 
     // Without the closure, an absent providerOptions stays absent (no behavior change).
-    const plainRequest = buildRequestConfig(
+    const plainRequest = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined, // routeProvider
-      undefined, // tools
-      undefined, // providerOptions
-      undefined, // maxOutputTokens
-      undefined, // callSettingsOverrides
-      undefined, // toolPolicy
-      undefined, // hasQueuedMessages
-      undefined, // headers
-      undefined, // anthropicCacheTtlOverride
-      undefined, // onChunk
-      undefined, // onStepMessages
-      undefined // toolSearchState
-    );
+      system: "system",
+    });
     expect(plainRequest.providerOptions).toBeUndefined();
 
     // With the closure, undefined normalizes to a mutable object whose identity
     // is exactly what streamText() captures — otherwise in-place mutation at
     // prepareStep time would be unobservable to the SDK's per-step merge.
-    const request = buildRequestConfig(
+    const request = buildRequestConfig({
       model,
-      KNOWN_MODELS.SONNET.id,
+      modelString: KNOWN_MODELS.SONNET.id,
       messages,
-      "system",
-      undefined,
-      undefined,
-      undefined, // providerOptions intentionally absent
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined, // onToolExecutionStart
-      state,
-      rebuild
-    );
+      system: "system",
+      // providerOptions intentionally absent
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel: rebuild,
+    });
     expect(request.providerOptions).toEqual({});
     expect(request.thinkingOverrideState).toBe(state);
     expect(request.rebuildProviderOptionsForThinkingLevel).toBe(rebuild);

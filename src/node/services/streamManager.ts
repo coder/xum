@@ -276,6 +276,39 @@ export interface TurnExecutionOptions {
 
 // Stream request config for start/retry
 
+// Request-construction inputs shared by the primary turn (sourced from
+// TurnExecutionOptions) and model-fallback hops (sourced from the prepared
+// fallback). routeProvider is the backend-resolved route
+// (initialMetadata.routeProvider for the primary request,
+// initialMetadataPatch.routeProvider for fallbacks); missing route metadata
+// fails closed for OpenAI explicit prompt caching.
+type StreamRequestInput = Pick<
+  TurnExecutionOptions,
+  | "model"
+  | "modelString"
+  | "messages"
+  | "system"
+  | "tools"
+  | "providerOptions"
+  | "maxOutputTokens"
+  | "callSettingsOverrides"
+  | "toolPolicy"
+  | "hasQueuedMessages"
+  | "headers"
+  | "anthropicCacheTtlOverride"
+  | "onChunk"
+  | "onStepMessages"
+  | "toolSearchState"
+  | "thinkingOverrideState"
+  | "rebuildProviderOptionsForThinkingLevel"
+  | "forcedFirstStepToolNames"
+  | "providersConfigSnapshot"
+  | "rebuildFirstStepForThinkingLevel"
+> & {
+  routeProvider?: string;
+  onToolExecutionStart?: (toolCallId: string) => void;
+};
+
 interface StepMessageTracker {
   latestMessages?: ModelMessage[];
 }
@@ -1795,33 +1828,31 @@ export class StreamManager {
       : normalizeUsageModelKey(model, this.getProvidersConfig());
   }
 
-  private buildStreamRequestConfig(
-    model: LanguageModel,
-    modelString: string,
-    messages: ModelMessage[],
-    system: string,
-    // Backend-resolved route provider (initialMetadata.routeProvider for the
-    // primary request, initialMetadataPatch.routeProvider for fallbacks).
-    // Missing route metadata fails closed for OpenAI explicit prompt caching.
-    routeProvider?: string,
-    tools?: Record<string, Tool>,
-    providerOptions?: Record<string, unknown>,
-    maxOutputTokens?: number,
-    callSettingsOverrides?: ResolvedCallSettingsOverrides,
-    toolPolicy?: ToolPolicy,
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean,
-    headers?: Record<string, string | undefined>,
-    anthropicCacheTtlOverride?: AnthropicCacheTtl,
-    onChunk?: StreamTextOnChunk,
-    onStepMessages?: (messages: ModelMessage[]) => void,
-    toolSearchState?: ToolSearchStreamState,
-    onToolExecutionStart?: (toolCallId: string) => void,
-    thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[],
-    providersConfigSnapshot?: ProvidersConfigMap,
-    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
-  ): StreamRequestConfig {
+  private buildStreamRequestConfig(input: StreamRequestInput): StreamRequestConfig {
+    const {
+      model,
+      modelString,
+      messages,
+      system,
+      routeProvider,
+      tools,
+      providerOptions,
+      maxOutputTokens,
+      callSettingsOverrides,
+      toolPolicy,
+      hasQueuedMessages,
+      headers,
+      anthropicCacheTtlOverride,
+      onChunk,
+      onStepMessages,
+      toolSearchState,
+      onToolExecutionStart,
+      thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel,
+      forcedFirstStepToolNames,
+      providersConfigSnapshot,
+      rebuildFirstStepForThinkingLevel,
+    } = input;
     // The request's pinned providers-config snapshot (when the caller has
     // one): cache wrappers and type-derived output limits below must resolve
     // Coder instance metadata against the SAME config that created the SDK
@@ -2178,30 +2209,12 @@ export class StreamManager {
     } = options;
     const stepTracker: StepMessageTracker = {};
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
-    const request = this.buildStreamRequestConfig(
-      options.model,
-      modelString,
-      options.messages,
-      options.system,
-      initialMetadata?.routeProvider,
-      options.tools,
-      options.providerOptions,
-      maxOutputTokens,
-      options.callSettingsOverrides,
-      options.toolPolicy,
-      options.hasQueuedMessages,
-      options.headers,
-      options.anthropicCacheTtlOverride,
-      options.onChunk,
-      options.onStepMessages,
-      options.toolSearchState,
-      (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
-      options.thinkingOverrideState,
-      options.rebuildProviderOptionsForThinkingLevel,
-      options.forcedFirstStepToolNames,
-      options.providersConfigSnapshot,
-      options.rebuildFirstStepForThinkingLevel
-    );
+    const request = this.buildStreamRequestConfig({
+      ...options,
+      routeProvider: initialMetadata?.routeProvider,
+      onToolExecutionStart: (toolCallId) =>
+        this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
+    });
 
     // Start streaming - this can throw immediately if API key is missing
     let streamResult;
@@ -2932,38 +2945,39 @@ export class StreamManager {
     // Build the swapped request/stream into locals first so a failure here
     // leaves streamInfo unmodified (the terminal error then names the model
     // that actually refused, not a half-applied fallback).
-    const nextRequest = this.buildStreamRequestConfig(
-      prepared.data.model,
-      prepared.data.modelString,
-      prepared.data.messages,
-      prepared.data.system,
+    const nextRequest = this.buildStreamRequestConfig({
+      model: prepared.data.model,
+      modelString: prepared.data.modelString,
+      messages: prepared.data.messages,
+      system: prepared.data.system,
       // Use the fallback's freshly-resolved route (not stale source metadata,
       // which streamInfo.initialMetadata still holds at this point) so the
       // OpenAI cached-system transform evaluates the fallback route.
-      prepared.data.initialMetadataPatch?.routeProvider,
-      prepared.data.tools,
-      prepared.data.providerOptions,
-      fallbackState.original.maxOutputTokens,
-      prepared.data.callSettingsOverrides,
-      streamInfo.request.toolPolicy,
-      streamInfo.request.hasQueuedMessages,
-      prepared.data.headers,
-      prepared.data.anthropicCacheTtl,
-      streamInfo.request.onChunk,
-      streamInfo.request.onStepMessages,
+      routeProvider: prepared.data.initialMetadataPatch?.routeProvider,
+      tools: prepared.data.tools,
+      providerOptions: prepared.data.providerOptions,
+      maxOutputTokens: fallbackState.original.maxOutputTokens,
+      callSettingsOverrides: prepared.data.callSettingsOverrides,
+      toolPolicy: streamInfo.request.toolPolicy,
+      hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      headers: prepared.data.headers,
+      anthropicCacheTtlOverride: prepared.data.anthropicCacheTtl,
+      onChunk: streamInfo.request.onChunk,
+      onStepMessages: streamInfo.request.onStepMessages,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
-      streamInfo.request.toolSearchState,
-      (toolCallId) => this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
+      toolSearchState: streamInfo.request.toolSearchState,
+      onToolExecutionStart: (toolCallId) =>
+        this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
       // Same holder object (the session's setter keeps working across the
       // hop) with a closure bound to the FALLBACK model. Attached before
       // createStreamResult below in case the SDK eagerly prepares step 1.
-      streamInfo.request.thinkingOverrideState,
-      prepared.data.rebuildProviderOptionsForThinkingLevel,
-      prepared.data.forcedFirstStepToolNames,
-      prepared.data.providersConfig,
-      prepared.data.rebuildFirstStepForThinkingLevel
-    );
+      thinkingOverrideState: streamInfo.request.thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel: prepared.data.rebuildProviderOptionsForThinkingLevel,
+      forcedFirstStepToolNames: prepared.data.forcedFirstStepToolNames,
+      providersConfigSnapshot: prepared.data.providersConfig,
+      rebuildFirstStepForThinkingLevel: prepared.data.rebuildFirstStepForThinkingLevel,
+    });
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
     // later disk-reset await cannot wipe freshly prepared fallback messages.
