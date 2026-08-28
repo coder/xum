@@ -1,4 +1,8 @@
-import { XUM_HOME_DIR_NAME, XUM_PROTOCOL_SCHEME } from "@/common/constants/product";
+import {
+  XUM_HOME_DIR_NAME,
+  XUM_PRODUCT_SLUG,
+  XUM_PROTOCOL_SCHEME,
+} from "@/common/constants/product";
 import { type XumEnvironment } from "./xumEnv";
 
 export { assignXumEnvironmentValue, resolveXumEnvironmentValue } from "./xumEnv";
@@ -127,6 +131,20 @@ export function resolveLegacyMuxBuiltInSkillName(name: string): string {
     LEGACY_MUX_BUILT_IN_SKILL_ALIASES[name as keyof typeof LEGACY_MUX_BUILT_IN_SKILL_ALIASES] ??
     name
   );
+}
+
+/**
+ * Settings backups pushed before the rename live under managed paths spelled with the
+ * legacy product slug (default `mux/`). Returns the configured spelling first, then the
+ * legacy spelling when they differ, so restore-side reads can fall back to an old backup
+ * while exports keep writing the configured canonical path.
+ */
+export function listBackupManagedPathSpellings(managedPath: string): readonly string[] {
+  const legacy = managedPath
+    .split("/")
+    .map((segment) => (segment === XUM_PRODUCT_SLUG ? LEGACY_MUX_PRODUCT_SLUG : segment))
+    .join("/");
+  return legacy === managedPath ? [managedPath] : [managedPath, legacy];
 }
 
 const XUM_ENV_PREFIX = "XUM_";

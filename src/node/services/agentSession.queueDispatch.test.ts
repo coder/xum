@@ -1000,4 +1000,36 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await cleanup();
     }
   });
+
+  test("rejected queued dispatch surfaces through onAcceptedPreStreamFailure", async () => {
+    const workspaceId = "queue-dispatch-rejected";
+    const { session, cleanup } = await createAgentSessionHarness({ workspaceId });
+    const failures: string[] = [];
+
+    try {
+      session.queueMessage(
+        "queued peer trigger",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          // Peer sends refund their family-message reservation through this hook; a dispatch
+          // that REJECTS (throws) instead of returning Err must reach it just like the
+          // returned-error branch, or the reservation is stranded until restart.
+          onAcceptedPreStreamFailure: (error) => {
+            failures.push(error.type === "unknown" ? error.raw : error.type);
+          },
+        }
+      );
+      const sendMessage = spyOn(session, "sendMessage").mockImplementation(() =>
+        Promise.reject(new Error("pricing gate exploded"))
+      );
+      session.sendQueuedMessages();
+      expect(await waitForCondition(() => failures.length === 1)).toBe(true);
+      expect(failures[0]).toContain("pricing gate exploded");
+      sendMessage.mockRestore();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
 });

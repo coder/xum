@@ -2163,7 +2163,7 @@ describe("StreamingMessageAggregator", () => {
       expect(remaining.map((m) => m.id)).toEqual(["boundary-2"]);
     });
 
-    test("updates reconnect cursor floor when a live compaction boundary arrives", () => {
+    test("keeps returning the stored server cursor when a live compaction boundary arrives", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
       // Simulate initial replay window starting at historySequence 40.
@@ -2182,8 +2182,16 @@ describe("StreamingMessageAggregator", () => {
         { mode: "replace" }
       );
 
+      const serverCursor = {
+        messageId: "history-41",
+        historySequence: 41,
+        oldestHistorySequence: 40,
+        priorHistoryFingerprint: "cafe1234",
+      };
+      aggregator.setServerHistoryCursor(serverCursor);
+
       const beforeCompactionCursor = aggregator.getOnChatCursor();
-      expect(beforeCompactionCursor?.history?.oldestHistorySequence).toBe(40);
+      expect(beforeCompactionCursor?.history).toEqual(serverCursor);
 
       const boundary = asChatMessage(
         createMuxMessage("boundary-60", "assistant", "Summary epoch 60", {
@@ -2196,8 +2204,11 @@ describe("StreamingMessageAggregator", () => {
       );
       aggregator.handleMessage(boundary);
 
+      // The cursor is reused verbatim: a live compaction makes it stale, and the
+      // server-side anchor validation downgrades the next reconnect to a (small)
+      // full replay of the fresh epoch instead of the client guessing a new cursor.
       const afterCompactionCursor = aggregator.getOnChatCursor();
-      expect(afterCompactionCursor?.history?.oldestHistorySequence).toBe(60);
+      expect(afterCompactionCursor?.history).toEqual(serverCursor);
     });
 
     test("keeps visible history when a live reset boundary arrives", () => {
@@ -4423,6 +4434,255 @@ describe("notify tool -> browser notifications", () => {
       startTestStream(aggregator, { messageId: "msg-2", historySequence: 2 });
       runNotifyTool(aggregator, { messageId: "msg-2", toolCallId: "tc-notify-2" });
       expect(FakeNotification.created).toEqual([{ title: "Task done", body: "All checks passed" }]);
+    });
+  });
+
+  describe("server-issued reconnect cursor", () => {
+    test("returns undefined before any server cursor is stored", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [createMuxMessage("history-1", "user", "hello", { historySequence: 1, timestamp: 1 })],
+        false,
+        { mode: "replace" }
+      );
+
+      // Local rows alone are not enough: only the server can issue a valid cursor.
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+
+    test("returns the stored server cursor verbatim and clears on null", () => {
+      const aggregator = createTestAggregator();
+      const serverCursor = {
+        messageId: "history-2",
+        historySequence: 2,
+        oldestHistorySequence: 1,
+        priorHistoryFingerprint: "deadbeef",
+      };
+
+      aggregator.setServerHistoryCursor(serverCursor);
+      expect(aggregator.getOnChatCursor()?.history).toEqual(serverCursor);
+
+      aggregator.setServerHistoryCursor(null);
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+
+    test("clear() drops the stored server cursor", () => {
+      const aggregator = createTestAggregator();
+      aggregator.setServerHistoryCursor({ messageId: "history-1", historySequence: 1 });
+      aggregator.clear();
+      expect(aggregator.getOnChatCursor()).toBeUndefined();
+    });
+  });
+
+  describe("since-replay suffix reconciliation", () => {
+    const persistedRow = (
+      id: string,
+      historySequence: number,
+      texts: string[],
+      role: "user" | "assistant" = "assistant"
+    ) => {
+      // createMuxMessage rejects empty user messages, so build with placeholder
+      // content and overwrite parts with the exact persisted-form layout.
+      const message = createMuxMessage(id, role, "placeholder", {
+        historySequence,
+        timestamp: historySequence * 100,
+      });
+      message.parts = texts.map((text) => ({ type: "text" as const, text }));
+      return message;
+    };
+
+    test("removes local suffix rows the server did not re-send", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("assistant-2", 2, ["kept"]),
+          persistedRow("assistant-3", 3, ["deleted server-side while away"]),
+        ],
+        false,
+        { mode: "replace" }
+      );
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [persistedRow("assistant-2", 2, ["kept"])],
+        hasActiveStream: false,
+      });
+
+      expect(aggregator.getAllMessages().map((message) => message.id)).toEqual([
+        "user-1",
+        "assistant-2",
+      ]);
+    });
+
+    test("replaces rewritten rows even when the persisted form has fewer parts", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("assistant-2", 2, ["a", "b", "c"]),
+        ],
+        false,
+        { mode: "replace" }
+      );
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [persistedRow("assistant-2", 2, ["rewritten"])],
+        hasActiveStream: false,
+      });
+
+      const rewritten = aggregator.getAllMessages().find((message) => message.id === "assistant-2");
+      expect(rewritten?.parts).toEqual([{ type: "text", text: "rewritten" }]);
+    });
+
+    test("keeps optimistic rows without a historySequence and does not duplicate the boundary row", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("assistant-1", 1, ["turn one"])], false, {
+        mode: "replace",
+      });
+      // Optimistic send awaiting ack: no historySequence yet.
+      aggregator.addMessage(createMuxMessage("optimistic-1", "user", "queued send"));
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [persistedRow("assistant-1", 1, ["turn one"])],
+        hasActiveStream: false,
+      });
+
+      const ids = aggregator.getAllMessages().map((message) => message.id);
+      expect(ids.filter((id) => id === "assistant-1")).toHaveLength(1);
+      expect(ids).toContain("optimistic-1");
+    });
+
+    test("drops derived state sourced from a removed suffix row", () => {
+      const aggregator = createTestAggregator();
+      const todos = [{ content: "task", status: "in_progress" as const }];
+      aggregator.loadHistoricalMessages(
+        [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          historicalTodoMessage("todo-row", todos, { historySequence: 3 }),
+        ],
+        false,
+        { mode: "replace" }
+      );
+      expect(aggregator.getCurrentTodos()).toEqual(todos);
+
+      // The todo-bearing row was deleted server-side while the client was away.
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [],
+        hasActiveStream: false,
+      });
+
+      expect(aggregator.getAllMessages().map((message) => message.id)).toEqual(["user-1"]);
+      expect(aggregator.getCurrentTodos()).toEqual([]);
+    });
+
+    test("rebuilds derived state from surviving rows when a suffix source is removed", () => {
+      const aggregator = createTestAggregator();
+      const keptTodos = [{ content: "kept", status: "in_progress" as const }];
+      const staleTodos = [{ content: "stale", status: "in_progress" as const }];
+      aggregator.loadHistoricalMessages(
+        [
+          historicalTodoMessage("todo-kept", keptTodos, { historySequence: 1 }),
+          historicalTodoMessage("todo-stale", staleTodos, { historySequence: 3 }),
+        ],
+        false,
+        { mode: "replace" }
+      );
+      expect(aggregator.getCurrentTodos()).toEqual(staleTodos);
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 2,
+        messages: [],
+        hasActiveStream: false,
+      });
+
+      // Derived state falls back to the surviving todo_write below the anchor.
+      expect(aggregator.getCurrentTodos()).toEqual(keptTodos);
+    });
+
+    test("preserves the locally assembled active-stream row when the carve-out applies", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("user-1", 1, ["hello"], "user")], false, {
+        mode: "replace",
+      });
+
+      startTestStream(aggregator, { messageId: "msg-live", historySequence: 2 });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        delta: "Hello ",
+        tokens: 1,
+        timestamp: 1_001,
+      });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        delta: "world",
+        tokens: 1,
+        timestamp: 1_002,
+      });
+
+      // The persisted placeholder for an in-flight stream has empty parts.
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [persistedRow("user-1", 1, ["hello"], "user"), persistedRow("msg-live", 2, [])],
+        preservedActiveStreamMessageId: "msg-live",
+        hasActiveStream: true,
+      });
+
+      const liveRow = aggregator.getAllMessages().find((message) => message.id === "msg-live");
+      expect(liveRow?.parts).toEqual([{ type: "text", text: "Hello world", timestamp: 1_001 }]);
+      expect(aggregator.getActiveStreamMessageId()).toBe("msg-live");
+
+      // Stream ending right after caught-up still finalizes the preserved message.
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-live",
+        metadata: { model: TEST_MODEL, historySequence: 2, timestamp: 1_003 },
+        parts: [],
+      });
+      const finalized = aggregator.getAllMessages().find((message) => message.id === "msg-live");
+      expect(finalized?.parts).toEqual([{ type: "text", text: "Hello world", timestamp: 1_001 }]);
+      expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
+    });
+
+    test("rebuilds the stream row from persisted form when no carve-out applies", () => {
+      const aggregator = createTestAggregator();
+      aggregator.loadHistoricalMessages([persistedRow("user-1", 1, ["hello"], "user")], false, {
+        mode: "replace",
+      });
+
+      // Local stream context went stale (e.g. stream A ended while away); the store
+      // clears mismatched stream contexts before reconciling, so no carve-out applies
+      // and the persisted (finalized) form wins over the richer local assembly.
+      startTestStream(aggregator, { messageId: "msg-old", historySequence: 2 });
+      aggregator.handleStreamDelta({
+        type: "stream-delta",
+        workspaceId: TEST_WORKSPACE_ID,
+        messageId: "msg-old",
+        delta: "locally assembled much longer content",
+        tokens: 1,
+        timestamp: 1_001,
+      });
+      aggregator.clearActiveStreams();
+
+      aggregator.reconcileSinceReplay({
+        requestedAnchorSequence: 1,
+        messages: [
+          persistedRow("user-1", 1, ["hello"], "user"),
+          persistedRow("msg-old", 2, ["final"]),
+        ],
+        hasActiveStream: false,
+      });
+
+      const rebuilt = aggregator.getAllMessages().find((message) => message.id === "msg-old");
+      expect(rebuilt?.parts).toEqual([{ type: "text", text: "final" }]);
     });
   });
 });

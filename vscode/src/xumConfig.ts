@@ -1,7 +1,10 @@
 import { Config } from "xum/node/config";
 import assert from "node:assert";
 
-import type { FrontendWorkspaceMetadata, WorkspaceActivitySnapshot } from "xum/common/types/workspace";
+import type {
+  FrontendWorkspaceMetadata,
+  WorkspaceActivitySnapshot,
+} from "xum/common/types/workspace";
 import { type ExtensionMetadata, readExtensionMetadata } from "xum/node/utils/extensionMetadata";
 import { createRuntime } from "xum/node/runtime/runtimeFactory";
 
@@ -13,7 +16,11 @@ import type { ApiClient } from "./api/client";
 
 const DEFAULT_WORKSPACE_LIST_TIMEOUT_MS = 5_000;
 
-async function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+async function promiseWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
   assert(timeoutMs > 0, "timeoutMs must be positive");
 
   return new Promise<T>((resolve, reject) => {
@@ -21,11 +28,9 @@ async function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number, lab
       reject(new Error(`${label} timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    promise
-      .then(resolve, reject)
-      .finally(() => {
-        clearTimeout(timeout);
-      });
+    promise.then(resolve, reject).finally(() => {
+      clearTimeout(timeout);
+    });
   });
 }
 export interface WorkspaceWithContext extends FrontendWorkspaceMetadata {
@@ -85,14 +90,15 @@ export async function getAllWorkspacesFromApi(
   const [workspaces, activityById] = await Promise.all([
     promiseWithTimeout(client.workspace.list(), timeoutMs, "xum API workspace.list"),
     promiseWithTimeout(
-      client.workspace.activity.list() as Promise<Record<string, WorkspaceActivitySnapshot>>,
+      // null = backend activity read failure; fall back to metadata-only sorting.
+      client.workspace.activity.list() as Promise<Record<string, WorkspaceActivitySnapshot> | null>,
       timeoutMs,
       "xum API workspace.activity.list"
     ),
   ]);
 
   const extensionMeta = new Map<string, ExtensionMetadata>();
-  for (const [workspaceId, activity] of Object.entries(activityById)) {
+  for (const [workspaceId, activity] of Object.entries(activityById ?? {})) {
     extensionMeta.set(workspaceId, {
       recency: activity.recency,
       streaming: activity.streaming,
@@ -112,4 +118,3 @@ export function getWorkspacePath(workspace: WorkspaceWithContext): string {
   const runtime = createRuntime(workspace.runtimeConfig, { projectPath: workspace.projectPath });
   return runtime.getWorkspacePath(workspace.projectPath, workspace.name);
 }
-

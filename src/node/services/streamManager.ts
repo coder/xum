@@ -33,6 +33,7 @@ import type {
 
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
@@ -93,7 +94,7 @@ import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
 } from "@/common/utils/providers/modelEntries";
-import { getErrorMessage } from "@/common/utils/errors";
+import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
@@ -111,6 +112,11 @@ const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
   "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
 const MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS = 1;
+
+/** Drop reason for a partial that never reaches chat.jsonl. */
+type DroppedStreamSource = "aborted_stream" | "errored_stream";
+/** Sidecar analytics label: drop reason, or the refusal-specific label. */
+type HeadlessDropSource = DroppedStreamSource | "refused_stream";
 const STREAM_TRUNCATED_MESSAGE_SUFFIX =
   "stream closed unexpectedly before the response completed. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
@@ -518,19 +524,18 @@ function clonePersistedToolModelUsage(event: PersistedToolModelUsage): Persisted
   };
 }
 
-function hasTokenUsage(usage: LanguageModelV2Usage | undefined): usage is LanguageModelV2Usage {
-  return (
-    usage !== undefined &&
-    ((usage.inputTokens ?? 0) > 0 ||
-      (usage.outputTokens ?? 0) > 0 ||
-      (usage.totalTokens ?? 0) > 0 ||
-      (usage.cachedInputTokens ?? 0) > 0 ||
-      (usage.reasoningTokens ?? 0) > 0)
-  );
-}
-
 function cloneUsage(usage: LanguageModelV2Usage): LanguageModelV2Usage {
   return { ...usage };
+}
+
+/**
+ * Fresh all-zero usage object for refusals where the provider billed nothing
+ * (or usage never arrived). A new object per call — downstream code mutates
+ * usage objects (e.g. reasoning-token backfill), so a shared singleton would
+ * leak counts across records.
+ */
+function zeroTokenUsage(): LanguageModelV2Usage {
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 }
 
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
@@ -1588,7 +1593,12 @@ export class StreamManager extends EventEmitter {
     streamInfo: Pick<WorkspaceStreamInfo, "model" | "metadataModel" | "toolModelUsages">,
     usage: LanguageModelV2Usage | undefined,
     providerMetadata: Record<string, unknown> | undefined,
-    analyticsSource: "aborted_stream" | "errored_stream"
+    analyticsSource: DroppedStreamSource,
+    // Label for the stream's OWN usage row only. The error path passes
+    // "refused_stream" when the turn died as a terminal model refusal (the
+    // stream usage is then terminalRefusalUsage), so refusals are not
+    // conflated with generic errored_stream rows in analytics.
+    streamUsageSource: HeadlessDropSource = analyticsSource
   ): Promise<void> {
     // Thread the request-pinned metadata identities through the sidecar
     // write: recordHeadlessUsage would otherwise re-resolve the raw model
@@ -1600,16 +1610,31 @@ export class StreamManager extends EventEmitter {
         streamInfo.model,
         cloneUsage(usage),
         providerMetadata,
-        { analyticsSource, skipSessionLedger: true, metadataModel: streamInfo.metadataModel }
+        {
+          analyticsSource: streamUsageSource,
+          skipSessionLedger: true,
+          metadataModel: streamInfo.metadataModel,
+        }
       );
     }
     for (const toolUsage of streamInfo.toolModelUsages) {
+      // Refused fallback hops ARE refusals regardless of how the turn ended
+      // (aborted, errored, exhausted chain); every other tool-internal usage
+      // entry keeps the turn's drop reason.
+      const entrySource: HeadlessDropSource =
+        toolUsage.toolName === MODEL_FALLBACK_REFUSAL_TOOL_NAME
+          ? "refused_stream"
+          : analyticsSource;
       await this.sessionUsageService?.recordHeadlessUsage(
         workspaceId as string,
         toolUsage.model,
         cloneUsage(toolUsage.usage),
         toolUsage.providerMetadata,
-        { analyticsSource, skipSessionLedger: true, metadataModel: toolUsage.metadataModel }
+        {
+          analyticsSource: entrySource,
+          skipSessionLedger: true,
+          metadataModel: toolUsage.metadataModel,
+        }
       );
     }
   }
@@ -1636,23 +1661,29 @@ export class StreamManager extends EventEmitter {
       return;
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    // Ledger key for Coder identities: the stream's PINNED record-time
-    // metadata identity (streamInfo.metadataModel), NOT a live re-resolution
-    // of the raw model. A catalog refresh can remove/retag the instance while
-    // the turn is active; re-resolving here would key the ledger differently
-    // from the pricing identity createDisplayUsage just used, and repricing
-    // would later change or strip the row. Non-Coder models keep the
-    // canonical key: their metadata identity can be a mappedToModel alias
-    // target — a pricing identity, deliberately not the ledger bucket.
-    const ledgerModel =
-      model.startsWith("coder:") && streamInfo?.metadataModel
-        ? streamInfo.metadataModel
-        : normalizeUsageModelKey(model, this.getProvidersConfig());
+    const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
     try {
       await this.sessionUsageService.recordUsage(workspaceId as string, ledgerModel, messageUsage);
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
     }
+  }
+
+  /**
+   * Usage-attribution key, mirroring SessionUsageService.recordHeadlessUsageLocked.
+   * Coder identities keep the stream's PINNED record-time metadata identity
+   * (streamInfo.metadataModel), NOT a live re-resolution of the raw model: a
+   * catalog refresh can remove/retag the instance while the turn is active,
+   * and re-resolving would key the ledger differently from the pricing
+   * identity createDisplayUsage used, so repricing would later change or
+   * strip the row. Non-Coder models resolve to the canonical usage key —
+   * their metadata identity can be a mappedToModel alias target (a pricing
+   * identity, deliberately not the attribution bucket).
+   */
+  private usageAttributionModel(model: string, metadataModel: string | undefined): string {
+    return model.startsWith("coder:") && metadataModel
+      ? metadataModel
+      : normalizeUsageModelKey(model, this.getProvidersConfig());
   }
 
   private buildStreamRequestConfig(
@@ -2312,6 +2343,13 @@ export class StreamManager extends EventEmitter {
       error?: string;
     }
   ): void {
+    // Kernel guests can call capabilities with zero arguments. JSON.stringify
+    // drops an `args: undefined` key, and the wire schema requires args on
+    // tool-call-start, so an unnormalized event would fail oRPC output
+    // validation and kill every live onChat subscription. Normalize to {} —
+    // the same shape a provider zero-arg tool call carries.
+    const args = event.args === undefined ? {} : event.args;
+
     // Persist nested calls to streamInfo.parts for crash/interrupt resilience
     const streamInfo = this.workspaceStreams.get(workspaceId as WorkspaceId);
     if (streamInfo) {
@@ -2328,7 +2366,7 @@ export class StreamManager extends EventEmitter {
           nestedCalls.push({
             toolCallId: event.callId,
             toolName: event.toolName,
-            input: event.args,
+            input: args,
             state: "input-available",
             timestamp: event.startTime,
           });
@@ -2358,7 +2396,7 @@ export class StreamManager extends EventEmitter {
         messageId,
         toolCallId: event.callId,
         toolName: event.toolName,
-        args: event.args,
+        args,
         tokens: 0, // Nested calls don't count toward stream tokens
         timestamp: event.startTime,
         parentToolCallId: event.parentToolCallId,
@@ -2554,18 +2592,30 @@ export class StreamManager extends EventEmitter {
     refusedModel: string
   ): Promise<void> {
     const { usage, providerMetadata } = await this.getRefusalUsageSnapshot(streamInfo);
+
+    // Zero-usage refusals (provider billed nothing / usage never arrived) are
+    // still real refused attempts: record an explicit all-zero entry so
+    // analytics counts the refusal, but skip the session ledger below — no
+    // zero-cost noise in the costs UI.
+    //
+    // The persisted entry carries the ATTRIBUTION key, not the raw stream
+    // identity: sidecar refused_stream rows are keyed by
+    // recordHeadlessUsageLocked's canonical model, so a raw gateway/Coder
+    // identity here (e.g. mux-gateway:openai/gpt-5 vs openai:gpt-5) would
+    // split one model across two analytics buckets when queries group
+    // committed hop rows and sidecar rows together.
+    streamInfo.toolModelUsages.push({
+      toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME,
+      timestamp: Date.now(),
+      model: this.usageAttributionModel(refusedModel, streamInfo.metadataModel),
+      metadataModel: streamInfo.metadataModel,
+      usage: usage ?? zeroTokenUsage(),
+      ...(providerMetadata ? { providerMetadata } : {}),
+    });
+
     if (!usage) {
       return;
     }
-
-    streamInfo.toolModelUsages.push({
-      toolName: "model_fallback_refusal",
-      timestamp: Date.now(),
-      model: refusedModel,
-      metadataModel: streamInfo.metadataModel,
-      usage,
-      ...(providerMetadata ? { providerMetadata } : {}),
-    });
 
     await this.recordSessionUsage(
       workspaceId,
@@ -2584,12 +2634,17 @@ export class StreamManager extends EventEmitter {
     refusedModel: string
   ): Promise<void> {
     const { usage, providerMetadata } = await this.getRefusalUsageSnapshot(streamInfo);
+
+    // Same zero-usage policy as recordRefusedAttemptUsage: the terminal
+    // refusal must reach the analytics sidecar (persistStreamError writes
+    // terminalRefusalUsage as a "refused_stream" row) even when the provider
+    // billed nothing, but the session ledger stays free of zero-cost entries.
+    streamInfo.terminalRefusalUsage = usage ?? zeroTokenUsage();
+    streamInfo.terminalRefusalProviderMetadata = providerMetadata;
+
     if (!usage) {
       return;
     }
-
-    streamInfo.terminalRefusalUsage = usage;
-    streamInfo.terminalRefusalProviderMetadata = providerMetadata;
 
     await this.recordSessionUsage(
       workspaceId,
@@ -3860,6 +3915,14 @@ export class StreamManager extends EventEmitter {
     streamInfo: WorkspaceStreamInfo,
     payload: StreamErrorPayload & { errorType: StreamErrorType }
   ): Promise<void> {
+    // Clamp at the single choke point every stream error payload passes
+    // through before persist/emit, including buildStreamErrorPayload's
+    // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
+    // embed another error's message). Some SDK errors embed the entire
+    // serialized prompt in their message (AI_TypeValidationError via the
+    // cause walk); unbounded, that would be persisted to history metadata,
+    // shipped over IPC, and rendered in the chat.
+    payload = { ...payload, error: clampErrorMessage(payload.error) };
     const refusalFinishReason =
       payload.errorType === "model_refusal"
         ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
@@ -3935,7 +3998,11 @@ export class StreamManager extends EventEmitter {
         streamInfo,
         errorUsage,
         errorProviderMetadata,
-        "errored_stream"
+        "errored_stream",
+        // A model_refusal error's stream usage row is terminalRefusalUsage
+        // (only set for terminal no-fallback refusals); label it as a refusal
+        // so analytics can distinguish refusals from generic stream errors.
+        payload.errorType === "model_refusal" ? "refused_stream" : "errored_stream"
       );
     } catch (error) {
       log.error("Failed to record errored-stream usage in headless sidecar", { error });

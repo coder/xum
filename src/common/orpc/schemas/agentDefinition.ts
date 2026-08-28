@@ -114,5 +114,14 @@ export const AgentDefinitionPackageSchema = z
     scope: AgentDefinitionScopeSchema,
     frontmatter: AgentDefinitionFrontmatterSchema,
     body: z.string(),
+    /**
+     * Exact source identity of the winning candidate: "built-in" for embedded
+     * definitions, otherwise the discovery root the file was read from (per-plugin
+     * agents dirs are unique per plugin). Scope alone is not a provenance
+     * identifier — project files and project plugins both report "project" — so
+     * strict explicit-agent sends pin this to detect a different definition
+     * taking over the same id between launch validation and streaming.
+     */
+    source: z.string().optional(),
   })
   .strict();

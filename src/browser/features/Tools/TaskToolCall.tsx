@@ -112,6 +112,7 @@ const TaskStatusBadge: React.FC<{
       case "backgrounded":
         return "bg-pending/20 text-pending";
       case "awaiting_report":
+      case "rate_limited":
         return "bg-warning/20 text-warning";
       case "queued":
         return "bg-muted/20 text-muted";
@@ -122,6 +123,7 @@ const TaskStatusBadge: React.FC<{
         return "bg-interrupted/20 text-interrupted";
       case "not_found":
       case "invalid_scope":
+      case "refused":
       case "error":
       case "failed":
         // Workflow-run terminal failure status (task_list rows).
@@ -131,7 +133,12 @@ const TaskStatusBadge: React.FC<{
     }
   };
 
-  const label = status === "awaiting_report" ? "awaiting report" : status;
+  const label =
+    status === "awaiting_report"
+      ? "awaiting report"
+      : status === "rate_limited"
+        ? "rate limited"
+        : status;
 
   return (
     <span
@@ -300,6 +307,8 @@ interface TaskRowProps {
   agentType?: string;
   title?: string;
   depth?: number;
+  /** Tree relationship to the calling workspace (task_list scope:"tree" rows). */
+  relationship?: string;
   startedAtMs?: number;
   openWorkspaceId?: string;
   className?: string;
@@ -364,6 +373,9 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
                 openWorkspaceId={props.openWorkspaceId}
               />
             )}
+            {props.relationship && (
+              <span className="text-muted text-[10px]">{props.relationship}</span>
+            )}
             {typeof props.depth === "number" && props.depth > 0 && (
               <span className="text-muted text-[10px]">depth {props.depth}</span>
             )}
@@ -391,6 +403,7 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
       {props.title && (
         <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
       )}
+      {props.relationship && <span className="text-muted text-[10px]">{props.relationship}</span>}
       {typeof props.depth === "number" && props.depth > 0 && (
         <span className="text-muted text-[10px]">depth: {props.depth}</span>
       )}
@@ -1680,6 +1693,9 @@ const TaskListItem: React.FC<{
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
     title={task.title}
     depth={task.depth}
+    // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
+    // self) — the key context for interpreting the tree view and addressing peer messages.
+    relationship={task.relationship}
     openWorkspaceId={task.workspaceId}
   />
 );
@@ -1715,12 +1731,23 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
             <div className="flex items-center gap-2">
               <TaskId id={props.args.task_id} />
               {props.result && <TaskStatusBadge status={props.result.status} />}
+              {props.result && "targetRelation" in props.result && props.result.targetRelation && (
+                <span className="text-muted text-[10px]">to {props.result.targetRelation}</span>
+              )}
             </div>
             <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
               {props.args.message}
             </div>
             {props.result && "error" in props.result && props.result.error && (
               <div className="text-danger text-[11px]">{props.result.error}</div>
+            )}
+            {props.result?.status === "refused" && (
+              <div className="text-danger text-[11px]">{props.result.reason}</div>
+            )}
+            {props.result?.status === "rate_limited" && props.result.retryAfterMs != null && (
+              <div className="text-warning text-[11px]">
+                Retry in {Math.ceil(props.result.retryAfterMs / 1000)}s
+              </div>
             )}
           </div>
         </ToolDetails>

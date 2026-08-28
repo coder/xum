@@ -7,7 +7,7 @@ import {
   TOOL_DEFINITIONS,
 } from "@/common/utils/tools/toolDefinitions";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
-import type { WorkflowRunRecord } from "@/common/types/workflow";
+import { isActiveWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   emitWorkflowRunAttachedEvent,
@@ -16,7 +16,11 @@ import {
   requireWorkspaceId,
 } from "./toolUtils";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  resolveWorkflowScript,
+  type ResolvedWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
+import type { Runtime } from "@/node/runtime/Runtime";
 
 function requireWorkflowService(config: ToolConfiguration) {
   if (!config.workflowService) {
@@ -41,6 +45,137 @@ function requireBackgroundWorkflowStart(
     throw new Error("workflow_run background mode requires startWorkflowInBackground");
   }
   return workflowService.startWorkflowInBackground.bind(workflowService);
+}
+
+/**
+ * Serialize the duplicate-run check and durable run creation per workspace + script identity so
+ * two overlapping workflow_run calls cannot both pass the check before either persists a run.
+ * Released once the run record exists (or the launch fails before creating one), not at workflow
+ * completion, so a later duplicate launch fails fast instead of queueing behind a foreground run.
+ */
+const scriptAdmissionTails = new Map<string, Promise<void>>();
+
+async function acquireScriptAdmission(key: string): Promise<() => void> {
+  const previous = scriptAdmissionTails.get(key) ?? Promise.resolve();
+  let releaseGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const tail = previous.then(() => gate);
+  scriptAdmissionTails.set(key, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    if (scriptAdmissionTails.get(key) === tail) {
+      scriptAdmissionTails.delete(key);
+    }
+    releaseGate();
+  };
+}
+
+function scriptIdentityKey(workspaceId: string, script: ResolvedWorkflowScript): string {
+  // Workspace files key on the physical resolved path so equivalent spellings of the same
+  // file ("./x.js" vs "x.js") contend on one admission gate; skill/plugin canonical paths
+  // are already spelling-independent.
+  const pathIdentity =
+    script.sourceKind === "workspace-file"
+      ? (script.resolvedPath ?? script.canonicalScriptPath)
+      : script.canonicalScriptPath;
+  const identity =
+    script.sourceKind === "inline"
+      ? `inline\u0000${script.sourceHash}`
+      : `path\u0000${pathIdentity}`;
+  return `${workspaceId}\u0000${identity}`;
+}
+
+/**
+ * Same-script identity is the canonical identity persisted at run creation: source hash for
+ * inline scripts, canonical script path otherwise. Plain path spellings are normalized so
+ * "./x.js" and "x.js" match; alternate identities for the same file (symlinks, copies) are
+ * deliberately not chased: that would need filesystem probing on every launch, and a missed
+ * match for an exotic alias merely degrades to the pre-guard duplicate behavior.
+ */
+function hasSameCanonicalScript(
+  run: WorkflowRunRecord,
+  script: ResolvedWorkflowScript,
+  runtime: Runtime,
+  workspacePath: string
+): boolean {
+  if (script.sourceKind === "inline" || run.workflow.sourceKind === "inline") {
+    // Match inline launches by source hash alone: legacy records may omit the optional
+    // workflow.sourceKind, and identical source is the same workflow either way.
+    return (
+      script.sourceKind === "inline" &&
+      (run.workflow.sourceHash ?? run.sourceHash) === script.sourceHash
+    );
+  }
+  const stored = run.workflow.canonicalScriptPath ?? run.workflow.sourcePath;
+  if (stored == null || stored.length === 0) {
+    return false;
+  }
+  if (stored === script.canonicalScriptPath) {
+    return true;
+  }
+  if (stored.includes("://") || script.canonicalScriptPath.includes("://")) {
+    return false;
+  }
+  const normalizedStored = runtime.normalizePath(stored, workspacePath);
+  return (
+    normalizedStored === script.canonicalScriptPath ||
+    (script.resolvedPath != null && normalizedStored === script.resolvedPath)
+  );
+}
+
+async function assertNoActiveSameScriptRun(input: {
+  workflowService: NonNullable<ToolConfiguration["workflowService"]>;
+  workspaceId: string;
+  script: ResolvedWorkflowScript;
+  runtime: Runtime;
+  workspacePath: string;
+}): Promise<void> {
+  if (input.workflowService.listRuns == null) {
+    return;
+  }
+  let rawRuns: unknown[];
+  try {
+    rawRuns = await input.workflowService.listRuns({ workspaceId: input.workspaceId });
+  } catch (error: unknown) {
+    // Fail closed: skipping the check on a store read error could mint exactly the duplicate
+    // this guard exists to prevent, and the caller has an explicit allow_concurrent escape hatch.
+    throw new Error(
+      "workflow_run refused: could not verify that no active run of this script exists " +
+        `(workflow store read failed: ${getErrorMessage(error)}). ` +
+        "Retry once the workflow store is readable, or pass allow_concurrent=true to bypass the duplicate guard."
+    );
+  }
+  const conflicts: WorkflowRunRecord[] = [];
+  for (const rawRun of rawRuns) {
+    // Records that fail to parse are skipped, matching listRuns' own self-healing treatment of
+    // unreadable runs: one malformed record must not brick every workflow launch.
+    const parsed = WorkflowRunRecordSchema.safeParse(rawRun);
+    if (!parsed.success || !isActiveWorkflowRunStatus(parsed.data.status)) {
+      continue;
+    }
+    if (hasSameCanonicalScript(parsed.data, input.script, input.runtime, input.workspacePath)) {
+      conflicts.push(parsed.data);
+    }
+  }
+  if (conflicts.length === 0) {
+    return;
+  }
+  const conflictDetails = conflicts
+    .map((run) => `- runId=${run.id}, status=${run.status}, createdAt=${run.createdAt}`)
+    .join("\n");
+  throw new Error(
+    "workflow_run refused because this script already has an active run in this workspace:\n" +
+      conflictDetails +
+      "\nReattach to running/backgrounded runs with task_await, resume pending runs with workflow_resume, " +
+      "or pass allow_concurrent=true to intentionally start another concurrent run."
+  );
 }
 
 function isBackgroundWorkflowResult(
@@ -106,6 +241,26 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         includeAgentPlugins: config.experiments?.agentPlugins === true,
         ...(skillCtx != null ? { skillStorageContext: skillCtx } : {}),
       });
+      // Duplicate guard: a retried or replayed turn must not mint a second active run of the
+      // same script. The admission gate serializes check + creation for one script identity.
+      const releaseAdmission =
+        args.allow_concurrent === true
+          ? null
+          : await acquireScriptAdmission(scriptIdentityKey(workspaceId, script));
+      if (releaseAdmission != null) {
+        try {
+          await assertNoActiveSameScriptRun({
+            workflowService,
+            workspaceId,
+            script,
+            runtime: config.runtime,
+            workspacePath: config.cwd,
+          });
+        } catch (error: unknown) {
+          releaseAdmission();
+          throw error;
+        }
+      }
       const createdRun: { id: string | null } = { id: null };
       const startInput = {
         script,
@@ -114,6 +269,8 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         args: args.args ?? {},
         onRunCreated: async (event: { runId: string; run: unknown }) => {
           createdRun.id = event.runId;
+          // The run record is durable now, so a concurrent duplicate launch will see it.
+          releaseAdmission?.();
           await emitWorkflowRunAttachedEvent({
             config,
             workspaceId,
@@ -173,6 +330,9 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
           },
           "workflow_run"
         );
+      } finally {
+        // Covers launches that fail before creating a durable run; release is idempotent.
+        releaseAdmission?.();
       }
 
       if (isBackgroundWorkflowResult(args, result.status)) {

@@ -10,6 +10,46 @@ describe("MessageQueue", () => {
     queue = new MessageQueue();
   });
 
+  describe("authoredAtMs", () => {
+    it("returns the request-entry authoring time from dequeueNext when provided", () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6b-orA): the sender captures authoring time
+      // before its preflight awaits (pricing gate, settings persistence);
+      // sampling Date.now() at enqueue instead would postdate a goal that
+      // became visible during those awaits and misclassify the message as an
+      // intervention against a goal the user had not seen.
+      const authoredAtMs = Date.now() - 5_000;
+      queue.add("typed before preflight", undefined, { authoredAtMs });
+
+      const { enqueuedAtMs } = queue.dequeueNext();
+      expect(enqueuedAtMs).toBe(authoredAtMs);
+    });
+
+    it("keeps the newest authoring time when batched adds arrive out of authoring order", () => {
+      // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): overlapping sends can
+      // complete preflight out of authoring order. The batched entry must
+      // report the NEWEST authoring time so a later post-goal stop/correction
+      // is never masked by an older pre-goal message — otherwise the batch
+      // would satisfy the pre-goal guard and keep the goal running despite
+      // the user's intervention.
+      const newerAuthoredAtMs = Date.now() - 1_000;
+      const olderAuthoredAtMs = Date.now() - 10_000;
+      queue.add("post-goal stop", undefined, { authoredAtMs: newerAuthoredAtMs });
+      // The older send finishes its preflight late and batches into the entry.
+      queue.add("pre-goal message", undefined, { authoredAtMs: olderAuthoredAtMs });
+
+      const { enqueuedAtMs } = queue.dequeueNext();
+      expect(enqueuedAtMs).toBe(newerAuthoredAtMs);
+    });
+
+    it("falls back to enqueue-time sampling when authoring time is absent", () => {
+      const before = Date.now();
+      queue.add("plain add");
+
+      const { enqueuedAtMs } = queue.dequeueNext();
+      expect(enqueuedAtMs).toBeGreaterThanOrEqual(before);
+    });
+  });
+
   describe("getDisplayText", () => {
     it("should return joined messages for normal messages", () => {
       queue.add("First message");
@@ -41,6 +81,75 @@ describe("MessageQueue", () => {
       expect(background.message).toBe("Background monitor wake");
       expect(background.internal).toMatchObject({ synthetic: true, agentInitiated: true });
       expect(queue.dequeueNext().message).toBe("User follow-up");
+    });
+
+    it("keeps agent peer messages sealed so later messages never coalesce with them", () => {
+      const peerMetadata: MuxMessageMetadata = {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-sibling",
+        fromTitle: "Watcher",
+        relationship: "sibling",
+      };
+      queue.add(
+        "<mux_agent_message>...</mux_agent_message>",
+        { model: "gpt-4", agentId: "exec", muxMetadata: peerMetadata },
+        // Matches the peer-send path: a removable dedupe key forces a sealed entry.
+        { synthetic: true, agentInitiated: true, removableDedupeKey: true }
+      );
+      queue.add("User follow-up");
+
+      // The follow-up starts a new entry: sender attribution stays on the peer entry alone,
+      // and the count reflects exactly the queued peer messages.
+      expect(queue.countAgentPeerMessageEntries()).toBe(1);
+      expect(queue.getVisibleMessages()).toEqual(["User follow-up"]);
+
+      const peerEntry = queue.dequeueNext();
+      expect(peerEntry.message).toBe("<mux_agent_message>...</mux_agent_message>");
+      expect(peerEntry.options?.muxMetadata).toEqual(peerMetadata);
+      expect(queue.countAgentPeerMessageEntries()).toBe(0);
+      expect(queue.dequeueNext().message).toBe("User follow-up");
+    });
+
+    it("threads the admission probe onto its own sealed entry and re-emits it at dispatch", () => {
+      // A Stop landing after dequeue is invisible to queue clearing, so the probe must ride
+      // the entry into the session's turn-admission gates — and it must not gate unrelated
+      // batched messages.
+      const admissionStale = () => true;
+      queue.add("wake trigger", undefined, { synthetic: true, admissionStale });
+      queue.add("User follow-up");
+
+      const probeEntry = queue.dequeueNext();
+      expect(probeEntry.message).toBe("wake trigger");
+      expect(probeEntry.internal?.admissionStale).toBe(admissionStale);
+
+      const followUp = queue.dequeueNext();
+      expect(followUp.message).toBe("User follow-up");
+      expect(followUp.internal?.admissionStale).toBeUndefined();
+    });
+
+    it("counts peer triggers by dedupe-key prefix when metadata carries a workspace-turn correlation", () => {
+      // Upward sends into a delegated workspace turn replace the trigger's muxMetadata with the
+      // turn correlation; the agent-msg: dedupe prefix must keep the peer count exact.
+      queue.addOnce(
+        "Peer agent task-sibling sent an agent message…",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: {
+            type: "workspace-turn-task",
+            taskHandleId: "wt-1",
+            ownerWorkspaceId: "owner-1",
+            turnId: "turn-1",
+          },
+        },
+        "agent-msg:task-sibling:uuid-1",
+        { synthetic: true, agentInitiated: true, removableDedupeKey: true }
+      );
+      queue.add("User follow-up");
+
+      expect(queue.countAgentPeerMessageEntries()).toBe(1);
+      queue.dequeueNext();
+      expect(queue.countAgentPeerMessageEntries()).toBe(0);
     });
 
     it("should return rawCommand for compaction request", () => {
@@ -502,6 +611,48 @@ describe("MessageQueue", () => {
       expect(second.options?.muxMetadata).toBeUndefined();
       expect(second.internal?.onCanceled).toBeUndefined();
       expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
+    });
+
+    it("should keep peer trigger identity and refund hook when correlation is stripped", () => {
+      const onCanceled = () => undefined;
+      const onAcceptedPreStreamFailure = () => undefined;
+      queue.add(
+        "Peer trigger",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: {
+            ...metadata,
+            agentPeerMessageTrigger: { fromWorkspaceId: "sib-a", relationship: "sibling" },
+          },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          workspaceTurnContinuation: true,
+          onCanceled,
+          onAcceptedPreStreamFailure,
+        }
+      );
+      queue.add("User send now", { model: "gpt-4", agentId: "exec" });
+
+      expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("User send now");
+
+      // The superseded correlation is stripped, but a peer trigger keeps its
+      // machine-notification identity (downgraded to plain peer attribution) plus both refund
+      // hooks — onCanceled and onAcceptedPreStreamFailure carry the sender's budget refund,
+      // tied to this entry rather than the superseded owner handle.
+      const second = queue.dequeueNext();
+      expect(second.options?.muxMetadata).toEqual({
+        type: "agent-peer-message",
+        fromWorkspaceId: "sib-a",
+        relationship: "sibling",
+      });
+      expect(second.internal?.onCanceled).toBe(onCanceled);
+      expect(second.internal?.onAcceptedPreStreamFailure).toBe(onAcceptedPreStreamFailure);
     });
 
     it("should preserve an original queued workspace-turn prompt during reordering", () => {

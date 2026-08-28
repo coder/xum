@@ -69,6 +69,10 @@ export interface ExecOptions {
   forcePTY?: boolean;
 }
 
+export type BackgroundMonitorProbeResult<T> =
+  | { success: true; value: T }
+  | { success: false; error: string };
+
 /**
  * Handle to a background process.
  * Abstracts away whether process is local or remote.
@@ -86,6 +90,9 @@ export interface BackgroundHandle {
    * Async because SSH needs to read remote exit_code file.
    */
   getExitCode(): Promise<number | null>;
+
+  /** Strict exit-code probe used only by monitor polling. */
+  getExitCodeForMonitor?(): Promise<BackgroundMonitorProbeResult<number | null>>;
 
   /**
    * Terminate the process (SIGTERM → wait → SIGKILL).
@@ -114,6 +121,11 @@ export interface BackgroundHandle {
    * Works on both local and SSH runtimes by using runtime.exec() internally.
    */
   readOutput(offset: number): Promise<{ content: string; newOffset: number }>;
+
+  /** Strict output probe used only by monitor polling. */
+  readOutputForMonitor?(
+    offset: number
+  ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>>;
 }
 
 /**

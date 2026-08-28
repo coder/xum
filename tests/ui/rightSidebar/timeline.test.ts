@@ -829,6 +829,35 @@ describe("TimelinePanel", () => {
     }
   });
 
+  test("ignores the reveal shortcut in a panel hidden behind an open modal", async () => {
+    // A CSS-hidden sidebar keeps its panel mounted while the mobile timeline dialog mounts a
+    // second one; Radix marks content outside the open modal aria-hidden. The hidden panel's
+    // window-level shortcut listener must not fire a competing reveal.
+    const event = makeEvent("anchored", "turn.completed", 1, {
+      anchor: { messageId: "loaded-message" },
+    });
+    const view = renderTimeline({ events: [event] });
+    view.workspaceState.messages = [{ historyId: "loaded-message" }];
+    const revealed: unknown[] = [];
+    const listener = (revealEvent: Event) => revealed.push(revealEvent);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+
+    try {
+      fireEvent.click(view.container.querySelector('[data-timeline-event-id="anchored"]')!);
+      const revealButton = await waitFor(() => view.getByTestId("timeline-reveal"));
+
+      view.container.setAttribute("aria-hidden", "true");
+      fireEvent.keyDown(window, { key: "Enter", ctrlKey: true, shiftKey: true });
+
+      // The guard rejects synchronously, so the button never enters the revealing state.
+      expect(revealButton.textContent).toBe("Reveal in transcript");
+      await Promise.resolve();
+      expect(revealed).toHaveLength(0);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
   test("keeps pagination reachable when the active filter has no matches", () => {
     const view = renderTimeline({
       events: [makeEvent("task", "task.created", 1, { source: { system: "task" } })],

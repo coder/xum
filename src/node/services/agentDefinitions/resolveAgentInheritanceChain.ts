@@ -19,6 +19,9 @@ export interface AgentForInheritance {
   uiColor?: string;
   /** Per-hop (unmerged) frontmatter `ai` defaults for AI-settings resolution. */
   ai?: AgentDefinitionPackage["frontmatter"]["ai"];
+  /** Provenance of the hop's winning definition (strict-send chain pinning). */
+  scope: AgentDefinitionPackage["scope"];
+  source?: string;
 }
 
 interface ResolveAgentInheritanceChainOptions {
@@ -74,6 +77,8 @@ export async function resolveAgentInheritanceChain(
       tools: currentDefinition.frontmatter.tools,
       uiColor: currentDefinition.frontmatter.ui?.color,
       ai: currentDefinition.frontmatter.ai,
+      scope: currentDefinition.scope,
+      ...(currentDefinition.source != null ? { source: currentDefinition.source } : {}),
     });
 
     const baseId = currentDefinition.frontmatter.base;

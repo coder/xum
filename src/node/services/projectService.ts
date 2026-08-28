@@ -41,7 +41,11 @@ import { getXumProjectsDir } from "@/common/constants/paths";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { getErrorMessage } from "@/common/utils/errors";
 import { deriveProjectHierarchy, isPathDescendant } from "@/common/utils/subProjects";
-import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
+import {
+  getProjectWorkspaceCounts,
+  type ProjectWorkspaceCounts,
+} from "@/common/utils/projectRemoval";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { z } from "zod";
 
 function orderWorkspacesForCascadeRemoval(
@@ -1289,6 +1293,19 @@ export class ProjectService {
 
       const totalWorkspaces = counts.activeCount + counts.archivedCount;
       if (force && totalWorkspaces > 0) {
+        // Fail fast on cross-project references BEFORE the cascade: the force
+        // loop below only deletes this project's own bucket, so proceeding
+        // would permanently delete owned workspaces and then still fail on the
+        // external references, leaving a partially-deleted project behind.
+        const crossCounts = this.countCrossProjectReferences(config, normalizedPath);
+        if (crossCounts.activeCount + crossCounts.archivedCount > 0) {
+          return Err({
+            type: "workspace_blockers" as const,
+            activeCount: counts.activeCount + crossCounts.activeCount,
+            archivedCount: counts.archivedCount + crossCounts.archivedCount,
+          });
+        }
+
         if (!this.workspaceService) {
           return Err({
             type: "unknown" as const,
@@ -1336,35 +1353,12 @@ export class ProjectService {
         counts = getProjectWorkspaceCounts(projectConfig.workspaces);
       }
 
-      // Also count multi-project workspace references to this project from OTHER project buckets.
-      // Multi-project workspaces can be stored under _multi (interactive creation) or under
-      // any project bucket (task/fork creation via taskService).
-      let crossProjectActiveCount = 0;
-      let crossProjectArchivedCount = 0;
-      for (const [configKey, otherConfig] of config.projects) {
-        if (configKey === normalizedPath) {
-          // Project workspaces in this bucket are already counted above.
-          continue;
-        }
-
-        const referencingWorkspaces = otherConfig.workspaces.filter((workspace) =>
-          workspace.projects?.some(
-            (project) => stripTrailingSlashes(project.projectPath) === normalizedPath
-          )
-        );
-
-        if (referencingWorkspaces.length === 0) {
-          continue;
-        }
-
-        const referencingWorkspaceCounts = getProjectWorkspaceCounts(referencingWorkspaces);
-        crossProjectActiveCount += referencingWorkspaceCounts.activeCount;
-        crossProjectArchivedCount += referencingWorkspaceCounts.archivedCount;
-      }
-
+      // Also count multi-project workspace references to this project from OTHER
+      // project buckets (recomputed from the post-cascade config snapshot).
+      const crossProjectCounts = this.countCrossProjectReferences(config, normalizedPath);
       counts = {
-        activeCount: counts.activeCount + crossProjectActiveCount,
-        archivedCount: counts.archivedCount + crossProjectArchivedCount,
+        activeCount: counts.activeCount + crossProjectCounts.activeCount,
+        archivedCount: counts.archivedCount + crossProjectCounts.archivedCount,
       };
 
       if (counts.activeCount + counts.archivedCount > 0) {
@@ -1408,10 +1402,83 @@ export class ProjectService {
     }
   }
 
+  /**
+   * Count multi-project workspace references to this project stored in OTHER
+   * project buckets. Multi-project workspaces can live under _multi
+   * (interactive creation) or any project bucket (task/fork creation).
+   */
+  private countCrossProjectReferences(
+    config: { projects: Map<string, ProjectConfig> },
+    normalizedPath: string
+  ): ProjectWorkspaceCounts {
+    let activeCount = 0;
+    let archivedCount = 0;
+    for (const [configKey, otherConfig] of config.projects) {
+      if (configKey === normalizedPath) {
+        // Project workspaces in this bucket are counted by the caller.
+        continue;
+      }
+
+      const referencingWorkspaces = otherConfig.workspaces.filter((workspace) =>
+        workspace.projects?.some(
+          (project) => stripTrailingSlashes(project.projectPath) === normalizedPath
+        )
+      );
+
+      if (referencingWorkspaces.length === 0) {
+        continue;
+      }
+
+      const referencingWorkspaceCounts = getProjectWorkspaceCounts(referencingWorkspaces);
+      activeCount += referencingWorkspaceCounts.activeCount;
+      archivedCount += referencingWorkspaceCounts.archivedCount;
+    }
+    return { activeCount, archivedCount };
+  }
+
+  /**
+   * Read-only removal preflight: reports the same blocker counts remove()
+   * enforces (own bucket + cross-project references) WITHOUT remove()'s side
+   * effects (stale-entry pruning, deletion of empty projects). The delete
+   * confirmation dialog needs this because projects.list no longer carries
+   * archived workspaces to count client-side.
+   */
+  getRemovalBlockers(projectPath: string): ProjectWorkspaceCounts {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    const config = this.config.loadConfigOrDefault();
+    const projectConfig = config.projects.get(normalizedPath);
+    if (!projectConfig) {
+      return { activeCount: 0, archivedCount: 0 };
+    }
+    const ownCounts = getProjectWorkspaceCounts(projectConfig.workspaces);
+    const crossCounts = this.countCrossProjectReferences(config, normalizedPath);
+    return {
+      activeCount: ownCounts.activeCount + crossCounts.activeCount,
+      archivedCount: ownCounts.archivedCount + crossCounts.archivedCount,
+    };
+  }
+
   list(): Array<[string, ProjectConfig]> {
     try {
       const config = this.config.loadConfigOrDefault();
-      return Array.from(deriveProjectHierarchy(config.projects).entries());
+      // Read-side projection: exclude archived workspaces from the listing. On
+      // archive-heavy configs they dominate the payload (measured 84% of a
+      // 1.1 MB projects.list response re-fetched on every config change), and
+      // the UI loads archived workspaces on demand via
+      // workspace.list({ archived: true }). Build new arrays instead of
+      // mutating the loaded config: persisted config.json must keep archived
+      // entries (upgrade/downgrade safety).
+      return Array.from(deriveProjectHierarchy(config.projects).entries()).map(
+        ([projectPath, project]): [string, ProjectConfig] => [
+          projectPath,
+          {
+            ...project,
+            workspaces: project.workspaces.filter(
+              (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+            ),
+          },
+        ]
+      );
     } catch (error) {
       log.error("Failed to list projects:", error);
       return [];

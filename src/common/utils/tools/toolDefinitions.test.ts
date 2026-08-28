@@ -8,6 +8,7 @@ import {
   TaskToolArgsSchema,
   TaskRetitleToolArgsSchema,
   TaskWorkspaceLifecycleToolArgsSchema,
+  TaskWorkspaceLifecycleToolInputSchema,
   TOOL_DEFINITIONS,
   WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
@@ -94,6 +95,34 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("accepts workspace task args with an agent id", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      kind: "workspace",
+      agentId: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.agentId).toBe("plan");
+    }
+  });
+
+  it("still rejects subagent_type for workspace tasks", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      kind: "workspace",
+      subagent_type: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+    });
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.path).toEqual(["subagent_type"]);
+    }
+  });
+
   it("rejects workspace task fanout until workspace handles support it", () => {
     expect(
       TaskToolArgsSchema.safeParse({
@@ -141,6 +170,48 @@ describe("TOOL_DEFINITIONS", () => {
       TaskWorkspaceLifecycleToolArgsSchema.safeParse({
         action: "destroy",
         targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+  });
+
+  it("restricts live task_workspace_lifecycle input to reversible actions", () => {
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "archive",
+        targets: [{ taskId: "wst_child" }],
+        interrupt_active: null,
+        acknowledged_untracked_paths: null,
+      }).success
+    ).toBe(true);
+
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "unarchive",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(true);
+
+    // Irreversible verbs and their escape hatch must not be model-invocable through
+    // this tool; task_remove is the only irreversible verb.
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "delete_worktree",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "remove",
+        targets: [{ workspaceId: "child-workspace" }],
+      }).success
+    ).toBe(false);
+
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        action: "archive",
+        targets: [{ workspaceId: "child-workspace" }],
+        force: true,
       }).success
     ).toBe(false);
   });

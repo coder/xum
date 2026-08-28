@@ -421,6 +421,8 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           ownerWorkspaceId: workspaceId,
           prompt,
           title,
+          // Agent mode for the launched turn (e.g. "plan"); createWorkspaceTurn defaults to exec.
+          ...(agentId != null ? { agentId } : {}),
           experiments: config.experiments,
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null

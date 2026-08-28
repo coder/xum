@@ -885,6 +885,49 @@ describe("SessionUsageService", () => {
       expect(result?.lastRequest?.model).toBe(metadataModel);
     });
 
+    it("skips zero-usage refusal markers but keeps billed refusal usage during rebuild", async () => {
+      // Zero-usage model_fallback_refusal entries are analytics-only markers:
+      // the live path never records them in the session ledger, so a rebuild
+      // must not surface 0-token/$0 Costs rows for models that only refused.
+      const workspaceId = "tool-usage-rebuild-skips-zero-refusals";
+      const answeringModel = "anthropic:claude-opus-4-5";
+      const refusedZeroModel = "anthropic:claude-sonnet-4-20250514";
+      const refusedBilledModel = "openai:gpt-5.2";
+      const assistantMessage = createMuxMessage("msg-zero-refusal", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model: answeringModel,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      });
+      Object.assign((assistantMessage.metadata ??= {}), {
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: Date.now(),
+            model: refusedZeroModel,
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: Date.now(),
+            model: refusedBilledModel,
+            usage: { inputTokens: 40, outputTokens: 0, totalTokens: 40 },
+          },
+        ],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result).toBeDefined();
+      const models = Object.keys(result?.byModel ?? {});
+      // Billed refusal usage still merges (live path records it too)…
+      expect(models).toContain(normalizeToCanonical(answeringModel));
+      expect(models).toContain(normalizeToCanonical(refusedBilledModel));
+      // …but the zero-usage marker leaves no ledger entry.
+      expect(models).not.toContain(normalizeToCanonical(refusedZeroModel));
+    });
+
     it("should skip malformed tool model usage entries during rebuild", async () => {
       const workspaceId = "tool-usage-rebuild-skips-malformed";
       const sameModel = "openai:gpt-4";

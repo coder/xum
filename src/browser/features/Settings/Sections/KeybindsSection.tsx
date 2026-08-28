@@ -48,6 +48,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   FOCUS_CHAT: "Focus chat input",
   CLOSE_TAB: "Close tab",
   REVEAL_TIMELINE_EVENT: "Reveal selected timeline event in transcript",
+  OPEN_TIMELINE_DIALOG: "Open timeline dialog (small viewports)",
   REVEAL_LAST_PROMPT: "Reveal last prompt in transcript",
   SIDEBAR_TAB_1: "Tab 1",
   SIDEBAR_TAB_2: "Tab 2",
@@ -188,6 +189,7 @@ const KEYBIND_GROUPS: Array<{
       "SIDEBAR_TAB_9",
       "CLOSE_TAB",
       "REVEAL_TIMELINE_EVENT",
+      "OPEN_TIMELINE_DIALOG",
     ],
   },
   {

@@ -477,11 +477,16 @@ describe("isProviderConfigFixableError", () => {
     "aborted",
     "runtime_not_ready",
     "model_not_found",
+    "agent_resolution",
   ]) {
     it(`does not flag ${type} as config-fixable`, () => {
       expect(isProviderConfigFixableError(type)).toBe(false);
     });
   }
+
+  it("flags agent_resolution as non-retryable (deterministic strict contract failure)", () => {
+    expect(isNonRetryableStreamError({ type: "agent_resolution" })).toBe(true);
+  });
 });
 
 describe("isNonRetryableSendError", () => {

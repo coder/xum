@@ -9,9 +9,14 @@ import type {
 } from "@/common/constants/contextBoundary";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
+import type {
+  AgentMessageRelationship,
+  AgentPeerMessageMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
@@ -58,6 +63,7 @@ type PreservedSendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "strictAgentResolution"
   | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
 >;
@@ -72,8 +78,14 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     reasoningMode: options.reasoningMode,
     additionalSystemInstructions: options.additionalSystemInstructions,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
+    // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
+    // can persist across restarts and build versions.
+    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Delegated turns with explicit agent overrides must stay loud across the
+    // compaction replay too — dropping this would let the follow-up silently
+    // fall back to exec if the agent vanished in the meantime.
+    strictAgentResolution: options.strictAgentResolution,
     allowAgentSetGoal: options.allowAgentSetGoal,
     skipAiSettingsPersistence: options.skipAiSettingsPersistence,
   };
@@ -91,14 +103,30 @@ export type StartupRetrySendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "strictAgentResolution"
   | "allowAgentSetGoal"
 > & {
-  /** Correlation for a delegated workspace turn that must survive restart recovery. */
-  muxMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Correlation metadata that must survive restart recovery: delegated
+   * workspace turns and interrupted compaction requests. A resumed compaction
+   * stream needs its original metadata so trailing synthetic rows cannot break
+   * compaction detection (resolveCompactionRequest only skips synthetic rows
+   * when the stream itself identifies as a compaction request).
+   */
+  muxMetadata?:
+    | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    | Extract<MuxMessageMetadata, { type: "compaction-request" }>;
   /** Internal-only Copilot billing override for startup auto-retry. */
   agentInitiated?: boolean;
   /** Internal goal continuation classification for startup auto-retry accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Not persisted by
+   * pickStartupRetrySendOptions (the user row's own metadata.goalId is the
+   * durable copy); startup recovery re-derives it so resumed streams keep
+   * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
 };
 
 /**
@@ -122,8 +150,12 @@ export function pickStartupRetrySendOptions(
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
+    // Downgrade-compat: retry snapshots persist to chat.jsonl and cross build
+    // versions, so an enabled merged PTC also stamps the legacy exclusive key.
+    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
+    strictAgentResolution: options.strictAgentResolution,
     allowAgentSetGoal: options.allowAgentSetGoal,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
@@ -160,6 +192,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   agentInitiated?: boolean;
   /** Internal goal continuation classification for synthetic follow-up accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Preserved through compaction so the
+   * re-dispatched follow-up row stays goal-scoped for chat-tail
+   * reconciliation instead of degrading to a legacy unscoped row (Codex P2
+   * PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**
@@ -513,6 +552,8 @@ export interface DisplayStatus {
   message: string;
 }
 
+export type BashMonitorFailedOperation = "readOutput" | "getExitCode";
+
 /**
  * Compact per-record summary attached to bash monitor wake turns so the
  * transcript can render a small card (process + filter) while keeping the full
@@ -524,9 +565,22 @@ export interface BashMonitorWakeDisplayRecord {
   /** Persisted wake snapshot version; paired with processId for accepted-delivery recovery. */
   wakeUpdatedAt?: string;
   kind: "match" | "monitor-lost";
+  /** Missing on legacy monitor-lost records, which represent restart losses. */
+  lostReason?: "restart" | "runtime-failure";
   displayName: string;
   filter: string;
   filterExclude: boolean;
+  /**
+   * Present when the wake reported process settlement (exit, kill, timeout). "unknown" is the
+   * backend's read-time degrade of malformed persisted metadata — still a settlement for
+   * display.
+   */
+  terminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
+  /**
+   * Present when the wake carries a dead earlier generation's settlement whose processId was
+   * re-armed by a new live process — still a settlement for display, never "monitor matched".
+   */
+  staleTerminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
 }
 
 export type MuxMessageMetadata = MuxMessageMetadataBase &
@@ -594,6 +648,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
     | {
         type: "goal-pause-boundary";
+        /**
+         * Goal this boundary pauses. Chat-tail reconciliation ignores
+         * boundaries stamped for a different goal so a stale pause finalizer
+         * racing a replacement cannot silently pause the newer goal (Codex P2
+         * PRRT_kwDOPxxmWM6cEl4F). Optional for legacy rows, which keep the
+         * old any-goal semantics.
+         */
+        goalId?: string;
       }
     | {
         // Durable, provider-visible summary of an abandoned history branch
@@ -672,8 +734,61 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         taskHandleId: string;
         ownerWorkspaceId: string;
         turnId: string;
+        /**
+         * Peer attribution for a peer-message wake trigger that must carry the delegated turn's
+         * correlation (stream-end settlement reads this variant's type). Carrying the full
+         * attribution — not just a flag — lets correlation stripping downgrade the row to plain
+         * peer metadata, so the UI keeps rendering it as a machine notification, never as a
+         * human prompt.
+         */
+        agentPeerMessageTrigger?: AgentPeerMessageMeta;
+      }
+    | {
+        // Intra-tree agent peer message (sibling/cousin or descendant→ancestor task_send_message).
+        // The <mux_agent_message> envelope stays in the message text for the model; this metadata
+        // drives the compact transcript card and queue-entry counting without re-parsing it.
+        type: "agent-peer-message";
+        /** Sender's tree target id — the reply address for task_send_message. */
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        /** The sender's relationship to the recipient (mirrors the envelope enum). */
+        relationship: AgentMessageRelationship;
       }
   );
+
+/** Correlation identifying which delegated workspace turn a stream belongs to. */
+export interface WorkspaceTurnTaskCorrelation {
+  taskHandleId: string;
+  ownerWorkspaceId: string;
+  turnId: string;
+}
+
+/**
+ * Parse untyped muxMetadata (from persisted history or live stream info) into a
+ * workspace-turn correlation. Returns null unless the value is a well-formed
+ * "workspace-turn-task" marker — callers use this to attribute a workspace's active
+ * stream to a specific delegated turn (e.g. archive interruption must not stop a user
+ * stream that replaced an ended delegated stream).
+ */
+export function parseWorkspaceTurnTaskCorrelation(
+  muxMetadata: unknown
+): WorkspaceTurnTaskCorrelation | null {
+  if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
+    return null;
+  }
+  const data = muxMetadata as Record<string, unknown>;
+  if (data.type !== "workspace-turn-task") {
+    return null;
+  }
+  const taskHandleId = typeof data.taskHandleId === "string" ? data.taskHandleId.trim() : "";
+  const ownerWorkspaceId =
+    typeof data.ownerWorkspaceId === "string" ? data.ownerWorkspaceId.trim() : "";
+  const turnId = typeof data.turnId === "string" ? data.turnId.trim() : "";
+  if (taskHandleId.length === 0 || ownerWorkspaceId.length === 0 || turnId.length === 0) {
+    return null;
+  }
+  return { taskHandleId, ownerWorkspaceId, turnId };
+}
 
 export function getCompactionFollowUpContent(
   metadata?: MuxMessageMetadata
@@ -715,6 +830,29 @@ export interface PersistedToolModelUsage {
   metadataModel?: string;
   usage: LanguageModelV2Usage;
   providerMetadata?: Record<string, unknown>;
+}
+
+/**
+ * PersistedToolModelUsage.toolName marker for a refused fallback attempt.
+ * Analytics keys on this exact string (events.tool_name), the sidecar flatten
+ * path uses it to relabel refusal usage as "refused_stream", and the session
+ * ledger rebuild uses it to skip zero-usage refusal markers (which exist only
+ * so analytics can count refused attempts, never as ledger entries).
+ */
+export const MODEL_FALLBACK_REFUSAL_TOOL_NAME = "model_fallback_refusal";
+
+/** True when any token counter on the usage payload is positive. */
+export function hasTokenUsage(
+  usage: LanguageModelV2Usage | undefined
+): usage is LanguageModelV2Usage {
+  return (
+    usage !== undefined &&
+    ((usage.inputTokens ?? 0) > 0 ||
+      (usage.outputTokens ?? 0) > 0 ||
+      (usage.totalTokens ?? 0) > 0 ||
+      (usage.cachedInputTokens ?? 0) > 0 ||
+      (usage.reasoningTokens ?? 0) > 0)
+  );
 }
 
 /**
@@ -773,6 +911,13 @@ export interface MuxMetadata {
   partial?: boolean; // Whether this message was interrupted and is incomplete
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
+   * For queue-dispatched user turns: when the user last added to the queued
+   * entry. The row `timestamp` is stamped at dispatch (after the blocking turn
+   * ends), so goal safety needs this to durably tell messages typed before a
+   * mid-turn goal existed from genuine interventions against a visible goal.
+   */
+  enqueuedAtMs?: number;
+  /**
    * UI hint: show in the chat UI even when synthetic.
    *
    * Synthetic messages are hidden by default because most are for model context only.
@@ -810,6 +955,14 @@ export interface MuxMetadata {
   muxMetadata?: MuxMessageMetadata; // Command metadata used by both frontend and backend message flows
   /** Persisted discriminator for synthetic user turns created by the active-goal loop. */
   kind?: "goal_continuation" | "goal_budget_limit";
+  /**
+   * Goal identity for `kind` rows. Chat-tail reconciliation only accepts a
+   * continuation row as "goal is active" evidence when it was dispatched for
+   * the goal being reconciled — a replaced goal's continuation must not
+   * reactivate its successor (Codex P2 PRRT_kwDOPxxmWM6cH3kV). Legacy rows
+   * without a goalId keep the old any-goal semantics.
+   */
+  goalId?: string;
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can
@@ -914,6 +1067,14 @@ export interface MuxFilePart {
   mediaType: string; // IANA media type, e.g., "image/png", "application/pdf"
   url: string; // Data URL (e.g., "data:application/pdf;base64,...") or hosted URL
   filename?: string; // Optional filename
+  /**
+   * Part-level metadata convertToModelMessages forwards as FilePart.providerOptions.
+   * Used to mark request-only synthetic tool-media parts (see
+   * SYNTHETIC_TOOL_MEDIA_PART_METADATA in toolResultAttachments.ts) so per-step
+   * transforms can evict the oldest ones under the request-wide media cap
+   * instead of treating them like immutable user uploads (r34).
+   */
+  providerMetadata?: Record<string, Record<string, unknown>>;
 }
 
 // XumMessage extends UIMessage with our metadata and custom parts
@@ -981,6 +1142,11 @@ export type DisplayedMessage =
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
       };
+      /**
+       * True for the fixed user-role notification that wakes a peer-message recipient (the
+       * payload itself is a separate assistant row). Excluded from human-prompt navigation.
+       */
+      agentPeerMessageTrigger?: true;
     }
   | {
       type: "assistant";
@@ -1009,6 +1175,15 @@ export type DisplayedMessage =
       streamPresentation?: {
         source: "live" | "replay";
       };
+      /**
+       * Present when this synthetic assistant row is an intra-tree agent peer message payload
+       * (delivered as an assistant pre-turn row so peer bytes never gain user-role authority).
+       */
+      agentPeerMessage?: {
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        relationship: AgentMessageRelationship;
+      };
     }
   | {
       type: "tool";
@@ -1032,10 +1207,12 @@ export type DisplayedMessage =
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
+      // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
+      // persist without an input key.
       nestedCalls?: Array<{
         toolCallId: string;
         toolName: string;
-        input: unknown;
+        input?: unknown;
         output?: unknown;
         state: "input-available" | "output-available" | "output-redacted";
         failed?: boolean;

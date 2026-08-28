@@ -2364,7 +2364,188 @@ exit 1
     });
   });
 
+  describe("list", () => {
+    it("excludes archived workspaces while preserving live ones", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "live-1", path: "/fake/project/ws-live" },
+          { id: "archived-1", path: "/fake/project/ws-archived", archivedAt: ARCHIVED_AT },
+          {
+            id: "unarchived-1",
+            path: "/fake/project/ws-unarchived",
+            archivedAt: ARCHIVED_AT,
+            unarchivedAt: "2026-01-02T00:00:00.000Z",
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const listed = service.list();
+
+      const project = listed.find(([listedPath]) => listedPath === projectPath)?.[1];
+      expect(project).toBeDefined();
+      expect(project?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "live-1",
+        "unarchived-1",
+      ]);
+    });
+
+    it("keeps live multi-project workspaces in their bucket", async () => {
+      const projectPath = "/fake/project";
+      const otherProjectPath = "/fake/other";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            id: "multi-live",
+            path: "/fake/project/ws-multi",
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: otherProjectPath, projectName: "other" },
+            ],
+          },
+          {
+            id: "multi-archived",
+            path: "/fake/project/ws-multi-archived",
+            archivedAt: ARCHIVED_AT,
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: otherProjectPath, projectName: "other" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const listed = service.list();
+
+      const project = listed.find(([listedPath]) => listedPath === projectPath)?.[1];
+      expect(project?.workspaces.map((workspace) => workspace.id)).toEqual(["multi-live"]);
+      expect(project?.workspaces[0]?.projects?.map((ref) => ref.projectPath)).toEqual([
+        projectPath,
+        otherProjectPath,
+      ]);
+    });
+
+    it("does not modify archived entries in persisted config", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "live-1", path: "/fake/project/ws-live" },
+          { id: "archived-1", path: "/fake/project/ws-archived", archivedAt: ARCHIVED_AT },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      service.list();
+
+      // The projection must not leak into the in-memory or persisted config:
+      // archived entries stay on disk for older builds (downgrade safety).
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "live-1",
+        "archived-1",
+      ]);
+    });
+  });
+
+  describe("getRemovalBlockers", () => {
+    it("counts own-bucket and cross-project blockers without mutating config", async () => {
+      const projectPath = "/fake/project";
+      const otherPath = "/fake/other";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          // Missing checkout directory on purpose: unlike remove(), the
+          // preflight must not prune stale entries (or delete the project).
+          { id: "stale-live", path: path.join(tempDir, "missing-checkout") },
+          { id: "own-archived", path: path.join(tempDir, "archived"), archivedAt: ARCHIVED_AT },
+        ],
+      });
+      cfg.projects.set(otherPath, {
+        workspaces: [
+          {
+            id: "cross-ref",
+            path: path.join(tempDir, "cross"),
+            projects: [
+              { projectPath: otherPath, projectName: "other" },
+              { projectPath, projectName: "project" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const counts = service.getRemovalBlockers(projectPath);
+
+      expect(counts).toEqual({ activeCount: 2, archivedCount: 1 });
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((ws) => ws.id)).toEqual([
+        "stale-live",
+        "own-archived",
+      ]);
+    });
+
+    it("returns zero counts for unknown projects", () => {
+      expect(service.getRemovalBlockers("/no/such/project")).toEqual({
+        activeCount: 0,
+        archivedCount: 0,
+      });
+    });
+  });
+
   describe("remove", () => {
+    it("force removal fails fast on cross-project references without deleting owned workspaces", async () => {
+      const projectPath = "/fake/project";
+      const otherPath = "/fake/other";
+      const ownWorkspaceDir = path.join(tempDir, "owned-workspace");
+      await fs.mkdir(ownWorkspaceDir, { recursive: true });
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [{ id: "owned-1", path: ownWorkspaceDir }],
+      });
+      cfg.projects.set(otherPath, {
+        workspaces: [
+          {
+            id: "cross-ref",
+            path: path.join(tempDir, "cross"),
+            projects: [
+              { projectPath: otherPath, projectName: "other" },
+              { projectPath, projectName: "project" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const removedWorkspaceIds: string[] = [];
+      service.setWorkspaceService({
+        remove: async (workspaceId) => {
+          removedWorkspaceIds.push(workspaceId);
+          await config.removeWorkspace(workspaceId);
+          return Ok(undefined);
+        },
+      });
+
+      const result = await service.remove(projectPath, true);
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toEqual({
+        type: "workspace_blockers",
+        activeCount: 2,
+        archivedCount: 0,
+      });
+      // The cascade must not have started: a partial deletion would destroy
+      // owned workspaces and still leave the project registered.
+      expect(removedWorkspaceIds).toEqual([]);
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((ws) => ws.id)).toEqual(["owned-1"]);
+    });
+
     it("removes project with no workspaces", async () => {
       const projectPath = "/fake/project";
       const cfg = config.loadConfigOrDefault();

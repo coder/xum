@@ -326,9 +326,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
   const rlmExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
   const ptcExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  const ptcExclusiveExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-  );
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -1752,7 +1749,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           memoryConsolidation: memoryConsolidationExperimentEnabled,
           rlm: rlmExperimentEnabled,
           programmaticToolCalling: ptcExperimentEnabled,
-          programmaticToolCallingExclusive: ptcExclusiveExperimentEnabled,
         }),
     });
     setCommandSuggestions((prev) => replaceSuggestions(prev, suggestions));
@@ -1769,7 +1765,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     memoryConsolidationExperimentEnabled,
     rlmExperimentEnabled,
     ptcExperimentEnabled,
-    ptcExclusiveExperimentEnabled,
   ]);
 
   // Watch input/cursor for `\symbol` backslash commands and surface the menu.
@@ -1807,7 +1802,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         memoryConsolidation: memoryConsolidationExperimentEnabled,
         rlm: rlmExperimentEnabled,
         programmaticToolCalling: ptcExperimentEnabled,
-        programmaticToolCallingExclusive: ptcExclusiveExperimentEnabled,
       }),
   });
 

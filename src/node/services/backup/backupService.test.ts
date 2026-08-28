@@ -59,6 +59,7 @@ function createRepository(
     rootDir: "/cache/repository",
     credential: "ssh",
     remoteCommit: "remote-commit",
+    managedPath: SETTINGS.path,
     ...overrides,
   };
 }
@@ -480,6 +481,45 @@ describe("BackupService", () => {
 
     expect(result.success).toBe(true);
     expect(events).toEqual(["restore-preview", "export", "push-preview"]);
+  });
+
+  test("addresses payload operations to the prepared repository's managed path", async () => {
+    // prepare() may select the legacy `mux` spelling of the configured path (backups
+    // pushed before the product rename); every payload call must follow that selection
+    // rather than the configured settings path.
+    const managedPaths: string[] = [];
+    const recordManagedPath = (options: { managedPath: string }) => {
+      managedPaths.push(options.managedPath);
+    };
+    const service = createService(tempDir, {
+      gitRepo: createGitRepo({
+        prepare: () => Promise.resolve(createRepository({ managedPath: "legacy-spelling" })),
+      }),
+      payload: createPayload({
+        previewRestore: (options) => {
+          recordManagedPath(options);
+          return Promise.resolve({ changes: [], localOnlyFiles: [], commandApprovals: [] });
+        },
+        exportTo: (options) => {
+          recordManagedPath(options);
+          return Promise.resolve({ redactions: [], secretFiles: [], secretApproval: "" });
+        },
+        validateRestore: (options) => {
+          recordManagedPath(options);
+          return Promise.resolve();
+        },
+        restore: (options) => {
+          recordManagedPath(options);
+          return Promise.resolve({ changedFiles: [], localOnlyFiles: [] });
+        },
+      }),
+    });
+
+    expect((await service.preview(SETTINGS)).success).toBe(true);
+    expect((await service.push(SETTINGS)).success).toBe(true);
+    expect((await service.restore(SETTINGS)).success).toBe(true);
+    expect(managedPaths).not.toContain(SETTINGS.path);
+    expect(new Set(managedPaths)).toEqual(new Set(["legacy-spelling"]));
   });
 
   test("returns repository drift as expected Result data without updating settings", async () => {

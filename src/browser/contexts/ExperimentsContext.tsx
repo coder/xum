@@ -8,11 +8,14 @@ import React, {
 } from "react";
 import {
   type ExperimentId,
+  EXPERIMENT_IDS,
   EXPERIMENTS,
   getExperimentKey,
+  getLegacyPtcExclusiveExperimentKey,
   isExperimentSupportedOnPlatform,
 } from "@/common/constants/experiments";
 import { getStorageChangeEvent } from "@/common/constants/events";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useAPI } from "@/browser/contexts/API";
 
 /**
@@ -44,10 +47,29 @@ function isExperimentSupported(experimentId: ExperimentId): boolean {
 }
 
 /**
+ * Upgrade alias (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): a stored legacy
+ * exclusive `true` opted into exactly the posture merged PTC activates, so PTC
+ * reads as enabled — winning even over an explicit supplement-off value,
+ * matching the backend read alias. setExperimentState rewrites the legacy key
+ * on every PTC toggle, so the alias never overrides a choice made in this
+ * build.
+ */
+export function hasLegacyPtcExclusiveOverride(): boolean {
+  return readPersistedState<unknown>(getLegacyPtcExclusiveExperimentKey(), undefined) === true;
+}
+
+/**
  * Get explicit localStorage override for an experiment.
  * Returns undefined if no value is set or parsing fails.
  */
 function getExperimentOverrideSnapshot(experimentId: ExperimentId): boolean | undefined {
+  if (
+    experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING &&
+    hasLegacyPtcExclusiveOverride()
+  ) {
+    return true;
+  }
+
   const key = getExperimentKey(experimentId);
 
   try {
@@ -97,6 +119,18 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
   try {
     window.localStorage.setItem(key, JSON.stringify(enabled));
 
+    // Downgrade sync (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): a downgraded
+    // renderer reads the pre-merge exclusive key as an explicit override that
+    // wins over the mirrored backend value in its send options, so a stale
+    // entry would resurrect supplement mode (stale false) or re-enable PTC
+    // after the user turned it off (stale true). Keep it equal to PTC.
+    // Routed through updatePersistedState so the mirror participates in the
+    // shared write-listener/subscriber notification path like other
+    // persisted preferences.
+    if (experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) {
+      updatePersistedState(getLegacyPtcExclusiveExperimentKey(), enabled);
+    }
+
     // Dispatch custom event for same-tab synchronization
     const customEvent = new CustomEvent(getStorageChangeEvent(key), {
       detail: { key, newValue: enabled },
@@ -105,6 +139,28 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
   } catch (error) {
     console.warn(`Error writing experiment state for "${experimentId}":`, error);
   }
+}
+
+/**
+ * Upgrade reconciliation for the legacy exclusive mirror (r33): an old
+ * renderer can leave `programmatic-tool-calling: true` alongside a stale
+ * legacy exclusive `false` (or none), and setExperimentState rewrites the
+ * mirror only on toggles — a user who upgrades and never touches the setting
+ * would downgrade into the removed supplement posture, because a downgraded
+ * renderer treats the stale explicit legacy key as an override that wins over
+ * the backend's mirrored flag. Keep the mirror stamped whenever the EFFECTIVE
+ * PTC state (local override first, else the backend override) is enabled.
+ * Only the enabled state needs stamping: a legacy `true` already aliases
+ * effective PTC to true, so a disagreeing pair can only be
+ * (ptc: true, legacy: false/absent).
+ */
+function reconcileLegacyPtcExclusiveMirror(
+  backendOverrides: Partial<Record<ExperimentId, boolean>> | null
+): void {
+  const local = getExperimentOverrideSnapshot(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const effective = local ?? backendOverrides?.[EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING];
+  if (effective !== true || hasLegacyPtcExclusiveOverride()) return;
+  updatePersistedState(getLegacyPtcExclusiveExperimentKey(), true);
 }
 
 /**
@@ -179,10 +235,14 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         const overrides = await api.experiments.getOverrides();
         if (!cancelled) {
           setBackendOverrides(overrides);
+          reconcileLegacyPtcExclusiveMirror(overrides);
         }
       } catch {
         if (!cancelled) {
           setBackendOverrides(null);
+          // Still reconciles the purely-local stale pair (ptc: true,
+          // legacy: false/absent) even when the backend is unreachable.
+          reconcileLegacyPtcExclusiveMirror(null);
         }
       }
     };

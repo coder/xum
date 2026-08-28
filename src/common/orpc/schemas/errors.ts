@@ -43,6 +43,7 @@ export const StreamErrorTypeSchema = z.enum([
   "stream_truncated", // Provider stream closed before its terminal finish event
   "max_output_tokens", // Provider truncated the response at max_tokens (finishReason: "length")
   "model_refusal", // Provider declined to answer (refusal/content-filter); retrying the same request will refuse again
+  "agent_resolution", // Strict explicit-agent contract failure (agent missing/hidden/disabled/provenance changed); deterministic, retrying reproduces it
   "unknown", // Catch-all
 ]);
 

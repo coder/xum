@@ -21,6 +21,8 @@ tools:
     - task_apply_git_patch
     # Plan should not perform destructive workspace cleanup.
     - task_remove
+    # Plan should not mutate owned workspace lifecycle state.
+    - task_workspace_lifecycle
     # Global config and catalog tools stay out of general-purpose agents
     - mux_agents_.*
     - agent_skill_write

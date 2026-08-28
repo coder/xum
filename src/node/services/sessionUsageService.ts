@@ -19,6 +19,7 @@ import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import type { MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
@@ -687,6 +688,18 @@ export class SessionUsageService {
 
       const rawModel = toolModelUsage.model.trim();
       if (!rawModel) {
+        return;
+      }
+
+      // Zero-usage refusal markers exist only so analytics can count refused
+      // attempts; the live path never records them in the session ledger
+      // (recordRefusedAttemptUsage skips recordSessionUsage without tokens).
+      // Skip them here too so a rebuilt ledger matches the live one instead
+      // of growing 0-token/$0 Costs rows for models that only ever refused.
+      if (
+        toolModelUsage.toolName === MODEL_FALLBACK_REFUSAL_TOOL_NAME &&
+        !hasTokenUsage(toolModelUsage.usage)
+      ) {
         return;
       }
 

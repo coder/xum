@@ -15,7 +15,11 @@ import { shellQuote } from "@/common/utils/shell";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { toPosixPath } from "@/node/utils/paths";
 import { log } from "@/node/services/log";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import {
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import { WORKTREE_DELETE_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import { syncXumignoreFiles } from "./xumignore";
@@ -42,8 +46,14 @@ export class WorktreeManager {
     return path.join(this.srcBaseDir, projectName, workspaceName);
   }
 
-  private getGitExecOptions(trusted?: boolean, signal?: AbortSignal): GitExecOptions {
-    const env = trusted ? undefined : GIT_NO_HOOKS_ENV;
+  private async getGitExecOptions(
+    projectPath: string,
+    trusted?: boolean,
+    signal?: AbortSignal
+  ): Promise<GitExecOptions> {
+    const env = gitHooksAllowed(trusted)
+      ? undefined
+      : await gitNoRepoAutomationEnvForLocalRepo(projectPath, signal);
     return env || signal ? { ...(env ? { env } : {}), ...(signal ? { signal } : {}) } : undefined;
   }
 
@@ -81,8 +91,15 @@ export class WorktreeManager {
     trusted?: boolean;
   }): Promise<WorkspaceCreationResult> {
     const { projectPath, branchName, trunkBranch, initLogger } = params;
-    // Disable git hooks for untrusted projects (prevents post-checkout execution)
-    const noHooksEnv = this.getGitExecOptions(params.trusted, params.abortSignal);
+    // Disable git hooks for untrusted projects (prevents post-checkout execution).
+    // Filter discovery is fail-closed, but creation callers consume a
+    // structured result, so translate preflight failures at this boundary.
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, params.trusted, params.abortSignal);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
     const workspaceName = params.directoryName ?? branchName;
     const workspacePath =
       params.workspacePathOverride ?? this.getWorkspacePath(projectPath, workspaceName);
@@ -122,16 +139,23 @@ export class WorktreeManager {
       const localBranches = await listLocalBranches(projectPath);
       const branchExists = localBranches.includes(branchName);
 
-      // Fetch origin before creating worktree (best-effort)
-      // This ensures new branches start from the latest origin state
-      const fetchedOrigin = skipRemoteSync
-        ? false
-        : await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv);
+      // Remote configuration can select executable upload-pack/helper
+      // commands. When repo automation is disallowed, stay entirely on local
+      // refs instead of executing any repo-configured fetch behavior.
+      const remoteSyncAllowed = !skipRemoteSync && gitHooksAllowed(params.trusted);
+      if (!skipRemoteSync && !remoteSyncAllowed) {
+        initLogger.logStep(
+          "Skipping origin fetch while project automation is disabled; using local state."
+        );
+      }
+      const fetchedOrigin = remoteSyncAllowed
+        ? await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv)
+        : false;
 
       // Determine best base for new branches: use origin if local can fast-forward to it,
       // otherwise preserve local state (user may have unpushed work)
       const shouldUseOrigin =
-        !skipRemoteSync &&
+        remoteSyncAllowed &&
         fetchedOrigin &&
         (await this.canFastForwardToOrigin(
           projectPath,
@@ -228,7 +252,7 @@ export class WorktreeManager {
     createdBranch: boolean;
     trusted?: boolean;
   }): Promise<void> {
-    const noHooksEnv = this.getGitExecOptions(args.trusted);
+    const noHooksEnv = await this.getGitExecOptions(args.projectPath, args.trusted);
 
     try {
       using removeProc = execFileAsync(
@@ -374,7 +398,12 @@ export class WorktreeManager {
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects
-    const noHooksEnv = this.getGitExecOptions(trusted);
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return { success: false, error: `Failed to rename workspace: ${getErrorMessage(error)}` };
+    }
 
     // Compute workspace paths using canonical method
     const oldPath = this.getWorkspacePath(projectPath, oldName);
@@ -423,7 +452,6 @@ export class WorktreeManager {
     // Match deleteWorkspace() semantics so preflight stays idempotent and non-destructive.
     cleanStaleLock(projectPath);
 
-    const noHooksEnv = this.getGitExecOptions(trusted);
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
     const isInPlace = projectPath === workspaceName;
 
@@ -435,6 +463,20 @@ export class WorktreeManager {
 
     if (isInPlace) {
       return { success: true };
+    }
+
+    // Resolve the git environment only after the idempotent checks above:
+    // repo-aware filter discovery fails closed when the main checkout is
+    // missing or corrupted, and preflight must keep returning its declared
+    // result so stale workspaces stay deletable (via force).
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to inspect worktree before deletion: ${getErrorMessage(error)}`,
+      };
     }
 
     try {
@@ -500,8 +542,20 @@ export class WorktreeManager {
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects and bound every git cleanup command.
+    let repoInspectionError: string | null = null;
+    let gitExecOptions: GitExecOptions;
+    try {
+      gitExecOptions = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      // Repo-aware filter discovery fails closed when the main checkout is
+      // missing or corrupted. Cleanup must still work, so fall back to the
+      // static automation-off environment; content-inspecting git commands
+      // are skipped below while this error is set.
+      repoInspectionError = getErrorMessage(error);
+      gitExecOptions = { env: gitNoRepoAutomationEnv() };
+    }
     const noHooksEnv: GitExecOptions = {
-      ...(this.getGitExecOptions(trusted) ?? {}),
+      ...gitExecOptions,
       timeoutMs: WORKTREE_DELETE_GIT_TIMEOUT_MS,
     };
 
@@ -544,6 +598,26 @@ export class WorktreeManager {
     // The workspace directory itself is the user's real project checkout.
     if (isInPlace) {
       return { success: true, deletedPath };
+    }
+
+    if (repoInspectionError !== null) {
+      // Without repo-aware filter overrides, git worktree remove must not run:
+      // its dirty-worktree check refreshes the index, which can execute
+      // repo-configured clean filters. Force removal bypasses git content
+      // inspection entirely; non-force deletion reports the blocker instead.
+      if (!force) {
+        return { success: false, error: `Failed to remove worktree: ${repoInspectionError}` };
+      }
+      try {
+        await this.pruneWorktreesBestEffort(projectPath, noHooksEnv);
+        await this.forceRemoveWorkspaceDirectory(deletedPath);
+        return deleteBranchAndSucceed();
+      } catch (rmError) {
+        return {
+          success: false,
+          error: `Failed to remove worktree via git and rm: ${getErrorMessage(rmError)}`,
+        };
+      }
     }
 
     try {

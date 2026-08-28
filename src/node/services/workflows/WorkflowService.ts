@@ -24,6 +24,10 @@ import {
   type WorkflowTaskAdapter,
 } from "./WorkflowRunner";
 import { deriveChildWorkflowRunId, MAX_NESTED_WORKFLOW_DEPTH } from "./nestedWorkflowRuns";
+import {
+  acquireWorkflowArchiveAdmission,
+  registerInProcessWorkflowRun,
+} from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
 import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
@@ -318,6 +322,8 @@ export class WorkflowService {
     runId: string;
     projectTrusted: boolean;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
@@ -337,6 +343,10 @@ export class WorkflowService {
     runId: string;
     projectTrusted: boolean;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing: refuse while the workspace is archiving/archived, and hold
+    // the admission across the method so the archive sink observes a resume that has not yet
+    // durably re-activated its run (see workflowArchiveAdmission).
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
@@ -357,6 +367,8 @@ export class WorkflowService {
     projectTrusted: boolean;
     abortSignal?: AbortSignal;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanTransition(run.status, "running");
@@ -376,6 +388,8 @@ export class WorkflowService {
     projectTrusted: boolean;
     abortSignal?: AbortSignal;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
@@ -428,6 +442,7 @@ export class WorkflowService {
         onLeaseAcquired: () => {
           unregisterRunnerAbort = this.registerActiveRunnerAbortController(
             runId,
+            input.workspaceId,
             runnerAbortController
           );
         },
@@ -468,6 +483,8 @@ export class WorkflowService {
   }
 
   async startWorkflowInBackground(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const createdRun = await this.createWorkflowRun({
       ...input,
       attentionPolicy: "notify_on_terminal",
@@ -489,6 +506,8 @@ export class WorkflowService {
   }
 
   async startWorkflow(input: StartWorkflowInput): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const createdRun = await this.createWorkflowRun(input);
     const runId = createdRun.id;
     await this.notifyRunStatusChanged(createdRun);
@@ -516,6 +535,7 @@ export class WorkflowService {
         onLeaseAcquired: () => {
           unregisterRunnerAbort = this.registerActiveRunnerAbortController(
             runId,
+            input.workspaceId,
             runnerAbortController
           );
         },
@@ -612,6 +632,7 @@ export class WorkflowService {
 
   private registerActiveRunnerAbortController(
     runId: string,
+    workspaceId: string,
     controller: AbortController
   ): () => void {
     assert(runId.length > 0, "WorkflowService.registerActiveRunnerAbortController: runId required");
@@ -620,10 +641,15 @@ export class WorkflowService {
       existing.abort();
     }
     activeWorkflowRunnerAbortControllers.set(runId, controller);
+    // Registration happens at lease acquisition, while the entry point's archive admission is
+    // still held, so the archive sink observes in-process workflow work continuously from
+    // admission entry to terminal settlement (see workflowArchiveAdmission).
+    const releaseInProcessWork = registerInProcessWorkflowRun(workspaceId);
     return () => {
       if (activeWorkflowRunnerAbortControllers.get(runId) === controller) {
         activeWorkflowRunnerAbortControllers.delete(runId);
       }
+      releaseInProcessWork();
     };
   }
 
@@ -742,6 +768,7 @@ export class WorkflowService {
     const markLeaseAcquired = () => {
       unregisterRunnerAbort = this.registerActiveRunnerAbortController(
         runId,
+        runStatus.workspaceId,
         runnerAbortController
       );
       markStarted();

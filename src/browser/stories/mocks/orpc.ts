@@ -5,6 +5,7 @@
  */
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
@@ -77,6 +78,7 @@ import {
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
 /** Session usage data structure matching SessionUsageFileSchema */
 export interface MockSessionUsage {
@@ -176,6 +178,8 @@ export interface MockORPCClientOptions {
    * keyed by the workspace ID the story uses.
    */
   goalBoardSnapshots?: Map<string, GoalBoardSnapshot>;
+  /** Pre-seeded timeline events served to workspace.timeline.list/subscribe for every workspace. */
+  timelineEvents?: TimelineEvent[];
   /**
    * Pre-seeded memory files for memory.list (Memory tab / Settings → Memory
    * stories). read/save/delete/setPinned operate on this in-memory set.
@@ -408,6 +412,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
+    timelineEvents = [],
     memoryFiles = [],
     memoryConsolidationStatus,
     memoryFileContents = new Map<string, string>(),
@@ -985,6 +990,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(agentPackage);
       },
     },
+    workflows: {
+      // The tray's cold-mount discovery and nested-run liveness poll run in any
+      // story that renders chat input; resolve empty so no groups are seeded.
+      getRunStatuses: () => Promise.resolve([]),
+      listActiveRuns: () => Promise.resolve([]),
+    },
     agentSkills: {
       list: () => Promise.resolve(agentSkills),
       listDiagnostics: () =>
@@ -1321,7 +1332,20 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     projects: {
-      list: () => Promise.resolve(Array.from(projects.entries())),
+      // Mirror the server-side read projection: projects.list excludes archived
+      // workspaces (the UI loads them on demand via workspace.list({archived:true})).
+      list: () =>
+        Promise.resolve(
+          Array.from(projects.entries()).map(([projectPath, project]): [string, ProjectConfig] => [
+            projectPath,
+            {
+              ...project,
+              workspaces: project.workspaces.filter(
+                (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+              ),
+            },
+          ])
+        ),
       create: () =>
         Promise.resolve({
           success: true,
@@ -1369,9 +1393,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
         return Promise.resolve({ success: true as const });
       },
-      remove: (input: { projectPath: string }) => {
+      // Read-only preflight used by the delete confirmation dialog.
+      getRemovalBlockers: (input: { projectPath: string }) => {
+        const project = projects.get(input.projectPath);
+        return Promise.resolve(getProjectWorkspaceCounts(project?.workspaces ?? []));
+      },
+      remove: (input: { projectPath: string; force?: boolean | null }) => {
         if (onProjectRemove) {
           return Promise.resolve(onProjectRemove(input.projectPath));
+        }
+        // Mirror the real backend: a non-forced removal of a project that still
+        // has workspaces is rejected with authoritative blocker counts, which
+        // the sidebar uses to populate the delete confirmation dialog.
+        const project = projects.get(input.projectPath);
+        const counts = getProjectWorkspaceCounts(project?.workspaces ?? []);
+        if (input.force !== true && counts.activeCount + counts.archivedCount > 0) {
+          return Promise.resolve({
+            success: false,
+            error: { type: "workspace_blockers", ...counts },
+          });
         }
         return Promise.resolve({ success: true, data: undefined });
       },
@@ -1518,11 +1558,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         set: () => Promise.resolve({ success: true, data: undefined }),
       },
       timeline: {
-        list: () => Promise.resolve({ events: [], nextCursor: null, hasOlder: false }),
+        list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),
         subscribe: () =>
           Promise.resolve(
             (function* () {
-              yield { type: "snapshot" as const, events: [], nextCursor: null, hasOlder: false };
+              yield {
+                type: "snapshot" as const,
+                events: timelineEvents,
+                nextCursor: null,
+                hasOlder: false,
+              };
             })()
           ),
         preview: () => Promise.resolve(null),

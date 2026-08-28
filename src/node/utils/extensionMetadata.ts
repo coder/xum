@@ -30,6 +30,11 @@ export interface ExtensionMetadata {
   // Persists the latest display-status URL so later updates without a URL
   // can still carry the last deep link even after displayStatus is cleared.
   lastStatusUrl?: string | null;
+  // Backend-only dedup state for AgentStatusService: hash of the input that
+  // produced the persisted AI sidebar status. Seeds the in-memory dedup after
+  // a restart so unchanged chats are not regenerated. Never exposed on
+  // WorkspaceActivitySnapshot (IPC shape).
+  sidebarStatusInputHash?: string | null;
   goal?: GoalSnapshot | null;
 }
 
@@ -121,6 +126,9 @@ export function coerceExtensionMetadata(value: unknown): ExtensionMetadata | nul
     ...(todoStatus !== undefined ? { todoStatus } : {}),
     ...(typeof record.hasTodos === "boolean" ? { hasTodos: record.hasTodos } : {}),
     lastStatusUrl: coerceStatusUrl(record.lastStatusUrl),
+    ...(typeof record.sidebarStatusInputHash === "string"
+      ? { sidebarStatusInputHash: record.sidebarStatusInputHash }
+      : {}),
     ...(goal !== undefined ? { goal } : {}),
   };
 }

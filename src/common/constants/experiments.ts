@@ -7,7 +7,6 @@
 
 export const EXPERIMENT_IDS = {
   PROGRAMMATIC_TOOL_CALLING: "programmatic-tool-calling",
-  PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE: "programmatic-tool-calling-exclusive",
   RLM: "rlm-mode",
   CONFIGURABLE_BIND_URL: "configurable-bind-url",
   MUX_GOVERNOR: "mux-governor",
@@ -28,6 +27,46 @@ export const EXPERIMENT_IDS = {
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
+
+/**
+ * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
+ * before Programmatic Tool Calling became exclusive-only. Persistence layers
+ * (backend feature_flags.json, renderer localStorage) alias a stored `true`
+ * onto the merged PTC key on read and mirror the merged PTC value back onto
+ * this key on write, so upgrades keep the user's exclusive posture and a
+ * downgraded build runs exclusive mode instead of the removed (~2x cost)
+ * supplement mode.
+ */
+export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exclusive";
+
+/**
+ * Read-side alias for persisted experiment-flag objects (camelCase form used
+ * by taskExperiments snapshots and startup-retry send options): a legacy
+ * exclusive `true` opted into exactly the posture merged PTC activates, so it
+ * wins even over an explicit `programmaticToolCalling: false`.
+ */
+export function aliasLegacyPtcExclusive<
+  T extends { programmaticToolCalling?: boolean; programmaticToolCallingExclusive?: boolean },
+>(
+  experiments: T | undefined
+): (Omit<T, "programmaticToolCalling"> & { programmaticToolCalling?: boolean }) | undefined {
+  if (experiments?.programmaticToolCallingExclusive !== true) return experiments;
+  if (experiments.programmaticToolCalling === true) return experiments;
+  return { ...experiments, programmaticToolCalling: true };
+}
+
+/**
+ * Write-side mirror for persisted experiment-flag objects: an enabled merged
+ * PTC also stamps the legacy exclusive key so a downgraded build runs the
+ * exclusive posture instead of reading bare PTC as the removed (~2x cost)
+ * supplement mode.
+ */
+export function withLegacyPtcExclusiveMirror<T extends { programmaticToolCalling?: boolean }>(
+  experiments: T | undefined
+): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
+  if (experiments?.programmaticToolCalling !== true) return experiments;
+  return { ...experiments, programmaticToolCallingExclusive: true };
+}
 
 export interface ExperimentDefinition {
   id: ExperimentId;
@@ -55,14 +94,8 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
     id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
     name: "Programmatic Tool Calling",
-    description: "Enable code_execution tool for multi-tool workflows in a sandboxed JS runtime",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: {
-    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE,
-    name: "PTC Exclusive Mode",
-    description: "Replace all tools with code_execution (forces PTC usage)",
+    description:
+      "Replace the standard toolset with a sandboxed code_execution tool; bridged tools are called as xum.<tool>(...) from JS",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -73,7 +106,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.RLM,
     name: "RLM Mode",
     description:
-      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Implies PTC Exclusive posture; supplement mode is not supported.",
+      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Requires Programmatic Tool Calling.",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -263,6 +296,15 @@ export function getExperimentPlatformRestrictionLabel(
  */
 export function getExperimentKey(experimentId: ExperimentId): string {
   return `experiment:${experimentId}`;
+}
+
+/**
+ * localStorage key of the removed exclusive experiment (see
+ * LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). Kept out of getExperimentKey's
+ * signature so ordinary call sites can't target a removed experiment.
+ */
+export function getLegacyPtcExclusiveExperimentKey(): string {
+  return `experiment:${LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID}`;
 }
 
 /**

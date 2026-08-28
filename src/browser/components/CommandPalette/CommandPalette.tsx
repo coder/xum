@@ -69,9 +69,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   );
   const rlmExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
   const ptcExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  const ptcExclusiveExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-  );
   const slashContext = getSlashContext?.();
   const slashWorkspaceId = slashContext?.workspaceId;
 
@@ -306,7 +303,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
             memoryConsolidation: memoryConsolidationExperimentEnabled,
             rlm: rlmExperimentEnabled,
             programmaticToolCalling: ptcExperimentEnabled,
-            programmaticToolCallingExclusive: ptcExclusiveExperimentEnabled,
           }),
       });
       const section = "Slash Commands";
@@ -385,7 +381,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     memoryConsolidationExperimentEnabled,
     rlmExperimentEnabled,
     ptcExperimentEnabled,
-    ptcExclusiveExperimentEnabled,
   ]);
 
   useEffect(() => {
@@ -570,13 +565,18 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   return (
     <div
-      className="fixed inset-0 z-[2000] flex items-start justify-center bg-black/40 pt-[10vh]"
+      // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
+      // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
+      className="fixed inset-0 z-[2000] flex items-start justify-center pt-[10vh] before:absolute before:inset-0 before:bg-black/40"
       onMouseDown={dismissPalette}
     >
       <Command
         label={currentField?.label ?? "Command palette"}
         ref={commandPanelRef}
-        className="font-primary w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
+        // relative keeps the panel painted above (and hit-tested before) the wrapper's
+        // absolutely positioned ::before backdrop, so clicks land on the palette instead
+        // of the wrapper's dismiss handler.
+        className="font-primary relative w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
         onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
         onKeyDown={trapPromptFocus}
         shouldFilter={false}

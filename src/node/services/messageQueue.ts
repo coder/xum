@@ -1,4 +1,6 @@
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
+import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -52,6 +54,8 @@ interface WorkspaceTurnMetadata {
   taskHandleId: string;
   ownerWorkspaceId: string;
   turnId: string;
+  /** Peer attribution nested on correlated peer triggers (see MuxMessageMetadata). */
+  agentPeerMessageTrigger?: unknown;
 }
 
 function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
@@ -63,6 +67,14 @@ function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
     typeof obj.ownerWorkspaceId === "string" &&
     typeof obj.turnId === "string"
   );
+}
+
+// Peer messages are sealed single-message entries (their sends use removable dedupe keys), so
+// counting entries by this metadata type is an exact count of queued peer messages.
+function isAgentPeerMessageMetadata(meta: unknown): boolean {
+  if (typeof meta !== "object" || meta === null) return false;
+  const obj = meta as Record<string, unknown>;
+  return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
 }
 
 // Type guard for metadata with reviews
@@ -84,6 +96,14 @@ type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
   agentInitiated?: boolean;
+  /**
+   * When the sender authored this message (request entry), before any send
+   * preflight awaits (pricing gate, settings persistence). Goal safety
+   * compares the authoring time against goal creation, so sampling at
+   * enqueue time would misclassify a message authored before a goal became
+   * visible as an intervention against it (Codex P2 PRRT_kwDOPxxmWM6b-orA).
+   */
+  authoredAtMs?: number;
   /** True only for a report that continues an existing workspace turn. */
   workspaceTurnContinuation?: boolean;
   /** Keep this queued add isolated so its dedupe key can be removed without affecting siblings. */
@@ -106,6 +126,12 @@ interface QueuedMessageInternalOptions {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
   onPreTurnRowsPersisted?: () => void;
+  /**
+   * Caller staleness probe re-emitted at dispatch and re-checked by the session's
+   * turn-admission gates. Peer agent sends use it so a Stop/task_stop landing after
+   * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
+   */
+  admissionStale?: () => boolean;
 }
 
 type QueueClearCallbacks = Pick<
@@ -143,6 +169,13 @@ interface QueueEntry {
   addCount: number;
   syntheticCount: number;
   agentInitiatedCount: number;
+  /**
+   * Timestamp of the latest add batched into this entry. Dispatch exposes it so
+   * goal safety can tell messages typed before a goal existed (queued while the
+   * goal-creating turn was still streaming) from genuine interventions against
+   * a goal the user has already seen.
+   */
+  lastAddedAtMs: number;
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -152,6 +185,8 @@ interface QueueEntry {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
   onPreTurnRowsPersisted?: () => void;
+  /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
+  admissionStale?: () => boolean;
 }
 
 /**
@@ -192,6 +227,17 @@ export class MessageQueue {
           isWorkspaceTurnMetadata(entry.muxMetadata) && entry.muxMetadata.taskHandleId === handleId
       )
     );
+  }
+
+  /** Queued intra-tree agent peer messages (sealed entries, one message each). */
+  countAgentPeerMessageEntries(): number {
+    // The dedupe-key prefix also matches triggers whose muxMetadata was replaced by a
+    // workspace-turn correlation (upward sends into a delegated turn keep the peer count).
+    return this.entries.filter(
+      (entry) =>
+        isAgentPeerMessageMetadata(entry.muxMetadata) ||
+        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX))
+    ).length;
   }
 
   private getDispatchMode(entries: readonly QueueEntry[]): QueueDispatchMode {
@@ -303,9 +349,19 @@ export class MessageQueue {
       } else if (!matchesPriorCorrelation) {
         hasUnrelatedPredecessor = true;
         if (entry.workspaceTurnContinuation) {
-          entry.muxMetadata = undefined;
-          entry.onCanceled = undefined;
-          entry.onAcceptedPreStreamFailure = undefined;
+          // Mirror WorkspaceService.stripWorkspaceTurnCorrelation for entries whose correlation
+          // goes stale while QUEUED: a peer trigger keeps its machine-notification identity
+          // (downgraded to plain peer attribution) plus its onCanceled AND
+          // onAcceptedPreStreamFailure — both carry the sender's budget refund, tied to this
+          // entry rather than the superseded owner handle. Owner handle-settling callbacks are
+          // still dropped.
+          const peerTrigger = getValidAgentPeerTriggerMeta(metadata.agentPeerMessageTrigger);
+          entry.muxMetadata =
+            peerTrigger != null ? { type: "agent-peer-message", ...peerTrigger } : undefined;
+          if (peerTrigger == null) {
+            entry.onCanceled = undefined;
+            entry.onAcceptedPreStreamFailure = undefined;
+          }
         }
       } else {
         priorCorrelation ??= metadata;
@@ -426,6 +482,9 @@ export class MessageQueue {
       // family sends would join their triggers while both payload rows pile
       // onto one entry, and the payloads would then persist adjacently.
       (internal?.preTurnMessages?.length ?? 0) > 0 ||
+      // A staleness probe gates exactly one dispatch; batching would let one
+      // sender's stop-refusal veto unrelated queued messages.
+      internal?.admissionStale != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches
@@ -459,6 +518,11 @@ export class MessageQueue {
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
+        // 0, not Date.now(): every add (including the entry-creating one)
+        // folds its authoring time in below via max(); seeding with the
+        // creation wall clock would swallow an authoredAtMs captured before
+        // slow send preflight, defeating the pre-goal queue-race guard.
+        lastAddedAtMs: 0,
       };
       this.entries.push(entry);
     }
@@ -521,8 +585,17 @@ export class MessageQueue {
     if (internal?.cancelSignal != null) {
       entry.cancelSignal = internal.cancelSignal;
     }
+    if (internal?.admissionStale != null) {
+      entry.admissionStale = internal.admissionStale;
+    }
 
     entry.addCount += 1;
+    // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): batched sends can finish
+    // preflight out of authoring order. Keep the NEWEST authoring time for
+    // the entry — a plain overwrite would let an older pre-goal message mask
+    // a later post-goal stop/correction, satisfying the pre-goal guard and
+    // granting the agent another autonomous turn despite the intervention.
+    entry.lastAddedAtMs = Math.max(entry.lastAddedAtMs, internal?.authoredAtMs ?? Date.now());
     if (internal?.synthetic === true) {
       entry.syntheticCount += 1;
     }
@@ -737,6 +810,8 @@ export class MessageQueue {
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
     internal?: QueuedMessageInternalOptions;
+    /** Timestamp of the latest add batched into this entry (see QueueEntry.lastAddedAtMs). */
+    enqueuedAtMs?: number;
   } {
     const entry = this.entries.shift();
     if (entry === undefined) {
@@ -770,6 +845,7 @@ export class MessageQueue {
       entry.onAcceptedPreStreamFailure != null ||
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
+      entry.admissionStale != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
       ? {
@@ -788,10 +864,11 @@ export class MessageQueue {
           ...(entry.onPreTurnRowsPersisted != null
             ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
+          ...(entry.admissionStale != null ? { admissionStale: entry.admissionStale } : {}),
         }
       : undefined;
 
-    return { message: joinedMessages, options, internal };
+    return { message: joinedMessages, options, internal, enqueuedAtMs: entry.lastAddedAtMs };
   }
 
   /**
@@ -807,5 +884,15 @@ export class MessageQueue {
    */
   isEmpty(): boolean {
     return this.entries.length === 0;
+  }
+
+  /**
+   * Number of pending entries, including synthetic/internal ones. Archive admission uses
+   * this to compare the queue against the delegated turns it is about to interrupt, so it
+   * must count every entry — a "visible" count could hide user work behind synthetic
+   * entries.
+   */
+  entryCount(): number {
+    return this.entries.length;
   }
 }

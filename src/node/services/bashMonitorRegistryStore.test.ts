@@ -99,7 +99,25 @@ describe("BashMonitorRegistryStore", () => {
     // Session dir without a registry dir must be skipped, not crash the walk.
     await fsPromises.mkdir(config.getSessionDir("owner-empty"), { recursive: true });
 
-    expect(await store.listOwnerWorkspaceIds()).toEqual(["owner-a"]);
+    expect(await store.listOwnerWorkspaceIds()).toEqual({
+      ownerWorkspaceIds: ["owner-a"],
+      scanFailed: false,
+    });
+  });
+
+  test("one unreadable session does not block owner discovery for others", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload({ workspaceId: "owner-good" }));
+    // A plain file where the registry directory should be makes listAll reject with ENOTDIR.
+    const badSession = config.getSessionDir("owner-bad");
+    await fsPromises.mkdir(badSession, { recursive: true });
+    await fsPromises.writeFile(path.join(badSession, BASH_MONITOR_REGISTRY_DIR), "not a dir");
+
+    expect(await store.listOwnerWorkspaceIds()).toEqual({
+      ownerWorkspaceIds: ["owner-good"],
+      scanFailed: true,
+    });
   });
 
   test("consumeIfArmedBefore takes stale records but preserves live replacements", async () => {
@@ -120,6 +138,25 @@ describe("BashMonitorRegistryStore", () => {
 
     // Missing record yields null.
     expect(await store.consumeIfArmedBefore("owner-1", "proc-missing", cutoffMs)).toBeNull();
+  });
+
+  test("keeps a stale record when the pre-remove callback fails", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    const cutoffMs = Date.parse("2026-06-01T00:00:00.000Z");
+    await store.upsert(armedPayload({ createdAt: "2026-01-01T00:00:00.000Z" }));
+
+    let rejection: unknown;
+    try {
+      await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs, () =>
+        Promise.reject(new Error("wake persistence failed"))
+      );
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    if (!(rejection instanceof Error)) throw new Error("expected callback rejection");
+    expect(rejection.message).toBe("wake persistence failed");
+    expect(await store.listAll("owner-1")).toHaveLength(1);
   });
 
   test("bounds persisted script length", async () => {

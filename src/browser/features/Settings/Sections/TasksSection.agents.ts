@@ -60,6 +60,7 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
         "task_retitle",
         "task_stop",
         "task_remove",
+        "task_workspace_lifecycle",
         "task_apply_git_patch",
         "propose_plan",
         "ask_user_question",

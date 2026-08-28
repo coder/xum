@@ -763,8 +763,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const userMessageNavigationByHistoryId = useMemo(() => {
     const userHistoryIds: string[] = [];
     for (const message of deferredMessages) {
-      // Monitor wake events should not interrupt navigation between human prompts.
-      if (message.type === "user" && message.bashMonitorWake == null) {
+      // Monitor wakes and peer-message wake triggers are synthetic machine rows and should not
+      // interrupt navigation between human prompts (payloads themselves are assistant rows).
+      if (
+        message.type === "user" &&
+        message.bashMonitorWake == null &&
+        message.agentPeerMessageTrigger == null
+      ) {
         userHistoryIds.push(message.historyId);
       }
     }
@@ -1894,7 +1899,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     key: "sub-agent-tasks",
     // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
     // The decoration is collapsed by default, so inactive task history is available without noise.
-    node: <SubAgentTasksDecoration workspaceId={props.workspaceId} />,
+    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
+    // retains observed workflow-run refs that must never leak into another chat's tray.
+    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
   addDecorationEntry({
     key: "background-processes",

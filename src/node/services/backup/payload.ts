@@ -18,7 +18,7 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval } from "@/common/orpc/schemas/backup";
 
 export const BACKUP_SCHEMA_VERSION = 1;
-const BACKUP_MANIFEST_FILE = "manifest.json";
+export const BACKUP_MANIFEST_FILE = "manifest.json";
 /**
  * A payload is read wholly into memory on both sides, and the repository side is written by
  * whoever can push to the branch, so an oversized entry would crash the main process during
@@ -1613,6 +1613,20 @@ function parseManifest(raw: string, portable: boolean): BackupManifest {
     { portable }
   );
   return manifest as BackupManifest;
+}
+
+/**
+ * True when the bytes parse as a portable backup manifest. Managed-path selection probes
+ * with this rather than mere existence: `manifest.json` is a generic filename, so an
+ * unrelated or corrupt file under one spelling must not beat a valid backup under another.
+ */
+export function isParseableBackupManifest(raw: string): boolean {
+  try {
+    parseManifest(raw, true);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function backupPayloadExists(sourceDir: string): Promise<boolean> {

@@ -14,8 +14,9 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import * as fsSync from "fs";
-import { Config, type ProjectConfig } from "../node/config";
+import { Config } from "../node/config";
+import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
@@ -80,8 +81,18 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
-import { EXPERIMENT_IDS } from "../common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+  type ExperimentId,
+} from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  createRunConfig,
+  prepareRunSessionRootOverride,
+  replacePrivateRunConfigFile,
+  type PreparedRunSessionRoot,
+} from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
   parseGoalBudgetInputCents,
@@ -264,13 +275,58 @@ function renderUnknown(value: unknown): string {
   }
 }
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
+/**
+ * Experiment IDs `xum run` can actually forward, each mapped to its
+ * SendMessageOptions.experiments field. A single table (instead of ad-hoc
+ * `includes` checks) guarantees an ID accepted by `-e` cannot be silently
+ * dropped here — that previously swallowed `rlm-mode`, so PTC+RLM CLI runs
+ * degraded to the flat non-kernel PTC toolset while desktop honored the flag.
+ */
+const SEND_MESSAGE_EXPERIMENT_FIELDS = {
+  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
+  [EXPERIMENT_IDS.RLM]: "rlm",
+  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
+  // Deliberately absent (accepting them would be a silent no-op or worse,
+  // which is exactly what this table exists to prevent):
+  // - TIMELINE: AIService resolves the timeline experiment exclusively from
+  //   the backend ExperimentsService (the schema's `timeline` request field is
+  //   never read), and `xum run` wires no timeline service.
+  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
+  //   tempDir config root, so persistent memories under the user's Xum home
+  //   would be invisible and new writes deleted on process exit.
+  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
+  //   has a non-empty advisorModelString, which the CLI's ephemeral config
+  //   never carries over.
+  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
+  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
+} as const satisfies Partial<
+  Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
+>;
+
+function isSendMessageExperimentId(
+  value: string
+): value is keyof typeof SEND_MESSAGE_EXPERIMENT_FIELDS {
+  // Own-property check: `in` would also accept Object.prototype names like
+  // "constructor" or "toString", which have no mapping and would silently
+  // produce a garbage experiments field.
+  return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
+}
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
+  // App-level experiments (e.g. agent-browser) have no send-options field and
+  // would be silent no-ops in a headless run, so reject them loudly.
+  if (!isSendMessageExperimentId(experimentId)) {
     throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
+      `Unknown or unsupported experiment "${value}". Valid experiments: ${Object.keys(
+        SEND_MESSAGE_EXPERIMENT_FIELDS
+      ).join(", ")}`
     );
   }
   if (previous.includes(experimentId)) {
@@ -281,16 +337,25 @@ function collectExperiments(value: string, previous: string[]): string[] {
 
 /**
  * Convert experiment ID array to the experiments object expected by SendMessageOptions.
+ * Only requested experiments are set (to true); unspecified flags stay undefined so
+ * backend fallbacks apply, mirroring how the desktop renderer sends them.
  */
 function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
   if (experimentIds.length === 0) return undefined;
 
-  return {
-    programmaticToolCalling: experimentIds.includes("programmatic-tool-calling"),
-    programmaticToolCallingExclusive: experimentIds.includes("programmatic-tool-calling-exclusive"),
-    dynamicWorkflows: experimentIds.includes("dynamic-workflows"),
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-  };
+  const experiments: NonNullable<SendMessageOptions["experiments"]> = {};
+  for (const experimentId of experimentIds) {
+    assert(isSendMessageExperimentId(experimentId), `Unmapped experiment id: ${experimentId}`);
+    experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
+  }
+  // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
+  // when the PTC flag is set, so rlm-mode alone would be silently inert. Imply
+  // the parent flag, mirroring the desktop where Settings nests RLM under the
+  // PTC toggle (PTC is exclusive-only, so RLM then runs the kernel posture).
+  if (experiments.rlm) {
+    experiments.programmaticToolCalling = true;
+  }
+  return experiments;
 }
 
 interface MCPServerEntry {
@@ -432,54 +497,57 @@ async function main(): Promise<number> {
     process.exit(1);
   }
 
-  // Create ephemeral temp dir for session data (auto-cleaned on exit)
+  // Create the private run config root and default session storage.
   using tempDir = new DisposableTempDir("mux-run");
 
-  // Use real config for providers, but ephemeral temp dir for session data
+  // Read credentials from the real config, then copy them into the private run config.
   const realConfig = new Config();
-  const config = new Config(tempDir.path);
+
+  // Session telemetry uses the private root by default. Benchmark/CI harnesses can pin it
+  // to collect chat.jsonl and session-usage.json after the process exits.
+  let sessionRootOverride: PreparedRunSessionRoot | undefined;
+  try {
+    sessionRootOverride = await prepareRunSessionRootOverride(process.env, realConfig.rootDir);
+  } catch (error) {
+    console.error(`Error: ${getErrorMessage(error)}`);
+    return 1;
+  }
+  await using preparedSessionRoot = sessionRootOverride;
+  const config = await createRunConfig(tempDir.path, preparedSessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config
   const existingProviders = realConfig.loadProvidersConfig();
-  if (hasAnyConfiguredProvider(existingProviders)) {
-    // Write providers to temp config so services can find them
-    const providersFile = path.join(config.rootDir, "providers.jsonc");
-    fsSync.writeFileSync(providersFile, JSON.stringify(existingProviders, null, 2));
-  }
+  const providersFile = path.join(config.rootDir, "providers.jsonc");
+  await replacePrivateRunConfigFile(
+    providersFile,
+    hasAnyConfiguredProvider(existingProviders)
+      ? JSON.stringify(existingProviders, null, 2)
+      : undefined
+  );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
   const existingSecrets = realConfig.loadSecretsConfig();
-  if (Object.keys(existingSecrets).length > 0) {
-    const secretsFile = path.join(config.rootDir, "secrets.json");
-    fsSync.writeFileSync(secretsFile, JSON.stringify(existingSecrets, null, 2));
-  }
+  const secretsFile = path.join(config.rootDir, "secrets.json");
+  await replacePrivateRunConfigFile(
+    secretsFile,
+    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
+  );
 
   // Copy only project trust metadata so AIService can read trust flags.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
-  const existingConfig = realConfig.loadConfigOrDefault();
-  if (existingConfig.projects.size > 0) {
-    const trustOnlyProjects = new Map<string, ProjectConfig>();
-    for (const [projectPath, projectConfig] of existingConfig.projects) {
-      if (projectConfig.trusted === undefined) {
-        continue;
-      }
-
-      trustOnlyProjects.set(projectPath, {
-        workspaces: [],
-        trusted: projectConfig.trusted,
-      });
-    }
-
-    if (trustOnlyProjects.size > 0) {
-      // Config.saveConfig is private (lost-update safety); route through the queue.
-      await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-    }
-  }
+  // Replace the full map so a reused run root cannot retain trust removed from real config.
+  await replaceRunTrustProjects(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);
   await ensureDirectory(projectDir);
+
+  // Trust for a linked worktree is recorded against the main repository, but
+  // TaskService's sub-agent gate looks up this exact checkout path in the
+  // ephemeral config. Materialize effective trust (direct or main-repo
+  // fallback) onto projectDir so trusted worktrees can spawn sub-agents.
+  const projectTrusted = await materializeResolvedTrust(realConfig, config, projectDir);
 
   // Shared normalization (alias resolution + gateway migration + format
   // validation); an unrecognized -m value fails up front instead of failing
@@ -536,6 +604,7 @@ async function main(): Promise<number> {
   const emitJsonLine = (payload: unknown) => {
     if (emitJson) process.stdout.write(`${JSON.stringify(payload)}\n`);
   };
+  fatalJsonMode = emitJson;
 
   // Log startup info (shown at info+ level, i.e., with --verbose)
   log.info(`Directory: ${projectDir}`);
@@ -728,8 +797,9 @@ async function main(): Promise<number> {
       // Fallback to main
     }
 
-    // Read trust state from real config so trusted projects can run hooks
-    const trusted = realConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted ?? false;
+    // Effective trust (including main-repo fallback for linked worktrees) was
+    // resolved and materialized into the ephemeral config above.
+    const trusted = projectTrusted;
 
     const createEnv = Object.fromEntries(
       Object.entries(process.env).filter(
@@ -832,6 +902,7 @@ async function main(): Promise<number> {
   });
 
   let goalStopReason: string | null = null;
+  let cliGoalId: string | undefined;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -843,6 +914,7 @@ async function main(): Promise<number> {
     if (!setGoalResult.success) {
       throw new Error(`Failed to set CLI goal: ${setGoalResult.error.type}`);
     }
+    cliGoalId = setGoalResult.data.goalId;
     const warning =
       goalBudgetCents == null && goalTurnCap == null
         ? "CLI Goal Run has no --goal-budget or --goal-turns limit. It will continue until the goal is complete or another stop condition occurs."
@@ -1023,6 +1095,7 @@ async function main(): Promise<number> {
             synthetic: true,
             agentInitiated: true,
             goalKind: GOAL_CONTINUATION_KIND,
+            goalId: cliGoalId,
             goalContinuation: true,
           }
         : undefined
@@ -1470,23 +1543,46 @@ async function main(): Promise<number> {
       }
     }
   } finally {
-    unsubscribe();
-    // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-    // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-    backgroundProcessManager.beginShutdown();
-    session.dispose();
-    mcpServerManager.dispose();
-    await codexOauthService.dispose();
-    await coderOauthService.dispose();
-    realProviderService.dispose();
-    policyService.dispose();
-    if (!keepBackgroundProcesses) {
-      await backgroundProcessManager.terminateAll();
-    }
+    // Teardown failures must not flip a finished run into exit 1: a rejection
+    // here would reach main().catch after run-complete was already emitted,
+    // and benchmark harnesses then discard the whole trial as an infra error.
+    // Contain each step, report it, and keep going.
+    await runBestEffortCleanup(
+      [
+        { name: "unsubscribe", run: () => unsubscribe() },
+        // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+        // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+        {
+          name: "backgroundProcessManager.beginShutdown",
+          run: () => backgroundProcessManager.beginShutdown(),
+        },
+        { name: "session.dispose", run: () => session.dispose() },
+        { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
+        { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
+        { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
+        { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
+        { name: "policyService.dispose", run: () => policyService.dispose() },
+        ...(keepBackgroundProcesses
+          ? []
+          : [
+              {
+                name: "backgroundProcessManager.terminateAll",
+                run: () => backgroundProcessManager.terminateAll(),
+              },
+            ]),
+      ],
+      (stepName, error) => {
+        const message = getErrorMessage(error);
+        process.stderr.write(`[cleanup] ${stepName} failed: ${message}\n`);
+        emitJsonLine({ type: "run-cleanup-error", step: stepName, error: message });
+      }
+    );
   }
 
-  if (budgetExceeded) return 2;
-  if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  let exitOutcome: number;
+  if (budgetExceeded) {
+    exitOutcome = 2;
+  } else if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({
@@ -1496,10 +1592,78 @@ async function main(): Promise<number> {
       status: finalGoalRecord?.status ?? null,
       stopReason: reason,
     });
-    return 3;
+    exitOutcome = 3;
+  } else {
+    exitOutcome = agentExitCode ?? 0;
   }
-  return agentExitCode ?? 0;
+  completedExitCode = exitOutcome;
+  return exitOutcome;
 }
+
+// Fatal diagnostics must survive benchmark transports: stderr is a pipe whose
+// buffered bytes process.exit() discards, so a late failure was previously an
+// invisible exit 1 that voided a completed run. Mirror fatal errors onto
+// stdout as JSON (when --json) and flush both streams before exiting.
+let fatalJsonMode = false;
+let completedExitCode: number | null = null;
+
+function reportFatalError(kind: string, prefix: string, error: unknown): void {
+  const message = getErrorMessage(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  try {
+    process.stderr.write(`${prefix}${message}\n${stack ? `${stack}\n` : ""}`);
+  } catch {
+    // stderr may already be gone; the JSON mirror below still records it.
+  }
+  if (fatalJsonMode) {
+    try {
+      process.stdout.write(`${JSON.stringify({ type: "run-fatal", kind, error: message })}\n`);
+    } catch {
+      // Nothing left to report to.
+    }
+  }
+}
+
+function exitAfterStreamFlush(exitCode: number): void {
+  const pending = [process.stdout, process.stderr].filter((stream) => stream.writableNeedDrain);
+  const exit = () => process.exit(exitCode);
+  if (pending.length === 0) {
+    exit();
+    return;
+  }
+  let remaining = pending.length;
+  for (const stream of pending) {
+    let settled = false;
+    const settleOne = () => {
+      if (settled) return;
+      settled = true;
+      remaining -= 1;
+      if (remaining <= 0) exit();
+    };
+    stream.once("drain", settleOne);
+    stream.once("error", settleOne);
+    stream.once("close", settleOne);
+  }
+  // Ref'd on purpose: keep the event loop alive until the flush window closes.
+  setTimeout(exit, 5000);
+}
+
+// Last-resort handlers: without them a stray rejection or throw (e.g. from a
+// fire-and-forget teardown promise) exits 1 with its report lost in an
+// unflushed pipe, and a completed benchmark trial gets discarded as an
+// infrastructure failure.
+process.on("uncaughtException", (error) => {
+  reportFatalError("uncaught-exception", "Uncaught exception: ", error);
+  exitAfterStreamFlush(completedExitCode ?? 1);
+});
+process.on("unhandledRejection", (reason) => {
+  reportFatalError("unhandled-rejection", "Unhandled rejection: ", reason);
+  // After the run outcome is final the normal exit path is already in
+  // flight; report only and let it exit with the real code.
+  if (completedExitCode == null) {
+    exitAfterStreamFlush(1);
+  }
+});
 
 // Keep process alive - Bun may exit when stdin closes even if async work is pending
 const keepAliveInterval = setInterval(() => {
@@ -1514,17 +1678,20 @@ main()
     if (process.stdout.writableNeedDrain) {
       const exit = () => process.exit(exitCode);
       process.stdout.once("drain", exit);
-      // Safety: if the downstream consumer closes (broken pipe) or backpressure
-      // never resolves, exit anyway after 1s to avoid hanging.
+      // Safety: if the downstream consumer closes (broken pipe), exit
+      // immediately. The backpressure timeout must be generous: the final
+      // --json stream-end + run-complete lines can be hundreds of KB, and a
+      // 1s cap was observed truncating them mid-line under pipe backpressure,
+      // silently losing cost telemetry in benchmark runs.
       process.stdout.once("error", exit);
       process.stdout.once("close", exit);
-      setTimeout(exit, 1000).unref();
+      setTimeout(exit, 30_000).unref();
     } else {
       process.exit(exitCode);
     }
   })
   .catch((error) => {
     clearInterval(keepAliveInterval);
-    console.error(`Error: ${getErrorMessage(error)}`);
-    process.exit(1);
+    reportFatalError("run-error", "Error: ", error);
+    exitAfterStreamFlush(1);
   });

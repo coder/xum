@@ -65,7 +65,9 @@ const mockHistoryLoadMore = mock(
       hasOlder: false,
     })
 );
-const mockActivityList = mock(() => Promise.resolve<Record<string, WorkspaceActivitySnapshot>>({}));
+const mockActivityList = mock(() =>
+  Promise.resolve<Record<string, WorkspaceActivitySnapshot> | null>({})
+);
 
 type WorkspaceActivityEvent =
   | {
@@ -485,6 +487,19 @@ const sinceCaughtUpEvent = (
 ): WorkspaceChatMessage =>
   caughtUpEvent({
     replay: "since",
+    cursor: { history: { messageId, historySequence }, ...(stream ? { stream } : {}) },
+  });
+
+// Full replay caught-up carrying a server cursor, as the real server issues on every
+// non-empty replay. The client reuses this cursor verbatim, making the next
+// subscription a legitimate since request.
+const fullCaughtUpEvent = (
+  historySequence = 1,
+  messageId = `history-${historySequence}`,
+  stream?: { messageId: string; lastTimestamp: number }
+): WorkspaceChatMessage =>
+  caughtUpEvent({
+    replay: "full",
     cursor: { history: { messageId, historySequence }, ...(stream ? { stream } : {}) },
   });
 
@@ -1923,12 +1938,24 @@ describe("WorkspaceStore", () => {
         subscriptionCount += 1;
 
         if (subscriptionCount === 1) {
-          yield { type: "caught-up" };
+          // Server issues a reconnect cursor on every caught-up; the client reuses
+          // it verbatim, so the second subscription legitimately requests since.
+          yield {
+            type: "caught-up",
+            cursor: {
+              history: {
+                messageId: "reconnect-pending-start",
+                historySequence: 1,
+              },
+            },
+          };
           await Promise.resolve();
           yield createUserMessageEvent("reconnect-pending-start", "hello", 1, 1_000);
           return;
         }
 
+        // Since replay re-sends the cursor-boundary row before caught-up.
+        yield createUserMessageEvent("reconnect-pending-start", "hello", 1, 1_000);
         yield {
           type: "caught-up",
           replay: "since",
@@ -2035,11 +2062,14 @@ describe("WorkspaceStore", () => {
       const requestedModel = "openai:gpt-4o-mini";
       let subscriptionCount = 0;
 
+      // Empty-history caught-ups carry no cursor, so every resubscribe legitimately
+      // requests (and receives) a full replay; the server never reports since for a
+      // full request.
       mockChatStreamFor(workspaceId, function* () {
         subscriptionCount += 1;
         yield {
           type: "caught-up",
-          replay: subscriptionCount === 1 ? "full" : "since",
+          replay: "full",
         };
       });
 
@@ -3903,8 +3933,8 @@ describe("WorkspaceStore", () => {
       }
     });
 
-    it("preserves cached activity snapshots when list returns an empty payload", async () => {
-      const workspaceId = "activity-list-empty-payload";
+    it("preserves cached activity snapshots when list reports a read failure (null)", async () => {
+      const workspaceId = "activity-list-read-failure";
       const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
       const snapshot: WorkspaceActivitySnapshot = {
         recency: initialRecency,
@@ -3917,7 +3947,69 @@ describe("WorkspaceStore", () => {
 
       let listCallCount = 0;
       mockActivityList.mockImplementation(
-        (): Promise<Record<string, WorkspaceActivitySnapshot>> => {
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          if (listCallCount === 1) {
+            return Promise.resolve({ [workspaceId]: snapshot });
+          }
+          return Promise.resolve(null);
+        }
+      );
+
+      // eslint-disable-next-line require-yield
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      const seededSnapshot = await waitUntil(() => {
+        const state = store.getWorkspaceState(workspaceId);
+        return state.recencyTimestamp === initialRecency && state.canInterrupt === true;
+      });
+      expect(seededSnapshot).toBe(true);
+
+      // Swap to a new client object to force activity subscription restart and a fresh list() call.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const sawRetryListCall = await waitUntil(() => listCallCount >= 2);
+      expect(sawRetryListCall).toBe(true);
+
+      const stateAfterFailedList = store.getWorkspaceState(workspaceId);
+      expect(stateAfterFailedList.recencyTimestamp).toBe(initialRecency);
+      expect(stateAfterFailedList.canInterrupt).toBe(true);
+      expect(stateAfterFailedList.currentModel).toBe(snapshot.lastModel);
+      expect(stateAfterFailedList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
+    });
+
+    it("clears cached activity snapshots when a later list is legitimately empty", async () => {
+      const workspaceId = "activity-list-empty-clears";
+      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
+      const snapshot: WorkspaceActivitySnapshot = {
+        recency: initialRecency,
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
           listCallCount += 1;
           if (listCallCount === 1) {
             return Promise.resolve({ [workspaceId]: snapshot });
@@ -3955,14 +4047,190 @@ describe("WorkspaceStore", () => {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
       store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
 
-      const sawRetryListCall = await waitUntil(() => listCallCount >= 2);
-      expect(sawRetryListCall).toBe(true);
+      // {} is a valid all-idle payload (failures arrive as null), so the stale
+      // streaming snapshot must clear instead of being preserved.
+      const clearedStreaming = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).canInterrupt === false
+      );
+      expect(clearedStreaming).toBe(true);
+    });
 
-      const stateAfterEmptyList = store.getWorkspaceState(workspaceId);
-      expect(stateAfterEmptyList.recencyTimestamp).toBe(initialRecency);
-      expect(stateAfterEmptyList.canInterrupt).toBe(true);
-      expect(stateAfterEmptyList.currentModel).toBe(snapshot.lastModel);
-      expect(stateAfterEmptyList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
+    it("marks activity authoritative when the initial list is legitimately empty", async () => {
+      resetStore();
+      mockActivityList.mockResolvedValue({});
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      // An all-idle cold start must become authoritative, otherwise baseline
+      // consumers (Workflows tab auto-activation) would stay disarmed forever.
+      const authoritative = await waitUntil(() => store.isActivityAuthoritative());
+      expect(authoritative).toBe(true);
+    });
+
+    it("hydrates without authority when the initial list reports a read failure", async () => {
+      resetStore();
+      mockActivityList.mockResolvedValue(null);
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const hydrated = await waitUntil(() => store.isActivityHydrated());
+      expect(hydrated).toBe(true);
+      expect(store.isActivityAuthoritative()).toBe(false);
+    });
+
+    it("regains authority by retrying a transiently null bootstrap list", async () => {
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          // The subscription stays healthy the whole time, so only the
+          // background bootstrap retry can issue the second read.
+          return Promise.resolve(listCallCount === 1 ? null : {});
+        }
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const authoritative = await waitUntil(() => store.isActivityAuthoritative(), 5000);
+      expect(authoritative).toBe(true);
+      expect(listCallCount).toBeGreaterThanOrEqual(2);
+    });
+
+    it("keeps newer subscription deltas over a stale bootstrap-retry list", async () => {
+      const workspaceId = "activity-retry-delta-race";
+      resetStore();
+
+      let listCallCount = 0;
+      let releaseSecondList!: (value: Record<string, WorkspaceActivitySnapshot> | null) => void;
+      const secondList = new Promise<Record<string, WorkspaceActivitySnapshot> | null>(
+        (resolve) => {
+          releaseSecondList = resolve;
+        }
+      );
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          return listCallCount === 1 ? Promise.resolve(null) : secondList;
+        }
+      );
+
+      let releaseEvent!: () => void;
+      const eventGate = new Promise<void>((resolve) => {
+        releaseEvent = resolve;
+      });
+      const deltaSnapshot: WorkspaceActivitySnapshot = {
+        recency: new Date("2024-01-08T00:00:00.000Z").getTime(),
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await eventGate;
+        yield { type: "activity", workspaceId, activity: deltaSnapshot };
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      // The bootstrap retry's list() is in flight (blocked)...
+      const secondListStarted = await waitUntil(() => listCallCount >= 2, 5000);
+      expect(secondListStarted).toBe(true);
+      // ...a live delta lands for this workspace while it is pending...
+      releaseEvent();
+      const deltaApplied = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).canInterrupt === true
+      );
+      expect(deltaApplied).toBe(true);
+
+      // ...then the older list arrives WITHOUT that workspace: it must confer
+      // authority but must not clear the newer delta.
+      releaseSecondList({});
+      const authoritative = await waitUntil(() => store.isActivityAuthoritative());
+      expect(authoritative).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).canInterrupt).toBe(true);
+    });
+
+    it("resyncs after a reconnect bootstrap failure even when authority is already latched", async () => {
+      const workspaceId = "activity-reconnect-null-bootstrap";
+      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
+      const snapshot: WorkspaceActivitySnapshot = {
+        recency: initialRecency,
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          if (listCallCount === 1) {
+            // First connection: authority latches.
+            return Promise.resolve({ [workspaceId]: snapshot });
+          }
+          if (listCallCount === 2) {
+            // Reconnect bootstrap: transient read failure.
+            return Promise.resolve(null);
+          }
+          // Reconnect retry: the workspace went idle while disconnected. The
+          // fresh subscription never replays this, so only the retry can resync.
+          return Promise.resolve({});
+        }
+      );
+
+      // eslint-disable-next-line require-yield
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      const seeded = await waitUntil(() => {
+        const state = store.getWorkspaceState(workspaceId);
+        return state.canInterrupt === true && store.isActivityAuthoritative();
+      });
+      expect(seeded).toBe(true);
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const resynced = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).canInterrupt === false,
+        5000
+      );
+      expect(resynced).toBe(true);
+      expect(listCallCount).toBeGreaterThanOrEqual(3);
     });
   });
 
@@ -5178,13 +5446,14 @@ describe("WorkspaceStore", () => {
       const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
         subscriptionCount === 1
           ? [
-              caughtUpEvent(),
+              createHistoryMessageEvent("history-1", 1),
+              fullCaughtUpEvent(),
               Promise.resolve(),
               bashOutputEvent(workspaceId, "call-bash-4", "stale-output\n"),
               taskCreatedEvent(workspaceId, "call-task-4", "child-workspace-4", 2),
               firstSubscription.wait,
             ]
-          : [sinceCaughtUpEvent()]
+          : [createHistoryMessageEvent("history-1", 1), sinceCaughtUpEvent()]
       );
 
       createAndAddWorkspace(store, workspaceId);
@@ -5216,7 +5485,13 @@ describe("WorkspaceStore", () => {
       const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
         subscriptionCount === 1
           ? [
-              caughtUpEvent(),
+              // Cursor anchored at the row the in-flight stream below will finalize,
+              // so the second subscription legitimately requests since.
+              caughtUpEvent({
+                cursor: {
+                  history: { messageId: "msg-old-stream-missing-local", historySequence: 1 },
+                },
+              }),
               Promise.resolve(),
               streamStartEvent(workspaceId, "msg-old-stream-missing-local", {
                 startTime: 1_000,
@@ -5236,7 +5511,9 @@ describe("WorkspaceStore", () => {
               firstSubscription.wait,
             ]
           : [
-              sinceCaughtUpEvent(1, "history-1", {
+              // Since replay re-sends the cursor-boundary row before caught-up.
+              createHistoryMessageEvent("msg-old-stream-missing-local", 1),
+              sinceCaughtUpEvent(1, "msg-old-stream-missing-local", {
                 messageId: "msg-new-stream-missing-local",
                 lastTimestamp: 2_000,
               }),
@@ -5273,9 +5550,11 @@ describe("WorkspaceStore", () => {
       const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
         subscriptionCount === 1
           ? [
-              caughtUpEvent(),
+              createHistoryMessageEvent("history-1", 1),
+              fullCaughtUpEvent(),
               Promise.resolve(),
               streamStartEvent(workspaceId, "msg-old-stream", {
+                historySequence: 2,
                 startTime: 1_000,
                 model: "claude-3-5-sonnet-20241022",
               }),
@@ -5286,6 +5565,8 @@ describe("WorkspaceStore", () => {
               firstSubscription.wait,
             ]
           : [
+              // Since replay re-sends the cursor-boundary row before caught-up.
+              createHistoryMessageEvent("history-1", 1),
               sinceCaughtUpEvent(1, "history-1", {
                 messageId: "msg-new-stream",
                 lastTimestamp: 2_000,
@@ -5363,6 +5644,129 @@ describe("WorkspaceStore", () => {
         );
       });
       expect(clearedAbortReason).toBe(true);
+    });
+
+    it("reuses the server-issued cursor verbatim on the next subscription", async () => {
+      const workspaceId = "cursor-reuse-workspace";
+      const serverCursor = {
+        messageId: "history-7",
+        historySequence: 7,
+        oldestHistorySequence: 3,
+        priorHistoryFingerprint: "0badf00d",
+      };
+      const firstSubscription = createReleaseGate();
+      const requestedModes: unknown[] = [];
+      let subscriptionCount = 0;
+
+      mockOnChat.mockImplementation(async function* (
+        input?: { workspaceId: string; mode?: unknown },
+        _options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        subscriptionCount += 1;
+        requestedModes.push(input?.mode);
+        if (subscriptionCount === 1) {
+          yield createHistoryMessageEvent("history-7", 7);
+          yield caughtUpEvent({ replay: "full", cursor: { history: serverCursor } });
+          await firstSubscription.wait;
+          return;
+        }
+        yield createHistoryMessageEvent("history-7", 7);
+        yield caughtUpEvent({ replay: "since", cursor: { history: serverCursor } });
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const hydrated = await waitUntil(
+        () => store.getAggregator(workspaceId)?.getAllMessages().length === 1
+      );
+      expect(hydrated).toBe(true);
+      expect(requestedModes[0]).toBeUndefined();
+
+      firstSubscription.release();
+
+      const resubscribed = await waitUntil(() => subscriptionCount >= 2);
+      expect(resubscribed).toBe(true);
+      // The client must not recompute any cursor fields; the server-issued cursor is
+      // reused verbatim (fingerprint included).
+      expect(requestedModes[1]).toEqual({
+        type: "since",
+        cursor: { history: serverCursor },
+      });
+    });
+
+    it("forces a full resubscribe when caught-up carries no cursor", async () => {
+      const workspaceId = "cursor-missing-workspace";
+      const firstSubscription = createReleaseGate();
+      const requestedModes: unknown[] = [];
+      let subscriptionCount = 0;
+
+      mockOnChat.mockImplementation(async function* (
+        input?: { workspaceId: string; mode?: unknown },
+        _options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        subscriptionCount += 1;
+        requestedModes.push(input?.mode);
+        // Replay failures make the server omit the cursor from caught-up.
+        yield createHistoryMessageEvent("history-1", 1);
+        yield caughtUpEvent({ replay: "full" });
+        if (subscriptionCount === 1) {
+          await firstSubscription.wait;
+        }
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const hydrated = await waitUntil(
+        () => store.getAggregator(workspaceId)?.getAllMessages().length === 1
+      );
+      expect(hydrated).toBe(true);
+
+      firstSubscription.release();
+
+      const resubscribed = await waitUntil(() => subscriptionCount >= 2);
+      expect(resubscribed).toBe(true);
+      expect(requestedModes[1]).toBeUndefined();
+    });
+
+    it("removes rows the server did not re-send from a since replay", async () => {
+      const workspaceId = "since-suffix-ghost-workspace";
+      const firstSubscription = createReleaseGate();
+      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
+        subscriptionCount === 1
+          ? [
+              createHistoryMessageEvent("history-1", 1),
+              createHistoryMessageEvent("history-2", 2),
+              fullCaughtUpEvent(2, "history-2"),
+              Promise.resolve(),
+              // Row streamed live after caught-up: it sits above the stored anchor.
+              createHistoryMessageEvent("history-3", 3),
+              firstSubscription.wait,
+            ]
+          : [
+              // Server deleted history-3 while the client was unsubscribed, so the
+              // since replay re-sends only the anchor row.
+              createHistoryMessageEvent("history-2", 2),
+              sinceCaughtUpEvent(2, "history-2"),
+            ]
+      );
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const seeded = await waitUntil(
+        () => store.getAggregator(workspaceId)?.getAllMessages().length === 3
+      );
+      expect(seeded).toBe(true);
+
+      firstSubscription.release();
+
+      const ghostRemoved = await waitUntil(() => {
+        const ids = store
+          .getAggregator(workspaceId)
+          ?.getAllMessages()
+          .map((message) => message.id);
+        return getSubscriptionCount() >= 2 && JSON.stringify(ids) === '["history-1","history-2"]';
+      });
+      expect(ghostRemoved).toBe(true);
     });
 
     it("clears stale auto-retry status when full replay reconnect replaces history", async () => {

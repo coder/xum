@@ -478,6 +478,247 @@ describe("task_apply_git_patch tool", () => {
     );
   }, 20_000);
 
+  it("blocks repo-configured merge drivers during three-way patch application", async () => {
+    const childRepo = path.join(rootDir, "child-merge-driver");
+    const targetRepo = path.join(rootDir, "target-merge-driver");
+    await fsPromises.mkdir(childRepo, { recursive: true });
+    initGitRepo(childRepo);
+    await commitFile(childRepo, "README.md", "base", "base");
+    execSync(`git clone ${JSON.stringify(childRepo)} ${JSON.stringify(targetRepo)}`, {
+      stdio: "ignore",
+    });
+    execSync('git config user.email "test@example.com"', { cwd: targetRepo, stdio: "ignore" });
+    execSync('git config user.name "test"', { cwd: targetRepo, stdio: "ignore" });
+    execSync("git config commit.gpgsign false", { cwd: targetRepo, stdio: "ignore" });
+
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    await commitFile(childRepo, "README.md", "child", "child change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    await commitFile(targetRepo, "README.md", "target", "target change");
+
+    const marker = path.join(rootDir, "merge-driver-ran");
+    const driver = path.join(rootDir, "merge-driver.sh");
+    await fsPromises.writeFile(driver, `#!/bin/sh\ntouch "$1"\ncp "$4" "$3"\n`, "utf-8");
+    await fsPromises.chmod(driver, 0o755);
+    execSync(
+      "git config merge.evil.driver " + JSON.stringify(driver + " " + marker + " %O %A %B"),
+      {
+        cwd: targetRepo,
+        stdio: "ignore",
+      }
+    );
+    await fsPromises.writeFile(
+      path.join(targetRepo, ".git", "info", "attributes"),
+      "*.md merge=evil\n",
+      "utf-8"
+    );
+
+    const muxRoot = path.join(rootDir, "mux-merge-driver");
+    const currentWorkspaceId = "current-workspace-merge-driver";
+    const sessionDir = path.join(muxRoot, "sessions", currentWorkspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await writeWorkspaceConfig({
+      muxRoot,
+      workspaceId: currentWorkspaceId,
+      workspaceName: "current",
+      primaryProjectPath: targetRepo,
+      projects: [{ projectPath: targetRepo, projectName: "project" }],
+    });
+    const childTaskId = "child-task-merge-driver";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId: currentWorkspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "project",
+          projectPath: targetRepo,
+          projectName: "project",
+          childRepo,
+          baseSha,
+          headSha,
+        }),
+      ],
+    });
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId: currentWorkspaceId,
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: sessionDir,
+    });
+
+    const result = (await tool.execute!(
+      { task_id: childTaskId, three_way: true },
+      mockToolCallOptions
+    )) as { success: boolean };
+
+    expect(result.success).toBe(false);
+    const markerExists = await fsPromises.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  }, 20_000);
+
+  it("disables commit signing during hardened patch application", async () => {
+    const childRepo = path.join(rootDir, "child-signing");
+    const targetRepo = path.join(rootDir, "target-signing");
+    for (const repo of [childRepo, targetRepo]) {
+      await fsPromises.mkdir(repo, { recursive: true });
+      initGitRepo(repo);
+    }
+    await commitFile(childRepo, "README.md", "hello", "base");
+    await commitFile(targetRepo, "README.md", "hello", "base");
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    await commitFile(childRepo, "README.md", "hello\nchild", "child change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    const marker = path.join(rootDir, "signer-ran");
+    const signer = path.join(rootDir, "signer.sh");
+    await fsPromises.writeFile(signer, `#!/bin/sh\ntouch "${marker}"\nexit 1\n`, "utf-8");
+    await fsPromises.chmod(signer, 0o755);
+    execSync("git config commit.gpgSign true", { cwd: targetRepo, stdio: "ignore" });
+    execSync(`git config gpg.program ${JSON.stringify(signer)}`, {
+      cwd: targetRepo,
+      stdio: "ignore",
+    });
+
+    const muxRoot = path.join(rootDir, "mux-signing");
+    const currentWorkspaceId = "current-workspace-signing";
+    const sessionDir = path.join(muxRoot, "sessions", currentWorkspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await writeWorkspaceConfig({
+      muxRoot,
+      workspaceId: currentWorkspaceId,
+      workspaceName: "current",
+      primaryProjectPath: targetRepo,
+      projects: [{ projectPath: targetRepo, projectName: "project" }],
+    });
+    const childTaskId = "child-task-signing";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId: currentWorkspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "project",
+          projectPath: targetRepo,
+          projectName: "project",
+          childRepo,
+          baseSha,
+          headSha,
+        }),
+      ],
+    });
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId: currentWorkspaceId,
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: sessionDir,
+    });
+
+    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+      success: boolean;
+    };
+
+    expect(result.success).toBe(true);
+    const markerExists = await fsPromises.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  }, 20_000);
+
+  it("blocks repo-configured smudge filters during dry-run worktree materialization", async () => {
+    const childRepo = path.join(rootDir, "child-filter");
+    const targetRepo = path.join(rootDir, "target-filter");
+    for (const repo of [childRepo, targetRepo]) {
+      await fsPromises.mkdir(repo, { recursive: true });
+      initGitRepo(repo);
+    }
+
+    await commitFile(childRepo, "README.md", "hello", "base");
+    await commitFile(targetRepo, "README.md", "hello", "base");
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    await commitFile(childRepo, "README.md", "hello\nchild", "child change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    const marker = path.join(rootDir, "smudge-ran");
+    const driver = path.join(rootDir, "smudge.sh");
+    await fsPromises.writeFile(driver, `#!/bin/sh\ntouch "${marker}"\ncat\n`, "utf-8");
+    await fsPromises.chmod(driver, 0o755);
+    execSync(`git config filter.evil.smudge ${JSON.stringify(driver)}`, {
+      cwd: targetRepo,
+      stdio: "ignore",
+    });
+    execSync("git config filter.evil.required true", { cwd: targetRepo, stdio: "ignore" });
+    await fsPromises.writeFile(
+      path.join(targetRepo, ".git", "info", "attributes"),
+      "*.md filter=evil\n",
+      "utf-8"
+    );
+
+    const muxRoot = path.join(rootDir, "mux-filter");
+    const currentWorkspaceId = "current-workspace-filter";
+    const sessionDir = path.join(muxRoot, "sessions", currentWorkspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await writeWorkspaceConfig({
+      muxRoot,
+      workspaceId: currentWorkspaceId,
+      workspaceName: "current",
+      primaryProjectPath: targetRepo,
+      projects: [{ projectPath: targetRepo, projectName: "project" }],
+    });
+
+    const childTaskId = "child-task-filter";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId: currentWorkspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "project",
+          projectPath: targetRepo,
+          projectName: "project",
+          childRepo,
+          baseSha,
+          headSha,
+        }),
+      ],
+    });
+
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId: currentWorkspaceId,
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: sessionDir,
+    });
+
+    const result = (await tool.execute!(
+      { task_id: childTaskId, dry_run: true },
+      mockToolCallOptions
+    )) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    const markerExists = await fsPromises.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  }, 20_000);
+
   it("cleans staged patch files between dry-run and real apply when temp dir is inside the repo", async () => {
     const childRepo = path.join(rootDir, "child");
     const targetRepo = path.join(rootDir, "target");

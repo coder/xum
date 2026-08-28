@@ -4,7 +4,11 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  getExperimentKey,
+  getLegacyPtcExclusiveExperimentKey,
+} from "@/common/constants/experiments";
 import { requireTestModule, type RecursivePartial } from "@/browser/testUtils";
 import type * as APIModule from "./API";
 import type { APIClient } from "./API";
@@ -247,5 +251,99 @@ describe("ExperimentsProvider", () => {
       });
       expect(getByTestId("toggle").textContent).toBe("true");
     });
+  });
+
+  test("initialization stamps the legacy mirror over a stale explicit false", async () => {
+    // An old renderer can leave ptc:true beside a stale legacy exclusive
+    // `false`; upgrading without touching the toggle previously never rewrote
+    // the mirror, and a downgraded renderer treats the stale explicit key as
+    // an override that wins over the backend flag — resuming the removed
+    // supplement posture (r33). Initialization reconciles it.
+    currentClientMock = {
+      experiments: {
+        setOverride: mock(() => Promise.resolve()),
+        getOverrides: mock(() => Promise.resolve({})),
+      },
+    };
+
+    globalThis.window.localStorage.setItem(
+      getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+      JSON.stringify(true)
+    );
+    globalThis.window.localStorage.setItem(
+      getLegacyPtcExclusiveExperimentKey(),
+      JSON.stringify(false)
+    );
+
+    function Probe() {
+      const enabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+      return <div data-testid="probe">{String(enabled)}</div>;
+    }
+
+    const { getByTestId } = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Probe />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+
+    expect(getByTestId("probe").textContent).toBe("true");
+    await waitFor(() => {
+      expect(globalThis.window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey())).toBe(
+        "true"
+      );
+    });
+  });
+
+  test("stale legacy exclusive true reads as PTC on, and toggling PTC rewrites the legacy key", async () => {
+    currentClientMock = {
+      experiments: {
+        setOverride: mock(() => Promise.resolve()),
+        getOverrides: mock(() => Promise.resolve({})),
+      },
+    };
+
+    // Pre-merge state: "PTC Exclusive Mode" enabled — exactly the posture
+    // merged PTC activates, so the upgrade must keep PTC on.
+    globalThis.window.localStorage.setItem(
+      getLegacyPtcExclusiveExperimentKey(),
+      JSON.stringify(true)
+    );
+
+    function Toggle() {
+      const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+      return (
+        <button data-testid="toggle" onClick={() => setEnabled(!enabled)}>
+          {String(enabled)}
+        </button>
+      );
+    }
+
+    const { getByTestId } = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Toggle />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+
+    expect(getByTestId("toggle").textContent).toBe("true");
+
+    // Toggling PTC off must rewrite the legacy key too: a downgraded renderer
+    // treats it as an explicit override that wins over the mirrored backend
+    // value, so a stale entry would resurrect the pre-merge posture.
+    fireEvent.click(getByTestId("toggle"));
+    await waitFor(() => {
+      expect(getByTestId("toggle").textContent).toBe("false");
+    });
+    expect(globalThis.window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey())).toBe(
+      "false"
+    );
+    expect(
+      globalThis.window.localStorage.getItem(
+        getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)
+      )
+    ).toBe("false");
   });
 });
