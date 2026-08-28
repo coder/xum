@@ -2348,7 +2348,7 @@ function hasDisguisedAssignment(
   inherited: InheritedLaunchContext
 ): boolean {
   let commandPosition = true;
-  let envCommandExpected = false;
+  let wrappedCommandExpected = false;
   let carrierArmed = false;
   let carrierSticky = false;
   let carrierOperandSkips = 0;
@@ -2361,6 +2361,8 @@ function hasDisguisedAssignment(
   let pendingEnvWorkingDirectory = false;
   let pendingNpmSubcommand = false;
   let pendingNpmExecOptions = false;
+  let pendingMiseSubcommand = false;
+  let pendingMiseExecOptions = false;
   let pendingGitSubcommand = false;
   let pendingGitOptionValue = false;
   let pendingGitSubmoduleAction = false;
@@ -2439,7 +2441,7 @@ function hasDisguisedAssignment(
       // previous one applies: retained interpreter tracking would read the next
       // command's ordinary options as evaluation (`python3 --version && mcp -c x`).
       commandPosition = true;
-      envCommandExpected = false;
+      wrappedCommandExpected = false;
       carrierArmed = false;
       carrierSticky = false;
       carrierOperandSkips = 0;
@@ -2452,6 +2454,8 @@ function hasDisguisedAssignment(
       pendingPrintfVariableOption = false;
       pendingNpmSubcommand = false;
       pendingNpmExecOptions = false;
+      pendingMiseSubcommand = false;
+      pendingMiseExecOptions = false;
       pendingGitSubcommand = false;
       pendingGitOptionValue = false;
       pendingGitSubmoduleAction = false;
@@ -2557,8 +2561,9 @@ function hasDisguisedAssignment(
       // `--` ends env option parsing, so the next word is the utility; a bare `-`
       // is `-i`, leaving option parsing armed.
       if (unquoted === "--") {
-        envCommandExpected ||= sawEnv;
+        wrappedCommandExpected ||= sawEnv || pendingMiseExecOptions;
         sawEnv = false;
+        pendingMiseExecOptions = false;
         pendingStartStopDaemonOptions = false;
         pendingStartStopDaemonExecutable = false;
         pendingSystemdRunOptions = false;
@@ -2600,8 +2605,8 @@ function hasDisguisedAssignment(
     // argument (`mcp-server --shell bash` stays published).
     let executesHere = commandPosition || carrierSticky;
     commandPosition = false;
-    if (envCommandExpected) {
-      envCommandExpected = false;
+    if (wrappedCommandExpected) {
+      wrappedCommandExpected = false;
       executesHere = true;
     }
     // GNU env reparses its split-string value even without an assignment or literal
@@ -2719,6 +2724,15 @@ function hasDisguisedAssignment(
             return true;
           }
         }
+      }
+    }
+    if (pendingMiseExecOptions && /^(?:-c(?:.+)?|--command(?:=|$))/.test(unquoted)) {
+      return true;
+    }
+    if (pendingMiseSubcommand) {
+      if (unquoted === "exec" || unquoted === "x") {
+        pendingMiseSubcommand = false;
+        pendingMiseExecOptions = true;
       }
     }
     if (pendingNpmExecOptions) {
@@ -2892,6 +2906,7 @@ function hasDisguisedAssignment(
       if (inherited.javaAgentHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
+      if (executable === "mise") pendingMiseSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;

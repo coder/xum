@@ -1788,6 +1788,10 @@ describe("backup payload", () => {
       `java @/tmp/opts.txt --source 17 ${muxRoot}/skills/launch.txt`,
       // Git searches this directory for external git-<subcommand> executables.
       `git --exec-path=${muxRoot}/skills leak.txt`,
+      `mise exec -- python3 ${muxRoot}/skills/launch.txt`,
+      `mise x -- ${muxRoot}/agents/launch.md`,
+      "mise exec --command=launch.txt",
+      "mise x -c launch.txt",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1827,6 +1831,9 @@ describe("backup payload", () => {
       "start-stop-daemon --stop --exec /usr/bin/mcp-server --",
       `mcp-server --launcher start-stop-daemon --exec ${muxRoot}/skills/config.txt`,
       "cmake --build build --target package",
+      "mise --version",
+      "mise exec python@3.11",
+      `mcp-server --launcher mise exec -- ${muxRoot}/skills/config.txt`,
       // A control operator starts a new command, ending interpreter tracking.
       "python3 --version && mcp-server -c config.toml",
       // deno's entrypoint ends script tracking; later published paths are data.
