@@ -4486,11 +4486,12 @@ export class TaskService {
         if (!slot.success) return Err(slot.error);
       }
       // Announce the probable quiet supersession in the creation result: with
-      // tool-end dispatch this follow-up cuts the caller's own active delegated
-      // turn at the target's next tool boundary, and that handle then settles
-      // interrupted without a separate wake (see
-      // buildOwnerFollowUpSupersededError). Only the caller's own active handle
-      // qualifies — a different owner's turn keeps its notify behavior.
+      // tool-end dispatch this follow-up cuts the caller's own immediately
+      // preceding delegated turn (the newest live handle — the queue tail, not
+      // necessarily the currently streaming one) at that turn's next tool
+      // boundary, and that handle then settles interrupted without a separate
+      // wake (see buildOwnerFollowUpSupersededError). Only the caller's own
+      // handle qualifies — a different owner's turn keeps its notify behavior.
       if (
         queuedForExistingWorkspace &&
         activeWorkspaceTurn?.ownerWorkspaceId === ownerWorkspaceId &&
@@ -8331,6 +8332,18 @@ export class TaskService {
         ownerWorkspaceId,
         notification.sourceId
       );
+      // Revalidate suppression against the just-read record before delivery: a
+      // quiet owner-follow-up resettle deletes its notification files, but
+      // cannot retract this drain's already-taken listPending() snapshot. The
+      // handle record is the source of truth, so a handle that has since
+      // settled into the quiet flavor is dropped here instead of waking the
+      // owner from the stale snapshot. (A resettle persisting after this read
+      // can still lose the race — full serializability would require holding
+      // the settlement lock across sendMessage, which the drain must not do.)
+      if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
+        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
+        continue;
+      }
       const isPersistentChildContinuation =
         record != null &&
         this.isDescendantAgentTaskUsingParentById(
@@ -8952,6 +8965,15 @@ export class TaskService {
      * same turn, and the correlated stream-end proves the turn's real outcome.
      */
     allowTerminalResettle?: boolean;
+    /**
+     * Only the settlement that itself moved disposable ownership to a
+     * successor (transferDisposableWorkspaceToSuccessor) may clear
+     * disposableWorkspace. Every other settlement may hold a snapshot read
+     * before a concurrent transfer flipped the bit on disk, so the
+     * lock-reloaded record's ownership is merged back in by default — dropping
+     * it would leak the disposable checkout with no owner left to clean it up.
+     */
+    disposableOwnershipTransferred?: boolean;
   }): Promise<void> {
     assert(
       params.next.handleId === params.record.handleId,
@@ -9051,9 +9073,26 @@ export class TaskService {
         // under this settlement lock, which direct-parent consumption shares.
         if (resettleStaleTerminal && suppressedQuietSettlement) {
           await this.deleteWorkspaceTurnTerminalAttention(current);
+          // When the direct parent is the owner, the quiet flavor also skips
+          // the direct-parent envelope, so the requiresDirectParentDelivery
+          // block below never runs for it — the stale direct-parent generation
+          // enqueued by the superseded settlement must be invalidated here
+          // too, or the parent retains and wakes on the corrected-away
+          // failure. (Idempotent with the non-skip resettle path's delete.)
+          await this.deletePersistentChildWorkspaceTurnAttention(current);
         }
 
         const nextRecord = { ...params.next };
+        if (
+          current.disposableWorkspace &&
+          !nextRecord.disposableWorkspace &&
+          params.disposableOwnershipTransferred !== true
+        ) {
+          // See disposableOwnershipTransferred: a transfer that landed while
+          // this settlement's snapshot was waiting on the lock is
+          // authoritative for ownership.
+          nextRecord.disposableWorkspace = true;
+        }
         if (resettleStaleTerminal) {
           log.debug("Workspace turn resettled from stale terminal status", {
             handleId: current.handleId,
@@ -12620,7 +12659,13 @@ export class TaskService {
     workspaceId: string
   ): Promise<WorkspaceTurnTaskHandleRecord | undefined> {
     assert(workspaceId.length > 0, "findActiveWorkspaceTurnForWorkspace requires workspaceId");
-    for (const record of records) {
+    // Newest-first (records arrive createdAt-ascending): the supersede
+    // announcement in createWorkspaceTurn must name the IMMEDIATE predecessor.
+    // With A active and same-owner follow-ups B and C queued, C supersedes B
+    // (not A) at B's first boundary — and B's own settlement wake is
+    // suppressed, so naming A for both B and C would leave B's interruption
+    // unreported anywhere. Existence checks are order-independent.
+    for (const record of [...records].reverse()) {
       if (record.workspaceId !== workspaceId || !this.isActiveWorkspaceTurn(record)) {
         continue;
       }
@@ -14176,11 +14221,9 @@ export class TaskService {
     snapshot: QueueCutAttributionSnapshot
   ): QueueCutSupersedeEvidence {
     const classifyMetadata = (muxMetadata: unknown): QueueCutSupersedeEvidence => {
-      const correlation = parseWorkspaceTurnTaskCorrelation(muxMetadata);
-      return correlation != null &&
-        correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
-        correlation.taskHandleId !== record.handleId
-        ? { kind: "same_owner_follow_up", successorHandleId: correlation.taskHandleId }
+      const successorHandleId = this.sameOwnerFollowUpHandleIdFromMetadata(record, muxMetadata);
+      return successorHandleId != null
+        ? { kind: "same_owner_follow_up", successorHandleId }
         : { kind: "other_input" };
     };
     // Already streaming at the cut: the uncorrelated active stream is the
@@ -14205,6 +14248,41 @@ export class TaskService {
     // Residual legacy positives (e.g. hasPendingAutoRetry with an empty queue)
     // stay generic supersede evidence.
     return snapshot.hasPendingQueuedOrPreparingTurn ? { kind: "other_input" } : null;
+  }
+
+  /** Successor handle id when metadata correlates to a DIFFERENT handle of the same owner. */
+  private sameOwnerFollowUpHandleIdFromMetadata(
+    record: WorkspaceTurnTaskHandleRecord,
+    muxMetadata: unknown
+  ): string | undefined {
+    const correlation = parseWorkspaceTurnTaskCorrelation(muxMetadata);
+    return correlation != null &&
+      correlation.ownerWorkspaceId === record.ownerWorkspaceId &&
+      correlation.taskHandleId !== record.handleId
+      ? correlation.taskHandleId
+      : undefined;
+  }
+
+  /**
+   * Same-owner follow-up that continues on this workspace at this stream end,
+   * for disposable-ownership transfer. Unlike cut attribution
+   * (getQueueCutSupersedeEvidence), dispatch mode is irrelevant here: a
+   * turn-end follow-up never cuts, but it still dispatches once the
+   * predecessor's stream ends naturally, so a completed predecessor's cleanup
+   * would otherwise delete the workspace out from under it.
+   */
+  private findSameOwnerFollowUpForDisposableTransfer(
+    event: StreamEndEvent,
+    record: WorkspaceTurnTaskHandleRecord,
+    snapshot: QueueCutAttributionSnapshot
+  ): string | undefined {
+    const { activeStream, cutter } = snapshot;
+    if (activeStream != null && activeStream.messageId !== event.messageId) {
+      return this.sameOwnerFollowUpHandleIdFromMetadata(record, activeStream.muxMetadata);
+    }
+    return cutter != null
+      ? this.sameOwnerFollowUpHandleIdFromMetadata(record, cutter.muxMetadata)
+      : undefined;
   }
 
   private async finalizeWorkspaceTurnFromStreamEnd(
@@ -14267,23 +14345,32 @@ export class TaskService {
     const next = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
       supersedeEvidence,
     });
-    // A quiet owner-follow-up supersede must not tear down a disposable
-    // workspace under its announced successor: transfer disposable ownership
-    // to the successor handle (which continues on the same workspace), so the
-    // workspace is removed when the successor itself settles terminally. When
-    // the transfer fails (successor missing, different workspace, or already
-    // terminal), the old record keeps disposable ownership and today's
-    // settlement cleanup runs rather than leaking the checkout.
-    if (
-      record.disposableWorkspace &&
-      next.status === "interrupted" &&
-      supersedeEvidence?.kind === "same_owner_follow_up" &&
-      (await this.transferDisposableWorkspaceToSuccessor(
-        record,
-        supersedeEvidence.successorHandleId
-      ))
-    ) {
-      next.disposableWorkspace = false;
+    // A same-owner follow-up continues on this workspace after this stream
+    // end: transfer disposable ownership to the successor handle, so the
+    // workspace is removed when the successor itself settles terminally. This
+    // covers the quiet supersede (evidence-classified cut) AND a natural
+    // completion with a follow-up queued in any dispatch mode — a turn-end
+    // follow-up never cuts (deliberately not supersede evidence) but still
+    // dispatches at this stream end and must not lose its workspace to this
+    // settlement's cleanup. When the transfer fails (successor missing,
+    // different workspace, or already terminal), the old record keeps
+    // disposable ownership and today's settlement cleanup runs rather than
+    // leaking the checkout.
+    let disposableOwnershipTransferred = false;
+    if (record.disposableWorkspace) {
+      const disposableSuccessorHandleId =
+        supersedeEvidence?.kind === "same_owner_follow_up"
+          ? supersedeEvidence.successorHandleId
+          : this.findSameOwnerFollowUpForDisposableTransfer(event, record, queueCutSnapshot);
+      if (disposableSuccessorHandleId != null) {
+        disposableOwnershipTransferred = await this.transferDisposableWorkspaceToSuccessor(
+          record,
+          disposableSuccessorHandleId
+        );
+      }
+      if (disposableOwnershipTransferred) {
+        next.disposableWorkspace = false;
+      }
     }
     await this.settleWorkspaceTurn({
       record,
@@ -14297,6 +14384,7 @@ export class TaskService {
       // transient failure (provider error, restart) may have self-healed via auto-retry
       // of the same turn; let this settlement correct that stale record.
       allowTerminalResettle: true,
+      disposableOwnershipTransferred,
     });
     return true;
   }
