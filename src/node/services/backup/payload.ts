@@ -2125,6 +2125,11 @@ const COMMAND_CARRIER_OPERANDS = new Map<string, number>([
   // -1: the wrapper's leading operand is optional (setarch [ARCH] COMMAND), so no
   // fixed count is safe; every following word is checked instead, failing closed.
   ["setarch", -1],
+  // The util-linux setarch hard links imply the architecture, so their first
+  // operand is already the program.
+  ["linux32", 0],
+  ["linux64", 0],
+  ["uname26", 0],
   // CMake executes several operand grammars (-P script mode, -E env/chdir/time
   // command mode) and CTest runs -S/-SP dashboard scripts; checking every operand
   // covers them all without modeling each option, failing closed like setarch.
@@ -2394,7 +2399,12 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
     // argument is never mistaken for an evaluator. They also terminate env options,
     // npm exec call options, and git rebase options at this parse level.
     if (unquoted === "-" || unquoted === "--") {
+      const scriptOperandFollows = unquoted === "--" && pendingLanguages.size > 0;
       clearInterpreterTracking();
+      // `--` only ends option parsing, so an armed interpreter's next positional
+      // is still its script operand (`python3 -- launch.txt` executes the file);
+      // a bare dash reads the script from stdin instead.
+      pendingScriptFileOperand = scriptOperandFollows;
       envOperandsOnly ||= sawEnv;
       // `--` ends env option parsing, so the next word is the utility; a bare `-`
       // is `-i`, leaving option parsing armed.

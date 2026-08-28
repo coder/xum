@@ -1754,6 +1754,10 @@ describe("backup payload", () => {
       `node < ${muxRoot}/skills/launch.txt`,
       `sh 0< ${muxRoot}/skills/launch.txt`,
       `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
+      // The util-linux setarch hard links run their first operand as the program.
+      `linux32 ${muxRoot}/skills/launch.txt`,
+      `linux64 ${muxRoot}/agents/launch.md`,
+      `uname26 ${muxRoot}/skills/launch.txt`,
       `cmake -P ${muxRoot}/skills/launch.txt`,
       `ctest -S ${muxRoot}/skills/launch.txt`,
       // Redundant separators and dot segments name the same collected file.
@@ -1799,6 +1803,8 @@ describe("backup payload", () => {
       "python3 --version && mcp-server -c config.toml",
       // deno's entrypoint ends script tracking; later published paths are data.
       `deno run /opt/server.ts ${muxRoot}/skills/config.txt`,
+      // The script operand after `--` ends tracking; later published paths are data.
+      `python3 -- /tmp/main.py ${muxRoot}/skills/config.txt`,
       // Two-segment merge/diff keys hold settings, not driver commands.
       "git config merge.conflictstyle diff3",
       "java @/tmp/opts.txt Main --port 8080",
@@ -1960,6 +1966,8 @@ describe("backup payload", () => {
   // also covers a custom (XUM_ROOT-style) root the old segment matching missed.
   for (const [name, command] of [
     ["Python", "python3 <root>/skills/launch.txt"],
+    // `--` ends option parsing but the next positional is still the script operand.
+    ["Python after option terminator", "python3 -- <root>/skills/launch.txt"],
     ["Node", "node <root>/agents/launch.md"],
     ["Rscript", "Rscript <root>/memory/global/launch.markdown"],
     ["Lua", "lua5.4 <root>/skills/launch.txt"],
