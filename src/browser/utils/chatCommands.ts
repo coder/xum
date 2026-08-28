@@ -762,7 +762,7 @@ export async function processSlashCommand(
         if (!env.workspaceId) throw new Error("Workspace ID required");
         if (!client) return notConnected();
         const workspaceId = env.workspaceId;
-        return complete("consume", [], async () => {
+        return complete("consume", [{ type: "clear-input" }], async () => {
           try {
             const result = await client.memory.consolidate({ workspaceId });
             const applied = result.success
@@ -805,6 +805,7 @@ export async function processSlashCommand(
         const displayedProposalHash = apply ? getDisplayedRefineProposalHash(workspaceId) : null;
         if (apply && displayedProposalHash === null) {
           return complete("consume", [
+            { type: "clear-input" },
             showToast({
               id: Date.now().toString(),
               type: "error",
@@ -814,7 +815,7 @@ export async function processSlashCommand(
           ]);
         }
         const experiments = env.sendMessageOptions.experiments;
-        return complete("consume", [], async () => {
+        return complete("consume", [{ type: "clear-input" }], async () => {
           try {
             const result =
               apply && displayedProposalHash !== null

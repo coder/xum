@@ -860,6 +860,7 @@ describe("detached command work", () => {
     expect(result.kind).toBe("complete");
     if (result.kind !== "complete") throw new Error("expected complete result");
     expectDisposition(result, "consume");
+    expect(result.actions).toEqual([{ type: "clear-input" }]);
     expect(consolidate).not.toHaveBeenCalled();
     const successActions = await result.backgroundTask?.();
     expect(successActions).toBeDefined();
@@ -913,7 +914,8 @@ describe("detached command work", () => {
     if (missingProposal.kind !== "complete") throw new Error("expected complete result");
     expectDisposition(missingProposal, "consume");
     expect(missingProposal.backgroundTask).toBeUndefined();
-    expect(missingProposal.actions[0]).toMatchObject({
+    expect(missingProposal.actions[0]).toEqual({ type: "clear-input" });
+    expect(missingProposal.actions[1]).toMatchObject({
       type: "show-toast",
       toast: { type: "error" },
     });
