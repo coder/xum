@@ -1759,6 +1759,9 @@ describe("backup payload", () => {
       // Redundant separators and dot segments name the same collected file.
       `${muxRoot}//skills/launch.txt`,
       `env ${muxRoot}/./skills/launch.txt`,
+      // The Java launcher expands @argument-files into options before parsing.
+      `java @${muxRoot}/skills/args.txt`,
+      `java @/tmp/opts.txt --source 17 ${muxRoot}/skills/launch.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1796,6 +1799,9 @@ describe("backup payload", () => {
       "python3 --version && mcp-server -c config.toml",
       // deno's entrypoint ends script tracking; later published paths are data.
       `deno run /opt/server.ts ${muxRoot}/skills/config.txt`,
+      // Two-segment merge/diff keys hold settings, not driver commands.
+      "git config merge.conflictstyle diff3",
+      "java @/tmp/opts.txt Main --port 8080",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -2033,6 +2039,9 @@ describe("backup payload", () => {
       "git config core.sshCommand 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git fetch origin",
       "git config credential.helper '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
       "git config filter.secret.process 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config merge.leak.driver 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git merge side",
+      "git config diff.leak.textconv 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config hook.leak.command 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
     ]) {
       await writeFixtureFile(
         muxRoot,

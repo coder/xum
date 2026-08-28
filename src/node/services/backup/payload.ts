@@ -1756,9 +1756,13 @@ function javaOptionTakesSeparateValue(unquoted: string): boolean {
   );
 }
 
-/** Git config values that Git later executes as commands or helper processes. */
+/**
+ * Git config values that Git later executes as commands or helper processes. Driver,
+ * tool, and hook names are user-chosen subsections that may themselves contain dots,
+ * so those middles match greedily.
+ */
 const GIT_COMMAND_CONFIG_KEY =
-  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy)|sequence\.editor|diff\.external|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|pager\.[^.]+|(?:diff|merge)tool\.[^.]+\.cmd|filter\.[^.]+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\.[^.]+\.cmd|tar\.[^.]+\.command)$/i;
+  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(?:external|.+\.(?:command|textconv))|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|gpg\.ssh\.defaultkeycommand|pager\.[^.]+|(?:diff|merge)tool\..+\.cmd|guitool\..+\.cmd|merge\..+\.driver|hook\..+\.command|browser\..+\.(?:cmd|path)|filter\..+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\..+\.cmd|tar\..+\.command|sendemail\.(?:sendmailcmd|cccmd|tocmd)|uploadpack\.packobjectshook)$/i;
 
 /**
  * core.fsmonitor doubles as a boolean toggle for the built-in monitor; only a
@@ -2527,7 +2531,13 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = true;
     } else if (pendingJavaOptions || pendingJavaSourceFile) {
-      if (javaOptionTakesSeparateValue(unquoted)) {
+      if (unquoted.startsWith("@")) {
+        // The launcher expands an @argument-file into options before parsing, so a
+        // published file can inject --source and a script operand; the file itself
+        // localizes, and any other @-file leaves tracking armed because the options
+        // it expands to are not visible here.
+        if (isAutoPublishedScriptOperand(unquoted.slice(1), rootPrefixes)) return true;
+      } else if (javaOptionTakesSeparateValue(unquoted)) {
         pendingJavaOptionValue = true;
       } else if (unquoted === "--source") {
         pendingJavaSourceVersion = true;
