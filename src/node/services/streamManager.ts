@@ -804,7 +804,13 @@ export class StreamManager {
   }
 
   private emitTurnEvent(event: TurnEngineEvent): void {
-    void this.eventSink(event);
+    // TurnEngineEventSink may return a promise; non-abort delivery stays
+    // fire-and-forget, so contain rejections here or a failing async sink
+    // becomes an unhandled rejection. Abort delivery is sequenced separately
+    // via emitStreamAbort.
+    void Promise.resolve(this.eventSink(event)).catch((error) => {
+      log.error("Turn event sink failed", { eventType: event.type, error: getErrorMessage(error) });
+    });
   }
 
   private getWorkspaceLogger(
@@ -1685,9 +1691,15 @@ export class StreamManager {
 
     // Clean up immediately
     this.workspaceStreams.delete(workspaceId);
-    void abortDelivery.finally(() => {
-      streamInfo.completionController?.settle({ status: "aborted", abortReason });
-    });
+    void abortDelivery
+      .catch((error) => {
+        // Contain sink rejections: .finally alone would re-propagate them as
+        // an unhandled rejection after completion settles.
+        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+      })
+      .finally(() => {
+        streamInfo.completionController?.settle({ status: "aborted", abortReason });
+      });
   }
 
   /**
@@ -4786,7 +4798,15 @@ export class StreamManager {
         // Emit abort event so frontend clears pending stream state.
         // This handles the case where user interrupts before stream-start arrives.
         // Use empty messageId - frontend handles gracefully (just clears pendingStreamStartTime).
-        void this.emitStreamAbort(typedWorkspaceId, "", {}, abortReason, options?.abandonPartial);
+        void this.emitStreamAbort(
+          typedWorkspaceId,
+          "",
+          {},
+          abortReason,
+          options?.abandonPartial
+        ).catch((error) => {
+          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+        });
         return Ok(undefined);
       }
 

@@ -257,6 +257,38 @@ function createStreamInfoForTests(
   };
 }
 
+describe("StreamManager - event sink rejection containment", () => {
+  test("a rejecting async event sink does not become an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const streamManager = new StreamManager(historyService, undefined, undefined, () =>
+        Promise.reject(new Error("sink boom"))
+      );
+      const emitTurnEvent = getPrivateMethodForTests<(event: TurnEngineEvent) => void>(
+        streamManager,
+        "emitTurnEvent"
+      );
+      emitTurnEvent.call(streamManager, {
+        type: "workflow-run-attached",
+        workspaceId: "sink-rejection-workspace",
+        messageId: "sink-rejection-message",
+        toolCallId: "sink-rejection-call",
+        runId: "wfr_sink",
+        timestamp: Date.now(),
+      });
+      // A macrotask so an uncontained rejection would surface before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});
+
 describe("StreamManager - workflow run attachments", () => {
   test("persists attached workflow run metadata to partial immediately", async () => {
     const streamManager = new StreamManager(historyService);
