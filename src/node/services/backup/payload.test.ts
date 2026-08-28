@@ -1717,6 +1717,7 @@ describe("backup payload", () => {
     ["systemd-run-wrapped shells", "systemd-run --user --scope bash -c exit"],
     ["systemd-inhibit-wrapped shells", "systemd-inhibit --what=idle bash -c exit"],
     ["systemd-cat-wrapped shells", "systemd-cat -t mcp bash -c exit"],
+    ["CMake command mode", "cmake -E env bash -c exit"],
   ] as const) {
     it(`localizes ${name}`, async () => {
       await writeFixtureFile(
@@ -1753,6 +1754,8 @@ describe("backup payload", () => {
       `node < ${muxRoot}/skills/launch.txt`,
       `sh 0< ${muxRoot}/skills/launch.txt`,
       `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
+      `cmake -P ${muxRoot}/skills/launch.txt`,
+      `ctest -S ${muxRoot}/skills/launch.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1785,6 +1788,7 @@ describe("backup payload", () => {
       "mcp-server --wrap prlimit --mode coproc",
       "mcp-server < /tmp/input.json",
       "mcp-server --launcher systemd-run",
+      "cmake --build build --target package",
     ]) {
       await writeFixtureFile(
         muxRoot,

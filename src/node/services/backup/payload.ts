@@ -2105,6 +2105,11 @@ const COMMAND_CARRIER_OPERANDS = new Map<string, number>([
   // -1: the wrapper's leading operand is optional (setarch [ARCH] COMMAND), so no
   // fixed count is safe; every following word is checked instead, failing closed.
   ["setarch", -1],
+  // CMake executes several operand grammars (-P script mode, -E env/chdir/time
+  // command mode) and CTest runs -S/-SP dashboard scripts; checking every operand
+  // covers them all without modeling each option, failing closed like setarch.
+  ["cmake", -1],
+  ["ctest", -1],
 ]);
 
 /**
