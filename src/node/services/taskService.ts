@@ -7915,19 +7915,25 @@ export class TaskService {
   }
 
   /**
-   * Caller send restrictions (tool policy, workspace-agent disable flag) to restore on a
-   * terminal-attention wake. The newest manual user row carries the conversation's persisted
-   * restrictions; synthetic rows without any (earlier wakes, heartbeat scaffolding) do not
-   * define them and are skipped. The walk is unbounded: a long assistant/synthetic tail after
-   * the launch turn must not push the defining row out of sight and silently lift the
-   * restrictions. Throws when history is unreadable so the caller can fail closed instead of
-   * waking with unrestricted tools.
+   * Caller send restrictions (tool policy, workspace-agent disable flag, strict-agent pin) to
+   * restore on a terminal-attention wake. The newest manual user row carries the
+   * conversation's persisted restrictions; synthetic rows without any (earlier wakes,
+   * heartbeat scaffolding) do not define them and are skipped. The walk is unbounded: a long
+   * assistant/synthetic tail after the launch turn must not push the defining row out of
+   * sight and silently lift the restrictions. Throws when history is unreadable so the caller
+   * can fail closed instead of waking with unrestricted tools.
    */
-  private async resolveTerminalWakeCallerSendRestrictions(
-    ownerWorkspaceId: string
-  ): Promise<{ toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean }> {
+  private async resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId: string): Promise<{
+    toolPolicy?: ToolPolicy;
+    disableWorkspaceAgents?: boolean;
+    strictAgentResolution?: boolean;
+  }> {
     const state: {
-      found: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean } | null;
+      found: {
+        toolPolicy?: ToolPolicy;
+        disableWorkspaceAgents?: boolean;
+        strictAgentResolution?: boolean;
+      } | null;
     } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
@@ -7938,6 +7944,11 @@ export class TaskService {
             continue;
           }
           const metadata = message.metadata;
+          // The strict-agent pin lives in the row's retry snapshot: an explicit agent override
+          // must stay loud on the wake too, or a vanished/corrupted definition would silently
+          // recompose the send from the exec fallback (same rule as startup retry and
+          // compaction follow-ups).
+          const strictAgentResolution = metadata?.retrySendOptions?.strictAgentResolution === true;
           if (metadata?.toolPolicy != null || metadata?.disableWorkspaceAgents != null) {
             // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
             // inside send resolution and leave the wake permanently blocked on the same corrupt
@@ -7956,11 +7967,12 @@ export class TaskService {
               ...(typeof metadata.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
+              ...(strictAgentResolution ? { strictAgentResolution: true } : {}),
             };
             return false;
           }
           if (metadata?.synthetic !== true) {
-            state.found = {};
+            state.found = strictAgentResolution ? { strictAgentResolution: true } : {};
             return false;
           }
         }
@@ -8422,7 +8434,11 @@ export class TaskService {
     // synthetic send starts a fresh turn, and omitting the policy would let a workflow wake
     // regain tools the caller disabled (with attacker-influenced workflow output choosing the
     // timing). The agent-level policy recomposes from agentId at send resolution.
-    let wakeRestrictions: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean };
+    let wakeRestrictions: {
+      toolPolicy?: ToolPolicy;
+      disableWorkspaceAgents?: boolean;
+      strictAgentResolution?: boolean;
+    };
     try {
       wakeRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
     } catch (error: unknown) {
@@ -8442,6 +8458,7 @@ export class TaskService {
       reasoningMode: resumeOptions.reasoningMode,
       ...(wakeRestrictions.toolPolicy != null ? { toolPolicy: wakeRestrictions.toolPolicy } : {}),
       ...(wakeRestrictions.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
+      ...(wakeRestrictions.strictAgentResolution === true ? { strictAgentResolution: true } : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
     if (prompt.length === 0) {
