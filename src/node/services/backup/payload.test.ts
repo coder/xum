@@ -1728,14 +1728,14 @@ describe("backup payload", () => {
 
   it("localizes directly executed auto-published documents", async () => {
     for (const command of [
-      "~/.xum/skills/launch.txt",
-      "MODE=fast ~/.xum/skills/launch.txt",
-      "env ~/.xum/skills/launch.txt",
-      "env -u TOKEN ~/.xum/skills/launch.txt",
-      "env env /home/user/.xum/agents/launch.md",
-      "true; /home/user/.xum/agents/launch.md",
-      "timeout 30 ~/.xum/skills/launch.txt",
-      "nohup ~/.xum/skills/launch.txt",
+      `${muxRoot}/skills/launch.txt`,
+      `MODE=fast ${muxRoot}/skills/launch.txt`,
+      `env ${muxRoot}/skills/launch.txt`,
+      `env -u TOKEN ${muxRoot}/skills/launch.txt`,
+      `env env ${muxRoot}/agents/launch.md`,
+      `true; ${muxRoot}/agents/launch.md`,
+      `timeout 30 ${muxRoot}/skills/launch.txt`,
+      `nohup ${muxRoot}/skills/launch.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1784,38 +1784,176 @@ describe("backup payload", () => {
     }
   });
 
-  for (const [name, command] of [
-    ["Python", "python3 ~/.xum/skills/launch.txt"],
-    ["Node", "node /home/user/.xum/agents/launch.md"],
-    ["Rscript", "Rscript ~/.mux/memory/global/launch.markdown"],
-    ["Lua", "lua5.4 ~/.xum/skills/launch.txt"],
-    ["LuaJIT", "luajit /home/user/.xum/agents/launch.md"],
-    ["Swift", "swift ~/.xum/skills/launch.txt"],
-    ["Elixir", "elixir /home/user/.xum/agents/launch.md"],
-    ["Java source mode", "java --source 17 ~/.xum/skills/launch.txt"],
-    ["Java attached source mode", "java --source=17 /home/user/.xum/agents/launch.md"],
-    [
-      "Java source mode with option values",
-      "java --class-path libs --source 17 --module-path mods ~/.xum/skills/launch.txt",
-    ],
-    ["JShell", "jshell ~/.xum/skills/launch.txt"],
-    ["Tcl", "tclsh ~/.xum/skills/launch.txt"],
-    ["Tk wish", "wish8.6 /home/user/.xum/agents/launch.md"],
-    ["Expect", "expect ~/.mux/memory/global/launch.txt"],
-    ["R attached file option", "R --file=/home/alice/.xum/skills/launch.txt"],
-    ["R separate file option", "R -f ~/.xum/skills/launch.txt"],
-    ["PHP attached file option", "php --file=/home/alice/.xum/skills/launch.mdx"],
-    ["PHP separate file option", "php -f ~/.mux/memory/global/launch.markdown"],
-    ["PHP process-file option", "php -F/home/alice/.xum/skills/launch.txt"],
-    ["PHP long process-file option", "php --process-file=~/.xum/skills/launch.txt"],
-    ["PHP separate process-file option", "php --process-file ~/.xum/skills/launch.txt"],
-    ["Deno", "deno run --config deno.json 'C:\\Users\\me\\.xum\\skills\\launch.mdx'"],
-  ] as const) {
-    it(`localizes ${name} execution of auto-published documents`, async () => {
+  it("resolves ~ spellings against a settings root under the home directory", async () => {
+    const homeRoot = await fs.mkdtemp(path.join(os.homedir(), ".xum-backup-test-"));
+    try {
+      await writeFixtureFile(
+        homeRoot,
+        "mcp.jsonc",
+        JSON.stringify({
+          servers: {
+            private: { command: `python3 ~/${path.basename(homeRoot)}/skills/launch.txt` },
+          },
+        })
+      );
+      const payload = await createBackupPayload({
+        muxRoot: homeRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    } finally {
+      await fs.rm(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("localizes the pre-rename spelling of a renamed settings root", async () => {
+    const xumRoot = path.join(tempDir, ".xum");
+    await fs.mkdir(xumRoot);
+    await writeFixtureFile(
+      xumRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { private: { command: `node ${tempDir}/.mux/agents/launch.md` } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot: xumRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps boolean core.fsmonitor configuration while localizing hook pathnames", async () => {
+    for (const command of [
+      "git config core.fsmonitor false && mcp-server",
+      "git config core.fsmonitor true && mcp-server",
+    ]) {
       await writeFixtureFile(
         muxRoot,
         "mcp.jsonc",
         JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(command);
+    }
+
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { private: { command: "git config core.fsmonitor /usr/local/bin/watch-hook" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes Git config includes of published documents", async () => {
+    for (const command of [
+      `git config include.path ${muxRoot}/skills/launch.txt && git x`,
+      `git config includeif.gitdir:/w/.path ${muxRoot}/AGENTS.md`,
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // Includes of files this backup does not publish stay portable.
+    const portable = "git config include.path /tmp/extra.gitconfig && git x";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { private: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(portable);
+  });
+
+  // <root> resolves to the collected settings root inside each test, so every entry
+  // also covers a custom (XUM_ROOT-style) root the old segment matching missed.
+  for (const [name, command] of [
+    ["Python", "python3 <root>/skills/launch.txt"],
+    ["Node", "node <root>/agents/launch.md"],
+    ["Rscript", "Rscript <root>/memory/global/launch.markdown"],
+    ["Lua", "lua5.4 <root>/skills/launch.txt"],
+    ["LuaJIT", "luajit <root>/agents/launch.md"],
+    ["Swift", "swift <root>/skills/launch.txt"],
+    ["Elixir", "elixir <root>/agents/launch.md"],
+    ["Erlang escript", "escript <root>/skills/launch.txt"],
+    ["Java source mode", "java --source 17 <root>/skills/launch.txt"],
+    ["Java attached source mode", "java --source=17 <root>/agents/launch.md"],
+    [
+      "Java source mode with option values",
+      "java --class-path libs --source 17 --module-path mods <root>/skills/launch.txt",
+    ],
+    ["JShell", "jshell <root>/skills/launch.txt"],
+    ["Tcl", "tclsh <root>/skills/launch.txt"],
+    ["Tk wish", "wish8.6 <root>/agents/launch.md"],
+    ["Expect", "expect <root>/memory/global/launch.txt"],
+    ["R attached file option", "R --file=<root>/skills/launch.txt"],
+    ["R separate file option", "R -f <root>/skills/launch.txt"],
+    ["PHP attached file option", "php --file=<root>/skills/launch.mdx"],
+    ["PHP separate file option", "php -f <root>/memory/global/launch.markdown"],
+    ["PHP process-file option", "php -F<root>/skills/launch.txt"],
+    ["PHP long process-file option", "php --process-file=<root>/skills/launch.txt"],
+    ["PHP separate process-file option", "php --process-file <root>/skills/launch.txt"],
+    // Backslash spelling of the same root, normalized like a Windows path.
+    ["Deno", "deno run --config deno.json '<rootbs>\\skills\\launch.mdx'"],
+  ] as const) {
+    it(`localizes ${name} execution of auto-published documents`, async () => {
+      const resolved = command
+        .replaceAll("<root>", muxRoot)
+        .replaceAll("<rootbs>", muxRoot.replaceAll("/", "\\"));
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command: resolved } } })
       );
       const payload = await createBackupPayload({
         muxRoot,
@@ -1832,11 +1970,11 @@ describe("backup payload", () => {
 
   it("localizes runtime preload modules", async () => {
     for (const command of [
-      "node --require /home/user/.xum/skills/launch.txt server.js",
-      "node -r/home/user/.xum/skills/launch.txt server.js",
-      "bun --preload /home/user/.xum/skills/launch.txt server.ts",
-      "bun --require=/home/user/.xum/skills/launch.txt server.ts",
-      "bun -r/home/user/.xum/skills/launch.txt server.ts",
+      `node --require ${muxRoot}/skills/launch.txt server.js`,
+      `node -r${muxRoot}/skills/launch.txt server.js`,
+      `bun --preload ${muxRoot}/skills/launch.txt server.ts`,
+      `bun --require=${muxRoot}/skills/launch.txt server.ts`,
+      `bun -r${muxRoot}/skills/launch.txt server.ts`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1908,8 +2046,8 @@ describe("backup payload", () => {
 
   it("localizes makefile-driven launchers", async () => {
     for (const command of [
-      "make -f /home/user/.xum/skills/launch.txt",
-      "gmake --file=/home/user/.xum/skills/launch.txt",
+      `make -f ${muxRoot}/skills/launch.txt`,
+      `gmake --file=${muxRoot}/skills/launch.txt`,
       "make --eval='run:;mcp --token ghp_Abcdef1234'",
     ]) {
       await writeFixtureFile(
@@ -2096,8 +2234,8 @@ describe("backup payload", () => {
       "python3 - -c",
       "node -- --require",
       "bun -- --preload",
-      "R -- --file=~/.xum/skills/launch.txt",
-      "php -- --file=~/.xum/skills/launch.txt",
+      `R -- --file=${muxRoot}/skills/launch.txt`,
+      `php -- --file=${muxRoot}/skills/launch.txt`,
       "make -- -f",
       "npm exec -- -c",
       "env -- -Ssettings",
@@ -2110,7 +2248,12 @@ describe("backup payload", () => {
       "Rscript server.R --port 8080",
       "lua /tmp/server.lua",
       "luajit /tmp/server.lua",
-      "mcp-server --config ~/.xum/skills/launch.txt",
+      `mcp-server --config ${muxRoot}/skills/launch.txt`,
+      // Project-local and relative spellings resolve against the server's own
+      // working directory, never the collected root.
+      "./.xum/skills/server.txt --port 8080",
+      "mcp-server ./.xum/skills/server.txt",
+      "python3 /repo/.xum/skills/launch.txt",
       "swift /tmp/launch.swift",
       "elixir /tmp/launch.exs",
       "iex /tmp/launch.exs",
@@ -2119,11 +2262,11 @@ describe("backup payload", () => {
       "tclsh /tmp/server.tcl",
       "wish8.6 /tmp/app.tcl",
       "expect /tmp/session.exp",
-      "R --file=/tmp/server.R ~/.xum/skills/argument.txt",
-      "R -f /tmp/server.R ~/.xum/skills/argument.txt",
-      "php --file=/tmp/server.php ~/.xum/skills/argument.txt",
-      "php -F/tmp/process.php ~/.xum/skills/argument.txt",
-      "php --process-file /tmp/process.php ~/.xum/skills/argument.txt",
+      `R --file=/tmp/server.R ${muxRoot}/skills/argument.txt`,
+      `R -f /tmp/server.R ${muxRoot}/skills/argument.txt`,
+      `php --file=/tmp/server.php ${muxRoot}/skills/argument.txt`,
+      `php -F/tmp/process.php ${muxRoot}/skills/argument.txt`,
+      `php --process-file /tmp/process.php ${muxRoot}/skills/argument.txt`,
       "npx notes-mcp --port 8080",
       "npm exec notes-mcp -- --port 8080",
       "npm --prefix /tmp install exec -c",

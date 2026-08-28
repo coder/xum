@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as jsonc from "jsonc-parser";
 import {
@@ -1755,7 +1756,18 @@ function javaOptionTakesSeparateValue(unquoted: string): boolean {
 
 /** Git config values that Git later executes as commands or helper processes. */
 const GIT_COMMAND_CONFIG_KEY =
-  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|fsmonitor)|sequence\.editor|diff\.external|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|pager\.[^.]+|(?:diff|merge)tool\.[^.]+\.cmd|filter\.[^.]+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\.[^.]+\.cmd|tar\.[^.]+\.command)$/i;
+  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy)|sequence\.editor|diff\.external|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|pager\.[^.]+|(?:diff|merge)tool\.[^.]+\.cmd|filter\.[^.]+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\.[^.]+\.cmd|tar\.[^.]+\.command)$/i;
+
+/**
+ * core.fsmonitor doubles as a boolean toggle for the built-in monitor; only a
+ * non-boolean value is the hook pathname Git executes. Git reads the boolean with
+ * its maybe-bool parser, which accepts these spellings and any integer.
+ */
+const GIT_FSMONITOR_CONFIG_KEY = /^core\.fsmonitor$/i;
+const GIT_BOOLEAN_CONFIG_VALUE = /^(?:true|false|yes|no|on|off|[+-]?[0-9]+)$/i;
+
+/** Git config keys whose value names another config file Git reads and applies. */
+const GIT_INCLUDE_PATH_CONFIG_KEY = /^include(?:if\..+)?\.path$/i;
 
 /**
  * Documentation is the only thing a recursive collection publishes without asking.
@@ -1764,15 +1776,64 @@ const GIT_COMMAND_CONFIG_KEY =
  */
 const AUTO_PUBLISHED_RECURSIVE_FILE = /\.(?:md|mdx|markdown|txt)$/i;
 
-function isAutoPublishedScriptOperand(unquoted: string): boolean {
-  const normalized = unquoted.replaceAll("\\", "/");
-  const relative = /(?:^|\/)\.(?:xum|mux)\/(.+)$/i.exec(normalized)?.[1];
-  if (relative === undefined) return false;
-  if (/^AGENTS\.md$/i.test(relative)) return true;
-  if (/^agents\/[^/]+\.md$/i.test(relative)) return true;
-  return (
-    /^(?:skills|memory\/global)\//i.test(relative) && AUTO_PUBLISHED_RECURSIVE_FILE.test(relative)
-  );
+/** Lowercased forward-slash spelling without trailing separators, for prefix compares. */
+function normalizeRootPrefix(root: string): string {
+  return root.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * The spellings a command can use for the directory this backup actually collects:
+ * the configured root (a custom XUM_ROOT or a `.xum-dev` build's root included), its
+ * pre-rename alias when the basename carries the product name (a config written
+ * before the rename spells the same collected files under `.mux`), and the `~/`
+ * shorthand for any of them under the home directory. Comparison is case-insensitive:
+ * Windows paths are, and folding a Unix spelling can only localize more.
+ */
+function collectedDocumentRootPrefixes(muxRoot: string): string[] {
+  const absolute = new Set<string>();
+  const root = normalizeRootPrefix(muxRoot);
+  if (root !== "") {
+    absolute.add(root);
+    const basename = root.slice(root.lastIndexOf("/") + 1);
+    const renamed = basename.startsWith(".xum")
+      ? `.mux${basename.slice(4)}`
+      : basename.startsWith(".mux")
+        ? `.xum${basename.slice(4)}`
+        : null;
+    if (renamed !== null) absolute.add(root.slice(0, root.length - basename.length) + renamed);
+  }
+  const prefixes = new Set<string>(absolute);
+  const home = normalizeRootPrefix(os.homedir());
+  if (home !== "") {
+    for (const candidate of absolute) {
+      if (candidate.startsWith(`${home}/`)) prefixes.add(`~${candidate.slice(home.length)}`);
+    }
+  }
+  return [...prefixes];
+}
+
+/**
+ * Whether the operand names a file this backup publishes automatically, resolved
+ * against the collected root's spellings rather than any `.xum` path segment: a
+ * relative or project-local path (`./.xum/skills/server.txt`) resolves against the
+ * server's own working directory, never the collected root, so localizing it would
+ * only remove a portable launcher on a fresh-device restore.
+ */
+function isAutoPublishedScriptOperand(unquoted: string, rootPrefixes: readonly string[]): boolean {
+  const normalized = unquoted.replaceAll("\\", "/").toLowerCase();
+  for (const prefix of rootPrefixes) {
+    if (!normalized.startsWith(`${prefix}/`)) continue;
+    const relative = normalized.slice(prefix.length + 1);
+    if (relative === "agents.md") return true;
+    if (/^agents\/[^/]+\.md$/.test(relative)) return true;
+    if (
+      /^(?:skills|memory\/global)\//.test(relative) &&
+      AUTO_PUBLISHED_RECURSIVE_FILE.test(relative)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Known npm commands and aliases terminate global-option parsing. */
@@ -2075,7 +2136,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   { name: /^(?:elixir|iex)[0-9.]*$/, evalWord: /^(?:-e$|--eval(?:=|$)|--rpc-eval(?:=|$))/ },
   // These launchers execute a positional script but need no inline-eval matcher here;
   // auto-published script operands still localize through the shared check.
-  { name: /^(?:jshell|swift|tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
+  { name: /^(?:jshell|swift|tclsh|wish|expectk?|jimsh|escript)[0-9.]*$/ },
   {
     name: /^r$/,
     evalWord: /^(?:-e$|--expression(?:=|$))/,
@@ -2147,7 +2208,7 @@ const SHELL_STATE_WORDS = new Set([
  * exempt (`A="B=1"` cannot fire); a marker merely inside a larger word proves nothing
  * about the rest of that word.
  */
-function hasDisguisedAssignment(redacted: string): boolean {
+function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[]): boolean {
   let commandPosition = true;
   let envCommandExpected = false;
   let carrierArmed = false;
@@ -2168,6 +2229,8 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingGitConfigOptionValue = false;
   let pendingGitAliasValue = false;
   let pendingGitCommandValue = false;
+  let pendingGitFsmonitorValue = false;
+  let pendingGitIncludePathValue = false;
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
   let pendingJavaOptions = false;
@@ -2225,7 +2288,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       continue;
     }
     if (pendingScriptFileOperand) {
-      const autoPublished = isAutoPublishedScriptOperand(unquoted);
+      const autoPublished = isAutoPublishedScriptOperand(unquoted, rootPrefixes);
       clearInterpreterTracking();
       if (autoPublished) return true;
     }
@@ -2300,6 +2363,16 @@ function hasDisguisedAssignment(redacted: string): boolean {
       pendingGitCommandValue = false;
       return true;
     }
+    if (pendingGitFsmonitorValue) {
+      pendingGitFsmonitorValue = false;
+      if (!GIT_BOOLEAN_CONFIG_VALUE.test(unquoted)) return true;
+    }
+    if (pendingGitIncludePathValue) {
+      pendingGitIncludePathValue = false;
+      // The included config file is read and applied (aliases, command-valued keys),
+      // so including a published document localizes; any other include stays portable.
+      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+    }
     if (pendingGitConfigKey) {
       if (pendingGitConfigOptionValue) {
         pendingGitConfigOptionValue = false;
@@ -2309,6 +2382,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
         pendingGitConfigKey = false;
         if (/^alias\.[^.]+$/i.test(unquoted)) {
           pendingGitAliasValue = true;
+        } else if (GIT_FSMONITOR_CONFIG_KEY.test(unquoted)) {
+          pendingGitFsmonitorValue = true;
+        } else if (GIT_INCLUDE_PATH_CONFIG_KEY.test(unquoted)) {
+          pendingGitIncludePathValue = true;
         } else if (GIT_COMMAND_CONFIG_KEY.test(unquoted)) {
           pendingGitCommandValue = true;
         }
@@ -2351,7 +2428,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       // Anything else can be a separated value for a global config option
       // (`--prefix /tmp`), so tracking stays armed until a known subcommand.
     }
-    if (pendingDenoRunScript && isAutoPublishedScriptOperand(unquoted)) return true;
+    if (pendingDenoRunScript && isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
     if (pendingJavaOptionValue) {
       pendingJavaOptionValue = false;
     } else if (pendingJavaSourceVersion) {
@@ -2365,7 +2442,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       } else if (unquoted.startsWith("--source=")) {
         pendingJavaSourceFile = true;
       } else if (pendingJavaSourceFile && !unquoted.startsWith("-")) {
-        const autoPublished = isAutoPublishedScriptOperand(unquoted);
+        const autoPublished = isAutoPublishedScriptOperand(unquoted, rootPrefixes);
         pendingJavaOptions = false;
         pendingJavaSourceFile = false;
         if (autoPublished) return true;
@@ -2405,7 +2482,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (executesHere) {
       // A directly executed auto-published document runs through its shebang,
       // publishing an executable relationship no marker can rehydrate elsewhere.
-      if (isAutoPublishedScriptOperand(unquoted)) return true;
+      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
@@ -2429,7 +2506,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     for (const pending of pendingLanguages) {
       const script = pending.attachedScriptFile?.exec(unquoted)?.[1];
       if (script !== undefined) {
-        if (isAutoPublishedScriptOperand(script)) return true;
+        if (isAutoPublishedScriptOperand(script, rootPrefixes)) return true;
         attachedScriptBoundary = true;
         break;
       }
@@ -2453,7 +2530,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
         // (`python3 -W ignore -c x`), so from here a non-option word no longer
         // proves the script boundary; tracking stays armed, failing closed.
         evalOperandAmbiguous = true;
-      } else if (isAutoPublishedScriptOperand(unquoted)) {
+      } else if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) {
         // The backup publishes this document automatically. An interpreter executing
         // it can join credential fragments across the command and file even when
         // neither spelling matches the non-overridable token backstop.
@@ -2775,7 +2852,7 @@ export const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
  */
 export const MAX_TOTAL_ANALYZED_COMMAND_LENGTH = 8 * MAX_ANALYZED_COMMAND_LENGTH;
 
-function redactCommandEnvAssignments(command: string): string {
+function redactCommandEnvAssignments(command: string, rootPrefixes: readonly string[]): string {
   if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
   // Analysis mirrors execution: active continuations vanish first, so every analyzer
   // below sees the same contiguous syntax the shell parses.
@@ -2795,7 +2872,7 @@ function redactCommandEnvAssignments(command: string): string {
   const constructs = findActiveShellConstructs(analyzed);
   if (
     UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
-    hasDisguisedAssignment(redactedCode) ||
+    hasDisguisedAssignment(redactedCode, rootPrefixes) ||
     constructs.carrier ||
     constructs.heredoc ||
     constructs.processSubstitution ||
@@ -2838,10 +2915,14 @@ function isBashStartupHookVariable(name: string, value: unknown): boolean {
   return name === "BASH_ENV" && value !== "" && value !== undefined;
 }
 
-function redactMcpConfig(content: Buffer): {
+function redactMcpConfig(
+  content: Buffer,
+  muxRoot: string
+): {
   content: Buffer;
   redactionPaths: BackupRedactionPath[];
 } {
+  const rootPrefixes = collectedDocumentRootPrefixes(muxRoot);
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
   const redactionPaths: BackupRedactionPath[] = [];
@@ -2867,7 +2948,7 @@ function redactMcpConfig(content: Buffer): {
       redacted = REDACTED_BACKUP_VALUE;
     } else {
       analysisBudget -= command.length;
-      redacted = redactCommandEnvAssignments(command);
+      redacted = redactCommandEnvAssignments(command, rootPrefixes);
     }
     if (redacted === command) return;
     edits.push({ path: jsonPath, value: redacted });
@@ -3144,7 +3225,7 @@ export async function createBackupPayload(
   const mcpRedactionPaths: BackupRedactionPath[] = [];
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   if (mcpFile && options.keepLocalSecrets !== true) {
-    const redacted = redactMcpConfig(mcpFile.content);
+    const redacted = redactMcpConfig(mcpFile.content, options.muxRoot);
     mcpFile.content = redacted.content;
     mcpRedactionPaths.push(...redacted.redactionPaths);
   }
