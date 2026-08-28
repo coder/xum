@@ -1582,6 +1582,12 @@ export class TaskService {
     string,
     ReturnType<typeof setTimeout>
   >();
+  // A reset whose store delete fails is retained here (owner -> runIds) instead of being
+  // swallowed: the stale delivered/superseded record only matters when the run settles
+  // again, so the next terminal enqueue completes the reset (delete before enqueue) and a
+  // failure there flows into the retained-enqueue retry above. No timer needed: with no
+  // later terminal transition the stale record is inert.
+  private readonly pendingWorkflowNotificationResets = new Map<string, Set<string>>();
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
@@ -7762,6 +7768,16 @@ export class TaskService {
       return;
     }
     try {
+      const pendingResets = this.pendingWorkflowNotificationResets.get(params.ownerWorkspaceId);
+      if (pendingResets?.has(params.runId)) {
+        // Marker cleared only after the delete succeeds so a failure retries the full
+        // reset-then-enqueue sequence instead of preserving the stale record.
+        await this.terminalAttentionStore.delete(
+          params.ownerWorkspaceId,
+          TerminalAttentionStore.notificationId("workflow_run", params.runId)
+        );
+        pendingResets.delete(params.runId);
+      }
       await this.enqueueTerminalAttention({
         ownerWorkspaceId: params.ownerWorkspaceId,
         sourceKind: "workflow_run",
@@ -7822,10 +7838,28 @@ export class TaskService {
     );
     assert(params.runId.length > 0, "resetWorkflowRunTerminalAttention requires runId");
     this.retainedWorkflowTerminalEnqueues.get(params.ownerWorkspaceId)?.delete(params.runId);
-    await this.terminalAttentionStore.delete(
-      params.ownerWorkspaceId,
-      TerminalAttentionStore.notificationId("workflow_run", params.runId)
-    );
+    try {
+      await this.terminalAttentionStore.delete(
+        params.ownerWorkspaceId,
+        TerminalAttentionStore.notificationId("workflow_run", params.runId)
+      );
+      this.pendingWorkflowNotificationResets.get(params.ownerWorkspaceId)?.delete(params.runId);
+    } catch (error) {
+      // Restart callers swallow this rejection, so a transiently failed delete would leave
+      // the stale delivered/superseded record absorbing the resumed run's next terminal
+      // enqueue. Retain the reset; the next enqueue completes it before enqueuing fresh.
+      log.error("Workflow terminal attention reset failed; retained for the next enqueue", {
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        runId: params.runId,
+        error,
+      });
+      let pendingResets = this.pendingWorkflowNotificationResets.get(params.ownerWorkspaceId);
+      if (pendingResets == null) {
+        pendingResets = new Set();
+        this.pendingWorkflowNotificationResets.set(params.ownerWorkspaceId, pendingResets);
+      }
+      pendingResets.add(params.runId);
+    }
   }
 
   /**
