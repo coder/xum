@@ -1802,6 +1802,7 @@ describe("backup payload", () => {
       // Two-segment merge/diff keys hold settings, not driver commands.
       "git config merge.conflictstyle diff3",
       "java @/tmp/opts.txt Main --port 8080",
+      "jshell --startup=/tmp/snippets.jsh /tmp/main.jsh",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1972,6 +1973,8 @@ describe("backup payload", () => {
       "java --class-path libs --source 17 --module-path mods <root>/skills/launch.txt",
     ],
     ["JShell", "jshell <root>/skills/launch.txt"],
+    ["JShell attached startup file", "jshell --startup=<root>/skills/launch.txt"],
+    ["JShell separate startup file", "jshell --startup <root>/skills/launch.txt"],
     ["Tcl", "tclsh <root>/skills/launch.txt"],
     ["Tk wish", "wish8.6 <root>/agents/launch.md"],
     ["Expect", "expect <root>/memory/global/launch.txt"],

@@ -2155,6 +2155,15 @@ interface LanguageInterpreter {
   evalWord?: RegExp;
   attachedScriptFile?: RegExp;
   separateScriptFileOption?: RegExp;
+  /**
+   * Attached option naming an auxiliary file the interpreter executes before its
+   * main operands (jshell --startup=FILE). Unlike attachedScriptFile it is not a
+   * script boundary: a positional load file can still follow, so tracking stays
+   * armed and the option word keeps its ordinary ambiguous-dash handling. The
+   * separate spelling needs no matcher, because after any dash option a published
+   * operand already localizes through the armed tracking.
+   */
+  attachedStartupFile?: RegExp;
 }
 
 const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
@@ -2181,7 +2190,8 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   { name: /^(?:elixir|iex)[0-9.]*$/, evalWord: /^(?:-e$|--eval(?:=|$)|--rpc-eval(?:=|$))/ },
   // These launchers execute a positional script but need no inline-eval matcher here;
   // auto-published script operands still localize through the shared check.
-  { name: /^(?:jshell|swift|tclsh|wish|expectk?|jimsh|escript)[0-9.]*$/ },
+  { name: /^(?:swift|tclsh|wish|expectk?|jimsh|escript)[0-9.]*$/ },
+  { name: /^jshell[0-9.]*$/, attachedStartupFile: /^--startup=(.+)$/ },
   {
     name: /^r$/,
     evalWord: /^(?:-e$|--expression(?:=|$))/,
@@ -2619,6 +2629,10 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
     // for code; an automatically published script localizes first.
     let attachedScriptBoundary = false;
     for (const pending of pendingLanguages) {
+      const startup = pending.attachedStartupFile?.exec(unquoted)?.[1];
+      if (startup !== undefined && isAutoPublishedScriptOperand(startup, rootPrefixes)) {
+        return true;
+      }
       const script = pending.attachedScriptFile?.exec(unquoted)?.[1];
       if (script !== undefined) {
         if (isAutoPublishedScriptOperand(script, rootPrefixes)) return true;
