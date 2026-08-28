@@ -1405,45 +1405,10 @@ export class StreamManager extends EventEmitter {
       // nested rows. Live appends never carry nestedCalls (buffered nested
       // records merge after this emit), so this only fires on replay in practice.
       const nestedCalls = (part as { nestedCalls?: NestedToolCall[] }).nestedCalls ?? [];
-      for (const nested of nestedCalls) {
-        this.emit("tool-call-start", {
-          type: "tool-call-start",
-          workspaceId: workspaceId as string,
-          messageId,
-          ...(isReplay ? { replay: true } : {}),
-          toolCallId: nested.toolCallId,
-          toolName: nested.toolName,
-          args: nested.input ?? {},
-          tokens: 0,
-          timestamp: nested.timestamp ?? timestamp,
-          parentToolCallId: part.toolCallId,
-        });
-        if (nested.workflowRun != null) {
-          this.emit("workflow-run-attached", {
-            type: "workflow-run-attached",
-            workspaceId: workspaceId as string,
-            messageId,
-            ...(isReplay ? { replay: true } : {}),
-            toolCallId: nested.toolCallId,
-            runId: nested.workflowRun.runId,
-            ...(nested.workflowRun.run != null ? { run: nested.workflowRun.run } : {}),
-            timestamp: nested.workflowRun.timestamp,
-          } satisfies WorkflowRunAttachedEvent);
-        }
-        if (nested.state === "output-available") {
-          this.emit("tool-call-end", {
-            type: "tool-call-end",
-            workspaceId: workspaceId as string,
-            messageId,
-            ...(isReplay ? { replay: true } : {}),
-            toolCallId: nested.toolCallId,
-            toolName: nested.toolName,
-            result: nested.output,
-            timestamp: Date.now(),
-            parentToolCallId: part.toolCallId,
-          });
-        }
-      }
+      this.emitNestedCallEvents(workspaceId, messageId, part.toolCallId, nestedCalls, {
+        replay: isReplay,
+        fallbackTimestamp: timestamp,
+      });
 
       // If tool has output, emit completion
       if (part.state === "output-available") {
@@ -1456,6 +1421,62 @@ export class StreamManager extends EventEmitter {
           toolName: part.toolName,
           result: part.output,
           timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Emit a nested call's full event sequence (start, workflow attachment, end)
+   * on behalf of its parent part. Used when the renderer could not have applied
+   * the original live events: reconnect replays, and the buffered-merge path in
+   * appendPartAndEmit where the original events raced ahead of the parent part.
+   * The aggregator dedupes re-delivered nested starts by toolCallId.
+   */
+  private emitNestedCallEvents(
+    workspaceId: WorkspaceId,
+    messageId: string,
+    parentToolCallId: string,
+    nestedCalls: NestedToolCall[],
+    options: { replay?: boolean; fallbackTimestamp: number }
+  ): void {
+    const isReplay = options.replay === true;
+    for (const nested of nestedCalls) {
+      this.emit("tool-call-start", {
+        type: "tool-call-start",
+        workspaceId: workspaceId as string,
+        messageId,
+        ...(isReplay ? { replay: true } : {}),
+        toolCallId: nested.toolCallId,
+        toolName: nested.toolName,
+        args: nested.input ?? {},
+        tokens: 0,
+        timestamp: nested.timestamp ?? options.fallbackTimestamp,
+        parentToolCallId,
+      });
+      if (nested.workflowRun != null) {
+        this.emit("workflow-run-attached", {
+          type: "workflow-run-attached",
+          workspaceId: workspaceId as string,
+          messageId,
+          ...(isReplay ? { replay: true } : {}),
+          toolCallId: nested.toolCallId,
+          runId: nested.workflowRun.runId,
+          ...(nested.workflowRun.run != null ? { run: nested.workflowRun.run } : {}),
+          timestamp: nested.workflowRun.timestamp,
+        } satisfies WorkflowRunAttachedEvent);
+      }
+      if (nested.state === "output-available") {
+        this.emit("tool-call-end", {
+          type: "tool-call-end",
+          workspaceId: workspaceId as string,
+          messageId,
+          ...(isReplay ? { replay: true } : {}),
+          toolCallId: nested.toolCallId,
+          toolName: nested.toolName,
+          result: nested.output,
+          timestamp: Date.now(),
+          parentToolCallId,
         });
       }
     }
@@ -1520,10 +1541,22 @@ export class StreamManager extends EventEmitter {
           timestamp: pendingExecutionStart,
         } satisfies ToolCallExecutionStartEvent);
       }
-      if (bufferedNestedCalls !== undefined && pendingAttachment == null) {
-        // Buffered nested calls can carry a workflow run identity that must
-        // survive an interrupt; don't wait for the debounced write.
-        await this.flushPartialWrite(workspaceId, streamInfo);
+      if (bufferedNestedCalls !== undefined && part.type === "dynamic-tool") {
+        if (pendingAttachment == null) {
+          // Buffered nested calls can carry a workflow run identity that must
+          // survive an interrupt; don't wait for the debounced write.
+          await this.flushPartialWrite(workspaceId, streamInfo);
+        }
+        // The original nested events raced ahead of the parent part, so the
+        // renderer dropped them (it refuses parented events with no parent
+        // row); re-deliver them now that the parent start has been emitted.
+        this.emitNestedCallEvents(
+          workspaceId,
+          streamInfo.messageId,
+          part.toolCallId,
+          bufferedNestedCalls,
+          { fallbackTimestamp: part.timestamp ?? Date.now() }
+        );
       }
       if (pendingAttachment != null && part.type === "dynamic-tool") {
         await this.flushPartialWrite(workspaceId, streamInfo);
@@ -2491,6 +2524,12 @@ export class StreamManager extends EventEmitter {
     // Persist nested calls to streamInfo.parts for crash/interrupt resilience
     const streamInfo = this.workspaceStreams.get(workspaceId as WorkspaceId);
     if (streamInfo) {
+      if (event.type === "tool-call-end") {
+        // Nested records never store an end time, so incremental replay needs
+        // this to notice a nested call that completed while the renderer was
+        // disconnected (same mechanism as top-level tool completions).
+        streamInfo.toolCompletionTimestamps.set(event.callId, event.endTime ?? Date.now());
+      }
       const parentPartIndex = streamInfo.parts.findIndex(
         (p): p is CompletedMessagePart & { type: "dynamic-tool"; toolCallId: string } =>
           p.type === "dynamic-tool" && "toolCallId" in p && p.toolCallId === event.parentToolCallId
@@ -5072,7 +5111,15 @@ export class StreamManager extends EventEmitter {
                     // Legacy rows can miss the timestamp; replay defensively.
                     nested.timestamp === undefined ||
                     nested.timestamp > afterTimestamp ||
-                    (nested.workflowRun != null && nested.workflowRun.timestamp > afterTimestamp)
+                    (nested.workflowRun != null && nested.workflowRun.timestamp > afterTimestamp) ||
+                    // The nested record stores no end time, so a call that
+                    // completed while the renderer was disconnected is only
+                    // visible through the recorded completion timestamp.
+                    // Missing entry => replay defensively; re-delivered nested
+                    // events are deduped by the aggregator.
+                    (nested.state === "output-available" &&
+                      (streamInfo.toolCompletionTimestamps.get(nested.toolCallId) ??
+                        Number.POSITIVE_INFINITY) > afterTimestamp)
                 )
               ) {
                 return true;

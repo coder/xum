@@ -488,6 +488,12 @@ describe("StreamManager - nested kernel call race and replay", () => {
         schedulePartialWrite?: boolean
       ) => Promise<void>
     >(streamManager, "appendPartAndEmit");
+    // The renderer dropped the original raced events, so the merge must
+    // re-deliver them once the parent part exists.
+    const reEmitted: Array<Record<string, unknown>> = [];
+    for (const type of ["tool-call-start", "workflow-run-attached"] as const) {
+      streamManager.on(type, (event: Record<string, unknown>) => reEmitted.push(event));
+    }
     await appendPartAndEmit.call(
       streamManager,
       workspaceId,
@@ -502,6 +508,15 @@ describe("StreamManager - nested kernel call race and replay", () => {
       },
       false
     );
+    const reEmittedStart = reEmitted.find(
+      (e) => e.type === "tool-call-start" && e.toolCallId === "nested-race-workflow"
+    );
+    expect(reEmittedStart?.parentToolCallId).toBe("code-exec-race");
+    expect(
+      reEmitted.some(
+        (e) => e.type === "workflow-run-attached" && e.toolCallId === "nested-race-workflow"
+      )
+    ).toBe(true);
 
     const partial = await historyService.readPartial(workspaceId);
     const part = partial?.parts[0];
@@ -572,6 +587,102 @@ describe("StreamManager - nested kernel call race and replay", () => {
       (e) => e.type === "tool-call-end" && e.toolCallId === "nested-replay-workflow"
     );
     expect(nestedEnd?.parentToolCallId).toBe("code-exec-replay");
+  });
+
+  test("incremental replay notices a nested call that completed while disconnected", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-replay-completion-workspace";
+    const messageId = "nested-replay-completion-message";
+    const timestamp = Date.now();
+    const makeStreamInfo = (completedAt: number) =>
+      createStreamInfoForTests({
+        messageId,
+        lastPartialWriteTime: timestamp,
+        toolCompletionTimestamps: new Map([["nested-completed-workflow", completedAt]]),
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "code-exec-completion",
+            toolName: "code_execution",
+            input: { code: "mux.workflow_run({...})" },
+            state: "input-available",
+            timestamp,
+            nestedCalls: [
+              {
+                toolCallId: "nested-completed-workflow",
+                toolName: "workflow_run",
+                input: {},
+                state: "output-available",
+                output: { runId: "wfr_done" },
+                // Start predates the cursor; only the completion is fresh.
+                timestamp,
+              },
+            ],
+          },
+        ],
+      });
+    const cursor = timestamp + 50;
+
+    // Completed after the cursor: the parent must replay.
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, makeStreamInfo(timestamp + 100));
+    const fresh: Array<Record<string, unknown>> = [];
+    const onStart = (event: Record<string, unknown>) => fresh.push(event);
+    streamManager.on("tool-call-start", onStart);
+    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+    expect(fresh.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(true);
+    streamManager.off("tool-call-start", onStart);
+
+    // Completed before the cursor: nothing fresh, no replay.
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, makeStreamInfo(timestamp + 10));
+    const stale: Array<Record<string, unknown>> = [];
+    streamManager.on("tool-call-start", (event: Record<string, unknown>) => stale.push(event));
+    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+    expect(stale.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(false);
+  });
+
+  test("emitNestedToolEvent records nested completion timestamps", () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-completion-record-workspace";
+    const messageId = "nested-completion-record-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-ts",
+          toolName: "code_execution",
+          input: {},
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-ts",
+              toolName: "bash",
+              input: {},
+              state: "input-available",
+              timestamp,
+            },
+          ],
+        },
+      ],
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-end",
+      callId: "nested-ts",
+      toolName: "bash",
+      args: {},
+      parentToolCallId: "code-exec-ts",
+      startTime: timestamp,
+      endTime: timestamp + 5,
+      result: { ok: true },
+    });
+
+    expect((streamInfo.toolCompletionTimestamps as Map<string, number>).get("nested-ts")).toBe(
+      timestamp + 5
+    );
   });
 
   test("incremental replay keeps a parent whose only fresh activity is nested", async () => {
