@@ -37,6 +37,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
+import type { QueueCutCutter } from "@/node/services/messageQueue";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -12551,6 +12552,15 @@ export class WorkspaceService extends EventEmitter {
   ): boolean {
     const session = this.sessions.get(workspaceId.trim());
     return session?.hasPendingWorkspaceTurnContinuation(metadata) ?? false;
+  }
+
+  /**
+   * Input poised to take over the session at a queue cut, for cut attribution.
+   * See AgentSession.getQueueCutCutter for stage semantics.
+   */
+  getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
+    const session = this.sessions.get(workspaceId.trim());
+    return session?.getQueueCutCutter();
   }
 
   /**

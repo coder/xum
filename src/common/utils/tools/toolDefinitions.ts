@@ -357,7 +357,7 @@ const WorkspaceTaskTargetSchema = z
       .enum(["tool-end", "turn-end"])
       .nullish()
       .describe(
-        'For kind="workspace" + workspace.mode="existing", choose when a follow-up queued while the workspace is busy should dispatch: "tool-end" after the next tool call, or "turn-end" after the current turn.'
+        'For kind="workspace" + workspace.mode="existing", choose when a follow-up queued while the workspace is busy should dispatch: "tool-end" after the next tool call, or "turn-end" after the current turn. Tool-end dispatch supersedes the caller\'s own active delegated turn on that workspace quietly (the old handle settles interrupted without a separate wake).'
       ),
     disposable: z.boolean().nullish(),
   })

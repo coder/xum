@@ -112,6 +112,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue } from "./messageQueue";
+import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -6618,6 +6619,30 @@ export class AgentSession {
       dispatching.ownerWorkspaceId === metadata.ownerWorkspaceId &&
       dispatching.turnId === metadata.turnId
     );
+  }
+
+  /**
+   * Input poised to take over this session at a queue cut. Engaged stages win
+   * over the queue head; an engaged stage is reported even when its metadata is
+   * undefined (manual message) so callers cannot misattribute the cut to an
+   * entry queued behind it. Pure read.
+   */
+  getQueueCutCutter(): QueueCutCutter | undefined {
+    // PREPARING covers both direct sends (preparingWorkspaceTurnMetadata set
+    // alongside setTurnPhase(PREPARING)) and dequeued entries (set at dequeue in
+    // sendQueuedMessages). The metadata is already parsed workspace-turn
+    // correlation or undefined for any other input.
+    if (this.turnPhase === TurnPhase.PREPARING) {
+      return { stage: "preparing", muxMetadata: this.preparingWorkspaceTurnMetadata };
+    }
+    // Dequeue-to-stream-start window after PREPARING released (e.g. a
+    // background send resolved before stream-start): the dispatched entry is
+    // still the engaged cutter.
+    if (this.dispatchingQueuedEntry) {
+      return { stage: "dispatching", muxMetadata: this.dispatchingQueuedEntryMuxMetadata };
+    }
+    const candidate = this.messageQueue.getNextQueueCutCandidate();
+    return candidate != null ? { stage: "queued", ...candidate } : undefined;
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */

@@ -446,12 +446,20 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           throw new Error(created.error);
         }
 
+        // Announce the probable quiet supersession at creation time so the
+        // owner is not surprised when its old handle settles interrupted
+        // without a separate wake. Only pending (queued/running) results carry
+        // the note — a foreground terminal result already knows the outcome.
+        const supersedeNote =
+          created.data.maySupersedeTaskId != null
+            ? ` Queued behind your active turn ${created.data.maySupersedeTaskId}; at the target's next tool boundary this follow-up may supersede it — if so, ${created.data.maySupersedeTaskId} settles as interrupted quietly (no separate wake) and this new handle carries the workspace's continuation.`
+            : "";
         const pendingResult = {
           status: created.data.status,
           taskId: created.data.taskId,
           workspaceId: created.data.workspaceId,
           handleKind: "workspace_turn" as const,
-          note: buildBackgroundStartNote(1),
+          note: buildBackgroundStartNote(1) + supersedeNote,
         };
         if (run_in_background) {
           return parseToolResult(TaskToolResultSchema, pendingResult, "task");
@@ -486,7 +494,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               TaskToolResultSchema,
               {
                 ...pendingResult,
-                note: buildForegroundContinuationNote(1, "backgrounded"),
+                note: buildForegroundContinuationNote(1, "backgrounded") + supersedeNote,
               },
               "task"
             );
@@ -504,7 +512,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               TaskToolResultSchema,
               {
                 ...pendingResult,
-                note: buildForegroundContinuationNote(1, "timed_out"),
+                note: buildForegroundContinuationNote(1, "timed_out") + supersedeNote,
               },
               "task"
             );

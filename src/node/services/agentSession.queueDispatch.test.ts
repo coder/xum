@@ -177,6 +177,117 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("getQueueCutCutter reports an engaged no-metadata dispatch over a queued follow-up", async () => {
+    // Queue-cut attribution must never blame an entry queued BEHIND the input
+    // actually taking over the session: a manual message being dispatched wins
+    // over a workspace-turn follow-up waiting behind it, even though its
+    // metadata is undefined.
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-preparing",
+    });
+
+    try {
+      expect(session.getQueueCutCutter()).toBeUndefined();
+
+      session.queueMessage(
+        "manual message",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage(
+        "workspace-turn follow-up",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+
+      // Queued stage: the manual head entry is the candidate (no metadata).
+      const queued = session.getQueueCutCutter();
+      expect(queued?.stage).toBe("queued");
+      expect(queued?.muxMetadata).toBeUndefined();
+
+      // Dispatch the manual entry: it becomes the engaged PREPARING cutter and
+      // keeps winning over the follow-up still queued behind it.
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      const engaged = session.getQueueCutCutter();
+      expect(engaged?.stage).toBe("preparing");
+      expect(engaged?.muxMetadata).toBeUndefined();
+      sendMessage.mockRestore();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter reports a no-metadata mid-dispatch entry over a queued follow-up", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-dispatching",
+    });
+
+    try {
+      session.queueMessage(
+        "workspace-turn follow-up",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { synthetic: true }
+      );
+      // Force the dequeue-to-stream-start window with PREPARING already
+      // released (a background send can resolve before stream-start): the
+      // dispatched entry stays the engaged cutter.
+      const internal = session as unknown as {
+        dispatchingQueuedEntry: boolean;
+        dispatchingQueuedEntryMuxMetadata?: unknown;
+      };
+      internal.dispatchingQueuedEntry = true;
+      internal.dispatchingQueuedEntryMuxMetadata = undefined;
+
+      const cutter = session.getQueueCutCutter();
+      expect(cutter?.stage).toBe("dispatching");
+      expect(cutter?.muxMetadata).toBeUndefined();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("getQueueCutCutter exposes the queued head's dispatch mode and correlation", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-cut-cutter-queued",
+    });
+
+    try {
+      session.queueMessage(
+        "workspace-turn follow-up",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: WORKSPACE_TURN_CORRELATION,
+          queueDispatchMode: "turn-end",
+        },
+        { synthetic: true }
+      );
+
+      const cutter = session.getQueueCutCutter();
+      expect(cutter?.stage).toBe("queued");
+      expect(cutter?.stage === "queued" ? cutter.dispatchMode : undefined).toBe("turn-end");
+      expect((cutter?.muxMetadata as MuxMessageMetadata | undefined)?.type).toBe(
+        "workspace-turn-task"
+      );
+
+      // Once dispatched, the follow-up's correlation rides through PREPARING.
+      const sendMessage = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
+      session.sendQueuedMessages();
+      const engaged = session.getQueueCutCutter();
+      expect(engaged?.stage).toBe("preparing");
+      expect((engaged?.muxMetadata as MuxMessageMetadata | undefined)?.type).toBe(
+        "workspace-turn-task"
+      );
+      sendMessage.mockRestore();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("waits for stream-end instead of interrupting between sibling tool results", async () => {
     const workspaceId = "queue-dispatch-full-step";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
