@@ -186,14 +186,8 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
 
   test("workspace-turn correlation persists in startup retry options", async () => {
     const workspaceId = "workspace-turn-retry-metadata";
-    const streamMessage = mock((_opts: StreamMessageOptions) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
-    );
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
-      aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      },
     });
     try {
       const result = await session.sendMessage(
@@ -228,14 +222,8 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
 
   test("on-send compaction consuming a wake stamps the correlation on the follow-up", async () => {
     const workspaceId = "workspace-turn-compaction-stamp";
-    const streamMessage = mock((_opts: StreamMessageOptions) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
-    );
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
-      aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      },
     });
     try {
       await historyService.appendToHistory(workspaceId, turnPrompt("delegated-prompt"));
