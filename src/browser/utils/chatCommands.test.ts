@@ -1095,6 +1095,84 @@ describe("compact and plan command results", () => {
       message: "No plan found for this workspace",
     });
   });
+
+  test("plan open with no plan consumes with an error toast and skips the editor", async () => {
+    const getInfo = mock(() => Promise.resolve(null));
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "plan-open" },
+        createEnv({
+          api: {
+            workspace: {
+              getPlanContent: mock(() =>
+                Promise.resolve({ success: false, error: "No plan found" })
+              ),
+              getInfo,
+            },
+          } as unknown as SlashCommandEnv["api"],
+        })
+      )
+    );
+    expectDisposition(settled.result, "consume");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: "No plan found for this workspace",
+    });
+    expect(getInfo).not.toHaveBeenCalled();
+  });
+
+  test("plan open surfaces an editor-open failure as an error toast", async () => {
+    const getPlanContent = mock(() =>
+      Promise.resolve({ success: true, data: { content: "# My Plan", path: "/path/to/plan.md" } })
+    );
+    const getInfo = mock(() =>
+      Promise.resolve({ runtimeConfig: { type: "local" } } as unknown as FrontendWorkspaceMetadata)
+    );
+    // openInEditor opens a blank placeholder window before its awaits; give it a
+    // live stub so the flow reaches the recordEditorOpen admission check, whose
+    // refusal is the deterministic failure path independent of deep-link launch.
+    const windowWithOpen = window as unknown as { open?: (...args: unknown[]) => unknown };
+    const previousOpen = windowWithOpen.open;
+    windowWithOpen.open = () => ({
+      closed: false,
+      close: () => undefined,
+      location: { href: "" },
+    });
+    // This suite aliases window to globalThis, which turns the tests/setup.ts
+    // location getter (window.location fallback) into infinite recursion when
+    // deep-link code reads location. Pin an own-value location for this test.
+    const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { href: "http://localhost/", hostname: "localhost" },
+    });
+    try {
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "plan-open" },
+          createEnv({
+            api: {
+              workspace: { getPlanContent, getInfo },
+              general: {
+                recordEditorOpen: mock(() =>
+                  Promise.resolve({ success: false, error: "Archive in progress" })
+                ),
+              },
+            } as unknown as SlashCommandEnv["api"],
+          })
+        )
+      );
+      expectDisposition(settled.result, "consume");
+      expectToast(settled.result.actions, { type: "error", message: "Archive in progress" });
+      expect(getPlanContent).toHaveBeenCalledWith({ workspaceId: "test-ws" });
+      expect(getInfo).toHaveBeenCalledWith({ workspaceId: "test-ws" });
+    } finally {
+      windowWithOpen.open = previousOpen;
+      if (previousLocation) {
+        Object.defineProperty(globalThis, "location", previousLocation);
+      }
+    }
+  });
 });
 
 describe("prepareCompactionMessage", () => {

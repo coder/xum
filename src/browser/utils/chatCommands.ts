@@ -1589,7 +1589,7 @@ export async function executeCompaction(
 }
 
 /** Handle /new command execution. */
-export function handleNewCommand(
+function handleNewCommand(
   parsed: Extract<ParsedCommand, { type: "new" }>,
   env: WorkspaceCommandEnv
 ): CommandResult {
@@ -1647,7 +1647,7 @@ export function handleNewCommand(
 }
 
 /** Handle /compact command execution. */
-export function handleCompactCommand(
+function handleCompactCommand(
   parsed: Extract<ParsedCommand, { type: "compact" }>,
   env: WorkspaceCommandEnv
 ): CommandResult {
@@ -1729,7 +1729,7 @@ export function handleCompactCommand(
   );
 }
 
-export function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
+function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
   return phase([{ type: "clear-input" }], async () => {
     try {
       const result = await env.api.workspace.getPlanContent({ workspaceId: env.workspaceId });
@@ -1765,7 +1765,7 @@ export function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
   });
 }
 
-export function handlePlanOpenCommand(env: WorkspaceCommandEnv): CommandResult {
+function handlePlanOpenCommand(env: WorkspaceCommandEnv): CommandResult {
   return phase([{ type: "clear-input" }], async () => {
     try {
       const planResult = await env.api.workspace.getPlanContent({ workspaceId: env.workspaceId });
