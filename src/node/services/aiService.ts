@@ -848,12 +848,12 @@ export class AIService extends EventEmitter {
     this.emit(event.type, event);
   }
 
-  private createSettledTurnHandle(messageId: string, completion: TurnCompletion): TurnStreamHandle {
-    return {
-      streamToken: this.streamManager.generateStreamToken(),
-      messageId,
-      completion: Promise.resolve(completion),
-    };
+  private createSettledTurnHandle(completion: TurnCompletion): TurnStreamHandle {
+    return { messageId: completion.messageId, completion: Promise.resolve(completion) };
+  }
+
+  private createAbortedTurnHandle(messageId: string): TurnStreamHandle {
+    return this.createSettledTurnHandle({ status: "aborted", messageId, abortReason: "startup" });
   }
 
   private trackPendingDevToolsRunMetadata(
@@ -1371,13 +1371,7 @@ export class AIService extends EventEmitter {
       if (this.mockModeEnabled && this.mockAiStreamPlayer) {
         await this.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
         if (combinedAbortSignal.aborted) {
-          return Ok(
-            this.createSettledTurnHandle(syntheticMessageId, {
-              status: "aborted",
-              messageId: syntheticMessageId,
-              abortReason: "startup",
-            })
-          );
+          return Ok(this.createAbortedTurnHandle(syntheticMessageId));
         }
         // play() resolves after the scripted playback (including any error
         // events, which the session drains from its in-flight capture), so the
@@ -1393,10 +1387,7 @@ export class AIService extends EventEmitter {
           return result;
         }
         return Ok(
-          this.createSettledTurnHandle(syntheticMessageId, {
-            status: "completed",
-            messageId: syntheticMessageId,
-          })
+          this.createSettledTurnHandle({ status: "completed", messageId: syntheticMessageId })
         );
       }
 
@@ -1760,13 +1751,7 @@ export class AIService extends EventEmitter {
       await this.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
       recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
       if (combinedAbortSignal.aborted) {
-        return Ok(
-          this.createSettledTurnHandle(syntheticMessageId, {
-            status: "aborted",
-            messageId: syntheticMessageId,
-            abortReason: "startup",
-          })
-        );
+        return Ok(this.createAbortedTurnHandle(syntheticMessageId));
       }
 
       // Verify runtime is actually reachable after init completes.
@@ -3013,13 +2998,7 @@ export class AIService extends EventEmitter {
       });
 
       if (combinedAbortSignal.aborted) {
-        return Ok(
-          this.createSettledTurnHandle(assistantMessageId, {
-            status: "aborted",
-            messageId: assistantMessageId,
-            abortReason: "startup",
-          })
-        );
+        return Ok(this.createAbortedTurnHandle(assistantMessageId));
       }
 
       const requestHistorySequence = providerRequestMessages.reduce(
@@ -3074,7 +3053,7 @@ export class AIService extends EventEmitter {
         if (forceContextLimitError) {
           const streamError = await simulateContextLimitError(simulationCtx, this.historyService);
           return Ok(
-            this.createSettledTurnHandle(assistantMessageId, {
+            this.createSettledTurnHandle({
               status: "failed",
               messageId: assistantMessageId,
               streamError,
@@ -3083,10 +3062,7 @@ export class AIService extends EventEmitter {
         }
         await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
         return Ok(
-          this.createSettledTurnHandle(assistantMessageId, {
-            status: "completed",
-            messageId: assistantMessageId,
-          })
+          this.createSettledTurnHandle({ status: "completed", messageId: assistantMessageId })
         );
       }
 
@@ -3362,13 +3338,7 @@ export class AIService extends EventEmitter {
 
       if (combinedAbortSignal.aborted) {
         await deleteAbortedPlaceholder(assistantMessageId);
-        return Ok(
-          this.createSettledTurnHandle(assistantMessageId, {
-            status: "aborted",
-            messageId: assistantMessageId,
-            abortReason: "startup",
-          })
-        );
+        return Ok(this.createAbortedTurnHandle(assistantMessageId));
       }
 
       // Capture request payload for the debug modal, then delegate to StreamManager.

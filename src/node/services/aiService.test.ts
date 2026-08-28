@@ -52,7 +52,6 @@ import type {
   RuntimeStatusEvent,
   StreamAbortEvent,
   StreamEndEvent,
-  WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
 import { log } from "./log";
 import type { SessionUsageService } from "./sessionUsageService";
@@ -412,7 +411,6 @@ function stubCommonStreamMessageDependencies(args: {
     return {
       success: true,
       data: {
-        streamToken,
         messageId: options.messageId,
         completion: new Promise<TurnCompletion>(() => undefined),
       },
@@ -715,28 +713,6 @@ describe("AIService turn engine events", () => {
     expect(await forwardedAbortPromise).toEqual(abortEvent);
     expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
     expect(internals.pendingDevToolsRunMetadataByMessageId.has("message-1")).toBe(true);
-  });
-
-  it("forwards workflow-run-attached events", async () => {
-    using harness = createForwardingHarness("ai-service-workflow-run-attached-forwarding");
-    const { service, internals } = harness;
-    const event: WorkflowRunAttachedEvent = {
-      type: "workflow-run-attached",
-      workspaceId: "workspace-1",
-      messageId: "message-1",
-      toolCallId: "workflow-call-1",
-      runId: "wfr_forwarded",
-      timestamp: Date.now(),
-    };
-
-    const forwardedPromise = new Promise<WorkflowRunAttachedEvent>((resolve) => {
-      service.once("workflow-run-attached", (forwarded) =>
-        resolve(forwarded as WorkflowRunAttachedEvent)
-      );
-    });
-    await internals.emitEngineEvent(event);
-
-    expect(await forwardedPromise).toEqual(event);
   });
 
   it.each([

@@ -2,7 +2,6 @@ import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import type { MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
@@ -18,11 +17,7 @@ import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
 
 export function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId,
-    completion: new Promise(() => undefined),
-  };
+  return { messageId, completion: new Promise(() => undefined) };
 }
 
 export function createFailedTurnHandle(
@@ -30,7 +25,6 @@ export function createFailedTurnHandle(
   failure: { error: string; errorType: StreamErrorType }
 ): TurnStreamHandle {
   return {
-    streamToken: "test-stream-token",
     messageId,
     completion: Promise.resolve({
       status: "failed",
@@ -67,22 +61,7 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
   aiService: AIService;
 } {
   const aiEmitter = args?.emitter ?? new EventEmitter();
-  const { streamMessage: streamMessageOverride, ...overrides } = args?.overrides ?? {};
-  const streamMessage =
-    streamMessageOverride ??
-    (mock((_history: MuxMessage[]) =>
-      Promise.resolve(Ok(undefined))
-    ) as unknown as AIService["streamMessage"]);
-  const normalizedStreamMessage = mock(
-    async (...streamArgs: Parameters<AIService["streamMessage"]>) => {
-      const result = await streamMessage(...streamArgs);
-      if (!result.success || result.data != null) {
-        return result;
-      }
-
-      return Ok(createStartedTurnHandle("test-assistant-message"));
-    }
-  );
+  const overrides = args?.overrides ?? {};
 
   return {
     aiEmitter,
@@ -90,7 +69,9 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       getStreamInfo: mock((_workspaceId: string) => null),
-      streamMessage: normalizedStreamMessage as AIService["streamMessage"],
+      streamMessage: mock(() =>
+        Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))
+      ) as unknown as AIService["streamMessage"],
       ...overrides,
     }) as unknown as AIService,
   };

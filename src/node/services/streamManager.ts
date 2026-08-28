@@ -214,7 +214,6 @@ export type TurnCompletion =
     };
 
 export interface TurnStreamHandle {
-  streamToken: string;
   messageId: string;
   completion: Promise<TurnCompletion>;
 }
@@ -4526,11 +4525,7 @@ export class StreamManager {
       onStreamConstructed,
     } = options;
     const completionController = createTurnCompletionController();
-    const createHandle = (streamToken: StreamToken): TurnStreamHandle => ({
-      streamToken,
-      messageId,
-      completion: completionController.promise,
-    });
+    const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
 
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
@@ -4575,7 +4570,7 @@ export class StreamManager {
         // temp dir creation, etc), avoid starting the stream entirely.
         if (streamAbortController.signal.aborted) {
           completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
-          return Ok(createHandle(streamToken));
+          return Ok(handle);
         }
 
         // Step 3: Create temp directory for this stream using runtime.
@@ -4586,7 +4581,7 @@ export class StreamManager {
 
         if (streamAbortController.signal.aborted) {
           completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
-          return Ok(createHandle(streamToken));
+          return Ok(handle);
         }
 
         // Step 4: Atomic stream creation and registration
@@ -4605,7 +4600,7 @@ export class StreamManager {
         if (streamAbortController.signal.aborted) {
           this.workspaceStreams.delete(typedWorkspaceId);
           completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
-          return Ok(createHandle(streamToken));
+          return Ok(handle);
         }
 
         streamInfo.unlinkAbortSignal = unlinkAbortSignal;
@@ -4631,7 +4626,7 @@ export class StreamManager {
           }
           streamRegistered = false;
           completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
-          return Ok(createHandle(streamToken));
+          return Ok(handle);
         }
 
         // Step 5: Track the processing promise for guaranteed cleanup
@@ -4644,7 +4639,7 @@ export class StreamManager {
           log.error("Unexpected error in stream processing:", error);
         });
 
-        return Ok(createHandle(streamToken));
+        return Ok(handle);
       } finally {
         if (!streamRegistered) {
           runLanguageModelCleanup(model);
