@@ -1793,6 +1793,24 @@ const GIT_BOOLEAN_CONFIG_VALUE = /^(?:true|false|yes|no|on|off|[+-]?[0-9]+)$/i;
 const GIT_INCLUDE_PATH_CONFIG_KEY = /^include(?:if\..+)?\.path$/i;
 
 /**
+ * Whether a `git -c`/`--config-env` override names a key whose value Git later
+ * executes or reads as config. The key alone decides: the assignment redaction
+ * replaces an unquoted `-c` value before this scan runs, a quote-mangled value
+ * localizes through the disguised-assignment rules, and `--config-env` reads a
+ * variable this scan cannot see, so a sensitive key fails closed on all three.
+ */
+function gitConfigOverrideNamesSensitiveKey(unquoted: string): boolean {
+  const separator = unquoted.indexOf("=");
+  const key = separator === -1 ? unquoted : unquoted.slice(0, separator);
+  return (
+    /^(?:alias\.[^.]+|submodule\..+\.update)$/i.test(key) ||
+    GIT_FSMONITOR_CONFIG_KEY.test(key) ||
+    GIT_INCLUDE_PATH_CONFIG_KEY.test(key) ||
+    GIT_COMMAND_CONFIG_KEY.test(key)
+  );
+}
+
+/**
  * Documentation is the only thing a recursive collection publishes without asking.
  * An interpreter that executes one of these files can reconstruct a credential across
  * the command and file even when neither spelling matches the token backstop.
@@ -2227,6 +2245,7 @@ interface LanguageInterpreter {
  * so inherited NODE_OPTIONS preloads execute for them exactly as for node.
  */
 const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "corepack"]);
+const PYTHON_LAUNCHER_NAME = /^(?:py|pyw|pythonw?[0-9.]*)$/;
 const PHP_LAUNCHER_NAME = /^(?:php[0-9.]*|php-win)$/;
 const JAVA_RUNTIME_LAUNCHER_NAME = /^(?:javaw?|jshell[0-9.]*)$/;
 const LUA_LAUNCHER_NAME = /^(?:lua|luajit)[0-9.]*$/;
@@ -2237,7 +2256,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // grammars under different executable names. Short eval flags can follow only flags
   // that consume no attached operand: `-Bc` evaluates, while `-Wsource` does not.
   {
-    name: /^(?:py|pyw|pythonw?[0-9.]*)$/,
+    name: PYTHON_LAUNCHER_NAME,
     evalWord: /^-[bBdEhiIOPqRsuSvVx]*c/,
     interactiveOption: /^-[bBdhOPqRsuv]*i/,
   },
@@ -2372,6 +2391,8 @@ function hasDisguisedAssignment(
   let pendingMiseExecOptions = false;
   let pendingGitSubcommand = false;
   let pendingGitOptionValue = false;
+  let pendingGitConfigOverrideValue = false;
+  let pendingGitConfigEnvValue = false;
   let pendingGitSubmoduleAction = false;
   let pendingGitRebaseOptions = false;
   let pendingGitConfigKey = false;
@@ -2473,6 +2494,8 @@ function hasDisguisedAssignment(
       pendingMiseExecOptions = false;
       pendingGitSubcommand = false;
       pendingGitOptionValue = false;
+      pendingGitConfigOverrideValue = false;
+      pendingGitConfigEnvValue = false;
       pendingGitSubmoduleAction = false;
       pendingGitRebaseOptions = false;
       pendingGitConfigKey = false;
@@ -2523,7 +2546,19 @@ function hasDisguisedAssignment(
       }
       continue;
     }
-    if (CONSUMED_ASSIGNMENT.test(word)) continue;
+    if (CONSUMED_ASSIGNMENT.test(word)) {
+      // A git -c or --config-env value can itself be the replaced assignment
+      // (`-c core.sshCommand=<marker>`): the key still classifies, and the
+      // hidden value fails closed wherever it would decide.
+      if (pendingGitOptionValue) {
+        pendingGitOptionValue = false;
+        const classifiable = pendingGitConfigOverrideValue || pendingGitConfigEnvValue;
+        pendingGitConfigOverrideValue = false;
+        pendingGitConfigEnvValue = false;
+        if (classifiable && gitConfigOverrideNamesSensitiveKey(word)) return true;
+      }
+      continue;
+    }
     // Bash expands neither syntax from quoted or escaped text (`--config
     // '{"a":1,"b":2}'` stays a literal argument). The brace test runs on the active
     // projection; the glob analyzer is quote-aware itself and needs the raw word to
@@ -2726,11 +2761,20 @@ function hasDisguisedAssignment(
     if (pendingGitSubcommand) {
       if (pendingGitOptionValue) {
         pendingGitOptionValue = false;
+        if (pendingGitConfigOverrideValue || pendingGitConfigEnvValue) {
+          pendingGitConfigOverrideValue = false;
+          pendingGitConfigEnvValue = false;
+          if (gitConfigOverrideNamesSensitiveKey(unquoted)) return true;
+        }
       } else {
         const execPath = /^--exec-path=(.*)$/.exec(unquoted)?.[1];
         if (execPath !== undefined && isUnderCollectedRoot(execPath, rootPrefixes)) return true;
+        const configEnv = /^--config-env=(.*)$/.exec(unquoted)?.[1];
+        if (configEnv !== undefined && gitConfigOverrideNamesSensitiveKey(configEnv)) return true;
         if (gitOptionTakesSeparateValue(unquoted)) {
           pendingGitOptionValue = true;
+          pendingGitConfigOverrideValue = unquoted === "-c";
+          pendingGitConfigEnvValue = unquoted === "--config-env";
         } else if (!unquoted.startsWith("-")) {
           pendingGitSubcommand = false;
           if (unquoted === "config") {
@@ -2933,6 +2977,10 @@ function hasDisguisedAssignment(
       if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
       if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.javaAgentHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
+      // A published sys.path or class-path archive executes through the plain
+      // launcher (`python3 -m leak`, `java Leak`) without spelling the root.
+      if (inherited.pythonPathHook && PYTHON_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.javaClassPathHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.luaStartupHook && LUA_LAUNCHER_NAME.test(executable)) return true;
       // The dynamic loader injects an inherited published preload into every
       // dynamically linked launcher, ahead of whatever the command runs.
@@ -3430,6 +3478,10 @@ interface InheritedLaunchContext {
   nodeCodeOptions: boolean;
   /** PYTHONSTARTUP names an auto-published document. */
   pythonStartupHook: boolean;
+  /** A PYTHONPATH entry names an auto-published archive Python imports from. */
+  pythonPathHook: boolean;
+  /** The inherited CLASSPATH names an auto-published executable archive. */
+  javaClassPathHook: boolean;
   /** PHPRC names an auto-published configuration document. */
   phpConfigHook: boolean;
   /** A JVM environment variable names an auto-published Java agent archive. */
@@ -3483,17 +3535,33 @@ function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
  * dynamically linked launcher before the command, and accepts a shared object
  * regardless of filename suffix. glibc splits its lists on colons or spaces;
  * dyld's DYLD_INSERT_LIBRARIES is colon-separated, preserving spaced paths.
+ * A slashless entry is not a pathname: the loader resolves it through the
+ * inherited library search path before the default directories.
  */
 function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
-  const preloadLists: ReadonlyArray<readonly [unknown, RegExp]> = [
-    [process.env.LD_PRELOAD, /[:\s]+/],
-    [process.env.LD_AUDIT, /[:\s]+/],
-    [process.env.DYLD_INSERT_LIBRARIES, /:/],
+  const linuxSearchDirs = (process.env.LD_LIBRARY_PATH ?? "").split(/[:;]/);
+  const dyldSearchDirs = [
+    ...(process.env.DYLD_LIBRARY_PATH ?? "").split(":"),
+    ...(process.env.DYLD_FALLBACK_LIBRARY_PATH ?? "").split(":"),
   ];
-  for (const [value, delimiter] of preloadLists) {
+  const preloadLists: ReadonlyArray<readonly [unknown, RegExp, readonly string[]]> = [
+    [process.env.LD_PRELOAD, /[:\s]+/, linuxSearchDirs],
+    [process.env.LD_AUDIT, /[:\s]+/, linuxSearchDirs],
+    [process.env.DYLD_INSERT_LIBRARIES, /:/, dyldSearchDirs],
+  ];
+  for (const [value, delimiter, searchDirs] of preloadLists) {
     if (typeof value !== "string") continue;
     for (const entry of value.split(delimiter)) {
-      if (entry !== "" && isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+      if (entry === "") continue;
+      if (/[/\\]/.test(entry)) {
+        if (isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+      } else {
+        for (const dir of searchDirs) {
+          if (dir !== "" && isAutoPublishedScriptOperand(`${dir}/${entry}`, rootPrefixes)) {
+            return true;
+          }
+        }
+      }
     }
   }
   return false;
@@ -3527,6 +3595,14 @@ function redactMcpConfig(
     cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter),
     nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
     pythonStartupHook: isAutoPublishedScriptOperand(process.env.PYTHONSTARTUP ?? "", rootPrefixes),
+    pythonPathHook: (process.env.PYTHONPATH ?? "")
+      .split(path.delimiter)
+      .some((entry) => isAutoPublishedScriptOperand(entry, rootPrefixes)),
+    javaClassPathHook: javaClassPathPublishesExecutable(
+      process.env.CLASSPATH ?? "",
+      rootPrefixes,
+      null
+    ),
     phpConfigHook: isAutoPublishedScriptOperand(process.env.PHPRC ?? "", rootPrefixes),
     javaAgentHook: hasInheritedJavaAgent(
       [process.env.JAVA_TOOL_OPTIONS, process.env._JAVA_OPTIONS, process.env.JDK_JAVA_OPTIONS],

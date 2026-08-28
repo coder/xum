@@ -2272,20 +2272,35 @@ describe("backup payload", () => {
   });
 
   it("localizes commands under an inherited published dynamic-loader preload", async () => {
-    const variableNames = ["LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES"] as const;
+    const variableNames = [
+      "LD_PRELOAD",
+      "LD_AUDIT",
+      "DYLD_INSERT_LIBRARIES",
+      "LD_LIBRARY_PATH",
+      "DYLD_LIBRARY_PATH",
+      "DYLD_FALLBACK_LIBRARY_PATH",
+    ] as const;
     const originals = variableNames.map((name) => process.env[name]);
     try {
-      for (const [variable, value, expected] of [
-        ["LD_PRELOAD", `${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
+      for (const [env, expected] of [
+        [{ LD_PRELOAD: `${muxRoot}/skills/launch.txt` }, REDACTED_BACKUP_VALUE],
         // glibc also splits the preload list on colons and spaces.
-        ["LD_PRELOAD", `/opt/lib/probe.so:${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
-        ["LD_AUDIT", `${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
-        ["DYLD_INSERT_LIBRARIES", `${muxRoot}/agents/launch.md`, REDACTED_BACKUP_VALUE],
+        [{ LD_PRELOAD: `/opt/lib/probe.so:${muxRoot}/skills/launch.txt` }, REDACTED_BACKUP_VALUE],
+        [{ LD_AUDIT: `${muxRoot}/skills/launch.txt` }, REDACTED_BACKUP_VALUE],
+        [{ DYLD_INSERT_LIBRARIES: `${muxRoot}/agents/launch.md` }, REDACTED_BACKUP_VALUE],
+        // A slashless name resolves through the inherited loader search path.
+        [{ LD_LIBRARY_PATH: `${muxRoot}/skills`, LD_PRELOAD: "launch.txt" }, REDACTED_BACKUP_VALUE],
+        [
+          { DYLD_LIBRARY_PATH: `${muxRoot}/skills`, DYLD_INSERT_LIBRARIES: "launch.txt" },
+          REDACTED_BACKUP_VALUE,
+        ],
         // A foreign preload is not a collected document.
-        ["LD_PRELOAD", "/opt/lib/probe.so", "mcp-server --transport stdio"],
+        [{ LD_PRELOAD: "/opt/lib/probe.so" }, "mcp-server --transport stdio"],
+        // A slashless name without a published search entry stays portable.
+        [{ LD_PRELOAD: "launch.txt" }, "mcp-server --transport stdio"],
       ] as const) {
         for (const name of variableNames) delete process.env[name];
-        process.env[variable] = value;
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
         await writeFixtureFile(
           muxRoot,
           "mcp.jsonc",
@@ -2308,6 +2323,137 @@ describe("backup payload", () => {
         if (original === undefined) delete process.env[name];
         else process.env[name] = original;
       }
+    }
+  });
+
+  it("localizes Python launchers under an inherited published PYTHONPATH archive", async () => {
+    const originalPythonPath = process.env.PYTHONPATH;
+    try {
+      for (const [pythonPath, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "python3 -m leak", REDACTED_BACKUP_VALUE],
+        // Search-path lists split on the platform delimiter.
+        [
+          `/opt/lib${path.delimiter}${muxRoot}/skills/launch.txt`,
+          "python3 -m leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Other launchers do not read PYTHONPATH.
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign archive is not a collected document.
+        ["/opt/lib/modules.zip", "python3 -m leak", "python3 -m leak"],
+      ] as const) {
+        process.env.PYTHONPATH = pythonPath;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPythonPath === undefined) delete process.env.PYTHONPATH;
+      else process.env.PYTHONPATH = originalPythonPath;
+    }
+  });
+
+  it("localizes Java launchers under an inherited published CLASSPATH archive", async () => {
+    const originalClassPath = process.env.CLASSPATH;
+    try {
+      for (const [classPath, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "java Leak", REDACTED_BACKUP_VALUE],
+        [
+          `/opt/lib${path.delimiter}${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Other launchers do not read CLASSPATH.
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign archive is not a collected document.
+        ["/opt/lib/leak.jar", "java Leak", "java Leak"],
+      ] as const) {
+        process.env.CLASSPATH = classPath;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalClassPath === undefined) delete process.env.CLASSPATH;
+      else process.env.CLASSPATH = originalClassPath;
+    }
+  });
+
+  it("localizes command-valued git -c and --config-env overrides", async () => {
+    for (const [command, expected] of [
+      // The assignment redaction replaces an unquoted `-c` value before the
+      // scan, so each sensitive key class fails closed on its hidden value.
+      [
+        `git -c core.sshCommand=${muxRoot}/skills/launch.txt ls-remote ssh://example.invalid/repo`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      ["git -c alias.up=!probe fetch", REDACTED_BACKUP_VALUE],
+      ["git -c core.fsmonitor=true status", REDACTED_BACKUP_VALUE],
+      ["git -c include.path=/etc/gitconfig status", REDACTED_BACKUP_VALUE],
+      // The env-valued spelling reads a value this scan cannot see, so a
+      // sensitive key fails closed in both attached and separate forms.
+      [
+        "git --config-env=core.sshCommand=SSH_HELPER ls-remote ssh://example.invalid/repo",
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "git --config-env core.sshCommand=SSH_HELPER ls-remote ssh://example.invalid/repo",
+        REDACTED_BACKUP_VALUE,
+      ],
+      // A data key stays portable, keeping only its value's assignment marker.
+      ["git -c user.name=xum log", `git -c user.name=${REDACTED_BACKUP_VALUE} log`],
+      // A valueless data-key override sets the boolean true, never a command.
+      ["git -c color.ui status", "git -c color.ui status"],
+      // A valueless sensitive key still fails closed.
+      ["git -c core.sshCommand status", REDACTED_BACKUP_VALUE],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
     }
   });
 
