@@ -14,6 +14,7 @@
  */
 
 import type { ChildProcess } from "child_process";
+import * as path from "node:path";
 import { Readable } from "stream";
 import type {
   Runtime,
@@ -38,7 +39,7 @@ import { DisposableProcess } from "@/node/utils/disposableExec";
 import { streamToString, shescape } from "./streamUtils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
-import { buildShellExport } from "./shellEnv";
+import { buildShellExport, buildShellPathExport } from "./shellEnv";
 
 // Cap for the stderr side-buffer kept purely for error reporting on process
 // failure. 16KB comfortably covers SSH/launch diagnostics while bounding memory
@@ -121,6 +122,9 @@ export abstract class RemoteRuntime implements Runtime {
     const envVars = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
     for (const [key, value] of Object.entries(envVars)) {
       parts.push(buildShellExport(key, value, (envValue) => shescape.quote(envValue)));
+    }
+    for (const [key, value] of Object.entries(options.pathEnv ?? {})) {
+      parts.push(buildShellPathExport(key, value, (envValue) => shescape.quote(envValue)));
     }
 
     // Add the actual command
@@ -356,6 +360,17 @@ export abstract class RemoteRuntime implements Runtime {
     return { stdout, stderr, stdin, exitCode, duration };
   }
 
+  private async resolveFilePath(filePath: string): Promise<string> {
+    if (filePath === "~" || filePath.startsWith("~/")) {
+      return this.resolvePath(filePath);
+    }
+    if (path.posix.isAbsolute(filePath)) {
+      return path.posix.normalize(filePath);
+    }
+    const basePath = await this.resolvePath(this.getBasePath());
+    return path.posix.resolve(basePath, filePath);
+  }
+
   /**
    * Read file contents as a stream via exec.
    */
@@ -383,7 +398,8 @@ export abstract class RemoteRuntime implements Runtime {
       },
       start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
         try {
-          const stream = await this.exec(`cat ${this.quoteForRemote(filePath)}`, {
+          const resolvedPath = await this.resolveFilePath(filePath);
+          const stream = await this.exec(`cat ${this.quoteForRemote(resolvedPath)}`, {
             cwd: this.getBasePath(),
             timeout: 300,
             abortSignal: readAbort.signal,
@@ -431,13 +447,6 @@ export abstract class RemoteRuntime implements Runtime {
    * Uses temp file + mv for atomic write.
    */
   writeFile(filePath: string, abortSignal?: AbortSignal): WritableStream<Uint8Array> {
-    const quotedPath = this.quoteForRemote(filePath);
-    const tempPath = getAtomicWriteTempPath(filePath);
-    const quotedTempPath = this.quoteForRemote(tempPath);
-
-    // Build write command - subclasses can override buildWriteCommand for special handling
-    const writeCommand = this.buildWriteCommand(quotedPath, quotedTempPath);
-
     let execPromise: Promise<ExecStream> | null = null;
     const writeAbortController = new AbortController();
     const abortWrite = () => writeAbortController.abort();
@@ -451,10 +460,16 @@ export abstract class RemoteRuntime implements Runtime {
     };
 
     const getExecStream = () => {
-      execPromise ??= this.exec(writeCommand, {
-        cwd: this.getBasePath(),
-        timeout: 300,
-        abortSignal: writeAbortController.signal,
+      execPromise ??= this.resolveFilePath(filePath).then((resolvedPath) => {
+        const quotedPath = this.quoteForRemote(resolvedPath);
+        const tempPath = getAtomicWriteTempPath(resolvedPath);
+        const quotedTempPath = this.quoteForRemote(tempPath);
+        const writeCommand = this.buildWriteCommand(quotedPath, quotedTempPath);
+        return this.exec(writeCommand, {
+          cwd: this.getBasePath(),
+          timeout: 300,
+          abortSignal: writeAbortController.signal,
+        });
       });
       return execPromise;
     };
@@ -513,7 +528,8 @@ export abstract class RemoteRuntime implements Runtime {
    * Ensure a directory exists (mkdir -p semantics).
    */
   async ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
-    const stream = await this.exec(`mkdir -p ${this.quoteForRemote(dirPath)}`, {
+    const resolvedPath = await this.resolveFilePath(dirPath);
+    const stream = await this.exec(`mkdir -p ${this.quoteForRemote(resolvedPath)}`, {
       cwd: "/",
       timeout: 10,
       abortSignal,
@@ -541,7 +557,8 @@ export abstract class RemoteRuntime implements Runtime {
    * Uses stat -L to follow symlinks (report target's type, not "symbolic link").
    */
   async stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
-    const stream = await this.exec(`stat -L -c '%s %Y %F' ${this.quoteForRemote(filePath)}`, {
+    const resolvedPath = await this.resolveFilePath(filePath);
+    const stream = await this.exec(`stat -L -c '%s %Y %F' ${this.quoteForRemote(resolvedPath)}`, {
       cwd: this.getBasePath(),
       timeout: 10,
       abortSignal,

@@ -61,6 +61,36 @@ class RecordingRemoteRuntime extends RemoteRuntime {
   }
 }
 
+function createStream(value: string): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(value));
+      controller.close();
+    },
+  });
+}
+
+class CanonicalPathRemoteRuntime extends RecordingRemoteRuntime {
+  commands: string[] = [];
+
+  override resolvePath(filePath: string): Promise<string> {
+    if (filePath === "~") return Promise.resolve("/home/test");
+    if (filePath.startsWith("~/")) return Promise.resolve(`/home/test/${filePath.slice(2)}`);
+    return Promise.resolve(filePath);
+  }
+
+  override exec(command: string, _options: ExecOptions): Promise<ExecStream> {
+    this.commands.push(command);
+    return Promise.resolve({
+      stdout: createStream(command.startsWith("stat ") ? "1 2 regular file\n" : "contents"),
+      stderr: createStream(""),
+      stdin: new WritableStream<Uint8Array>(),
+      exitCode: Promise.resolve(0),
+      duration: Promise.resolve(0),
+    });
+  }
+}
+
 /**
  * Fake exec: records the abortSignal readFile passes and returns a wedged
  * cat whose stdout never yields — exactly the stalled remote read the r18
@@ -85,6 +115,29 @@ class ReadFileRemoteRuntime extends RecordingRemoteRuntime {
     });
   }
 }
+
+describe("RemoteRuntime file path canonicalization", () => {
+  it("resolves relative and tilde paths inside file operations", async () => {
+    const runtime = new CanonicalPathRemoteRuntime();
+
+    const reader = runtime.readFile("nested/../read.txt").getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    const writer = runtime.writeFile("~/write.txt").getWriter();
+    await writer.close();
+    await runtime.stat("nested/../stat.txt");
+    await runtime.ensureDir("~/dir");
+
+    expect(runtime.commands).toContain("cat '/workspace/read.txt'");
+    expect(runtime.commands.some((command) => command.includes("'/home/test/write.txt'"))).toBe(
+      true
+    );
+    expect(runtime.commands).toContain("stat -L -c '%s %Y %F' '/workspace/stat.txt'");
+    expect(runtime.commands).toContain("mkdir -p '/home/test/dir'");
+  });
+});
 
 describe("RemoteRuntime.readFile", () => {
   it("cancelling the stream aborts the underlying cat exec", async () => {

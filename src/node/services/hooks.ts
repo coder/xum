@@ -25,6 +25,7 @@ const FLATTENED_TOOL_ENV_MAX_VARS = 200;
 const FLATTENED_TOOL_ENV_MAX_ARRAY_LENGTH = 50;
 const DEFAULT_HOOK_PHASE_TIMEOUT_MS = 10_000; // 10 seconds
 const EXEC_MARKER_PREFIX = "MUX_EXEC_";
+const HOOK_PATH_ENV = "XUM_INTERNAL_HOOK_PATH";
 
 /** Shell-escape a string for safe use in bash -c commands */
 function shellEscape(str: string): string {
@@ -32,12 +33,16 @@ function shellEscape(str: string): string {
   return `'${str.replace(/'/g, "'\\''")}'`;
 }
 
-/**
- * Hooks execute in the runtime's exec namespace, so the documented
- * XUM_PROJECT_DIR env value must be valid there (issue #3709).
- */
-function resolveExecProjectDir(runtime: Runtime, projectDir: string): string {
-  return runtime.mapPathForExec?.(projectDir) ?? projectDir;
+function buildHookCommand(): string {
+  return `hook_path="$${HOOK_PATH_ENV}"; unset ${HOOK_PATH_ENV}; "$hook_path"`;
+}
+
+function getHookPathEnv(projectDir: string, hookPath: string): Record<string, string> {
+  return {
+    [HOOK_PATH_ENV]: hookPath,
+    XUM_PROJECT_DIR: projectDir,
+    MUX_PROJECT_DIR: projectDir,
+  };
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -85,8 +90,7 @@ async function getProjectOrGlobalConfigPath(
   for (const relativePath of listProjectMetadataRelativePaths(filename)) {
     const projectPath = joinPathLike(projectDir, relativePath);
     if (await isFile(runtime, projectPath)) {
-      // Hook and tool_env paths are embedded in exec scripts, so return them in that namespace.
-      return runtime.mapPathForExec?.(projectPath) ?? projectPath;
+      return projectPath;
     }
   }
   return getUserGlobalConfigPath(runtime, filename);
@@ -276,7 +280,7 @@ export async function runWithHook<T>(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
+    XUM_PROJECT_DIR: context.projectDir,
     XUM_EXEC: execMarker,
   };
   if (toolInputPath) {
@@ -315,11 +319,10 @@ export async function runWithHook<T>(
 
   let stream;
   try {
-    // Shell-escape the hook path to handle spaces and special characters
-    // runtime.exec() uses bash -c, so unquoted paths would break
-    stream = await runtime.exec(shellEscape(hookPath), {
+    stream = await runtime.exec(buildHookCommand(), {
       cwd: context.projectDir,
       env: hookEnv,
+      pathEnv: getHookPathEnv(context.projectDir, hookPath),
       abortSignal: abortController.signal,
     });
   } catch (err) {
@@ -623,7 +626,7 @@ export async function runPreHook(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
+    XUM_PROJECT_DIR: context.projectDir,
   };
   if (toolInputPath) {
     canonicalHookEnv.XUM_TOOL_INPUT_PATH = toolInputPath;
@@ -631,9 +634,10 @@ export async function runPreHook(
   const hookEnv = withLegacyMuxEnvironmentAliases(canonicalHookEnv);
 
   try {
-    const result = await execBuffered(runtime, shellEscape(hookPath), {
+    const result = await execBuffered(runtime, buildHookCommand(), {
       cwd: context.projectDir,
       env: hookEnv,
+      pathEnv: getHookPathEnv(context.projectDir, hookPath),
       timeout: Math.ceil(timeoutMs / 1000),
       abortSignal: context.abortSignal,
     });
@@ -719,7 +723,7 @@ export async function runPostHook(
     // Ensure base JSON env vars cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
+    XUM_PROJECT_DIR: context.projectDir,
     XUM_TOOL_RESULT: resultEnv,
   };
   if (toolInputPath) {
@@ -745,9 +749,10 @@ export async function runPostHook(
   };
 
   try {
-    const result = await execBuffered(runtime, shellEscape(hookPath), {
+    const result = await execBuffered(runtime, buildHookCommand(), {
       cwd: context.projectDir,
       env: hookEnv,
+      pathEnv: getHookPathEnv(context.projectDir, hookPath),
       timeout: Math.ceil(timeoutMs / 1000),
       abortSignal: context.abortSignal,
     });

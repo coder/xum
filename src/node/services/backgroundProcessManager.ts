@@ -1342,6 +1342,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     config: {
       cwd: string;
       env?: Record<string, string>;
+      pathEnv?: Record<string, string>;
       /** Human-readable name for the process - used to generate the process ID */
       displayName: string;
       /** If true, process is foreground (being waited on). Default: false (background) */
@@ -1413,6 +1414,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       workspaceId,
       processId,
       env: config.env,
+      pathEnv: config.pathEnv,
     });
 
     if (!result.success) {

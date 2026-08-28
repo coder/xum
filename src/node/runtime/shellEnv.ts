@@ -16,3 +16,16 @@ export function buildShellExport(
   assertShellEnvName(key);
   return `export ${key}=${quoteValue(value)}`;
 }
+
+export function buildShellPathExport(
+  key: string,
+  value: string,
+  quoteValue: (value: string) => string = shellQuote
+): string {
+  assertShellEnvName(key);
+  return [
+    `${key}=${quoteValue(value)}`,
+    `case "$${key}" in '~') ${key}="$HOME" ;; '~/'*) ${key}="$HOME/\${${key}:2}" ;; /*) ;; *) ${key}="$PWD/$${key}" ;; esac`,
+    `export ${key}`,
+  ].join(" && ");
+}

@@ -32,7 +32,7 @@ import {
 } from "./initHook";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
-import { buildShellExport } from "./shellEnv";
+import { buildShellExport, buildShellPathExport } from "./shellEnv";
 import { sanitizeXumChildEnv } from "./childProcessEnv";
 
 /**
@@ -85,10 +85,17 @@ export abstract class LocalBaseRuntime implements Runtime {
       .map(([key, value]) => buildShellExport(key, value))
       .join("\n");
 
-    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${command}`];
+    const pathEnvPrelude = Object.entries(options.pathEnv ?? {})
+      .map(([key, value]) => buildShellPathExport(key, value))
+      .join("\n");
+    const spawnArgs = ["-c", `${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`];
 
     const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-    const mergedEnv = sanitizeXumChildEnv({ ...process.env, ...(options.env ?? {}) });
+    const mergedEnv = sanitizeXumChildEnv({
+      ...process.env,
+      ...(options.env ?? {}),
+      ...(options.pathEnv ?? {}),
+    });
     const basePath =
       (options.env?.PATH && options.env.PATH.length > 0
         ? mergedEnv.PATH
@@ -213,9 +220,8 @@ export abstract class LocalBaseRuntime implements Runtime {
   }
 
   readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    // Expand tildes before reading (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
-    const nodeStream = fs.createReadStream(expandedPath);
+    const resolvedPath = path.resolve(expandTilde(filePath));
+    const nodeStream = fs.createReadStream(resolvedPath);
 
     // Handle errors by wrapping in a transform
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
@@ -284,8 +290,7 @@ export abstract class LocalBaseRuntime implements Runtime {
 
   writeFile(filePath: string, _abortSignal?: AbortSignal): WritableStream<Uint8Array> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before writing (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const canonicalPath = path.resolve(expandTilde(filePath));
     let tempPath: string;
     let writer: WritableStreamDefaultWriter<Uint8Array>;
     let resolvedPath: string;
@@ -295,13 +300,12 @@ export abstract class LocalBaseRuntime implements Runtime {
       async start() {
         // Resolve symlinks to write through them (preserves the symlink)
         try {
-          resolvedPath = await fsPromises.realpath(expandedPath);
+          resolvedPath = await fsPromises.realpath(canonicalPath);
           // Save original permissions to restore after write
           const stat = await fsPromises.stat(resolvedPath);
           originalMode = stat.mode;
         } catch {
-          // If file doesn't exist, use the expanded path and default permissions
-          resolvedPath = expandedPath;
+          resolvedPath = canonicalPath;
           originalMode = undefined;
         }
 
@@ -354,10 +358,9 @@ export abstract class LocalBaseRuntime implements Runtime {
 
   async stat(filePath: string, _abortSignal?: AbortSignal): Promise<FileStat> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    // Expand tildes before stat (Node.js fs doesn't expand ~)
-    const expandedPath = expandTilde(filePath);
+    const resolvedPath = path.resolve(expandTilde(filePath));
     try {
-      const stats = await fsPromises.stat(expandedPath);
+      const stats = await fsPromises.stat(resolvedPath);
       return {
         size: stats.size,
         modifiedTime: stats.mtime,
@@ -376,9 +379,9 @@ export abstract class LocalBaseRuntime implements Runtime {
     if (abortSignal?.aborted) {
       throw new RuntimeErrorClass("Operation aborted before directory creation", "file_io");
     }
-    const expandedPath = expandTilde(dirPath);
+    const resolvedPath = path.resolve(expandTilde(dirPath));
     try {
-      await fsPromises.mkdir(expandedPath, { recursive: true });
+      await fsPromises.mkdir(resolvedPath, { recursive: true });
     } catch (err) {
       throw new RuntimeErrorClass(
         `Failed to create directory ${dirPath}: ${getErrorMessage(err)}`,

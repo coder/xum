@@ -996,7 +996,7 @@ export class StreamManager extends EventEmitter {
     }
 
     try {
-      await runtime.ensureDir(resolvedPath);
+      await runtime.ensureDir(tempDir);
     } catch (err) {
       const msg = getErrorMessage(err);
       throw new Error(`Failed to create temp directory ${resolvedPath}: ${msg}`);

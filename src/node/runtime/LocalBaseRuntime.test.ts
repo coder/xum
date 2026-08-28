@@ -104,6 +104,19 @@ describe("LocalBaseRuntime.resolvePath", () => {
 });
 
 describe("LocalBaseRuntime.exec PATH handling", () => {
+  it("canonicalizes pathEnv values before command execution", async () => {
+    const runtime = new TestLocalRuntime();
+    const stream = await runtime.exec('printf "%s" "$XUM_TEST_PATH"', {
+      cwd: os.tmpdir(),
+      pathEnv: { XUM_TEST_PATH: "~/runtime-path" },
+      timeout: 5,
+    });
+    await stream.stdin.close();
+
+    expect(await readStreamAsString(stream.stdout)).toBe(path.join(os.homedir(), "runtime-path"));
+    expect(await stream.exitCode).toBe(0);
+  });
+
   it("strips mux browser shims and leaked browser env from child shells", async () => {
     const runtime = new TestLocalRuntime();
     const tempBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-path-probe-"));

@@ -15,9 +15,9 @@ import type {
   FileStat,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import { buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
-import { expandTildeForSSH } from "./tildeExpansion";
 import { shescape, streamToString } from "./streamUtils";
 import {
   readHostGitconfig,
@@ -37,6 +37,9 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
+
+const FILE_PATH_ENV = "XUM_INTERNAL_FILE_PATH";
+const TEMP_FILE_PATH_ENV = "XUM_INTERNAL_TEMP_FILE_PATH";
 
 export interface DevcontainerRuntimeOptions {
   srcBaseDir: string;
@@ -186,13 +189,6 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     return this.mapContainerPathToHost(filePath);
   }
 
-  private quoteForContainer(filePath: string): string {
-    if (filePath === "~" || filePath.startsWith("~/")) {
-      return expandTildeForSSH(filePath);
-    }
-    return shescape.quote(filePath);
-  }
-
   /**
    * Expand tilde in file paths for container operations.
    * Returns unexpanded path when container user is unknown (before ensureReady).
@@ -290,8 +286,9 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     return new ReadableStream<Uint8Array>({
       start: async (controller) => {
         try {
-          const stream = await this.exec(`cat ${this.quoteForContainer(filePath)}`, {
+          const stream = await this.exec(`cat "$${FILE_PATH_ENV}"`, {
             cwd: this.getContainerBasePath(),
+            pathEnv: { [FILE_PATH_ENV]: filePath },
             timeout: 300,
             abortSignal,
           });
@@ -333,10 +330,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     filePath: string,
     abortSignal?: AbortSignal
   ): WritableStream<Uint8Array> {
-    const quotedPath = this.quoteForContainer(filePath);
     const tempPath = getAtomicWriteTempPath(filePath);
-    const quotedTempPath = this.quoteForContainer(tempPath);
-    const writeCommand = `mkdir -p $(dirname ${quotedPath}) && cat > ${quotedTempPath} && mv ${quotedTempPath} ${quotedPath}`;
+    const writeCommand = `mkdir -p "$(dirname "$${FILE_PATH_ENV}")" && cat > "$${TEMP_FILE_PATH_ENV}" && mv "$${TEMP_FILE_PATH_ENV}" "$${FILE_PATH_ENV}"`;
 
     let execPromise: Promise<ExecStream> | null = null;
     const writeAbortController = new AbortController();
@@ -353,6 +348,10 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     const getExecStream = () => {
       execPromise ??= this.exec(writeCommand, {
         cwd: this.getContainerBasePath(),
+        pathEnv: {
+          [FILE_PATH_ENV]: filePath,
+          [TEMP_FILE_PATH_ENV]: tempPath,
+        },
         timeout: 300,
         abortSignal: writeAbortController.signal,
       });
@@ -402,8 +401,9 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   }
 
   private async ensureDirViaExec(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
-    const stream = await this.exec(`mkdir -p ${this.quoteForContainer(dirPath)}`, {
-      cwd: "/",
+    const stream = await this.exec(`mkdir -p "$${FILE_PATH_ENV}"`, {
+      cwd: this.getContainerBasePath(),
+      pathEnv: { [FILE_PATH_ENV]: dirPath },
       timeout: 10,
       abortSignal,
     });
@@ -427,8 +427,9 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
   private async statViaExec(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
     // -L follows symlinks so symlinked paths report the target's type
-    const stream = await this.exec(`stat -L -c '%s %Y %F' ${this.quoteForContainer(filePath)}`, {
+    const stream = await this.exec(`stat -L -c '%s %Y %F' "$${FILE_PATH_ENV}"`, {
       cwd: this.getContainerBasePath(),
+      pathEnv: { [FILE_PATH_ENV]: filePath },
       timeout: 10,
       abortSignal,
     });
@@ -458,7 +459,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       isDirectory: fileType === "directory",
     };
   }
-  mapPathForExec(filePath: string): string {
+  private mapPathForExec(filePath: string): string {
     // Issue #3709: paths embedded in exec scripts must use the container namespace.
     return this.mapHostPathToContainer(filePath) ?? filePath;
   }
@@ -612,7 +613,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     // Merge cached container credential env + caller env + non-interactive vars.
     // Spread order: container env (lowest) < caller env < NON_INTERACTIVE (highest).
-    const envVars = { ...this.containerEnv, ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+    const mappedPathEnv = Object.fromEntries(
+      Object.entries(options.pathEnv ?? {}).map(([key, value]) => [key, this.mapPathForExec(value)])
+    );
+    const envVars = {
+      ...this.containerEnv,
+      ...options.env,
+      ...mappedPathEnv,
+      ...NON_INTERACTIVE_ENV_VARS,
+    };
     for (const [key, value] of Object.entries(envVars)) {
       args.push("--remote-env", `${key}=${value}`);
     }
@@ -621,7 +630,14 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     // Map host workspace path to container path; fall back to container workspace if unmappable
     const mappedCwd = options.cwd ? this.mapHostPathToContainer(options.cwd) : null;
     const cwd = mappedCwd ?? this.resolveContainerCwd(options.cwd, workspaceFolder);
-    const fullCommand = `cd ${shescape.quote(cwd)} && ${command}`;
+    const pathEnvPrelude = Object.entries(mappedPathEnv)
+      .map(([key, value]) =>
+        buildShellPathExport(key, value, (envValue) => shescape.quote(envValue))
+      )
+      .join(" && ");
+    const fullCommand = [`cd ${shescape.quote(cwd)}`, pathEnvPrelude, command]
+      .filter(Boolean)
+      .join(" && ");
     args.push("--", "bash", "-c", fullCommand);
 
     const childProcess = spawnDevcontainer(args, {

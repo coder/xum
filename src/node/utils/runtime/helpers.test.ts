@@ -1,7 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { ExecOptions, ExecStream, FileStat, Runtime } from "@/node/runtime/Runtime";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { shellQuote } from "@/common/utils/shell";
 import { copyPlanFileAcrossRuntimes, movePlanFile, readPlanFile } from "./helpers";
 
 interface MockRuntimeState {
@@ -194,7 +193,7 @@ describe("copyPlanFileAcrossRuntimes", () => {
 });
 
 describe("readPlanFile", () => {
-  it("resolves paths before building the quoted migration command", async () => {
+  it("passes unresolved migration paths through pathEnv", async () => {
     const workspaceName = "workspace-a1b2";
     const projectName = "demo-project";
     const workspaceId = "legacy-workspace-id";
@@ -206,16 +205,12 @@ describe("readPlanFile", () => {
     const planDir = planPath.substring(0, planPath.lastIndexOf("/"));
 
     const resolvedPlanPath = "/home/dev/.mux/plans/demo-project/workspace-a1b2.md";
-    const resolvedPlanDir = "/home/dev/.mux/plans/demo-project";
-    const resolvedLegacyPath = "/home/dev/.mux/plans/legacy-workspace-id.md";
 
     const state = createRuntimeState(xumHome, {
       [legacyPath]: legacyContent,
     });
 
     state.resolvedPaths.set(planPath, resolvedPlanPath);
-    state.resolvedPaths.set(planDir, resolvedPlanDir);
-    state.resolvedPaths.set(legacyPath, resolvedLegacyPath);
 
     const result = await readPlanFile(
       createMockRuntime(state),
@@ -231,11 +226,18 @@ describe("readPlanFile", () => {
     });
     expect(state.readAttempts).toEqual([planPath, legacyPath]);
     expect(state.execCalls).toHaveLength(1);
-    expect(state.execCalls[0]?.command).toBe(
-      `mkdir -p ${shellQuote(resolvedPlanDir)} && mv ${shellQuote(resolvedLegacyPath)} ${shellQuote(resolvedPlanPath)}`
-    );
-    expect(state.execCalls[0]?.options).toMatchObject({ cwd: "/tmp", timeout: 5 });
-    expect(state.execCalls[0]?.command.includes("'~")).toBe(false);
+    expect(state.execCalls[0]).toEqual({
+      command: 'mkdir -p "$XUM_PLAN_DIR" && mv "$XUM_LEGACY_PLAN" "$XUM_PLAN"',
+      options: {
+        cwd: "/tmp",
+        pathEnv: {
+          XUM_PLAN_DIR: planDir,
+          XUM_LEGACY_PLAN: legacyPath,
+          XUM_PLAN: planPath,
+        },
+        timeout: 5,
+      },
+    });
   });
 
   it.each([
@@ -277,7 +279,7 @@ describe("readPlanFile", () => {
 });
 
 describe("movePlanFile", () => {
-  it("uses resolved absolute paths when constructing the mv command", async () => {
+  it("passes unresolved plan paths through pathEnv", async () => {
     const oldWorkspaceName = "old-workspace";
     const newWorkspaceName = "new-workspace";
     const projectName = "demo-project";
@@ -285,22 +287,24 @@ describe("movePlanFile", () => {
 
     const oldPath = getPlanFilePath(oldWorkspaceName, projectName, xumHome);
     const newPath = getPlanFilePath(newWorkspaceName, projectName, xumHome);
-    const resolvedOldPath = "/home/dev/.mux/plans/demo-project/old-workspace.md";
-    const resolvedNewPath = "/home/dev/.mux/plans/demo-project/new-workspace.md";
 
     const state = createRuntimeState(xumHome, {
       [oldPath]: "# old plan\n",
     });
 
-    state.resolvedPaths.set(oldPath, resolvedOldPath);
-    state.resolvedPaths.set(newPath, resolvedNewPath);
-
     await movePlanFile(createMockRuntime(state), oldWorkspaceName, newWorkspaceName, projectName);
 
     expect(state.execCalls).toHaveLength(1);
-    expect(state.execCalls[0]?.command).toBe(
-      `mv ${shellQuote(resolvedOldPath)} ${shellQuote(resolvedNewPath)}`
-    );
-    expect(state.execCalls[0]?.options).toMatchObject({ cwd: "/tmp", timeout: 5 });
+    expect(state.execCalls[0]).toEqual({
+      command: 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"',
+      options: {
+        cwd: "/tmp",
+        pathEnv: {
+          XUM_OLD_PLAN: oldPath,
+          XUM_NEW_PLAN: newPath,
+        },
+        timeout: 5,
+      },
+    });
   });
 });
