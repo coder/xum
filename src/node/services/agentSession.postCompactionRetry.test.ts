@@ -7,32 +7,13 @@ import * as path from "path";
 import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
-import type { TurnStreamHandle } from "./streamManager";
 import type { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
-
-function createTurnHandle(
-  messageId: string,
-  failure?: { error: string; errorType: "context_exceeded" | "model_refusal" }
-): TurnStreamHandle {
-  return {
-    streamToken: "token-" + messageId,
-    messageId,
-    completion:
-      failure == null
-        ? new Promise(() => undefined)
-        : Promise.resolve({
-            status: "failed" as const,
-            messageId,
-            error: { type: "unknown" as const, raw: failure.error },
-            streamError: { messageId, ...failure },
-          }),
-  };
-}
+import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
 
 function createPersistedPostCompactionState(options: {
   filePath: string;
@@ -113,7 +94,7 @@ describe("AgentSession post-compaction context retry", () => {
 
         return Promise.resolve({
           success: true as const,
-          data: createTurnHandle("assistant-ctx-exceeded", {
+          data: createFailedTurnHandle("assistant-ctx-exceeded", {
             error: "Context length exceeded",
             errorType: "context_exceeded",
           }),
@@ -123,7 +104,7 @@ describe("AgentSession post-compaction context retry", () => {
       resolveSecondCall?.();
       return Promise.resolve({
         success: true as const,
-        data: createTurnHandle("assistant-retry"),
+        data: createStartedTurnHandle("assistant-retry"),
       });
     });
 
@@ -268,7 +249,7 @@ describe("AgentSession post-compaction context retry", () => {
         });
         return {
           success: true as const,
-          data: createTurnHandle("assistant-ctx-exceeded", {
+          data: createFailedTurnHandle("assistant-ctx-exceeded", {
             error: "Context length exceeded",
             errorType: "context_exceeded",
           }),
@@ -409,7 +390,7 @@ describe("AgentSession post-compaction context retry", () => {
         });
         return Promise.resolve({
           success: true as const,
-          data: createTurnHandle("assistant-attempt-1", {
+          data: createFailedTurnHandle("assistant-attempt-1", {
             error: "Context length exceeded",
             errorType: "context_exceeded",
           }),
@@ -425,7 +406,7 @@ describe("AgentSession post-compaction context retry", () => {
       });
       return Promise.resolve({
         success: true as const,
-        data: createTurnHandle("assistant-attempt-2", {
+        data: createFailedTurnHandle("assistant-attempt-2", {
           error: "The model refused to continue",
           errorType: "model_refusal",
         }),

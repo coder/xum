@@ -1,12 +1,11 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { AgentSession, clearProviderConfigFixableAbandonMarkers } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
-import type { TurnStreamHandle } from "./streamManager";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/types";
@@ -17,14 +16,6 @@ import { Ok } from "@/common/types/result";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-
-function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId,
-    completion: new Promise(() => undefined),
-  };
-}
 
 interface AutoRetryResumeRequest {
   options: SendMessageOptions;

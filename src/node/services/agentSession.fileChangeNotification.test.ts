@@ -12,15 +12,7 @@ import type { AIService, StreamMessageOptions } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
-import type { TurnStreamHandle } from "./streamManager";
-
-function createStartedTurnHandle(): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId: "test-assistant",
-    completion: new Promise(() => undefined),
-  };
-}
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>

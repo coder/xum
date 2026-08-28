@@ -7,6 +7,7 @@ import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
@@ -16,7 +17,6 @@ import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
 import { Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1 } from "@/common/types/goal";
-import type { TurnStreamHandle } from "./streamManager";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-budget-gate-test-project";
 const PRICED_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
@@ -24,14 +24,6 @@ const UNPRICED_OPTIONS: SendMessageOptions = {
   model: "openai:not-priced-model",
   agentId: "exec",
 };
-
-function createStartedTurnHandle(): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId: "test-assistant",
-    completion: new Promise(() => undefined),
-  };
-}
 
 interface SessionHarness {
   historyService: HistoryService;

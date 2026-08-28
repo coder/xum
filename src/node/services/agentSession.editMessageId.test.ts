@@ -7,20 +7,13 @@ import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
-import type { TurnStreamHandle } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 
-function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId,
-    completion: new Promise(() => undefined),
-  };
-}
 const config = {
   srcDir: "/tmp",
   getSessionDir: (_workspaceId: string) => "/tmp",

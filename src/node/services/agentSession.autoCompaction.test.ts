@@ -15,21 +15,12 @@ import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
-import type { TurnStreamHandle } from "./streamManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
-
-function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId,
-    completion: new Promise(() => undefined),
-  };
-}
 
 describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   let historyCleanup: (() => Promise<void>) | undefined;

@@ -8,15 +8,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import type { TurnStreamHandle } from "./streamManager";
-
-function createStartedTurnHandle(): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId: "test-assistant",
-    completion: new Promise(() => undefined),
-  };
-}
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const config = {

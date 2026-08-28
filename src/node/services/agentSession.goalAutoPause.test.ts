@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import type { AIService } from "./aiService";
-import type { TurnStreamHandle } from "./streamManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
@@ -20,27 +19,7 @@ import {
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
-
-function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId,
-    completion: new Promise(() => undefined),
-  };
-}
-
-function createFailedTurnHandle(messageId: string, error: string): TurnStreamHandle {
-  return {
-    streamToken: "test-stream-token",
-    messageId,
-    completion: Promise.resolve({
-      status: "failed",
-      messageId,
-      error: { type: "unknown", raw: error },
-      streamError: { messageId, error, errorType: "unknown" },
-    }),
-  };
-}
+import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-goal-test-project";
 const SEND_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o", agentId: "exec" };
@@ -1023,7 +1002,11 @@ describe("AgentSession goal safety hooks", () => {
         error: "boom",
         errorType: "unknown",
       });
-      return Promise.resolve(Ok(createFailedTurnHandle("assistant-stream-error", "boom")));
+      return Promise.resolve(
+        Ok(
+          createFailedTurnHandle("assistant-stream-error", { error: "boom", errorType: "unknown" })
+        )
+      );
     }) as unknown as AIService["streamMessage"];
     const eventTypes: string[] = [];
     session.onChatEvent((event) => {

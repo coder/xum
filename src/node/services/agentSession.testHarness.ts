@@ -15,6 +15,30 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import type { StreamErrorType } from "@/common/types/errors";
+
+export function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
+  return {
+    streamToken: "test-stream-token",
+    messageId,
+    completion: new Promise(() => undefined),
+  };
+}
+
+export function createFailedTurnHandle(
+  messageId: string,
+  failure: { error: string; errorType: StreamErrorType }
+): TurnStreamHandle {
+  return {
+    streamToken: "test-stream-token",
+    messageId,
+    completion: Promise.resolve({
+      status: "failed",
+      messageId,
+      streamError: { messageId, ...failure },
+    }),
+  };
+}
 
 function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
   return {
@@ -56,12 +80,7 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
         return result;
       }
 
-      const handle: TurnStreamHandle = {
-        streamToken: "test-stream-token",
-        messageId: "test-assistant-message",
-        completion: new Promise(() => undefined),
-      };
-      return Ok(handle);
+      return Ok(createStartedTurnHandle("test-assistant-message"));
     }
   );
 
