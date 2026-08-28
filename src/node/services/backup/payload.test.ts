@@ -1745,6 +1745,10 @@ describe("backup payload", () => {
       `env ${muxRoot}/skills/launch.txt`,
       `env -u TOKEN ${muxRoot}/skills/launch.txt`,
       `env env ${muxRoot}/agents/launch.md`,
+      // GNU env changes the wrapped utility's working directory before launch.
+      `env -C ${muxRoot} python3 skills/launch.txt`,
+      `env --chdir=${muxRoot} python3 agents/launch.md`,
+      `env --chd ${muxRoot}/skills tclsh launch.txt`,
       `true; ${muxRoot}/agents/launch.md`,
       `timeout 30 ${muxRoot}/skills/launch.txt`,
       `nohup ${muxRoot}/skills/launch.txt`,
@@ -1780,6 +1784,8 @@ describe("backup payload", () => {
       // The Java launcher expands @argument-files into options before parsing.
       `java @${muxRoot}/skills/args.txt`,
       `java @/tmp/opts.txt --source 17 ${muxRoot}/skills/launch.txt`,
+      // Git searches this directory for external git-<subcommand> executables.
+      `git --exec-path=${muxRoot}/skills leak.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1812,6 +1818,10 @@ describe("backup payload", () => {
       "mcp-server --wrap prlimit --mode coproc",
       "mcp-server < /tmp/input.json",
       "mcp-server --launcher systemd-run",
+      "env -C /opt python3 app.py",
+      `mcp-server --launcher env --chdir=${muxRoot}`,
+      "git --exec-path=/usr/lib/git-core status",
+      `mcp-server --git-exec-path=${muxRoot}/skills`,
       "start-stop-daemon --stop --exec /usr/bin/mcp-server --",
       `mcp-server --launcher start-stop-daemon --exec ${muxRoot}/skills/config.txt`,
       "cmake --build build --target package",
@@ -2047,6 +2057,40 @@ describe("backup payload", () => {
     } finally {
       if (originalStartup === undefined) delete process.env.PYTHONSTARTUP;
       else process.env.PYTHONSTARTUP = originalStartup;
+    }
+  });
+
+  it("localizes PHP launchers under an inherited published PHPRC", async () => {
+    const originalPhpRc = process.env.PHPRC;
+    try {
+      for (const [phpRc, command, expected] of [
+        [`${muxRoot}/skills/php-config.txt`, "php /opt/server.php", REDACTED_BACKUP_VALUE],
+        [`${muxRoot}/skills/php-config.txt`, "php8.3 /opt/server.php", REDACTED_BACKUP_VALUE],
+        // A non-PHP launcher never reads PHPRC.
+        [`${muxRoot}/skills/php-config.txt`, "python3 /opt/server.py", "python3 /opt/server.py"],
+        // A foreign config file is not published by this backup.
+        ["/etc/php.ini", "php /opt/server.php", "php /opt/server.php"],
+      ] as const) {
+        process.env.PHPRC = phpRc;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPhpRc === undefined) delete process.env.PHPRC;
+      else process.env.PHPRC = originalPhpRc;
     }
   });
 

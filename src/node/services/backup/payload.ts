@@ -2209,6 +2209,7 @@ interface LanguageInterpreter {
  * so inherited NODE_OPTIONS preloads execute for them exactly as for node.
  */
 const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "corepack"]);
+const PHP_LAUNCHER_NAME = /^(?:php[0-9.]*|php-win)$/;
 
 const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
@@ -2262,7 +2263,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
   {
-    name: /^(?:php[0-9.]*|php-win)$/,
+    name: PHP_LAUNCHER_NAME,
     evalWord: /^-[nq]*[rRBE]/,
     attachedScriptFile: /^(?:--file=|--process-file=|-[fF])(.+)$/,
     separateScriptFileOption: /^(?:-[fF]|--file|--process-file)$/,
@@ -2342,6 +2343,7 @@ function hasDisguisedAssignment(
   let pendingPrintfVariableOption = false;
   let sawEnv = false;
   let pendingEnvOptionValue = false;
+  let pendingEnvWorkingDirectory = false;
   let pendingNpmSubcommand = false;
   let pendingNpmExecOptions = false;
   let pendingGitSubcommand = false;
@@ -2420,6 +2422,7 @@ function hasDisguisedAssignment(
       pendingBodyName = null;
       sawEnv = false;
       pendingEnvOptionValue = false;
+      pendingEnvWorkingDirectory = false;
       envOperandsOnly = false;
       pendingPrintfVariableOption = false;
       pendingNpmSubcommand = false;
@@ -2532,6 +2535,7 @@ function hasDisguisedAssignment(
         pendingStartStopDaemonExecutable = false;
       }
       pendingEnvOptionValue = false;
+      pendingEnvWorkingDirectory = false;
       pendingNpmExecOptions = false;
       pendingGitRebaseOptions = false;
       pendingJavaOptions = false;
@@ -2573,16 +2577,37 @@ function hasDisguisedAssignment(
     // whitespace, so this runs before the assignment-only exit below. Stop tracking at
     // its command operand: the target program may use -S for an ordinary option.
     if (sawEnv) {
-      if (pendingEnvOptionValue) {
+      if (pendingEnvWorkingDirectory) {
+        pendingEnvWorkingDirectory = false;
+        executesHere = false;
+        const directory = resolveKnownDirectory(unquoted, trackedCwd);
+        if (directory !== null && isUnderCollectedRoot(directory, rootPrefixes)) return true;
+      } else if (pendingEnvOptionValue) {
         pendingEnvOptionValue = false;
         executesHere = false;
       } else if (isSplitStringOption(unquoted)) {
         return true;
-      } else if (envOptionTakesSeparateValue(unquoted)) {
-        pendingEnvOptionValue = true;
-      } else if (!unquoted.startsWith("-")) {
-        sawEnv = false;
-        executesHere = true;
+      } else {
+        const attachedChdir = /^(?:-C(.+)|--([A-Za-z-]+)=(.*))$/.exec(unquoted);
+        const longChdir = attachedChdir?.[2];
+        if (
+          attachedChdir?.[1] !== undefined ||
+          (longChdir !== undefined && "chdir".startsWith(longChdir))
+        ) {
+          const value = attachedChdir?.[1] ?? attachedChdir?.[3] ?? "";
+          const directory = resolveKnownDirectory(value, trackedCwd);
+          if (directory !== null && isUnderCollectedRoot(directory, rootPrefixes)) return true;
+        } else {
+          const longOption = /^--([A-Za-z-]+)$/.exec(unquoted)?.[1];
+          if (unquoted === "-C" || (longOption !== undefined && "chdir".startsWith(longOption))) {
+            pendingEnvWorkingDirectory = true;
+          } else if (envOptionTakesSeparateValue(unquoted)) {
+            pendingEnvOptionValue = true;
+          } else if (!unquoted.startsWith("-")) {
+            sawEnv = false;
+            executesHere = true;
+          }
+        }
       }
     } else if (carrierArmed) {
       if (unquoted.startsWith("-")) {
@@ -2646,18 +2671,22 @@ function hasDisguisedAssignment(
     if (pendingGitSubcommand) {
       if (pendingGitOptionValue) {
         pendingGitOptionValue = false;
-      } else if (gitOptionTakesSeparateValue(unquoted)) {
-        pendingGitOptionValue = true;
-      } else if (!unquoted.startsWith("-")) {
-        pendingGitSubcommand = false;
-        if (unquoted === "config") {
-          pendingGitConfigKey = true;
-        } else if (unquoted === "submodule") {
-          pendingGitSubmoduleAction = true;
-        } else if (unquoted === "rebase") {
-          pendingGitRebaseOptions = true;
-        } else if (unquoted === "filter-branch") {
-          return true;
+      } else {
+        const execPath = /^--exec-path=(.*)$/.exec(unquoted)?.[1];
+        if (execPath !== undefined && isUnderCollectedRoot(execPath, rootPrefixes)) return true;
+        if (gitOptionTakesSeparateValue(unquoted)) {
+          pendingGitOptionValue = true;
+        } else if (!unquoted.startsWith("-")) {
+          pendingGitSubcommand = false;
+          if (unquoted === "config") {
+            pendingGitConfigKey = true;
+          } else if (unquoted === "submodule") {
+            pendingGitSubmoduleAction = true;
+          } else if (unquoted === "rebase") {
+            pendingGitRebaseOptions = true;
+          } else if (unquoted === "filter-branch") {
+            return true;
+          }
         }
       }
     }
@@ -2804,6 +2833,7 @@ function hasDisguisedAssignment(
         }
       }
       if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
+      if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
@@ -3290,6 +3320,8 @@ interface InheritedLaunchContext {
   nodeCodeOptions: boolean;
   /** PYTHONSTARTUP names an auto-published document. */
   pythonStartupHook: boolean;
+  /** PHPRC names an auto-published configuration document. */
+  phpConfigHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3322,6 +3354,7 @@ function redactMcpConfig(
     cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter),
     nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
     pythonStartupHook: isAutoPublishedScriptOperand(process.env.PYTHONSTARTUP ?? "", rootPrefixes),
+    phpConfigHook: isAutoPublishedScriptOperand(process.env.PHPRC ?? "", rootPrefixes),
   };
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
