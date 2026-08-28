@@ -2497,6 +2497,9 @@ describe("backup payload", () => {
           "java Leak",
           REDACTED_BACKUP_VALUE,
         ],
+        // The JVM expands inherited @argument files into further options.
+        ["JDK_JAVA_OPTIONS", `@${muxRoot}/skills/options.txt`, "java Leak", REDACTED_BACKUP_VALUE],
+        ["JDK_JAVA_OPTIONS", "@/opt/options.txt", "java Leak", "java Leak"],
         // Other launchers do not consult the JVM option variables.
         [
           "JAVA_TOOL_OPTIONS",

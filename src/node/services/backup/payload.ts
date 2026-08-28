@@ -3682,6 +3682,14 @@ function hasInheritedJavaLaunchOptions(
     if (typeof value !== "string") continue;
     for (const match of value.matchAll(SHELL_WORD)) {
       const option = unquoteShellWord(match[0]);
+      // The JVM expands an inherited @argument file into options before
+      // parsing, so a published file can inject an agent or boot class path.
+      if (
+        option.startsWith("@") &&
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(option.slice(1)), rootPrefixes)
+      ) {
+        return true;
+      }
       const agent = /^-(?:javaagent|agentpath):([^=]+)/.exec(option)?.[1];
       if (
         agent !== undefined &&
