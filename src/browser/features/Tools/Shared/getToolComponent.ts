@@ -8,6 +8,7 @@ import type { ComponentType } from "react";
 import { z, type ZodSchema } from "zod";
 import {
   TaskTerminateToolArgsSchema,
+  TaskWorkspaceLifecycleToolArgsSchema,
   TOOL_DEFINITIONS,
   type ToolName,
 } from "@/common/utils/tools/toolDefinitions";
@@ -150,6 +151,8 @@ const TOOL_SCHEMA_OVERRIDES: Record<string, ZodSchema> = {
   tool_search: TOOL_DEFINITIONS.tool_catalog_search.schema,
   // task_terminate is retained only for historical task transcripts.
   task_terminate: TaskTerminateToolArgsSchema,
+  // Historical lifecycle transcripts include actions removed from the live input schema.
+  task_workspace_lifecycle: TaskWorkspaceLifecycleToolArgsSchema,
   // Provider-executed web search tools have no catalog definition.
   web_search: z.object({ query: z.string().optional() }),
   // Pending Google search arguments can arrive before queries are parsed.

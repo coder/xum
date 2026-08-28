@@ -4,6 +4,7 @@ import { AgentReportToolCall } from "../AgentReportToolCall";
 import { GenericToolCall } from "../GenericToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
 import { ToolSearchToolCall } from "../ToolSearchToolCall";
+import { WorkspaceLifecycleToolCall } from "../WorkspaceLifecycleToolCall";
 import { getToolComponent } from "./getToolComponent";
 
 describe("getToolComponent", () => {
@@ -21,6 +22,16 @@ describe("getToolComponent", () => {
       })
     ).toBe(AgentReportToolCall);
     expect(getToolComponent("agent_report", {})).toBe(AgentReportToolCall);
+  });
+
+  test("renders historical workspace lifecycle actions", () => {
+    expect(
+      getToolComponent("task_workspace_lifecycle", {
+        action: "remove",
+        targets: [{ workspaceId: "workspace-id" }],
+        force: true,
+      })
+    ).toBe(WorkspaceLifecycleToolCall);
   });
 
   test("falls back when catalog schema validation fails", () => {
