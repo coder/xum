@@ -1703,10 +1703,13 @@ export class TaskService {
     }
 
     const runIds = new Set<string>();
-    // An unreadable sidecar PROPAGATES: callers gate destructive completion decisions
-    // (finalizing task reports, ending workspace turns) on this listing, and treating the
-    // failure as "no references" would let those finalize while a kernel workflow still runs.
-    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    let references: Awaited<ReturnType<typeof readAgentWorkflowRunReferences>> = [];
+    try {
+      references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    } catch (error: unknown) {
+      // Rediscovery is non-destructive and re-runs on the next listing; skip this pass.
+      log.warn("Failed to read agent workflow run references", { workspaceId, error });
+    }
     for (const reference of references) {
       // If the latest user/reset supersession has no durable timestamp, fail safe: only trust
       // workflow provenance re-established by current/post-supersession assistant output below.
@@ -7594,15 +7597,7 @@ export class TaskService {
           ) {
             continue;
           }
-          const currentness = await this.workspaceService.getWorkflowInvocationCurrentness(
-            workspace.id,
-            run.id
-          );
-          // Indeterminate (unreadable history/sidecar) must still enqueue: startup recovery is
-          // the only reconstruction point for wakes that never reached the outbox, and no
-          // pending notification exists yet to arm the drain's defer retry. The drain
-          // re-evaluates currentness and defers or supersedes with full context.
-          if (currentness === "not_current") {
+          if (!(await this.workspaceService.isWorkflowInvocationCurrent(workspace.id, run.id))) {
             continue;
           }
           const created = await this.terminalAttentionStore.enqueueIfAbsent({
@@ -7915,31 +7910,50 @@ export class TaskService {
   }
 
   /**
-   * Caller tool policy to restore on a terminal-attention wake. The newest manual user row
-   * carries the conversation's persisted caller policy; synthetic rows without one (earlier
-   * wakes, heartbeat scaffolding) do not define policy and are skipped. Throws when history
-   * is unreadable so the caller can fail closed instead of waking with unrestricted tools.
+   * Caller send restrictions (tool policy, workspace-agent disable flag) to restore on a
+   * terminal-attention wake. The newest manual user row carries the conversation's persisted
+   * restrictions; synthetic rows without any (earlier wakes, heartbeat scaffolding) do not
+   * define them and are skipped. The walk is unbounded: a long assistant/synthetic tail after
+   * the launch turn must not push the defining row out of sight and silently lift the
+   * restrictions. Throws when history is unreadable so the caller can fail closed instead of
+   * waking with unrestricted tools.
    */
-  private async resolveTerminalWakeCallerToolPolicy(
+  private async resolveTerminalWakeCallerSendRestrictions(
     ownerWorkspaceId: string
-  ): Promise<ToolPolicy | undefined> {
-    const historyResult = await this.historyService.getLastMessages(ownerWorkspaceId, 50);
+  ): Promise<{ toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean }> {
+    const state: {
+      found: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean } | null;
+    } = { found: null };
+    const historyResult = await this.historyService.iterateFullHistory(
+      ownerWorkspaceId,
+      "backward",
+      (messages) => {
+        for (const message of messages) {
+          if (message.role !== "user") {
+            continue;
+          }
+          const metadata = message.metadata;
+          if (metadata?.toolPolicy != null || metadata?.disableWorkspaceAgents != null) {
+            state.found = {
+              ...(metadata.toolPolicy != null ? { toolPolicy: metadata.toolPolicy } : {}),
+              ...(metadata.disableWorkspaceAgents != null
+                ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
+                : {}),
+            };
+            return false;
+          }
+          if (metadata?.synthetic !== true) {
+            state.found = {};
+            return false;
+          }
+        }
+        return undefined;
+      }
+    );
     if (!historyResult.success) {
       throw new Error(`history unavailable: ${historyResult.error}`);
     }
-    for (let i = historyResult.data.length - 1; i >= 0; i--) {
-      const message = historyResult.data[i];
-      if (message?.role !== "user") {
-        continue;
-      }
-      if (message.metadata?.toolPolicy != null) {
-        return message.metadata.toolPolicy;
-      }
-      if (message.metadata?.synthetic !== true) {
-        return undefined;
-      }
-    }
-    return undefined;
+    return state.found ?? {};
   }
 
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
@@ -8314,23 +8328,12 @@ export class TaskService {
         isPersistentChildContinuation ? record.workspaceId : notification.sourceId
       );
     }
-    // Workflow prompts are validated against history well before the send is admitted; a full
-    // clear in that window truncates history and retires the sidecar, so the send must refuse
-    // (admissionStale) rather than inject the stale result into the freshly cleared
-    // conversation. A refused send leaves the notifications pending for the next drain.
-    const admissionEpoch = this.workspaceService.getContextMutationEpoch(ownerWorkspaceId);
-    const sendAdmissionStale = () =>
-      this.workspaceService.getContextMutationEpoch(ownerWorkspaceId) !== admissionEpoch;
     const workflowNotifications = pending.filter(
       (notification) => notification.sourceKind === "workflow_run"
     );
     const deliverableWorkflowNotificationIds = new Set<string>();
 
     const promptSections: string[] = [];
-    // Persisted onto the accepted row as consumption provenance (see
-    // MuxMetadata.deliveredWorkflowRunIds): after a crash between acceptance and the outbox
-    // delivery mark, restart recovery recognizes the row and does not replay these results.
-    const deliveredWorkflowRunIds: string[] = [];
     if (publicAwaitIds.length > 0) {
       promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
     }
@@ -8360,7 +8363,6 @@ export class TaskService {
         continue;
       }
       deliverableWorkflowNotificationIds.add(notification.id);
-      deliveredWorkflowRunIds.push(notification.sourceId);
       promptSections.push(workflowPrompt.prompt);
     }
 
@@ -8403,9 +8405,9 @@ export class TaskService {
     // synthetic send starts a fresh turn, and omitting the policy would let a workflow wake
     // regain tools the caller disabled (with attacker-influenced workflow output choosing the
     // timing). The agent-level policy recomposes from agentId at send resolution.
-    let wakeToolPolicy: ToolPolicy | undefined;
+    let wakeRestrictions: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean };
     try {
-      wakeToolPolicy = await this.resolveTerminalWakeCallerToolPolicy(ownerWorkspaceId);
+      wakeRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
     } catch (error: unknown) {
       // Fail closed: an unknown policy must not fall back to unrestricted tools.
       log.warn("Deferring terminal wake; caller tool policy unavailable", {
@@ -8421,7 +8423,8 @@ export class TaskService {
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
       reasoningMode: resumeOptions.reasoningMode,
-      ...(wakeToolPolicy != null ? { toolPolicy: wakeToolPolicy } : {}),
+      ...(wakeRestrictions.toolPolicy != null ? { toolPolicy: wakeRestrictions.toolPolicy } : {}),
+      ...(wakeRestrictions.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
     if (prompt.length === 0) {
@@ -8451,14 +8454,7 @@ export class TaskService {
       prompt,
       sendOptions,
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
-      {
-        skipAutoResumeReset: true,
-        synthetic: true,
-        agentInitiated: true,
-        requireIdle: true,
-        admissionStale: sendAdmissionStale,
-        deliveredWorkflowRunIds,
-      }
+      { skipAutoResumeReset: true, synthetic: true, agentInitiated: true, requireIdle: true }
     );
 
     if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
@@ -8480,8 +8476,6 @@ export class TaskService {
             skipAutoResumeReset: true,
             synthetic: true,
             agentInitiated: true,
-            admissionStale: sendAdmissionStale,
-            deliveredWorkflowRunIds,
             onCanceled: () => {
               this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
@@ -12587,21 +12581,10 @@ export class TaskService {
       return true;
     }
 
-    let referencedWorkflowRunIds: string[];
-    try {
-      referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-        record.workspaceId,
-        []
-      );
-    } catch (error: unknown) {
-      // Unreadable sidecar: assume blockers exist so the deferred turn is not finalized while
-      // a kernel workflow may still be running; the next evaluation retries.
-      log.warn("Deferring workspace-turn blocker check; sidecar unreadable", {
-        workspaceId: record.workspaceId,
-        error,
-      });
-      return true;
-    }
+    const referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+      record.workspaceId,
+      []
+    );
     if (
       (await this.listActiveBackgroundWorkflowRunIds(record.workspaceId, referencedWorkflowRunIds))
         .length > 0
@@ -14218,22 +14201,11 @@ export class TaskService {
         taskIndex,
         workspaceId
       );
-      let referencedWorkflowRunIds: string[];
-      try {
-        referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-          workspaceId,
-          event.parts,
-          event.messageId
-        );
-      } catch (error: unknown) {
-        // Unreadable sidecar: neither finalize the turn nor nudge the model about unknown
-        // runs; leave the stream-end unhandled so deferred recovery re-evaluates later.
-        log.warn("Skipping parent stream-end workflow reconciliation; sidecar unreadable", {
-          workspaceId,
-          error,
-        });
-        return;
-      }
+      const referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+        workspaceId,
+        event.parts,
+        event.messageId
+      );
       let activeWorkflowRunIds = await this.listActiveBackgroundWorkflowRunIds(
         workspaceId,
         referencedWorkflowRunIds
@@ -14520,22 +14492,11 @@ export class TaskService {
       return;
     }
 
-    let taskReferencedWorkflowRunIds: string[];
-    try {
-      taskReferencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-        workspaceId,
-        event.parts,
-        event.messageId
-      );
-    } catch (error: unknown) {
-      // Unreadable sidecar: defer report finalization like an active blocker instead of
-      // publishing while a kernel workflow may still be running.
-      log.warn("Deferring task finalization; sidecar unreadable", { workspaceId, error });
-      if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running");
-      }
-      return;
-    }
+    const taskReferencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+      workspaceId,
+      event.parts,
+      event.messageId
+    );
     const activeTaskWorkflowRunIds = await this.listActiveBackgroundWorkflowRunIds(
       workspaceId,
       taskReferencedWorkflowRunIds

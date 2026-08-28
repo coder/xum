@@ -27,7 +27,6 @@
  * foreign backend's still-running consolidation refuse arbitrarily late.
  */
 
-import { cancelAgentWorkflowRunReferenceMaintenance } from "@/node/services/agentWorkflowRunReferences";
 import crypto from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -218,10 +217,6 @@ export async function removeSessionDirUnderMemoryLocks(args: {
         // deleted directory cannot be recreated by a late mutation or
         // journal append.
         await publishTombstone();
-        // Detached sidecar maintenance (provenance record retries) would survive removal and
-        // recreate the deleted session directory when its timer fires; cancel and drain it
-        // like the other session writers before the directory goes away.
-        await cancelAgentWorkflowRunReferenceMaintenance(args.sessionDir);
         await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
       }
     );

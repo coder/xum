@@ -329,6 +329,44 @@ describe("workflow_resume tool", () => {
     });
   });
 
+  test("consumes the foreground terminal result even when the refresh read fails", async () => {
+    using tempDir = new TestTempDir("test-workflow-resume-refresh-failure-consume");
+    // WorkflowService.getRun collapses transient read failures to null. The terminal result is
+    // still returned to the model, so consumption must derive from the dispatch result or the
+    // pending terminal attention would re-inject it later.
+    let getRunCalls = 0;
+    const workflowService = buildWorkflowService({
+      getRun: mock(async () => {
+        getRunCalls += 1;
+        return getRunCalls === 1 ? buildRun() : null;
+      }),
+      resumeRun: mock(async () => ({
+        runId: "wfr_resume_me",
+        status: "completed" as const,
+        result: { reportMarkdown: "resumed" },
+      })),
+    });
+    const markWorkflowRunTerminalAttentionConsumed = mock(() => Promise.resolve());
+    const tool = createWorkflowResumeTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService,
+      taskService: { markWorkflowRunTerminalAttentionConsumed } as unknown as TaskService,
+    });
+
+    const result = await tool.execute!(
+      { run_id: "wfr_resume_me", run_in_background: false, mode: null },
+      mockToolCallOptions
+    );
+
+    expect(markWorkflowRunTerminalAttentionConsumed).toHaveBeenCalledWith({
+      ownerWorkspaceId: "workspace-1",
+      runId: "wfr_resume_me",
+      status: "completed",
+    });
+    expect(result).toMatchObject({ status: "completed", runId: "wfr_resume_me", mode: "resume" });
+  });
+
   test("rejects default resume of a failed run with checkpoint retry guidance", async () => {
     using tempDir = new TestTempDir("test-workflow-resume-failed");
     const workflowService = buildWorkflowService({ getRun: mock(async () => buildFailedRun()) });

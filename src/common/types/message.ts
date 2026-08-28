@@ -868,13 +868,6 @@ export interface ModelFallbackRecord {
 
 // Our custom metadata type
 export interface MuxMetadata {
-  /**
-   * Workflow run IDs whose terminal results this synthetic user row delivered (set by the
-   * terminal-attention drain). Currentness checks treat the row as consumption for these runs;
-   * persisted provenance, not text recognition, so repo/user-controlled content quoting a run
-   * ID (e.g. a heartbeat body) cannot spoof consumption and suppress a real wake.
-   */
-  deliveredWorkflowRunIds?: string[];
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)

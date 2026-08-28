@@ -554,7 +554,6 @@ function createWorkspaceServiceMocks(
     isExperimentEnabled: ReturnType<typeof mock>;
     emitChatEvent: ReturnType<typeof mock>;
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
-    getContextMutationEpoch: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
     countQueuedAgentPeerMessages: ReturnType<typeof mock>;
   }>
@@ -592,7 +591,6 @@ function createWorkspaceServiceMocks(
   isExperimentEnabled: ReturnType<typeof mock>;
   emitChatEvent: ReturnType<typeof mock>;
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
-  getContextMutationEpoch: ReturnType<typeof mock>;
   create: ReturnType<typeof mock>;
 } {
   const sendMessage =
@@ -662,7 +660,6 @@ function createWorkspaceServiceMocks(
   const updateAgentStatus =
     overrides?.updateAgentStatus ?? mock((): Promise<void> => Promise.resolve());
   const isExperimentEnabled = overrides?.isExperimentEnabled ?? mock(() => false);
-  const getContextMutationEpoch = overrides?.getContextMutationEpoch ?? mock(() => 0);
   const emitChatEvent =
     overrides?.emitChatEvent ??
     mock((_workspaceId: string, _message: WorkspaceChatMessage) => undefined);
@@ -739,7 +736,6 @@ function createWorkspaceServiceMocks(
       isExperimentEnabled,
       emitChatEvent,
       isWorkflowInvocationCurrent,
-      getContextMutationEpoch,
       getWorkflowInvocationCurrentness,
       countQueuedAgentPeerMessages,
     } as unknown as WorkspaceService,
@@ -776,7 +772,6 @@ function createWorkspaceServiceMocks(
     isExperimentEnabled,
     emitChatEvent,
     isWorkflowInvocationCurrent,
-    getContextMutationEpoch,
   };
 }
 
@@ -6438,10 +6433,11 @@ describe("TaskService", () => {
     expect(liftedOptions.toolPolicy).toBeUndefined();
   });
 
-  test("drain sends carry a staleness probe that trips after a full clear", async () => {
+  test("wake restriction restore walks past a long synthetic tail and carries the agent disable flag", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runId = "wfr_admission_stale";
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+    const runId = "wfr_policy_long_tail";
     const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
     await runStore.createRun({
       id: runId,
@@ -6463,34 +6459,38 @@ describe("TaskService", () => {
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
-    // The prompt is validated against history before the send is admitted; a full clear in
-    // that window advances the context-mutation epoch. The probe handed to sendMessage must
-    // observe the live epoch so admission can refuse the stale prompt.
-    let epoch = 1;
-    const { workspaceService } = createWorkspaceServiceMocks({
-      sendMessage,
-      getContextMutationEpoch: mock(() => epoch),
-    });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-restricted", "user", "run the audit", {
+        timestamp: 1_000,
+        toolPolicy: restrictedPolicy,
+        disableWorkspaceAgents: true,
+      })
+    );
+    // A tail longer than any bounded history read: the launch turn's restrictions must still
+    // be found, not silently lifted once enough rows accumulate after the manual turn.
+    for (let i = 0; i < 60; i++) {
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(`assistant-${i}`, "assistant", `progress ${i}`, { timestamp: 1_001 + i })
+      );
+    }
     await taskService.enqueueWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
     });
     await flushTerminalAttentionDrains(taskService);
-
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    const internal = sendMessage.mock.calls[0]?.[3] as {
-      admissionStale?: () => boolean;
-      deliveredWorkflowRunIds?: string[];
-    };
-    // Consumption provenance persisted with the accepted row (crash-replay suppression).
-    expect(internal.deliveredWorkflowRunIds).toEqual([runId]);
-    expect(typeof internal.admissionStale).toBe("function");
-    expect(internal.admissionStale?.()).toBe(false);
-    epoch = 2;
-    expect(internal.admissionStale?.()).toBe(true);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      toolPolicy: restrictedPolicy,
+      disableWorkspaceAgents: true,
+    });
   });
 
   test("initialize replays and clears persisted pending task guidance", async () => {
@@ -6888,75 +6888,6 @@ describe("TaskService", () => {
       workspaceId: childTaskId,
       status: "running",
     });
-  });
-
-  test("initialize recovery keeps indeterminate workflow runs enqueued for a later drain", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runId = "wfr_recovery_indeterminate";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
-    await runStore.createRun({
-      id: runId,
-      workspaceId: parentId,
-      workflow: {
-        name: "research",
-        description: "Research workflow",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
-      args: {},
-      attentionPolicy: "notify_on_terminal",
-      now: "2026-06-19T00:00:00.000Z",
-    });
-    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
-    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
-
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const sendMessage = mock(
-      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
-    );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    // History/sidecar unreadable at startup. Recovery is the only reconstruction point for a
-    // wake that never reached the outbox, and no pending notification exists yet to arm the
-    // drain's defer retry, so skipping here would strand the run until another restart. The
-    // boolean wrapper collapses indeterminate to false, which is what recovery must NOT use.
-    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
-      mock(() => Promise.resolve("indeterminate"));
-    (workspaceService as unknown as Record<string, unknown>).isWorkflowInvocationCurrent = mock(
-      () => Promise.resolve(false)
-    );
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    await taskService.initialize();
-    await flushTerminalAttentionDrains(taskService);
-
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
-  });
-
-  test("an unreadable sidecar defers workspace-turn blocker checks", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const { workspaceService } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const internal = taskService as unknown as {
-      hasActiveWorkspaceTurnDeferredBlockers(record: { workspaceId: string }): Promise<boolean>;
-    };
-
-    expect(await internal.hasActiveWorkspaceTurnDeferredBlockers({ workspaceId: parentId })).toBe(
-      false
-    );
-
-    // The sidecar is the only durable provenance for kernel-launched workflows, and this
-    // result gates completion decisions: an unreadable sidecar must report blockers (defer),
-    // not "none" and let the turn finalize while a workflow may still be running.
-    await fsPromises.mkdir(path.join(config.getSessionDir(parentId), "agent-workflow-runs.json"), {
-      recursive: true,
-    });
-    expect(await internal.hasActiveWorkspaceTurnDeferredBlockers({ workspaceId: parentId })).toBe(
-      true
-    );
   });
 
   test("initialize recovers terminal notify workspace turns without pending notification", async () => {

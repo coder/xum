@@ -190,6 +190,41 @@ export function buildWorkflowResultContextMessage(input: {
   ].join("\n\n");
 }
 
+/**
+ * Recognize this run's result payload inside a coalesced terminal-attention prompt from the
+ * builder's own output format. The drain's synthetic user row can coalesce several runs into
+ * one message and carries no workflow-result metadata, so currentness checks must read the
+ * consumption evidence out of the text: each payload block is parsed back and matched on the
+ * exact workflow.runId the builder wrote, not on a raw substring, so a run ID merely quoted
+ * inside another run's report cannot count as consumption.
+ */
+export function textContainsWorkflowResultPayload(text: string, runId: string): boolean {
+  assert(runId.length > 0, "textContainsWorkflowResultPayload: runId is required");
+  if (!text.includes(WORKFLOW_RESULT_MESSAGE_OPENING_SENTENCE)) {
+    return false;
+  }
+  const blockPattern = new RegExp(
+    `<${WORKFLOW_RESULT_XML_TAG}>\\n([\\s\\S]*?)\\n</${WORKFLOW_RESULT_XML_TAG}>`,
+    "g"
+  );
+  for (const match of text.matchAll(blockPattern)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(match[1] ?? "");
+    } catch {
+      continue;
+    }
+    if (!isRecordValue(payload)) {
+      continue;
+    }
+    const workflow = payload.workflow;
+    if (isRecordValue(workflow) && workflow.runId === runId) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface WorkflowRunCardInput {
   scriptPath?: string;
   scriptSource?: string;

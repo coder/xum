@@ -2950,8 +2950,6 @@ export class AgentSession {
     internal?: {
       synthetic?: boolean;
       agentInitiated?: boolean;
-      /** Persisted onto the user row; see MuxMetadata.deliveredWorkflowRunIds. */
-      deliveredWorkflowRunIds?: string[];
       goalContinuation?: boolean;
       goalKind?: GoalSyntheticMessageKind;
       /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
@@ -3547,9 +3545,6 @@ export class AgentSession {
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && { synthetic: true, uiVisible: true }),
-        ...(internal?.deliveredWorkflowRunIds != null && internal.deliveredWorkflowRunIds.length > 0
-          ? { deliveredWorkflowRunIds: internal.deliveredWorkflowRunIds }
-          : {}),
       },
       additionalParts
     );
@@ -6395,8 +6390,6 @@ export class AgentSession {
     internal?: {
       synthetic?: boolean;
       agentInitiated?: boolean;
-      /** Persisted onto the user row; see MuxMetadata.deliveredWorkflowRunIds. */
-      deliveredWorkflowRunIds?: string[];
       /** Request-entry authoring time captured before send preflight awaits (see MessageQueue). */
       authoredAtMs?: number;
       /** True only for a report that continues an existing workspace turn. */

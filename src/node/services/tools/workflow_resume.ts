@@ -4,7 +4,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { isTerminalWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
-import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
+import { WorkflowRunRecordSchema, WorkflowRunStatusSchema } from "@/common/orpc/schemas";
 import {
   WorkflowResumeToolResultSchema,
   TOOL_DEFINITIONS,
@@ -158,7 +158,9 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // workflow_resume part in history, so the history-walk consumption predicates cannot see
       // that this turn already received the terminal result. Persist consumption durably so the
       // terminal-attention drain never re-delivers it.
-      const markTerminalAttentionConsumed = async (terminalRun: WorkflowRunRecord) => {
+      const markTerminalAttentionConsumed = async (
+        terminalRun: Pick<WorkflowRunRecord, "id" | "status">
+      ) => {
         if (!isTerminalWorkflowRunStatus(terminalRun.status)) {
           return;
         }
@@ -249,8 +251,14 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
 
       // Foreground only: a background dispatch can still observe the stale pre-dispatch terminal
       // status, and consuming it would tombstone the retried run's future terminal wake.
-      if (!isBackgroundDispatch && refreshedRun != null) {
-        await markTerminalAttentionConsumed(refreshedRun);
+      // Consumption derives from the dispatch result itself, not the refreshed record: the
+      // terminal result is returned to the model below even when the refresh read fails, and
+      // skipping the tombstone would let the pending terminal attention re-inject it later.
+      if (!isBackgroundDispatch) {
+        const dispatchedStatus = WorkflowRunStatusSchema.safeParse(dispatched.status);
+        if (dispatchedStatus.success) {
+          await markTerminalAttentionConsumed({ id: runId, status: dispatchedStatus.data });
+        }
       }
 
       return parseToolResult(

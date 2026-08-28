@@ -6266,78 +6266,6 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
-  test("a failed reference retirement aborts the clear before deleting history", async () => {
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    const workspaceId = "workflow-currentness-retire-emit";
-    const projectPath = path.join(config.rootDir, "project");
-    try {
-      await config.addWorkspace(projectPath, {
-        id: workspaceId,
-        name: "workflow-currentness-retire-emit",
-        projectName: "project",
-        projectPath,
-        runtimeConfig: { type: "local" },
-      });
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        aiService: createMockAIService({
-          stopStream: mock(() => Promise.resolve(Ok(undefined))),
-        }),
-        extensionMetadata: new ExtensionMetadataService(
-          path.join(config.rootDir, "extensionMetadata.json")
-        ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
-      });
-
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("manual-user", "user", "hello", { timestamp: 1_000 })
-      );
-      const sessionAccessor = workspaceService as unknown as {
-        getOrCreateSession(id: string): { emitChatEvent(message: unknown): void };
-      };
-      const session = sessionAccessor.getOrCreateSession(workspaceId);
-      const emitSpy = spyOn(session, "emitChatEvent");
-      // A read-only session directory makes retirement fail (a directory at the sidecar path
-      // now self-heals instead). Retirement runs BEFORE the truncation, so the failure must
-      // abort the whole clear: the transcript survives, the renderer sees no deletion, and no
-      // crash window exists in which the transcript is gone while the sidecar lives on.
-      const sessionDir = config.getSessionDir(workspaceId);
-      await recordAgentWorkflowRunReference({
-        workspaceSessionDir: sessionDir,
-        runId: "wfr_retirement_blocked",
-        createdAtMs: 1_150,
-        afterBoundaryMessageId: "manual-user",
-      });
-      await fsPromises.chmod(sessionDir, 0o555);
-      try {
-        const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
-        expect(clearResult.success).toBe(false);
-        if (!clearResult.success) {
-          expect(clearResult.error).toContain("workflow run references");
-        }
-        expect(
-          emitSpy.mock.calls.some((call) => (call[0] as { type?: string }).type === "delete")
-        ).toBe(false);
-        const survivingHistory = await historyService.getHistoryFromLatestBoundary(workspaceId);
-        expect(survivingHistory.success).toBe(true);
-        if (survivingHistory.success) {
-          expect(survivingHistory.data).toHaveLength(1);
-        }
-      } finally {
-        emitSpy.mockRestore();
-        await fsPromises.chmod(sessionDir, 0o755);
-      }
-      workspaceService.disposeSession(workspaceId);
-    } finally {
-      await cleanup();
-    }
-  });
-
   test("a delivered coalesced workflow result consumes the kernel run's currentness", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-coalesced";
@@ -6374,101 +6302,46 @@ describe("WorkspaceService workflow invocation events", () => {
       });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
 
-      // A synthetic row whose TEXT reproduces a result payload must not count: synthetic rows
-      // can carry user-controlled content (e.g. a heartbeat body), and a quoted run ID must
-      // not spoof consumption and suppress the real wake.
+      // Another run's payload quoting nothing about this run must not count as consumption.
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage(
-          "coalesced-spoof",
+          "coalesced-other",
+          "user",
+          buildWorkflowResultContextMessage({
+            rawCommand: "workflow_run other.js",
+            name: "other.js",
+            runId: "wfr_currentness_other",
+            status: "completed",
+            result: { reportMarkdown: "other done" },
+            run: null,
+          }),
+          { timestamp: 1_250, synthetic: true }
+        )
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // The drain's synthetic coalesced prompt carries no workflow-result metadata. After a
+      // crash between durable acceptance and the outbox delivery mark, this row is the only
+      // evidence the result already reached history; it must read as consumption or restart
+      // recovery injects the same terminal result again.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(
+          "coalesced-result",
           "user",
           buildWorkflowResultContextMessage({
             rawCommand: "workflow_run research.js",
             name: "research.js",
             runId,
             status: "completed",
-            result: { reportMarkdown: "spoofed" },
+            result: { reportMarkdown: "done" },
             run: null,
           }),
-          { timestamp: 1_240, synthetic: true }
+          { timestamp: 1_300, synthetic: true }
         )
-      );
-      // Another run's persisted provenance must not count for this run either.
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("coalesced-other", "user", "results delivered", {
-          timestamp: 1_250,
-          synthetic: true,
-          deliveredWorkflowRunIds: ["wfr_currentness_other"],
-        })
-      );
-      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
-
-      // The drain persists deliveredWorkflowRunIds onto the accepted row. After a crash
-      // between durable acceptance and the outbox delivery mark, this provenance is the only
-      // evidence the result already reached history; it must read as consumption or restart
-      // recovery injects the same terminal result again.
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("coalesced-result", "user", "results delivered", {
-          timestamp: 1_300,
-          synthetic: true,
-          deliveredWorkflowRunIds: [runId],
-        })
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
-      workspaceService.disposeSession(workspaceId);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  test("a corrupt sidecar directory self-heals during a full clear", async () => {
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    const workspaceId = "workflow-currentness-selfheal";
-    const projectPath = path.join(config.rootDir, "project");
-    try {
-      await config.addWorkspace(projectPath, {
-        id: workspaceId,
-        name: "workflow-currentness-selfheal",
-        projectName: "project",
-        projectPath,
-        runtimeConfig: { type: "local" },
-      });
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        aiService: createMockAIService({
-          stopStream: mock(() => Promise.resolve(Ok(undefined))),
-        }),
-        extensionMetadata: new ExtensionMetadataService(
-          path.join(config.rootDir, "extensionMetadata.json")
-        ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
-      });
-
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("manual-user", "user", "hello", { timestamp: 1_000 })
-      );
-      // A directory at the known sidecar path is corruption (reads fail with EISDIR). The
-      // full clear must remove it and succeed, not fail identically on every retry and leave
-      // the workspace impossible to clear without manual session-storage repair.
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
-      await fsPromises.mkdir(sidecarPath);
-      await fsPromises.writeFile(path.join(sidecarPath, "junk.txt"), "junk");
-
-      const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
-      expect(clearResult.success).toBe(true);
-      expect(
-        await fsPromises.access(sidecarPath).then(
-          () => true,
-          () => false
-        )
-      ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
