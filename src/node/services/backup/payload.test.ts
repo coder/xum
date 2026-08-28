@@ -2411,6 +2411,157 @@ describe("backup payload", () => {
     }
   });
 
+  it("canonicalizes symlinked inherited environment entries", async () => {
+    await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+    await fs.writeFile(path.join(muxRoot, "skills", "launch.txt"), "leak");
+    const linkedDir = path.join(tempDir, "xum-lib");
+    await fs.symlink(path.join(muxRoot, "skills"), linkedDir, "dir");
+    const linkedFile = path.join(tempDir, "linked-archive");
+    await fs.symlink(path.join(muxRoot, "skills", "launch.txt"), linkedFile, "file");
+    const foreignFile = path.join(tempDir, "foreign.txt");
+    await fs.writeFile(foreignFile, "data");
+    const foreignLink = path.join(tempDir, "foreign-archive");
+    await fs.symlink(foreignFile, foreignLink, "file");
+    const variableNames = [
+      "LD_LIBRARY_PATH",
+      "LD_PRELOAD",
+      "PYTHONPATH",
+      "CLASSPATH",
+      "PYTHONSTARTUP",
+    ] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, command, expected] of [
+        // A loader search directory symlinked into the root resolves the preload.
+        [
+          { LD_LIBRARY_PATH: linkedDir, LD_PRELOAD: "launch.txt" },
+          "mcp-server --transport stdio",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A preload spelling symlinked to a published document localizes.
+        [{ LD_PRELOAD: linkedFile }, "mcp-server --transport stdio", REDACTED_BACKUP_VALUE],
+        [{ PYTHONPATH: linkedFile }, "python3 -m leak", REDACTED_BACKUP_VALUE],
+        [{ CLASSPATH: linkedFile }, "java Leak", REDACTED_BACKUP_VALUE],
+        [{ PYTHONSTARTUP: linkedFile }, "python3 -i", REDACTED_BACKUP_VALUE],
+        // A symlink to a foreign file stays portable.
+        [{ PYTHONPATH: foreignLink }, "python3 -m leak", "python3 -m leak"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes Java launchers under inherited published boot class paths", async () => {
+    const variableNames = ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, command, expected] of [
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-Xbootclasspath/a:${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "_JAVA_OPTIONS",
+          `-Xbootclasspath:${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Boot class paths split on the platform delimiter.
+        [
+          "JDK_JAVA_OPTIONS",
+          `-Xbootclasspath/p:/opt/lib${path.delimiter}${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Other launchers do not consult the JVM option variables.
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-Xbootclasspath/a:${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign archive is not a collected document.
+        ["JAVA_TOOL_OPTIONS", "-Xbootclasspath/a:/opt/lib/leak.jar", "java Leak", "java Leak"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes sqlite3 command options", async () => {
+    for (const [command, expected] of [
+      // -cmd hands its operand to SQLite's own parse before stdin.
+      ["sqlite3 -cmd .dump :memory:", REDACTED_BACKUP_VALUE],
+      ["sqlite3 --cmd .dump :memory:", REDACTED_BACKUP_VALUE],
+      // Both dash spellings of -init name the startup file.
+      [`sqlite3 --init ${muxRoot}/skills/launch.txt :memory:`, REDACTED_BACKUP_VALUE],
+      ["sqlite3 --init /opt/init.sql :memory:", "sqlite3 --init /opt/init.sql :memory:"],
+      ["sqlite3 :memory:", "sqlite3 :memory:"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
   it("localizes command-valued git -c and --config-env overrides", async () => {
     for (const [command, expected] of [
       // The assignment redaction replaces an unquoted `-c` value before the

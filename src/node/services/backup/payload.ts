@@ -1918,6 +1918,22 @@ function isUnderCollectedRoot(unquoted: string, rootPrefixes: readonly string[])
   );
 }
 
+/**
+ * Inherited environment paths resolve on this machine, so a symlinked spelling
+ * reaches the same collected documents; the canonical target decides. A path
+ * that does not resolve keeps its lexical spelling, and a relative spelling
+ * stays lexical because it resolves against the server's own working
+ * directory, not this process's.
+ */
+function canonicalizeInheritedPath(target: string): string {
+  if (!/^(?:\/|\\|[a-z]:)/i.test(target)) return target;
+  try {
+    return realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+
 /** Known npm commands and aliases terminate global-option parsing. */
 const NPM_SUBCOMMANDS = new Set(
   "access adduser audit bugs cache ci completion config dedupe deprecate diff dist-tag docs doctor edit exec explain explore find-dupes fund get help help-search hook init install install-ci-test install-test link ll login logout ls org outdated owner pack ping pkg prefix profile prune publish query rebuild repo restart root run-script sbom search set shrinkwrap star stars start stop team test token uninstall unpublish unstar update version view whoami add add-user author c cit clean-install clean-install-test create ddp dist-tags find hlep home i ic in info innit ins inst insta instal install-clean isnt isnta isntal isntall isntall-clean issues it la list ln ogr r rb remove rm rum run s se show sit t tst udpate un unlink up upgrade urn v verison why x".split(
@@ -2828,8 +2844,14 @@ function hasDisguisedAssignment(
     if (pendingSqliteInitFile) {
       pendingSqliteInitFile = false;
       if (isShellResolvedPublishedOperand(unquoted)) return true;
-    } else if (pendingSqliteOptions && unquoted === "-init") {
+    } else if (pendingSqliteOptions && /^--?init$/.test(unquoted)) {
+      // SQLite accepts every option with one or two leading dashes.
       pendingSqliteInitFile = true;
+    } else if (pendingSqliteOptions && /^--?cmd$/.test(unquoted)) {
+      // -cmd runs its operand through SQLite's own parse before stdin, an
+      // evaluation channel this scan cannot follow (.shell and dot-command
+      // quoting), so it localizes like other eval words.
+      return true;
     }
     if (pendingJavaClassPathValue) {
       pendingJavaClassPathValue = false;
@@ -2976,7 +2998,9 @@ function hasDisguisedAssignment(
       }
       if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
       if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
-      if (inherited.javaAgentHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.javaLaunchOptionsHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) {
+        return true;
+      }
       // A published sys.path or class-path archive executes through the plain
       // launcher (`python3 -m leak`, `java Leak`) without spelling the root.
       if (inherited.pythonPathHook && PYTHON_LAUNCHER_NAME.test(executable)) return true;
@@ -3484,8 +3508,8 @@ interface InheritedLaunchContext {
   javaClassPathHook: boolean;
   /** PHPRC names an auto-published configuration document. */
   phpConfigHook: boolean;
-  /** A JVM environment variable names an auto-published Java agent archive. */
-  javaAgentHook: boolean;
+  /** A JVM option variable names an auto-published agent or boot-class-path archive. */
+  javaLaunchOptionsHook: boolean;
   /** A LUA_INIT variable's @file form names an auto-published document. */
   luaStartupHook: boolean;
   /** An inherited dynamic-loader preload list names an auto-published document. */
@@ -3504,7 +3528,12 @@ function hasInheritedNodeCodeOptions(value: unknown): boolean {
   return false;
 }
 
-function hasInheritedJavaAgent(
+/**
+ * JVM option variables inject execution into every launched JVM: an agent
+ * archive runs its premain, and a boot-class-path entry supplies executable
+ * classes ahead of the application regardless of filename extension.
+ */
+function hasInheritedJavaLaunchOptions(
   values: readonly unknown[],
   rootPrefixes: readonly string[]
 ): boolean {
@@ -3513,7 +3542,22 @@ function hasInheritedJavaAgent(
     for (const match of value.matchAll(SHELL_WORD)) {
       const option = unquoteShellWord(match[0]);
       const agent = /^-(?:javaagent|agentpath):([^=]+)/.exec(option)?.[1];
-      if (agent !== undefined && isAutoPublishedScriptOperand(agent, rootPrefixes)) return true;
+      if (
+        agent !== undefined &&
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(agent), rootPrefixes)
+      ) {
+        return true;
+      }
+      const bootClassPath = /^-Xbootclasspath(?:\/[ap])?:(.+)$/.exec(option)?.[1];
+      if (
+        bootClassPath
+          ?.split(path.delimiter)
+          .some((entry) =>
+            isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+          ) === true
+      ) {
+        return true;
+      }
     }
   }
   return false;
@@ -3525,7 +3569,9 @@ function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
     // @ prefix names a file, and any other value is inline code, not a document.
     if (!/^LUA_INIT(?:_\d+_\d+)?$/.test(name)) continue;
     if (typeof value !== "string" || !value.startsWith("@")) continue;
-    if (isAutoPublishedScriptOperand(value.slice(1), rootPrefixes)) return true;
+    if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(value.slice(1)), rootPrefixes)) {
+      return true;
+    }
   }
   return false;
 }
@@ -3539,11 +3585,13 @@ function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
  * inherited library search path before the default directories.
  */
 function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
-  const linuxSearchDirs = (process.env.LD_LIBRARY_PATH ?? "").split(/[:;]/);
+  const linuxSearchDirs = (process.env.LD_LIBRARY_PATH ?? "")
+    .split(/[:;]/)
+    .map(canonicalizeInheritedPath);
   const dyldSearchDirs = [
     ...(process.env.DYLD_LIBRARY_PATH ?? "").split(":"),
     ...(process.env.DYLD_FALLBACK_LIBRARY_PATH ?? "").split(":"),
-  ];
+  ].map(canonicalizeInheritedPath);
   const preloadLists: ReadonlyArray<readonly [unknown, RegExp, readonly string[]]> = [
     [process.env.LD_PRELOAD, /[:\s]+/, linuxSearchDirs],
     [process.env.LD_AUDIT, /[:\s]+/, linuxSearchDirs],
@@ -3554,10 +3602,15 @@ function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
     for (const entry of value.split(delimiter)) {
       if (entry === "") continue;
       if (/[/\\]/.test(entry)) {
-        if (isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+        if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)) {
+          return true;
+        }
       } else {
         for (const dir of searchDirs) {
-          if (dir !== "" && isAutoPublishedScriptOperand(`${dir}/${entry}`, rootPrefixes)) {
+          if (
+            dir !== "" &&
+            isAutoPublishedScriptOperand(canonicalizeInheritedPath(`${dir}/${entry}`), rootPrefixes)
+          ) {
             return true;
           }
         }
@@ -3584,27 +3637,29 @@ function redactMcpConfig(
       // A PATH entry can reach the collected root through a symlink, so filter
       // on the canonical target; joining a bare name against that spelling then
       // matches the published document it actually resolves to.
-      .map((entry) => {
-        try {
-          return realpathSync(entry);
-        } catch {
-          return entry;
-        }
-      })
+      .map(canonicalizeInheritedPath)
       .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes)),
-    cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter),
+    cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter).map(canonicalizeInheritedPath),
     nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
-    pythonStartupHook: isAutoPublishedScriptOperand(process.env.PYTHONSTARTUP ?? "", rootPrefixes),
+    pythonStartupHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.PYTHONSTARTUP ?? ""),
+      rootPrefixes
+    ),
     pythonPathHook: (process.env.PYTHONPATH ?? "")
       .split(path.delimiter)
-      .some((entry) => isAutoPublishedScriptOperand(entry, rootPrefixes)),
-    javaClassPathHook: javaClassPathPublishesExecutable(
-      process.env.CLASSPATH ?? "",
-      rootPrefixes,
-      null
+      .some((entry) =>
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+      ),
+    javaClassPathHook: (process.env.CLASSPATH ?? "")
+      .split(path.delimiter)
+      .some((entry) =>
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+      ),
+    phpConfigHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.PHPRC ?? ""),
+      rootPrefixes
     ),
-    phpConfigHook: isAutoPublishedScriptOperand(process.env.PHPRC ?? "", rootPrefixes),
-    javaAgentHook: hasInheritedJavaAgent(
+    javaLaunchOptionsHook: hasInheritedJavaLaunchOptions(
       [process.env.JAVA_TOOL_OPTIONS, process.env._JAVA_OPTIONS, process.env.JDK_JAVA_OPTIONS],
       rootPrefixes
     ),
