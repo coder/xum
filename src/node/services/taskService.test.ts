@@ -710,24 +710,28 @@ function createWorkspaceServiceMocks(
 // Registers the created workspace-turn checkout in config the way the real create()
 // would, so handle persistence and cleanup paths see a config entry.
 function makeWorkspaceTurnCreateMock(config: Config, projectPath: string) {
-  return mock(async (...args: unknown[]): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
-    const tags = args[7] as Record<string, string> | undefined;
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push({
-        path: path.join(projectPath, "workspace-turn"),
-        id: "childworkspace",
-        name: "workspace-turn",
-        title: "Workspace turn",
-        createdAt: "2026-06-19T00:00:00.000Z",
-        runtimeConfig: { type: "local" },
-        tags,
+  return mock(
+    async (
+      ...args: Parameters<WorkspaceHost["create"]>
+    ): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+      const tags = args[7];
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push({
+          path: path.join(projectPath, "workspace-turn"),
+          id: "childworkspace",
+          name: "workspace-turn",
+          title: "Workspace turn",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          tags,
+        });
+        return cfg;
       });
-      return cfg;
-    });
-    return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
-  });
+      return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+    }
+  );
 }
 
 function makeCreateMockReturning(result: Result<{ metadata: WorkspaceMetadata }>) {

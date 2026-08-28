@@ -6143,8 +6143,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     operation: () => Promise<T>
   ): Promise<T> {
     const integration = this.agentTaskIntegration;
-    const withLock = integration?.withTaskTreeLifecycleLock.bind(integration);
-    return withLock == null ? await operation() : await withLock(workspaceId, operation);
+    return integration == null
+      ? await operation()
+      : await integration.withTaskTreeLifecycleLock(workspaceId, operation);
   }
 
   async remove(workspaceId: string, force = false): Promise<Result<void>> {

@@ -11934,7 +11934,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
       makeAgentTaskIntegrationFake({
         markInterruptedTaskRunning,
         restoreInterruptedTaskAfterResumeFailure,
-        resetAutoResumeCount: mock(() => undefined),
       })
     );
 
@@ -16761,7 +16760,6 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   test("archive() rechecks durably active workflow runs after arming the admission gate", async () => {
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({
-        hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
         hasActiveTopLevelWorkflowRunsForWorkspace: mock(() => Promise.resolve(true)),
       })
     );
