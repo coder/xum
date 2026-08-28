@@ -4836,6 +4836,17 @@ export class AgentSession {
     acpPromptId?: string,
     preStartErrors?: StreamErrorPayload[] | null
   ): Promise<AgentSessionResult<void>> {
+    // A disposed session must not persist retry/goal state or error rows
+    // post-teardown (mirrors consumeTurnCompletion). Settle collected recovery
+    // decisions in memory so waiters cannot hang, then skip all recovery
+    // bookkeeping; failureHandled keeps callers from running theirs.
+    if (this.disposed) {
+      for (const payload of preStartErrors ?? []) {
+        this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+      }
+      return { success: false, error, failureHandled: true };
+    }
+
     // Collected pre-start error events own this failure; the branches below
     // only cover failures that produced no error event.
     if (preStartErrors != null && preStartErrors.length > 0) {

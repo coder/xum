@@ -541,6 +541,41 @@ describe("AgentSession disposal race conditions", () => {
     }
   });
 
+  test("skips handle-less startup-failure recovery when disposal begins mid-startup", async () => {
+    const commitDeferred = createDeferred<Result<void>>();
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId: "ws-dispose-startup-failure",
+    });
+    try {
+      spyOn(historyService, "commitPartial").mockReturnValueOnce(commitDeferred.promise);
+      const errorSink = session as unknown as {
+        handleStreamError: (data: unknown) => Promise<void>;
+        handleStreamFailureForAutoRetry: (failure: unknown) => Promise<void>;
+      };
+      const handleStreamErrorSpy = spyOn(errorSink, "handleStreamError");
+      const autoRetrySpy = spyOn(errorSink, "handleStreamFailureForAutoRetry");
+
+      const resumePromise = session.resumeStream({
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+      });
+      // Let the resume park on the pending commitPartial before disposing.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      session.dispose();
+      commitDeferred.resolve(Err("workspace removed mid-startup"));
+
+      const result = await resumePromise;
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.failureHandled).toBe(true);
+      }
+      expect(handleStreamErrorSpy).not.toHaveBeenCalled();
+      expect(autoRetrySpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("preserves synthetic flag when flushing queued messages", () => {
     const aiService: AIService = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
