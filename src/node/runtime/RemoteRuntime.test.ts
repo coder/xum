@@ -169,6 +169,29 @@ describe("RemoteRuntime.readFile", () => {
   });
 });
 
+describe("RemoteRuntime file operation aborts", () => {
+  it("stat settles immediately when aborted instead of waiting out path resolution", async () => {
+    const runtime = new RecordingRemoteRuntime();
+    let resolverSettled = false;
+    runtime.resolvePath = () =>
+      new Promise((resolve) =>
+        setTimeout(() => {
+          resolverSettled = true;
+          resolve("/workspace");
+        }, 1000)
+      );
+    const controller = new AbortController();
+    controller.abort();
+
+    const rejected = await runtime.stat("relative/file.txt", controller.signal).then(
+      () => false,
+      () => true
+    );
+    expect(rejected).toBe(true);
+    expect(resolverSettled).toBe(false);
+  });
+});
+
 describe("RemoteRuntime.writeFile", () => {
   it("does not start a remote write command when aborted before the first write", async () => {
     const runtime = new RecordingRemoteRuntime();
