@@ -2934,6 +2934,9 @@ function hasDisguisedAssignment(
       if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.javaAgentHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.luaStartupHook && LUA_LAUNCHER_NAME.test(executable)) return true;
+      // The dynamic loader injects an inherited published preload into every
+      // dynamically linked launcher, ahead of whatever the command runs.
+      if (inherited.loaderPreloadHook) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "mise") pendingMiseSubcommand = true;
@@ -3433,6 +3436,8 @@ interface InheritedLaunchContext {
   javaAgentHook: boolean;
   /** A LUA_INIT variable's @file form names an auto-published document. */
   luaStartupHook: boolean;
+  /** An inherited dynamic-loader preload list names an auto-published document. */
+  loaderPreloadHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3473,6 +3478,27 @@ function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * The dynamic loader runs inherited preload/audit objects inside every
+ * dynamically linked launcher before the command, and accepts a shared object
+ * regardless of filename suffix. glibc splits its lists on colons or spaces;
+ * dyld's DYLD_INSERT_LIBRARIES is colon-separated, preserving spaced paths.
+ */
+function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
+  const preloadLists: ReadonlyArray<readonly [unknown, RegExp]> = [
+    [process.env.LD_PRELOAD, /[:\s]+/],
+    [process.env.LD_AUDIT, /[:\s]+/],
+    [process.env.DYLD_INSERT_LIBRARIES, /:/],
+  ];
+  for (const [value, delimiter] of preloadLists) {
+    if (typeof value !== "string") continue;
+    for (const entry of value.split(delimiter)) {
+      if (entry !== "" && isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+    }
+  }
+  return false;
+}
+
 function redactMcpConfig(
   content: Buffer,
   muxRoot: string
@@ -3487,6 +3513,16 @@ function redactMcpConfig(
   const inherited: InheritedLaunchContext = {
     publishedPathDirs: (process.env.PATH ?? "")
       .split(path.delimiter)
+      // A PATH entry can reach the collected root through a symlink, so filter
+      // on the canonical target; joining a bare name against that spelling then
+      // matches the published document it actually resolves to.
+      .map((entry) => {
+        try {
+          return realpathSync(entry);
+        } catch {
+          return entry;
+        }
+      })
       .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes)),
     cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter),
     nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
@@ -3497,6 +3533,7 @@ function redactMcpConfig(
       rootPrefixes
     ),
     luaStartupHook: hasInheritedLuaStartupFile(rootPrefixes),
+    loaderPreloadHook: hasInheritedLoaderPreload(rootPrefixes),
   };
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");

@@ -1984,6 +1984,47 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes bare commands through a PATH entry symlinked into the root", async () => {
+    // A PATH entry outside the root can still reach published documents through
+    // a symlink, so the filter canonicalizes each entry before testing it.
+    await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+    const linkedBin = path.join(tempDir, "xum-bin");
+    await fs.symlink(path.join(muxRoot, "skills"), linkedBin, "dir");
+    const foreignTarget = path.join(tempDir, "foreign-bin");
+    await fs.mkdir(foreignTarget);
+    const foreignLink = path.join(tempDir, "foreign-link");
+    await fs.symlink(foreignTarget, foreignLink, "dir");
+    const originalPath = process.env.PATH;
+    try {
+      for (const [pathEntry, command, expected] of [
+        [linkedBin, "launch.txt --serve", REDACTED_BACKUP_VALUE],
+        // A published name stays portable when only a foreign symlink precedes it.
+        [foreignLink, "launch.txt --serve", "launch.txt --serve"],
+        [linkedBin, "mcp-server --transport stdio", "mcp-server --transport stdio"],
+      ] as const) {
+        process.env.PATH = `${pathEntry}${path.delimiter}${originalPath ?? ""}`;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
   it("resolves relative cd targets through inherited CDPATH", async () => {
     const originalCdPath = process.env.CDPATH;
     const command = "cd skills && ruby launch.txt";
@@ -2209,6 +2250,46 @@ describe("backup payload", () => {
           muxRoot,
           "mcp.jsonc",
           JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes commands under an inherited published dynamic-loader preload", async () => {
+    const variableNames = ["LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, expected] of [
+        ["LD_PRELOAD", `${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
+        // glibc also splits the preload list on colons and spaces.
+        ["LD_PRELOAD", `/opt/lib/probe.so:${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
+        ["LD_AUDIT", `${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
+        ["DYLD_INSERT_LIBRARIES", `${muxRoot}/agents/launch.md`, REDACTED_BACKUP_VALUE],
+        // A foreign preload is not a collected document.
+        ["LD_PRELOAD", "/opt/lib/probe.so", "mcp-server --transport stdio"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command: "mcp-server --transport stdio" } } })
         );
         const payload = await createBackupPayload({
           muxRoot,
