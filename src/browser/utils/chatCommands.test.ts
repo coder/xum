@@ -1582,6 +1582,32 @@ describe("prepareCompactionMessage", () => {
     expect(metadata.parsed.followUpContent?.agentId).toBe("exec");
   });
 
+  test("compaction recovery keeps the persisted follow-up's restrictions when retry options lack them", () => {
+    // Retrying a failed compaction passes the already-persisted follow-up together with
+    // storage-derived send options, which never carry a caller toolPolicy. The preserved
+    // restrictions must survive that recomposition or the recovered follow-up resumes with
+    // unrestricted caller tools.
+    const recoveredFollowUp = {
+      text: "Keep building",
+      model: "openai:gpt-4o",
+      agentId: "code",
+      toolPolicy: [{ regex_match: "^bash$", action: "disable" as const }],
+      disableWorkspaceAgents: true,
+    };
+    const { metadata } = prepareCompactionMessage({
+      workspaceId: "ws-1",
+      followUpContent: recoveredFollowUp,
+      sendMessageOptions: { model: "anthropic:claude-sonnet-4-6", agentId: "exec" },
+    });
+
+    expectCompactionMetadata(metadata);
+    expect(metadata.parsed.followUpContent?.toolPolicy).toEqual(recoveredFollowUp.toolPolicy);
+    expect(metadata.parsed.followUpContent?.disableWorkspaceAgents).toBe(true);
+    // Existing model/agentId still win over the retry-time options.
+    expect(metadata.parsed.followUpContent?.model).toBe("openai:gpt-4o");
+    expect(metadata.parsed.followUpContent?.agentId).toBe("code");
+  });
+
   test("does not create followUpContent when no text or images provided", () => {
     const sendMessageOptions = createBaseOptions();
     const { metadata } = prepareCompactionMessage({

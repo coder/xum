@@ -74,24 +74,39 @@ type PreservedSendOptions = Pick<
  * Use this helper to avoid duplicating the field list when building CompactionFollowUpRequest.
  */
 export function pickPreservedSendOptions(options: SendMessageOptions): PreservedSendOptions {
+  // Unset fields are OMITTED, not emitted as explicit undefined: compaction recovery spreads
+  // this pick over an already-persisted follow-up, and an undefined key would clobber the
+  // original preserved value (e.g. a restricted turn's toolPolicy) instead of leaving it.
   return {
-    thinkingLevel: options.thinkingLevel,
-    reasoningMode: options.reasoningMode,
-    additionalSystemInstructions: options.additionalSystemInstructions,
-    providerOptions: options.providerOptions,
+    ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
+    ...(options.reasoningMode !== undefined ? { reasoningMode: options.reasoningMode } : {}),
+    ...(options.additionalSystemInstructions !== undefined
+      ? { additionalSystemInstructions: options.additionalSystemInstructions }
+      : {}),
+    ...(options.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
     // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
     // can persist across restarts and build versions.
-    experiments: withLegacyPtcExclusiveMirror(options.experiments),
-    disableWorkspaceAgents: options.disableWorkspaceAgents,
+    ...(options.experiments !== undefined
+      ? { experiments: withLegacyPtcExclusiveMirror(options.experiments) }
+      : {}),
+    ...(options.disableWorkspaceAgents !== undefined
+      ? { disableWorkspaceAgents: options.disableWorkspaceAgents }
+      : {}),
     // Security: a restricted turn (including a terminal-wake send restoring the caller's
     // policy) that triggers on-send compaction must not redispatch its follow-up allow-all.
-    toolPolicy: options.toolPolicy,
+    ...(options.toolPolicy !== undefined ? { toolPolicy: options.toolPolicy } : {}),
     // Delegated turns with explicit agent overrides must stay loud across the
     // compaction replay too — dropping this would let the follow-up silently
     // fall back to exec if the agent vanished in the meantime.
-    strictAgentResolution: options.strictAgentResolution,
-    allowAgentSetGoal: options.allowAgentSetGoal,
-    skipAiSettingsPersistence: options.skipAiSettingsPersistence,
+    ...(options.strictAgentResolution !== undefined
+      ? { strictAgentResolution: options.strictAgentResolution }
+      : {}),
+    ...(options.allowAgentSetGoal !== undefined
+      ? { allowAgentSetGoal: options.allowAgentSetGoal }
+      : {}),
+    ...(options.skipAiSettingsPersistence !== undefined
+      ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
+      : {}),
   };
 }
 
