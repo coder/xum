@@ -169,7 +169,18 @@ describe("workflow_resume tool", () => {
 
   test("resumes in background and records an agent workflow run reference", async () => {
     using tempDir = new TestTempDir("test-workflow-resume-bg");
-    const workflowService = buildWorkflowService();
+    // The reference must be durable BEFORE the dispatch: background execution starts at lease
+    // acquisition, and a fast run could otherwise reach terminal state with no provenance.
+    let referenceDurableAtDispatch = false;
+    const workflowService = buildWorkflowService({
+      resumeRunInBackground: mock(async () => {
+        const references = await readAgentWorkflowRunReferences(tempDir.path);
+        referenceDurableAtDispatch = references.some(
+          (reference) => reference.runId === "wfr_resume_me"
+        );
+        return { runId: "wfr_resume_me", status: "running" as const, result: null };
+      }),
+    });
     const tool = createWorkflowResumeTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
       trusted: false,
@@ -187,6 +198,7 @@ describe("workflow_resume tool", () => {
       projectTrusted: false,
     });
     expect(workflowService.resumeRun).not.toHaveBeenCalled();
+    expect(referenceDurableAtDispatch).toBe(true);
     const references = await readAgentWorkflowRunReferences(tempDir.path);
     expect(references.map((reference) => reference.runId)).toContain("wfr_resume_me");
     expect(result).toMatchObject({ status: "running", runId: "wfr_resume_me", mode: "resume" });

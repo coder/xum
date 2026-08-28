@@ -14,8 +14,13 @@ import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptR
 import { TestTempDir, createTestToolConfig, writeProjectSkill } from "./testHelpers";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import type { TaskService } from "@/node/services/taskService";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
+
+type BackgroundStartInput = Parameters<
+  NonNullable<NonNullable<ToolConfiguration["workflowService"]>["startWorkflowInBackground"]>
+>[0];
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -645,11 +650,23 @@ describe("workflow_run tool", () => {
     const startWorkflow = mock(async () => {
       throw new Error("foreground start should not be used");
     });
-    const startWorkflowInBackground = mock(async () => ({
-      runId: "wfr_background",
-      status: "running" as const,
-      result: null,
-    }));
+    // Faithful to WorkflowService: onRunCreated is awaited at run creation, before the runner
+    // starts executing. The probe checks the sidecar reference is already durable at that
+    // point, so a fast run (or a crash) after launch cannot lose its terminal wake.
+    let referenceDurableBeforeRunnerStart = false;
+    const startWorkflowInBackground = mock(async (input: BackgroundStartInput) => {
+      await input.onRunCreated?.({
+        runId: "wfr_background",
+        status: "pending",
+        result: null,
+        run: null,
+      });
+      const references = await readAgentWorkflowRunReferences(tempDir.path);
+      referenceDurableBeforeRunnerStart = references.some(
+        (reference) => reference.runId === "wfr_background"
+      );
+      return { runId: "wfr_background", status: "running" as const, result: null };
+    });
     const getRun = mock(async () => null);
     const getWorkflowInvocationBoundaryMessageId = mock(async () => "boundary-row-1");
     const tool = createWorkflowRunTool({
@@ -668,6 +685,7 @@ describe("workflow_run tool", () => {
       mockToolCallOptions
     );
 
+    expect(referenceDurableBeforeRunnerStart).toBe(true);
     // The reference must persist the invocation-boundary snapshot: currentness compares row
     // identity, so a reference recorded without it fails safe and the wake is dropped.
     const references = await readAgentWorkflowRunReferences(tempDir.path);
@@ -697,11 +715,15 @@ describe("workflow_run tool", () => {
   test("records a rediscovery-only reference when the boundary snapshot fails", async () => {
     using tempDir = new TestTempDir("test-workflow-run-tool-boundary-error");
     const scriptPath = await writeWorkflowScript(tempDir.path);
-    const startWorkflowInBackground = mock(async () => ({
-      runId: "wfr_boundary_error",
-      status: "running" as const,
-      result: null,
-    }));
+    const startWorkflowInBackground = mock(async (input: BackgroundStartInput) => {
+      await input.onRunCreated?.({
+        runId: "wfr_boundary_error",
+        status: "pending",
+        result: null,
+        run: null,
+      });
+      return { runId: "wfr_boundary_error", status: "running" as const, result: null };
+    });
     const getWorkflowInvocationBoundaryMessageId = mock(async () => {
       throw new Error("history read failed");
     });
