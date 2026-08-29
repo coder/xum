@@ -50,7 +50,8 @@ export interface PreparedMessagePayload {
 }
 
 export function prepareMessagePayload(input: PrepareMessagePayloadInput): PreparedMessagePayload {
-  const fileParts = input.fileParts ?? chatAttachmentsToFileParts(input.attachments, { validate: true });
+  const fileParts =
+    input.fileParts ?? chatAttachmentsToFileParts(input.attachments, { validate: true });
   const sendFileParts = input.editMessageId
     ? fileParts
     : fileParts.length > 0

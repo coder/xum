@@ -32,16 +32,18 @@ interface UseComposerDraftOptions {
 }
 
 export function useComposerDraft(options: UseComposerDraftOptions) {
+  const { attachedReviews, creationProjectPath, pendingDraftId, pushToast, variant, workspaceId } =
+    options;
   const scopeId =
-    options.variant === "workspace"
-      ? (options.workspaceId ?? "")
-      : options.pendingDraftId?.trim().length
-        ? getDraftScopeId(options.creationProjectPath, options.pendingDraftId)
-        : getPendingScopeId(options.creationProjectPath);
+    variant === "workspace"
+      ? (workspaceId ?? "")
+      : pendingDraftId?.trim().length
+        ? getDraftScopeId(creationProjectPath, pendingDraftId)
+        : getPendingScopeId(creationProjectPath);
   const inputKey = getInputKey(scopeId);
   const attachmentsKey = getInputAttachmentsKey(scopeId);
   const modelKey = getModelKey(
-    options.variant === "creation" ? getProjectScopeId(options.creationProjectPath) : scopeId
+    variant === "creation" ? getProjectScopeId(creationProjectPath) : scopeId
   );
   const [input, setInput] = usePersistedState(inputKey, "", { listener: true });
   const latestInputValueRef = useRef(input);
@@ -70,7 +72,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
         else if (tooLargeToastKeyRef.current !== attachmentsKey) {
           tooLargeToastKeyRef.current = attachmentsKey;
-          options.pushToast({
+          pushToast({
             type: "error",
             message:
               "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
@@ -79,7 +81,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         }
         return next;
       }),
-    [attachmentsKey, options.pushToast]
+    [attachmentsKey, pushToast]
   );
   useEffect(() => {
     tooLargeToastKeyRef.current = null;
@@ -121,9 +123,9 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
   const reviews = reviewOverrideActive
     ? draftReviewItems
-    : options.attachedReviews.map((review) => review.data);
+    : attachedReviews.map((review) => review.data);
   const reviewData = reviews.length > 0 ? reviews : undefined;
-  const reviewIdsForCheck = reviewOverrideActive ? [] : options.attachedReviews.map(({ id }) => id);
+  const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map(({ id }) => id);
   const reviewPanelItems = reviewOverrideActive
     ? draftReviewItems.map((data) => ({
         id: idForReview(data),
@@ -131,7 +133,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         status: "attached" as const,
         createdAt: 0,
       }))
-    : options.attachedReviews;
+    : attachedReviews;
   const getDraft = useCallback(() => ({ text: input, attachments }), [input, attachments]);
   const setDraft = useCallback(
     (draft: { text: string; attachments: ChatAttachment[] }) => {

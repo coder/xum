@@ -498,7 +498,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
       setInput(next);
     },
-    [powerMode, setInput]
+    [latestInputValueRef, powerMode, setInput]
   );
 
   const { open } = useSettings();
@@ -596,14 +596,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       programmaticToolCalling: ptcExperimentEnabled,
     },
   });
-  const { agentSkillDescriptors, mcpPromptDescriptors } = composerSuggestions;
-  const handleComposerInputChange = useCallback(
-    (next: string, caret?: number) => {
-      composerSuggestions.handleInputCaretChange(caret, next.length);
-      handleInputChange(next, caret);
-    },
-    [composerSuggestions.handleInputCaretChange, handleInputChange]
-  );
+  const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
+    composerSuggestions;
+  const handleComposerInputChange = (next: string, caret?: number) => {
+    handleInputCaretChange(caret, next.length);
+    handleInputChange(next, caret);
+  };
   const additionalSystemContext = useAdditionalSystemContextSnapshot(
     variant === "workspace" ? props.workspaceId : ""
   );
@@ -1131,7 +1129,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const restorePreEditDraft = useCallback(() => {
     setDraft(preEditDraftRef.current);
     setDraftReviews(preEditReviewsRef.current);
-  }, [setDraft, setDraftReviews]);
+  }, [preEditDraftRef, preEditReviewsRef, setDraft, setDraftReviews]);
 
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
@@ -1432,7 +1430,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER, handler as EventListener);
-  }, [onDetachAllReviewsForComposerClear, setAttachments, setInput, workspaceIdForComposerClear]);
+  }, [
+    onDetachAllReviewsForComposerClear,
+    setAttachments,
+    setDraftReviews,
+    setInput,
+    workspaceIdForComposerClear,
+  ]);
 
   // Allow external components to open the Model Selector
   useEffect(() => {

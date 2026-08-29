@@ -46,7 +46,7 @@ export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
 }
 export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   const { api } = useAPI();
-  const { attachments, setAttachments } = options;
+  const { attachments, setAttachments, editingMessage, pushToast, variant, workspaceId } = options;
   const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
 
   const showResizeToast = useCallback(
@@ -57,7 +57,7 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
       );
       const resizeInfo = resized[0]?.resizeInfo;
       if (!resizeInfo) return;
-      options.pushToast({
+      pushToast({
         type: "info",
         message:
           resized.length === 1
@@ -65,7 +65,7 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
             : `${resized.length} images resized to fit provider limits`,
       });
     },
-    [options.pushToast]
+    [pushToast]
   );
 
   const processFiles = useCallback(
@@ -73,13 +73,13 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
       setProcessingAttachmentCount((count) => count + 1);
       return processAttachmentFiles(files, {
         stageAttachment:
-          options.variant === "workspace"
+          variant === "workspace"
             ? async (file, dataBase64) => {
                 if (!api) throw new Error("Not connected to server");
-                if (options.workspaceId == null)
+                if (workspaceId == null)
                   throw new Error("Files can be staged after opening a workspace.");
                 const result = await api.workspace.stageAttachment({
-                  workspaceId: options.workspaceId,
+                  workspaceId: workspaceId,
                   filename: file.name,
                   mediaType: file.type || null,
                   sizeBytes: file.size,
@@ -89,10 +89,10 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
                 return result.data;
               }
             : undefined,
-        holdNonProviderFiles: options.variant === "creation",
+        holdNonProviderFiles: variant === "creation",
       }).finally(() => setProcessingAttachmentCount((count) => Math.max(0, count - 1)));
     },
-    [api, options.variant, options.workspaceId]
+    [api, variant, workspaceId]
   );
 
   const attachFiles = useCallback(
@@ -113,7 +113,7 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
         for (const outcome of outcomes) {
           if (outcome.ok) continue;
           console.error("Failed to process attached file:", outcome.error);
-          options.pushToast({
+          pushToast({
             type: "error",
             message:
               outcome.error instanceof Error
@@ -123,12 +123,12 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
         }
       });
     },
-    [options.pushToast, processFiles, setAttachments, showResizeToast]
+    [pushToast, processFiles, setAttachments, showResizeToast]
   );
 
   const rejectEditAttachment = useCallback(() => {
-    options.pushToast({ type: "error", message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE });
-  }, [options.pushToast]);
+    pushToast({ type: "error", message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE });
+  }, [pushToast]);
 
   const handlePaste = useCallback(
     (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -136,31 +136,31 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
         ? extractAttachmentsFromClipboard(event.clipboardData.items)
         : [];
       if (files.length === 0) return;
-      if (options.editingMessage) {
+      if (editingMessage) {
         rejectEditAttachment();
         return;
       }
       event.preventDefault();
       attachFiles(files);
     },
-    [attachFiles, options.editingMessage, rejectEditAttachment]
+    [attachFiles, editingMessage, rejectEditAttachment]
   );
 
   const handleAttachFiles = useCallback(
     (files: File[]) => {
-      if (options.editingMessage) rejectEditAttachment();
+      if (editingMessage) rejectEditAttachment();
       else attachFiles(files);
     },
-    [attachFiles, options.editingMessage, rejectEditAttachment]
+    [attachFiles, editingMessage, rejectEditAttachment]
   );
 
   const handleDragOver = useCallback(
     (event: React.DragEvent<HTMLTextAreaElement>) => {
       if (!event.dataTransfer.types.includes("Files")) return;
       event.preventDefault();
-      event.dataTransfer.dropEffect = options.editingMessage ? "none" : "copy";
+      event.dataTransfer.dropEffect = editingMessage ? "none" : "copy";
     },
-    [options.editingMessage]
+    [editingMessage]
   );
 
   const handleDrop = useCallback(
@@ -168,10 +168,10 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
       event.preventDefault();
       const files = extractAttachmentsFromDrop(event.dataTransfer);
       if (files.length === 0) return;
-      if (options.editingMessage) rejectEditAttachment();
+      if (editingMessage) rejectEditAttachment();
       else attachFiles(files);
     },
-    [attachFiles, options.editingMessage, rejectEditAttachment]
+    [attachFiles, editingMessage, rejectEditAttachment]
   );
 
   const handleRemoveAttachment = useCallback(

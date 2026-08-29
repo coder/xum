@@ -157,8 +157,20 @@ interface UseComposerSuggestionsOptions {
 }
 
 export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
+  const {
+    agentPluginsEnabled,
+    disableWorkspaceAgents,
+    experiments,
+    input,
+    inputRef,
+    projectPath,
+    setInput,
+    transferredDraftProjectDiscovery,
+    variant,
+    workspaceId,
+  } = options;
   const { api } = useAPI();
-  const [cursor, setCursor] = useState(options.input.length);
+  const [cursor, setCursor] = useState(input.length);
   const [selection, setSelection] = useState({
     channelKey: "",
     index: 0,
@@ -182,15 +194,15 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const mcpAbort = useRef<AbortController | null>(null);
   const listId = useId();
 
-  const activeToken = detectActiveComposerToken(options.input, cursor);
+  const activeToken = detectActiveComposerToken(input, cursor);
   const activeTokenKey = tokenKey(activeToken) ?? "";
   const activeChannelKey = activeToken ? `${activeToken.kind}:${activeToken.startIndex}` : "";
   const synchronousSuggestions = getSynchronousComposerSuggestions(activeToken, {
     agentSkills,
     mcpPrompts,
     pluginCommands,
-    variant: options.variant,
-    experiments: options.experiments,
+    variant,
+    experiments,
   });
   const suggestions =
     activeToken?.kind === "file" && fileCompletion.tokenKey === activeTokenKey
@@ -216,14 +228,13 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     let mounted = true;
     const requestId = ++skillRequestId.current;
     const discovery =
-      options.variant === "workspace" && options.workspaceId
+      variant === "workspace" && workspaceId
         ? {
-            workspaceId: options.workspaceId,
-            disableWorkspaceAgents:
-              options.disableWorkspaceAgents || options.transferredDraftProjectDiscovery,
+            workspaceId: workspaceId,
+            disableWorkspaceAgents: disableWorkspaceAgents || transferredDraftProjectDiscovery,
           }
-        : options.variant === "creation" && options.projectPath
-          ? { projectPath: options.projectPath }
+        : variant === "creation" && projectPath
+          ? { projectPath }
           : null;
     if (!api || !discovery) {
       setAgentSkills([]);
@@ -243,28 +254,23 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     };
   }, [
     api,
-    options.variant,
-    options.workspaceId,
-    options.projectPath,
-    options.disableWorkspaceAgents,
-    options.transferredDraftProjectDiscovery,
-    options.agentPluginsEnabled,
+    variant,
+    workspaceId,
+    projectPath,
+    disableWorkspaceAgents,
+    transferredDraftProjectDiscovery,
+    agentPluginsEnabled,
     pluginMutationTick,
   ]);
 
   useEffect(() => {
     let mounted = true;
-    if (
-      !api ||
-      options.variant !== "workspace" ||
-      !options.workspaceId ||
-      !options.agentPluginsEnabled
-    ) {
+    if (!api || variant !== "workspace" || !workspaceId || !agentPluginsEnabled) {
       setPluginCommands([]);
       return;
     }
     api.workspace.plugins.slashCommands
-      .list({ workspaceId: options.workspaceId })
+      .list({ workspaceId: workspaceId })
       .then((commands) => {
         if (mounted) setPluginCommands(commands);
       })
@@ -274,11 +280,10 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     return () => {
       mounted = false;
     };
-  }, [api, options.variant, options.workspaceId, options.agentPluginsEnabled, pluginMutationTick]);
+  }, [api, variant, workspaceId, agentPluginsEnabled, pluginMutationTick]);
 
   useEffect(() => {
-    const workspaceId = options.workspaceId;
-    if (!api || options.variant !== "workspace" || !workspaceId) {
+    if (!api || variant !== "workspace" || !workspaceId) {
       mcpWorkspace.current = null;
       mcpLoadedAt.current = 0;
       mcpRequestId.current++;
@@ -321,16 +326,16 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         if (mcpAbort.current === controller) mcpAbort.current = null;
       });
     mcpRequest.current = request;
-  }, [api, activeToken?.kind, activeTokenKey, options.variant, options.workspaceId]);
+  }, [api, activeToken?.kind, activeTokenKey, variant, workspaceId]);
 
   useEffect(() => {
     if (!api || activeToken?.kind !== "file") return;
-    const scope = options.variant === "workspace" ? options.workspaceId : options.projectPath;
+    const scope = variant === "workspace" ? workspaceId : projectPath;
     if (!scope) return;
     const requestId = ++fileRequestId.current;
     const requestedTokenKey = activeTokenKey;
     const request =
-      options.variant === "workspace"
+      variant === "workspace"
         ? api.workspace.getFileCompletions({
             workspaceId: scope,
             query: activeToken.query,
@@ -361,7 +366,15 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
           setFileCompletion({ tokenKey: requestedTokenKey, suggestions: [] });
         }
       });
-  }, [api, activeTokenKey, options.variant, options.workspaceId, options.projectPath]);
+  }, [
+    api,
+    activeToken?.kind,
+    activeToken?.query,
+    activeTokenKey,
+    projectPath,
+    variant,
+    workspaceId,
+  ]);
 
   const dismiss = useCallback(() => {
     setSelection({
@@ -386,8 +399,8 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const select = useCallback(
     (suggestion: SlashSuggestion) => {
       if (!activeToken) return;
-      const applied = applyComposerSuggestion(options.input, activeToken, suggestion);
-      options.setInput(applied.input);
+      const applied = applyComposerSuggestion(input, activeToken, suggestion);
+      setInput(applied.input);
       setCursor(applied.cursor);
       setSelection({
         channelKey: activeChannelKey,
@@ -396,14 +409,14 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         dismissedTokenKey: tokenKey(detectActiveComposerToken(applied.input, applied.cursor)) ?? "",
       });
       requestAnimationFrame(() => {
-        const element = options.inputRef.current;
+        const element = inputRef.current;
         if (!element || element.disabled) return;
         element.focus();
         element.selectionStart = applied.cursor;
         element.selectionEnd = applied.cursor;
       });
     },
-    [activeChannelKey, activeToken, options.input, options.inputRef, options.setInput]
+    [activeChannelKey, activeToken, input, inputRef, setInput]
   );
 
   useEffect(() => {
@@ -430,18 +443,18 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   useEffect(() => () => mcpAbort.current?.abort(), []);
 
   const handleCursorActivity = useCallback(() => {
-    const element = options.inputRef.current;
-    if (element) setCursor(element.selectionStart ?? options.input.length);
-  }, [options.input.length, options.inputRef]);
+    const element = inputRef.current;
+    if (element) setCursor(element.selectionStart ?? input.length);
+  }, [input.length, inputRef]);
 
   const handleInputCaretChange = useCallback((caret: number | undefined, inputLength: number) => {
     setCursor(caret ?? inputLength);
   }, []);
 
-  const ghostHint = getCommandGhostHint(options.input, isVisible && activeToken?.kind === "slash", {
-    variant: options.variant,
+  const ghostHint = getCommandGhostHint(input, isVisible && activeToken?.kind === "slash", {
+    variant,
     isExperimentEnabled: (experimentId) =>
-      resolveSlashCommandExperimentValue(experimentId, options.experiments),
+      resolveSlashCommandExperimentValue(experimentId, experiments),
   });
 
   return {
