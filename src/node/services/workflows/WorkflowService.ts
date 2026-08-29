@@ -8,13 +8,28 @@ import {
   type WorkflowRunStatus,
 } from "@/common/types/workflow";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import {
+  appendSubProjectRelativePath,
+  createRuntimeForWorkspace,
+  resolveWorkspaceRootPath,
+} from "@/node/runtime/runtimeHelpers";
+import type { Config } from "@/node/config";
+import type { AIService } from "@/node/services/aiService";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import { sendWorkflowRunTerminalContinuation } from "@/node/services/workspaceService";
+import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
-import type { WorkflowRunStatusSnapshot, WorkflowRunStore } from "./WorkflowRunStore";
+import { WorkflowRunStore, type WorkflowRunStatusSnapshot } from "./WorkflowRunStore";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
@@ -29,8 +44,13 @@ import {
   registerInProcessWorkflowRun,
 } from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
+import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
-import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
+import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
+import {
+  DEFAULT_WORKFLOW_AGENT_ID,
+  WorkflowTaskServiceAdapter,
+} from "./WorkflowTaskServiceAdapter";
 
 export interface WorkflowBackgroundRunTerminalEvent {
   runId: string;
@@ -934,6 +954,283 @@ export class WorkflowService {
     assert(this.taskAdapter != null, "WorkflowService: taskAdapter is required");
     return this.taskAdapter;
   }
+}
+
+export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are disabled";
+
+export interface WorkflowServiceContext {
+  config: Config;
+  aiService: AIService;
+  workspaceService: WorkspaceService;
+  taskService: TaskService;
+  experimentsService: ExperimentsService;
+  workflowRuntimeFactory: IJSRuntimeFactory;
+}
+
+export interface WorkflowStartRequest {
+  workspaceId: string;
+  scriptPath: string;
+  args?: unknown;
+  runInBackground?: boolean | null;
+  rawCommand?: string | null;
+  continuationOptions?: SendMessageOptions | null;
+}
+
+export async function resolveWorkflowContext(
+  context: WorkflowServiceContext,
+  workspaceId: string,
+  options: {
+    onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
+    notifyInterruptedBackgroundRunTerminal?: boolean;
+    projectPath?: string;
+  } = {}
+) {
+  assert(workspaceId.length > 0, "resolveWorkflowContext: workspaceId is required");
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+    throw new Error(DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE);
+  }
+  await context.aiService.waitForInit(workspaceId);
+  const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
+  if (!metadataResult.success) {
+    throw new Error(metadataResult.error);
+  }
+  const metadata = metadataResult.data;
+  const requestedWorkflowProjectPath = options.projectPath?.trim();
+  const hasRequestedWorkflowProjectPath =
+    requestedWorkflowProjectPath != null && requestedWorkflowProjectPath.length > 0;
+  const workflowProjectPath = hasRequestedWorkflowProjectPath
+    ? requestedWorkflowProjectPath
+    : metadata.projectPath;
+  const resolveWorkflowProjectTrusted = () =>
+    hasRequestedWorkflowProjectPath
+      ? isProjectTrusted(context.config, workflowProjectPath)
+      : isWorkspaceProjectTrusted(context.config, metadata);
+  const projectTrusted = resolveWorkflowProjectTrusted();
+  const runtime = createRuntimeForWorkspace(metadata);
+  const workspaceRootPath = resolveWorkspaceRootPath(metadata, runtime);
+  const workflowExecutionProjectPath = hasRequestedWorkflowProjectPath
+    ? appendSubProjectRelativePath(
+        { ...metadata, subProjectPath: workflowProjectPath },
+        runtime,
+        workspaceRootPath
+      )
+    : appendSubProjectRelativePath(metadata, runtime, workspaceRootPath);
+  const workspacePath = workflowExecutionProjectPath;
+  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.AGENT_PLUGINS
+  );
+  const skillStorageContext = resolveSkillStorageContext({
+    runtime,
+    workspacePath,
+    xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
+    includeAgentPlugins,
+  });
+  const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
+
+  return {
+    workflowExecutionProjectPath,
+    runtime,
+    workspacePath,
+    projectSearchRoot: workspaceRootPath,
+    skillStorageContext,
+    projectTrusted,
+    service: new WorkflowService({
+      notifyInterruptedBackgroundRunTerminal:
+        options.notifyInterruptedBackgroundRunTerminal === true,
+      runStore: new WorkflowRunStore({ sessionDir: context.config.getSessionDir(workspaceId) }),
+      runtimeFactory: context.workflowRuntimeFactory,
+      taskAdapterFactory: (runId, workflowName) =>
+        new WorkflowTaskServiceAdapter({
+          taskService: context.taskService,
+          parentWorkspaceId: workspaceId,
+          workflowRunId: runId,
+          workflowName,
+          defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
+          patchToolConfig: {
+            workspaceId,
+            cwd: workspacePath,
+            runtime,
+            runtimeTempDir: workflowRuntimeTempDir,
+            workspaceSessionDir: context.config.getSessionDir(workspaceId),
+            trusted: projectTrusted,
+          },
+          getProjectTrusted: resolveWorkflowProjectTrusted,
+          experiments: { dynamicWorkflows: true },
+        }),
+      resolveWorkflowScript: (scriptPath) =>
+        resolveWorkflowScript({
+          scriptPath,
+          runtime,
+          workspacePath,
+          projectSearchRoot: workspaceRootPath,
+          projectTrusted: resolveWorkflowProjectTrusted(),
+          includeAgentPlugins,
+          skillStorageContext,
+        }),
+      onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
+      ...(options.onBackgroundRunTerminal != null
+        ? { onBackgroundRunTerminal: options.onBackgroundRunTerminal }
+        : {}),
+      getCurrentProjectTrusted: resolveWorkflowProjectTrusted,
+      runnerId: "workflow-runner:" + workspaceId,
+    }),
+  };
+}
+
+export async function resumeWorkflowRun(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+): Promise<StartNamedWorkflowResult> {
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  const { service, projectTrusted } = await resolveWorkflowContext(context, input.workspaceId);
+  return service.resumeRunInBackground({ ...input, projectTrusted });
+}
+
+export async function retryWorkflowRunFromCheckpoint(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+): Promise<StartNamedWorkflowResult> {
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  const { service, projectTrusted } = await resolveWorkflowContext(context, input.workspaceId, {
+    onBackgroundRunTerminal: (event) => {
+      const name = event.run.workflow.sourcePath ?? event.run.workflow.name;
+      return sendWorkflowRunTerminalContinuation(context.workspaceService, {
+        ...event,
+        workspaceId: input.workspaceId,
+        rawCommand: "workflow_run " + name,
+        name,
+      });
+    },
+  });
+  return service.retryRunFromCheckpointInBackground({ ...input, projectTrusted });
+}
+
+export async function startWorkflowRun(
+  context: WorkflowServiceContext,
+  input: WorkflowStartRequest,
+  signal?: AbortSignal
+): Promise<StartNamedWorkflowResult & { invocationMessagePersisted?: boolean }> {
+  using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
+  let invocationMessagePersisted: boolean | undefined;
+  let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
+  const invocationPersistence = new Promise<boolean>((resolve) => {
+    resolveInvocationPersistence = resolve;
+  });
+  const rawCommandForContinuation = input.rawCommand;
+  const continuationOptions = input.continuationOptions;
+  const onBackgroundRunTerminal =
+    rawCommandForContinuation != null && continuationOptions != null
+      ? async (event: WorkflowBackgroundRunTerminalEvent) => {
+          const persistedInvocation =
+            invocationMessagePersisted === true ? true : await invocationPersistence;
+          if (!persistedInvocation) {
+            log.warn("Skipping slash workflow continuation without persisted invocation", {
+              workspaceId: input.workspaceId,
+              runId: event.runId,
+            });
+            return;
+          }
+          await sendWorkflowRunTerminalContinuation(context.workspaceService, {
+            ...event,
+            workspaceId: input.workspaceId,
+            rawCommand: rawCommandForContinuation,
+            name: input.scriptPath,
+            continuationOptions,
+          });
+        }
+      : undefined;
+
+  if (input.rawCommand != null) {
+    await context.workspaceService.waitForWorkspaceIdle(input.workspaceId, {
+      signal,
+      manualFollowUp: true,
+    });
+  }
+  const resolved = await resolveWorkflowContext(context, input.workspaceId, {
+    onBackgroundRunTerminal,
+  });
+  const script = await resolveWorkflowScript({
+    scriptPath: input.scriptPath,
+    runtime: resolved.runtime,
+    workspacePath: resolved.workspacePath,
+    projectSearchRoot: resolved.projectSearchRoot,
+    projectTrusted: resolved.projectTrusted,
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+    skillStorageContext: resolved.skillStorageContext,
+  });
+  if (input.rawCommand != null) {
+    await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
+  }
+  const args = input.args === undefined ? {} : input.args;
+  const startInput: StartWorkflowInput = {
+    script,
+    workspaceId: input.workspaceId,
+    projectTrusted: resolved.projectTrusted,
+    args,
+    ...(input.rawCommand != null
+      ? { defaultArgs: { projectPath: resolved.workflowExecutionProjectPath } }
+      : {}),
+  };
+  const persistInvocation = async (details: {
+    runId: string;
+    status: WorkflowRunStatus;
+    result: unknown;
+    run?: WorkflowRunRecord;
+  }) => {
+    assert(input.rawCommand != null, "Workflow invocation persistence requires rawCommand");
+    try {
+      invocationMessagePersisted = await context.workspaceService.appendWorkflowRunInvocation({
+        workspaceId: input.workspaceId,
+        rawCommand: input.rawCommand,
+        scriptPath: input.scriptPath,
+        args,
+        runId: details.runId,
+        status: details.status,
+        result: details.result,
+        ...(details.run != null ? { run: details.run } : {}),
+      });
+    } finally {
+      resolveInvocationPersistence(invocationMessagePersisted === true);
+    }
+  };
+
+  const result =
+    input.runInBackground === true
+      ? await resolved.service.startWorkflowInBackground({
+          ...startInput,
+          ...(input.rawCommand != null ? { onBackgroundRunCreated: persistInvocation } : {}),
+        })
+      : await resolved.service.startWorkflow({ ...startInput, abortSignal: signal });
+  if (input.rawCommand == null) {
+    return result;
+  }
+  if (input.runInBackground !== true) {
+    const run = await resolved.service.getRun({
+      workspaceId: input.workspaceId,
+      runId: result.runId,
+    });
+    await persistInvocation({ ...result, ...(run != null ? { run } : {}) });
+  }
+  return { ...result, invocationMessagePersisted };
+}
+
+export async function listWorkflowScripts(
+  context: WorkflowServiceContext,
+  workspaceId: string
+): ReturnType<typeof discoverWorkflowScripts> {
+  const resolved = await resolveWorkflowContext(context, workspaceId);
+  return discoverWorkflowScripts({
+    runtime: resolved.runtime,
+    workspacePath: resolved.workspacePath,
+    projectSearchRoot: resolved.projectSearchRoot,
+    projectTrusted: resolved.projectTrusted,
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+    skillStorageContext: resolved.skillStorageContext,
+  });
 }
 
 export function buildWorkflowScriptDescriptor(

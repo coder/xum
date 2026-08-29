@@ -23,7 +23,6 @@ import type {
   WorkspaceChatMessage,
   WorkspaceStatsSnapshot,
   FrontendWorkspaceMetadataSchemaType,
-  SendMessageOptions,
 } from "@/common/orpc/types";
 import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
@@ -87,7 +86,6 @@ import {
   RUNTIME_ENABLEMENT_IDS,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
-import type { Runtime } from "@/node/runtime/Runtime";
 import {
   discoverAgentSkills,
   discoverAgentSkillsDiagnostics,
@@ -109,36 +107,29 @@ import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
-import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { log } from "@/node/services/log";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "@/node/orpc/wsPaths";
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
-import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import {
+  getWorkflowRunStatusesForOwners,
+  listActiveWorkflowRunsForOwners,
+} from "@/node/services/workflows/WorkflowRunStore";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 import { buildWorkspaceComposition } from "@/node/services/agentPlugins/composition";
 import { discoverWorkspaceAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import { collectPluginSlashCommands } from "@/node/services/agentPlugins/slashCommands";
-import { discoverWorkflowScripts } from "@/node/services/workflows/workflowScriptDiscovery";
 import {
-  WorkflowService,
-  type WorkflowBackgroundRunTerminalEvent,
+  listWorkflowScripts,
+  resolveWorkflowContext,
+  resumeWorkflowRun,
+  retryWorkflowRunFromCheckpoint,
+  startWorkflowRun,
 } from "@/node/services/workflows/WorkflowService";
-import {
-  DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
-} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
-import { acquireWorkflowArchiveAdmission } from "@/node/services/workflows/workflowArchiveAdmission";
-import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
-
-import {
-  WORKFLOW_RESULT_METADATA_TYPE,
-  buildWorkflowResultContextMessage,
-} from "@/common/utils/workflowRunMessages";
 
 const RAW_QUERY_USER_ERROR_PATTERNS = [
   /^parser error:/i,
@@ -157,92 +148,8 @@ function shouldExposeRawQueryError(error: unknown): boolean {
   return RAW_QUERY_USER_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-const WORKFLOW_CONTINUATION_RETRY_DELAY_MS = 1_000;
-const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send was skipped.";
-
-function isWorkspaceBusyIdleOnlySend(error: { type: string; raw?: string }): boolean {
-  return (
-    error.type === "unknown" && error.raw?.includes(WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE) === true
-  );
-}
-
-export async function sendWorkflowRunTerminalContinuation(input: {
-  context: ORPCContext;
-  workspaceId: string;
-  rawCommand: string;
-  name: string;
-  event: WorkflowBackgroundRunTerminalEvent;
-  continuationOptions?: SendMessageOptions;
-}): Promise<void> {
-  const { context, workspaceId, rawCommand, name, event } = input;
-  const { runId, status, result, run } = event;
-  const commandPrefix = rawCommand.split(/\s+/u)[0] ?? name;
-  const workflowResultMessage = buildWorkflowResultContextMessage({
-    rawCommand,
-    name,
-    runId,
-    status,
-    result,
-    run,
-  });
-  let continuationOptions = input.continuationOptions ?? null;
-
-  for (;;) {
-    const invocationCurrent = await context.workspaceService.isWorkflowInvocationCurrent(
-      workspaceId,
-      runId
-    );
-    if (!invocationCurrent) {
-      log.debug("Skipping superseded workflow continuation", { workspaceId, runId });
-      return;
-    }
-
-    continuationOptions ??=
-      await context.workspaceService.getWorkflowContinuationSendOptions(workspaceId);
-    if (continuationOptions == null) {
-      log.warn("Skipping workflow continuation without send options", { workspaceId, runId });
-      return;
-    }
-
-    const sendResult = await context.workspaceService.sendMessage(
-      workspaceId,
-      workflowResultMessage,
-      {
-        ...continuationOptions,
-        skipAiSettingsPersistence: true,
-        muxMetadata: {
-          type: WORKFLOW_RESULT_METADATA_TYPE,
-          rawCommand,
-          commandPrefix,
-          runId,
-          requestedModel: continuationOptions.model,
-        },
-      },
-      {
-        skipAutoResumeReset: true,
-        synthetic: true,
-        agentInitiated: true,
-        requireIdle: true,
-        startStreamInBackground: true,
-      }
-    );
-    if (sendResult.success) {
-      return;
-    }
-    if (!isWorkspaceBusyIdleOnlySend(sendResult.error)) {
-      log.warn("Failed to continue workflow after completion", {
-        workspaceId,
-        runId,
-        error: sendResult.error,
-      });
-      return;
-    }
-    await waitForWorkflowContinuationRetry();
-  }
-}
-
-function waitForWorkflowContinuationRetry(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
+function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
+  return request().catch(throwWorkflowOrpcError);
 }
 
 /**
@@ -390,38 +297,10 @@ function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null)
   return isProjectTrusted(context.config, projectPath);
 }
 
-/**
- * SECURITY: the workflow liveness/discovery handlers construct per-owner
- * session paths straight from config.getSessionDir(workspaceId) without the
- * workspace-metadata lookup resolveWorkflowContext performs, so an owner ID
- * must be a single path segment — separators or dot segments could otherwise
- * escape the sessions root via path.join. Unsafe IDs cannot name a real
- * workspace, so callers skip them rather than erroring.
- */
-export function isPathSafeWorkspaceId(workspaceId: string): boolean {
-  return (
-    workspaceId.length > 0 &&
-    workspaceId !== "." &&
-    workspaceId !== ".." &&
-    !workspaceId.includes("/") &&
-    !workspaceId.includes("\\") &&
-    path.basename(workspaceId) === workspaceId
-  );
-}
-
 function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Dynamic workflows are disabled",
-    });
+    throw new ORPCError("BAD_REQUEST", { message: "Dynamic workflows are disabled" });
   }
-}
-
-function throwWorkflowStartOrpcError(error: unknown): never {
-  if (error instanceof WorkflowArgsValidationError) {
-    throw new ORPCError("BAD_REQUEST", { message: error.message });
-  }
-  throw error;
 }
 
 /** Server-side enforcement: memory.* routes reject while the experiment is off. */
@@ -461,121 +340,6 @@ async function resolveMemoryScopeContext(
   return {
     projectPath,
     scopeCtx: { runtime, checkoutCwd: "", workspaceId, projectPath },
-  };
-}
-
-/**
- * Build a fully-wired WorkflowService for one workspace. Exported so CLI/server
- * entry points share exactly the same construction as the workflows.* routes.
- */
-export async function resolveWorkflowContext(
-  context: ORPCContext,
-  workspaceId: string,
-  options: {
-    onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
-    notifyInterruptedBackgroundRunTerminal?: boolean;
-    projectPath?: string;
-  } = {}
-): Promise<{
-  service: WorkflowService;
-  projectTrusted: boolean;
-  workflowExecutionProjectPath: string;
-  runtime: Runtime;
-  workspacePath: string;
-  projectSearchRoot: string;
-  skillStorageContext: SkillStorageContext;
-}> {
-  assert(workspaceId.length > 0, "resolveWorkflowContext: workspaceId is required");
-  assertDynamicWorkflowsEnabled(context);
-  await context.aiService.waitForInit(workspaceId);
-  const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
-  if (!metadataResult.success) {
-    throw new Error(metadataResult.error);
-  }
-  const metadata = metadataResult.data;
-  const requestedWorkflowProjectPath = options.projectPath?.trim();
-  const hasRequestedWorkflowProjectPath =
-    requestedWorkflowProjectPath != null && requestedWorkflowProjectPath.length > 0;
-  const workflowProjectPath = hasRequestedWorkflowProjectPath
-    ? requestedWorkflowProjectPath
-    : metadata.projectPath;
-  // Workspace-default trust must be metadata-aware: scratch chats are trusted
-  // by design but their projectPath is an app-managed workdir, not a config key.
-  const resolveWorkflowProjectTrusted = () =>
-    hasRequestedWorkflowProjectPath
-      ? isTrustedProjectPath(context, workflowProjectPath)
-      : isWorkspaceProjectTrusted(context.config, metadata);
-  const projectTrusted = resolveWorkflowProjectTrusted();
-  const runtime = createRuntimeForWorkspace(metadata);
-  const workspaceRootPath = resolveWorkspaceRootPath(metadata, runtime);
-  const workflowExecutionProjectPath = hasRequestedWorkflowProjectPath
-    ? appendSubProjectRelativePath(
-        { ...metadata, subProjectPath: workflowProjectPath },
-        runtime,
-        workspaceRootPath
-      )
-    : appendSubProjectRelativePath(metadata, runtime, workspaceRootPath);
-  const workspacePath = workflowExecutionProjectPath;
-  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
-    EXPERIMENT_IDS.AGENT_PLUGINS
-  );
-  const skillStorageContext = resolveSkillStorageContext({
-    runtime,
-    workspacePath,
-    xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
-    includeAgentPlugins,
-  });
-  const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
-
-  return {
-    workflowExecutionProjectPath,
-    runtime,
-    workspacePath,
-    projectSearchRoot: workspaceRootPath,
-    skillStorageContext,
-    projectTrusted,
-    service: new WorkflowService({
-      notifyInterruptedBackgroundRunTerminal:
-        options.notifyInterruptedBackgroundRunTerminal === true,
-      runStore: new WorkflowRunStore({ sessionDir: context.config.getSessionDir(workspaceId) }),
-      runtimeFactory: context.workflowRuntimeFactory,
-      taskAdapterFactory: (runId, workflowName) =>
-        new WorkflowTaskServiceAdapter({
-          taskService: context.taskService,
-          parentWorkspaceId: workspaceId,
-          workflowRunId: runId,
-          workflowName,
-          defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
-          patchToolConfig: {
-            workspaceId,
-            cwd: workspacePath,
-            runtime,
-            runtimeTempDir: workflowRuntimeTempDir,
-            workspaceSessionDir: context.config.getSessionDir(workspaceId),
-            trusted: projectTrusted,
-          },
-          getProjectTrusted: resolveWorkflowProjectTrusted,
-          experiments: {
-            dynamicWorkflows: true,
-          },
-        }),
-      resolveWorkflowScript: (scriptPath) =>
-        resolveWorkflowScript({
-          scriptPath,
-          runtime,
-          workspacePath,
-          projectSearchRoot: workspaceRootPath,
-          projectTrusted: resolveWorkflowProjectTrusted(),
-          includeAgentPlugins,
-          skillStorageContext,
-        }),
-      onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
-      ...(options.onBackgroundRunTerminal != null
-        ? { onBackgroundRunTerminal: options.onBackgroundRunTerminal }
-        : {}),
-      getCurrentProjectTrusted: resolveWorkflowProjectTrusted,
-      runnerId: `workflow-runner:${workspaceId}`,
-    }),
   };
 }
 
@@ -1818,285 +1582,75 @@ export const router = (authToken?: string) => {
       listRuns: t
         .input(schemas.workflows.listRuns.input)
         .output(schemas.workflows.listRuns.output)
-        .handler(async ({ context, input }) => {
-          const { service, projectTrusted } = await resolveWorkflowContext(
-            context,
-            input.workspaceId
-          );
-          await service.resumeCrashedRuns({ workspaceId: input.workspaceId, projectTrusted });
-          return service.listRuns({ workspaceId: input.workspaceId });
-        }),
+        .handler(({ context, input }) =>
+          handleWorkflowRequest(async () => {
+            const { service, projectTrusted } = await resolveWorkflowContext(
+              context,
+              input.workspaceId
+            );
+            await service.resumeCrashedRuns({ workspaceId: input.workspaceId, projectTrusted });
+            return service.listRuns({ workspaceId: input.workspaceId });
+          })
+        ),
       getRun: t
         .input(schemas.workflows.getRun.input)
         .output(schemas.workflows.getRun.output)
-        .handler(async ({ context, input }) => {
-          const { service } = await resolveWorkflowContext(context, input.workspaceId);
-          return service.getRun({ workspaceId: input.workspaceId, runId: input.runId });
-        }),
+        .handler(({ context, input }) =>
+          handleWorkflowRequest(async () => {
+            const { service } = await resolveWorkflowContext(context, input.workspaceId);
+            return service.getRun(input);
+          })
+        ),
       getRunStatuses: t
         .input(schemas.workflows.getRunStatuses.input)
         .output(schemas.workflows.getRunStatuses.output)
         .handler(async ({ context, input }) => {
-          // Bulk nested-run liveness for the sub-agent tray: one renderer round
-          // trip covers all candidates. Reads go straight to each owner's run
-          // store (plain host-side session state) instead of through
-          // resolveWorkflowContext, which waits on workspace initialization — one
-          // stuck provisioning owner must not stall verification for the rest.
-          // A ref whose read rejects is omitted (transient); the store maps only
-          // a definitively-missing durable record to a null status, so callers
-          // can tell "gone" from "retry later". With the workflows experiment
-          // off there are no runs to verify — empty, not an error.
+          // Read owner stores without waiting for workspace initialization so one stuck
+          // workspace cannot stall the batch. Transient failures are omitted; missing runs
+          // retain a null status so callers can distinguish them from retryable reads.
           if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
             return [];
           }
-          const stores = new Map<string, WorkflowRunStore>();
-          const storeFor = (workspaceId: string) => {
-            let store = stores.get(workspaceId);
-            if (store == null) {
-              store = new WorkflowRunStore({
-                sessionDir: context.config.getSessionDir(workspaceId),
-              });
-              stores.set(workspaceId, store);
-            }
-            return store;
-          };
-          const entries = await Promise.all(
-            input.runs.map(async (ref) => {
-              if (!isPathSafeWorkspaceId(ref.workspaceId)) {
-                return null;
-              }
-              try {
-                const status = await storeFor(ref.workspaceId).getRunStatusForLiveness({
-                  workspaceId: ref.workspaceId,
-                  runId: ref.runId,
-                });
-                return { runId: ref.runId, status };
-              } catch {
-                return null;
-              }
-            })
-          );
-          return entries.filter((entry): entry is WorkflowRunLivenessEntry => entry != null);
+          return getWorkflowRunStatusesForOwners(context.config, input.runs);
         }),
       listActiveRuns: t
         .input(schemas.workflows.listActiveRuns.input)
         .output(schemas.workflows.listActiveRuns.output)
         .handler(async ({ context, input }) => {
-          // Cold-mount discovery for the tray. Same no-initialization-wait rule
-          // as getRunStatuses above, and strict per owner: a deleted workspace's
-          // missing session dir reads as empty, but a transient store failure
-          // rejects the whole call so the tray retries instead of caching "no
-          // active runs" for the rest of a nested run's worker gap. With the
-          // workflows experiment off there is nothing to discover — empty, not
-          // an error the tray would uselessly retry.
+          // Keep discovery strict per owner: missing session dirs are empty, while transient
+          // store failures reject the call so the tray retries instead of caching no runs.
           if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
             return [];
           }
-          const results = await Promise.all(
-            input.workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
-              const runStore = new WorkflowRunStore({
-                sessionDir: context.config.getSessionDir(workspaceId),
-              });
-              const summaries = await runStore.listActiveRunSummaries({ workspaceId });
-              return summaries.map((summary) => ({ workspaceId, ...summary }));
-            })
-          );
-          return results.flat();
+          return listActiveWorkflowRunsForOwners(context.config, input.workspaceIds);
         }),
       interrupt: t
         .input(schemas.workflows.interrupt.input)
         .output(schemas.workflows.interrupt.output)
-        .handler(async ({ context, input }) => {
-          const { service } = await resolveWorkflowContext(context, input.workspaceId);
-          return service.interruptRun({ workspaceId: input.workspaceId, runId: input.runId });
-        }),
+        .handler(({ context, input }) =>
+          handleWorkflowRequest(async () => {
+            const { service } = await resolveWorkflowContext(context, input.workspaceId);
+            return service.interruptRun(input);
+          })
+        ),
       resume: t
         .input(schemas.workflows.resume.input)
         .output(schemas.workflows.resume.output)
-        .handler(async ({ context, input }) => {
-          // Acquired before any await: resolveWorkflowContext suspends, and an
-          // interrupt_active archive entering during that window would see neither an
-          // admission nor a durable active run — it could destroy the delegated turns and
-          // archive the workspace before this request reaches the service-level admission.
-          // The service re-acquires its own admission; the counters stack.
-          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
-          const { service, projectTrusted } = await resolveWorkflowContext(
-            context,
-            input.workspaceId
-          );
-          return service.resumeRunInBackground({
-            workspaceId: input.workspaceId,
-            runId: input.runId,
-            projectTrusted,
-          });
-        }),
-      // Retry actions arrive from a fresh oRPC request, so rebuild the terminal continuation
-      // callback here instead of relying on the original WorkflowService instance still existing.
+        .handler(({ context, input }) =>
+          handleWorkflowRequest(() => resumeWorkflowRun(context, input))
+        ),
       retryFromCheckpoint: t
         .input(schemas.workflows.retryFromCheckpoint.input)
         .output(schemas.workflows.retryFromCheckpoint.output)
-        .handler(async ({ context, input }) => {
-          // Entry-level admission; see workflows.resume above.
-          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
-          const { service, projectTrusted } = await resolveWorkflowContext(
-            context,
-            input.workspaceId,
-            {
-              onBackgroundRunTerminal: (event) =>
-                sendWorkflowRunTerminalContinuation({
-                  context,
-                  workspaceId: input.workspaceId,
-                  rawCommand: `workflow_run ${event.run.workflow.sourcePath ?? event.run.workflow.name}`,
-                  name: event.run.workflow.sourcePath ?? event.run.workflow.name,
-                  event,
-                }),
-            }
-          );
-          return service.retryRunFromCheckpointInBackground({
-            workspaceId: input.workspaceId,
-            runId: input.runId,
-            projectTrusted,
-          });
-        }),
+        .handler(({ context, input }) =>
+          handleWorkflowRequest(() => retryWorkflowRunFromCheckpoint(context, input))
+        ),
       start: t
         .input(schemas.workflows.start.input)
         .output(schemas.workflows.start.output)
-        .handler(async ({ context, input, signal }) => {
-          assertDynamicWorkflowsEnabled(context);
-          // Entry-level admission; see workflows.resume above. start additionally awaits
-          // workspace idleness and script resolution before reaching the service, widening
-          // the window an unguarded interrupt_active archive could slip through.
-          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
-          let invocationMessagePersisted: boolean | undefined;
-          let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
-          const invocationPersistence = new Promise<boolean>((resolve) => {
-            resolveInvocationPersistence = resolve;
-          });
-          const rawCommandForContinuation = input.rawCommand;
-          const continuationOptions = input.continuationOptions;
-          const onBackgroundRunTerminal =
-            rawCommandForContinuation != null && continuationOptions != null
-              ? async (event: WorkflowBackgroundRunTerminalEvent) => {
-                  const persistedInvocation =
-                    invocationMessagePersisted === true ? true : await invocationPersistence;
-                  if (persistedInvocation !== true) {
-                    log.warn("Skipping slash workflow continuation without persisted invocation", {
-                      workspaceId: input.workspaceId,
-                      runId: event.runId,
-                    });
-                    return;
-                  }
-                  await sendWorkflowRunTerminalContinuation({
-                    context,
-                    workspaceId: input.workspaceId,
-                    rawCommand: rawCommandForContinuation,
-                    name: input.scriptPath,
-                    event,
-                    continuationOptions,
-                  });
-                }
-              : undefined;
-          if (input.rawCommand != null) {
-            // Slash workflow commands are user follow-ups, just like normal composer sends.
-            // Wait for the active chat turn (including compaction follow-ups and queued messages)
-            // to finish before starting the workflow or appending its invocation to history.
-            await context.workspaceService.waitForWorkspaceIdle(input.workspaceId, {
-              signal,
-              manualFollowUp: true,
-            });
-          }
-          const {
-            service,
-            workflowExecutionProjectPath,
-            projectTrusted,
-            runtime,
-            workspacePath,
-            projectSearchRoot,
-            skillStorageContext,
-          } = await resolveWorkflowContext(context, input.workspaceId, { onBackgroundRunTerminal });
-          const script = await resolveWorkflowScript({
-            scriptPath: input.scriptPath,
-            runtime,
-            workspacePath,
-            projectSearchRoot,
-            projectTrusted,
-            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-            skillStorageContext,
-          });
-          if (input.rawCommand != null) {
-            await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
-          }
-          // Slash workflow commands run from the active project/sub-project; expose that
-          // server-resolved context as schema defaults without adding hidden fields to
-          // persisted command args.
-          const workflowStartArgs = {
-            script,
-            workspaceId: input.workspaceId,
-            projectTrusted,
-            // Default to {} only when args is omitted; an explicit `null` is passed
-            // through verbatim (not coerced via `?? {}`) so argsSchema normalization
-            // validates it instead of silently treating it as "no args".
-            args: input.args === undefined ? {} : input.args,
-            ...(input.rawCommand != null
-              ? { defaultArgs: { projectPath: workflowExecutionProjectPath } }
-              : {}),
-          };
-          const persistInvocation = async (details: {
-            runId: string;
-            status: string;
-            result: unknown;
-            run?: NonNullable<Awaited<ReturnType<typeof service.getRun>>>;
-          }) => {
-            assert(input.rawCommand != null, "Workflow invocation persistence requires rawCommand");
-            try {
-              invocationMessagePersisted =
-                await context.workspaceService.appendWorkflowRunInvocation({
-                  workspaceId: input.workspaceId,
-                  rawCommand: input.rawCommand,
-                  scriptPath: input.scriptPath,
-                  args: workflowStartArgs.args,
-                  runId: details.runId,
-                  status: details.status,
-                  result: details.result,
-                  ...(details.run != null ? { run: details.run } : {}),
-                });
-            } finally {
-              resolveInvocationPersistence(invocationMessagePersisted === true);
-            }
-          };
-          let result: Awaited<ReturnType<typeof service.startWorkflow>>;
-          try {
-            result =
-              input.runInBackground === true
-                ? await service.startWorkflowInBackground({
-                    ...workflowStartArgs,
-                    ...(input.rawCommand != null
-                      ? { onBackgroundRunCreated: persistInvocation }
-                      : {}),
-                  })
-                : await service.startWorkflow({ ...workflowStartArgs, abortSignal: signal });
-          } catch (error) {
-            throwWorkflowStartOrpcError(error);
-          }
-          if (input.rawCommand == null) {
-            return result;
-          }
-          if (input.runInBackground !== true) {
-            const run = await service.getRun({
-              workspaceId: input.workspaceId,
-              runId: result.runId,
-            });
-            await persistInvocation({
-              runId: result.runId,
-              status: result.status,
-              result: result.result,
-              ...(run != null ? { run } : {}),
-            });
-          }
-          return { ...result, invocationMessagePersisted };
-        }),
+        .handler(({ context, input, signal }) =>
+          handleWorkflowRequest(() => startWorkflowRun(context, input, signal))
+        ),
       // Live run stream for the Workflows tab. Mirrors devtools.subscribe (queue +
       // resolve-next async generator). The event source is the module-level
       // workflowRunStreamHub, fed by WorkflowRunStore on every durable write, so
@@ -2188,20 +1742,9 @@ export const router = (authToken?: string) => {
       listScripts: t
         .input(schemas.workflows.listScripts.input)
         .output(schemas.workflows.listScripts.output)
-        .handler(async ({ context, input }) => {
-          const { runtime, workspacePath, projectSearchRoot, projectTrusted, skillStorageContext } =
-            await resolveWorkflowContext(context, input.workspaceId);
-          return discoverWorkflowScripts({
-            runtime,
-            workspacePath,
-            projectSearchRoot,
-            projectTrusted,
-            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-            skillStorageContext,
-          });
-        }),
+        .handler(({ context, input }) =>
+          handleWorkflowRequest(() => listWorkflowScripts(context, input.workspaceId))
+        ),
     },
     providers: {
       list: t

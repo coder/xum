@@ -42,6 +42,59 @@ const WorkflowRunStatusSnapshotSchema = WorkflowRunRecordSchema.pick({
 
 export type WorkflowRunStatusSnapshot = z.infer<typeof WorkflowRunStatusSnapshotSchema>;
 
+// Owner IDs feed directly into host-side session paths. Reject separators and dot segments
+// before constructing a store so a malformed reference cannot escape the sessions root.
+export function isPathSafeWorkspaceId(workspaceId: string): boolean {
+  return (
+    workspaceId.length > 0 &&
+    workspaceId !== "." &&
+    workspaceId !== ".." &&
+    !workspaceId.includes("/") &&
+    !workspaceId.includes("\\") &&
+    path.basename(workspaceId) === workspaceId
+  );
+}
+
+export async function getWorkflowRunStatusesForOwners(
+  context: { getSessionDir(workspaceId: string): string },
+  refs: ReadonlyArray<{ workspaceId: string; runId: string }>
+) {
+  const stores = new Map<string, WorkflowRunStore>();
+  const entries = await Promise.all(
+    refs.map(async (ref) => {
+      if (!isPathSafeWorkspaceId(ref.workspaceId)) {
+        return null;
+      }
+      try {
+        let store = stores.get(ref.workspaceId);
+        if (store == null) {
+          store = new WorkflowRunStore({ sessionDir: context.getSessionDir(ref.workspaceId) });
+          stores.set(ref.workspaceId, store);
+        }
+        const status = await store.getRunStatusForLiveness(ref);
+        return { runId: ref.runId, status };
+      } catch {
+        return null;
+      }
+    })
+  );
+  return entries.filter((entry) => entry != null);
+}
+
+export async function listActiveWorkflowRunsForOwners(
+  context: { getSessionDir(workspaceId: string): string },
+  workspaceIds: readonly string[]
+) {
+  const results = await Promise.all(
+    workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
+      const store = new WorkflowRunStore({ sessionDir: context.getSessionDir(workspaceId) });
+      const summaries = await store.listActiveRunSummaries({ workspaceId });
+      return summaries.map((summary) => ({ workspaceId, ...summary }));
+    })
+  );
+  return results.flat();
+}
+
 export interface WorkflowRunStoreOptions {
   sessionDir: string;
   staleLeaseMs?: number;
