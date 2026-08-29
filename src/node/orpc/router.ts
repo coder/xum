@@ -496,14 +496,9 @@ export const router = (authToken?: string) => {
       setProviderConfig: t
         .input(schemas.providers.setProviderConfig.input)
         .output(schemas.providers.setProviderConfig.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.providerService.setConfig(
-            input.provider,
-            input.keyPath,
-            input.value
-          );
-          return result;
-        }),
+        .handler(({ context, input }) =>
+          context.providerService.setConfig(input.provider, input.keyPath, input.value)
+        ),
       setModels: t
         .input(schemas.providers.setModels.input)
         .output(schemas.providers.setModels.output)
