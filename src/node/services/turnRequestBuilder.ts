@@ -2615,6 +2615,7 @@ export class TurnRequestBuilder {
       (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
       -1
     );
+    emitStartupBreadcrumb("preparing_request");
     const prepareMessagesForProviderStartedAt = Date.now();
     const primaryRequest = await prepareModelRequest({
       seed: modelResult.data,
@@ -2943,6 +2944,7 @@ export class TurnRequestBuilder {
       await primaryRequest.emitEnvelopeWith(effectiveLevel, providerOptions);
       return rebuiltMessages;
     };
+    emitStartupBreadcrumb("starting_stream");
     const turnExecutionOptions: TurnExecutionOptions = {
       workspaceId,
       messages: streamFinalMessages,
