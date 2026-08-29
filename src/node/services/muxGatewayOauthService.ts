@@ -5,8 +5,12 @@ import {
   buildAuthorizeUrl,
   buildExchangeBody,
   MUX_GATEWAY_EXCHANGE_URL,
+  MUX_GATEWAY_ORIGIN,
+  MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
 } from "@/common/constants/muxGatewayOAuth";
+import type { Config } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
+import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
@@ -27,9 +31,101 @@ export class MuxGatewayOauthService {
   private readonly serverFlows = new Map<string, ServerFlow>();
 
   constructor(
+    private readonly config: Pick<Config, "loadProvidersConfig">,
     private readonly providerService: ProviderService,
     private readonly windowService?: WindowService
   ) {}
+
+  async getAccountStatus(): Promise<
+    Result<
+      {
+        remaining_microdollars: number;
+        ai_gateway_concurrent_requests_per_user: number;
+      },
+      string
+    >
+  > {
+    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const muxConfig = (providersConfig["mux-gateway"] ?? {}) as Record<string, unknown>;
+    const creds = resolveProviderCredentials("mux-gateway", {
+      couponCode: typeof muxConfig.couponCode === "string" ? muxConfig.couponCode : undefined,
+      voucher: typeof muxConfig.voucher === "string" ? muxConfig.voucher : undefined,
+    });
+
+    if (!creds.isConfigured || !creds.couponCode) {
+      return Err("Xum Gateway is not logged in");
+    }
+
+    let response: Awaited<ReturnType<typeof fetch>>;
+    try {
+      response = await fetch(`${MUX_GATEWAY_ORIGIN}/api/v1/balance`, {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${creds.couponCode}`,
+        },
+      });
+    } catch (error) {
+      return Err(`Xum Gateway balance request failed: ${getErrorMessage(error)}`);
+    }
+
+    if (response.status === 401) {
+      try {
+        await this.providerService.setConfig("mux-gateway", ["couponCode"], "");
+        await this.providerService.setConfig("mux-gateway", ["voucher"], "");
+      } catch {
+        // Credential clearing is best-effort; session expiry still reaches the caller.
+      }
+
+      return Err(MUX_GATEWAY_SESSION_EXPIRED_MESSAGE);
+    }
+
+    if (!response.ok) {
+      let body = "";
+      try {
+        body = await response.text();
+      } catch {
+        // Preserve the HTTP status fallback when the response body is unreadable.
+      }
+      const prefix = body.trim().slice(0, 200);
+      return Err(
+        `Xum Gateway balance request failed (HTTP ${response.status}): ${
+          prefix || response.statusText
+        }`
+      );
+    }
+
+    let json: unknown;
+    try {
+      json = await response.json();
+    } catch (error) {
+      return Err(`Xum Gateway balance response was not valid JSON: ${getErrorMessage(error)}`);
+    }
+
+    const payload = json as {
+      remaining_microdollars?: unknown;
+      ai_gateway_concurrent_requests_per_user?: unknown;
+    };
+    const remaining = payload.remaining_microdollars;
+    const concurrency = payload.ai_gateway_concurrent_requests_per_user;
+
+    if (
+      typeof remaining !== "number" ||
+      !Number.isFinite(remaining) ||
+      !Number.isInteger(remaining) ||
+      remaining < 0 ||
+      typeof concurrency !== "number" ||
+      !Number.isFinite(concurrency) ||
+      !Number.isInteger(concurrency) ||
+      concurrency < 0
+    ) {
+      return Err("Xum Gateway returned an invalid balance payload");
+    }
+
+    return Ok({
+      remaining_microdollars: remaining,
+      ai_gateway_concurrent_requests_per_user: concurrency,
+    });
+  }
 
   async startDesktopFlow(): Promise<
     Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>

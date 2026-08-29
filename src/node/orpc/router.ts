@@ -4,13 +4,8 @@ import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBeha
 import * as schemas from "@/common/orpc/schemas";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ORPCContext } from "./context";
-import {
-  MUX_GATEWAY_ORIGIN,
-  MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
-} from "@/common/constants/muxGatewayOAuth";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import { Err, Ok } from "@/common/types/result";
-import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import {
@@ -2561,92 +2556,7 @@ export const router = (authToken?: string) => {
       getAccountStatus: t
         .input(schemas.muxGateway.getAccountStatus.input)
         .output(schemas.muxGateway.getAccountStatus.output)
-        .handler(async ({ context }) => {
-          const providersConfig = context.config.loadProvidersConfig() ?? {};
-          const muxConfig = (providersConfig["mux-gateway"] ?? {}) as Record<string, unknown>;
-          const creds = resolveProviderCredentials("mux-gateway", {
-            couponCode: typeof muxConfig.couponCode === "string" ? muxConfig.couponCode : undefined,
-            voucher: typeof muxConfig.voucher === "string" ? muxConfig.voucher : undefined,
-          });
-
-          if (!creds.isConfigured || !creds.couponCode) {
-            return Err("Xum Gateway is not logged in");
-          }
-
-          let response: Awaited<ReturnType<typeof fetch>>;
-          try {
-            response = await fetch(`${MUX_GATEWAY_ORIGIN}/api/v1/balance`, {
-              headers: {
-                Accept: "application/json",
-                Authorization: `Bearer ${creds.couponCode}`,
-              },
-            });
-          } catch (error) {
-            const message = getErrorMessage(error);
-            return Err(`Xum Gateway balance request failed: ${message}`);
-          }
-
-          if (response.status === 401) {
-            try {
-              // Best-effort auto-logout: clear local mux-gateway creds on session expiry.
-              await context.providerService.setConfig("mux-gateway", ["couponCode"], "");
-              await context.providerService.setConfig("mux-gateway", ["voucher"], "");
-            } catch {
-              // Ignore failures clearing local credentials
-            }
-
-            return Err(MUX_GATEWAY_SESSION_EXPIRED_MESSAGE);
-          }
-
-          if (!response.ok) {
-            let body = "";
-            try {
-              body = await response.text();
-            } catch {
-              // Ignore errors reading response body
-            }
-            const prefix = body.trim().slice(0, 200);
-            return Err(
-              `Xum Gateway balance request failed (HTTP ${response.status}): ${
-                prefix || response.statusText
-              }`
-            );
-          }
-
-          let json: unknown;
-          try {
-            json = await response.json();
-          } catch (error) {
-            const message = getErrorMessage(error);
-            return Err(`Xum Gateway balance response was not valid JSON: ${message}`);
-          }
-
-          const payload = json as {
-            remaining_microdollars?: unknown;
-            ai_gateway_concurrent_requests_per_user?: unknown;
-          };
-
-          const remaining = payload.remaining_microdollars;
-          const concurrency = payload.ai_gateway_concurrent_requests_per_user;
-
-          if (
-            typeof remaining !== "number" ||
-            !Number.isFinite(remaining) ||
-            !Number.isInteger(remaining) ||
-            remaining < 0 ||
-            typeof concurrency !== "number" ||
-            !Number.isFinite(concurrency) ||
-            !Number.isInteger(concurrency) ||
-            concurrency < 0
-          ) {
-            return Err("Xum Gateway returned an invalid balance payload");
-          }
-
-          return Ok({
-            remaining_microdollars: remaining,
-            ai_gateway_concurrent_requests_per_user: concurrency,
-          });
-        }),
+        .handler(({ context }) => context.muxGatewayOauthService.getAccountStatus()),
     },
 
     muxGatewayOauth: {

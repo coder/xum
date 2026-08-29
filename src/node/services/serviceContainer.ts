@@ -329,6 +329,7 @@ export class ServiceContainer {
     this.mcpServerManager.setMcpOauthService(this.mcpOauthService);
 
     this.muxGatewayOauthService = new MuxGatewayOauthService(
+      config,
       this.providerService,
       this.windowService
     );
