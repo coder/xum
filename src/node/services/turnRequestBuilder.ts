@@ -172,7 +172,7 @@ import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import { modelCostsIncluded } from "./providerModelFactory";
-import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
+import { buildPlanInstructions, buildStreamSystemContext } from "./turnContextAssembler";
 import {
   simulateContextLimitError,
   simulateToolPolicyNoop,

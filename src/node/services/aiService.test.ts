@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
-import { discoverAvailableSubagentsForToolContext } from "./streamContextBuilder";
+import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
   buildAppAttributionHeaders,
@@ -58,7 +58,7 @@ import type { DevToolsService } from "./devToolsService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import * as agentResolution from "./agentResolution";
-import * as streamContextBuilder from "./streamContextBuilder";
+import * as turnContextAssembler from "./turnContextAssembler";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -297,7 +297,7 @@ function stubCommonStreamMessageDependencies(args: {
   useRequestedModelString?: boolean;
   onPlanPayloadMessageIds?: (messageIds: string[]) => void;
   onBuildStreamSystemContext?: (
-    args: Parameters<typeof streamContextBuilder.buildStreamSystemContext>[0]
+    args: Parameters<typeof turnContextAssembler.buildStreamSystemContext>[0]
   ) => void;
   onPrepareMessagesForProvider?: (
     args: Parameters<typeof messagePipeline.prepareMessagesForProvider>[0]
@@ -306,7 +306,7 @@ function stubCommonStreamMessageDependencies(args: {
   spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(
     resolvedAgentResultFor(args.metadata)
   );
-  spyOn(streamContextBuilder, "buildPlanInstructions").mockImplementation((planArgs) => {
+  spyOn(turnContextAssembler, "buildPlanInstructions").mockImplementation((planArgs) => {
     args.onPlanPayloadMessageIds?.(planArgs.requestPayloadMessages.map((message) => message.id));
     return Promise.resolve({
       effectiveAdditionalInstructions: undefined,
@@ -314,7 +314,7 @@ function stubCommonStreamMessageDependencies(args: {
       planContentForTransition: undefined,
     });
   });
-  spyOn(streamContextBuilder, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+  spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
     args.onBuildStreamSystemContext?.(contextArgs);
     return Promise.resolve({
       agentSystemPromptSections: ["test-agent-prompt"],

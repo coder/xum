@@ -13,7 +13,7 @@ import { getPlanFilePath } from "@/common/utils/planStorage";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
-import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
+import { buildPlanInstructions, buildStreamSystemContext } from "./turnContextAssembler";
 
 class TestRuntime extends LocalRuntime {
   constructor(
