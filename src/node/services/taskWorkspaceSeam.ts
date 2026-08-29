@@ -27,18 +27,49 @@ import type { QueueCutCutter } from "@/node/services/messageQueue";
 export type AgentTaskStatus = NonNullable<WorkspaceConfigEntry["taskStatus"]>;
 
 export interface ArchiveWorkspaceOptions {
-  /** Prevent an agent-driven archive from deleting a checkout after a concurrent settings flip. */
+  /**
+   * Refuse to archive when the effective worktree archive behavior would delete the checkout
+   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
+   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
+   * behavior read that drives the snapshot/deletion decisions.
+   */
   forbidWorktreeCheckoutDeletion?: boolean;
   /**
-   * Fail closed if user activity starts after the caller's earlier check, and hold turn admission
-   * through the archive. User-driven archives intentionally keep their stop-activity behavior.
+   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
+   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
+   * session). Model-facing callers set this so an agent-driven archive fails closed instead
+   * of silently terminating user work that started after the caller's earlier activity check.
+   * Checked synchronously in the same block that marks the workspace as archiving, pairing
+   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
+   * other. Also holds the session's turn admission for the rest of the archive so a queued
+   * entry cannot dispatch through AgentSession's internal send path (which bypasses
+   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
+   * path intentionally omits this and keeps its stop-activity semantics.
    */
   refuseLiveUserActivity?: boolean;
-  /** Keep archive eligibility stable after the caller commits to interrupting active turns. */
+  /**
+   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
+   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
+   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
+   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
+   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
+   */
   worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
-  /** Prevent a reversible agent archive from permanently deleting its remote Coder workspace. */
+  /**
+   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
+   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
+   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
+   * fail closed instead; route that policy through user-mediated archive.
+   */
   forbidCoderWorkspaceDeletion?: boolean;
-  /** Keep the Coder stop/deletion policy stable after the caller commits to interruption. */
+  /**
+   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
+   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
+   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
+   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
+   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
+   * otherwise strand already-interrupted turns behind a failed archive.
+   */
   coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
 }
 
