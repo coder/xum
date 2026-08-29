@@ -1,5 +1,4 @@
 import type { GoalRecordV1 } from "@/common/types/goal";
-import type { SendMessageOptions } from "@/common/orpc/types";
 
 const MICRO_CENTS_PER_CENT = 1_000_000;
 
@@ -34,128 +33,104 @@ export type GoalContinuationDecision =
   | { kind: "defer"; reason: GoalContinuationSkipReason; untilMs: number }
   | { kind: "stop"; reason: GoalContinuationSkipReason; dropCandidate: boolean };
 
-export interface GoalContinuationPolicyCandidate {
+type Candidate = {
   goalId: string;
   source: "stream_end" | "kickoff" | "budget_wrapup";
-  sendOptions: Pick<SendMessageOptions, "agentId" | "mode">;
-}
+  sendOptions: { agentId?: string | null; mode?: string | null };
+};
+type WorkspaceState = { found: boolean; archived: boolean; hasPath: boolean; isChild: boolean };
+type RuntimeState = {
+  isInitializing: boolean;
+  isRuntimeCompatible: boolean;
+  isBusy: boolean;
+  hasQueuedMessages: boolean;
+  hasPendingFollowUp: boolean;
+};
+type PolicyGoal = Pick<
+  GoalRecordV1,
+  | "goalId"
+  | "status"
+  | "requireUserAcknowledgmentSinceMs"
+  | "budgetLimitInjectedForGoalId"
+  | "lastContinuationFiredAtMs"
+>;
+export type GoalStreamStamp = { goalId: string | null; originKind: GoalStreamOriginKind };
 
 export interface GoalContinuationPolicyState {
   nowMs: number;
   bridgeRegistered: boolean;
-  candidate: GoalContinuationPolicyCandidate | null;
-  workspace: { found: boolean; archived: boolean; hasPath: boolean; isChild: boolean };
+  candidate: Candidate | null;
+  workspace: WorkspaceState;
   hasActiveDescendantTasks: boolean;
-  runtime: {
-    isInitializing: boolean;
-    isRuntimeCompatible: boolean;
-    isBusy: boolean;
-    hasQueuedMessages: boolean;
-    hasPendingFollowUp: boolean;
-  };
+  runtime: RuntimeState;
   isStreaming: boolean;
   userStopAtMs: number | null;
   stopCheckGoal: Pick<GoalRecordV1, "createdAtMs"> | null;
-  goal: Pick<
-    GoalRecordV1,
-    | "goalId"
-    | "status"
-    | "requireUserAcknowledgmentSinceMs"
-    | "budgetLimitInjectedForGoalId"
-    | "lastContinuationFiredAtMs"
-  > | null;
-  lastStreamStamp: Pick<GoalStreamStamp, "goalId" | "originKind"> | null;
+  goal: PolicyGoal | null;
+  lastStreamStamp: GoalStreamStamp | null;
   continuationCooldownMs: number;
   allowUserOriginBudgetWrapup: boolean;
 }
 
-export interface GoalStreamStamp {
-  goalId: string | null;
-  originKind: GoalStreamOriginKind;
-}
+export type GoalContinuationPolicyProbe = Pick<
+  GoalContinuationPolicyState,
+  "nowMs" | "bridgeRegistered" | "candidate"
+> &
+  Partial<
+    Pick<
+      GoalContinuationPolicyState,
+      | "workspace"
+      | "hasActiveDescendantTasks"
+      | "runtime"
+      | "isStreaming"
+      | "userStopAtMs"
+      | "stopCheckGoal"
+    >
+  >;
 
 const stop = (
   reason: GoalContinuationSkipReason,
   dropCandidate: boolean
 ): GoalContinuationDecision => ({ kind: "stop", reason, dropCandidate });
 
-export function evaluateGoalContinuationRegistration(
-  state: Pick<GoalContinuationPolicyState, "candidate" | "bridgeRegistered">
+export function evaluateGoalContinuationBeforeGoal(
+  state: GoalContinuationPolicyProbe
 ): GoalContinuationDecision | null {
-  if (!state.candidate) {
-    return stop("no_pending_candidate", false);
-  }
-  if (!state.bridgeRegistered) {
-    return stop("not_registered", false);
-  }
-  return null;
-}
-
-export function evaluateGoalContinuationWorkspace(
-  state: Pick<GoalContinuationPolicyState, "workspace" | "hasActiveDescendantTasks">
-): GoalContinuationDecision | null {
-  if (!state.workspace.found) {
-    return stop("workspace_not_found", true);
-  }
-  if (state.workspace.archived) {
-    return stop("archived", true);
-  }
-  if (!state.workspace.hasPath) {
-    return stop("transcript_only", true);
-  }
-  if (state.workspace.isChild) {
-    return stop("child_workspace", true);
-  }
-  if (state.hasActiveDescendantTasks) {
-    return stop("active_descendant_tasks", false);
-  }
-  return null;
-}
-
-export function evaluateGoalContinuationRuntime(
-  state: Pick<GoalContinuationPolicyState, "nowMs" | "runtime" | "candidate"> & {
-    isStreaming: boolean | null;
-  }
-): GoalContinuationDecision | null {
+  const candidate = state.candidate;
+  if (!candidate) return stop("no_pending_candidate", false);
+  if (!state.bridgeRegistered) return stop("not_registered", false);
+  if (!state.workspace) return null;
+  if (!state.workspace.found) return stop("workspace_not_found", true);
+  if (state.workspace.archived) return stop("archived", true);
+  if (!state.workspace.hasPath) return stop("transcript_only", true);
+  if (state.workspace.isChild) return stop("child_workspace", true);
+  if (state.hasActiveDescendantTasks == null) return null;
+  if (state.hasActiveDescendantTasks) return stop("active_descendant_tasks", false);
+  if (!state.runtime) return null;
   if (state.runtime.isInitializing) {
     return { kind: "defer", reason: "initializing", untilMs: state.nowMs + 1_000 };
   }
-  if (!state.runtime.isRuntimeCompatible) {
-    return stop("incompatible_runtime", true);
-  }
-  if (state.runtime.isBusy || state.isStreaming === true) {
+  if (!state.runtime.isRuntimeCompatible) return stop("incompatible_runtime", true);
+  if (state.runtime.isBusy) {
     return { kind: "defer", reason: "currently_streaming", untilMs: state.nowMs + 1_000 };
   }
-  if (state.isStreaming == null) {
-    return null;
+  if (state.isStreaming == null) return null;
+  if (state.isStreaming) {
+    return { kind: "defer", reason: "currently_streaming", untilMs: state.nowMs + 1_000 };
   }
-  if (state.runtime.hasQueuedMessages) {
-    return stop("queued_user_input", false);
-  }
-  if (state.runtime.hasPendingFollowUp) {
-    return stop("pending_follow_up", false);
-  }
-  const sendOptions = state.candidate?.sendOptions;
-  if (sendOptions?.agentId === "plan" || sendOptions?.mode === "plan") {
+  if (state.runtime.hasQueuedMessages) return stop("queued_user_input", false);
+  if (state.runtime.hasPendingFollowUp) return stop("pending_follow_up", false);
+  if (candidate.sendOptions.agentId === "plan" || candidate.sendOptions.mode === "plan") {
     return stop("plan_mode", true);
   }
-  if (sendOptions?.agentId === "compact" || sendOptions?.mode === "compact") {
+  if (candidate.sendOptions.agentId === "compact" || candidate.sendOptions.mode === "compact") {
     return stop("compact_mode", true);
   }
-  return null;
-}
-
-export function evaluateGoalContinuationStopCheck(
-  state: Pick<GoalContinuationPolicyState, "userStopAtMs" | "stopCheckGoal">
-): GoalContinuationDecision | null {
-  if (state.userStopAtMs == null) {
-    return null;
-  }
-  if (!state.stopCheckGoal) {
-    return stop("goal_missing", true);
-  }
-  if (state.userStopAtMs >= state.stopCheckGoal.createdAtMs) {
-    return stop("user_stop", true);
+  if (state.userStopAtMs === undefined) return null;
+  if (state.userStopAtMs != null) {
+    if (state.stopCheckGoal === undefined) return null;
+    if (!state.stopCheckGoal) return stop("goal_missing", true);
+    if (state.userStopAtMs >= state.stopCheckGoal.createdAtMs) return stop("user_stop", true);
   }
   return null;
 }
@@ -171,14 +146,9 @@ export function evaluateGoalContinuationGoal(
     | "allowUserOriginBudgetWrapup"
   >
 ): GoalContinuationDecision {
-  const candidate = state.candidate;
-  const goal = state.goal;
-  if (!goal || !candidate) {
-    return stop("goal_missing", true);
-  }
-  if (goal.goalId !== candidate.goalId) {
-    return stop("goal_mismatch", true);
-  }
+  const { candidate, goal } = state;
+  if (!goal || !candidate) return stop("goal_missing", true);
+  if (goal.goalId !== candidate.goalId) return stop("goal_mismatch", true);
   if (
     goal.status !== "active" &&
     goal.status !== "budget_limited" &&
@@ -186,9 +156,7 @@ export function evaluateGoalContinuationGoal(
   ) {
     return stop("goal_not_active", true);
   }
-  if (goal.requireUserAcknowledgmentSinceMs != null) {
-    return stop("requires_ack", false);
-  }
+  if (goal.requireUserAcknowledgmentSinceMs != null) return stop("requires_ack", false);
   if (goal.status === "budget_limited") {
     if (goal.budgetLimitInjectedForGoalId === goal.goalId) {
       return stop("budget_wrapup_already_fired", true);
@@ -205,37 +173,27 @@ export function evaluateGoalContinuationGoal(
     return { kind: "continue", mode: "budget_wrapup" };
   }
   const lastFiredAtMs = goal.lastContinuationFiredAtMs ?? null;
-  if (lastFiredAtMs != null && state.nowMs - lastFiredAtMs < state.continuationCooldownMs) {
-    return {
-      kind: "defer",
-      reason: "cooldown",
-      untilMs: lastFiredAtMs + state.continuationCooldownMs,
-    };
-  }
-  return { kind: "continue", mode: "continuation" };
+  return lastFiredAtMs != null && state.nowMs - lastFiredAtMs < state.continuationCooldownMs
+    ? {
+        kind: "defer",
+        reason: "cooldown",
+        untilMs: lastFiredAtMs + state.continuationCooldownMs,
+      }
+    : { kind: "continue", mode: "continuation" };
 }
 
 export function evaluateGoalContinuation(
   state: GoalContinuationPolicyState
 ): GoalContinuationDecision {
-  return (
-    evaluateGoalContinuationRegistration(state) ??
-    evaluateGoalContinuationWorkspace(state) ??
-    evaluateGoalContinuationRuntime(state) ??
-    evaluateGoalContinuationStopCheck(state) ??
-    evaluateGoalContinuationGoal(state)
-  );
-}
-
-function getGoalCostMicroCents(goal: GoalRecordV1): number {
-  return goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
+  return evaluateGoalContinuationBeforeGoal(state) ?? evaluateGoalContinuationGoal(state);
 }
 
 export function hasReachedGoalBudgetLimit(goal: GoalRecordV1): boolean {
+  const costMicroCents = goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
   return (
     goal.budgetCents != null &&
     goal.budgetCents > 0 &&
-    getGoalCostMicroCents(goal) >= goal.budgetCents * MICRO_CENTS_PER_CENT
+    costMicroCents >= goal.budgetCents * MICRO_CENTS_PER_CENT
   );
 }
 
@@ -258,29 +216,18 @@ export function applyBudgetDrivenStatus(
   goal: GoalRecordV1,
   options: { originKind?: GoalStreamOriginKind; nowMs: number }
 ): GoalRecordV1 {
-  const normalizedBudgetCents =
-    goal.budgetCents != null && goal.budgetCents > 0 ? goal.budgetCents : null;
+  const budgetCents = goal.budgetCents != null && goal.budgetCents > 0 ? goal.budgetCents : null;
   const normalized =
-    normalizedBudgetCents === goal.budgetCents
-      ? goal
-      : { ...goal, budgetCents: normalizedBudgetCents, updatedAtMs: options.nowMs };
+    budgetCents === goal.budgetCents ? goal : { ...goal, budgetCents, updatedAtMs: options.nowMs };
   const reachedLimit = hasReachedAnyGoalLimit(normalized);
-  const shouldLimitActiveGoal = normalized.status === "active" && reachedLimit;
-  const shouldRearmBudgetLimitedGoal = normalized.status === "budget_limited" && !reachedLimit;
-  if (!shouldLimitActiveGoal && !shouldRearmBudgetLimitedGoal) {
-    return normalized;
-  }
+  const limit = normalized.status === "active" && reachedLimit;
+  const rearm = normalized.status === "budget_limited" && !reachedLimit;
+  if (!limit && !rearm) return normalized;
   return {
     ...normalized,
-    status: shouldLimitActiveGoal ? "budget_limited" : "active",
-    budgetLimitInjectedForGoalId: shouldRearmBudgetLimitedGoal
-      ? null
-      : normalized.budgetLimitInjectedForGoalId,
-    budgetLimitOriginKind: shouldLimitActiveGoal
-      ? (options.originKind ?? null)
-      : shouldRearmBudgetLimitedGoal
-        ? null
-        : normalized.budgetLimitOriginKind,
+    status: limit ? "budget_limited" : "active",
+    budgetLimitInjectedForGoalId: rearm ? null : normalized.budgetLimitInjectedForGoalId,
+    budgetLimitOriginKind: limit ? (options.originKind ?? null) : null,
     updatedAtMs: options.nowMs,
   };
 }

@@ -55,15 +55,13 @@ import { log } from "./log";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import {
   applyBudgetDrivenStatus,
+  evaluateGoalContinuationBeforeGoal,
   evaluateGoalContinuationGoal,
-  evaluateGoalContinuationRegistration,
-  evaluateGoalContinuationRuntime,
-  evaluateGoalContinuationStopCheck,
-  evaluateGoalContinuationWorkspace,
   hasReachedGoalBudgetLimit,
   hasReachedGoalTurnLimit,
   isBudgetWrapupEligibleOrigin,
   type GoalContinuationDecision,
+  type GoalContinuationPolicyProbe,
   type GoalContinuationSkipReason,
   type GoalStreamOriginKind,
 } from "./goalContinuationPolicy";
@@ -2133,76 +2131,56 @@ export class WorkspaceGoalService {
         ...(decision.kind === "defer" ? { deferUntilMs: decision.untilMs } : {}),
       };
     };
-
     const bridge = this.goalContinuationBridge;
-    let decision = evaluateGoalContinuationRegistration({
+    const probe: GoalContinuationPolicyProbe = {
+      nowMs,
       candidate,
       bridgeRegistered: bridge != null,
-    });
-    if (decision) {
-      return finish(decision);
-    }
+    };
+    const evaluateProbe = () => evaluateGoalContinuationBeforeGoal(probe);
+    let decision = evaluateProbe();
+    if (decision) return finish(decision);
     assert(
       candidate != null && bridge != null,
       "registered continuation requires candidate and bridge"
     );
 
     const workspace = this.findWorkspaceConfigEntry(workspaceId);
-    const workspaceState = {
+    probe.workspace = {
       found: workspace != null,
       archived:
         workspace != null && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt),
-      hasPath: workspace?.path != null,
+      hasPath: Boolean(workspace?.path),
       isChild: workspace?.parentWorkspaceId != null,
     };
-    decision = evaluateGoalContinuationWorkspace({
-      workspace: workspaceState,
-      hasActiveDescendantTasks: false,
-    });
-    if (decision) {
-      return finish(decision);
-    }
-    decision = evaluateGoalContinuationWorkspace({
-      workspace: workspaceState,
-      hasActiveDescendantTasks: bridge.hasActiveDescendantTasks(workspaceId),
-    });
-    if (decision) {
-      return finish(decision);
-    }
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
+
+    probe.hasActiveDescendantTasks = bridge.hasActiveDescendantTasks(workspaceId);
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
 
     const runtimeState = bridge.getRuntimeState(workspaceId);
-    const runtime = {
+    probe.runtime = {
       isInitializing: runtimeState.isInitializing === true,
       isRuntimeCompatible: runtimeState.isRuntimeCompatible !== false,
       isBusy: runtimeState.isBusy === true,
       hasQueuedMessages: runtimeState.hasQueuedMessages === true,
       hasPendingFollowUp: runtimeState.hasPendingFollowUp === true,
     };
-    decision = evaluateGoalContinuationRuntime({
-      nowMs,
-      runtime,
-      isStreaming: null,
-      candidate,
-    });
-    if (decision) {
-      return finish(decision);
-    }
-    decision = evaluateGoalContinuationRuntime({
-      nowMs,
-      runtime,
-      isStreaming: await this.isWorkspaceStreaming(workspaceId),
-      candidate,
-    });
-    if (decision) {
-      return finish(decision);
-    }
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
 
-    const userStopAtMs = this.lastUserStopAtMsByWorkspace.get(workspaceId) ?? null;
-    const stopCheckGoal = userStopAtMs != null ? await this.readGoalFile(workspaceId) : null;
-    decision = evaluateGoalContinuationStopCheck({ userStopAtMs, stopCheckGoal });
-    if (decision) {
-      return finish(decision);
+    probe.isStreaming = await this.isWorkspaceStreaming(workspaceId);
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
+
+    probe.userStopAtMs = this.lastUserStopAtMsByWorkspace.get(workspaceId) ?? null;
+    if (probe.userStopAtMs != null) {
+      probe.stopCheckGoal = await this.readGoalFile(workspaceId);
     }
+    decision = evaluateProbe();
+    if (decision) return finish(decision);
 
     const goal = await this.normalizeGoalLimits(workspaceId, {
       syncChatTail: candidate.source !== "kickoff",
