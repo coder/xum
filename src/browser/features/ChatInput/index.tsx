@@ -577,7 +577,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
     composerSuggestions;
   const handleComposerInputChange = (next: string, caret?: number) => {
-    handleInputCaretChange(caret, next.length);
+    handleInputCaretChange(caret, next);
     handleInputChange(next, caret);
   };
   const additionalSystemContext = useAdditionalSystemContextSnapshot(

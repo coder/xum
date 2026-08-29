@@ -187,7 +187,11 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     false,
     { listener: true }
   );
-  const [cursor, setCursor] = useState(input.length);
+  // A measured caret is only valid for the input it was measured against;
+  // external input changes (draft restore, persisted-state writes) fall back
+  // to end-of-text, matching the pre-extraction selectionStart ?? length read.
+  const [caretState, setCaretState] = useState<{ input: string; cursor: number } | null>(null);
+  const cursor = caretState?.input === input ? caretState.cursor : input.length;
   const [selection, setSelection] = useState({
     channelKey: "",
     index: 0,
@@ -424,7 +428,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     if (!activeToken) return;
     const applied = applyComposerSuggestion(input, activeToken, suggestion);
     setInput(applied.input);
-    setCursor(applied.cursor);
+    setCaretState({ input: applied.input, cursor: applied.cursor });
     setSelection({
       channelKey: activeChannelKey,
       index: 0,
@@ -472,11 +476,11 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
 
   const handleCursorActivity = () => {
     const element = inputRef.current;
-    if (element) setCursor(element.selectionStart ?? input.length);
+    if (element) setCaretState({ input, cursor: element.selectionStart ?? input.length });
   };
 
-  const handleInputCaretChange = (caret: number | undefined, inputLength: number) => {
-    setCursor(caret ?? inputLength);
+  const handleInputCaretChange = (caret: number | undefined, nextInput: string) => {
+    setCaretState({ input: nextInput, cursor: caret ?? nextInput.length });
   };
 
   const ghostHint = getCommandGhostHint(input, isVisible && activeToken?.kind === "slash", {
