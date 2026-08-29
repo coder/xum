@@ -494,10 +494,10 @@ describe("WorkflowTaskServiceAdapter", () => {
       taskId: "task_impl",
       error: "outside allowed prefixes",
     });
-    expect(calls).toHaveLength(2);
+    // Prefix policy rides the dry-run precheck, so a violation fails before the real apply.
+    expect(calls).toHaveLength(1);
     expect(calls[0]?.args.dry_run).toBe(true);
-    expect(calls[1]?.args.dry_run).toBe(false);
-    expect(calls[1]?.options?.allowedPathPrefixes).toEqual([".mux/security"]);
+    expect(calls[0]?.options?.allowedPathPrefixes).toEqual([".mux/security"]);
   });
 
   test("holds the stable child patch lock across workflow dry-run and real apply", async () => {

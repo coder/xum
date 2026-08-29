@@ -184,7 +184,11 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
         force: spec.force,
       };
       const engineConfig = { ...patchToolConfig, trusted: true };
-      const engineOptions = { abortSignal: options?.abortSignal, allowAlreadyApplied: true };
+      const engineOptions = {
+        abortSignal: options?.abortSignal,
+        allowAlreadyApplied: true,
+        allowedPathPrefixes: spec.allowedPathPrefixes,
+      };
       const dryRun = await this.patchEngine.applyPatch(
         engineConfig,
         { ...baseArgs, dry_run: true },
@@ -194,7 +198,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       return await this.patchEngine.applyPatch(
         engineConfig,
         { ...baseArgs, dry_run: false },
-        { ...engineOptions, allowedPathPrefixes: spec.allowedPathPrefixes }
+        engineOptions
       );
     };
 

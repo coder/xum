@@ -7,7 +7,7 @@ import type { z } from "zod";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
   TaskApplyGitPatchToolArgsSchema,
-  TaskApplyGitPatchToolResultSchema,
+  type TaskApplyGitPatchToolResultSchema,
   type SubagentGitPatchArtifact,
   type SubagentGitProjectPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
@@ -32,8 +32,6 @@ import { coerceNonEmptyString, findWorkspaceEntry } from "@/node/services/taskUt
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
 
 import { streamToString } from "@/node/runtime/streamUtils";
-
-import { parseToolResult, requireWorkspaceId } from "./tools/toolUtils";
 
 export type TaskApplyGitPatchArgs = z.infer<typeof TaskApplyGitPatchToolArgsSchema>;
 export type TaskApplyGitPatchResult = z.infer<typeof TaskApplyGitPatchToolResultSchema>;
@@ -1717,11 +1715,12 @@ async function applyPatch(
   args: TaskApplyGitPatchArgs,
   options: TaskGitPatchApplyOptions = {}
 ): Promise<TaskApplyGitPatchResult> {
-  const workspaceId = requireWorkspaceId(config, "task_apply_git_patch");
-  assert(config.cwd, "task_apply_git_patch requires cwd");
-  assert(config.runtimeTempDir, "task_apply_git_patch requires runtimeTempDir");
+  assert(config.workspaceId, "taskGitPatchEngine.applyPatch requires workspaceId");
+  const workspaceId = config.workspaceId;
+  assert(config.cwd, "taskGitPatchEngine.applyPatch requires cwd");
+  assert(config.runtimeTempDir, "taskGitPatchEngine.applyPatch requires runtimeTempDir");
   const workspaceSessionDir = config.workspaceSessionDir;
-  assert(workspaceSessionDir, "task_apply_git_patch requires workspaceSessionDir");
+  assert(workspaceSessionDir, "taskGitPatchEngine.applyPatch requires workspaceSessionDir");
 
   const parsedArgs = TaskApplyGitPatchToolArgsSchema.parse(args);
   const taskId = parsedArgs.task_id;
@@ -1731,17 +1730,13 @@ async function applyPatch(
   const expectedHeadSha = parsedArgs.expected_head_sha ?? undefined;
 
   if (!isSafeSubagentGitPatchPathComponent(taskId)) {
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        error: "Invalid task_id.",
-        note: "task_id must be a safe path component.",
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      error: "Invalid task_id.",
+      note: "task_id must be a safe path component.",
+    };
   }
 
   await config.runtime.ensureDir(config.runtimeTempDir, options.abortSignal);
@@ -1753,16 +1748,12 @@ async function applyPatch(
   });
 
   if (!artifactLookup) {
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        error: "No git patch artifact found for this taskId.",
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      error: "No git patch artifact found for this taskId.",
+    };
   }
 
   let artifact = artifactLookup.artifact;
@@ -1775,20 +1766,16 @@ async function applyPatch(
   const artifactLookupNote = artifactLookup.note;
 
   if (artifact.parentWorkspaceId !== artifactWorkspaceId) {
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        error: "This patch artifact belongs to a different parent workspace.",
-        note: mergeNotes(
-          artifactLookupNote,
-          `Expected parent workspace ${artifactWorkspaceId} but artifact metadata says ${artifact.parentWorkspaceId}.`
-        ),
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      error: "This patch artifact belongs to a different parent workspace.",
+      note: mergeNotes(
+        artifactLookupNote,
+        `Expected parent workspace ${artifactWorkspaceId} but artifact metadata says ${artifact.parentWorkspaceId}.`
+      ),
+    };
   }
 
   const requestedProjectPath = parsedArgs.project_path;
@@ -1812,45 +1799,33 @@ async function applyPatch(
   // on its final re-read. Never start a (destructive) apply for a cancelled
   // call — bail before any repo mutation.
   if (options.abortSignal?.aborted === true) {
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        error: "Aborted while waiting for patch generation; the patch was not applied.",
-        note: artifactLookupNote,
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      error: "Aborted while waiting for patch generation; the patch was not applied.",
+      note: artifactLookupNote,
+    };
   }
 
   const projectArtifacts = listRelevantProjectArtifacts(artifact, requestedProjectPath);
 
   if (parsedArgs.project_path != null && projectArtifacts.length === 0) {
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        error: `No project patch artifact found for ${parsedArgs.project_path}.`,
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      error: `No project patch artifact found for ${parsedArgs.project_path}.`,
+    };
   }
 
   if (projectArtifacts.length === 0) {
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        error: "This task has no project patch artifacts.",
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      error: "This task has no project patch artifacts.",
+    };
   }
 
   // Still-pending here means generation outlived the wait above. Do not
@@ -1869,20 +1844,16 @@ async function applyPatch(
           }
         : summarizeNonReadyProjectArtifact({ projectArtifact })
     );
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        projectResults: pendingProjectResults,
-        error:
-          "Patch generation has not finished for this task yet. This is not an apply conflict; retry task_apply_git_patch shortly.",
-        note: artifactLookupNote,
-        ...toLegacyFields(pendingProjectResults),
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      projectResults: pendingProjectResults,
+      error:
+        "Patch generation has not finished for this task yet. This is not an apply conflict; retry task_apply_git_patch shortly.",
+      note: artifactLookupNote,
+      ...toLegacyFields(pendingProjectResults),
+    };
   }
 
   if (options.allowedPathPrefixes != null && options.allowedPathPrefixes.length > 0) {
@@ -1893,11 +1864,7 @@ async function applyPatch(
       allowedPathPrefixes: options.allowedPathPrefixes,
     });
     if (pathViolation != null) {
-      return parseToolResult(
-        TaskApplyGitPatchToolResultSchema,
-        { success: false as const, taskId, error: pathViolation },
-        "task_apply_git_patch"
-      );
+      return { success: false as const, taskId, error: pathViolation };
     }
   }
 
@@ -1916,19 +1883,15 @@ async function applyPatch(
     }
 
     const legacyFields = toLegacyFields(projectResults);
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        projectResults,
-        error: "This task has no ready project patch artifacts.",
-        note: artifactLookupNote,
-        ...legacyFields,
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      projectResults,
+      error: "This task has no ready project patch artifacts.",
+      note: artifactLookupNote,
+      ...legacyFields,
+    };
   }
 
   let shouldStopAfterFailure = false;
@@ -2036,35 +1999,27 @@ async function applyPatch(
     const firstFailedProject = projectResults.find(
       (projectResult) => projectResult.status === "failed"
     );
-    return parseToolResult(
-      TaskApplyGitPatchToolResultSchema,
-      {
-        success: false as const,
-        taskId,
-        dryRun,
-        projectResults,
-        error:
-          firstFailedProject?.error ??
-          `Failed while applying project patches (${appliedReadyCount}/${attemptedReadyCount} ready projects applied).`,
-        note: overallNote,
-        ...legacyFields,
-      },
-      "task_apply_git_patch"
-    );
+    return {
+      success: false as const,
+      taskId,
+      dryRun,
+      projectResults,
+      error:
+        firstFailedProject?.error ??
+        `Failed while applying project patches (${appliedReadyCount}/${attemptedReadyCount} ready projects applied).`,
+      note: overallNote,
+      ...legacyFields,
+    };
   }
 
-  return parseToolResult(
-    TaskApplyGitPatchToolResultSchema,
-    {
-      success: true as const,
-      taskId,
-      projectResults,
-      dryRun,
-      note: overallNote,
-      ...(projectResults.length === 1 ? legacyFields : {}),
-    },
-    "task_apply_git_patch"
-  );
+  return {
+    success: true as const,
+    taskId,
+    projectResults,
+    dryRun,
+    note: overallNote,
+    ...(projectResults.length === 1 ? legacyFields : {}),
+  };
 }
 
 async function writeReadableStreamToLocalFile(
