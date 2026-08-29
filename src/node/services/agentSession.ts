@@ -8,8 +8,8 @@ import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
-import type { AIService } from "@/node/services/aiService";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
+import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -183,8 +183,10 @@ import {
   awaitPendingBranchSummary,
   isRlmModeEnabled,
   runInlineAbandonedBranchSummary,
+  type BranchSummaryAiService,
 } from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import type { MemorySessionContext } from "@/node/services/memoryService";
@@ -525,11 +527,46 @@ export interface AgentSessionMetadataEvent {
   metadata: FrontendWorkspaceMetadata | null;
 }
 
+interface AgentSessionActiveStreamInfo {
+  messageId: string;
+  startTime?: number;
+  parts: Array<{ timestamp?: number; workflowRun?: { timestamp?: number } }>;
+  toolCompletionTimestamps: Map<string, number>;
+}
+
+/** Keeps AgentSession coupled only to the AI operations and events it consumes. */
+export interface AgentSessionAIService extends BranchSummaryAiService {
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  off(event: string, listener: (...args: unknown[]) => void): void;
+  streamMessage(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+  stopStream(
+    workspaceId: string,
+    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+  ): Promise<Result<void>>;
+  isStreaming(workspaceId: string): boolean;
+  getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
+  replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+  getProvidersConfig(): ProvidersConfigMap | null;
+  isExperimentEnabled(experimentId: ExperimentId): boolean;
+  buildMemorySessionContext?(
+    workspaceId: string,
+    modelString: string,
+    options?: { includeHotMemories?: boolean }
+  ): Promise<MemorySessionContext | null>;
+  isClaudeSkillsCompatEnabled?(): boolean;
+  isAgentPluginsEnabled?(): boolean;
+  resolveXumToolScopeForWorkspace?(
+    metadata: WorkspaceMetadata,
+    runtime: Runtime,
+    workspacePath: string
+  ): XumToolScope;
+}
+
 interface AgentSessionOptions {
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
-  aiService: AIService;
+  aiService: AgentSessionAIService;
   mcpServerManager?: MCPServerManager;
   initStateManager: InitStateManager;
   telemetryService?: TelemetryService;
@@ -596,7 +633,7 @@ export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
   private readonly historyService: HistoryService;
-  private readonly aiService: AIService;
+  private readonly aiService: AgentSessionAIService;
   private readonly mcpServerManager?: MCPServerManager;
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
@@ -933,7 +970,7 @@ export class AgentSession {
     }
 
     for (const { event, handler } of this.aiListeners) {
-      this.aiService.off(event, handler as never);
+      this.aiService.off(event, handler);
     }
     this.aiListeners.length = 0;
     for (const { event, handler } of this.initListeners) {
@@ -1490,7 +1527,7 @@ export class AgentSession {
   }
 
   private isAiStreaming(): boolean {
-    const aiService = this.aiService as Partial<Pick<AIService, "isStreaming">>;
+    const aiService = this.aiService as Partial<Pick<AgentSessionAIService, "isStreaming">>;
     if (typeof aiService.isStreaming !== "function") {
       return false;
     }
@@ -1791,7 +1828,9 @@ export class AgentSession {
   }
 
   private async getWorkspaceMetadataForRetry(): Promise<WorkspaceMetadata | undefined> {
-    const aiService = this.aiService as Partial<Pick<AIService, "getWorkspaceMetadata">>;
+    const aiService = this.aiService as Partial<
+      Pick<AgentSessionAIService, "getWorkspaceMetadata">
+    >;
     if (typeof aiService.getWorkspaceMetadata !== "function") {
       return undefined;
     }
@@ -2283,14 +2322,14 @@ export class AgentSession {
         };
 
         const cleanup = () => {
-          this.aiService.off("stream-end", maybeResolve as never);
-          this.aiService.off("stream-abort", maybeResolve as never);
-          this.aiService.off("error", maybeResolve as never);
+          this.aiService.off("stream-end", maybeResolve);
+          this.aiService.off("stream-abort", maybeResolve);
+          this.aiService.off("error", maybeResolve);
         };
 
-        this.aiService.on("stream-end", maybeResolve as never);
-        this.aiService.on("stream-abort", maybeResolve as never);
-        this.aiService.on("error", maybeResolve as never);
+        this.aiService.on("stream-end", maybeResolve);
+        this.aiService.on("stream-abort", maybeResolve);
+        this.aiService.on("error", maybeResolve);
 
         // Defensive: stream state may have changed between waitForIdle() and listener setup.
         maybeResolve({ workspaceId: this.workspaceId });
@@ -4235,7 +4274,7 @@ export class AgentSession {
       // Prefer ProviderService's safe config view: it includes env/file API-key source
       // metadata plus the Codex OAuth presence bit, which context-limit resolution needs
       // to distinguish GPT-5.5 API-key requests from lower-cap OAuth-routed requests.
-      const maybeAIService = this.aiService as AIService & {
+      const maybeAIService = this.aiService as AgentSessionAIService & {
         getProvidersConfig?: () => ProvidersConfigMap | null;
       };
       if (typeof maybeAIService.getProvidersConfig === "function") {
@@ -5718,7 +5757,7 @@ export class AgentSession {
         void handler(payload as WorkspaceChatMessage);
       };
       this.aiListeners.push({ event, handler: wrapped });
-      this.aiService.on(event, wrapped as never);
+      this.aiService.on(event, wrapped);
     };
 
     forward("stream-start", (payload) => {
@@ -6165,7 +6204,7 @@ export class AgentSession {
     };
 
     this.aiListeners.push({ event: "error", handler: errorHandler });
-    this.aiService.on("error", errorHandler as never);
+    this.aiService.on("error", errorHandler);
   }
 
   private attachInitListeners(): void {
