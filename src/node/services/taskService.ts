@@ -15,7 +15,12 @@ import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import {
+  SecretsStore,
+  type Config,
+  type ProjectsConfig,
+  type Workspace as WorkspaceConfigEntry,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
@@ -2205,7 +2210,8 @@ export class TaskService implements AgentTaskIntegration {
     private readonly initStateManager: InitStateManager,
     private readonly sessionUsageService?: SessionUsageService,
     private readonly workspaceGoalService?: WorkspaceGoalService,
-    private readonly streamManager?: StreamManager
+    private readonly streamManager?: StreamManager,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     this.agentPeerMessageBroker = new AgentPeerMessageBroker(workspaceService);
     this.taskHandleStore = new TaskHandleStore(config);
@@ -2569,7 +2575,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       const projectEnv = await secretsToRecord(
-        this.config.getEffectiveSecrets(normalizedRuntimeProjectPath)
+        this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
       );
       projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
       return projectEnv;
@@ -3950,7 +3956,7 @@ export class TaskService implements AgentTaskIntegration {
       initLogger.logComplete(0);
     } else {
       const secrets = await secretsToRecord(
-        this.config.getEffectiveSecrets(plan.parentMeta.projectPath)
+        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
@@ -5554,7 +5560,7 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.config.getEffectiveSecrets(parentMeta.projectPath)
+        this.secretsStore.getEffectiveSecrets(parentMeta.projectPath)
       );
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and

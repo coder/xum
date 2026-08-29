@@ -3,7 +3,7 @@ import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBeha
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
-import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { createCoreServices, type CoreServices } from "@/node/services/coreServices";
 import { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -91,6 +91,7 @@ export class ServiceContainer {
   public readonly workflowRuntimeFactory = new QuickJSRuntimeFactory();
   public readonly config: Config;
   public readonly providersConfigStore: ProvidersConfigStore;
+  public readonly secretsStore: SecretsStore;
   public readonly fileLeaseManager: FileLeaseManager;
   // Core services — instantiated by createCoreServices (shared with `xum run` CLI)
   private readonly historyService: CoreServices["historyService"];
@@ -157,6 +158,7 @@ export class ServiceContainer {
   constructor(config: Config) {
     this.config = config;
     this.providersConfigStore = new ProvidersConfigStore(config.rootDir);
+    this.secretsStore = new SecretsStore(config.rootDir);
     this.fileLeaseManager = new FileLeaseManager(config.rootDir);
 
     // Cross-cutting services: created first so they can be passed to core
@@ -185,6 +187,7 @@ export class ServiceContainer {
     const core = createCoreServices({
       config,
       providersConfigStore: this.providersConfigStore,
+      secretsStore: this.secretsStore,
       fileLeaseManager: this.fileLeaseManager,
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
@@ -253,7 +256,7 @@ export class ServiceContainer {
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
     });
 
-    this.projectService = new ProjectService(config, this.sshPromptService);
+    this.projectService = new ProjectService(config, this.sshPromptService, this.secretsStore);
     this.projectService.setWorkspaceService(this.workspaceService);
     this.projectService.setWorkspaceMetadataRefresher(this.workspaceService);
     this.projectService.setMcpServerManager(this.mcpServerManager);
@@ -370,7 +373,7 @@ export class ServiceContainer {
     this.copilotOauthService = new CopilotOauthService(this.providerService, this.windowService);
     // Terminal services - PTYService is cross-platform
     this.ptyService = new PTYService();
-    this.terminalService = new TerminalService(config, this.ptyService);
+    this.terminalService = new TerminalService(config, this.ptyService, this.secretsStore);
     // Wire terminal service to workspace service for cleanup on removal
     this.workspaceService.setTerminalService(this.terminalService);
     this.workspaceService.setDesktopSessionManager(this.desktopSessionManager);
@@ -645,6 +648,7 @@ export class ServiceContainer {
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
       providersConfigStore: this.providersConfigStore,
+      secretsStore: this.secretsStore,
       fileLeaseManager: this.fileLeaseManager,
       aiService: this.aiService,
       historyService: this.historyService,

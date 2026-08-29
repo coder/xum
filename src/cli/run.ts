@@ -14,7 +14,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { Config, FileLeaseManager, ProvidersConfigStore } from "../node/config";
+import { Config, FileLeaseManager, ProvidersConfigStore, SecretsStore } from "../node/config";
 import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
@@ -528,7 +528,7 @@ async function main(): Promise<number> {
   );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = new SecretsStore(realConfig.rootDir).loadSecretsConfig();
   const secretsFile = path.join(config.rootDir, "secrets.json");
   await replacePrivateRunConfigFile(
     secretsFile,

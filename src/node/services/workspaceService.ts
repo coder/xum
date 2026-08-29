@@ -18,7 +18,7 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import { ProvidersConfigStore, type Config } from "@/node/config";
+import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -2375,7 +2375,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     telemetryService?: TelemetryService,
     experimentsService?: ExperimentsService,
     sessionTimingService?: SessionTimingService,
-    private readonly streamManager?: StreamManager
+    private readonly streamManager?: StreamManager,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     super();
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
@@ -5476,7 +5477,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       }
 
-      const createEnv = await secretsToRecord(this.config.getEffectiveSecrets(owningProjectPath));
+      const createEnv = await secretsToRecord(
+        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+      );
       const maxCollisionRetries = hasSanitizedWorkspaceName
         ? 0
         : MAX_WORKSPACE_NAME_COLLISION_RETRIES;
@@ -5680,7 +5683,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
       // Background init: run postCreateSetup (if present) then initWorkspace
-      const secrets = await secretsToRecord(this.config.getEffectiveSecrets(owningProjectPath));
+      const secrets = await secretsToRecord(
+        this.secretsStore.getEffectiveSecrets(owningProjectPath)
+      );
       // Background init: postCreateSetup (provisioning) + initWorkspace (sync/checkout/hook)
       //
       // If the user cancelled creation while create() was still in flight, avoid spawning
@@ -5949,7 +5954,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
 
         const createEnv = await secretsToRecord(
-          this.config.getEffectiveSecrets(projectRuntimeEntry.project.projectPath)
+          this.secretsStore.getEffectiveSecrets(projectRuntimeEntry.project.projectPath)
         );
 
         const createResult = await projectRuntimeEntry.runtime.createWorkspace({
@@ -6077,7 +6082,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
               try {
                 const secrets = await secretsToRecord(
-                  this.config.getEffectiveSecrets(createdWorkspace.project.projectPath)
+                  this.secretsStore.getEffectiveSecrets(createdWorkspace.project.projectPath)
                 );
 
                 const initResult = await runFullInit(createdWorkspace.runtime, {
@@ -10482,7 +10487,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
 
         const projectEnv = await secretsToRecord(
-          this.config.getEffectiveSecrets(normalizedRuntimeProjectPath)
+          this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
         );
         projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
         return projectEnv;
@@ -14856,8 +14861,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Multi-project bash shares one execution environment, so inject the union of repo secrets.
       const projectSecrets = isMultiProject(metadata)
-        ? mergeMultiProjectSecrets(metadata, this.config)
-        : this.config.getEffectiveSecrets(metadata.projectPath);
+        ? mergeMultiProjectSecrets(metadata, this.secretsStore)
+        : this.secretsStore.getEffectiveSecrets(metadata.projectPath);
 
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");

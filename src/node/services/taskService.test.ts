@@ -10,6 +10,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import {
   Config,
+  SecretsStore,
   type ProjectConfig,
   type ProjectsConfig,
   type Workspace as WorkspaceConfigEntry,
@@ -11818,10 +11819,10 @@ describe("TaskService", () => {
       taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
     }));
 
-    await config.updateProjectSecrets(primaryProjectPath, [
+    await new SecretsStore(config.rootDir).updateProjectSecrets(primaryProjectPath, [
       { key: "PRIMARY_SECRET", value: "primary-secret" },
     ]);
-    await config.updateProjectSecrets(secondaryProjectPath, [
+    await new SecretsStore(config.rootDir).updateProjectSecrets(secondaryProjectPath, [
       { key: "SECONDARY_SECRET", value: "secondary-secret" },
     ]);
 

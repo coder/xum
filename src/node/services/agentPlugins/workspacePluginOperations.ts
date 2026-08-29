@@ -83,8 +83,8 @@ export async function listWorkspaceMcpPrompts(
     await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId);
   const projectSecrets = await secretsToRecord(
     isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, context.config)
-      : context.config.getEffectiveSecrets(metadata.projectPath)
+      ? mergeMultiProjectSecrets(metadata, context.secretsStore)
+      : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
   );
   return context.mcpServerManager.getPromptsForWorkspace(
     {

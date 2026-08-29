@@ -5,7 +5,7 @@
 import * as os from "os";
 import * as path from "path";
 import type { Config } from "@/node/config";
-import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
@@ -48,6 +48,7 @@ import type { DevToolsService } from "@/node/services/devToolsService";
 export interface CoreServicesOptions {
   config: Config;
   providersConfigStore?: ProvidersConfigStore;
+  secretsStore?: SecretsStore;
   fileLeaseManager?: FileLeaseManager;
   extensionMetadataPath: string;
   /** Overrides config for MCPConfigService; CLI passes its persistent realConfig. */
@@ -97,6 +98,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   const initStateManager = new InitStateManager(config);
   const providersConfigStore =
     opts.providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  const secretsStore = opts.secretsStore ?? new SecretsStore(config.rootDir);
   const fileLeaseManager = opts.fileLeaseManager ?? new FileLeaseManager(config.rootDir);
   const providerService = new ProviderService(
     config,
@@ -185,7 +187,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.experimentsService,
     streamManager,
     turnRequestBuilderBindings,
-    providersConfigStore
+    providersConfigStore,
+    secretsStore
   );
 
   // Agent memory (memory experiment): scope roots derive from Config (xum home
@@ -250,8 +253,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     const metadata = metadataResult.success ? metadataResult.data : null;
     const secrets =
       metadata && isMultiProject(metadata)
-        ? mergeMultiProjectSecrets(metadata, config)
-        : config.getEffectiveSecrets(projectPath);
+        ? mergeMultiProjectSecrets(metadata, secretsStore)
+        : secretsStore.getEffectiveSecrets(projectPath);
     return secretsToRecord(secrets);
   });
 
@@ -267,7 +270,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.telemetryService,
     opts.experimentsService,
     opts.sessionTimingService,
-    streamManager
+    streamManager,
+    secretsStore
   );
   turnRequestBuilderBindings.workspaceHeartbeatService = workspaceService;
   // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
@@ -316,7 +320,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     initStateManager,
     sessionUsageService,
     workspaceGoalService,
-    streamManager
+    streamManager,
+    secretsStore
   );
   turnRequestBuilderBindings.taskService = taskService;
   workspaceService.setAgentTaskIntegration(taskService);

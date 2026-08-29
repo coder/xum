@@ -21,7 +21,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
@@ -198,6 +198,7 @@ function createWorkspaceServiceForTest(options: {
   experimentsService?: WorkspaceServiceArgs[9];
   sessionTimingService?: WorkspaceServiceArgs[10];
   streamManager?: WorkspaceServiceArgs[11];
+  secretsStore?: WorkspaceServiceArgs[12];
 }): WorkspaceService {
   // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -214,7 +215,8 @@ function createWorkspaceServiceForTest(options: {
     options.telemetryService,
     options.experimentsService,
     options.sessionTimingService,
-    options.streamManager
+    options.streamManager,
+    options.secretsStore
   );
 }
 
@@ -11240,6 +11242,7 @@ describe("WorkspaceService initialize", () => {
       config,
       aiService,
       initStateManager: mockInitStateManager as InitStateManager,
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
   });
 
@@ -13609,7 +13612,6 @@ describe("WorkspaceService executeBash archive guards", () => {
       getSessionDir: mock(() => "/tmp/test/sessions"),
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
-      getProjectSecrets: mock(() => []),
     };
     const mockInitStateManager: Partial<InitStateManager> = {
       on: mock(() => undefined as unknown as InitStateManager),
@@ -13838,7 +13840,6 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
       getSessionDir: mock(() => "/tmp/test/sessions"),
       generateStableId: mock(() => "test-id"),
       findWorkspace: findWorkspaceMock,
-      getEffectiveSecrets: getEffectiveSecretsMock,
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
     const mockInitStateManager: Partial<InitStateManager> = {
@@ -13851,6 +13852,7 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
       historyService,
       aiService,
       initStateManager: mockInitStateManager as InitStateManager,
+      secretsStore: { getEffectiveSecrets: getEffectiveSecretsMock } as unknown as SecretsStore,
     });
 
     createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
@@ -19029,7 +19031,6 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
       getSessionDir: mock(() => "/tmp/test/sessions"),
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
@@ -19085,7 +19086,14 @@ describe("WorkspaceService init cancellation", () => {
         mockAIService,
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        mockBackgroundProcessManager as BackgroundProcessManager,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]) } as unknown as SecretsStore
       );
 
       const metadataEvents: Array<FrontendWorkspaceMetadata | null> = [];
@@ -19178,7 +19186,6 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getEffectiveSecrets: mock(() => []),
       getSessionDir: mock(() => "/tmp/test/sessions"),
       findWorkspace: mock(() => null),
       // Two pre-existing workspaces — auto-naming should skip past them.
@@ -19221,7 +19228,14 @@ describe("WorkspaceService init cancellation", () => {
         mockAIService,
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        mockBackgroundProcessManager as BackgroundProcessManager,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore
       );
 
       const removingWorkspaces = (
@@ -19708,7 +19722,6 @@ describe("WorkspaceService fork", () => {
       generateStableId: mock(() => newWorkspaceId),
       findWorkspace: mock(() => null),
       getSessionDir: mock(() => "/tmp/test/sessions"),
-      getEffectiveSecrets: mock(() => []),
       loadConfigOrDefault: mock(() => ({
         projects: new Map([[sourceProjectPath, { workspaces: [], trusted: true }]]),
       })),
@@ -19719,6 +19732,7 @@ describe("WorkspaceService fork", () => {
       historyService,
       aiService: mockAIService,
       initStateManager: mockInitStateManager as InitStateManager,
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
 
     const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({

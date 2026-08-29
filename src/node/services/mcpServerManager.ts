@@ -30,7 +30,7 @@ import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
 import type { PolicyService } from "@/node/services/policyService";
-import type { Config } from "@/node/config";
+import { SecretsStore, type Config } from "@/node/config";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { secretsToRecord } from "@/common/types/secrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
@@ -3054,10 +3054,11 @@ export class MCPServerManager {
     const trusted = projectPathProvided
       ? isProjectTrusted(this.config, resolvedProjectPath)
       : false;
+    const secretsStore = new SecretsStore(this.config.rootDir);
     const projectSecrets = await secretsToRecord(
       projectPathProvided
-        ? this.config.getEffectiveSecrets(resolvedProjectPath)
-        : this.config.getGlobalSecrets()
+        ? secretsStore.getEffectiveSecrets(resolvedProjectPath)
+        : secretsStore.getGlobalSecrets()
     );
     const agentPlugins =
       options.includeAgentPlugins === false

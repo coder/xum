@@ -31,7 +31,7 @@ import {
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
-import type { Config, ProvidersConfigStore } from "@/node/config";
+import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
@@ -465,6 +465,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
 interface TurnRequestBuilderDependencies {
   config: Config;
   providersConfigStore: ProvidersConfigStore;
+  secretsStore: SecretsStore;
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
@@ -1488,8 +1489,8 @@ export class TurnRequestBuilder {
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
     const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.config)
-      : this.dependencies.config.getEffectiveSecrets(metadata.projectPath);
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 

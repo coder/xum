@@ -22,7 +22,7 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { Config, FileLeaseManager, ProvidersConfigStore } from "@/node/config";
+import { Config, FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
@@ -213,9 +213,9 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
   if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
     new ProvidersConfigStore(config.rootDir).saveProvidersConfig(existingProviders);
   }
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = new SecretsStore(realConfig.rootDir).loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
-    await config.saveSecretsConfig(existingSecrets);
+    await new SecretsStore(config.rootDir).saveSecretsConfig(existingSecrets);
   }
 
   const existingConfig = realConfig.loadConfigOrDefault();

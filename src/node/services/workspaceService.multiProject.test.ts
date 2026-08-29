@@ -4,7 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { createStreamLifecycleMocks } from "@/node/services/agentSession.testHarness";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
@@ -72,6 +72,7 @@ interface WorkspaceServiceTestOptions {
   aiService?: AIService;
   initStateManager?: InitStateManager;
   experimentsEnabled?: boolean;
+  secretsStore?: SecretsStore;
 }
 function createMockAIService(metadata?: WorkspaceMetadata): AIService {
   return {
@@ -92,7 +93,10 @@ function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): Wo
     undefined,
     undefined,
     undefined,
-    createMockExperimentsService(options.experimentsEnabled ?? true)
+    createMockExperimentsService(options.experimentsEnabled ?? true),
+    undefined,
+    undefined,
+    options.secretsStore
   );
 }
 interface ExecuteBashHarnessOptions {
@@ -108,7 +112,8 @@ interface ExecuteBashHarnessOptions {
   trustedProjects?: Array<[string, boolean]>;
   runtimeWorkspacePaths?: Record<string, string>;
   findWorkspaceProjectPath?: string;
-  getEffectiveSecrets?: Config["getEffectiveSecrets"];
+  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
+  secretsStore?: SecretsStore;
   onCreateRuntime?: (
     projectPath: string,
     options: Parameters<typeof runtimeFactory.createRuntime>[1]
@@ -196,8 +201,12 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
           ])
         ),
       })),
-      getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []),
     },
+    secretsStore:
+      options.secretsStore ??
+      ({
+        getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []),
+      } as unknown as SecretsStore),
   });
   return {
     bashExecuteMock,
@@ -389,7 +398,9 @@ describe("WorkspaceService executeBash runtime selection", () => {
       historyService,
       workspaceId,
       workspaceName,
-      getEffectiveSecrets: getEffectiveSecretsMock as Config["getEffectiveSecrets"],
+      secretsStore: {
+        getEffectiveSecrets: getEffectiveSecretsMock as SecretsStore["getEffectiveSecrets"],
+      } as unknown as SecretsStore,
     });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "pwd");
@@ -501,8 +512,8 @@ describe("WorkspaceService executeBash runtime selection", () => {
         loadConfigOrDefault: mock(() => ({
           projects: new Map([[projectPath, { workspaces: [], trusted: true }]]),
         })),
-        getEffectiveSecrets: mock(() => []),
       },
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
     try {
       const result = await workspaceService.executeBash(workspaceId, "pwd");
@@ -711,7 +722,6 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           );
         }),
-        getEffectiveSecrets: mock(() => []),
         getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
         findWorkspace: mock(() => null),
       };
@@ -878,7 +888,6 @@ describe("WorkspaceService multi-project lifecycle", () => {
             }))
           );
         }),
-        getEffectiveSecrets: mock(() => []),
         getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
         findWorkspace: mock(() => null),
       };
@@ -1029,7 +1038,6 @@ describe("WorkspaceService multi-project lifecycle", () => {
         srcDir,
         generateStableId: mock(() => workspaceId),
         loadConfigOrDefault: mock(() => configState),
-        getEffectiveSecrets: mock(() => []),
         getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
         findWorkspace: mock(() => null),
       };
@@ -1175,7 +1183,6 @@ describe("WorkspaceService multi-project lifecycle", () => {
             }))
           );
         }),
-        getEffectiveSecrets: mock(() => []),
         getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
         findWorkspace: mock(() => null),
       };

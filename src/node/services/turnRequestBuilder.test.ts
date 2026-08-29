@@ -7,7 +7,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import * as providerOptionsModule from "@/common/utils/ai/providerOptions";
-import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
+import { ProvidersConfigStore, SecretsStore, type ProvidersConfig } from "@/node/config";
 import { InitStateManager } from "./initStateManager";
 import { ProviderModelFactory } from "./providerModelFactory";
 import { ProviderService } from "./providerService";
@@ -35,6 +35,7 @@ async function createPreparationHarness() {
   const builder = new TurnRequestBuilder({
     config,
     providersConfigStore,
+    secretsStore: new SecretsStore(config.rootDir),
     historyService,
     initStateManager: new InitStateManager(config),
     providerService,

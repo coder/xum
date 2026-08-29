@@ -28,7 +28,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { ProvidersConfigStore, type Config } from "@/node/config";
+import { ProvidersConfigStore, SecretsStore, type Config } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -146,7 +146,8 @@ export class AIService extends EventEmitter {
     experimentsService?: ExperimentsService,
     streamManager?: StreamManager,
     public readonly turnRequestBuilderBindings: TurnRequestBuilderBindings = {},
-    providersConfigStore?: ProvidersConfigStore
+    providersConfigStore?: ProvidersConfigStore,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     super();
     // Increase max listeners to accommodate multiple concurrent workspace listeners
@@ -183,6 +184,7 @@ export class AIService extends EventEmitter {
     this.turnRequestBuilder = new TurnRequestBuilder({
       config: this.config,
       providersConfigStore: this.providersConfigStore,
+      secretsStore: this.secretsStore,
       historyService: this.historyService,
       initStateManager: this.initStateManager,
       providerService: this.providerService,
