@@ -218,6 +218,14 @@ jobs:
             # or installDom alike) makes the portal land in a stale document. Verified
             # order-dependent on origin/main; only reliable in its own process.
             src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx
+            # Its "last prompt" popup tests fail when any earlier test file in the
+            # shared process evaluated UI modules without a DOM installed (Radix's
+            # use-layout-effect binds to `globalThis.document` at module eval, so a
+            # DOM-less first import caches the broken no-op mode process-wide).
+            # Verified order-dependent on origin/main via a two-file repro; only
+            # reliable in its own process. Took the merge queue down on 2026-08-29
+            # when runner file enumeration order changed.
+            src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx
           )
           # One process per file rather than one shared isolated process. Sharing it still
           # segfaults Bun on the runner (exit 132, "Bun has crashed", zero failing assertions)
