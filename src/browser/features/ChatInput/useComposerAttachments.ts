@@ -1,10 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import type React from "react";
 import { useAPI } from "@/browser/contexts/API";
-import {
-  subscribePersistedStateWrites,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
 import {
   extractAttachmentsFromClipboard,
   extractAttachmentsFromDrop,
@@ -12,11 +8,6 @@ import {
 } from "@/browser/utils/attachmentsHandling";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
-import {
-  estimatePersistedChatAttachmentsChars,
-  MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
-  readPersistedChatAttachments,
-} from "./draftAttachmentsStorage";
 
 const PDF_MEDIA_TYPE = "application/pdf";
 const EDIT_MODE_ATTACHMENT_ERROR_MESSAGE = "Attachments cannot be added while editing a message.";
@@ -26,7 +17,10 @@ type PushToast = (toast: Omit<Toast, "id" | "type"> & { type: Toast["type"] | "i
 interface UseComposerAttachmentsOptions {
   variant: "creation" | "workspace";
   workspaceId: string | null;
-  attachmentsKey: string;
+  attachments: ChatAttachment[];
+  setAttachments: (
+    value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
+  ) => void;
   editingMessage: boolean;
   pushToast: PushToast;
 }
@@ -52,70 +46,8 @@ export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
 }
 export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   const { api } = useAPI();
-  const tooLargeToastKeyRef = useRef<string | null>(null);
-  // External draft transfers must not replace an oversized attachment kept only in memory.
-  const selfWriteRef = useRef(false);
-  const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
-    readPersistedChatAttachments(options.attachmentsKey)
-  );
+  const { attachments, setAttachments } = options;
   const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
-
-  const persistAttachments = useCallback(
-    (next: ChatAttachment[]) => {
-      selfWriteRef.current = true;
-      try {
-        if (next.length === 0) {
-          tooLargeToastKeyRef.current = null;
-          updatePersistedState<ChatAttachment[] | undefined>(options.attachmentsKey, undefined);
-          return;
-        }
-        if (estimatePersistedChatAttachmentsChars(next) > MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS) {
-          updatePersistedState<ChatAttachment[] | undefined>(options.attachmentsKey, undefined);
-          if (tooLargeToastKeyRef.current !== options.attachmentsKey) {
-            tooLargeToastKeyRef.current = options.attachmentsKey;
-            options.pushToast({
-              type: "error",
-              message:
-                "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-              duration: 5000,
-            });
-          }
-          return;
-        }
-        tooLargeToastKeyRef.current = null;
-        updatePersistedState<ChatAttachment[] | undefined>(options.attachmentsKey, next);
-      } finally {
-        selfWriteRef.current = false;
-      }
-    },
-    [options.attachmentsKey, options.pushToast]
-  );
-
-  useEffect(() => {
-    tooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(options.attachmentsKey));
-  }, [options.attachmentsKey]);
-
-  useEffect(
-    () =>
-      subscribePersistedStateWrites((event) => {
-        if (event.key === options.attachmentsKey && !selfWriteRef.current) {
-          setAttachmentsState(readPersistedChatAttachments(options.attachmentsKey));
-        }
-      }),
-    [options.attachmentsKey]
-  );
-
-  const setAttachments = useCallback(
-    (value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])) => {
-      setAttachmentsState((previous) => {
-        const next = value instanceof Function ? value(previous) : value;
-        persistAttachments(next);
-        return next;
-      });
-    },
-    [persistAttachments]
-  );
 
   const showResizeToast = useCallback(
     (next: ChatAttachment[]) => {

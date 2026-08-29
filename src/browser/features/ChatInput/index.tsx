@@ -62,14 +62,10 @@ import {
   getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
-  getInputKey,
-  getInputAttachmentsKey,
   AGENT_AI_DEFAULTS_KEY,
   VIM_ENABLED_KEY,
   RUNTIME_ENABLEMENT_KEY,
   getProjectScopeId,
-  getPendingScopeId,
-  getDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
@@ -149,7 +145,7 @@ import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { SendHorizontal } from "lucide-react";
 import { AttachFileButton } from "./AttachFileButton";
 import { VimTextArea } from "@/browser/components/VimTextArea/VimTextArea";
-import { ChatAttachments, type ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
+import { ChatAttachments } from "@/browser/features/ChatInput/ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
 import {
   buildPendingFromRestoredInput,
@@ -171,9 +167,8 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
-withMcpPromptRefs,
+  withMcpPromptRefs,
 } from "@/common/types/message";
-import type { Review } from "@/common/types/review";
 import {
   getModelCapabilities,
   getModelCapabilitiesResolved,
@@ -239,6 +234,7 @@ import {
   isPdfAttachment,
   useComposerAttachments,
 } from "./useComposerAttachments";
+import { useComposerDraft } from "./useComposerDraft";
 
 // Normal typing usually has no active suggestion menu. Reuse the existing empty array
 // so suggestion effects do not schedule an avoidable second render on every keypress.
@@ -373,26 +369,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Callback for model changes (both variants support this)
   const onModelChange = props.onModelChange;
 
-  // Storage keys differ by variant
-  const storageKeys = (() => {
-    if (variant === "creation") {
-      const pendingScopeId =
-        typeof props.pendingDraftId === "string" && props.pendingDraftId.trim().length > 0
-          ? getDraftScopeId(creationParentProjectPath, props.pendingDraftId)
-          : getPendingScopeId(creationParentProjectPath);
-      return {
-        inputKey: getInputKey(pendingScopeId),
-        attachmentsKey: getInputAttachmentsKey(pendingScopeId),
-        modelKey: getModelKey(getProjectScopeId(creationParentProjectPath)),
-      };
-    }
-    return {
-      inputKey: getInputKey(props.workspaceId),
-      attachmentsKey: getInputAttachmentsKey(props.workspaceId),
-      modelKey: getModelKey(props.workspaceId),
-    };
-  })();
-
   // User request: keep creation runtime controls synced with Settings enablement toggles.
   const [rawRuntimeEnablement] = usePersistedState(
     RUNTIME_ENABLEMENT_KEY,
@@ -401,12 +377,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
   const runtimeEnablement = normalizeRuntimeEnablement(rawRuntimeEnablement);
 
-  const [input, setInput] = usePersistedState(storageKeys.inputKey, "", { listener: true });
-
-  // Keep a stable reference to the latest input value so event handlers don't need to rebind
-  // on same-length edits (e.g. selection-replace) to know the previous value.
-  const latestInputValueRef = useRef(input);
-  latestInputValueRef.current = input;
   // Track concurrent sends with a counter (not boolean) to handle queued follow-ups correctly.
   // When a follow-up is queued during stream-start, it resolves immediately but shouldn't
   // clear the "in flight" state until all sends complete.
@@ -432,7 +402,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const atMentionRequestIdRef = useRef(0);
   const lastAtMentionScopeIdRef = useRef<string | null>(null);
   const lastAtMentionQueryRef = useRef<string | null>(null);
-  const lastAtMentionInputRef = useRef<string>(input);
   const lastSkillInputRef = useRef<string | null>(null);
   const lastSkillQueryRef = useRef<string | null>(null);
   const lastSkillDescriptorsRef = useRef<AgentSkillDescriptor[] | null>(null);
@@ -493,9 +462,36 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setToast(null);
   }, []);
 
+  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
   const {
+    storageKeys,
+    input,
+    setInput,
+    latestInputValueRef,
     attachments,
     setAttachments,
+    draftReviews,
+    setDraftReviews,
+    getDraft,
+    setDraft,
+    preEditDraftRef,
+    preEditReviewsRef,
+    reviewOverrideActive,
+    reviewData,
+    reviewIdsForCheck,
+    reviewPanelItems,
+    removeDraftReview,
+    updateDraftReviewNote,
+  } = useComposerDraft({
+    variant,
+    workspaceId,
+    creationProjectPath: creationParentProjectPath,
+    pendingDraftId: variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined,
+    attachedReviews,
+    pushToast,
+  });
+  const lastAtMentionInputRef = useRef<string>(input);
+  const {
     processingAttachmentCount,
     handlePaste,
     handleAttachFiles,
@@ -505,58 +501,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   } = useComposerAttachments({
     variant,
     workspaceId,
-    attachmentsKey: storageKeys.attachmentsKey,
+    attachments,
+    setAttachments,
     editingMessage: editingMessageForUi != null,
     pushToast,
   });
-  // Reviews restored from edits/queued drafts override attached review state while active.
-  const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
-  // Attached reviews come from parent via props (persisted in pendingReviews state).
   const workspaceIdForComposerClear = variant === "workspace" ? props.workspaceId : null;
   const onDetachAllReviewsForComposerClear =
     variant === "workspace" ? props.onDetachAllReviews : undefined;
-
-  // draftReviews takes precedence when restoring or editing message drafts.
-  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
-  const draftReviewIdsByValueRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
-  const nextDraftReviewIdRef = useRef(0);
-  const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
-    typeof value === "object" && value !== null;
-  const getDraftReviewId = (review: ReviewNoteDataForDisplay): string => {
-    const existingId = draftReviewIdsByValueRef.current.get(review);
-    if (existingId) return existingId;
-    const newId = `draft-review-${nextDraftReviewIdRef.current++}`;
-    draftReviewIdsByValueRef.current.set(review, newId);
-    return newId;
-  };
-
-  const withDraftReview = (
-    reviewId: string,
-    update: (reviews: ReviewNoteDataForDisplay[], reviewIndex: number) => ReviewNoteDataForDisplay[]
-  ) =>
-    setDraftReviews((prev) => {
-      if (prev === null) return prev;
-      const reviewIndex = prev.findIndex(
-        (review) => isDraftReviewData(review) && getDraftReviewId(review) === reviewId
-      );
-      return reviewIndex === -1 ? prev : update(prev, reviewIndex);
-    });
-
-  const removeDraftReview = (reviewId: string) =>
-    withDraftReview(reviewId, (prev, reviewIndex) =>
-      prev.filter((_, index) => index !== reviewIndex)
-    );
-
-  const updateDraftReviewNote = (reviewId: string, newNote: string) =>
-    withDraftReview(reviewId, (prev, reviewIndex) => {
-      const review = prev[reviewIndex];
-      if (!review || review.userNote === newNote) return prev;
-      const next = [...prev];
-      const updatedReview = { ...review, userNote: newNote };
-      draftReviewIdsByValueRef.current.set(updatedReview, reviewId);
-      next[reviewIndex] = updatedReview;
-      return next;
-    });
 
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
@@ -650,25 +602,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [powerMode, setInput]
   );
 
-  // Draft state combines text input and attachments.
-  // Reviews are sourced separately via attachedReviews unless draftReviews overrides them.
-  interface DraftState {
-    text: string;
-    attachments: ChatAttachment[];
-  }
-  const getDraft = useCallback(
-    (): DraftState => ({ text: input, attachments }),
-    [input, attachments]
-  );
-  const setDraft = useCallback(
-    (draft: DraftState) => {
-      setInput(draft.text);
-      setAttachments(draft.attachments);
-    },
-    [setInput, setAttachments]
-  );
-  const preEditDraftRef = useRef<DraftState>({ text: "", attachments: [] });
-  const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   const { open } = useSettings();
   const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
@@ -1075,24 +1008,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       : null;
   const hasTypedText = input.trim().length > 0;
   const hasImages = attachments.length > 0;
-  const reviewOverrideActive = draftReviews !== null;
-  const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
-  const reviewData = reviewOverrideActive
-    ? draftReviewItems.length > 0
-      ? draftReviewItems
-      : undefined
-    : attachedReviews.length > 0
-      ? attachedReviews.map((review) => review.data)
-      : undefined;
-  const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map((review) => review.id);
-  const reviewPanelItems: Review[] = reviewOverrideActive
-    ? draftReviewItems.map((data) => ({
-        id: getDraftReviewId(data),
-        data,
-        status: "attached",
-        createdAt: 0,
-      }))
-    : attachedReviews;
   const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
   const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
