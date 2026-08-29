@@ -7049,6 +7049,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
+  async listByArchivedStatus(archived: boolean): Promise<FrontendWorkspaceMetadata[]> {
+    const workspaces = await this.list();
+    return workspaces.filter(
+      (workspace) => isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) === archived
+    );
+  }
+
   // Devcontainer Docker labels are keyed by the exact host worktree path from startup, so stop/status
   // APIs must prefer the persisted config path and only fall back to canonical reconstruction if the
   // config entry is missing.

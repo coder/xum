@@ -99,6 +99,7 @@ import {
   getAgentDefinition,
   listAgentDefinitions,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
 
@@ -1430,21 +1431,15 @@ export const router = (authToken?: string) => {
       list: t
         .input(schemas.workspace.list.input)
         .output(schemas.workspace.list.output)
-        .handler(async ({ context, input }) => {
-          const allWorkspaces = await context.workspaceService.list();
-          // Filter by archived status (derived from timestamps via shared utility)
-          if (input?.archived) {
-            return allWorkspaces.filter((w) => isWorkspaceArchived(w.archivedAt, w.unarchivedAt));
-          }
-          // Default: return non-archived workspaces
-          return allWorkspaces.filter((w) => !isWorkspaceArchived(w.archivedAt, w.unarchivedAt));
-        }),
+        .handler(({ context, input }) =>
+          context.workspaceService.listByArchivedStatus(input?.archived === true)
+        ),
       create: t
         .input(schemas.workspace.create.input)
         .output(schemas.workspace.create.output)
         .handler(async ({ context, input }) => {
           const result = await context.workspaceService.create(
-            stripTrailingSlashes(input.projectPath),
+            input.projectPath,
             input.branchName,
             input.trunkBranch,
             input.title,
@@ -1481,10 +1476,7 @@ export const router = (authToken?: string) => {
           }
 
           const result = await context.workspaceService.createMultiProject(
-            input.projects.map((project) => ({
-              projectPath: stripTrailingSlashes(project.projectPath),
-              projectName: project.projectName,
-            })),
+            input.projects,
             input.branchName,
             input.trunkBranch,
             input.title,
@@ -1927,16 +1919,12 @@ export const router = (authToken?: string) => {
       getSubagentTranscript: t
         .input(schemas.workspace.getSubagentTranscript.input)
         .output(schemas.workspace.getSubagentTranscript.output)
-        .handler(async ({ context, input }) => {
-          const taskId = input.taskId.trim();
-          assert(taskId.length > 0, "workspace.getSubagentTranscript: taskId must be non-empty");
-          let workspaceId = input.workspaceId?.trim() ?? null;
-          if (workspaceId === "") workspaceId = null;
-          return context.historyService.getSubagentTranscript(
-            { taskId, requestingWorkspaceId: workspaceId },
+        .handler(({ context, input }) =>
+          context.historyService.getSubagentTranscript(
+            { taskId: input.taskId, requestingWorkspaceId: input.workspaceId },
             { taskService: context.taskService, aiService: context.aiService }
-          );
-        }),
+          )
+        ),
       executeBash: t
         .input(schemas.workspace.executeBash.input)
         .output(schemas.workspace.executeBash.output)
