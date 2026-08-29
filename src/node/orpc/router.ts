@@ -46,7 +46,7 @@ import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { clearLogFiles, getLogFilePath } from "@/node/services/log";
 import type { LogEntry } from "@/node/services/logBuffer";
 import { clearLogEntries, subscribeLogFeed } from "@/node/services/logBuffer";
-import { createReplayBufferedStreamMessageRelay } from "./replayBufferedStreamMessageRelay";
+import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
 
 import { createRuntime, checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import {
