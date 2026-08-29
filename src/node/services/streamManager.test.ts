@@ -45,7 +45,6 @@ import { SessionUsageService } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { applyCacheControl } from "@/common/utils/ai/cacheStrategy";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -1425,186 +1424,10 @@ describe("StreamManager - refusal usage attribution", () => {
   });
 });
 
-describe("StreamManager - Anthropic cache TTL overrides", () => {
-  interface StreamRequestConfigForTests {
-    messages: ModelMessage[];
-    system?: string;
-    tools?: Record<string, Tool>;
-    providerOptions?: Record<string, unknown>;
-  }
-
-  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
-
-  test("applies anthropicCacheTtlOverride to manual cache markers without top-level cacheControl", () => {
-    const streamManager = new StreamManager(historyService);
-    const buildRequestConfig = Reflect.get(streamManager, "buildStreamRequestConfig") as
-      | BuildStreamRequestConfig
-      | undefined;
-
-    expect(typeof buildRequestConfig).toBe("function");
-    if (!buildRequestConfig) {
-      throw new Error("Expected StreamManager.buildStreamRequestConfig to exist");
-    }
-    // Rebind: buildStreamRequestConfig reads this.getProvidersConfig for
-    // cache-marker eligibility; a detached Reflect.get reference loses `this`.
-    const buildRequestConfigBound: BuildStreamRequestConfig = (input) =>
-      buildRequestConfig.call(streamManager, input);
-
-    const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
-    const modelString = KNOWN_MODELS.SONNET.id;
-    const providerOptions = {
-      anthropic: {
-        disableParallelToolUse: false,
-        sendReasoning: true,
-      },
-    };
-    const messages = applyCacheControl([{ role: "user", content: "hello" }], modelString, "1h");
-    const tools = {
-      readFile: tool({
-        description: "Read a file",
-        inputSchema: z.object({ path: z.string() }),
-        execute: () => Promise.resolve({ ok: true }),
-      }),
-      bash: tool({
-        description: "Run a command",
-        inputSchema: z.object({ command: z.string() }),
-        execute: () => Promise.resolve({ ok: true }),
-      }),
-    };
-
-    const request = buildRequestConfigBound({
-      model,
-      modelString,
-      messages,
-      system: "You are a helpful assistant",
-      tools,
-      providerOptions,
-      anthropicCacheTtlOverride: "1h",
-    });
-
-    expect(request.system).toBeUndefined();
-    expect(request.providerOptions).toEqual(providerOptions);
-    expect(request.messages).toHaveLength(2);
-    expect(request.messages[0]).toEqual({
-      role: "system",
-      content: "You are a helpful assistant",
-      providerOptions: {
-        anthropic: {
-          cacheControl: {
-            type: "ephemeral",
-            ttl: "1h",
-          },
-        },
-      },
-    });
-    expect(request.messages[1]).toEqual(messages[0]);
-
-    const toolKeys = Object.keys(tools);
-    const firstToolKey = toolKeys[0];
-    const lastToolKey = toolKeys[toolKeys.length - 1];
-    expect(
-      (
-        request.tools?.[firstToolKey] as {
-          providerOptions?: {
-            anthropic?: {
-              cacheControl?: unknown;
-            };
-          };
-        }
-      ).providerOptions?.anthropic?.cacheControl
-    ).toBeUndefined();
-    expect(
-      (
-        request.tools?.[lastToolKey] as {
-          providerOptions?: {
-            anthropic?: {
-              cacheControl?: {
-                type?: string;
-                ttl?: string;
-              };
-            };
-          };
-        }
-      ).providerOptions?.anthropic?.cacheControl
-    ).toEqual({
-      type: "ephemeral",
-      ttl: "1h",
-    });
-  });
-});
-
-describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
-  interface StreamRequestConfigForTests {
-    messages: ModelMessage[];
-    system?: string | { role: string; content: string; providerOptions?: unknown };
-  }
-
-  type BuildStreamRequestConfig = (input: Record<string, unknown>) => StreamRequestConfigForTests;
-
+describe("StreamManager - fallback construction callbacks", () => {
   const eligibleProvidersConfig: ProvidersConfigMap = {
     openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
   };
-
-  const structuredSystem = {
-    role: "system",
-    content: "You are a helpful assistant",
-    providerOptions: { openai: { promptCacheBreakpoint: { mode: "explicit" } } },
-  };
-
-  function buildRequestForRoute(
-    providersConfig: ProvidersConfigMap | null,
-    routeProvider: string | undefined,
-    modelString = "openai:gpt-5.6-luna"
-  ): StreamRequestConfigForTests {
-    const streamManager = new StreamManager(historyService, undefined, () => providersConfig);
-    const buildRequestConfig = getPrivateMethodForTests<BuildStreamRequestConfig>(
-      streamManager,
-      "buildStreamRequestConfig"
-    );
-    // .call: the transform reads this.getProvidersConfig for route eligibility.
-    return buildRequestConfig.call(streamManager, {
-      model: createTestLanguageModel(),
-      modelString,
-      messages: [{ role: "user", content: "hello" }],
-      system: "You are a helpful assistant",
-      routeProvider,
-    });
-  }
-
-  test("direct GPT-5.6 replaces the system string with a structured cached message", () => {
-    const request = buildRequestForRoute(eligibleProvidersConfig, "openai");
-
-    expect(request.system).toEqual(structuredSystem);
-    // Unlike the Anthropic transform, messages stay untouched (no prepend).
-    expect(request.messages).toEqual([{ role: "user", content: "hello" }]);
-  });
-
-  test("ineligible routes and endpoints preserve the original system string", () => {
-    // Missing route metadata (legacy/test-stub) fails closed.
-    expect(buildRequestForRoute(eligibleProvidersConfig, undefined).system).toBe(
-      "You are a helpful assistant"
-    );
-    // Gateway routes fail closed.
-    expect(buildRequestForRoute(eligibleProvidersConfig, "mux-gateway").system).toBe(
-      "You are a helpful assistant"
-    );
-    // Custom base URLs fail closed.
-    expect(
-      buildRequestForRoute(
-        {
-          openai: {
-            ...eligibleProvidersConfig.openai,
-            baseUrl: "https://proxy.example.com/v1",
-          },
-        },
-        "openai"
-      ).system
-    ).toBe("You are a helpful assistant");
-    // Non-GPT-5.6 models keep the plain string.
-    expect(buildRequestForRoute(eligibleProvidersConfig, "openai", "openai:gpt-5.2").system).toBe(
-      "You are a helpful assistant"
-    );
-  });
 
   // The fallback swap must evaluate the fallback's freshly-resolved route
   // (initialMetadataPatch.routeProvider), not the stale source metadata that
@@ -1698,28 +1521,6 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
     expect(prepare).toHaveBeenCalledTimes(1);
     return streamInfo.request as Record<string, unknown>;
   }
-
-  test("fallback swap applies the cached system when the route patch resolves to direct OpenAI", async () => {
-    const request = await runRefusalFallbackForTests({
-      workspaceId: "gpt56-fallback-eligible-workspace",
-      staleRouteProvider: "mux-gateway",
-      initialMetadataPatch: { routedThroughGateway: false, routeProvider: "openai" },
-    });
-
-    expect(request.system).toEqual(structuredSystem);
-  });
-
-  test("fallback swap keeps the plain system string when the route patch omits the route", async () => {
-    // Stale source metadata says direct OpenAI, but the fallback prepare could
-    // not resolve a route — the transform must fail closed on the patch.
-    const request = await runRefusalFallbackForTests({
-      workspaceId: "gpt56-fallback-ineligible-workspace",
-      staleRouteProvider: "openai",
-      initialMetadataPatch: { routedThroughGateway: false },
-    });
-
-    expect(request.system).toBe("You are a helpful assistant");
-  });
 
   test("onStreamConstructed fires after successful construction, never on failure", async () => {
     // Durable side effects hung on this callback (the superseding fallback
@@ -6266,53 +6067,6 @@ describe("StreamManager - mid-turn thinking override", () => {
     // Without a new pending value the next step is a no-op again.
     expect(await prepareStep({ messages })).toBeUndefined();
     expect(rebuild).toHaveBeenCalledTimes(1);
-  });
-
-  test("step-0 message rebuild preserves the cached system row when the system prompt lives in messages", async () => {
-    const streamManager = new StreamManager(historyService);
-    const { createStreamResult } = getRequestHelpers(streamManager);
-    const streamTextSpy = setupStreamTextSpy();
-
-    // Anthropic prompt-cache shape from buildStreamRequestConfig: the system
-    // prompt is messages[0] with cache control and request.system is
-    // undefined. The rebuild closure returns history messages only, so the
-    // step-0 replacement must re-prepend this row or the first provider
-    // request loses the entire system prompt.
-    const cachedSystemRow: ModelMessage = {
-      role: "system",
-      content: "cached system prompt",
-      providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
-    };
-    const state: ActiveTurnThinkingOverride = { pending: "high" };
-    const rebuildOptions = mock(() => ({
-      effectiveLevel: "high" as const,
-      providerOptions: { anthropic: { thinking: { type: "enabled" } } },
-    }));
-    const rebuiltHistory: ModelMessage[] = [{ role: "user", content: "rebuilt hello" }];
-    const rebuildMessages = mock(() => Promise.resolve(rebuiltHistory));
-    const stepMessageBatches: ModelMessage[][] = [];
-
-    const request: OverrideRequestForTests = {
-      model,
-      messages: [cachedSystemRow, ...messages],
-      system: undefined,
-      providerOptions: {},
-      thinkingOverrideState: state,
-      rebuildProviderOptionsForThinkingLevel:
-        rebuildOptions as unknown as RebuildProviderOptionsForThinkingLevel,
-      rebuildFirstStepForThinkingLevel:
-        rebuildMessages as unknown as RebuildFirstStepForThinkingLevel,
-      onStepMessages: (stepMessages) => stepMessageBatches.push(stepMessages),
-    };
-    createStreamResult(request, new AbortController());
-    const prepareStep = capturePrepareStep(streamTextSpy);
-
-    const step = await prepareStep({ messages: request.messages, stepNumber: 0 });
-    expect(rebuildMessages).toHaveBeenCalledTimes(1);
-    expect(step?.messages).toEqual([cachedSystemRow, ...rebuiltHistory]);
-    // Consumers (advisor transcript ref) must end on the rebuilt transcript,
-    // not the pre-rebuild messages announced at the top of prepareStep.
-    expect(stepMessageBatches.at(-1)).toEqual([cachedSystemRow, ...rebuiltHistory]);
   });
 
   test("clears pending without touching options when the rebuild reports not-applicable", async () => {

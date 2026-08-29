@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
 import { createMuxMessage } from "@/common/types/message";
@@ -10,10 +11,17 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { getPlanFilePath } from "@/common/utils/planStorage";
+import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
+import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
-import { buildPlanInstructions, buildStreamSystemContext } from "./turnContextAssembler";
+import {
+  assemblePromptPayload,
+  buildPlanInstructions,
+  buildStreamSystemContext,
+  prepareProviderRequestMessages,
+} from "./turnContextAssembler";
 
 class TestRuntime extends LocalRuntime {
   constructor(
@@ -102,6 +110,250 @@ async function buildSystemContextForTest(args: {
     memoryToolAvailable: args.memoryToolAvailable,
   });
 }
+
+describe("prepareProviderRequestMessages", () => {
+  test("slices at reset boundaries before filtering empty assistant messages", () => {
+    const oldMessage = createMuxMessage("old-user", "user", "old context", {
+      historySequence: 1,
+    });
+    const resetBoundary = createMuxMessage("reset-boundary", "assistant", "", {
+      historySequence: 2,
+      contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+    });
+    const newMessage = createMuxMessage("new-user", "user", "new context", {
+      historySequence: 3,
+    });
+
+    const result = prepareProviderRequestMessages(
+      [oldMessage, resetBoundary, newMessage],
+      "openai",
+      "off"
+    );
+
+    expect(result.activeContextMessages.map((message) => message.id)).toEqual(["new-user"]);
+    expect(result.providerRequestMessages.map((message) => message.id)).toEqual(["new-user"]);
+  });
+
+  test("filters workflow display rows while keeping provider-visible workflow results", () => {
+    const trigger = createMuxMessage("workflow-command", "user", "/shallow-review mux", {
+      historySequence: 1,
+      muxMetadata: {
+        type: "workflow-trigger-display",
+        rawCommand: "/shallow-review mux",
+        commandPrefix: "/shallow-review",
+        runId: "wfr_1",
+      },
+    });
+    const card = buildWorkflowRunCardMessage(
+      { name: "shallow-review", args: { input: "mux" } },
+      { runId: "wfr_1", status: "running", result: null },
+      2
+    );
+    card.metadata = {
+      historySequence: 2,
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: { type: "workflow-run-card-display", runId: "wfr_1" },
+    };
+    const result = createMuxMessage(
+      "workflow-result",
+      "user",
+      "/shallow-review mux\n\n<mux_workflow_result>{}</mux_workflow_result>",
+      {
+        historySequence: 3,
+        muxMetadata: {
+          type: "workflow-result",
+          rawCommand: "/shallow-review mux",
+          commandPrefix: "/shallow-review",
+          runId: "wfr_1",
+        },
+      }
+    );
+    const nextUser = createMuxMessage("next-user", "user", "continue normal work", {
+      historySequence: 4,
+    });
+
+    const prepared = prepareProviderRequestMessages(
+      [trigger, card, result, nextUser],
+      "openai",
+      "off"
+    );
+
+    expect(prepared.activeContextMessages.map((message) => message.id)).toEqual([
+      "workflow-result",
+      "next-user",
+    ]);
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "workflow-result",
+      "next-user",
+    ]);
+  });
+
+  test("excludes the stamped keep-recent tail from RLM compaction summarization requests", () => {
+    const head = createMuxMessage("head-user", "user", "old context", { historySequence: 1 });
+    const headReply = createMuxMessage("head-assistant", "assistant", "old reply", {
+      historySequence: 2,
+    });
+    const tail = createMuxMessage("tail-user", "user", "recent context", { historySequence: 3 });
+    const tailReply = createMuxMessage("tail-assistant", "assistant", "recent reply", {
+      historySequence: 4,
+    });
+    const stampedRequest = createMuxMessage("compact-req", "user", "/compact", {
+      historySequence: 5,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: {},
+        keepRecentTail: { startHistorySequence: 3 },
+      },
+    });
+
+    const prepared = prepareProviderRequestMessages(
+      [head, headReply, tail, tailReply, stampedRequest],
+      "openai",
+      "off"
+    );
+
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "head-user",
+      "head-assistant",
+      "compact-req",
+    ]);
+  });
+
+  test("keeps whole-epoch summarization for unstamped compaction requests (RLM off)", () => {
+    const head = createMuxMessage("head-user", "user", "old context", { historySequence: 1 });
+    const tail = createMuxMessage("tail-user", "user", "recent context", { historySequence: 2 });
+    const request = createMuxMessage("compact-req", "user", "/compact", {
+      historySequence: 3,
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    });
+
+    const prepared = prepareProviderRequestMessages([head, tail, request], "openai", "off");
+
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "head-user",
+      "tail-user",
+      "compact-req",
+    ]);
+  });
+});
+
+describe("assemblePromptPayload", () => {
+  const createTools = () => ({
+    first: tool({
+      description: "first",
+      inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
+      execute: () => Promise.resolve({ ok: true }),
+    }),
+    terminal: tool({
+      description: "terminal",
+      inputSchema: jsonSchema({ type: "object", properties: {}, additionalProperties: false }),
+      execute: () => Promise.resolve({ ok: true }),
+    }),
+  });
+
+  const assemble = (overrides: Partial<Parameters<typeof assemblePromptPayload>[0]> = {}) =>
+    assemblePromptPayload({
+      history: [createMuxMessage("user", "user", "hello")],
+      systemMessage: "system",
+      systemMessageTokens: 6,
+      tools: createTools(),
+      modelString: "google:gemini-2.5-pro",
+      providerForMessages: "google",
+      effectiveThinkingLevel: "off",
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: ["first", "terminal"],
+      workspaceId: "workspace",
+      ...overrides,
+    });
+
+  for (const testCase of [
+    {
+      name: "folds Anthropic system and caches the terminal tool",
+      modelString: "anthropic:claude-sonnet-4-5",
+      providerForMessages: "anthropic",
+      expectedSystem: "folded",
+    },
+    {
+      name: "uses an explicit system breakpoint for eligible OpenAI requests",
+      modelString: "openai:gpt-5.6-luna",
+      providerForMessages: "openai",
+      routeProvider: "openai",
+      providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+      expectedSystem: "structured",
+    },
+    {
+      name: "keeps plain system instructions for providers without explicit caching",
+      modelString: "google:gemini-2.5-pro",
+      providerForMessages: "google",
+      expectedSystem: "plain",
+    },
+  ] as const) {
+    test(testCase.name, async () => {
+      const payload = await assemble({ ...testCase, anthropicCacheTtl: "1h" });
+
+      if (testCase.expectedSystem === "folded") {
+        expect(payload.system).toBeUndefined();
+        expect(payload.messages[0]?.role).toBe("system");
+        expect(payload.tools?.terminal.providerOptions).toEqual({
+          anthropic: { cacheControl: { type: "ephemeral", ttl: "1h" } },
+        });
+        expect(payload.tools?.first.providerOptions).toBeUndefined();
+      } else if (testCase.expectedSystem === "structured") {
+        expect(payload.system).toEqual({
+          role: "system",
+          content: "system",
+          providerOptions: { openai: { promptCacheBreakpoint: { mode: "explicit" } } },
+        });
+      } else {
+        expect(payload.system).toBe("system");
+      }
+      expect(payload.systemMessageTokens).toBe(6);
+    });
+  }
+
+  test("injects an interrupted sentinel only when a partial assistant remains terminal", async () => {
+    const partial = createMuxMessage("partial", "assistant", "working", { partial: true });
+    const withoutFollowingUser = await assemble({
+      history: [createMuxMessage("user", "user", "hello"), partial],
+    });
+    const withFollowingUser = await assemble({
+      history: [
+        createMuxMessage("user", "user", "hello"),
+        partial,
+        createMuxMessage("follow-up", "user", "continue"),
+      ],
+    });
+
+    expect(withoutFollowingUser.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+    ]);
+    expect(withFollowingUser.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+    ]);
+    expect(JSON.stringify(withoutFollowingUser.messages.at(-1))).not.toContain("continue");
+    expect(JSON.stringify(withFollowingUser.messages.at(-1))).toContain("continue");
+  });
+
+  test("places plan transition context before the final user request", async () => {
+    const payload = await assemble({
+      history: [
+        createMuxMessage("planned", "assistant", "plan ready", { agentId: "plan" }),
+        createMuxMessage("execute", "user", "implement it"),
+      ],
+      planContentForTransition: "approved plan body",
+      planFilePath: "/tmp/plan.md",
+    });
+
+    expect(payload.messages.map((message) => message.role)).toEqual(["assistant", "user"]);
+    expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
+  });
+});
 
 describe("buildPlanInstructions", () => {
   test("prepends runtime plan file guidance ahead of caller additional instructions", async () => {
