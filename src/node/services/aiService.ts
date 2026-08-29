@@ -24,7 +24,6 @@ import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiment
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
-import type { MuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -121,7 +120,7 @@ export class AIService extends EventEmitter {
   private readonly telemetryService?: TelemetryService;
   private readonly initStateManager: InitStateManager;
   private mockModeEnabled: boolean;
-  private mockAiStreamPlayer?: MockAiStreamPlayer;
+  public mockAiStreamPlayer?: MockAiStreamPlayer;
   private readonly backgroundProcessManager?: BackgroundProcessManager;
   private readonly sessionUsageService?: SessionUsageService;
   private readonly providerService: ProviderService;
@@ -1027,88 +1026,12 @@ export class AIService extends EventEmitter {
     return this.streamManager.isStreaming(workspaceId);
   }
 
-  /**
-   * Get the current stream state for a workspace
-   */
-  getStreamState(workspaceId: string): string {
-    if (this.mockModeEnabled && this.mockAiStreamPlayer) {
-      return this.mockAiStreamPlayer.isStreaming(workspaceId) ? "streaming" : "idle";
-    }
-    return this.streamManager.getStreamState(workspaceId);
-  }
-
-  /**
-   * Get the current stream info for a workspace if actively streaming
-   * Used to re-establish streaming context on frontend reconnection
-   */
-  getStreamInfo(workspaceId: string): ReturnType<typeof this.streamManager.getStreamInfo> {
-    if (this.mockModeEnabled && this.mockAiStreamPlayer) {
-      return undefined;
-    }
-    return this.streamManager.getStreamInfo(workspaceId);
-  }
-
-  /**
-   * Replay stream events
-   * Emits the same events that would be emitted during live streaming
-   */
-  async replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
-    if (this.mockModeEnabled && this.mockAiStreamPlayer) {
-      await this.mockAiStreamPlayer.replayStream(workspaceId);
-      return;
-    }
-    await this.streamManager.replayStream(workspaceId, opts);
-  }
-
-  debugGetLastMockPrompt(workspaceId: string): Result<MuxMessage[] | null> {
-    if (typeof workspaceId !== "string" || workspaceId.trim().length === 0) {
-      return Err("debugGetLastMockPrompt: workspaceId is required");
-    }
-
-    if (!this.mockModeEnabled || !this.mockAiStreamPlayer) {
-      return Ok(null);
-    }
-
-    return Ok(this.mockAiStreamPlayer.debugGetLastPrompt(workspaceId));
-  }
-  debugGetLastMockModel(workspaceId: string): Result<string | null> {
-    if (typeof workspaceId !== "string" || workspaceId.trim().length === 0) {
-      return Err("debugGetLastMockModel: workspaceId is required");
-    }
-
-    if (!this.mockModeEnabled || !this.mockAiStreamPlayer) {
-      return Ok(null);
-    }
-
-    return Ok(this.mockAiStreamPlayer.debugGetLastModel(workspaceId));
-  }
-
   debugGetLastLlmRequest(workspaceId: string): Result<DebugLlmRequestSnapshot | null> {
     if (typeof workspaceId !== "string" || workspaceId.trim().length === 0) {
       return Err("debugGetLastLlmRequest: workspaceId is required");
     }
 
     return Ok(this.lastLlmRequestByWorkspace.get(workspaceId) ?? null);
-  }
-
-  /**
-   * DEBUG ONLY: Trigger an artificial stream error for testing.
-   * This is used by integration tests to simulate network errors mid-stream.
-   * @returns true if an active stream was found and error was triggered
-   */
-  debugTriggerStreamError(
-    workspaceId: string,
-    errorMessage = "Test-triggered stream error"
-  ): Promise<boolean> {
-    return this.streamManager.debugTriggerStreamError(workspaceId, errorMessage);
-  }
-
-  /**
-   * Wait for workspace initialization to complete (if running).
-   * Public wrapper for agent discovery and other callers.
-   */
-  async waitForInit(workspaceId: string, abortSignal?: AbortSignal): Promise<void> {
-    return this.initStateManager.waitForInit(workspaceId, abortSignal);
   }
 
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {

@@ -534,6 +534,11 @@ interface AgentSessionActiveStreamInfo {
   toolCompletionTimestamps: Map<string, number>;
 }
 
+export interface AgentSessionStreamManager {
+  getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
+  replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+}
+
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
 export interface AgentSessionAIService extends BranchSummaryAiService {
   on(event: string, listener: (...args: unknown[]) => void): void;
@@ -544,8 +549,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
   ): Promise<Result<void>>;
   isStreaming(workspaceId: string): boolean;
-  getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
-  replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+  getStreamInfo?(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
+  replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
@@ -567,6 +572,7 @@ interface AgentSessionOptions {
   config: Config;
   historyService: HistoryService;
   aiService: AgentSessionAIService;
+  streamManager?: AgentSessionStreamManager;
   mcpServerManager?: MCPServerManager;
   initStateManager: InitStateManager;
   telemetryService?: TelemetryService;
@@ -634,6 +640,7 @@ export class AgentSession {
   private readonly config: Config;
   private readonly historyService: HistoryService;
   private readonly aiService: AgentSessionAIService;
+  private readonly streamManager: AgentSessionStreamManager;
   private readonly mcpServerManager?: MCPServerManager;
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
@@ -869,6 +876,7 @@ export class AgentSession {
       config,
       historyService,
       aiService,
+      streamManager,
       mcpServerManager,
       initStateManager,
       telemetryService,
@@ -891,6 +899,13 @@ export class AgentSession {
     this.config = config;
     this.historyService = historyService;
     this.aiService = aiService;
+    const streamManagerCandidate = streamManager ?? aiService;
+    assert(
+      typeof streamManagerCandidate.getStreamInfo === "function" &&
+        typeof streamManagerCandidate.replayStream === "function",
+      "AgentSession requires stream lifecycle access"
+    );
+    this.streamManager = streamManagerCandidate as AgentSessionStreamManager;
     this.mcpServerManager = mcpServerManager;
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
@@ -2585,15 +2600,15 @@ export class AgentSession {
         // Live mode still needs stream context when a response is currently active.
         // Replay only stream-start (no historical deltas/tool updates) so clients can
         // attach future live events to the correct message.
-        const liveStreamInfo = this.aiService.getStreamInfo(this.workspaceId);
+        const liveStreamInfo = this.streamManager.getStreamInfo(this.workspaceId);
         if (liveStreamInfo) {
           const streamLastTimestamp = this.getStreamLastTimestamp(liveStreamInfo);
-          await this.aiService.replayStream(this.workspaceId, {
+          await this.streamManager.replayStream(this.workspaceId, {
             afterTimestamp: streamLastTimestamp,
           });
 
           // Stream can end while replayStream runs; only expose cursor when still active.
-          const liveStreamInfoAfterReplay = this.aiService.getStreamInfo?.(this.workspaceId);
+          const liveStreamInfoAfterReplay = this.streamManager.getStreamInfo(this.workspaceId);
           if (liveStreamInfoAfterReplay) {
             serverCursor = {
               ...serverCursor,
@@ -2614,7 +2629,7 @@ export class AgentSession {
 
       // Read partial BEFORE iterating history so we can skip the corresponding
       // placeholder message (which has empty parts). The partial has the real content.
-      const streamInfo = this.aiService.getStreamInfo(this.workspaceId);
+      const streamInfo = this.streamManager.getStreamInfo(this.workspaceId);
       const partial = await this.historyService.readPartial(this.workspaceId);
       const partialHistorySequence = partial?.metadata?.historySequence;
 
@@ -2786,13 +2801,13 @@ export class AgentSession {
 
       const attemptedStreamReplay = streamInfo !== undefined;
       if (streamInfo) {
-        await this.aiService.replayStream(this.workspaceId, { afterTimestamp });
+        await this.streamManager.replayStream(this.workspaceId, { afterTimestamp });
       }
 
       // Re-read stream state after replay. The stream can end while we are
       // replaying history, and caught-up cursor metadata must reflect that
       // latest backend state to avoid phantom active streams in the client.
-      const streamInfoAfterReplay = this.aiService.getStreamInfo?.(this.workspaceId);
+      const streamInfoAfterReplay = this.streamManager.getStreamInfo(this.workspaceId);
       if (streamInfoAfterReplay) {
         serverCursor = {
           ...serverCursor,

@@ -39,6 +39,7 @@ import {
 import type { QueueCutCutter } from "@/node/services/messageQueue";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
+import type { StreamManager } from "@/node/services/streamManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type {
   ExtensionMetadataService,
@@ -2373,7 +2374,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     policyService?: PolicyService,
     telemetryService?: TelemetryService,
     experimentsService?: ExperimentsService,
-    sessionTimingService?: SessionTimingService
+    sessionTimingService?: SessionTimingService,
+    private readonly streamManager?: StreamManager
   ) {
     super();
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
@@ -4001,8 +4003,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * This is used by integration tests to simulate network errors mid-stream.
    * @returns true if an active stream was found and error was triggered
    */
-  debugTriggerStreamError(workspaceId: string, errorMessage?: string): Promise<boolean> {
-    return this.aiService.debugTriggerStreamError(workspaceId, errorMessage);
+  debugTriggerStreamError(
+    workspaceId: string,
+    errorMessage = "Test-triggered stream error"
+  ): Promise<boolean> {
+    return (
+      this.streamManager?.debugTriggerStreamError(workspaceId, errorMessage) ??
+      Promise.resolve(false)
+    );
   }
 
   /**
@@ -4713,6 +4721,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       config: this.config,
       historyService: this.historyService,
       aiService: this.aiService,
+      streamManager: this.streamManager,
       mcpServerManager: this.mcpServerManager,
       telemetryService: this.telemetryService,
       initStateManager: this.initStateManager,
@@ -8906,7 +8915,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // different turn) is treated as user work and refuses.
     if (this.aiService.isStreaming(workspaceId)) {
       const streamCorrelation = parseWorkspaceTurnTaskCorrelation(
-        this.aiService.getStreamInfo(workspaceId)?.muxMetadata
+        this.streamManager?.getStreamInfo(workspaceId)?.muxMetadata
       );
       const streamIsExpectedDelegatedTurn =
         streamCorrelation != null &&

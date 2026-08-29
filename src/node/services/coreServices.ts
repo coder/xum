@@ -10,6 +10,7 @@ import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { ProviderService } from "@/node/services/providerService";
 import { AIService } from "@/node/services/aiService";
+import { StreamManager } from "@/node/services/streamManager";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { log } from "@/node/services/log";
@@ -73,6 +74,7 @@ export interface CoreServices {
    */
   idleDispatcher: IdleDispatcher;
   aiService: AIService;
+  streamManager: StreamManager;
   mcpConfigService: MCPConfigService;
   mcpServerManager: MCPServerManager;
   extensionMetadata: ExtensionMetadataService;
@@ -151,6 +153,10 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   const workspaceMcpOverridesService =
     opts.workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
 
+  const streamManager = new StreamManager(historyService, sessionUsageService, () =>
+    providerService.getConfig()
+  );
+
   const aiService = new AIService(
     config,
     historyService,
@@ -162,7 +168,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.policyService,
     opts.telemetryService,
     opts.devToolsService,
-    opts.experimentsService
+    opts.experimentsService,
+    streamManager
   );
 
   // Agent memory (memory experiment): scope roots derive from Config (xum home
@@ -242,7 +249,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.policyService,
     opts.telemetryService,
     opts.experimentsService,
-    opts.sessionTimingService
+    opts.sessionTimingService,
+    streamManager
   );
   aiService.setWorkspaceHeartbeatService(workspaceService);
   // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
@@ -291,7 +299,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceService,
     initStateManager,
     sessionUsageService,
-    workspaceGoalService
+    workspaceGoalService,
+    streamManager
   );
   aiService.setTaskService(taskService);
   workspaceService.setAgentTaskIntegration(taskService);
@@ -320,6 +329,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceGoalService,
     idleDispatcher,
     aiService,
+    streamManager,
     mcpConfigService,
     mcpServerManager,
     extensionMetadata,

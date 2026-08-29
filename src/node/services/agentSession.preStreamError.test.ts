@@ -40,7 +40,7 @@ async function createReplaySessionHarness(
       streamMessage: mock((_history: MuxMessage[]) =>
         Promise.resolve(Err({ type: "unknown", raw: "unused" }))
       ) as unknown as AIService["streamMessage"],
-      getStreamInfo: mock((_workspaceId: string) => streamInfo) as AIService["getStreamInfo"],
+      getStreamInfo: mock((_workspaceId: string) => streamInfo),
       replayStream,
     },
     initStateManagerOverrides: { replayInit },
@@ -226,7 +226,7 @@ describe("AgentSession pre-stream errors", () => {
         streamMessage: mock((_history: MuxMessage[]) =>
           Promise.resolve(Err({ type: "api_key_not_found", provider: "anthropic" }))
         ) as unknown as AIService["streamMessage"],
-        getStreamInfo: mock((_workspaceId: string) => undefined) as AIService["getStreamInfo"],
+        getStreamInfo: mock((_workspaceId: string) => undefined),
         replayStream: mock((_workspaceId: string, _opts?: { afterTimestamp?: number }) =>
           Promise.resolve()
         ),
