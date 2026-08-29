@@ -2329,25 +2329,28 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
+        // Shared by the initial build and thinking rebuilds so their assembly
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
+          assemblePromptPayload({
+            history: options.sourceMessages,
+            systemMessage: attemptSystem,
+            tools: attemptTools,
+            modelString: seed.rawModelString,
+            routeProvider: seed.routeProvider,
+            providerForMessages: seed.wireProviderName,
+            effectiveThinkingLevel: level,
+            effectiveAgentId,
+            toolNamesForSentinel,
+            planContentForTransition,
+            planFilePath,
+            postCompactionAttachments,
+            providersConfig: seed.providersConfig,
+            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
+            workspaceId,
+          });
         const prepareMessagesForProviderStartedAt = Date.now();
-        const attemptPayload = await assemblePromptPayload({
-          history: options.sourceMessages,
-          systemMessage: attemptSystem,
-          systemMessageTokens: attemptSystemTokens,
-          tools: attemptTools,
-          modelString: seed.rawModelString,
-          routeProvider: seed.routeProvider,
-          providerForMessages: seed.wireProviderName,
-          effectiveThinkingLevel: seed.effectiveThinkingLevel,
-          effectiveAgentId,
-          toolNamesForSentinel,
-          planContentForTransition,
-          planFilePath,
-          postCompactionAttachments,
-          providersConfig: seed.providersConfig,
-          anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-          workspaceId,
-        });
+        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
         if (options.recordTimings) {
           recordStartupPhaseTiming(
             "prepareMessagesForProviderMs",
@@ -2410,24 +2413,7 @@ export class TurnRequestBuilder {
           });
         };
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
-          const rebuiltPayload = await assemblePromptPayload({
-            history: options.sourceMessages,
-            systemMessage: attemptSystem,
-            systemMessageTokens: attemptSystemTokens,
-            tools: attemptTools,
-            modelString: seed.rawModelString,
-            routeProvider: seed.routeProvider,
-            providerForMessages: seed.wireProviderName,
-            effectiveThinkingLevel: level,
-            effectiveAgentId,
-            toolNamesForSentinel,
-            planContentForTransition,
-            planFilePath,
-            postCompactionAttachments,
-            providersConfig: seed.providersConfig,
-            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-            workspaceId,
-          });
+          const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
           return rebuiltPayload.messages;
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (

@@ -8,9 +8,9 @@
  *
  * The reconstruction reuses the production assemblePromptPayload entry point
  * and the real AI SDK streamText conversion (ModelMessage → LanguageModelV4
- *   prompt), captured through a stub model that never performs network I/O,
- *   with the same per-step message transforms StreamManager's prepareStep
- *   applies.
+ * prompt), captured through a stub model that never performs network I/O,
+ * with the same per-step message transforms StreamManager's prepareStep
+ * applies.
  *
  * Guarantee scope: same log + same config + same binary. Request-time inputs
  * that chat.jsonl alone cannot provide (plan-transition content,
@@ -204,7 +204,6 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
   const payload = await assemblePromptPayload({
     history: requestMessages,
     systemMessage: inputs.systemPrompt,
-    systemMessageTokens: 0,
     modelString: inputs.modelString,
     routeProvider: inputs.routeProvider,
     providerForMessages: wireProviderName,

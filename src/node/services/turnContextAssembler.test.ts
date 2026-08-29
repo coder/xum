@@ -257,7 +257,6 @@ describe("assemblePromptPayload", () => {
     assemblePromptPayload({
       history: [createMuxMessage("user", "user", "hello")],
       systemMessage: "system",
-      systemMessageTokens: 6,
       tools: createTools(),
       modelString: "google:gemini-2.5-pro",
       providerForMessages: "google",
@@ -309,7 +308,6 @@ describe("assemblePromptPayload", () => {
       } else {
         expect(payload.system).toBe("system");
       }
-      expect(payload.systemMessageTokens).toBe(6);
     });
   }
 
@@ -357,7 +355,7 @@ describe("assemblePromptPayload", () => {
 
 describe("buildPlanInstructions", () => {
   test("prepends runtime plan file guidance ahead of caller additional instructions", async () => {
-    using tempRoot = new DisposableTempDir("stream-context-builder");
+    using tempRoot = new DisposableTempDir("turn-context-assembler");
 
     const projectPath = path.join(tempRoot.path, "project");
     const xumHome = path.join(tempRoot.path, "mux-home");
@@ -409,7 +407,7 @@ describe("buildPlanInstructions", () => {
   });
 
   test("uses request payload history for Start Here detection", async () => {
-    using tempRoot = new DisposableTempDir("stream-context-builder");
+    using tempRoot = new DisposableTempDir("turn-context-assembler");
 
     const projectPath = path.join(tempRoot.path, "project");
     const xumHome = path.join(tempRoot.path, "mux-home");
@@ -613,237 +611,141 @@ describe("buildStreamSystemContext", () => {
     );
   });
 
-  test("includes the direct parent plan path ahead of caller instructions", async () => {
-    using tempRoot = new DisposableTempDir("stream-system-context");
-
-    const projectPath = path.join(tempRoot.path, "project");
-    const xumHome = path.join(tempRoot.path, "mux-home");
-    await fs.mkdir(projectPath, { recursive: true });
-    await fs.mkdir(xumHome, { recursive: true });
-
-    const metadata = createWorkspaceMetadata({
-      id: "child-ws",
-      name: "child-workspace",
-      projectName: "project",
-      projectPath,
+  const ancestorPlanCases: Array<{
+    name: string;
+    parentWorkspaceId?: string;
+    otherWorkspaces: Array<{ id: string; name: string; parentWorkspaceId?: string }>;
+    isSubagentWorkspace?: boolean;
+    note?: string;
+    activePlanFrom?: string;
+    expectedAncestors: string[];
+  }> = [
+    {
+      name: "includes the direct parent plan path ahead of caller instructions",
       parentWorkspaceId: "parent-ws",
-    });
-    const cfg = createProjectsConfig({
-      projectPath,
-      workspaces: [
-        { id: "parent-ws", name: "parent-workspace" },
-        { id: metadata.id, name: metadata.name, parentWorkspaceId: metadata.parentWorkspaceId },
-      ],
-    });
-
-    const parentPlanPath = getPlanFilePath("parent-workspace", "project", xumHome);
-    const result = await buildSystemContextForTest({
-      runtime: new TestRuntime(projectPath, xumHome),
-      metadata,
-      workspacePath: projectPath,
-      cfg,
-      isSubagentWorkspace: true,
-      effectiveAdditionalInstructions: "Caller-specific note",
-    });
-
-    expect(result.ancestorPlanFilePaths).toEqual([parentPlanPath]);
-    expect(result.systemMessage).toContain("Ancestor plan file paths (nearest parent first):");
-    expect(result.systemMessage).toContain(
-      "If useful for broader context, you may read these ancestor/parent plan files:"
-    );
-    expect(result.systemMessage).toContain(`- parent-workspace: ${parentPlanPath}`);
-    expect(result.systemMessage).toContain("Caller-specific note");
-    expect(result.systemMessage.indexOf(parentPlanPath)).toBeLessThan(
-      result.systemMessage.indexOf("Caller-specific note")
-    );
-  });
-
-  test("lists nested ancestor plan paths in nearest-parent-first order", async () => {
-    using tempRoot = new DisposableTempDir("stream-system-context");
-
-    const projectPath = path.join(tempRoot.path, "project");
-    const xumHome = path.join(tempRoot.path, "mux-home");
-    await fs.mkdir(projectPath, { recursive: true });
-    await fs.mkdir(xumHome, { recursive: true });
-
-    const metadata = createWorkspaceMetadata({
-      id: "grandchild-ws",
-      name: "grandchild-workspace",
-      projectName: "project",
-      projectPath,
+      otherWorkspaces: [{ id: "parent-ws", name: "parent-workspace" }],
+      note: "Caller-specific note",
+      expectedAncestors: ["parent-workspace"],
+    },
+    {
+      name: "lists nested ancestor plan paths in nearest-parent-first order",
       parentWorkspaceId: "child-ws",
-    });
-    const cfg = createProjectsConfig({
-      projectPath,
-      workspaces: [
+      otherWorkspaces: [
         { id: "parent-ws", name: "parent-workspace" },
         { id: "child-ws", name: "child-workspace", parentWorkspaceId: "parent-ws" },
-        { id: metadata.id, name: metadata.name, parentWorkspaceId: metadata.parentWorkspaceId },
       ],
-    });
-
-    const childPlanPath = getPlanFilePath("child-workspace", "project", xumHome);
-    const parentPlanPath = getPlanFilePath("parent-workspace", "project", xumHome);
-    const result = await buildSystemContextForTest({
-      runtime: new TestRuntime(projectPath, xumHome),
-      metadata,
-      workspacePath: projectPath,
-      cfg,
-      isSubagentWorkspace: true,
-    });
-
-    expect(result.ancestorPlanFilePaths).toEqual([childPlanPath, parentPlanPath]);
-    expect(result.systemMessage).toContain(`- child-workspace: ${childPlanPath}`);
-    expect(result.systemMessage).toContain(`- parent-workspace: ${parentPlanPath}`);
-    expect(result.systemMessage.indexOf(childPlanPath)).toBeLessThan(
-      result.systemMessage.indexOf(parentPlanPath)
-    );
-  });
-
-  test("omits ancestor plan paths for top-level workspaces", async () => {
-    using tempRoot = new DisposableTempDir("stream-system-context");
-
-    const projectPath = path.join(tempRoot.path, "project");
-    const xumHome = path.join(tempRoot.path, "mux-home");
-    await fs.mkdir(projectPath, { recursive: true });
-    await fs.mkdir(xumHome, { recursive: true });
-
-    const metadata = createWorkspaceMetadata({
-      id: "top-level-ws",
-      name: "top-level-workspace",
-      projectName: "project",
-      projectPath,
-    });
-    const cfg = createProjectsConfig({
-      projectPath,
-      workspaces: [{ id: metadata.id, name: metadata.name }],
-    });
-
-    const result = await buildSystemContextForTest({
-      runtime: new TestRuntime(projectPath, xumHome),
-      metadata,
-      workspacePath: projectPath,
-      cfg,
+      expectedAncestors: ["child-workspace", "parent-workspace"],
+    },
+    {
+      name: "omits ancestor plan paths for top-level workspaces",
+      otherWorkspaces: [],
       isSubagentWorkspace: false,
-      effectiveAdditionalInstructions: "Top-level note",
-    });
-
-    expect(result.ancestorPlanFilePaths).toEqual([]);
-    expect(result.systemMessage).not.toContain("Ancestor plan file paths (nearest parent first):");
-    expect(result.systemMessage).toContain("Top-level note");
-  });
-
-  test("omits the ancestor section when the parent metadata is missing", async () => {
-    using tempRoot = new DisposableTempDir("stream-system-context");
-
-    const projectPath = path.join(tempRoot.path, "project");
-    const xumHome = path.join(tempRoot.path, "mux-home");
-    await fs.mkdir(projectPath, { recursive: true });
-    await fs.mkdir(xumHome, { recursive: true });
-
-    const metadata = createWorkspaceMetadata({
-      id: "child-ws",
-      name: "child-workspace",
-      projectName: "project",
-      projectPath,
+      note: "Top-level note",
+      expectedAncestors: [],
+    },
+    {
+      name: "omits the ancestor section when the parent metadata is missing",
       parentWorkspaceId: "missing-parent-ws",
-    });
-    const cfg = createProjectsConfig({
-      projectPath,
-      workspaces: [
-        { id: metadata.id, name: metadata.name, parentWorkspaceId: metadata.parentWorkspaceId },
-      ],
-    });
-
-    const result = await buildSystemContextForTest({
-      runtime: new TestRuntime(projectPath, xumHome),
-      metadata,
-      workspacePath: projectPath,
-      cfg,
-      isSubagentWorkspace: true,
-      effectiveAdditionalInstructions: "Existing note",
-    });
-
-    expect(result.ancestorPlanFilePaths).toEqual([]);
-    expect(result.systemMessage).not.toContain("Ancestor plan file paths (nearest parent first):");
-    expect(result.systemMessage).toContain("Existing note");
-  });
-
-  test("dedupes ancestor plan paths that are already covered by the active plan file", async () => {
-    using tempRoot = new DisposableTempDir("stream-system-context");
-
-    const projectPath = path.join(tempRoot.path, "project");
-    const xumHome = path.join(tempRoot.path, "mux-home");
-    await fs.mkdir(projectPath, { recursive: true });
-    await fs.mkdir(xumHome, { recursive: true });
-
-    const metadata = createWorkspaceMetadata({
-      id: "child-ws",
-      name: "child-workspace",
-      projectName: "project",
-      projectPath,
+      otherWorkspaces: [],
+      note: "Existing note",
+      expectedAncestors: [],
+    },
+    {
+      name: "dedupes ancestor plan paths that are already covered by the active plan file",
       parentWorkspaceId: "parent-ws",
-    });
-    const cfg = createProjectsConfig({
-      projectPath,
-      workspaces: [
-        { id: "parent-ws", name: "parent-workspace" },
-        { id: metadata.id, name: metadata.name, parentWorkspaceId: metadata.parentWorkspaceId },
-      ],
-    });
-
-    const parentPlanPath = getPlanFilePath("parent-workspace", "project", xumHome);
-    const result = await buildSystemContextForTest({
-      runtime: new TestRuntime(projectPath, xumHome),
-      metadata,
-      workspacePath: projectPath,
-      cfg,
-      isSubagentWorkspace: true,
-      planFilePath: parentPlanPath,
-    });
-
-    expect(result.ancestorPlanFilePaths).toEqual([]);
-    expect(result.systemMessage).not.toContain("Ancestor plan file paths (nearest parent first):");
-    expect(result.systemMessage).not.toContain(parentPlanPath);
-  });
-
-  test("truncates cyclic ancestry without crashing", async () => {
-    using tempRoot = new DisposableTempDir("stream-system-context");
-
-    const projectPath = path.join(tempRoot.path, "project");
-    const xumHome = path.join(tempRoot.path, "mux-home");
-    await fs.mkdir(projectPath, { recursive: true });
-    await fs.mkdir(xumHome, { recursive: true });
-
-    const metadata = createWorkspaceMetadata({
-      id: "child-ws",
-      name: "child-workspace",
-      projectName: "project",
-      projectPath,
+      otherWorkspaces: [{ id: "parent-ws", name: "parent-workspace" }],
+      activePlanFrom: "parent-workspace",
+      expectedAncestors: [],
+    },
+    {
+      name: "truncates cyclic ancestry without crashing",
       parentWorkspaceId: "parent-ws",
-    });
-    const cfg = createProjectsConfig({
-      projectPath,
-      workspaces: [
-        { id: "parent-ws", name: "parent-workspace", parentWorkspaceId: metadata.id },
-        { id: metadata.id, name: metadata.name, parentWorkspaceId: metadata.parentWorkspaceId },
+      otherWorkspaces: [
+        { id: "parent-ws", name: "parent-workspace", parentWorkspaceId: "self-ws" },
       ],
-    });
+      expectedAncestors: ["parent-workspace"],
+    },
+  ];
 
-    const parentPlanPath = getPlanFilePath("parent-workspace", "project", xumHome);
-    const result = await buildSystemContextForTest({
-      runtime: new TestRuntime(projectPath, xumHome),
-      metadata,
-      workspacePath: projectPath,
-      cfg,
-      isSubagentWorkspace: true,
-    });
+  for (const testCase of ancestorPlanCases) {
+    test(testCase.name, async () => {
+      using tempRoot = new DisposableTempDir("stream-system-context");
 
-    expect(result.ancestorPlanFilePaths).toEqual([parentPlanPath]);
-    expect(result.systemMessage).toContain("Ancestor plan file paths (nearest parent first):");
-    expect(result.systemMessage).toContain(`- parent-workspace: ${parentPlanPath}`);
-    expect(result.systemMessage).not.toContain(
-      `- child-workspace: ${getPlanFilePath(metadata.name, "project", xumHome)}`
-    );
-  });
+      const projectPath = path.join(tempRoot.path, "project");
+      const xumHome = path.join(tempRoot.path, "mux-home");
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.mkdir(xumHome, { recursive: true });
+
+      const metadata = createWorkspaceMetadata({
+        id: "self-ws",
+        name: "self-workspace",
+        projectName: "project",
+        projectPath,
+        ...(testCase.parentWorkspaceId != null
+          ? { parentWorkspaceId: testCase.parentWorkspaceId }
+          : {}),
+      });
+      const cfg = createProjectsConfig({
+        projectPath,
+        workspaces: [
+          ...testCase.otherWorkspaces,
+          {
+            id: metadata.id,
+            name: metadata.name,
+            ...(testCase.parentWorkspaceId != null
+              ? { parentWorkspaceId: testCase.parentWorkspaceId }
+              : {}),
+          },
+        ],
+      });
+
+      const activePlanPath =
+        testCase.activePlanFrom != null
+          ? getPlanFilePath(testCase.activePlanFrom, "project", xumHome)
+          : undefined;
+      const result = await buildSystemContextForTest({
+        runtime: new TestRuntime(projectPath, xumHome),
+        metadata,
+        workspacePath: projectPath,
+        cfg,
+        isSubagentWorkspace: testCase.isSubagentWorkspace ?? true,
+        ...(testCase.note != null ? { effectiveAdditionalInstructions: testCase.note } : {}),
+        ...(activePlanPath != null ? { planFilePath: activePlanPath } : {}),
+      });
+
+      const expectedPaths = testCase.expectedAncestors.map((name) =>
+        getPlanFilePath(name, "project", xumHome)
+      );
+      expect(result.ancestorPlanFilePaths).toEqual(expectedPaths);
+      // The workspace's own plan must never list as its ancestor (covers cycles).
+      expect(result.systemMessage).not.toContain(`- ${metadata.name}:`);
+      if (expectedPaths.length === 0) {
+        expect(result.systemMessage).not.toContain(
+          "Ancestor plan file paths (nearest parent first):"
+        );
+        if (activePlanPath != null) {
+          expect(result.systemMessage).not.toContain(activePlanPath);
+        }
+      } else {
+        expect(result.systemMessage).toContain("Ancestor plan file paths (nearest parent first):");
+        expect(result.systemMessage).toContain(
+          "If useful for broader context, you may read these ancestor/parent plan files:"
+        );
+        const indices = testCase.expectedAncestors.map((name, i) => {
+          const line = `- ${name}: ${expectedPaths[i]}`;
+          expect(result.systemMessage).toContain(line);
+          return result.systemMessage.indexOf(line);
+        });
+        expect([...indices].sort((a, b) => a - b)).toEqual(indices);
+      }
+      if (testCase.note != null) {
+        expect(result.systemMessage).toContain(testCase.note);
+        if (expectedPaths.length > 0) {
+          expect(result.systemMessage.indexOf(expectedPaths[0])).toBeLessThan(
+            result.systemMessage.indexOf(testCase.note)
+          );
+        }
+      }
+    });
+  }
 });

@@ -371,8 +371,8 @@ interface PreparedModelFallback {
    * (see TurnRequestBuilder's pinCoderInstanceProvidersConfig). The swap's request-config
    * rebuild and metadata resolution must read THIS snapshot, not the live
    * config: a catalog refresh between prepare() and the swap could retag the
-   * instance and hand the prepared SDK model another wire's cache wrappers,
-   * output limits, or usage identity.
+   * instance and hand the prepared SDK model another wire's output limits or
+   * usage identity.
    */
   providersConfig?: ProvidersConfigMap;
 }
@@ -655,11 +655,10 @@ interface WorkspaceStreamInfo {
   didRetryAfterEmptyOutput?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
   // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
-  // be rebuilt for a different model — buildStreamRequestConfig re-applies
-  // provider-specific wrapping (e.g. Anthropic cached system message / tool
-  // cache_control), which must not be applied twice or leak across providers.
-  // System and tools are rebuilt per fallback model by prepare() because both
-  // are model-keyed (provider web tools, MCP sanitization, model sections).
+  // be rebuilt for a different model. System, tools, and messages are rebuilt
+  // per fallback model by prepare() via the prompt assembler because they are
+  // model-keyed (cache wrapping, provider web tools, MCP sanitization, model
+  // sections) and must not leak across providers.
   modelFallback?: {
     options: ModelFallbackOptions;
     /** Canonical model originally requested for this turn (the chain source). */

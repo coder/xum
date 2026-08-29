@@ -96,19 +96,15 @@ export function formatMcpWarningPrefix(
 }
 
 export interface PromptPayload {
-  activeContextMessages: MuxMessage[];
   providerRequestMessages: MuxMessage[];
-  contextBoundarySlicedCount: number;
   messages: ModelMessage[];
   system: string | SystemModelMessage | undefined;
   tools: Record<string, Tool> | undefined;
-  systemMessageTokens: number;
 }
 
 export interface AssemblePromptPayloadOptions {
   history: MuxMessage[];
   systemMessage: string;
-  systemMessageTokens: number;
   tools?: Record<string, Tool>;
   modelString: string;
   routeProvider?: string;
@@ -168,7 +164,7 @@ export async function assemblePromptPayload(
   }
 
   return {
-    ...prepared,
+    providerRequestMessages: prepared.providerRequestMessages,
     messages,
     system,
     tools: options.tools
@@ -179,7 +175,6 @@ export async function assemblePromptPayload(
           options.providersConfig
         )
       : undefined,
-    systemMessageTokens: options.systemMessageTokens,
   };
 }
 
