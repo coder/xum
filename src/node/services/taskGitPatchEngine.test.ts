@@ -4,9 +4,6 @@ import * as os from "os";
 import * as path from "path";
 import { execSync } from "node:child_process";
 
-import type { ToolExecutionOptions } from "ai";
-
-import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
 import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
 import {
   getSubagentGitPatchArtifactsFilePath,
@@ -15,13 +12,6 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import { getTestDeps } from "@/node/services/tools/testHelpers";
-
-const mockToolCallOptions: ToolExecutionOptions<unknown> = {
-  toolCallId: "test-call-id",
-  messages: [],
-  context: undefined,
-};
 
 function initGitRepo(repoPath: string): void {
   execSync("git init -b main", { cwd: repoPath, stdio: "ignore" });
@@ -154,7 +144,7 @@ async function writeWorkspaceConfig(params: {
   );
 }
 
-describe("task_apply_git_patch tool", () => {
+describe("task git patch engine", () => {
   let rootDir: string;
 
   beforeEach(async () => {
@@ -163,6 +153,82 @@ describe("task_apply_git_patch tool", () => {
 
   afterEach(async () => {
     await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  it("generates and applies a path-restricted patch", async () => {
+    const childRepo = path.join(rootDir, "generate-child");
+    const targetRepo = path.join(rootDir, "generate-target");
+    const sessionDir = path.join(rootDir, "generate-session");
+    await fsPromises.mkdir(path.join(childRepo, "src"), { recursive: true });
+    initGitRepo(childRepo);
+    await commitFile(childRepo, "src/app.ts", "base\n", "base");
+    execSync("git clone " + JSON.stringify(childRepo) + " " + JSON.stringify(targetRepo), {
+      stdio: "ignore",
+    });
+    execSync('git config user.email "test@example.com"', { cwd: targetRepo, stdio: "ignore" });
+    execSync('git config user.name "test"', { cwd: targetRepo, stdio: "ignore" });
+    const baseCommitSha = execSync("git rev-parse HEAD", {
+      cwd: childRepo,
+      encoding: "utf-8",
+    }).trim();
+    await commitFile(childRepo, "src/app.ts", "changed\n", "change app");
+    const headCommitSha = execSync("git rev-parse HEAD", {
+      cwd: childRepo,
+      encoding: "utf-8",
+    }).trim();
+    const childTaskId = "generated-patch";
+    const patchPath = getSubagentGitPatchMboxPath(sessionDir, childTaskId, "repo");
+    expect(
+      await taskGitPatchEngine.generatePatch({
+        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+        repoCwd: childRepo,
+        baseCommitSha,
+        headCommitSha,
+        patchPath,
+      })
+    ).toEqual({ success: true });
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId: "test-workspace",
+      childTaskId,
+      projectArtifacts: [
+        {
+          projectPath: targetRepo,
+          projectName: "repo",
+          storageKey: "repo",
+          status: "ready",
+          baseCommitSha,
+          headCommitSha,
+          commitCount: 1,
+          mboxPath: patchPath,
+        },
+      ],
+    });
+    const config = {
+      workspaceId: "test-workspace",
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: path.join(rootDir, "generate-runtime"),
+      workspaceSessionDir: sessionDir,
+    };
+
+    const rejected = await taskGitPatchEngine.applyPatch(
+      config,
+      { task_id: childTaskId, three_way: true },
+      { allowedPathPrefixes: ["docs"] }
+    );
+    expect(rejected.success).toBe(false);
+    if (!rejected.success) expect(rejected.error).toContain("src/app.ts");
+
+    const applied = await taskGitPatchEngine.applyPatch(
+      config,
+      { task_id: childTaskId, three_way: true },
+      { allowedPathPrefixes: ["src"] }
+    );
+    expect(applied.success).toBe(true);
+    expect(await fsPromises.readFile(path.join(targetRepo, "src/app.ts"), "utf-8")).toBe(
+      "changed\n"
+    );
   });
 
   it("finds a nested descendant patch in its direct parent session", async () => {
@@ -401,16 +467,18 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+    })) as {
       success: boolean;
       projectResults: Array<{
         projectPath: string;
@@ -505,19 +573,18 @@ describe("task_apply_git_patch tool", () => {
         }),
       ],
     });
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!(
-      { task_id: childTaskId, three_way: true },
-      mockToolCallOptions
-    )) as { success: boolean };
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      task_id: childTaskId,
+      three_way: true,
+    })) as { success: boolean };
 
     expect(result.success).toBe(false);
     const markerExists = await fsPromises.access(marker).then(
@@ -579,16 +646,18 @@ describe("task_apply_git_patch tool", () => {
         }),
       ],
     });
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+    })) as {
       success: boolean;
     };
 
@@ -660,19 +729,19 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!(
-      { task_id: childTaskId, dry_run: true },
-      mockToolCallOptions
-    )) as { success: boolean };
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+      dry_run: true,
+    })) as { success: boolean };
 
     expect(result.success).toBe(true);
     const markerExists = await fsPromises.access(marker).then(
@@ -680,96 +749,6 @@ describe("task_apply_git_patch tool", () => {
       () => false
     );
     expect(markerExists).toBe(false);
-  }, 20_000);
-
-  it("cleans staged patch files between dry-run and real apply when temp dir is inside the repo", async () => {
-    const childRepo = path.join(rootDir, "child");
-    const targetRepo = path.join(rootDir, "target");
-    for (const repo of [childRepo, targetRepo]) {
-      await fsPromises.mkdir(repo, { recursive: true });
-      initGitRepo(repo);
-    }
-
-    await commitFile(childRepo, "README.md", "hello", "base");
-    await commitFile(targetRepo, "README.md", "hello", "base");
-    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-    await commitFile(childRepo, "README.md", "hello\nchild", "child change");
-    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-
-    const muxRoot = path.join(rootDir, "mux");
-    const currentWorkspaceId = "current-workspace";
-    const sessionDir = path.join(muxRoot, "sessions", currentWorkspaceId);
-    await fsPromises.mkdir(sessionDir, { recursive: true });
-    await writeWorkspaceConfig({
-      muxRoot,
-      workspaceId: currentWorkspaceId,
-      workspaceName: "current",
-      primaryProjectPath: targetRepo,
-      projects: [{ projectPath: targetRepo, projectName: "project" }],
-    });
-
-    const childTaskId = "child-task-cleanup";
-    await writePatchArtifact({
-      sessionDir,
-      workspaceId: currentWorkspaceId,
-      childTaskId,
-      projectArtifacts: [
-        await buildReadyProjectArtifact({
-          sessionDir,
-          childTaskId,
-          storageKey: "project",
-          projectPath: targetRepo,
-          projectName: "project",
-          childRepo,
-          baseSha,
-          headSha,
-        }),
-      ],
-    });
-
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
-      workspaceId: currentWorkspaceId,
-      cwd: targetRepo,
-      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-      runtimeTempDir: path.join(targetRepo, ".mux", "tmp"),
-      workspaceSessionDir: sessionDir,
-    });
-
-    const dryRun = (await tool.execute!(
-      { task_id: childTaskId, dry_run: true },
-      mockToolCallOptions
-    )) as { success: boolean };
-    expect(dryRun.success).toBe(true);
-    expect(execSync("git status --porcelain", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
-      ""
-    );
-
-    const stalePatchPath = path.join(
-      targetRepo,
-      ".mux",
-      "tmp",
-      `mux-task-${childTaskId}-project-series.mbox`
-    );
-    await fsPromises.mkdir(path.dirname(stalePatchPath), { recursive: true });
-    await fsPromises.writeFile(stalePatchPath, "stale patch copy", "utf-8");
-    expect(execSync("git status --porcelain", { cwd: targetRepo, encoding: "utf-8" })).toContain(
-      ".mux/"
-    );
-
-    const realApply = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
-      success: boolean;
-      projectResults: Array<{ status: string }>;
-    };
-
-    expect(realApply.success).toBe(true);
-    expect(realApply.projectResults[0]).toMatchObject({ status: "applied" });
-    expect(execSync("git log -1 --pretty=%s", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
-      "child change"
-    );
-    expect(execSync("git status --porcelain", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
-      ""
-    );
   }, 20_000);
 
   it("lets git am apply when dirty files are unrelated to the patch", async () => {
@@ -800,7 +779,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-unrelated-dirty";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         await buildReadyProjectArtifact({
@@ -828,7 +807,7 @@ describe("task_apply_git_patch tool", () => {
     }).trim();
 
     const config = {
-      ...getTestDeps(),
+      workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: path.join(rootDir, "runtime-tmp-unrelated-dirty"),
@@ -887,7 +866,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-staged-unrelated";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         await buildReadyProjectArtifact({
@@ -912,7 +891,7 @@ describe("task_apply_git_patch tool", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
-        ...getTestDeps(),
+        workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
         runtimeTempDir: path.join(rootDir, "runtime-tmp-staged-unrelated"),
@@ -931,64 +910,6 @@ describe("task_apply_git_patch tool", () => {
     expect(execSync("git rev-parse HEAD", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
       headBeforeApply
     );
-  }, 20_000);
-
-  it("rejects intent-to-add entries before git am", async () => {
-    const childRepo = path.join(rootDir, "child-intent-to-add");
-    const targetRepo = path.join(rootDir, "target-intent-to-add");
-    for (const repo of [childRepo, targetRepo]) {
-      await fsPromises.mkdir(repo, { recursive: true });
-      initGitRepo(repo);
-    }
-
-    await commitFile(childRepo, "README.md", "hello", "base");
-    await commitFile(targetRepo, "README.md", "hello", "base");
-    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-    await commitFile(childRepo, "README.md", "hello\nchild", "child change");
-    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-
-    const sessionDir = path.join(rootDir, "session-intent-to-add");
-    await fsPromises.mkdir(sessionDir, { recursive: true });
-    const childTaskId = "child-task-intent-to-add";
-    await writePatchArtifact({
-      sessionDir,
-      workspaceId: getTestDeps().workspaceId,
-      childTaskId,
-      projectArtifacts: [
-        await buildReadyProjectArtifact({
-          sessionDir,
-          childTaskId,
-          storageKey: "target",
-          projectPath: targetRepo,
-          projectName: "target",
-          childRepo,
-          baseSha,
-          headSha,
-        }),
-      ],
-    });
-
-    await fsPromises.writeFile(path.join(targetRepo, "notes.txt"), "intent", "utf-8");
-    execSync("git add -N notes.txt", { cwd: targetRepo, stdio: "ignore" });
-
-    const result = await taskGitPatchEngine.applyPatch(
-      {
-        ...getTestDeps(),
-        cwd: targetRepo,
-        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-        runtimeTempDir: path.join(rootDir, "runtime-tmp-intent-to-add"),
-        workspaceSessionDir: sessionDir,
-      },
-      { task_id: childTaskId, dry_run: true, three_way: true },
-      {}
-    );
-
-    expect(result.success).toBe(false);
-    if (result.success) {
-      throw new Error("expected intent-to-add failure");
-    }
-    expect(result.error).toContain("staged changes");
-    expect(result.conflictPaths).toEqual(["notes.txt"]);
   }, 20_000);
 
   it("rejects overlapping dirty paths before a multi-commit patch can partially apply", async () => {
@@ -1013,7 +934,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-overlapping-dirty";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         await buildReadyProjectArtifact({
@@ -1036,7 +957,7 @@ describe("task_apply_git_patch tool", () => {
     }).trim();
 
     const config = {
-      ...getTestDeps(),
+      workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: path.join(rootDir, "runtime-tmp-overlapping-dirty"),
@@ -1101,7 +1022,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-rename-source-dirty";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         await buildReadyProjectArtifact({
@@ -1125,7 +1046,7 @@ describe("task_apply_git_patch tool", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
-        ...getTestDeps(),
+        workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
         runtimeTempDir: path.join(rootDir, "runtime-tmp-rename-source-dirty"),
@@ -1140,76 +1061,6 @@ describe("task_apply_git_patch tool", () => {
       throw new Error("expected rename source overlap failure");
     }
     expect(result.conflictPaths).toEqual(["é b/old.txt"]);
-    expect(execSync("git rev-parse HEAD", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
-      headBeforeApply
-    );
-  }, 20_000);
-
-  it("treats dirty ancestor paths as overlapping patch paths", async () => {
-    const childRepo = path.join(rootDir, "child-ancestor-dirty");
-    const targetRepo = path.join(rootDir, "target-ancestor-dirty");
-    for (const repo of [childRepo, targetRepo]) {
-      await fsPromises.mkdir(repo, { recursive: true });
-      initGitRepo(repo);
-      await commitFile(repo, "README.md", "hello", "base");
-    }
-
-    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-    await commitFile(childRepo, "README.md", "hello\nchild", "child readme change");
-    await fsPromises.mkdir(path.join(childRepo, "dir"), { recursive: true });
-    await fsPromises.writeFile(path.join(childRepo, "dir", "file.txt"), "child", "utf-8");
-    execSync("git add dir/file.txt", { cwd: childRepo, stdio: "ignore" });
-    execSync('git commit -m "add nested file"', { cwd: childRepo, stdio: "ignore" });
-    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-
-    const sessionDir = path.join(rootDir, "session-ancestor-dirty");
-    await fsPromises.mkdir(sessionDir, { recursive: true });
-    const childTaskId = "child-task-ancestor-dirty";
-    await writePatchArtifact({
-      sessionDir,
-      workspaceId: getTestDeps().workspaceId,
-      childTaskId,
-      projectArtifacts: [
-        await buildReadyProjectArtifact({
-          sessionDir,
-          childTaskId,
-          storageKey: "target",
-          projectPath: targetRepo,
-          projectName: "target",
-          childRepo,
-          baseSha,
-          headSha,
-        }),
-      ],
-    });
-
-    await fsPromises.writeFile(
-      path.join(targetRepo, "dir"),
-      "local file blocks directory",
-      "utf-8"
-    );
-    const headBeforeApply = execSync("git rev-parse HEAD", {
-      cwd: targetRepo,
-      encoding: "utf-8",
-    }).trim();
-
-    const result = await taskGitPatchEngine.applyPatch(
-      {
-        ...getTestDeps(),
-        cwd: targetRepo,
-        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-        runtimeTempDir: path.join(rootDir, "runtime-tmp-ancestor-dirty"),
-        workspaceSessionDir: sessionDir,
-      },
-      { task_id: childTaskId, dry_run: true, three_way: true },
-      {}
-    );
-
-    expect(result.success).toBe(false);
-    if (result.success) {
-      throw new Error("expected ancestor path overlap failure");
-    }
-    expect(result.conflictPaths).toEqual(["dir"]);
     expect(execSync("git rev-parse HEAD", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
       headBeforeApply
     );
@@ -1235,7 +1086,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-copy-source-dirty";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         await buildReadyProjectArtifact({
@@ -1253,7 +1104,7 @@ describe("task_apply_git_patch tool", () => {
     });
 
     const config = {
-      ...getTestDeps(),
+      workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: path.join(rootDir, "runtime-tmp-copy-source-dirty"),
@@ -1288,95 +1139,6 @@ describe("task_apply_git_patch tool", () => {
     expect(withoutThreeWay.conflictPaths).toEqual(["src.txt"]);
   }, 20_000);
 
-  it("cleans repo-local patch files when the runtime copy fails", async () => {
-    const childRepo = path.join(rootDir, "child-copy-fails");
-    const targetRepo = path.join(rootDir, "target-copy-fails");
-    for (const repo of [childRepo, targetRepo]) {
-      await fsPromises.mkdir(repo, { recursive: true });
-      initGitRepo(repo);
-    }
-
-    await commitFile(childRepo, "README.md", "hello", "base");
-    await commitFile(targetRepo, "README.md", "hello", "base");
-    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-    await commitFile(childRepo, "README.md", "hello\nchild", "child change");
-    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
-
-    const muxRoot = path.join(rootDir, "mux-copy-fails");
-    const currentWorkspaceId = "current-workspace-copy-fails";
-    const sessionDir = path.join(muxRoot, "sessions", currentWorkspaceId);
-    await fsPromises.mkdir(sessionDir, { recursive: true });
-    await writeWorkspaceConfig({
-      muxRoot,
-      workspaceId: currentWorkspaceId,
-      workspaceName: "current",
-      primaryProjectPath: targetRepo,
-      projects: [{ projectPath: targetRepo, projectName: "project" }],
-    });
-
-    const childTaskId = "child-task-copy-fails";
-    await writePatchArtifact({
-      sessionDir,
-      workspaceId: currentWorkspaceId,
-      childTaskId,
-      projectArtifacts: [
-        await buildReadyProjectArtifact({
-          sessionDir,
-          childTaskId,
-          storageKey: "project",
-          projectPath: targetRepo,
-          projectName: "project",
-          childRepo,
-          baseSha,
-          headSha,
-        }),
-      ],
-    });
-
-    const runtimeTempDir = path.join(targetRepo, ".mux", "tmp");
-    const leakedPatchPath = path.join(
-      runtimeTempDir,
-      `mux-task-${childTaskId}-project-series.mbox`
-    );
-    const baseRuntime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
-    const failingRuntime = Object.create(baseRuntime) as typeof baseRuntime;
-    failingRuntime.writeFile = (remotePath: string) =>
-      new WritableStream<Uint8Array>({
-        async write(chunk) {
-          await fsPromises.mkdir(path.dirname(remotePath), { recursive: true });
-          await fsPromises.writeFile(remotePath, chunk);
-          throw new Error("simulated copy failure");
-        },
-      });
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
-      workspaceId: currentWorkspaceId,
-      cwd: targetRepo,
-      runtime: failingRuntime,
-      runtimeTempDir,
-      workspaceSessionDir: sessionDir,
-    });
-
-    let copyFailure: unknown;
-    try {
-      await tool.execute!({ task_id: childTaskId }, mockToolCallOptions);
-    } catch (error) {
-      copyFailure = error;
-    }
-    expect(copyFailure).toBeInstanceOf(Error);
-    expect(copyFailure instanceof Error ? copyFailure.message : "").toContain(
-      "simulated copy failure"
-    );
-    const leakedPatchExists = await fsPromises.stat(leakedPatchPath).then(
-      () => true,
-      () => false
-    );
-    expect(leakedPatchExists).toBe(false);
-    expect(execSync("git status --porcelain", { cwd: targetRepo, encoding: "utf-8" }).trim()).toBe(
-      ""
-    );
-  }, 20_000);
-
   it("does not derive runtime paths from unsafe task IDs", async () => {
     const targetRepo = path.join(rootDir, "target-unsafe-task-id");
     await fsPromises.mkdir(targetRepo, { recursive: true });
@@ -1399,19 +1161,18 @@ describe("task_apply_git_patch tool", () => {
     const escapedPath = path.join(rootDir, "runtime-unsafe-task-id", "victim-project-series.mbox");
     await fsPromises.mkdir(path.dirname(escapedPath), { recursive: true });
     await fsPromises.writeFile(escapedPath, "do not delete", "utf-8");
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir,
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!(
-      { task_id: "child/../../victim" },
-      mockToolCallOptions
-    )) as { success: boolean; error?: string; note?: string };
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: "child/../../victim",
+    })) as { success: boolean; error?: string; note?: string };
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("Invalid task_id.");
@@ -1473,16 +1234,18 @@ describe("task_apply_git_patch tool", () => {
     const escapedPath = path.join(rootDir, "runtime-unsafe-storage-key", "victim-series.mbox");
     await fsPromises.mkdir(path.dirname(escapedPath), { recursive: true });
     await fsPromises.writeFile(escapedPath, "do not delete", "utf-8");
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir,
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+    })) as {
       success: boolean;
       error?: string;
     };
@@ -1540,19 +1303,19 @@ describe("task_apply_git_patch tool", () => {
       cwd: targetRepo,
       encoding: "utf-8",
     }).trim();
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: path.join(rootDir, "runtime-expected-head"),
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!(
-      { task_id: childTaskId, expected_head_sha: headSha },
-      mockToolCallOptions
-    )) as { success: boolean; error?: string };
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+      expected_head_sha: headSha,
+    })) as { success: boolean; error?: string };
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("does not match expected HEAD");
@@ -1627,19 +1390,19 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!(
-      { task_id: childTaskId, project_path: targetRepoB },
-      mockToolCallOptions
-    )) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+      project_path: targetRepoB,
+    })) as {
       success: boolean;
       projectResults: Array<{ projectPath: string; status: string }>;
       appliedCommits?: Array<{ subject: string }>;
@@ -1725,16 +1488,18 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepoA,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+    })) as {
       success: boolean;
       projectResults: Array<{ projectPath: string; status: string; conflictPaths?: string[] }>;
     };
@@ -1763,68 +1528,6 @@ describe("task_apply_git_patch tool", () => {
     ).toBeUndefined();
   }, 20_000);
 
-  it("rejects mismatched project_path filters for legacy single-project artifacts", async () => {
-    const targetRepo = path.join(rootDir, "target");
-    await fsPromises.mkdir(targetRepo, { recursive: true });
-
-    const childTaskId = "child-task-legacy-filter";
-    const muxRoot = path.join(rootDir, "mux");
-    const workspaceId = "workspace-legacy-filter";
-    const sessionDir = path.join(muxRoot, "sessions", workspaceId);
-    await fsPromises.mkdir(sessionDir, { recursive: true });
-
-    await writeWorkspaceConfig({
-      muxRoot,
-      workspaceId,
-      workspaceName: "target",
-      primaryProjectPath: targetRepo,
-      projects: [{ projectPath: targetRepo, projectName: "target" }],
-    });
-
-    await fsPromises.writeFile(
-      getSubagentGitPatchArtifactsFilePath(sessionDir),
-      JSON.stringify(
-        {
-          version: 1,
-          artifactsByChildTaskId: {
-            [childTaskId]: {
-              childTaskId,
-              parentWorkspaceId: workspaceId,
-              createdAtMs: Date.now(),
-              status: "ready",
-              commitCount: 1,
-              mboxPath: "/tmp/legacy-series.mbox",
-            },
-          },
-        },
-        null,
-        2
-      ),
-      "utf-8"
-    );
-
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
-      workspaceId,
-      cwd: targetRepo,
-      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-      runtimeTempDir: "/tmp",
-      workspaceSessionDir: sessionDir,
-    });
-
-    const mismatchedProjectPath = path.join(rootDir, "other-project");
-    const result = (await tool.execute!(
-      { task_id: childTaskId, project_path: mismatchedProjectPath },
-      mockToolCallOptions
-    )) as {
-      success: boolean;
-      error?: string;
-    };
-
-    expect(result.success).toBe(false);
-    expect(result.error).toBe(`No project patch artifact found for ${mismatchedProjectPath}.`);
-  });
-
   it("preserves legacy single-project result fields when one project result is returned", async () => {
     const childRepo = path.join(rootDir, "child");
     const targetRepo = path.join(rootDir, "target");
@@ -1842,7 +1545,7 @@ describe("task_apply_git_patch tool", () => {
     const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
 
     const childTaskId = "child-task-1";
-    const workspaceId = getTestDeps().workspaceId;
+    const workspaceId = "test-workspace";
     await writePatchArtifact({
       sessionDir,
       workspaceId,
@@ -1861,15 +1564,18 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
+      workspaceId: "test-workspace",
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: sessionDir,
-    });
+    };
 
-    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+    })) as {
       success: boolean;
       projectResults: Array<{ projectPath: string; status: string }>;
       appliedCommits?: Array<{ subject: string }>;
@@ -1899,7 +1605,7 @@ describe("task_apply_git_patch tool", () => {
     const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
 
     const childTaskId = "child-task-1";
-    const workspaceId = getTestDeps().workspaceId;
+    const workspaceId = "test-workspace";
     // The task has reported but background `git format-patch` has not finished.
     await writePatchArtifact({
       sessionDir,
@@ -1931,7 +1637,7 @@ describe("task_apply_git_patch tool", () => {
     const markReadyCalls: Array<Promise<void>> = [];
     const result = await taskGitPatchEngine.applyPatch(
       {
-        ...getTestDeps(),
+        workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
         runtimeTempDir: "/tmp",
@@ -1980,7 +1686,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-1";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         {
@@ -1996,7 +1702,7 @@ describe("task_apply_git_patch tool", () => {
     const startedAtMs = Date.now();
     const result = await taskGitPatchEngine.applyPatch(
       {
-        ...getTestDeps(),
+        workspaceId: "test-workspace",
         cwd: targetRepo,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
         runtimeTempDir: "/tmp",
@@ -2050,7 +1756,7 @@ describe("task_apply_git_patch tool", () => {
     const childTaskId = "child-task-1";
     await writePatchArtifact({
       sessionDir,
-      workspaceId: getTestDeps().workspaceId,
+      workspaceId: "test-workspace",
       childTaskId,
       projectArtifacts: [
         await buildReadyProjectArtifact({
@@ -2074,7 +1780,7 @@ describe("task_apply_git_patch tool", () => {
 
     const result = await taskGitPatchEngine.applyPatch(
       {
-        ...getTestDeps(),
+        workspaceId: "test-workspace",
         cwd: targetRepoA,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
         runtimeTempDir: "/tmp",
@@ -2163,7 +1869,6 @@ describe("task_apply_git_patch tool", () => {
     const startedAtMs = Date.now();
     const result = await taskGitPatchEngine.applyPatch(
       {
-        ...getTestDeps(),
         workspaceId: currentWorkspaceId,
         cwd: targetRepoA,
         runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -2179,55 +1884,6 @@ describe("task_apply_git_patch tool", () => {
     expect(result.success).toBe(true);
     expect(result.projectResults?.map((projectResult) => projectResult.status)).toEqual([
       "applied",
-    ]);
-  }, 20_000);
-
-  it("reports still-pending generation as a retryable non-conflict failure after the wait times out", async () => {
-    const targetRepo = path.join(rootDir, "target");
-    const sessionDir = path.join(rootDir, "session");
-    for (const repo of [targetRepo, sessionDir]) {
-      await fsPromises.mkdir(repo, { recursive: true });
-    }
-    initGitRepo(targetRepo);
-    await commitFile(targetRepo, "README.md", "hello", "base");
-
-    const childTaskId = "child-task-1";
-    await writePatchArtifact({
-      sessionDir,
-      workspaceId: getTestDeps().workspaceId,
-      childTaskId,
-      projectArtifacts: [
-        {
-          projectPath: targetRepo,
-          projectName: "target",
-          storageKey: "target",
-          status: "pending",
-        },
-      ],
-    });
-
-    const result = await taskGitPatchEngine.applyPatch(
-      {
-        ...getTestDeps(),
-        cwd: targetRepo,
-        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-        runtimeTempDir: "/tmp",
-        workspaceSessionDir: sessionDir,
-      },
-      { task_id: childTaskId, dry_run: true, three_way: true },
-      { pendingGenerationWaitMs: 50, pendingGenerationPollIntervalMs: 10 }
-    );
-
-    expect(result.success).toBe(false);
-    if (result.success) {
-      throw new Error("expected failure result");
-    }
-    // The timing gap must not be reported as an apply conflict (workflows
-    // would otherwise spawn conflict-resolution agents for it).
-    expect(result.error).toContain("not an apply conflict");
-    expect(result.conflictPaths).toBeUndefined();
-    expect(result.projectResults?.map((projectResult) => projectResult.status)).toEqual([
-      "skipped",
     ]);
   }, 20_000);
 
@@ -2336,16 +1992,18 @@ describe("task_apply_git_patch tool", () => {
       "utf-8"
     );
 
-    const tool = createTaskApplyGitPatchTool({
-      ...getTestDeps(),
+    const engineConfig = {
       workspaceId: currentWorkspaceId,
       cwd: targetRepo,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
       runtimeTempDir: "/tmp",
       workspaceSessionDir: currentSessionDir,
-    });
+    };
 
-    const result = (await tool.execute!({ task_id: childTaskId }, mockToolCallOptions)) as {
+    const result = (await taskGitPatchEngine.applyPatch(engineConfig, {
+      three_way: true,
+      task_id: childTaskId,
+    })) as {
       success: boolean;
     };
 

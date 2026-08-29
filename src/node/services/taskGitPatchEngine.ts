@@ -350,18 +350,9 @@ async function findPatch(params: {
   workspaceSessionDir: string;
   childTaskId: string;
 }): Promise<GitPatchArtifactLookup | null> {
-  assert(
-    params.workspaceId.length > 0,
-    "findGitPatchArtifactInWorkspaceOrAncestors: workspaceId must be non-empty"
-  );
-  assert(
-    params.workspaceSessionDir.length > 0,
-    "findGitPatchArtifactInWorkspaceOrAncestors: workspaceSessionDir must be non-empty"
-  );
-  assert(
-    params.childTaskId.length > 0,
-    "findGitPatchArtifactInWorkspaceOrAncestors: childTaskId must be non-empty"
-  );
+  assert(params.workspaceId.length > 0, "findPatch: workspaceId must be non-empty");
+  assert(params.workspaceSessionDir.length > 0, "findPatch: workspaceSessionDir must be non-empty");
+  assert(params.childTaskId.length > 0, "findPatch: childTaskId must be non-empty");
 
   const direct = await readSubagentGitPatchArtifact(params.workspaceSessionDir, params.childTaskId);
   if (direct) {
@@ -512,7 +503,7 @@ function listRelevantProjectArtifacts(
 
 // Unlike the shared sleepWithAbort in @/node/utils/abort (which REJECTS on
 // abort), this helper RESOLVES on abort so the wait loop can fall through to a
-// structured tool result instead of throwing out of applyTaskGitPatchArtifact.
+// structured tool result instead of throwing out of applyPatch.
 async function sleepResolvingOnAbort(delayMs: number, abortSignal?: AbortSignal): Promise<void> {
   assert(delayMs > 0, "sleepResolvingOnAbort: delayMs must be positive");
   if (abortSignal?.aborted === true) {
