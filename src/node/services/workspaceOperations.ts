@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import type { z } from "zod";
-import * as schemas from "@/common/orpc/schemas";
+import type * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { RuntimeConfig } from "@/common/types/runtime";
