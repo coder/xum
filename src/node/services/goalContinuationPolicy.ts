@@ -1,32 +1,40 @@
 import type { GoalRecordV1 } from "@/common/types/goal";
+import { hasGoalBudgetLimit, normalizeGoalBudgetCents } from "@/common/utils/goals/budgetPricing";
 
-const MICRO_CENTS_PER_CENT = 1_000_000;
-const _SKIP_REASONS = [
-  "not_registered",
-  "no_pending_candidate",
-  "workspace_not_found",
-  "archived",
-  "transcript_only",
-  "initializing",
-  "incompatible_runtime",
-  "child_workspace",
-  "active_descendant_tasks",
-  "currently_streaming",
-  "queued_user_input",
-  "pending_follow_up",
-  "plan_mode",
-  "compact_mode",
-  "user_stop",
-  "goal_missing",
-  "goal_mismatch",
-  "goal_not_active",
-  "requires_ack",
-  "budget_wrapup_already_fired",
-  "budget_wrapup_suppressed",
-  "cooldown",
-] as const;
+export const MICRO_CENTS_PER_CENT = 1_000_000;
 
-export type GoalContinuationSkipReason = (typeof _SKIP_REASONS)[number];
+/**
+ * Returns the goal's accumulated cost in micro-cents, falling back to the
+ * coarser `costCents` field for goals persisted before micro-cent tracking
+ * was added.
+ */
+export function getGoalCostMicroCents(goal: GoalRecordV1): number {
+  return goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
+}
+
+export type GoalContinuationSkipReason =
+  | "not_registered"
+  | "no_pending_candidate"
+  | "workspace_not_found"
+  | "archived"
+  | "transcript_only"
+  | "initializing"
+  | "incompatible_runtime"
+  | "child_workspace"
+  | "active_descendant_tasks"
+  | "currently_streaming"
+  | "queued_user_input"
+  | "pending_follow_up"
+  | "plan_mode"
+  | "compact_mode"
+  | "user_stop"
+  | "goal_missing"
+  | "goal_mismatch"
+  | "goal_not_active"
+  | "requires_ack"
+  | "budget_wrapup_already_fired"
+  | "budget_wrapup_suppressed"
+  | "cooldown";
 export type GoalStreamOriginKind = "goal_continuation" | "goal_budget_limit" | "user" | "other";
 export type GoalContinuationDecision =
   | { kind: "continue"; mode: "continuation" | "budget_wrapup" }
@@ -66,6 +74,13 @@ export interface GoalContinuationPolicyState {
   allowUserOriginBudgetWrapup: boolean;
 }
 
+/**
+ * Staged input for `evaluateGoalContinuationBeforeGoal`: the shell gathers
+ * I/O progressively and an absent (undefined) field means "not gathered yet",
+ * so evaluation stops there with null. This keeps the pre-extraction I/O
+ * gating (e.g. no goal-file reads while the workspace is busy) while every
+ * decision branch stays pure.
+ */
 export type GoalContinuationPolicyProbe = Pick<
   GoalContinuationPolicyState,
   "nowMs" | "bridgeRegistered" | "candidate"
@@ -176,12 +191,11 @@ export function evaluateGoalContinuation(
 }
 
 export function hasReachedGoalBudgetLimit(goal: GoalRecordV1): boolean {
-  const cost = goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
-  return (
-    goal.budgetCents != null &&
-    goal.budgetCents > 0 &&
-    cost >= goal.budgetCents * MICRO_CENTS_PER_CENT
-  );
+  const { budgetCents } = goal;
+  if (budgetCents == null || !hasGoalBudgetLimit(budgetCents)) {
+    return false;
+  }
+  return getGoalCostMicroCents(goal) >= budgetCents * MICRO_CENTS_PER_CENT;
 }
 
 export function hasReachedGoalTurnLimit(goal: GoalRecordV1): boolean {
@@ -203,7 +217,7 @@ export function applyBudgetDrivenStatus(
   goal: GoalRecordV1,
   options: { originKind?: GoalStreamOriginKind; nowMs: number }
 ): GoalRecordV1 {
-  const budgetCents = goal.budgetCents != null && goal.budgetCents > 0 ? goal.budgetCents : null;
+  const budgetCents = normalizeGoalBudgetCents(goal.budgetCents);
   const normalized =
     budgetCents === goal.budgetCents ? goal : { ...goal, budgetCents, updatedAtMs: options.nowMs };
   const reachedLimit = hasReachedAnyGoalLimit(normalized);

@@ -57,9 +57,11 @@ import {
   applyBudgetDrivenStatus,
   evaluateGoalContinuationBeforeGoal,
   evaluateGoalContinuationGoal,
+  getGoalCostMicroCents,
   hasReachedGoalBudgetLimit,
   hasReachedGoalTurnLimit,
   isBudgetWrapupEligibleOrigin,
+  MICRO_CENTS_PER_CENT,
   type GoalContinuationDecision,
   type GoalContinuationPolicyProbe,
   type GoalContinuationSkipReason,
@@ -84,19 +86,9 @@ const GOAL_HISTORY_FILE = "goal-history.jsonl";
 // generous cap still keeps the response payload bounded; older entries remain
 // on disk in the JSONL but are simply not surfaced to the UI.
 const GOAL_HISTORY_RENDER_CAP = 200;
-const MICRO_CENTS_PER_CENT = 1_000_000;
 
 function costUsdToMicroCents(costUsd: number | null | undefined): number {
   return Math.max(0, Math.round((costUsd ?? 0) * 100 * MICRO_CENTS_PER_CENT));
-}
-
-/**
- * Returns the goal's accumulated cost in micro-cents, falling back to the
- * coarser `costCents` field for goals persisted before micro-cent tracking
- * was added.
- */
-function getGoalCostMicroCents(goal: GoalRecordV1): number {
-  return goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
 }
 
 type GoalLifecycleEvent =
