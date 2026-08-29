@@ -1,6 +1,12 @@
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { IncomingHttpHeaders } from "http";
-import type { Config, FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
+import type {
+  Config,
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -56,6 +62,7 @@ import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenMa
 
 export interface ORPCContext {
   config: Config;
+  sessionLocator: WorkspaceSessionLocator;
   providersConfigStore: ProvidersConfigStore;
   secretsStore: SecretsStore;
   fileLeaseManager: FileLeaseManager;

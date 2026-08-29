@@ -5,7 +5,9 @@ import { EventEmitter } from "events";
 import writeFileAtomic from "write-file-atomic";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
-import { ProvidersConfigStore } from "./ProvidersConfigStore";
+import { ProvidersConfigStore } from "./providersConfigStore";
+import { FileLeaseManager } from "./fileLeaseManager";
+import { SecretsStore } from "./secretsStore";
 import { WorkspaceSessionLocator } from "./sessionLocator";
 import type { WorkspaceMetadata, FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Result } from "@/common/types/result";
@@ -84,9 +86,9 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig, CanonicalProvidersConfig };
-export { FileLeaseManager } from "./FileLeaseManager";
-export { ProvidersConfigStore, type ProvidersConfig } from "./ProvidersConfigStore";
-export { SecretsStore } from "./SecretsStore";
+export { FileLeaseManager } from "./fileLeaseManager";
+export { ProvidersConfigStore, type ProvidersConfig } from "./providersConfigStore";
+export { SecretsStore } from "./secretsStore";
 export { WorkspaceSessionLocator } from "./sessionLocator";
 
 /** True only for fs errors whose errno code is ENOENT (genuinely missing path). */
@@ -3498,5 +3500,22 @@ export class Config {
   }
 }
 
-// Default instance for application use
-export const defaultConfig = new Config();
+export interface ConfigStores {
+  config: Config;
+  sessionLocator: WorkspaceSessionLocator;
+  providersConfig: ProvidersConfigStore;
+  secrets: SecretsStore;
+  fileLeases: FileLeaseManager;
+}
+
+export function createConfigStores(rootDir?: string): ConfigStores {
+  const sessionLocator = new WorkspaceSessionLocator(rootDir);
+  const providersConfig = new ProvidersConfigStore(sessionLocator.rootDir);
+  const secrets = new SecretsStore(sessionLocator.rootDir);
+  const fileLeases = new FileLeaseManager(sessionLocator.rootDir);
+  const config = new Config(sessionLocator.rootDir, providersConfig, sessionLocator);
+  return { config, sessionLocator, providersConfig, secrets, fileLeases };
+}
+
+const defaultStores = createConfigStores();
+export const defaultConfig = defaultStores.config;

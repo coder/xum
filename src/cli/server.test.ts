@@ -21,7 +21,7 @@ import type { BrowserWindow, WebContents } from "electron";
 
 import { type AppRouter } from "@/node/orpc/router";
 import type { ORPCContext } from "@/node/orpc/context";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
@@ -43,7 +43,7 @@ interface TestServerHandle {
 async function createTestServer(): Promise<TestServerHandle> {
   // Create temp dir for config
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-server-test-"));
-  const config = new Config(tempDir);
+  const stores = createConfigStores(tempDir);
 
   // Mock BrowserWindow
   const mockWindow: BrowserWindow = {
@@ -56,7 +56,7 @@ async function createTestServer(): Promise<TestServerHandle> {
   } as unknown as BrowserWindow;
 
   // Initialize services
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   await services.initialize();
   services.windowService.setMainWindow(mockWindow);
 

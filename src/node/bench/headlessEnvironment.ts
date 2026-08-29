@@ -3,7 +3,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import createIPCMock from "electron-mock-ipc";
 import type { BrowserWindow, IpcMain as ElectronIpcMain, WebContents } from "electron";
-import { Config } from "@/node/config";
+import { createConfigStores, type Config } from "@/node/config";
 import { setOpenSSHHostKeyPolicyMode } from "@/node/runtime/sshConnectionPool";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 
@@ -98,7 +98,8 @@ export async function createHeadlessEnvironment(
 ): Promise<HeadlessEnvironment> {
   const { rootDir, dispose: disposeRootDir } = await establishRootDir(options.rootDir);
 
-  const config = new Config(rootDir);
+  const stores = createConfigStores(rootDir);
+  const config = stores.config;
 
   const { window: mockWindow, sentEvents } = createMockBrowserWindow();
 
@@ -107,7 +108,7 @@ export async function createHeadlessEnvironment(
   const mockIpcMainModule = mockedElectron.ipcMain;
   const mockIpcRendererModule = mockedElectron.ipcRenderer;
 
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   // Headless bench environment has no interactive host-key dialog
   setOpenSSHHostKeyPolicyMode("headless-fallback");
   await services.initialize();

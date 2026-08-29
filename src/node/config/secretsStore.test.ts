@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { secretsToRecord } from "@/common/types/secrets";
-import { SecretsStore } from "./SecretsStore";
+import { SecretsStore } from "./secretsStore";
 
 describe("SecretsStore", () => {
   let tempDir: string;

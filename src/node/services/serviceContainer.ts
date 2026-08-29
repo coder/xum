@@ -2,7 +2,7 @@ import * as path from "path";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { log } from "@/node/services/log";
-import type { Config } from "@/node/config";
+import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { createCoreServices, type CoreServices } from "@/node/services/coreServices";
 import { PTYService } from "@/node/services/ptyService";
@@ -90,6 +90,7 @@ import type { ORPCContext } from "@/node/orpc/context";
 export class ServiceContainer {
   public readonly workflowRuntimeFactory = new QuickJSRuntimeFactory();
   public readonly config: Config;
+  public readonly sessionLocator: WorkspaceSessionLocator;
   public readonly providersConfigStore: ProvidersConfigStore;
   public readonly secretsStore: SecretsStore;
   public readonly fileLeaseManager: FileLeaseManager;
@@ -155,11 +156,13 @@ export class ServiceContainer {
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
 
-  constructor(config: Config) {
+  constructor(stores: ConfigStores) {
+    const config = stores.config;
     this.config = config;
-    this.providersConfigStore = new ProvidersConfigStore(config.rootDir);
-    this.secretsStore = new SecretsStore(config.rootDir);
-    this.fileLeaseManager = new FileLeaseManager(config.rootDir);
+    this.sessionLocator = stores.sessionLocator;
+    this.providersConfigStore = stores.providersConfig;
+    this.secretsStore = stores.secrets;
+    this.fileLeaseManager = stores.fileLeases;
 
     // Cross-cutting services: created first so they can be passed to core
     // services via constructor params (no setter injection needed).
@@ -186,6 +189,7 @@ export class ServiceContainer {
 
     const core = createCoreServices({
       config,
+      sessionLocator: this.sessionLocator,
       providersConfigStore: this.providersConfigStore,
       secretsStore: this.secretsStore,
       fileLeaseManager: this.fileLeaseManager,
@@ -647,6 +651,7 @@ export class ServiceContainer {
     return {
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
+      sessionLocator: this.sessionLocator,
       providersConfigStore: this.providersConfigStore,
       secretsStore: this.secretsStore,
       fileLeaseManager: this.fileLeaseManager,

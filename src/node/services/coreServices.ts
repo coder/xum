@@ -5,7 +5,12 @@
 import * as os from "os";
 import * as path from "path";
 import type { Config } from "@/node/config";
-import { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
+import {
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+} from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
@@ -47,6 +52,7 @@ import type { DevToolsService } from "@/node/services/devToolsService";
 
 export interface CoreServicesOptions {
   config: Config;
+  sessionLocator?: WorkspaceSessionLocator;
   providersConfigStore?: ProvidersConfigStore;
   secretsStore?: SecretsStore;
   fileLeaseManager?: FileLeaseManager;
@@ -94,7 +100,8 @@ export interface CoreServices {
 export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   const { config, extensionMetadataPath } = opts;
 
-  const historyService = new HistoryService(config);
+  const sessionLocator = opts.sessionLocator ?? new WorkspaceSessionLocator(config.rootDir);
+  const historyService = new HistoryService(sessionLocator);
   const initStateManager = new InitStateManager(config);
   const providersConfigStore =
     opts.providersConfigStore ?? new ProvidersConfigStore(config.rootDir);

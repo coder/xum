@@ -3,7 +3,7 @@
  * Uses ServerService for server lifecycle management.
  */
 import "source-map-support/register";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import { setOpenSSHHostKeyPolicyMode } from "@/node/runtime/sshConnectionPool";
 import { cleanupObsoleteXumBinArtifacts, getXumHome } from "@/common/constants/paths";
@@ -127,8 +127,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const config = new Config();
-  const serviceContainer = new ServiceContainer(config);
+  const stores = createConfigStores();
+  const config = stores.config;
+  const serviceContainer = new ServiceContainer(stores);
   // Headless server has no interactive host-key dialog
   setOpenSSHHostKeyPolicyMode("headless-fallback");
   await serviceContainer.initialize();

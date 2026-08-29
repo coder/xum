@@ -22,7 +22,7 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { Config, FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
+import { Config, ProvidersConfigStore, SecretsStore, createConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
@@ -337,13 +337,15 @@ async function createWorkflowContext(options: {
   let realProviderService: ProviderService | undefined;
   let policyService: PolicyService | undefined;
   try {
-    const realConfig = new Config();
-    const config = new Config(tempDir.path);
+    const realStores = createConfigStores();
+    const realConfig = realStores.config;
+    const runStores = createConfigStores(tempDir.path);
+    const config = runStores.config;
     await copyPersistentConfig(realConfig, config);
 
-    const realProvidersStore = new ProvidersConfigStore(realConfig.rootDir);
-    const realFileLeaseManager = new FileLeaseManager(realConfig.rootDir);
-    const runProvidersStore = new ProvidersConfigStore(config.rootDir);
+    const realProvidersStore = realStores.providersConfig;
+    const realFileLeaseManager = realStores.fileLeases;
+    const runProvidersStore = runStores.providersConfig;
     const existingProviders = realProvidersStore.loadProvidersConfig();
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
@@ -367,6 +369,10 @@ async function createWorkflowContext(options: {
 
     services = createCoreServices({
       config,
+      sessionLocator: runStores.sessionLocator,
+      providersConfigStore: runStores.providersConfig,
+      secretsStore: runStores.secrets,
+      fileLeaseManager: runStores.fileLeases,
       policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,

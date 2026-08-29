@@ -14,7 +14,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { Config, FileLeaseManager, ProvidersConfigStore, SecretsStore } from "../node/config";
+import { createConfigStores } from "../node/config";
 import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
@@ -501,7 +501,8 @@ async function main(): Promise<number> {
   using tempDir = new DisposableTempDir("mux-run");
 
   // Read credentials from the real config, then copy them into the private run config.
-  const realConfig = new Config();
+  const realStores = createConfigStores();
+  const realConfig = realStores.config;
 
   // Session telemetry uses the private root by default. Benchmark/CI harnesses can pin it
   // to collect chat.jsonl and session-usage.json after the process exits.
@@ -513,11 +514,13 @@ async function main(): Promise<number> {
     return 1;
   }
   await using preparedSessionRoot = sessionRootOverride;
-  const config = await createRunConfig(tempDir.path, preparedSessionRoot);
+  const preparedConfig = await createRunConfig(tempDir.path, preparedSessionRoot);
+  const runStores = createConfigStores(preparedConfig.rootDir);
+  const config = runStores.config;
 
   // Copy providers and secrets from real config to ephemeral config
-  const realProvidersStore = new ProvidersConfigStore(realConfig.rootDir);
-  const runProvidersStore = new ProvidersConfigStore(config.rootDir);
+  const realProvidersStore = realStores.providersConfig;
+  const runProvidersStore = runStores.providersConfig;
   const existingProviders = realProvidersStore.loadProvidersConfig();
   const providersFile = path.join(config.rootDir, "providers.jsonc");
   await replacePrivateRunConfigFile(
@@ -528,7 +531,7 @@ async function main(): Promise<number> {
   );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
-  const existingSecrets = new SecretsStore(realConfig.rootDir).loadSecretsConfig();
+  const existingSecrets = realStores.secrets.loadSecretsConfig();
   const secretsFile = path.join(config.rootDir, "secrets.json");
   await replacePrivateRunConfigFile(
     secretsFile,
@@ -657,6 +660,10 @@ async function main(): Promise<number> {
     turnRequestBuilderBindings,
   } = createCoreServices({
     config,
+    sessionLocator: runStores.sessionLocator,
+    providersConfigStore: runStores.providersConfig,
+    secretsStore: runStores.secrets,
+    fileLeaseManager: runStores.fileLeases,
     policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
@@ -685,7 +692,7 @@ async function main(): Promise<number> {
   // the refresh token on every use, so persisting rotations only to tempDir
   // would strand ~/.xum/providers.jsonc with a consumed (dead) refresh token
   // once this CLI session exits.
-  const realFileLeaseManager = new FileLeaseManager(realConfig.rootDir);
+  const realFileLeaseManager = realStores.fileLeases;
   const realProviderService = new ProviderService(
     realConfig,
     policyService,

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { FileLeaseManager } from "./FileLeaseManager";
+import { FileLeaseManager } from "./fileLeaseManager";
 
 describe("FileLeaseManager", () => {
   let tempDir: string;
