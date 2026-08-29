@@ -392,6 +392,7 @@ async function createWorkflowContext(options: {
       config,
       historyService: services.historyService,
       aiService: services.aiService,
+      streamManager: services.streamManager,
       initStateManager: services.initStateManager,
       backgroundProcessManager: services.backgroundProcessManager,
       workspaceGoalService: services.workspaceGoalService,

@@ -51,6 +51,7 @@ import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import type { StreamManager } from "./streamManager";
 import {
+  markProviderMetadataCostsIncluded,
   type ModelFallbackOptions,
   type StreamTextOnChunk,
   type TurnCompletion,
@@ -361,29 +362,6 @@ function mergeProviderExtrasUnderMux(
   return merged;
 }
 
-function markProviderMetadataCostsIncluded(
-  providerMetadata: Record<string, unknown> | undefined,
-  costsIncluded: boolean | undefined
-): Record<string, unknown> | undefined {
-  if (!costsIncluded) {
-    return providerMetadata;
-  }
-
-  const muxMetadata = providerMetadata?.mux;
-  const existingMux =
-    muxMetadata && typeof muxMetadata === "object"
-      ? (muxMetadata as Record<string, unknown>)
-      : undefined;
-
-  return {
-    ...(providerMetadata ?? {}),
-    mux: {
-      ...(existingMux ?? {}),
-      costsIncluded: true,
-    },
-  };
-}
-
 const WORKFLOW_CONTINUATION_RETRY_DELAY_MS = 1_000;
 const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 
@@ -462,7 +440,7 @@ function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
   return `${metadata.projectName}-${uniqueSuffix([metadata.projectPath])}`;
 }
 
-export interface WorkflowResultContinuationSender {
+interface WorkflowResultContinuationSender {
   isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
   sendMessage(
     workspaceId: string,
@@ -479,12 +457,12 @@ export interface WorkflowResultContinuationSender {
   ): Promise<Result<void, SendMessageError>>;
 }
 
-export interface TurnRequestBuildStartupState {
+interface TurnRequestBuildStartupState {
   pendingRunMetadataId: string | null;
   logSlowStreamStartup?: (details: Record<string, unknown>) => void;
 }
 
-export interface TurnRequestBuildContext {
+interface TurnRequestBuildContext {
   abortSignal: AbortSignal;
   syntheticMessageId: string;
   startTime: number;
@@ -493,7 +471,7 @@ export interface TurnRequestBuildContext {
   recordStartupPhaseTiming: (phase: string, phaseStartedAt: number) => void;
 }
 
-export type TurnRequestBuildOutcome =
+type TurnRequestBuildOutcome =
   | { type: "finished"; result: Result<TurnStreamHandle, SendMessageError> }
   | {
       type: "ready";
@@ -516,7 +494,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   desktopSessionManager?: DesktopSessionManager;
 }
 
-export interface TurnRequestBuilderDependencies {
+interface TurnRequestBuilderDependencies {
   config: Config;
   historyService: HistoryService;
   initStateManager: InitStateManager;
@@ -591,7 +569,7 @@ export interface PrepareModelAttemptOptions {
   recordStartupPhaseTiming?: (phase: string, phaseStartedAt: number) => void;
 }
 
-export interface PreparedModelAttempt {
+interface PreparedModelAttempt {
   providerOptions: Record<string, unknown>;
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
@@ -605,135 +583,6 @@ export interface PreparedModelAttempt {
 
 export class TurnRequestBuilder {
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
-
-  private get config(): Config {
-    return this.dependencies.config;
-  }
-  private get historyService(): HistoryService {
-    return this.dependencies.historyService;
-  }
-  private get initStateManager(): InitStateManager {
-    return this.dependencies.initStateManager;
-  }
-  private get providerService(): ProviderService {
-    return this.dependencies.providerService;
-  }
-  private get providerModelFactory(): ProviderModelFactory {
-    return this.dependencies.providerModelFactory;
-  }
-  private get streamManager(): StreamManager {
-    return this.dependencies.streamManager;
-  }
-  private get workspaceMcpOverridesService(): WorkspaceMcpOverridesService {
-    return this.dependencies.workspaceMcpOverridesService;
-  }
-  private get policyService(): PolicyService | undefined {
-    return this.dependencies.policyService;
-  }
-  private get telemetryService(): TelemetryService | undefined {
-    return this.dependencies.telemetryService;
-  }
-  private get backgroundProcessManager(): BackgroundProcessManager | undefined {
-    return this.dependencies.backgroundProcessManager;
-  }
-  private get sessionUsageService(): SessionUsageService | undefined {
-    return this.dependencies.sessionUsageService;
-  }
-  private get devToolsService(): DevToolsService | undefined {
-    return this.dependencies.devToolsService;
-  }
-  private get experimentsService(): ExperimentsService | undefined {
-    return this.dependencies.experimentsService;
-  }
-  private get lastLlmRequestByWorkspace(): Map<string, DebugLlmRequestSnapshot> {
-    return this.dependencies.lastLlmRequestByWorkspace;
-  }
-  private get mcpServerManager(): MCPServerManager | undefined {
-    return this.dependencies.bindings.mcpServerManager;
-  }
-  private get taskService(): TaskService | undefined {
-    return this.dependencies.bindings.taskService;
-  }
-  private get memoryService(): MemoryService | undefined {
-    return this.dependencies.bindings.memoryService;
-  }
-  private get timelineService(): ToolConfiguration["timelineService"] {
-    return this.dependencies.bindings.timelineService;
-  }
-  private get extraTools(): Record<string, Tool> | undefined {
-    return this.dependencies.bindings.extraTools;
-  }
-  private get onWorkflowRunStatusChanged():
-    | ((event: WorkflowRunStatusChangedEvent) => Promise<void> | void)
-    | undefined {
-    return this.dependencies.bindings.onWorkflowRunStatusChanged;
-  }
-  private get workflowResultContinuationSender(): WorkflowResultContinuationSender | undefined {
-    return this.dependencies.bindings.workflowResultContinuationSender;
-  }
-  private get workspaceHeartbeatService(): ToolConfiguration["workspaceHeartbeatService"] {
-    return this.dependencies.bindings.workspaceHeartbeatService;
-  }
-  private get analyticsService(): { executeRawQuery(sql: string): Promise<unknown> } | undefined {
-    return this.dependencies.bindings.analyticsService;
-  }
-  private get desktopSessionManager(): DesktopSessionManager | undefined {
-    return this.dependencies.bindings.desktopSessionManager;
-  }
-
-  private emit(event: string, ...args: unknown[]): boolean {
-    return this.dependencies.emit(event, ...args);
-  }
-  private createAbortedTurnHandle(messageId: string): TurnStreamHandle {
-    return this.dependencies.createAbortedTurnHandle(messageId);
-  }
-  private createSettledTurnHandle(messageId: string, completion: TurnCompletion): TurnStreamHandle {
-    return this.dependencies.createSettledTurnHandle(messageId, completion);
-  }
-  private getWorkspaceMetadata(workspaceId: string): Promise<Result<WorkspaceMetadata>> {
-    return this.dependencies.getWorkspaceMetadata(workspaceId);
-  }
-  private createWorkspaceRuntimeContext(workspaceId: string, metadata: WorkspaceMetadata) {
-    return this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
-  }
-  private isClaudeSkillsCompatEnabled(): boolean {
-    return this.dependencies.isClaudeSkillsCompatEnabled();
-  }
-  private isAgentPluginsEnabled(): boolean {
-    return this.dependencies.isAgentPluginsEnabled();
-  }
-  private wrapToolsForDelegation(
-    workspaceId: string,
-    tools: Record<string, Tool>,
-    delegatedToolNames?: string[]
-  ): Record<string, Tool> {
-    return this.dependencies.wrapToolsForDelegation(workspaceId, tools, delegatedToolNames);
-  }
-  private durableEventJournalFor(workspaceId: string): DurableEventJournal {
-    return this.dependencies.durableEventJournalFor(workspaceId);
-  }
-  private shouldAllowLegacyInvalidWorkflowAgentOutputSchema(
-    metadata: WorkspaceMetadata
-  ): Promise<boolean> {
-    return this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
-  }
-  private createModel(
-    modelString: string,
-    muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string; providersConfig?: ProvidersConfig }
-  ) {
-    return this.dependencies.createModel(modelString, muxProviderOptions, opts);
-  }
-  private isStreaming(workspaceId: string): boolean {
-    return this.dependencies.isStreaming(workspaceId);
-  }
-  private trackPendingDevToolsRunMetadata(
-    messageId: string,
-    workspaceId: string,
-    metadataId: string
-  ): void {
-    this.dependencies.trackPendingDevToolsRunMetadata(messageId, workspaceId, metadataId);
-  }
 
   private resolveOverridesIdentity(
     rawModelString: string,
@@ -778,7 +627,7 @@ export class TurnRequestBuilder {
       options.optionsModelString,
       options.effectiveThinkingLevel,
       options.providerRequestMessages,
-      (id) => this.streamManager.isResponseIdLost(id),
+      (id) => this.dependencies.streamManager.isResponseIdLost(id),
       options.muxProviderOptions,
       options.workspaceId,
       options.truncationMode,
@@ -804,7 +653,7 @@ export class TurnRequestBuilder {
     );
     const resolvedOverrides = resolveModelParameterOverrides(
       pinCoderInstanceRawProvidersConfig(
-        this.config.loadProvidersConfig(),
+        this.dependencies.config.loadProvidersConfig(),
         options.rawModelString,
         options.coderSelectedInstance
       ),
@@ -856,7 +705,7 @@ export class TurnRequestBuilder {
         options.optionsModelString,
         effective,
         options.providerRequestMessages,
-        (id) => this.streamManager.isResponseIdLost(id),
+        (id) => this.dependencies.streamManager.isResponseIdLost(id),
         options.muxProviderOptions,
         options.workspaceId,
         options.truncationMode,
@@ -923,7 +772,8 @@ export class TurnRequestBuilder {
     } = opts;
     const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
       experimentsFromOptions,
-      (experimentId) => this.experimentsService?.isExperimentEnabled(experimentId) === true
+      (experimentId) =>
+        this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
     );
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
@@ -933,7 +783,10 @@ export class TurnRequestBuilder {
     let pendingRunMetadataId: string | null = context.startupState.pendingRunMetadataId;
 
     const deleteAbortedPlaceholder = async (messageId: string): Promise<void> => {
-      const deleteResult = await this.historyService.deleteMessage(workspaceId, messageId);
+      const deleteResult = await this.dependencies.historyService.deleteMessage(
+        workspaceId,
+        messageId
+      );
       if (!deleteResult.success) {
         log.error(
           "Failed to delete aborted assistant placeholder (" +
@@ -1047,7 +900,7 @@ export class TurnRequestBuilder {
       }
 
       const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
-      const preliminaryProvidersConfig = this.providerService.getConfig();
+      const preliminaryProvidersConfig = this.dependencies.providerService.getConfig();
       const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
@@ -1067,7 +920,7 @@ export class TurnRequestBuilder {
           );
 
       const resolveAndCreateModelStartedAt = Date.now();
-      const resolved = await this.providerModelFactory.resolveAndCreateModel(
+      const resolved = await this.dependencies.providerModelFactory.resolveAndCreateModel(
         options.rawModelString,
         preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
@@ -1081,7 +934,7 @@ export class TurnRequestBuilder {
       }
 
       const providersConfig = pinCoderInstanceProvidersConfig(
-        this.providerService.getConfig(),
+        this.dependencies.providerService.getConfig(),
         options.rawModelString,
         resolved.data.coderSelectedInstance
       );
@@ -1159,7 +1012,6 @@ export class TurnRequestBuilder {
       capabilityModelString,
     } = modelResult.data;
 
-    // Dump original messages for debugging
     log.debug_obj(`${workspaceId}/1_original_messages.json`, messages);
 
     // Context Boundary request slicing happens before empty-assistant filtering so
@@ -1189,12 +1041,10 @@ export class TurnRequestBuilder {
     if (wireProviderName === "openai") {
       log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
     }
-    // Add [CONTINUE] sentinel to partial messages (for model context)
     const messagesWithSentinel = addInterruptedSentinel(providerRequestMessages);
 
-    // Get workspace metadata to retrieve workspace path
     const getWorkspaceMetadataStartedAt = Date.now();
-    const metadataResult = await this.getWorkspaceMetadata(workspaceId);
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
     recordStartupPhaseTiming("getWorkspaceMetadataMs", getWorkspaceMetadataStartedAt);
     if (!metadataResult.success) {
       return { type: "finished", result: Err({ type: "unknown", raw: metadataResult.error }) };
@@ -1202,8 +1052,8 @@ export class TurnRequestBuilder {
 
     const metadata = metadataResult.data;
 
-    if (this.policyService?.isEnforced()) {
-      if (!this.policyService.isRuntimeAllowed(metadata.runtimeConfig)) {
+    if (this.dependencies.policyService?.isEnforced()) {
+      if (!this.dependencies.policyService.isRuntimeAllowed(metadata.runtimeConfig)) {
         return {
           type: "finished",
           result: Err({
@@ -1277,7 +1127,7 @@ export class TurnRequestBuilder {
         detail: breadcrumb.detail,
         elapsedMs: Date.now() - startTime,
       });
-      this.emit("runtime-status", {
+      this.dependencies.emit("runtime-status", {
         type: "runtime-status",
         workspaceId,
         phase: breadcrumb.phase,
@@ -1287,7 +1137,10 @@ export class TurnRequestBuilder {
       });
     };
 
-    const runtimeContextResult = this.createWorkspaceRuntimeContext(workspaceId, metadata);
+    const runtimeContextResult = this.dependencies.createWorkspaceRuntimeContext(
+      workspaceId,
+      metadata
+    );
     if (!runtimeContextResult.success) {
       return { type: "finished", result: Err(runtimeContextResult.error) };
     }
@@ -1298,10 +1151,13 @@ export class TurnRequestBuilder {
     // (SSH/devcontainer may not be ready until init finishes pulling the container)
     emitStartupBreadcrumb("waiting_for_init");
     const waitForInitStartedAt = Date.now();
-    await this.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
+    await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
     recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
     if (combinedAbortSignal.aborted) {
-      return { type: "finished", result: Ok(this.createAbortedTurnHandle(syntheticMessageId)) };
+      return {
+        type: "finished",
+        result: Ok(this.dependencies.createAbortedTurnHandle(syntheticMessageId)),
+      };
     }
 
     // Verify runtime is actually reachable after init completes.
@@ -1314,7 +1170,7 @@ export class TurnRequestBuilder {
       signal: combinedAbortSignal,
       statusSink: (status) => {
         // Emit runtime-status events for frontend UX (StreamingBarrier)
-        this.emit("runtime-status", {
+        this.dependencies.emit("runtime-status", {
           type: "runtime-status",
           workspaceId,
           phase: status.phase,
@@ -1332,7 +1188,6 @@ export class TurnRequestBuilder {
       const runtimeLabel = runtimeType === "docker" ? "Container" : "Runtime";
       const errorMessage = readyResult.error || `${runtimeLabel} unavailable.`;
 
-      // Use the errorType from ensureReady result (runtime_not_ready vs runtime_start_failed)
       const errorType = readyResult.errorType;
 
       // Emit error event so frontend receives it via stream subscription.
@@ -1345,7 +1200,7 @@ export class TurnRequestBuilder {
         errorType,
         acpPromptId,
       });
-      this.emit("error", errorEvent);
+      this.dependencies.emit("error", errorEvent);
       onPreStartError?.(errorEvent);
 
       logSlowStreamStartup({
@@ -1372,31 +1227,37 @@ export class TurnRequestBuilder {
       ? await resolveMemoryContext(modelString, { includeHotMemories: false })
       : undefined;
 
-    // Resolve agent definition, compute effective mode & tool policy.
-    const cfg = this.config.loadConfigOrDefault();
+    const cfg = this.dependencies.config.loadConfigOrDefault();
     const advisorExperimentEnabled =
       experiments?.advisorTool ??
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL) ===
+        true;
     const dynamicWorkflowsExperimentEnabled =
       experiments?.dynamicWorkflows ??
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(
+        EXPERIMENT_IDS.DYNAMIC_WORKFLOWS
+      ) === true;
     const memoryExperimentEnabled =
       experiments?.memory ??
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
     const timelineExperimentEnabled =
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE) === true;
     const workspaceHeartbeatsExperimentEnabled =
       experiments?.workspaceHeartbeats ??
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(
+        EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
+      ) === true;
     const toolSearchExperimentEnabled =
       experiments?.toolSearch ??
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
+        true;
     const memoryHotSetExperimentEnabled =
-      this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true;
+      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) ===
+      true;
     // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
     // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
-    const claudeSkillsCompatExperimentEnabled = this.isClaudeSkillsCompatEnabled();
-    const agentPluginsExperimentEnabled = this.isAgentPluginsEnabled();
+    const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
+    const agentPluginsExperimentEnabled = this.dependencies.isAgentPluginsEnabled();
     // Once final tool policy keeps the memory tool, upgrade the index-only
     // memory context (resolved pre-policy with includeHotMemories: false) to
     // the token-budgeted hot block for the model that will actually stream.
@@ -1425,7 +1286,7 @@ export class TurnRequestBuilder {
       callerToolPolicy: toolPolicy,
       cfg,
       emitError: (event) => {
-        this.emit("error", event);
+        this.dependencies.emit("error", event);
         onPreStartError?.(event);
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
@@ -1450,7 +1311,7 @@ export class TurnRequestBuilder {
       effectiveToolPolicy,
     } = agentResult.data;
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
-    const projectTrusted = isWorkspaceProjectTrusted(this.config, metadata);
+    const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
     // projectAutomationDisabled: benchmark harnesses opt out of automatic
     // repo hook execution (tool_env/tool_pre/tool_post) while keeping
     // config trust for sub-agent delegation.
@@ -1486,8 +1347,9 @@ export class TurnRequestBuilder {
     let mcpOverrides: WorkspaceMCPOverrides | undefined;
     const loadWorkspaceMcpOverridesStartedAt = Date.now();
     try {
-      mcpOverrides = (await this.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId))
-        .overrides;
+      mcpOverrides = (
+        await this.dependencies.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)
+      ).overrides;
     } catch (error) {
       log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
         workspaceId,
@@ -1510,10 +1372,10 @@ export class TurnRequestBuilder {
     try {
       await agentPluginHookService.ensureWorkspaceHooks({
         workspaceId,
-        sessionDir: this.config.getSessionDir(workspaceId),
-        journal: this.durableEventJournalFor(workspaceId),
-        enabled: this.isAgentPluginsEnabled(),
-        xumHome: this.config.rootDir,
+        sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+        journal: this.dependencies.durableEventJournalFor(workspaceId),
+        enabled: this.dependencies.isAgentPluginsEnabled(),
+        xumHome: this.dependencies.config.rootDir,
         // Project containers follow the same off-host gating as plugin MCP.
         projectRoot: agentPluginsMcpContext?.projectRoot,
         projectTrusted,
@@ -1522,10 +1384,9 @@ export class TurnRequestBuilder {
       log.warn("Agent plugin hooks: ensure failed; continuing without plugin hooks", { error });
     }
 
-    // Fetch MCP server config for system prompt (before building message).
     const listMcpServersStartedAt = Date.now();
-    const mcpServers = this.mcpServerManager
-      ? await this.mcpServerManager.listServers(
+    const mcpServers = this.dependencies.bindings.mcpServerManager
+      ? await this.dependencies.bindings.mcpServerManager.listServers(
           metadata.projectPath,
           mcpOverrides,
           projectTrusted,
@@ -1542,7 +1403,7 @@ export class TurnRequestBuilder {
         // `effectiveAdditionalSystemContext` honors the `enabled` toggle: when
         // the user has disabled the scratchpad, the persisted content is
         // intentionally not injected.
-        const record = await readAdditionalSystemContext(this.config, workspaceId);
+        const record = await readAdditionalSystemContext(this.dependencies.config, workspaceId);
         workspaceAdditionalSystemContext = effectiveAdditionalSystemContext(record);
       } catch (error) {
         // The scratchpad is user-editable state, so a transient read failure should not block a send.
@@ -1582,16 +1443,21 @@ export class TurnRequestBuilder {
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
-    const xumScope = resolveXumToolScope(this.config, metadata, workspacePath, projectCheckoutRoot);
+    const xumScope = resolveXumToolScope(
+      this.dependencies.config,
+      metadata,
+      workspacePath,
+      projectCheckoutRoot
+    );
 
     const workflowSkillStorageContext = resolveSkillStorageContext({
       runtime,
       workspacePath,
       xumScope,
-      includeAgentPlugins: this.isAgentPluginsEnabled(),
+      includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
     });
 
-    const desktopSessionManager = this.desktopSessionManager;
+    const desktopSessionManager = this.dependencies.bindings.desktopSessionManager;
     let desktopCapabilityPromise: ReturnType<DesktopSessionManager["getCapability"]> | undefined;
     const loadDesktopCapability =
       desktopSessionManager == null
@@ -1608,7 +1474,8 @@ export class TurnRequestBuilder {
     // Memory index eligibility mirrors memory tool registration (experiment +
     // service); tool policy may still strip the tool, which forces a rebuild
     // below so the prompt never advertises an absent tool.
-    const memoryToolEligible = memoryExperimentEnabled && this.memoryService !== undefined;
+    const memoryToolEligible =
+      memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
     const buildStreamSystemContextForToolset = (
       toolset: { advisorToolAvailable: boolean; memoryToolAvailable: boolean },
       modelStringForSystem: string = modelString,
@@ -1628,7 +1495,7 @@ export class TurnRequestBuilder {
         planFilePath,
         modelString: modelStringForSystem,
         cfg,
-        providersConfig: this.providerService.getConfig(),
+        providersConfig: this.dependencies.providerService.getConfig(),
         mcpServers,
         xumScope,
         loadDesktopCapability,
@@ -1653,13 +1520,11 @@ export class TurnRequestBuilder {
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
-    // Load project secrets for local tool execution and MCP server startup.
     const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.config)
-      : this.config.getEffectiveSecrets(metadata.projectPath);
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.config)
+      : this.dependencies.config.getEffectiveSecrets(metadata.projectPath);
 
-    // Generate stream token and create temp directory for tools
-    const streamToken = this.streamManager.generateStreamToken();
+    const streamToken = this.dependencies.streamManager.generateStreamToken();
 
     let mcpTools: Record<string, Tool> | undefined;
     let mcpToolServerNames: Record<string, string> | undefined;
@@ -1667,8 +1532,8 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    if (this.mcpServerManager) {
-      const mcpServerManager = this.mcpServerManager;
+    if (this.dependencies.bindings.mcpServerManager) {
+      const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {
         const result = await mcpServerManager.getToolsForWorkspace({
@@ -1710,10 +1575,12 @@ export class TurnRequestBuilder {
       toolSearchExperimentEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
     const createTempDirForStreamStartedAt = Date.now();
-    const runtimeTempDir = await this.streamManager.createTempDirForStream(streamToken, runtime);
+    const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
+      streamToken,
+      runtime
+    );
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
-    // Extract tool-specific instructions from AGENTS.md files and agent definition
     const readToolInstructionsStartedAt = Date.now();
     const toolInstructions = await readToolInstructions(
       metadata,
@@ -1729,8 +1596,8 @@ export class TurnRequestBuilder {
     // Calculate cumulative session costs for MUX_COSTS_USD env var
     let sessionCostsUsd: number | undefined;
     const loadSessionUsageStartedAt = Date.now();
-    if (this.sessionUsageService) {
-      const sessionUsage = await this.sessionUsageService.getSessionUsage(workspaceId);
+    if (this.dependencies.sessionUsageService) {
+      const sessionUsage = await this.dependencies.sessionUsageService.getSessionUsage(workspaceId);
       if (sessionUsage) {
         const allUsage = sumUsageHistory(Object.values(sessionUsage.byModel));
         sessionCostsUsd = getTotalCost(allUsage);
@@ -1738,12 +1605,8 @@ export class TurnRequestBuilder {
     }
     recordStartupPhaseTiming("loadSessionUsageMs", loadSessionUsageStartedAt);
 
-    // Get model-specific tools with workspace path (correct for local or remote)
     emitStartupBreadcrumb("loading_tools");
-    assert(
-      workspaceId.trim().length > 0,
-      "AIService.streamMessage requires a non-empty workspaceId"
-    );
+    assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
     if (advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length === 0) {
       workspaceLog.warn("Advisor tool enabled for agent without advisorModelString; suppressing", {
         effectiveAgentId,
@@ -1752,7 +1615,7 @@ export class TurnRequestBuilder {
     if (advisorToolEligible) {
       assert(
         advisorModelString.length > 0,
-        "AIService advisorModelString must be non-empty when advisor is eligible"
+        "advisorModelString must be non-empty when advisor is eligible"
       );
     }
     // Mutable ref updated by StreamManager.prepareStep so the advisor tool reads the live
@@ -1834,7 +1697,7 @@ export class TurnRequestBuilder {
     assert(
       cfg.advisorMaxOutputTokens == null ||
         (Number.isInteger(cfg.advisorMaxOutputTokens) && cfg.advisorMaxOutputTokens > 0),
-      "AIService advisorMaxOutputTokens must be null, undefined, or a positive integer"
+      "advisorMaxOutputTokens must be null, undefined, or a positive integer"
     );
     const advisorMaxOutputTokens =
       cfg.advisorMaxOutputTokens != null && cfg.advisorMaxOutputTokens > 0
@@ -1846,7 +1709,7 @@ export class TurnRequestBuilder {
       advisorModelString,
       cfg.advisorThinkingLevel ?? THINKING_LEVEL_OFF,
       undefined,
-      this.providerService.getConfig()
+      this.dependencies.providerService.getConfig()
     );
     const runtimeType = getRuntimeType(metadata.runtimeConfig);
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
@@ -1855,27 +1718,28 @@ export class TurnRequestBuilder {
       thinkingLevel: thinkingLevel ?? "off",
       costsUsd: sessionCostsUsd,
     });
-    const getWorkflowProjectTrusted = () => isWorkspaceProjectTrusted(this.config, metadata);
+    const getWorkflowProjectTrusted = () =>
+      isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
     const workflowService =
-      dynamicWorkflowsExperimentEnabled && this.taskService != null
+      dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             runStore: new WorkflowRunStore({
-              sessionDir: this.config.getSessionDir(workspaceId),
+              sessionDir: this.dependencies.config.getSessionDir(workspaceId),
             }),
             onRunStatusChanged: async (event) => {
               if (!isTerminalWorkflowRunStatus(event.status)) {
-                await this.taskService?.resetWorkflowRunTerminalAttention({
+                await this.dependencies.bindings.taskService?.resetWorkflowRunTerminalAttention({
                   ownerWorkspaceId: event.workspaceId,
                   runId: event.runId,
                 });
               }
-              await this.onWorkflowRunStatusChanged?.(event);
+              await this.dependencies.bindings.onWorkflowRunStatusChanged?.(event);
             },
             runtimeFactory: new QuickJSRuntimeFactory(),
             taskAdapterFactory: (runId, workflowName) =>
               new WorkflowTaskServiceAdapter({
-                taskService: this.taskService!,
+                taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,
                 workflowName,
@@ -1885,7 +1749,7 @@ export class TurnRequestBuilder {
                   cwd: workspacePath,
                   runtime,
                   runtimeTempDir,
-                  workspaceSessionDir: this.config.getSessionDir(workspaceId),
+                  workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
@@ -1902,7 +1766,7 @@ export class TurnRequestBuilder {
                 workspacePath,
                 projectSearchRoot: projectCheckoutRoot ?? workspacePath,
                 projectTrusted: getWorkflowProjectTrusted(),
-                includeAgentPlugins: this.isAgentPluginsEnabled(),
+                includeAgentPlugins: this.dependencies.isAgentPluginsEnabled(),
                 skillStorageContext: workflowSkillStorageContext,
               }),
             // Background workflow tools outlive the model turn that started them. Feed the
@@ -1912,8 +1776,8 @@ export class TurnRequestBuilder {
               if (run.parentWorkflow != null) {
                 return;
               }
-              if (this.taskService != null) {
-                await this.taskService.enqueueWorkflowRunTerminalAttention({
+              if (this.dependencies.bindings.taskService != null) {
+                await this.dependencies.bindings.taskService.enqueueWorkflowRunTerminalAttention({
                   ownerWorkspaceId: workspaceId,
                   runId,
                   status,
@@ -1921,7 +1785,8 @@ export class TurnRequestBuilder {
                 return;
               }
 
-              const continuationSender = this.workflowResultContinuationSender;
+              const continuationSender =
+                this.dependencies.bindings.workflowResultContinuationSender;
               if (continuationSender == null) {
                 log.warn("Workflow completed but no continuation sender is configured", {
                   workspaceId,
@@ -1946,7 +1811,7 @@ export class TurnRequestBuilder {
                   runId
                 );
                 if (!invocationCurrent) {
-                  if (this.isStreaming(workspaceId)) {
+                  if (this.dependencies.isStreaming(workspaceId)) {
                     await waitForWorkflowContinuationRetry();
                     continue;
                   }
@@ -2004,7 +1869,8 @@ export class TurnRequestBuilder {
                 await waitForWorkflowContinuationRetry();
               }
             },
-            getCurrentProjectTrusted: () => isWorkspaceProjectTrusted(this.config, metadata),
+            getCurrentProjectTrusted: () =>
+              isWorkspaceProjectTrusted(this.dependencies.config, metadata),
             runnerId: `workflow-runner:${workspaceId}`,
           })
         : undefined;
@@ -2014,7 +1880,7 @@ export class TurnRequestBuilder {
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
     const allowLegacyInvalidWorkflowAgentOutputSchema =
-      await this.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
+      await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
     // Hoisted so the refusal-fallback prepare() can rebuild the toolset for a
     // different model with identical context (only the model string varies).
     const toolsForModelConfig: ToolConfiguration = {
@@ -2035,7 +1901,7 @@ export class TurnRequestBuilder {
                 const messages = advisorTranscriptRef.messages;
                 assert(
                   messages != null,
-                  "AIService advisor transcript ref must be populated before advisor execution"
+                  "advisor transcript ref must be populated before advisor execution"
                 );
                 return messages;
               },
@@ -2063,15 +1929,19 @@ export class TurnRequestBuilder {
                 // pinned pricing identity: two independent reads would let
                 // a catalog refresh land between them, running the request
                 // on one wire while recording usage under another type.
-                const advisorProvidersConfig = this.config.loadProvidersConfig() ?? {};
+                const advisorProvidersConfig = this.dependencies.config.loadProvidersConfig() ?? {};
                 // View snapshot captured at creation time for option
                 // building (buildProviderOptions takes the oRPC view, not
                 // the raw config shape).
-                const advisorOptionsProvidersConfig = this.providerService.getConfig();
-                const advisorModel = await this.createModel(advisorModelString, undefined, {
-                  workspaceId,
-                  providersConfig: advisorProvidersConfig,
-                });
+                const advisorOptionsProvidersConfig = this.dependencies.providerService.getConfig();
+                const advisorModel = await this.dependencies.createModel(
+                  advisorModelString,
+                  undefined,
+                  {
+                    workspaceId,
+                    providersConfig: advisorProvidersConfig,
+                  }
+                );
                 if (!advisorModel.success) {
                   throw new Error(
                     `Failed to create advisor model: ${getErrorMessage(advisorModel.error)}`
@@ -2087,7 +1957,7 @@ export class TurnRequestBuilder {
                 // options derived from the raw selection (instance type)
                 // would diverge from the model actually created.
                 const advisorEffectiveModelString =
-                  this.providerModelFactory.resolveEffectiveModelString(
+                  this.dependencies.providerModelFactory.resolveEffectiveModelString(
                     advisorModelString,
                     undefined,
                     advisorProvidersConfig
@@ -2149,7 +2019,7 @@ export class TurnRequestBuilder {
       openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
       xaiNativeToolsEnabled: routeProvider === "xai",
       xaiSearchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
-      backgroundProcessManager: this.backgroundProcessManager,
+      backgroundProcessManager: this.dependencies.backgroundProcessManager,
       // Plan agent configuration for plan file access.
       // - read: plan file is readable in all agents (useful context)
       // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
@@ -2160,21 +2030,23 @@ export class TurnRequestBuilder {
           return;
         }
         if (event.type === "workflow-run-attached") {
-          return this.streamManager.attachWorkflowRunToToolCall(event).then(() => {
-            this.emit(event.type, event as never);
+          return this.dependencies.streamManager.attachWorkflowRunToToolCall(event).then(() => {
+            this.dependencies.emit(event.type, event as never);
           });
         }
-        this.emit(event.type, event as never);
+        this.dependencies.emit(event.type, event as never);
       },
       workspaceProjectPath: metadata.projectPath,
       workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
-      workspaceSessionDir: this.config.getSessionDir(workspaceId),
+      workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,
       xumScope,
-      timelineService: timelineExperimentEnabled ? this.timelineService : undefined,
-      workspaceHeartbeatService: this.workspaceHeartbeatService,
+      timelineService: timelineExperimentEnabled
+        ? this.dependencies.bindings.timelineService
+        : undefined,
+      workspaceHeartbeatService: this.dependencies.bindings.workspaceHeartbeatService,
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
@@ -2198,7 +2070,6 @@ export class TurnRequestBuilder {
         ),
       workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
       allowLegacyInvalidWorkflowAgentOutputSchema,
-      // External edit detection callback
       recordFileState,
       reportModelUsage: (event) => {
         try {
@@ -2216,8 +2087,8 @@ export class TurnRequestBuilder {
           const pinnedMetadataModel = toolModelMetadataModelByModelString.get(eventModel);
           const metadataModel =
             pinnedMetadataModel ??
-            resolveModelForMetadata(eventModel, this.providerService.getConfig());
-          this.streamManager.recordToolModelUsage(workspaceId, assistantMessageId, {
+            resolveModelForMetadata(eventModel, this.dependencies.providerService.getConfig());
+          this.dependencies.streamManager.recordToolModelUsage(workspaceId, assistantMessageId, {
             toolName: event.toolName,
             toolCallId: event.toolCallId,
             timestamp: event.timestamp,
@@ -2228,7 +2099,7 @@ export class TurnRequestBuilder {
           });
           void (async () => {
             try {
-              if (!this.sessionUsageService) {
+              if (!this.dependencies.sessionUsageService) {
                 return;
               }
               const displayUsage = createDisplayUsage(
@@ -2248,9 +2119,16 @@ export class TurnRequestBuilder {
               const canonicalModel =
                 eventModel.startsWith("coder:") && pinnedMetadataModel
                   ? pinnedMetadataModel
-                  : normalizeUsageModelKey(eventModel, this.providerService.getConfig());
-              await this.sessionUsageService.recordUsage(workspaceId, canonicalModel, displayUsage);
-              this.emit("session-usage-delta", {
+                  : normalizeUsageModelKey(
+                      eventModel,
+                      this.dependencies.providerService.getConfig()
+                    );
+              await this.dependencies.sessionUsageService.recordUsage(
+                workspaceId,
+                canonicalModel,
+                displayUsage
+              );
+              this.dependencies.emit("session-usage-delta", {
                 type: "session-usage-delta" as const,
                 workspaceId,
                 sourceWorkspaceId: workspaceId,
@@ -2275,14 +2153,14 @@ export class TurnRequestBuilder {
           });
         }
       },
-      onConfigChanged: () => this.providerService.notifyConfigChanged(),
-      taskService: this.taskService,
-      analyticsService: this.analyticsService,
-      desktopSessionManager: this.desktopSessionManager,
+      onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
+      taskService: this.dependencies.bindings.taskService,
+      analyticsService: this.dependencies.bindings.analyticsService,
+      desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
       // Agent memory (memory experiment): per-scope write policy derived from
       // the agent class (exec-like / plan-like / read-only). Project memory is
       // host-local under xumHome, keyed by the stable project identity.
-      memoryService: this.memoryService,
+      memoryService: this.dependencies.bindings.memoryService,
       memoryAccess: resolveMemoryAccessPolicy({
         planLike: agentIsPlanLike,
         editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
@@ -2310,7 +2188,7 @@ export class TurnRequestBuilder {
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
-        this.streamManager.emitNestedToolEvent(workspaceId, assistantMessageId, event);
+        this.dependencies.streamManager.emitNestedToolEvent(workspaceId, assistantMessageId, event);
       }
     };
     const kernelFileLoader = createKernelFileLoader({
@@ -2363,7 +2241,7 @@ export class TurnRequestBuilder {
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
           },
           workspaceId,
-          this.initStateManager,
+          this.dependencies.initStateManager,
           toolInstructions,
           mcpTools
         );
@@ -2373,14 +2251,18 @@ export class TurnRequestBuilder {
 
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
-          allTools: this.wrapToolsForDelegation(workspaceId, allTools, delegatedToolNames),
-          extraTools: this.extraTools,
+          allTools: this.dependencies.wrapToolsForDelegation(
+            workspaceId,
+            allTools,
+            delegatedToolNames
+          ),
+          extraTools: this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
           experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
-            sessionDir: this.config.getSessionDir(workspaceId),
+            sessionDir: this.dependencies.config.getSessionDir(workspaceId),
             kernelFileLoader,
           },
         });
@@ -2531,7 +2413,7 @@ export class TurnRequestBuilder {
           providerOptionsForEnvelope: unknown
         ): Promise<void> => {
           await emitTurnEnvelope({
-            journal: this.durableEventJournalFor(workspaceId),
+            journal: this.dependencies.durableEventJournalFor(workspaceId),
             workspaceId,
             systemMessage: attemptSystem,
             tools: Object.fromEntries(
@@ -2632,7 +2514,7 @@ export class TurnRequestBuilder {
     const finalMessages = primaryRequest.messages;
 
     captureMcpToolTelemetry({
-      telemetryService: this.telemetryService,
+      telemetryService: this.dependencies.telemetryService,
       mcpStats,
       mcpTools,
       tools,
@@ -2645,7 +2527,10 @@ export class TurnRequestBuilder {
     });
 
     if (combinedAbortSignal.aborted) {
-      return { type: "finished", result: Ok(this.createAbortedTurnHandle(assistantMessageId)) };
+      return {
+        type: "finished",
+        result: Ok(this.dependencies.createAbortedTurnHandle(assistantMessageId)),
+      };
     }
 
     const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
@@ -2657,13 +2542,14 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
     });
 
-    // Append to history to get historySequence assigned
-    const appendResult = await this.historyService.appendToHistory(workspaceId, assistantMessage);
+    const appendResult = await this.dependencies.historyService.appendToHistory(
+      workspaceId,
+      assistantMessage
+    );
     if (!appendResult.success) {
       return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
     }
 
-    // Get the assigned historySequence
     const historySequence = assistantMessage.metadata?.historySequence ?? 0;
 
     // Handle simulated stream scenarios (OpenAI SDK testing features).
@@ -2688,24 +2574,36 @@ export class TurnRequestBuilder {
         effectiveMode,
         metadataMode: legacyModeForMetadata,
         effectiveThinkingLevel,
-        emit: (event, data) => this.emit(event, data),
+        emit: (event, data) => this.dependencies.emit(event, data),
       };
 
       // Simulations emit their synthetic events before returning, so the
       // handle settles immediately with the matching terminal outcome.
       if (forceContextLimitError) {
-        const streamError = await simulateContextLimitError(simulationCtx, this.historyService);
+        const streamError = await simulateContextLimitError(
+          simulationCtx,
+          this.dependencies.historyService
+        );
         return {
           type: "finished",
           result: Ok(
-            this.createSettledTurnHandle(assistantMessageId, { status: "failed", streamError })
+            this.dependencies.createSettledTurnHandle(assistantMessageId, {
+              status: "failed",
+              streamError,
+            })
           ),
         };
       }
-      await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
+      await simulateToolPolicyNoop(
+        simulationCtx,
+        effectiveToolPolicy,
+        this.dependencies.historyService
+      );
       return {
         type: "finished",
-        result: Ok(this.createSettledTurnHandle(assistantMessageId, { status: "completed" })),
+        result: Ok(
+          this.dependencies.createSettledTurnHandle(assistantMessageId, { status: "completed" })
+        ),
       };
     }
 
@@ -2753,10 +2651,12 @@ export class TurnRequestBuilder {
 
     if (combinedAbortSignal.aborted) {
       await deleteAbortedPlaceholder(assistantMessageId);
-      return { type: "finished", result: Ok(this.createAbortedTurnHandle(assistantMessageId)) };
+      return {
+        type: "finished",
+        result: Ok(this.dependencies.createAbortedTurnHandle(assistantMessageId)),
+      };
     }
 
-    // Capture request payload for the debug modal, then delegate to StreamManager.
     const snapshot: DebugLlmRequestSnapshot = {
       capturedAt: Date.now(),
       workspaceId,
@@ -2772,15 +2672,16 @@ export class TurnRequestBuilder {
     };
 
     try {
-      this.lastLlmRequestByWorkspace.set(workspaceId, structuredClone(snapshot));
+      this.dependencies.lastLlmRequestByWorkspace.set(workspaceId, structuredClone(snapshot));
     } catch (error) {
       const errMsg = getErrorMessage(error);
       workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
     }
     const toolsForStream = tools;
 
+    const devToolsService = this.dependencies.devToolsService;
     const canQueueDevToolsRunMetadata =
-      this.devToolsService?.enabled === true &&
+      devToolsService?.enabled === true &&
       typeof modelResult.data.model !== "string" &&
       modelResult.data.model.specificationVersion === "v4";
 
@@ -2790,7 +2691,7 @@ export class TurnRequestBuilder {
       // when middleware is guaranteed to run (LanguageModelV3).
       pendingRunMetadataId = String(streamToken);
       context.startupState.pendingRunMetadataId = pendingRunMetadataId;
-      this.devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
+      devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
         toolPolicy:
           effectiveToolPolicy != null && effectiveToolPolicy.length > 0
             ? effectiveToolPolicy
@@ -2799,7 +2700,11 @@ export class TurnRequestBuilder {
         // its turn-envelope row and assistant message (see DevToolsRun).
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
       });
-      this.trackPendingDevToolsRunMetadata(assistantMessageId, workspaceId, pendingRunMetadataId);
+      this.dependencies.trackPendingDevToolsRunMetadata(
+        assistantMessageId,
+        workspaceId,
+        pendingRunMetadataId
+      );
       requestHeaders = {
         ...requestHeaders,
         [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
@@ -2813,10 +2718,10 @@ export class TurnRequestBuilder {
     // children can opt out via taskOnRefusal: "fail" (see
     // resolveWorkspaceModelFallbackChain).
     const modelFallbackChain = resolveWorkspaceModelFallbackChain(
-      this.config.loadConfigOrDefault(),
+      this.dependencies.config.loadConfigOrDefault(),
       workspaceId,
       modelString,
-      this.providerService.getConfig()
+      this.dependencies.providerService.getConfig()
     );
 
     // Lazily rebuilds the per-model slice of this pipeline (model creation,
@@ -2838,7 +2743,7 @@ export class TurnRequestBuilder {
                 rawModelString: nextModelString,
                 requestedThinkingLevel,
                 minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
-                  this.config.loadConfigOrDefault().minThinkingLevelByModel,
+                  this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
                   nextModelString
                 ),
                 enforceMinimum: true,
@@ -2935,14 +2840,6 @@ export class TurnRequestBuilder {
 
     const emitPrimaryEnvelope = (): Promise<void> =>
       primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
-    const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
-      effectiveLevel,
-      providerOptions
-    ) => {
-      const rebuiltMessages = await primaryRequest.rebuildMessagesForThinkingLevel(effectiveLevel);
-      await primaryRequest.emitEnvelopeWith(effectiveLevel, providerOptions);
-      return rebuiltMessages;
-    };
     emitStartupBreadcrumb("starting_stream");
     const turnExecutionOptions: TurnExecutionOptions = {
       workspaceId,
@@ -2994,7 +2891,7 @@ export class TurnRequestBuilder {
       forcedFirstStepToolNames,
       providersConfigSnapshot: requestProvidersConfig,
       onStreamConstructed: emitPrimaryEnvelope,
-      rebuildFirstStepForThinkingLevel,
+      rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
     };
 
     const logStartOutcome = (

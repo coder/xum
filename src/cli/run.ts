@@ -651,6 +651,7 @@ async function main(): Promise<number> {
     workspaceService,
     workspaceGoalService,
     idleDispatcher,
+    streamManager,
     turnRequestBuilderBindings,
   } = createCoreServices({
     config,
@@ -723,6 +724,7 @@ async function main(): Promise<number> {
     config,
     historyService,
     aiService,
+    streamManager,
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService,

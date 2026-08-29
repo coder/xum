@@ -215,7 +215,7 @@ export interface TurnStreamHandle {
   completion: Promise<TurnCompletion>;
 }
 
-export interface TurnCompletionController {
+interface TurnCompletionController {
   promise: Promise<TurnCompletion>;
   settle: (completion: TurnCompletion) => void;
 }
@@ -323,7 +323,7 @@ interface StreamRequestConfig {
    */
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   /**
-   * Closure built by AIService that re-runs the effective-level pipeline
+   * Closure built by TurnRequestBuilder that re-runs the effective-level pipeline
    * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
    * options for the stream's model. `null` ⇒ not applicable / no-op.
    */
@@ -338,12 +338,12 @@ interface StreamRequestConfig {
 }
 
 /**
- * Per-model request pieces for a refusal-fallback swap, rebuilt by AIService so
+ * Per-model request pieces for a refusal-fallback swap, rebuilt by TurnRequestBuilder so
  * provider-specific message preparation, provider options, and headers match a
  * first-class send of the fallback model (reusing the source model's request
  * verbatim would leak provider-specific options/messages across providers).
  */
-export interface PreparedModelFallback {
+interface PreparedModelFallback {
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -385,7 +385,7 @@ export interface PreparedModelFallback {
   onStreamConstructed?: () => Promise<void>;
   /**
    * Pinned providers-config snapshot the fallback request was built from
-   * (see AIService's pinCoderWireProvidersConfig). The swap's request-config
+   * (see TurnRequestBuilder's pinCoderInstanceProvidersConfig). The swap's request-config
    * rebuild and metadata resolution must read THIS snapshot, not the live
    * config: a catalog refresh between prepare() and the swap could retag the
    * instance and hand the prepared SDK model another wire's cache wrappers,
@@ -566,7 +566,7 @@ function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
   };
 }
 
-function markProviderMetadataCostsIncluded(
+export function markProviderMetadataCostsIncluded(
   providerMetadata: Record<string, unknown> | undefined,
   costsIncluded: boolean | undefined
 ): Record<string, unknown> | undefined {
@@ -700,7 +700,7 @@ interface WorkspaceStreamInfo {
   // attempt's totalUsage only.
   didRetryAfterEmptyOutput?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
-  // (as passed by AIService) that prepare() does not rebuild, so the request can
+  // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
   // be rebuilt for a different model — buildStreamRequestConfig re-applies
   // provider-specific wrapping (e.g. Anthropic cached system message / tool
   // cache_control), which must not be applied twice or leak across providers.
@@ -782,13 +782,13 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
  * - Atomic stream creation/cancellation operations
  * - Guaranteed resource cleanup in all code paths
  */
-export interface PendingStreamStartHandle {
+interface PendingStreamStartHandle {
   readonly abortSignal: AbortSignal;
   readonly syntheticMessageId: string;
   finish(): void;
 }
 
-export interface MockStreamLifecycle {
+interface MockStreamLifecycle {
   isStreaming(workspaceId: string): boolean;
   stop(workspaceId: string): Promise<void>;
   replayStream(workspaceId: string): Promise<void>;
@@ -2317,7 +2317,7 @@ export class StreamManager {
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
         // Step 0: an override consumed here raced stream setup (written during
-        // startStream's awaits, after AIService's pre-construction quiescence
+        // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
         // fold). Message preparation is thinking-level-dependent (Anthropic
         // signed-reasoning transforms), so rebuild the first-step messages
         // under the applied level too; the closure also emits a superseding
@@ -3978,7 +3978,7 @@ export class StreamManager {
                 ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
                 : {}),
               metadata: {
-                ...streamInfo.initialMetadata, // AIService-provided metadata (systemMessageTokens, etc)
+                ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
                 model: canonicalModel,
                 metadataModel: streamInfo.metadataModel,
                 routedThroughGateway,
@@ -4831,7 +4831,7 @@ export class StreamManager {
         }
 
         // Step 3: Create temp directory for this stream using runtime.
-        // AIService pre-creates this dir so tool configuration can reference the same stable path;
+        // TurnRequestBuilder pre-creates this dir so tool configuration can reference the same stable path;
         // once startStream receives it, StreamManager owns cleanup for both success and abort paths.
         runtimeTempDir =
           providedRuntimeTempDir ?? (await this.createTempDirForStream(streamToken, runtime));

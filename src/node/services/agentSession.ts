@@ -1549,11 +1549,7 @@ export class AgentSession {
   }
 
   private isAiStreaming(): boolean {
-    const aiService = this.aiService as Partial<Pick<AgentSessionAIService, "isStreaming">>;
-    if (typeof aiService.isStreaming !== "function") {
-      return false;
-    }
-    return aiService.isStreaming(this.workspaceId);
+    return this.streamManager.isStreaming(this.workspaceId);
   }
 
   private normalizeStartupModel(model: unknown): string | undefined {
