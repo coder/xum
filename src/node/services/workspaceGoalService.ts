@@ -32,7 +32,6 @@ import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   hasBudgetedResumableGoal,
-  hasGoalBudgetLimit,
   modelHasPricingData,
   normalizeGoalBudgetCents,
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
@@ -54,6 +53,20 @@ import { buildGoalBudgetLimitMessage, buildGoalContinuationMessage } from "@/con
 import type { IdleDispatcher, IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
+import {
+  applyBudgetDrivenStatus,
+  evaluateGoalContinuationGoal,
+  evaluateGoalContinuationRegistration,
+  evaluateGoalContinuationRuntime,
+  evaluateGoalContinuationStopCheck,
+  evaluateGoalContinuationWorkspace,
+  hasReachedGoalBudgetLimit,
+  hasReachedGoalTurnLimit,
+  isBudgetWrapupEligibleOrigin,
+  type GoalContinuationDecision,
+  type GoalContinuationSkipReason,
+  type GoalStreamOriginKind,
+} from "./goalContinuationPolicy";
 
 const GOAL_FILE = "goal.json";
 const GOAL_BOARD_FILE = "goal-board.json";
@@ -142,29 +155,7 @@ export interface SetGoalInput {
   editInPlace?: boolean | null;
 }
 
-export type GoalContinuationSkipReason =
-  | "not_registered"
-  | "no_pending_candidate"
-  | "workspace_not_found"
-  | "archived"
-  | "transcript_only"
-  | "initializing"
-  | "incompatible_runtime"
-  | "child_workspace"
-  | "active_descendant_tasks"
-  | "currently_streaming"
-  | "queued_user_input"
-  | "pending_follow_up"
-  | "plan_mode"
-  | "compact_mode"
-  | "user_stop"
-  | "goal_missing"
-  | "goal_mismatch"
-  | "goal_not_active"
-  | "requires_ack"
-  | "budget_wrapup_already_fired"
-  | "budget_wrapup_suppressed"
-  | "cooldown";
+export type { GoalContinuationSkipReason, GoalStreamOriginKind } from "./goalContinuationPolicy";
 
 export interface GoalContinuationRuntimeState {
   isInitializing?: boolean;
@@ -329,8 +320,6 @@ interface PendingGoalMutation {
    */
   editInPlace?: boolean | null;
 }
-
-export type GoalStreamOriginKind = "goal_continuation" | "goal_budget_limit" | "user" | "other";
 
 interface GoalStreamStamp {
   originKind: GoalStreamOriginKind;
@@ -1008,7 +997,7 @@ export class WorkspaceGoalService {
       status: desiredStatus,
       updatedAtMs: Date.now(),
     });
-    return this.applyBudgetDrivenStatus(next);
+    return applyBudgetDrivenStatus(next, { nowMs: Date.now() });
   }
 
   private async syncGoalStatusToChatTail(workspaceId: string): Promise<GoalRecordV1 | null> {
@@ -1166,7 +1155,7 @@ export class WorkspaceGoalService {
       createdAtMs: now,
       updatedAtMs: now,
     });
-    return status === "active" ? this.applyBudgetDrivenStatus(goal) : goal;
+    return status === "active" ? applyBudgetDrivenStatus(goal, { nowMs: Date.now() }) : goal;
   }
 
   private async writeGoal(workspaceId: string, goal: GoalRecordV1): Promise<void> {
@@ -1989,7 +1978,7 @@ export class WorkspaceGoalService {
               const stamp = this.lastGoalStreamStamps.get(workspaceId);
               if (
                 stamp?.goalId !== goal.goalId ||
-                !this.isBudgetWrapupEligibleOrigin(stamp.originKind)
+                !isBudgetWrapupEligibleOrigin(stamp.originKind, this.allowUserOriginBudgetWrapup)
               ) {
                 return true;
               }
@@ -2126,125 +2115,111 @@ export class WorkspaceGoalService {
     assert(workspaceId.trim().length > 0, "checkGoalContinuationEligibility requires workspaceId");
     assert(Number.isFinite(nowMs) && nowMs >= 0, "checkGoalContinuationEligibility requires nowMs");
 
-    const candidate = this.pendingContinuationCandidates.get(workspaceId);
-    if (!candidate) {
-      return { eligible: false, reason: "no_pending_candidate" };
-    }
+    const candidate = this.pendingContinuationCandidates.get(workspaceId) ?? null;
+    const finish = (
+      decision: GoalContinuationDecision,
+      goal?: GoalRecordV1,
+      lastStreamStamp?: GoalStreamStamp
+    ): GoalContinuationEligibilityResult => {
+      if (decision.kind === "continue") {
+        return { eligible: true, goal, candidate: candidate ?? undefined, lastStreamStamp };
+      }
+      if (decision.kind === "stop" && decision.dropCandidate) {
+        this.pendingContinuationCandidates.delete(workspaceId);
+      }
+      return {
+        eligible: false,
+        reason: decision.reason,
+        ...(decision.kind === "defer" ? { deferUntilMs: decision.untilMs } : {}),
+      };
+    };
+
     const bridge = this.goalContinuationBridge;
-    if (!bridge) {
-      return { eligible: false, reason: "not_registered" };
+    let decision = evaluateGoalContinuationRegistration({
+      candidate,
+      bridgeRegistered: bridge != null,
+    });
+    if (decision) {
+      return finish(decision);
     }
+    assert(
+      candidate != null && bridge != null,
+      "registered continuation requires candidate and bridge"
+    );
 
     const workspace = this.findWorkspaceConfigEntry(workspaceId);
-    if (!workspace) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "workspace_not_found" };
+    const workspaceState = {
+      found: workspace != null,
+      archived:
+        workspace != null && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt),
+      hasPath: workspace?.path != null,
+      isChild: workspace?.parentWorkspaceId != null,
+    };
+    decision = evaluateGoalContinuationWorkspace({
+      workspace: workspaceState,
+      hasActiveDescendantTasks: false,
+    });
+    if (decision) {
+      return finish(decision);
     }
-    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "archived" };
-    }
-    if (!workspace.path) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "transcript_only" };
-    }
-    if (workspace.parentWorkspaceId != null) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "child_workspace" };
-    }
-    if (bridge.hasActiveDescendantTasks(workspaceId)) {
-      return { eligible: false, reason: "active_descendant_tasks" };
+    decision = evaluateGoalContinuationWorkspace({
+      workspace: workspaceState,
+      hasActiveDescendantTasks: bridge.hasActiveDescendantTasks(workspaceId),
+    });
+    if (decision) {
+      return finish(decision);
     }
 
     const runtimeState = bridge.getRuntimeState(workspaceId);
-    if (runtimeState.isInitializing === true) {
-      return { eligible: false, reason: "initializing", deferUntilMs: nowMs + 1_000 };
+    const runtime = {
+      isInitializing: runtimeState.isInitializing === true,
+      isRuntimeCompatible: runtimeState.isRuntimeCompatible !== false,
+      isBusy: runtimeState.isBusy === true,
+      hasQueuedMessages: runtimeState.hasQueuedMessages === true,
+      hasPendingFollowUp: runtimeState.hasPendingFollowUp === true,
+    };
+    decision = evaluateGoalContinuationRuntime({
+      nowMs,
+      runtime,
+      isStreaming: null,
+      candidate,
+    });
+    if (decision) {
+      return finish(decision);
     }
-    if (runtimeState.isRuntimeCompatible === false) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "incompatible_runtime" };
-    }
-    if (runtimeState.isBusy === true || (await this.isWorkspaceStreaming(workspaceId))) {
-      return { eligible: false, reason: "currently_streaming", deferUntilMs: nowMs + 1_000 };
-    }
-    if (runtimeState.hasQueuedMessages === true) {
-      return { eligible: false, reason: "queued_user_input" };
-    }
-    if (runtimeState.hasPendingFollowUp === true) {
-      return { eligible: false, reason: "pending_follow_up" };
-    }
-    if (candidate.sendOptions.agentId === "plan" || candidate.sendOptions.mode === "plan") {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "plan_mode" };
-    }
-    if (candidate.sendOptions.agentId === "compact" || candidate.sendOptions.mode === "compact") {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "compact_mode" };
+    decision = evaluateGoalContinuationRuntime({
+      nowMs,
+      runtime,
+      isStreaming: await this.isWorkspaceStreaming(workspaceId),
+      candidate,
+    });
+    if (decision) {
+      return finish(decision);
     }
 
-    const userStopAtMs = this.lastUserStopAtMsByWorkspace.get(workspaceId);
-    if (userStopAtMs != null) {
-      const goalForStopCheck = await this.readGoalFile(workspaceId);
-      if (!goalForStopCheck) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "goal_missing" };
-      }
-      if (userStopAtMs >= goalForStopCheck.createdAtMs) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "user_stop" };
-      }
+    const userStopAtMs = this.lastUserStopAtMsByWorkspace.get(workspaceId) ?? null;
+    const stopCheckGoal = userStopAtMs != null ? await this.readGoalFile(workspaceId) : null;
+    decision = evaluateGoalContinuationStopCheck({ userStopAtMs, stopCheckGoal });
+    if (decision) {
+      return finish(decision);
     }
 
     const goal = await this.normalizeGoalLimits(workspaceId, {
       syncChatTail: candidate.source !== "kickoff",
     });
-    if (!goal) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "goal_missing" };
-    }
-    if (goal.goalId !== candidate.goalId) {
-      this.pendingContinuationCandidates.delete(workspaceId);
-      return { eligible: false, reason: "goal_mismatch" };
-    }
-    if (goal.status !== "active" && goal.status !== "budget_limited") {
-      if (goal.status !== "paused" || candidate.source !== "kickoff") {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "goal_not_active" };
-      }
-    }
-    if (goal.requireUserAcknowledgmentSinceMs != null) {
-      return { eligible: false, reason: "requires_ack" };
-    }
-
-    if (goal.status === "budget_limited") {
-      const lastStreamStamp = this.lastGoalStreamStamps.get(workspaceId);
-      if (goal.budgetLimitInjectedForGoalId === goal.goalId) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "budget_wrapup_already_fired" };
-      }
-      if (
-        lastStreamStamp?.goalId !== goal.goalId ||
-        !this.isBudgetWrapupEligibleOrigin(lastStreamStamp.originKind)
-      ) {
-        this.pendingContinuationCandidates.delete(workspaceId);
-        return { eligible: false, reason: "budget_wrapup_suppressed" };
-      }
-      return { eligible: true, goal, candidate, lastStreamStamp };
-    }
-
-    const lastContinuationFiredAtMs = goal.lastContinuationFiredAtMs ?? null;
-    if (
-      lastContinuationFiredAtMs != null &&
-      nowMs - lastContinuationFiredAtMs < this.continuationCooldownMs
-    ) {
-      return {
-        eligible: false,
-        reason: "cooldown",
-        deferUntilMs: lastContinuationFiredAtMs + this.continuationCooldownMs,
-      };
-    }
-
-    return { eligible: true, goal, candidate };
+    const lastStreamStamp =
+      goal?.status === "budget_limited"
+        ? (this.lastGoalStreamStamps.get(workspaceId) ?? null)
+        : null;
+    decision = evaluateGoalContinuationGoal({
+      nowMs,
+      candidate,
+      goal,
+      lastStreamStamp,
+      continuationCooldownMs: this.continuationCooldownMs,
+      allowUserOriginBudgetWrapup: this.allowUserOriginBudgetWrapup,
+    });
+    return finish(decision, goal ?? undefined, lastStreamStamp ?? undefined);
   }
 
   private scheduleContinuationReRequest(workspaceId: string, dueAtMs: number): void {
@@ -2302,7 +2277,7 @@ export class WorkspaceGoalService {
         preReadChatTailMode != null && current.goalId === preRead?.goalId
           ? preReadChatTailMode
           : null;
-      const budgetNormalized = this.applyBudgetDrivenStatus(current);
+      const budgetNormalized = applyBudgetDrivenStatus(current, { nowMs: Date.now() });
       const next = chatTailMode
         ? this.applyChatTailGoalMode(workspaceId, budgetNormalized, chatTailMode)
         : budgetNormalized;
@@ -2380,10 +2355,6 @@ export class WorkspaceGoalService {
     });
   }
 
-  private isBudgetWrapupEligibleOrigin(originKind: GoalStreamOriginKind): boolean {
-    return this.allowUserOriginBudgetWrapup || originKind !== "user";
-  }
-
   private async tryMarkBudgetLimitInjected(
     workspaceId: string,
     expectedGoalId: string,
@@ -2391,7 +2362,10 @@ export class WorkspaceGoalService {
   ): Promise<GoalRecordV1 | null> {
     assert(expectedGoalId.trim().length > 0, "budget wrap-up reservation requires a goal id");
     assert(
-      this.isBudgetWrapupEligibleOrigin(expectedLastStreamStamp.originKind),
+      isBudgetWrapupEligibleOrigin(
+        expectedLastStreamStamp.originKind,
+        this.allowUserOriginBudgetWrapup
+      ),
       "budget wrap-up reservation requires a goal-attributable stream"
     );
 
@@ -2399,7 +2373,7 @@ export class WorkspaceGoalService {
       const currentStamp = this.lastGoalStreamStamps.get(workspaceId);
       if (
         currentStamp?.goalId !== expectedGoalId ||
-        !this.isBudgetWrapupEligibleOrigin(currentStamp.originKind)
+        !isBudgetWrapupEligibleOrigin(currentStamp.originKind, this.allowUserOriginBudgetWrapup)
       ) {
         return null;
       }
@@ -2576,23 +2550,7 @@ export class WorkspaceGoalService {
       ...completionSummaryPatch(input.status, completionSummary),
       updatedAtMs: Date.now(),
     });
-    return this.applyBudgetDrivenStatus(next);
-  }
-
-  private hasReachedBudgetLimit(goal: GoalRecordV1): boolean {
-    const { budgetCents } = goal;
-    if (budgetCents == null || !hasGoalBudgetLimit(budgetCents)) {
-      return false;
-    }
-    return getGoalCostMicroCents(goal) >= budgetCents * MICRO_CENTS_PER_CENT;
-  }
-
-  private hasReachedTurnLimit(goal: GoalRecordV1): boolean {
-    return goal.turnCap != null && goal.turnsUsed >= goal.turnCap;
-  }
-
-  private hasReachedAnyLimit(goal: GoalRecordV1): boolean {
-    return this.hasReachedBudgetLimit(goal) || this.hasReachedTurnLimit(goal);
+    return applyBudgetDrivenStatus(next, { nowMs: Date.now() });
   }
 
   private applyCostAccounting(
@@ -2604,45 +2562,6 @@ export class WorkspaceGoalService {
       costCents: Math.round(costMicroCents / MICRO_CENTS_PER_CENT),
       costMicroCents,
     };
-  }
-
-  private applyBudgetDrivenStatus(
-    next: GoalRecordV1,
-    options?: { originKind?: GoalStreamOriginKind }
-  ): GoalRecordV1 {
-    const normalizedBudgetCents = normalizeGoalBudgetCents(next.budgetCents);
-    const normalized =
-      normalizedBudgetCents === next.budgetCents
-        ? next
-        : GoalRecordV1Schema.parse({
-            ...next,
-            budgetCents: normalizedBudgetCents,
-            updatedAtMs: Date.now(),
-          });
-    const reachedLimit = this.hasReachedAnyLimit(normalized);
-    const shouldLimitActiveGoal = normalized.status === "active" && reachedLimit;
-    const shouldRearmBudgetLimitedGoal = normalized.status === "budget_limited" && !reachedLimit;
-    if (!shouldLimitActiveGoal && !shouldRearmBudgetLimitedGoal) {
-      return normalized;
-    }
-
-    return GoalRecordV1Schema.parse({
-      ...normalized,
-      status: shouldLimitActiveGoal ? "budget_limited" : "active",
-      // Raising/removing limits re-arms the one-shot budget wrap-up.
-      budgetLimitInjectedForGoalId: shouldRearmBudgetLimitedGoal
-        ? null
-        : normalized.budgetLimitInjectedForGoalId,
-      // Persist the origin kind on active→budget_limited so restart recovery
-      // can decide whether to arm a wrap-up. Clear it when re-arming back to
-      // `active` after the budget is raised or removed.
-      budgetLimitOriginKind: shouldLimitActiveGoal
-        ? (options?.originKind ?? null)
-        : shouldRearmBudgetLimitedGoal
-          ? null
-          : normalized.budgetLimitOriginKind,
-      updatedAtMs: Date.now(),
-    });
   }
 
   private emitBudgetLimited(
@@ -2664,10 +2583,10 @@ export class WorkspaceGoalService {
     this.emitLifecycle("goal_budget_limited", {
       hasBudget: goal.budgetCents != null,
       hasTurnCap: goal.turnCap != null,
-      "cost-overshoot": this.hasReachedBudgetLimit(goal)
+      "cost-overshoot": hasReachedGoalBudgetLimit(goal)
         ? centsBucket(Math.max(0, goal.costCents - (goal.budgetCents ?? 0)))
         : null,
-      "turn-overshoot": this.hasReachedTurnLimit(goal)
+      "turn-overshoot": hasReachedGoalTurnLimit(goal)
         ? countBucket(Math.max(0, goal.turnsUsed - (goal.turnCap ?? 0)))
         : null,
       ...(properties ?? {}),
@@ -4225,7 +4144,7 @@ export class WorkspaceGoalService {
         turnsUsed: current.turnsUsed + turnsDelta,
         updatedAtMs: Date.now(),
       });
-      const next = this.applyBudgetDrivenStatus(accounted, { originKind });
+      const next = applyBudgetDrivenStatus(accounted, { originKind, nowMs: Date.now() });
       if (input.streamStartedAtMs != null) {
         this.recordedStreamStartedAtMsByWorkspace.set(input.workspaceId, input.streamStartedAtMs);
       }
@@ -4284,7 +4203,10 @@ export class WorkspaceGoalService {
       // wrap-up is owed . `goal_continuation` is the right tag here
       // because the wrap-up MUST fire — child attribution is goal-attributable
       // work. The recovery path checks for `!= "user"`.
-      const next = this.applyBudgetDrivenStatus(accounted, { originKind: "goal_continuation" });
+      const next = applyBudgetDrivenStatus(accounted, {
+        originKind: "goal_continuation",
+        nowMs: Date.now(),
+      });
       const causedLimit = current.status === "active" && next.status === "budget_limited";
 
       await this.writeGoal(input.parentWorkspaceId, next);
@@ -5163,7 +5085,7 @@ export class WorkspaceGoalService {
         // activation consent (see stampUserActivation).
         lastUserActivationAtMs: now,
       });
-      const activated = this.applyBudgetDrivenStatus(baseActivated);
+      const activated = applyBudgetDrivenStatus(baseActivated, { nowMs: Date.now() });
 
       // gate budgeted goal promotion on pricing data. A user
       // who queued a goal under a priced model and then switched to an
@@ -5339,7 +5261,7 @@ export class WorkspaceGoalService {
       // queue-race pause bypasses fail closed for this activation.
       lastUserActivationAtMs: null,
     });
-    const activated = this.applyBudgetDrivenStatus(baseActivated);
+    const activated = applyBudgetDrivenStatus(baseActivated, { nowMs: Date.now() });
     // same pricing gate as `promoteUpcomingGoal`. If the next
     // queued goal is budgeted and the workspace is currently on an
     // unpriced model, refuse the auto-promotion — otherwise we'd leave
