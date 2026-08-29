@@ -525,82 +525,54 @@ type WorkspaceHostMockOverrides = Partial<{
 }> & { unarchive?: ReturnType<typeof mock> };
 
 function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {
-  const sendMessage =
-    overrides.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const resumeStream =
-    overrides.resumeStream ??
-    mock((): Promise<Result<{ started: boolean }>> => Promise.resolve(Ok({ started: true })));
-  const clearQueue = overrides.clearQueue ?? mock((): Result<void> => Ok(undefined));
-  const removeQueuedWorkspaceTurn =
-    overrides.removeQueuedWorkspaceTurn ?? mock((): Result<boolean> => Ok(true));
-  const isBusyForMessage = overrides.isBusyForMessage ?? mock(() => false);
-  const getQueueCutCutter = overrides.getQueueCutCutter ?? mock(() => undefined);
-  const remove =
-    overrides.remove ??
-    overrides.removeWhileTaskTreeLocked ??
-    mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const updateTitle =
-    overrides.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const emitChatEvent = overrides.emitChatEvent ?? mock(() => undefined);
-  const emit = overrides.emit ?? mock(() => true);
-  const archive =
-    overrides.archive ??
-    overrides.archiveWhileTaskTreeLocked ??
-    mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" })));
-  const unarchive =
-    overrides.unarchive ??
-    overrides.unarchiveWhileTaskTreeLocked ??
-    mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const isWorkflowInvocationCurrent =
-    overrides.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
-  const create =
-    overrides.create ??
-    mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Err("workspaceHost.create not mocked"))
-    );
-  const discardExtensionMetadataEntry =
-    overrides.discardExtensionMetadataEntry ?? mock(() => Promise.resolve());
-
+  const mocks = {
+    sendMessage:
+      overrides.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
+    resumeStream:
+      overrides.resumeStream ??
+      mock((): Promise<Result<{ started: boolean }>> => Promise.resolve(Ok({ started: true }))),
+    clearQueue: overrides.clearQueue ?? mock((): Result<void> => Ok(undefined)),
+    removeQueuedWorkspaceTurn:
+      overrides.removeQueuedWorkspaceTurn ?? mock((): Result<boolean> => Ok(true)),
+    isBusyForMessage: overrides.isBusyForMessage ?? mock(() => false),
+    getQueueCutCutter: overrides.getQueueCutCutter ?? mock(() => undefined),
+    remove:
+      overrides.remove ??
+      overrides.removeWhileTaskTreeLocked ??
+      mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
+    updateTitle:
+      overrides.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
+    emitChatEvent: overrides.emitChatEvent ?? mock(() => undefined),
+    emit: overrides.emit ?? mock(() => true),
+    archive:
+      overrides.archive ??
+      overrides.archiveWhileTaskTreeLocked ??
+      mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))),
+    unarchive:
+      overrides.unarchive ??
+      overrides.unarchiveWhileTaskTreeLocked ??
+      mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
+    isWorkflowInvocationCurrent:
+      overrides.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true)),
+    create:
+      overrides.create ??
+      mock(
+        (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+          Promise.resolve(Err("workspaceHost.create not mocked"))
+      ),
+    discardExtensionMetadataEntry:
+      overrides.discardExtensionMetadataEntry ?? mock(() => Promise.resolve()),
+  };
+  const { unarchive, ...hostMocks } = mocks;
   const workspaceService = makeWorkspaceHostFake({
     ...overrides,
-    create,
-    discardExtensionMetadataEntry,
-    sendMessage,
-    resumeStream,
-    clearQueue,
-    removeQueuedWorkspaceTurn,
-    isBusyForMessage,
-    getQueueCutCutter,
-    archive,
-    archiveWhileTaskTreeLocked: archive,
+    ...hostMocks,
+    archiveWhileTaskTreeLocked: mocks.archive,
     unarchiveWhileTaskTreeLocked: unarchive,
-    remove,
-    removeWhileTaskTreeLocked: remove,
-    updateTitle,
-    emitChatEvent,
-    emit,
-    isWorkflowInvocationCurrent,
+    removeWhileTaskTreeLocked: mocks.remove,
   });
 
-  return {
-    workspaceService,
-    create,
-    discardExtensionMetadataEntry,
-    sendMessage,
-    resumeStream,
-    clearQueue,
-    removeQueuedWorkspaceTurn,
-    isBusyForMessage,
-    getQueueCutCutter,
-    remove,
-    updateTitle,
-    emitChatEvent,
-    emit,
-    archive,
-    unarchive,
-    isWorkflowInvocationCurrent,
-  };
+  return { workspaceService, ...mocks };
 }
 
 // Registers the created workspace-turn checkout in config the way the real create()
