@@ -21,7 +21,7 @@ import { CompactionBoundaryMessage } from "./CompactionBoundaryMessage";
 import { HistoryHiddenMessage } from "./HistoryHiddenMessage";
 import { InitMessage } from "./InitMessage";
 import { ProposePlanToolCall } from "../Tools/ProposePlanToolCall";
-import { removeEphemeralMessage } from "@/browser/stores/WorkspaceStore";
+import { removeEphemeralMessage, useStreamingMessageDelta } from "@/browser/stores/WorkspaceStore";
 import { TranscriptMessageBoundary, TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
 interface MessageRendererProps {
@@ -90,6 +90,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     taskReportLinking,
     userMessageNavigation,
   }) => {
+    message = useStreamingMessageDelta(workspaceId, message);
     let renderedMessage: React.ReactNode;
 
     // Route based on message type

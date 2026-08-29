@@ -694,6 +694,14 @@ function repriceSessionUsage(
  * specific workspaces via useSyncExternalStore, ensuring only relevant
  * components re-render when workspace state changes.
  */
+function getStreamingMessageKey(workspaceId: string, messageId: string): string {
+  return workspaceId + " " + messageId;
+}
+
+function getAdvisorLiveKey(workspaceId: string, toolCallId: string): string {
+  return workspaceId + " " + toolCallId;
+}
+
 export class WorkspaceStore {
   // Per-workspace state (lazy computed on get)
   private states = new MapStore<string, WorkspaceState>();
@@ -839,10 +847,9 @@ export class WorkspaceStore {
   // RAF presentation clock isn't competing with a 100ms ingestion clock.
   private deltaIdleHandles = new Map<string, number>();
 
-  // Microtask coalescing for streaming deltas. Many deltas can arrive in the same
-  // task pump (ORPC iterator drain); we collapse them into a single states.bump()
-  // at the microtask tail so React reconciles once per pump instead of once per chunk.
-  private pendingStreamingBump = new Set<string>();
+  private pendingStreamingMessageBump = new Map<string, string>();
+  private streamingMessageStore = new MapStore<string, DisplayedMessage | null>();
+  private advisorLiveStore = new MapStore<string, void>();
 
   // Live streaming stats (tokens/sec) — exposed via useWorkspaceStreamingStats() as a
   // leaf subscription. Updated on every stream-delta in the same coalesced microtask
@@ -912,7 +919,7 @@ export class WorkspaceStore {
     },
     "stream-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingStateBump(workspaceId);
+      this.scheduleStreamingMessageBump(workspaceId, aggregator);
     },
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
@@ -1010,7 +1017,7 @@ export class WorkspaceStore {
     },
     "tool-call-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingStateBump(workspaceId);
+      this.scheduleStreamingMessageBump(workspaceId, aggregator);
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
@@ -1065,7 +1072,7 @@ export class WorkspaceStore {
     },
     "reasoning-delta": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingStateBump(workspaceId);
+      this.scheduleStreamingMessageBump(workspaceId, aggregator);
     },
     "reasoning-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1657,36 +1664,50 @@ export class WorkspaceStore {
     this.deltaIdleHandles.set(workspaceId, handle);
   }
 
-  /**
-   * Coalesce streaming state bumps to a single microtask per workspace.
-   *
-   * Streaming text/reasoning/tool deltas land in the aggregator immediately, but
-   * the React notification is deferred to the microtask tail of the current
-   * task pump. Many deltas can arrive in the same pump (the ORPC iterator
-   * drains a queue) — we want React to reconcile once per pump, not once per
-   * chunk.
-   *
-   * Why microtask and not requestIdleCallback? The smoothing engine
-   * ({@link useSmoothStreamingText}) is the presentation clock — pacing the
-   * visible reveal at RAF frequency. The ingestion clock should be deterministic
-   * and prompt; an idle-callback ingestion delay (~100ms) just means the
-   * smoothing engine has to absorb burstier inputs and is more likely to hit
-   * its visual-lag safety net.
-   */
-  private scheduleStreamingStateBump(workspaceId: string): void {
-    if (this.pendingStreamingBump.has(workspaceId)) return;
-    this.pendingStreamingBump.add(workspaceId);
+  private scheduleStreamingMessageBump(
+    workspaceId: string,
+    aggregator: StreamingMessageAggregator
+  ): void {
+    const messageId = aggregator.getActiveStreamMessageId();
+    if (!messageId || this.pendingStreamingMessageBump.has(workspaceId)) return;
+    const key = getStreamingMessageKey(workspaceId, messageId);
+    this.pendingStreamingMessageBump.set(workspaceId, key);
     queueMicrotask(() => {
-      // Cleared by cancelPendingStreamingBump (e.g. on stream-end) — skip the bump
-      // so we don't double-notify after the terminal event already bumped state.
-      if (!this.pendingStreamingBump.delete(workspaceId)) return;
-      this.states.bump(workspaceId);
+      if (this.pendingStreamingMessageBump.get(workspaceId) !== key) return;
+      this.pendingStreamingMessageBump.delete(workspaceId);
+      this.streamingMessageStore.bump(key);
       this.streamingStatsStore.bump(workspaceId);
     });
   }
 
   private cancelPendingStreamingBump(workspaceId: string): void {
-    this.pendingStreamingBump.delete(workspaceId);
+    this.pendingStreamingMessageBump.delete(workspaceId);
+  }
+
+  getStreamingMessage(
+    workspaceId: string,
+    displayedId: string,
+    messageId: string
+  ): DisplayedMessage | null {
+    return this.streamingMessageStore.get(
+      getStreamingMessageKey(workspaceId, messageId),
+      () =>
+        this.aggregators
+          .get(workspaceId)
+          ?.getDisplayedMessages()
+          .find((message) => message.id === displayedId) ?? null
+    );
+  }
+
+  subscribeStreamingMessage(
+    workspaceId: string,
+    messageId: string,
+    listener: () => void
+  ): () => void {
+    return this.streamingMessageStore.subscribeKey(
+      getStreamingMessageKey(workspaceId, messageId),
+      listener
+    );
   }
 
   /**
@@ -1998,6 +2019,10 @@ export class WorkspaceStore {
   subscribeKey = (workspaceId: string, listener: () => void) => {
     return this.states.subscribeKey(workspaceId, listener);
   };
+
+  subscribeAdvisorLive(workspaceId: string, toolCallId: string, listener: () => void): () => void {
+    return this.advisorLiveStore.subscribeKey(getAdvisorLiveKey(workspaceId, toolCallId), listener);
+  }
 
   getBashToolLiveOutput(workspaceId: string, toolCallId: string): LiveBashOutputView | null {
     const state = this.chatTransientState.get(workspaceId)?.liveBashOutput.get(toolCallId);
@@ -4590,7 +4615,7 @@ export class WorkspaceStore {
         return;
       }
 
-      this.scheduleStreamingStateBump(workspaceId);
+      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
       return;
     }
 
@@ -4609,7 +4634,7 @@ export class WorkspaceStore {
         return;
       }
 
-      this.scheduleStreamingStateBump(workspaceId);
+      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
       return;
     }
 
@@ -4942,7 +4967,7 @@ export function useAdvisorToolLiveOutput(
   return useSyncExternalStore(
     (listener) => {
       if (!workspaceId) return () => undefined;
-      return store.subscribeKey(workspaceId, listener);
+      return store.subscribeAdvisorLive(workspaceId, toolCallId ?? "", listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
@@ -4963,7 +4988,7 @@ export function useAdvisorToolLiveReasoning(
   return useSyncExternalStore(
     (listener) => {
       if (!workspaceId) return () => undefined;
-      return store.subscribeKey(workspaceId, listener);
+      return store.subscribeAdvisorLive(workspaceId, toolCallId ?? "", listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
@@ -5203,6 +5228,24 @@ export function useWorkspaceRoundedStreamingTps(workspaceId: string): number | n
   return useSyncExternalStore(
     (listener: () => void) => store.subscribeStreamingStats(workspaceId, listener),
     () => store.getWorkspaceRoundedStreamingTps(workspaceId)
+  );
+}
+
+export function useStreamingMessageDelta(
+  workspaceId: string | undefined,
+  message: DisplayedMessage
+): DisplayedMessage {
+  const store = getStoreInstance();
+  const messageId = "historyId" in message ? message.historyId : null;
+  return useSyncExternalStore(
+    (listener) => {
+      if (!workspaceId || !messageId) return () => undefined;
+      return store.subscribeStreamingMessage(workspaceId, messageId, listener);
+    },
+    () => {
+      if (!workspaceId || !messageId) return message;
+      return store.getStreamingMessage(workspaceId, message.id, messageId) ?? message;
+    }
   );
 }
 
