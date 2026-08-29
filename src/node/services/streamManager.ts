@@ -782,8 +782,30 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
  * - Atomic stream creation/cancellation operations
  * - Guaranteed resource cleanup in all code paths
  */
+export interface PendingStreamStartHandle {
+  readonly abortSignal: AbortSignal;
+  readonly syntheticMessageId: string;
+  finish(): void;
+}
+
+export interface MockStreamLifecycle {
+  isStreaming(workspaceId: string): boolean;
+  stop(workspaceId: string): Promise<void>;
+  replayStream(workspaceId: string): Promise<void>;
+}
+
 export class StreamManager {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
+  private readonly pendingStreamStarts = new Map<
+    string,
+    {
+      abortController: AbortController;
+      startTime: number;
+      syntheticMessageId: string;
+      acpPromptId?: string;
+    }
+  >();
+  private mockStreamLifecycle?: MockStreamLifecycle;
   private streamLocks = new Map<WorkspaceId, AsyncMutex>();
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
   private readonly historyService: HistoryService;
@@ -849,6 +871,44 @@ export class StreamManager {
 
   setMCPServerManager(manager: MCPServerManager | undefined): void {
     this.mcpServerManager = manager;
+  }
+
+  setMockStreamLifecycle(lifecycle: MockStreamLifecycle | undefined): void {
+    this.mockStreamLifecycle = lifecycle;
+  }
+
+  beginStreamStart(input: {
+    workspaceId: string;
+    abortSignal?: AbortSignal;
+    acpPromptId?: string;
+  }): PendingStreamStartHandle {
+    const abortController = new AbortController();
+    const startTime = Date.now();
+    const syntheticMessageId =
+      "starting-" + startTime + "-" + Math.random().toString(36).substring(2, 11);
+    const unlinkAbortSignal = linkAbortSignal(input.abortSignal, abortController);
+
+    this.pendingStreamStarts.set(input.workspaceId, {
+      abortController,
+      startTime,
+      syntheticMessageId,
+      acpPromptId: input.acpPromptId,
+    });
+
+    let finished = false;
+    return {
+      abortSignal: abortController.signal,
+      syntheticMessageId,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        unlinkAbortSignal();
+        const pending = this.pendingStreamStarts.get(input.workspaceId);
+        if (pending?.abortController === abortController) {
+          this.pendingStreamStarts.delete(input.workspaceId);
+        }
+      },
+    };
   }
 
   recordToolModelUsage(
@@ -4992,23 +5052,44 @@ export class StreamManager {
     options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
   ): Promise<Result<void>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
+    const pending = this.pendingStreamStarts.get(workspaceId);
+    const isActuallyStreaming = this.mockStreamLifecycle
+      ? this.mockStreamLifecycle.isStreaming(workspaceId)
+      : this.isStreaming(workspaceId);
+
+    if (pending) {
+      pending.abortController.abort();
+      if (!isActuallyStreaming) {
+        await this.emitStreamAbort(
+          typedWorkspaceId,
+          pending.syntheticMessageId,
+          { duration: Date.now() - pending.startTime },
+          options?.abortReason ?? "startup",
+          options?.abandonPartial,
+          pending.acpPromptId
+        );
+      }
+    }
+
+    if (this.mockStreamLifecycle) {
+      await this.mockStreamLifecycle.stop(workspaceId);
+      return Ok(undefined);
+    }
 
     try {
       const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
       if (!streamInfo) {
-        const abortReason = options?.abortReason ?? "startup";
-        // Emit abort event so frontend clears pending stream state.
-        // This handles the case where user interrupts before stream-start arrives.
-        // Use empty messageId - frontend handles gracefully (just clears pendingStreamStartTime).
-        void this.emitStreamAbort(
-          typedWorkspaceId,
-          "",
-          {},
-          abortReason,
-          options?.abandonPartial
-        ).catch((error) => {
-          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-        });
+        if (!pending) {
+          void this.emitStreamAbort(
+            typedWorkspaceId,
+            "",
+            {},
+            options?.abortReason ?? "startup",
+            options?.abandonPartial
+          ).catch((error) => {
+            log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+          });
+        }
         return Ok(undefined);
       }
 
@@ -5016,14 +5097,12 @@ export class StreamManager {
       const soft = options?.soft ?? false;
 
       if (soft) {
-        // Soft interrupt: set flag, will cancel at next block boundary
         streamInfo.softInterrupt = {
           pending: true,
           abandonPartial: options?.abandonPartial ?? false,
           abortReason,
         };
       } else {
-        // Hard interrupt: cancel immediately
         await this.cancelStreamSafely(
           typedWorkspaceId,
           streamInfo,
@@ -5034,7 +5113,7 @@ export class StreamManager {
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
-      return Err(`Failed to stop stream: ${message}`);
+      return Err("Failed to stop stream: " + message);
     }
   }
 
@@ -5051,6 +5130,9 @@ export class StreamManager {
    * Checks if a workspace currently has an active stream
    */
   isStreaming(workspaceId: string): boolean {
+    if (this.mockStreamLifecycle) {
+      return this.mockStreamLifecycle.isStreaming(workspaceId);
+    }
     const state = this.getStreamState(workspaceId);
     return state === StreamState.STARTING || state === StreamState.STREAMING;
   }
@@ -5109,6 +5191,11 @@ export class StreamManager {
    * This allows replay to flow through the same event path as live streaming (no duplication)
    */
   async replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
+    if (this.mockStreamLifecycle) {
+      await this.mockStreamLifecycle.replayStream(workspaceId);
+      return;
+    }
+
     const typedWorkspaceId = workspaceId as WorkspaceId;
     const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
 
