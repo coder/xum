@@ -42,7 +42,7 @@ interface SubscriptionLoopOptions<TClient, TEvent, TContext> {
   sleep?: (timeoutMs: number, signal: AbortSignal) => Promise<void>;
 }
 
-function sleepWithAbort(timeoutMs: number, signal: AbortSignal): Promise<void> {
+export function sleepWithAbort(timeoutMs: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) {
       resolve();

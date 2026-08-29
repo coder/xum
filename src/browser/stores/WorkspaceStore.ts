@@ -32,6 +32,7 @@ import {
   SUBSCRIPTION_RETRY_BASE_MS,
   calculateSubscriptionBackoffMs,
   runSubscriptionLoop,
+  sleepWithAbort,
 } from "@/browser/stores/subscriptionTransport";
 import {
   ADVISOR_LIVE_OUTPUT_MAX_CHARS,
@@ -3145,32 +3146,6 @@ export class WorkspaceStore {
     }
   }
 
-  private sleepWithAbort(timeoutMs: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve) => {
-      if (signal.aborted) {
-        resolve();
-        return;
-      }
-
-      const onAbort = () => {
-        cleanup();
-        resolve();
-      };
-
-      const timeout = setTimeout(() => {
-        cleanup();
-        resolve();
-      }, timeoutMs);
-
-      const cleanup = () => {
-        clearTimeout(timeout);
-        signal.removeEventListener("abort", onAbort);
-      };
-
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
-
   private isWorkspaceRegistered(workspaceId: string): boolean {
     return this.workspaceMetadata.has(workspaceId);
   }
@@ -3576,7 +3551,7 @@ export class WorkspaceStore {
   ): Promise<void> {
     let attempt = 0;
     while (!signal.aborted && !attemptSignal.aborted) {
-      await this.sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
+      await sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
       attempt++;
       if (signal.aborted || attemptSignal.aborted) {
         return;
