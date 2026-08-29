@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 
-import {
-  type AgentMessageRelationship,
-  formatAgentMessageEnvelope,
-} from "@/common/utils/agentMessageEnvelope";
+import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
@@ -30,15 +27,8 @@ export type AgentPeerMessageAdmissionError =
   | { code: "refused"; reason: string }
   | { code: "rate_limited"; retryAfterMs?: number };
 
-export interface PreparedPeerMessage {
-  envelope: string;
-  fromTitle?: string;
-  payloadMessageId: string;
-  relationship: AgentMessageRelationship;
-  trigger: string;
-}
-
 export class AgentPeerMessageBroker {
+  // Serialize multi-step delivery per target so concurrent senders cannot interleave admission.
   private readonly deliveryLocks = new MutexMap<string>();
   private readonly familyMessageTotals = new Map<string, { count: number; chars: number }>();
   private readonly familyMessageTargetTotals = new Map<string, { count: number; chars: number }>();
@@ -62,7 +52,7 @@ export class AgentPeerMessageBroker {
     this.sweepPeerMessageThrottleState(now);
 
     const rateCutoff = now - PEER_MESSAGE_RATE_WINDOW_MS;
-    const pairKey = this.pairKey(senderWorkspaceId, targetId);
+    const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
     const pairTimes = (this.peerMessageSendTimesByPair.get(pairKey) ?? []).filter(
       (time) => time > rateCutoff
     );
@@ -82,9 +72,7 @@ export class AgentPeerMessageBroker {
       };
     }
 
-    const lastDuplicate = this.peerMessageDedupeTimes.get(
-      this.dedupeKey(senderWorkspaceId, targetId, message)
-    );
+    const lastDuplicate = this.peerMessageDedupeTimes.get(`${pairKey}\u0000${message}`);
     if (lastDuplicate != null && now - lastDuplicate < PEER_MESSAGE_DEDUPE_WINDOW_MS) {
       return {
         code: "refused",
@@ -114,14 +102,14 @@ export class AgentPeerMessageBroker {
 
   recordPeerSend(senderWorkspaceId: string, targetId: string, message: string): void {
     const now = this.now();
-    const pairKey = this.pairKey(senderWorkspaceId, targetId);
+    const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
     const pairTimes = this.peerMessageSendTimesByPair.get(pairKey) ?? [];
     pairTimes.push(now);
     this.peerMessageSendTimesByPair.set(pairKey, pairTimes);
     const targetTimes = this.peerMessageSendTimesByTarget.get(targetId) ?? [];
     targetTimes.push(now);
     this.peerMessageSendTimesByTarget.set(targetId, targetTimes);
-    this.peerMessageDedupeTimes.set(this.dedupeKey(senderWorkspaceId, targetId, message), now);
+    this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, now);
   }
 
   chargeConsecutivePeerWake(targetId: string): void {
@@ -137,9 +125,9 @@ export class AgentPeerMessageBroker {
     senderTitle?: string;
     relation: "target_ancestor" | "peer";
     message: string;
-  }): PreparedPeerMessage {
-    const relationship: AgentMessageRelationship =
-      params.relation === "target_ancestor" ? "descendant" : "sibling";
+  }) {
+    const relationship =
+      params.relation === "target_ancestor" ? ("descendant" as const) : ("sibling" as const);
     const fromTitle = params.senderTitle != null ? this.capTitle(params.senderTitle) : undefined;
     const envelope = formatAgentMessageEnvelope({
       from: params.senderWorkspaceId,
@@ -167,7 +155,7 @@ export class AgentPeerMessageBroker {
     chars: number
   ): (() => void) | null {
     assert(chars > 0, "reserveBudget: chars must be positive");
-    const pairKey = this.pairKey(senderWorkspaceId, targetWorkspaceId);
+    const pairKey = `${senderWorkspaceId}\u0000${targetWorkspaceId}`;
     const pairTotals = this.familyMessageTotals.get(pairKey) ?? { count: 0, chars: 0 };
     const targetTotals = this.familyMessageTargetTotals.get(targetWorkspaceId) ?? {
       count: 0,
@@ -223,14 +211,6 @@ export class AgentPeerMessageBroker {
 
   withDeliveryLock<T>(targetId: string, fn: () => Promise<T>): Promise<T> {
     return this.deliveryLocks.withLock(targetId, fn);
-  }
-
-  private pairKey(senderWorkspaceId: string, targetId: string): string {
-    return `${senderWorkspaceId}\u0000${targetId}`;
-  }
-
-  private dedupeKey(senderWorkspaceId: string, targetId: string, message: string): string {
-    return `${this.pairKey(senderWorkspaceId, targetId)}\u0000${message}`;
   }
 
   private sweepPeerMessageThrottleState(now: number): void {

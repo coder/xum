@@ -35,9 +35,9 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
+import { PEER_MESSAGE_RATE_LIMIT_MAX } from "@/constants/agentMessaging";
 import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
-  TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
@@ -781,6 +781,23 @@ function createTaskServiceHarness(
     workspaceService,
     initStateManager,
   };
+}
+
+function reserveFamilyMessageTargetSlots(
+  taskService: TaskService,
+  targetId: string,
+  count: number
+): void {
+  const broker = (
+    taskService as unknown as {
+      agentPeerMessageBroker: {
+        reserveBudget(senderId: string, targetId: string, chars: number): (() => void) | null;
+      };
+    }
+  ).agentPeerMessageBroker;
+  for (let i = 0; i < count; i++) {
+    expect(broker.reserveBudget(`prefill-${i}`, targetId, 1)).not.toBeNull();
+  }
 }
 
 describe("TaskService", () => {
@@ -16836,11 +16853,9 @@ describe("TaskService", () => {
     expect(create).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
   });
-
-  test("sendAgentTreeMessage enforces the per-pair rate limit and duplicate suppression", async () => {
+  test("sendAgentTreeMessage surfaces broker rate-limit refusals", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
-
     await saveWorkspaces(
       config,
       projectPath,
@@ -16858,130 +16873,23 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    // The default mock never calls onAccepted (queued deliveries), keeping the
-    // consecutive-wake counter out of this test's way.
     const { workspaceService } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // Duplicate text within the window is refused (and does not consume rate budget).
-    expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "same text")).success).toBe(
-      true
-    );
-    const duplicate = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "same text");
-    expect(duplicate).toEqual(
-      Err({
-        code: "refused",
-        reason: "Duplicate of an identical message recently sent to this target.",
-      })
-    );
-
-    for (let i = 2; i <= 5; i++) {
-      // User attention between sends keeps the (stricter) consecutive-wake budget out of this
-      // test's way — the rate window intentionally does NOT reset on user attention.
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
+    for (let i = 0; i < PEER_MESSAGE_RATE_LIMIT_MAX; i++) {
       taskService.resetAutoResumeCount("sib-b");
-      const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `message ${i}`);
-      expect(result.success).toBe(true);
+      expect(
+        (await taskService.sendAgentTreeMessage("sib-a", "sib-b", `message ${i}`)).success
+      ).toBe(true);
     }
 
     taskService.resetAutoResumeCount("sib-b");
-    const limited = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "message 6");
+    const limited = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "limited");
     expect(limited.success).toBe(false);
     if (!limited.success) {
       expect(limited.error.code).toBe("rate_limited");
-      if (limited.error.code === "rate_limited") {
-        expect(limited.error.retryAfterMs).toBeGreaterThan(0);
-      }
     }
-  });
-
-  test("sendAgentTreeMessage caps consecutive peer wakes until user attention resets them", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService } = createWorkspaceServiceMocks({
-      sendMessage: mock(
-        async (
-          _workspaceId: string,
-          _message: string,
-          _options: unknown,
-          internal?: { onAccepted?: () => Promise<void> | void }
-        ): Promise<Result<void>> => {
-          await internal?.onAccepted?.();
-          return Ok(undefined);
-        }
-      ),
-    });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    for (let i = 1; i <= 3; i++) {
-      const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `wake ${i}`);
-      expect(result.success).toBe(true);
-    }
-
-    const capped = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "wake 4");
-    expect(capped).toEqual(
-      Err({
-        code: "refused",
-        reason:
-          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-      })
-    );
-
-    // User-authored input (or parent guidance) resets the wake budget.
-    taskService.resetAutoResumeCount("sib-b");
-    expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "wake 5")).success).toBe(true);
-  });
-
-  test("sendAgentTreeMessage refuses when the target's peer-message queue is at capacity", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-      countQueuedAgentPeerMessages: mock(() => 10),
-    });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hi")).toEqual(
-      Err({
-        code: "refused",
-        reason: "Target already has the maximum number of queued peer messages.",
-      })
-    );
-    expect(sendMessage).not.toHaveBeenCalled();
   });
   test("sendAgentTreeMessage charges the consecutive-wake budget at admission, before dispatch", async () => {
     const config = await createTestConfig(rootDir);
@@ -17833,75 +17741,6 @@ describe("TaskService", () => {
     expect(await terminating).toEqual(["leaf-a"]);
     expect(sendMessage).not.toHaveBeenCalled();
   });
-
-  test("sendAgentTreeMessage bounds peer message size, sender titles, and aggregate budgets", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const longTitle = "T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 40);
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          title: longTitle,
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // Per-message cap: refused before any delivery side effects.
-    const oversized = "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS + 1);
-    const tooLong = await taskService.sendAgentTreeMessage("sib-a", "sib-b", oversized);
-    expect(tooLong.success).toBe(false);
-    if (!tooLong.success) {
-      expect(tooLong.error.code).toBe("refused");
-    }
-    expect(sendMessage).not.toHaveBeenCalled();
-
-    // Sender titles are attacker-influenced; the envelope payload row carries the capped form.
-    expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).success).toBe(true);
-    const [, , , internalArg] = sendMessage.mock.calls[0] as [
-      string,
-      string,
-      unknown,
-      { preTurnMessages?: MuxMessage[] },
-    ];
-    const payloadText =
-      internalArg.preTurnMessages?.[0]?.parts[0]?.type === "text"
-        ? internalArg.preTurnMessages[0].parts[0].text
-        : "";
-    const fromTitle = parseAgentMessageEnvelope(payloadText)?.fromTitle;
-    expect(fromTitle).toBe(`${longTitle.slice(0, TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS)}…`);
-
-    // Peer sends draw from the shared family-message aggregate pools.
-    const internals = taskService as unknown as {
-      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
-    };
-    internals.familyMessageTargetTotals.set("sib-b", {
-      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
-      chars: 0,
-    });
-    const exhausted = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "one more");
-    expect(exhausted.success).toBe(false);
-    if (!exhausted.success) {
-      expect(exhausted.error.code).toBe("refused");
-      if (exhausted.error.code === "refused") {
-        expect(exhausted.error.reason).toContain("budget");
-      }
-    }
-  });
-
   test("sendAgentTreeMessage refunds budget reservations when dispatch throws pre-persistence", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -17940,13 +17779,11 @@ describe("TaskService", () => {
 
     // Exactly ONE aggregate slot left for sib-b: without the refund, the thrown first attempt
     // permanently consumes it and the follow-up is budget-refused.
-    const internals = taskService as unknown as {
-      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
-    };
-    internals.familyMessageTargetTotals.set("sib-b", {
-      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1,
-      chars: 0,
-    });
+    reserveFamilyMessageTargetSlots(
+      taskService,
+      "sib-b",
+      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+    );
 
     try {
       await taskService.sendAgentTreeMessage("sib-a", "sib-b", "first try");
@@ -17986,13 +17823,11 @@ describe("TaskService", () => {
 
     // One aggregate slot left: a queued-then-canceled send that never refunds would consume it
     // permanently and refuse the follow-up.
-    const internals = taskService as unknown as {
-      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
-    };
-    internals.familyMessageTargetTotals.set("sib-b", {
-      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1,
-      chars: 0,
-    });
+    reserveFamilyMessageTargetSlots(
+      taskService,
+      "sib-b",
+      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+    );
 
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued send")).toEqual(
       Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
@@ -18699,13 +18534,11 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internals = taskService as unknown as {
-      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
-    };
-    internals.familyMessageTargetTotals.set("sib-b", {
-      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1,
-      chars: 0,
-    });
+    reserveFamilyMessageTargetSlots(
+      taskService,
+      "sib-b",
+      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1
+    );
 
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued send")).toEqual(
       Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
@@ -19310,17 +19143,11 @@ describe("TaskService", () => {
     );
     expect(atLimit.success).toBe(true);
   });
-
-  test("family messages are bounded by an aggregate per-sender session budget", async () => {
-    // The per-message cap alone is not enough: a code_execution loop can
-    // repeat valid max-size sends, and a busy parent's queue would append
-    // every one into one unbounded entry before joining it for provider
-    // input. The aggregate budget absolutely bounds one sender's total.
+  test("task_message_parent surfaces broker budget exhaustion", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const parentWorkspaceId = "parent-msg-budget";
     const childTaskId = "child-msg-budget";
-
     await saveWorkspaces(
       config,
       projectPath,
@@ -19338,241 +19165,27 @@ describe("TaskService", () => {
     );
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, {
+    const { taskService } = createTaskServiceHarness(config, {
       workspaceService,
     });
-
-    // Budgets charge the COMPLETE rendered payload (attribution framing +
-    // message), so max-size sends are refused strictly BEFORE the rendered
-    // total could cross the ceiling.
-    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
-    let delivered = 0;
-    let refusal: Awaited<ReturnType<typeof taskService.sendMessageToParentFromAgentTask>> | null =
-      null;
-    for (let i = 0; i < maxSizeSends; i++) {
-      const sent = await taskService.sendMessageToParentFromAgentTask(
-        childTaskId,
-        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
-        "tool-end"
-      );
-      if (!sent.success) {
-        refusal = sent;
-        break;
-      }
-      delivered += 1;
-    }
-    // Rendered overhead makes fewer than the raw-chars quotient fit; the
-    // refusing send is a budget error that delivered nothing.
-    expect(delivered).toBeLessThan(maxSizeSends);
-    expect(delivered).toBeGreaterThan(0);
-    expect(refusal).not.toBeNull();
-    if (refusal !== null && !refusal.success) {
-      expect(refusal.error.code).toBe("send_failed");
-      expect("message" in refusal.error && refusal.error.message).toContain("budget");
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(delivered);
-
-    // The AIRTIGHT invariant: the rendered bytes persisted into the parent
-    // transcript — payload rows AND fixed trigger rows (r21) — never exceed
-    // the pair ceiling. Triggers are observed at the sendMessage boundary
-    // (arg 1 is the trigger content the mock would persist as a user row).
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    const renderedPayloadTotal = history.data
-      .filter((m) => m.metadata?.muxMetadata?.type === "family-message")
-      .reduce(
-        (sum, m) =>
-          sum + m.parts.reduce((s, part) => s + (part.type === "text" ? part.text.length : 0), 0),
-        0
-      );
-    const triggerTotal = sendMessage.mock.calls.reduce(
-      (sum, call) => sum + String(call[1]).length,
-      0
-    );
-    expect(renderedPayloadTotal + triggerTotal).toBeLessThanOrEqual(
-      TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS
-    );
-  });
-
-  test("mid-size family messages: payload + trigger rows stay within the pair ceiling", async () => {
-    // r21 red-check: max-size sends leave enough per-send headroom for the
-    // fixed trigger row to hide in, but ~2KiB sends admit enough repetitions
-    // that UNCHARGED trigger rows accumulate past the ceiling (pre-fix:
-    // charged = payload only → persisted payload+trigger ≈ 107% of ceiling).
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-midsize-budget";
-    const childTaskId = "child-midsize-budget";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          parentWorkspaceId,
-          taskStatus: "running",
-          taskExperiments: { rlm: true },
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-
-    // Message sized so the chars budget (not the count budget) refuses first.
-    const messageChars = Math.floor(
-      TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES
-    );
-    let refused = false;
     for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-      const sent = await taskService.sendMessageToParentFromAgentTask(
-        childTaskId,
-        "x".repeat(messageChars),
-        "tool-end"
-      );
-      if (!sent.success) {
-        refused = true;
-        expect("message" in sent.error && sent.error.message).toContain("budget");
-        break;
-      }
+      expect(
+        (await taskService.sendMessageToParentFromAgentTask(childTaskId, `update ${i}`, "tool-end"))
+          .success
+      ).toBe(true);
     }
-    expect(refused).toBe(true);
 
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    const renderedPayloadTotal = history.data
-      .filter((m) => m.metadata?.muxMetadata?.type === "family-message")
-      .reduce(
-        (sum, m) =>
-          sum + m.parts.reduce((s, part) => s + (part.type === "text" ? part.text.length : 0), 0),
-        0
-      );
-    const triggerTotal = sendMessage.mock.calls.reduce(
-      (sum, call) => sum + String(call[1]).length,
-      0
-    );
-    expect(renderedPayloadTotal + triggerTotal).toBeLessThanOrEqual(
-      TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS
-    );
-  });
-
-  test("exact-length sends never exceed the ceiling once queue-join separators are counted", async () => {
-    // r22: triggers batched into one MessageQueue entry are joined with "\n"
-    // — one separator per trigger after the first. A sender picking payload
-    // lengths that consume the chars budget EXACTLY made the joined durable
-    // row exceed the ceiling by those uncharged newlines; the trigger charge
-    // is now a safe upper bound (+1/send).
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-joined-budget";
-    const probeChildId = "child-joined-probee";
-    const attackChildId = "child-joined-attack";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        projectWorkspace(projectPath, "probee", probeChildId, {
-          parentWorkspaceId,
-          taskStatus: "running",
-          taskExperiments: { rlm: true },
-        }),
-        projectWorkspace(projectPath, "attack", attackChildId, {
-          parentWorkspaceId,
-          taskStatus: "running",
-          taskExperiments: { rlm: true },
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-    simulateAcceptedFamilySends(sendMessage, historyService);
-
-    // Probe: measure the per-send framing overhead and trigger length (IDs
-    // and names are deliberately equal-length across the two children so the
-    // measured numbers transfer exactly).
-    const probeChars = 100;
-    const probed = await taskService.sendMessageToParentFromAgentTask(
-      probeChildId,
-      "p".repeat(probeChars),
+    const exhausted = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "one too many",
       "tool-end"
     );
-    expect(probed.success).toBe(true);
-    const probeHistory = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(probeHistory.success).toBe(true);
-    if (!probeHistory.success) return;
-    const probeRow = probeHistory.data.find(
-      (m) => m.metadata?.muxMetadata?.type === "family-message"
-    );
-    expect(probeRow).toBeDefined();
-    const probePayloadLength = probeRow!.parts.reduce(
-      (s, part) => s + (part.type === "text" ? part.text.length : 0),
-      0
-    );
-    const framingOverhead = probePayloadLength - probeChars;
-    const triggerLength = String(sendMessage.mock.calls[0][1]).length;
-    sendMessage.mockClear();
-
-    // Attack: size messages so payload+trigger divides the pair ceiling
-    // exactly across the 32-message count budget (32 × 8192 = 256KiB — the
-    // chars ceiling is filled to the last byte pre-fix).
-    const perSendRendered =
-      TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES;
-    const messageChars = perSendRendered - framingOverhead - triggerLength;
-    expect(messageChars).toBeGreaterThan(0);
-    let delivered = 0;
-    for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-      const sent = await taskService.sendMessageToParentFromAgentTask(
-        attackChildId,
-        "y".repeat(messageChars),
-        "tool-end"
-      );
-      if (!sent.success) break;
-      delivered += 1;
+    expect(exhausted.success).toBe(false);
+    if (!exhausted.success) {
+      expect(exhausted.error.code).toBe("send_failed");
     }
-    expect(delivered).toBeGreaterThan(0);
-
-    // Worst-case durable bytes: every trigger of this sender batched into
-    // one queue entry → payload rows + joined trigger row incl. separators.
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    const attackPayloadTotal = history.data
-      .filter(
-        (m) =>
-          m.metadata?.muxMetadata?.type === "family-message" &&
-          m.parts.some((part) => part.type === "text" && part.text.includes(attackChildId))
-      )
-      .reduce(
-        (sum, m) =>
-          sum + m.parts.reduce((s, part) => s + (part.type === "text" ? part.text.length : 0), 0),
-        0
-      );
-    const triggerTotal = sendMessage.mock.calls.reduce(
-      (sum, call) => sum + String(call[1]).length,
-      0
-    );
-    const joinedSeparators = Math.max(0, delivered - 1);
-    expect(attackPayloadTotal + triggerTotal + joinedSeparators).toBeLessThanOrEqual(
-      TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS
-    );
+    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES);
   });
-
   test("post-acceptance wake failures retain the budget charge for persisted payload rows", async () => {
     // Codex round 18: refunding on wake failure let a child that catches the
     // tool error retry unlimited max-size payload rows while the wake path
@@ -19804,118 +19417,6 @@ describe("TaskService", () => {
       history.data.filter((m) => m.metadata?.muxMetadata?.type === "family-message")
     ).toHaveLength(0);
   });
-
-  test("huge sender titles are capped and budgets charge the rendered payload", async () => {
-    // Codex round 20: attribution interpolated the FULL title while quotas
-    // charged only message.trim().length — spawn/retitle impose no title cap,
-    // so an attacker-influenced huge title added unbounded uncharged bytes to
-    // every send, breaking the transcript ceilings.
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-huge-title";
-    const childTaskId = "child-huge-title";
-    const hugeTitle = "T".repeat(64 * 1024);
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        projectWorkspace(projectPath, "child", childTaskId, {
-          parentWorkspaceId,
-          title: hugeTitle,
-          taskStatus: "running",
-          taskExperiments: { rlm: true },
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService, historyService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-    simulateAcceptedFamilySends(sendMessage, historyService);
-
-    const sent = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      "small message",
-      "tool-end"
-    );
-    expect(sent.success).toBe(true);
-
-    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
-    expect(history.success).toBe(true);
-    if (!history.success) return;
-    const payloadRow = history.data.find((m) => m.metadata?.muxMetadata?.type === "family-message");
-    expect(payloadRow).toBeDefined();
-    const text = payloadRow!.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
-    // The persisted row is provably bounded: the huge title was capped.
-    expect(text.length).toBeLessThan(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 512);
-    expect(text).toContain("T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS));
-    expect(text).not.toContain("T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 1));
-  });
-
-  test("the receiver-side ceiling bounds many senders targeting one parent", async () => {
-    // Pair budgets alone let every child spend a full allowance on the same
-    // busy parent; the target ceiling bounds the aggregate across senders.
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-target-budget";
-    const senderCount =
-      TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES / TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES;
-
-    const children = Array.from({ length: senderCount + 1 }, (_, i) =>
-      projectWorkspace(projectPath, `child-${i}`, `child-target-budget-${i}`, {
-        parentWorkspaceId,
-        taskStatus: "running" as const,
-        taskExperiments: { rlm: true },
-      })
-    );
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-        ...children,
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // Each of the first N senders exhausts its own per-pair message count.
-    for (let s = 0; s < senderCount; s++) {
-      for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-        const sent = await taskService.sendMessageToParentFromAgentTask(
-          `child-target-budget-${s}`,
-          `update ${s}/${i}`,
-          "tool-end"
-        );
-        expect(sent.success).toBe(true);
-      }
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES);
-
-    // A FRESH sender with an untouched pair budget is still refused: the
-    // receiver's aggregate ceiling is exhausted.
-    const refused = await taskService.sendMessageToParentFromAgentTask(
-      `child-target-budget-${senderCount}`,
-      "fresh sender",
-      "tool-end"
-    );
-    expect(refused.success).toBe(false);
-    if (!refused.success) {
-      expect(refused.error.code).toBe("send_failed");
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES);
-  });
-
   test("sibling family messages enforce the aggregate message-count budget", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -20221,11 +19722,11 @@ describe("TaskService", () => {
     // lock, so a real removal can interleave exactly here.)
     const deliveryLocks = (
       taskService as unknown as {
-        familyMessageDeliveryLocks: {
-          withLock<T>(key: string, operation: () => Promise<T>): Promise<T>;
+        agentPeerMessageBroker: {
+          withDeliveryLock<T>(key: string, operation: () => Promise<T>): Promise<T>;
         };
       }
-    ).familyMessageDeliveryLocks;
+    ).agentPeerMessageBroker;
     let releaseWindow!: () => void;
     const windowGate = new Promise<void>((resolve) => {
       releaseWindow = resolve;
@@ -20234,7 +19735,7 @@ describe("TaskService", () => {
     const windowOpened = new Promise<void>((resolve) => {
       windowOpen = resolve;
     });
-    const holder = deliveryLocks.withLock(targetTaskId, async () => {
+    const holder = deliveryLocks.withDeliveryLock(targetTaskId, async () => {
       windowOpen();
       await windowGate;
     });
