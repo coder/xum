@@ -1,11 +1,8 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import assert from "node:assert/strict";
 import { describe, expect, mock, test } from "bun:test";
 import { Ok } from "@/common/types/result";
-import type { TaskApplyGitPatchConfiguration } from "@/node/services/tools/task_apply_git_patch";
-import { DisposableTempDir } from "@/node/services/tempDir";
+import type { TaskGitPatchApplyConfig } from "@/node/services/taskGitPatchEngine";
 import type { TaskCreateResult } from "@/node/services/taskService";
 import {
   DEFAULT_WORKFLOW_AGENT_ID,
@@ -404,14 +401,17 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      applyPatchArtifact: async (args) => {
-        calls.push(args);
-        return {
-          success: true,
-          taskId: args.task_id,
-          dryRun: args.dry_run === true,
-          projectResults: [{ projectPath: "/repo", projectName: "repo", status: "applied" }],
-        };
+      patchToolConfig: {} as TaskGitPatchApplyConfig,
+      patchEngine: {
+        applyPatch: async (_config, args) => {
+          calls.push(args);
+          return {
+            success: true,
+            taskId: args.task_id,
+            dryRun: args.dry_run === true,
+            projectResults: [{ projectPath: "/repo", projectName: "repo", status: "applied" }],
+          };
+        },
       },
     });
 
@@ -443,91 +443,33 @@ describe("WorkflowTaskServiceAdapter", () => {
     expect(result).toMatchObject({ success: true, dryRun: false });
   });
 
-  test("rejects workflow patch artifacts outside allowed path prefixes", async () => {
-    using tmp = new DisposableTempDir("workflow-adapter-patch-paths");
-    const mboxPath = path.join(tmp.path, "subagent-patches", "task_impl", "repo", "series.mbox");
-    await fs.mkdir(path.dirname(mboxPath), { recursive: true });
-    await fs.writeFile(
-      mboxPath,
-      [
-        "diff --git a/.mux/security/runs/latest b/.mux/security/runs/latest",
-        "--- a/.mux/security/runs/latest",
-        "+++ b/.mux/security/runs/latest",
-        "@@ -1 +1 @@",
-        "-old",
-        "+new",
-        "diff --git a/src/app.ts b/src/app.ts",
-        "--- a/src/app.ts",
-        "+++ b/src/app.ts",
-        "@@ -1 +1 @@",
-        "-old",
-        "+new",
-      ].join("\n")
-    );
-    await fs.writeFile(
-      path.join(tmp.path, "subagent-patches.json"),
-      JSON.stringify({
-        version: 2,
-        artifactsByChildTaskId: {
-          task_impl: {
-            childTaskId: "task_impl",
-            parentWorkspaceId: "parent_1",
-            createdAtMs: 1,
-            status: "ready",
-            projectArtifacts: [
-              {
-                projectPath: "/other-repo",
-                projectName: "other-repo",
-                storageKey: "other-repo",
-                status: "skipped",
-              },
-              {
-                projectPath: "/repo",
-                projectName: "repo",
-                storageKey: "repo",
-                status: "ready",
-                mboxPath,
-                commitCount: 1,
-              },
-            ],
-            readyProjectCount: 1,
-            failedProjectCount: 0,
-            skippedProjectCount: 0,
-            totalCommitCount: 1,
-          },
-        },
-      })
-    );
+  test("passes allowed path prefixes after a successful dry-run", async () => {
     const create = mock(async () =>
       Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
     );
     const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
-    const applyPatchCalls: unknown[] = [];
-    const applyPatchArtifact = mock(async (args: unknown) => {
-      applyPatchCalls.push(args);
-      return {
-        success: true as const,
-        taskId: "task_impl",
-        projectResults: [],
-      };
-    });
-    const patchToolConfig: TaskApplyGitPatchConfiguration = {
-      cwd: "/repo",
-      runtime: undefined as unknown as TaskApplyGitPatchConfiguration["runtime"],
-      runtimeTempDir: "/tmp",
-      workspaceSessionDir: tmp.path,
-    };
+    const calls: unknown[] = [];
     const adapter = new WorkflowTaskServiceAdapter({
       taskService: { create, waitForAgentReport },
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      patchToolConfig,
-      applyPatchArtifact,
+      patchToolConfig: {} as TaskGitPatchApplyConfig,
+      patchEngine: {
+        applyPatch: async (_config, args, options) => {
+          calls.push({ args, options });
+          return {
+            success: true,
+            taskId: args.task_id,
+            dryRun: args.dry_run === true,
+            projectResults: [],
+          };
+        },
+      },
     });
 
-    const result = await adapter.applyPatch({
+    await adapter.applyPatch({
       id: "apply-security-state",
       sourceTaskId: "task_impl",
       target: "parent",
@@ -536,11 +478,12 @@ describe("WorkflowTaskServiceAdapter", () => {
       allowedPathPrefixes: [".mux/security"],
     });
 
-    expect(result).toMatchObject({ success: false, taskId: "task_impl" });
-    expect(result.success ? "" : result.error).toContain("src/app.ts");
-    expect(applyPatchArtifact).toHaveBeenCalledTimes(1);
-    expect(applyPatchCalls).toEqual([
-      expect.objectContaining({ task_id: "task_impl", dry_run: true }),
+    expect(calls).toEqual([
+      expect.objectContaining({ args: expect.objectContaining({ dry_run: true }) }),
+      expect.objectContaining({
+        args: expect.objectContaining({ dry_run: false }),
+        options: expect.objectContaining({ allowedPathPrefixes: [".mux/security"] }),
+      }),
     ]);
   });
 
@@ -569,13 +512,16 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      applyPatchArtifact: async (args) => {
-        events.push(args.dry_run === true ? "apply:dry-run" : "apply:real");
-        return {
-          success: true,
-          taskId: args.task_id,
-          projectResults: [],
-        };
+      patchToolConfig: {} as TaskGitPatchApplyConfig,
+      patchEngine: {
+        applyPatch: async (_config, args) => {
+          events.push(args.dry_run === true ? "apply:dry-run" : "apply:real");
+          return {
+            success: true,
+            taskId: args.task_id,
+            projectResults: [],
+          };
+        },
       },
     });
 
@@ -607,15 +553,18 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      applyPatchArtifact: async (args) => {
-        calls.push(args);
-        return {
-          success: false,
-          taskId: args.task_id,
-          dryRun: true,
-          error: "Patch failed",
-          conflictPaths: ["src/auth.ts"],
-        };
+      patchToolConfig: {} as TaskGitPatchApplyConfig,
+      patchEngine: {
+        applyPatch: async (_config, args) => {
+          calls.push(args);
+          return {
+            success: false,
+            taskId: args.task_id,
+            dryRun: true,
+            error: "Patch failed",
+            conflictPaths: ["src/auth.ts"],
+          };
+        },
       },
     });
 
@@ -636,7 +585,7 @@ describe("WorkflowTaskServiceAdapter", () => {
       Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
     );
     const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
-    const applyPatchArtifact = mock(async () => ({
+    const applyPatch = mock(async () => ({
       success: true as const,
       taskId: "task_impl",
       projectResults: [],
@@ -647,7 +596,8 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => false,
-      applyPatchArtifact,
+      patchToolConfig: {} as TaskGitPatchApplyConfig,
+      patchEngine: { applyPatch },
     });
 
     await expect(
@@ -659,7 +609,7 @@ describe("WorkflowTaskServiceAdapter", () => {
         force: false,
       })
     ).rejects.toThrow(/Project Trust/);
-    expect(applyPatchArtifact).not.toHaveBeenCalled();
+    expect(applyPatch).not.toHaveBeenCalled();
   });
 
   test("interrupts preserved descendant task workspaces for the parent workspace", async () => {

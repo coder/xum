@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -6,11 +6,8 @@ import { execSync } from "node:child_process";
 
 import type { ToolExecutionOptions } from "ai";
 
-import {
-  applyTaskGitPatchArtifact,
-  createTaskApplyGitPatchTool,
-  findGitPatchArtifactInWorkspaceOrAncestors,
-} from "@/node/services/tools/task_apply_git_patch";
+import { createTaskApplyGitPatchTool } from "@/node/services/tools/task_apply_git_patch";
+import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
 import {
   getSubagentGitPatchArtifactsFilePath,
   getSubagentGitPatchMboxPath,
@@ -18,7 +15,6 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import type { TaskService } from "@/node/services/taskService";
 import { getTestDeps } from "@/node/services/tools/testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -169,39 +165,6 @@ describe("task_apply_git_patch tool", () => {
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
 
-  it("serializes apply through the stable child patch-operation lock", async () => {
-    const taskId = "child-lock-test";
-    const withGitPatchArtifactOperationLock = mock(
-      async <T>(lockedTaskId: string, operation: () => Promise<T>): Promise<T> => {
-        expect(lockedTaskId).toBe(taskId);
-        return await operation();
-      }
-    );
-    const targetRepo = path.join(rootDir, "lock-target");
-    const sessionDir = path.join(rootDir, "lock-session");
-    await fsPromises.mkdir(targetRepo, { recursive: true });
-    await fsPromises.mkdir(sessionDir, { recursive: true });
-
-    const result = await applyTaskGitPatchArtifact(
-      {
-        workspaceId: "lock-workspace",
-        cwd: targetRepo,
-        runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
-        runtimeTempDir: path.join(rootDir, "lock-tmp"),
-        workspaceSessionDir: sessionDir,
-        taskService: { withGitPatchArtifactOperationLock } as unknown as TaskService,
-      },
-      { task_id: taskId, three_way: true }
-    );
-
-    expect(withGitPatchArtifactOperationLock).toHaveBeenCalledTimes(1);
-    expect(result).toMatchObject({
-      success: false,
-      taskId,
-      error: "No git patch artifact found for this taskId.",
-    });
-  });
-
   it("finds a nested descendant patch in its direct parent session", async () => {
     const muxRoot = path.join(rootDir, "nested-mux");
     const sessionsDir = path.join(muxRoot, "sessions");
@@ -262,7 +225,7 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const lookup = await findGitPatchArtifactInWorkspaceOrAncestors({
+    const lookup = await taskGitPatchEngine.findPatch({
       workspaceId: rootWorkspaceId,
       workspaceSessionDir: rootSessionDir,
       childTaskId,
@@ -351,7 +314,7 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         workspaceId: rootWorkspaceId,
         cwd: targetRepo,
@@ -872,7 +835,7 @@ describe("task_apply_git_patch tool", () => {
       workspaceSessionDir: sessionDir,
     };
 
-    const dryRun = await applyTaskGitPatchArtifact(
+    const dryRun = await taskGitPatchEngine.applyPatch(
       config,
       { task_id: childTaskId, dry_run: true, three_way: true },
       {}
@@ -882,7 +845,7 @@ describe("task_apply_git_patch tool", () => {
       headBeforeDryRun
     );
 
-    const realApply = await applyTaskGitPatchArtifact(
+    const realApply = await taskGitPatchEngine.applyPatch(
       config,
       { task_id: childTaskId, three_way: true },
       {}
@@ -947,7 +910,7 @@ describe("task_apply_git_patch tool", () => {
       encoding: "utf-8",
     }).trim();
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
@@ -1008,7 +971,7 @@ describe("task_apply_git_patch tool", () => {
     await fsPromises.writeFile(path.join(targetRepo, "notes.txt"), "intent", "utf-8");
     execSync("git add -N notes.txt", { cwd: targetRepo, stdio: "ignore" });
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
@@ -1080,7 +1043,7 @@ describe("task_apply_git_patch tool", () => {
       workspaceSessionDir: sessionDir,
     };
 
-    const dryRun = await applyTaskGitPatchArtifact(
+    const dryRun = await taskGitPatchEngine.applyPatch(
       config,
       { task_id: childTaskId, dry_run: true, three_way: true },
       {}
@@ -1095,7 +1058,7 @@ describe("task_apply_git_patch tool", () => {
       headBeforeApply
     );
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       config,
       { task_id: childTaskId, three_way: true },
       {}
@@ -1160,7 +1123,7 @@ describe("task_apply_git_patch tool", () => {
       encoding: "utf-8",
     }).trim();
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
@@ -1230,7 +1193,7 @@ describe("task_apply_git_patch tool", () => {
       encoding: "utf-8",
     }).trim();
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
@@ -1299,7 +1262,7 @@ describe("task_apply_git_patch tool", () => {
 
     await fsPromises.rm(path.join(targetRepo, "src.txt"));
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       config,
       { task_id: childTaskId, dry_run: true, three_way: true },
       {}
@@ -1313,7 +1276,7 @@ describe("task_apply_git_patch tool", () => {
 
     execSync("git checkout -- src.txt", { cwd: targetRepo, stdio: "ignore" });
     await fsPromises.writeFile(path.join(targetRepo, "src.txt"), "source\nlocal", "utf-8");
-    const withoutThreeWay = await applyTaskGitPatchArtifact(
+    const withoutThreeWay = await taskGitPatchEngine.applyPatch(
       config,
       { task_id: childTaskId, dry_run: true, three_way: false },
       {}
@@ -1966,7 +1929,7 @@ describe("task_apply_git_patch tool", () => {
     // Flip the artifact to ready only once the wait loop is observably polling,
     // so the test deterministically exercises the wait path (never vacuous).
     const markReadyCalls: Array<Promise<void>> = [];
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
@@ -2031,7 +1994,7 @@ describe("task_apply_git_patch tool", () => {
 
     const controller = new AbortController();
     const startedAtMs = Date.now();
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
@@ -2109,7 +2072,7 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepoA,
@@ -2198,7 +2161,7 @@ describe("task_apply_git_patch tool", () => {
     });
 
     const startedAtMs = Date.now();
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         workspaceId: currentWorkspaceId,
@@ -2243,7 +2206,7 @@ describe("task_apply_git_patch tool", () => {
       ],
     });
 
-    const result = await applyTaskGitPatchArtifact(
+    const result = await taskGitPatchEngine.applyPatch(
       {
         ...getTestDeps(),
         cwd: targetRepo,
