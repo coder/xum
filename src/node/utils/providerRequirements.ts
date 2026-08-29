@@ -69,6 +69,9 @@ export const PROVIDER_ENV_VARS: Partial<
   moonshotai: {
     apiKey: ["MOONSHOT_API_KEY"],
   },
+  zai: {
+    apiKey: ["ZAI_API_KEY"],
+  },
   "github-copilot": {
     apiKey: ["GITHUB_COPILOT_TOKEN"],
   },

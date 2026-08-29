@@ -19,6 +19,7 @@ import {
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
+import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-goal-test-project";
 const SEND_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o", agentId: "exec" };
@@ -50,7 +51,7 @@ function createAiService(workspaceId: string): AIService & EventEmitter {
   return Object.assign(aiEmitter, {
     isStreaming: mock((_workspaceId: string) => false),
     stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(undefined))),
+    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(createStartedTurnHandle()))),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
     getWorkspaceMetadata: mock((_workspaceId: string) =>
@@ -1001,7 +1002,11 @@ describe("AgentSession goal safety hooks", () => {
         error: "boom",
         errorType: "unknown",
       });
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(
+        Ok(
+          createFailedTurnHandle("assistant-stream-error", { error: "boom", errorType: "unknown" })
+        )
+      );
     }) as unknown as AIService["streamMessage"];
     const eventTypes: string[] = [];
     session.onChatEvent((event) => {
@@ -1181,7 +1186,7 @@ describe("AgentSession goal safety hooks", () => {
       emitStreamEnd(aiService, workspaceId, "assistant-silent", [
         { type: "text", text: "I believe everything is done already." },
       ]);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
@@ -1228,7 +1233,7 @@ describe("AgentSession goal safety hooks", () => {
           output: { ok: true },
         },
       ]);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
@@ -1253,7 +1258,7 @@ describe("AgentSession goal safety hooks", () => {
       emitStreamEnd(aiService, workspaceId, "assistant-text-only", [
         { type: "text", text: "Just thinking out loud." },
       ]);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     }) as unknown as AIService["streamMessage"];
 
     // Manual user messages now pause active goals because the goal mode is
@@ -1291,7 +1296,7 @@ describe("AgentSession goal safety hooks", () => {
         [{ type: "text", text: "Mid-sentence, then cut off by the token limit" }],
         { finishReason: "length" }
       );
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
@@ -1323,7 +1328,7 @@ describe("AgentSession goal safety hooks", () => {
       emitStreamEnd(aiService, workspaceId, "assistant-paused-silent", [
         { type: "text", text: "All wrapped up." },
       ]);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     }) as unknown as AIService["streamMessage"];
 
     const result = await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {

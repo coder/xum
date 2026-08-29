@@ -4,7 +4,7 @@ import * as path from "path";
 import * as os from "os";
 import type { ToolExecutionOptions } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { TestRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { Config } from "@/node/config";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -305,7 +305,7 @@ export class RemotePathMappedRuntime extends LocalRuntime {
   }
 }
 
-export class TrueRemotePathMappedRuntime extends RemoteRuntime {
+export class TrueRemotePathMappedRuntime extends TestRemoteRuntime {
   private readonly delegate: RemotePathMappedRuntime;
   private readonly remoteBase: string;
 
@@ -315,22 +315,8 @@ export class TrueRemotePathMappedRuntime extends RemoteRuntime {
     this.delegate = new RemotePathMappedRuntime(localBase, remoteBase);
   }
 
-  protected readonly commandPrefix = "TestRemoteRuntime";
-
-  protected spawnRemoteProcess(): Promise<SpawnResult> {
-    throw new Error("spawnRemoteProcess should not be called");
-  }
-
-  protected getBasePath(): string {
+  protected override getBasePath(): string {
     return this.remoteBase;
-  }
-
-  protected quoteForRemote(targetPath: string): string {
-    return `'${targetPath.replaceAll("'", "'\\''")}'`;
-  }
-
-  protected cdCommand(cwd: string): string {
-    return `cd ${this.quoteForRemote(cwd)}`;
   }
 
   override exec(
@@ -372,30 +358,6 @@ export class TrueRemotePathMappedRuntime extends RemoteRuntime {
 
   override ensureDir(dirPath: string): ReturnType<LocalRuntime["ensureDir"]> {
     return this.delegate.ensureDir(dirPath);
-  }
-
-  override createWorkspace(_params: Parameters<LocalRuntime["createWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override initWorkspace(_params: Parameters<LocalRuntime["initWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override renameWorkspace(
-    _projectPath: string,
-    _oldWorkspaceName: string,
-    _newWorkspaceName: string
-  ) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override deleteWorkspace(_projectPath: string, _workspaceName: string, _deleteBranch: boolean) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
-  }
-
-  override forkWorkspace(_params: Parameters<LocalRuntime["forkWorkspace"]>[0]) {
-    return Promise.resolve({ success: false as const, error: "not implemented" });
   }
 }
 

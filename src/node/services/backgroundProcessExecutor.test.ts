@@ -5,23 +5,8 @@ import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
+import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor";
-
-class ExecPathMappingRuntime extends LocalRuntime {
-  constructor(
-    projectPath: string,
-    private readonly hostPrefix: string,
-    private readonly execPrefix: string
-  ) {
-    super(projectPath);
-  }
-
-  mapPathForExec(filePath: string): string {
-    return filePath.startsWith(this.hostPrefix)
-      ? this.execPrefix + filePath.slice(this.hostPrefix.length)
-      : filePath;
-  }
-}
 
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
@@ -110,6 +95,33 @@ describe("spawnProcess", () => {
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe(execDir);
+  });
+
+  it("pathEnv values win over colliding caller env in background wrappers", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-pathenv-collision-"));
+    const resultDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-pathenv-result-"));
+    cleanupDirs.push(hostDir, resultDir);
+
+    const outFile = path.join(resultDir, "value.txt");
+    const result = await spawnProcess(
+      new LocalRuntime(hostDir),
+      `printf %s "$XUM_TEST_TOOLENV" > ${shellQuote(outFile)}`,
+      {
+        cwd: hostDir,
+        workspaceId: `pathenv-collision-${Date.now()}`,
+        processId: "collision",
+        env: { XUM_TEST_TOOLENV: "/wrong/value" },
+        pathEnv: { XUM_TEST_TOOLENV: "/right/value" },
+      }
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+
+    expect(await waitForExit(result.handle)).toBe(0);
+    expect((await fs.readFile(outFile, "utf8")).trim()).toBe("/right/value");
   });
 
   it("fails the strict exit probe when the exit marker is a dangling symlink", async () => {

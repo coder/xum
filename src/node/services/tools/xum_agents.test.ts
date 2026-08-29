@@ -4,7 +4,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { ToolExecutionOptions } from "ai";
 
-import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { LocalRuntime } from "@/node/runtime/LocalRuntime";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 const GLOBAL_WORKSPACE_NAME = "global-scope";
 const GLOBAL_WORKSPACE_TITLE = "Global Scope";
@@ -14,7 +14,7 @@ import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import { resolveAgentsPathOnRuntime } from "./xum_agents_path";
 import { createXumAgentsReadTool } from "./xum_agents_read";
 import { createXumAgentsWriteTool } from "./xum_agents_write";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createTestToolConfig, RemotePathMappedRuntime } from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -106,143 +106,6 @@ function mockAgentsPathProbe(
     }
     return originalExec(command, options);
   });
-}
-
-class RemotePathMappedRuntime extends LocalRuntime {
-  private readonly localWorkspaceRoot: string;
-  private readonly remoteWorkspaceRoot: string;
-  private readonly localHomeForTildeRoot: string | null;
-
-  constructor(localWorkspaceRoot: string, remoteWorkspaceRoot: string) {
-    super(localWorkspaceRoot);
-    this.localWorkspaceRoot = path.resolve(localWorkspaceRoot);
-    this.remoteWorkspaceRoot =
-      remoteWorkspaceRoot === "/" ? remoteWorkspaceRoot : remoteWorkspaceRoot.replace(/\/+$/u, "");
-
-    if (this.remoteWorkspaceRoot === "~") {
-      this.localHomeForTildeRoot = this.localWorkspaceRoot;
-    } else if (this.remoteWorkspaceRoot.startsWith("~/")) {
-      const homeRelativeSuffix = this.remoteWorkspaceRoot.slice(1);
-      const normalizedLocalRoot = this.localWorkspaceRoot.replaceAll("\\", "/");
-      if (normalizedLocalRoot.endsWith(homeRelativeSuffix)) {
-        const derivedHome = normalizedLocalRoot.slice(
-          0,
-          normalizedLocalRoot.length - homeRelativeSuffix.length
-        );
-        this.localHomeForTildeRoot = derivedHome.length > 0 ? derivedHome : "/";
-      } else {
-        this.localHomeForTildeRoot = null;
-      }
-    } else {
-      this.localHomeForTildeRoot = null;
-    }
-  }
-
-  private usesTildeWorkspaceRoot(): boolean {
-    return this.remoteWorkspaceRoot === "~" || this.remoteWorkspaceRoot.startsWith("~/");
-  }
-
-  private toLocalPath(runtimePath: string): string {
-    const normalizedRuntimePath = runtimePath.replaceAll("\\", "/");
-
-    if (normalizedRuntimePath === this.remoteWorkspaceRoot) {
-      return this.localWorkspaceRoot;
-    }
-
-    if (normalizedRuntimePath.startsWith(`${this.remoteWorkspaceRoot}/`)) {
-      const suffix = normalizedRuntimePath.slice(this.remoteWorkspaceRoot.length + 1);
-      return path.join(this.localWorkspaceRoot, ...suffix.split("/"));
-    }
-
-    return runtimePath;
-  }
-
-  private toRemotePath(localPath: string): string {
-    const resolvedLocalPath = path.resolve(localPath);
-
-    if (resolvedLocalPath === this.localWorkspaceRoot) {
-      return this.remoteWorkspaceRoot;
-    }
-
-    const localPrefix = `${this.localWorkspaceRoot}${path.sep}`;
-    if (resolvedLocalPath.startsWith(localPrefix)) {
-      const suffix = resolvedLocalPath.slice(localPrefix.length).split(path.sep).join("/");
-      return `${this.remoteWorkspaceRoot}/${suffix}`;
-    }
-
-    return localPath.replaceAll("\\", "/");
-  }
-
-  private translateCommandToLocal(command: string): string {
-    return command
-      .split(this.remoteWorkspaceRoot)
-      .join(this.localWorkspaceRoot.replaceAll("\\", "/"));
-  }
-
-  override normalizePath(targetPath: string, basePath: string): string {
-    const normalizedBasePath = this.toRemotePath(basePath);
-    const normalizedTargetPath = targetPath.replaceAll("\\", "/");
-
-    if (normalizedBasePath === "~" || normalizedBasePath.startsWith("~/")) {
-      if (
-        normalizedTargetPath === "~" ||
-        normalizedTargetPath.startsWith("~/") ||
-        normalizedTargetPath.startsWith("/")
-      ) {
-        return normalizedTargetPath;
-      }
-      return path.posix.normalize(path.posix.join(normalizedBasePath, normalizedTargetPath));
-    }
-
-    return path.posix.resolve(normalizedBasePath, normalizedTargetPath);
-  }
-
-  override async resolvePath(filePath: string): Promise<string> {
-    const resolvedLocalPath = await super.resolvePath(this.toLocalPath(filePath));
-    return this.toRemotePath(resolvedLocalPath);
-  }
-
-  override exec(
-    command: string,
-    options: Parameters<LocalRuntime["exec"]>[1]
-  ): ReturnType<LocalRuntime["exec"]> {
-    const usesTildeRoot = this.usesTildeWorkspaceRoot();
-    const localHomeForTildeRoot =
-      this.localHomeForTildeRoot ?? process.env.HOME ?? this.localWorkspaceRoot;
-
-    return super.exec(usesTildeRoot ? command : this.translateCommandToLocal(command), {
-      ...options,
-      cwd: this.toLocalPath(options.cwd),
-      env: usesTildeRoot
-        ? {
-            ...(options.env ?? {}),
-            HOME: localHomeForTildeRoot,
-          }
-        : options.env,
-    });
-  }
-
-  override stat(filePath: string, abortSignal?: AbortSignal): ReturnType<LocalRuntime["stat"]> {
-    return super.stat(this.toLocalPath(filePath), abortSignal);
-  }
-
-  override readFile(
-    filePath: string,
-    abortSignal?: AbortSignal
-  ): ReturnType<LocalRuntime["readFile"]> {
-    return super.readFile(this.toLocalPath(filePath), abortSignal);
-  }
-
-  override writeFile(
-    filePath: string,
-    abortSignal?: AbortSignal
-  ): ReturnType<LocalRuntime["writeFile"]> {
-    return super.writeFile(this.toLocalPath(filePath), abortSignal);
-  }
-
-  override ensureDir(dirPath: string): ReturnType<LocalRuntime["ensureDir"]> {
-    return super.ensureDir(this.toLocalPath(dirPath));
-  }
 }
 
 /** Simulates BSD/macOS where readlink doesn't support -f */

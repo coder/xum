@@ -109,7 +109,7 @@ describe("generateXumTypes", () => {
       task_message_sibling: createMockTool(z.object({ task_id: z.string(), message: z.string() })),
     });
 
-    // Both tools must resolve through RESULT_SCHEMAS so the kernel sees their
+    // Both tools must resolve through catalog result schemas so the kernel sees their
     // status discriminants instead of an opaque unknown return type.
     expect(types).toContain(
       "function task_message_parent(args: TaskMessageParentArgs): TaskMessageParentResult"

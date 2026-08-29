@@ -2,10 +2,10 @@ import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import type { MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { TurnStreamHandle } from "@/node/services/streamManager";
 import { AgentSession } from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -14,6 +14,24 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import type { StreamErrorType } from "@/common/types/errors";
+
+export function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
+  return { messageId, completion: new Promise(() => undefined) };
+}
+
+export function createFailedTurnHandle(
+  messageId: string,
+  failure: { error: string; errorType: StreamErrorType }
+): TurnStreamHandle {
+  return {
+    messageId,
+    completion: Promise.resolve({
+      status: "failed" as const,
+      streamError: { messageId, ...failure },
+    }),
+  };
+}
 
 function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
   return {
@@ -48,8 +66,8 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       getStreamInfo: mock((_workspaceId: string) => null),
-      streamMessage: mock((_history: MuxMessage[]) =>
-        Promise.resolve(Ok(undefined))
+      streamMessage: mock(() =>
+        Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))
       ) as unknown as AIService["streamMessage"],
       ...args?.overrides,
     }) as unknown as AIService,

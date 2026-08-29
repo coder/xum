@@ -63,6 +63,7 @@ function installProviderIconSvgMocks() {
     "@/browser/assets/icons/ollama.svg?react",
     "@/browser/assets/icons/deepseek.svg?react",
     "@/browser/assets/icons/moonshotai.svg?react",
+    "@/browser/assets/icons/zai.svg?react",
     "@/browser/assets/icons/aws.svg?react",
     "@/browser/assets/icons/github.svg?react",
     "@/browser/assets/icons/coder.svg?react",

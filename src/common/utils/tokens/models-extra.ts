@@ -660,6 +660,20 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // GLM 5.3 Flash list pricing and limits for the direct Z.ai provider.
+  "zai/glm-5.3-flash": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 131072,
+    input_cost_per_token: 0.00000015, // $0.15 per million input tokens
+    output_cost_per_token: 0.0000005, // $0.50 per million output tokens
+    cache_read_input_token_cost: 0.00000003, // $0.03 per million cached input tokens
+    litellm_provider: "zai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+  },
+
   // Kimi K3 - released July 16, 2026. 1M context, 128K max output, text+image input.
   // Keyed on the direct provider; OpenRouter-routed requests canonicalize to this id.
   "moonshotai/kimi-k3": {

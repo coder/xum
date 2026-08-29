@@ -53,6 +53,8 @@ export interface ExecOptions {
   cwd: string;
   /** Environment variables to inject */
   env?: Record<string, string>;
+  /** Host-namespace paths to translate before exposing them as environment variables. */
+  pathEnv?: Record<string, string>;
   /**
    * Timeout in seconds.
    *
@@ -373,7 +375,8 @@ export interface Runtime {
    */
   readonly createFlags?: RuntimeCreateFlags;
   /**
-   * Execute a bash command with streaming I/O
+   * Execute a bash command with streaming I/O.
+   * cwd and pathEnv values are host-namespace paths translated by the adapter.
    * @param command The bash script to execute
    * @param options Execution options (cwd, env, timeout, etc.)
    * @returns Promise that resolves to streaming handles for stdin/stdout/stderr and completion promises
@@ -382,13 +385,7 @@ export interface Runtime {
   exec(command: string, options: ExecOptions): Promise<ExecStream>;
 
   /**
-   * Translate a host-visible path into the namespace used by exec() scripts.
-   * When absent, file I/O and exec share the same path namespace.
-   */
-  mapPathForExec?(filePath: string): string;
-
-  /**
-   * Read file contents as a stream
+   * Read file contents as a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
    * @returns Readable stream of file contents
@@ -397,7 +394,7 @@ export interface Runtime {
   readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array>;
 
   /**
-   * Write file contents atomically from a stream
+   * Write file contents atomically from a stream. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
    * @returns Writable stream for file contents
@@ -406,7 +403,7 @@ export interface Runtime {
   writeFile(path: string, abortSignal?: AbortSignal): WritableStream<Uint8Array>;
 
   /**
-   * Get file statistics
+   * Get file statistics. Adapters canonicalize tilde and relative paths.
    * @param path Absolute or relative path to file/directory
    * @param abortSignal Optional abort signal for cancellation
    * @returns File statistics
@@ -415,7 +412,7 @@ export interface Runtime {
   stat(path: string, abortSignal?: AbortSignal): Promise<FileStat>;
 
   /**
-   * Ensure a directory exists (mkdir -p semantics).
+   * Ensure a directory exists (mkdir -p semantics). Adapters canonicalize tilde and relative paths.
    *
    * This intentionally lives on the Runtime abstraction so local runtimes can use
    * Node fs APIs (Windows-safe) while remote runtimes can use shell commands.

@@ -20,6 +20,7 @@ import { advanceAnchoredDeadline, HeartbeatService } from "./heartbeatService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import type { TaskService } from "./taskService";
+import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { WorkspaceService } from "./workspaceService";
 
 async function waitForCondition(
@@ -1251,9 +1252,11 @@ describe("HeartbeatService", () => {
         getOrCreateSession: mock(() => params.session),
         sendMessage: sendMessageMock,
       });
-      workspaceService.setTaskService({
-        hasActiveDescendantAgentTasksForWorkspace: () => params.hasActiveDescendantTasks ?? false,
-      } as unknown as TaskService);
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          hasActiveDescendantAgentTasksForWorkspace: () => params.hasActiveDescendantTasks ?? false,
+        })
+      );
       return {
         workspaceService,
         sendMessageMock,

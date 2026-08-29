@@ -1,4 +1,4 @@
-import { describe, expect, test, mock } from "bun:test";
+import { describe, expect, test, mock, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
@@ -17,6 +17,9 @@ import {
   startAbandonedBranchSummaryInBackground,
   type BranchSummaryAiService,
 } from "./branchSummary";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { StreamMessageOptions } from "./aiService";
+import type { TurnCompletion } from "./streamManager";
 
 function createDeferred<T>(): {
   promise: Promise<T>;
@@ -502,6 +505,75 @@ describe("AgentSession disposal race conditions", () => {
     expect(userResult.success).toBe(false);
     expect(cancel).toHaveBeenCalledTimes(0);
     expect(setEnabled).toHaveBeenCalledTimes(0);
+  });
+
+  test("drops failed turn completions delivered after disposal", async () => {
+    const completion = createDeferred<TurnCompletion>();
+    const streamMessage = mock((_opts: StreamMessageOptions) =>
+      Promise.resolve(Ok({ messageId: "assistant-post-dispose", completion: completion.promise }))
+    );
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "ws-dispose-turn-completion",
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    try {
+      const result = await session.sendMessage("hello", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+
+      const errorSink = session as unknown as {
+        handleStreamError: (data: unknown) => Promise<void>;
+      };
+      const handleStreamErrorSpy = spyOn(errorSink, "handleStreamError");
+      session.dispose();
+      completion.resolve({
+        status: "failed",
+        streamError: { messageId: "assistant-post-dispose", error: "boom", errorType: "api" },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(handleStreamErrorSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("skips handle-less startup-failure recovery when disposal begins mid-startup", async () => {
+    const commitDeferred = createDeferred<Result<void>>();
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId: "ws-dispose-startup-failure",
+    });
+    try {
+      spyOn(historyService, "commitPartial").mockReturnValueOnce(commitDeferred.promise);
+      const errorSink = session as unknown as {
+        handleStreamError: (data: unknown) => Promise<void>;
+        handleStreamFailureForAutoRetry: (failure: unknown) => Promise<void>;
+      };
+      const handleStreamErrorSpy = spyOn(errorSink, "handleStreamError");
+      const autoRetrySpy = spyOn(errorSink, "handleStreamFailureForAutoRetry");
+
+      const resumePromise = session.resumeStream({
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+      });
+      // Let the resume park on the pending commitPartial before disposing.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      session.dispose();
+      commitDeferred.resolve(Err("workspace removed mid-startup"));
+
+      const result = await resumePromise;
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.failureHandled).toBe(true);
+      }
+      expect(handleStreamErrorSpy).not.toHaveBeenCalled();
+      expect(autoRetrySpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
   });
 
   test("preserves synthetic flag when flushing queued messages", () => {

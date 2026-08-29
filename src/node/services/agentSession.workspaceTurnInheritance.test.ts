@@ -5,7 +5,7 @@ import { Ok } from "@/common/types/result";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 
 import { inheritOpenWorkspaceTurnMetadata } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const correlation = {
   type: "workspace-turn-task",
@@ -142,7 +142,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     let streamedMuxMetadata: StreamMessageOptions["muxMetadata"];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       streamedMuxMetadata = opts.muxMetadata;
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId: "workspace-turn-inheritance",
@@ -186,12 +186,8 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
 
   test("workspace-turn correlation persists in startup retry options", async () => {
     const workspaceId = "workspace-turn-retry-metadata";
-    const streamMessage = mock((_opts: StreamMessageOptions) => Promise.resolve(Ok(undefined)));
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
-      aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      },
     });
     try {
       const result = await session.sendMessage(
@@ -226,12 +222,8 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
 
   test("on-send compaction consuming a wake stamps the correlation on the follow-up", async () => {
     const workspaceId = "workspace-turn-compaction-stamp";
-    const streamMessage = mock((_opts: StreamMessageOptions) => Promise.resolve(Ok(undefined)));
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
-      aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      },
     });
     try {
       await historyService.appendToHistory(workspaceId, turnPrompt("delegated-prompt"));

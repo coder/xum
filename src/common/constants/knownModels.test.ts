@@ -49,6 +49,14 @@ describe("Known Models Integration", () => {
     expect(MODEL_ABBREVIATIONS.k3).toBe("moonshotai:kimi-k3");
   });
 
+  test("glm aliases resolve only to the direct Z.ai GLM 5.3 Flash model", () => {
+    expect(MODEL_ABBREVIATIONS.glm).toBe("zai:glm-5.3-flash");
+    expect(MODEL_ABBREVIATIONS["glm-flash"]).toBe("zai:glm-5.3-flash");
+    expect(Object.values(KNOWN_MODELS).filter((model) => model.provider === "zai")).toEqual([
+      KNOWN_MODELS.GLM_53_FLASH,
+    ]);
+  });
+
   test("known model ids and aliases stay unique across the curated registry", () => {
     const seenIds = new Set<string>();
     const seenAliases = new Set<string>();

@@ -14,7 +14,7 @@ import { createHash } from "crypto";
 import { z } from "zod";
 import { compile } from "json-schema-to-typescript";
 import type { Tool } from "ai";
-import { RESULT_SCHEMAS, type BridgeableToolName } from "@/common/utils/tools/toolDefinitions";
+import { getToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { TASK_TERMINAL_EVENT_TYPE } from "@/constants/sandboxEvents";
 
 /** Options for mux type generation. */
@@ -204,11 +204,8 @@ async function getResultTypeString(toolName: string): Promise<string | null> {
     return cache.resultTypes.get(toolName)!;
   }
 
-  // Check if this is a bridgeable tool with a known result schema
-  if (!(toolName in RESULT_SCHEMAS)) {
-    return null;
-  }
-  const schema = RESULT_SCHEMAS[toolName as BridgeableToolName];
+  const schema = getToolResultSchema(toolName);
+  if (!schema) return null;
 
   // Convert Zod → JSON Schema → TypeScript
   const jsonSchema = z.toJSONSchema(schema);

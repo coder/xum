@@ -10,6 +10,7 @@ import type { AnthropicProviderOptions } from "@ai-sdk/anthropic";
 import type { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
 import type { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import type { JSONValue } from "@ai-sdk/provider";
+import type { ZaiLanguageModelChatOptions } from "@ai-sdk/zai";
 import type {
   XaiProviderOptions,
   // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
@@ -28,6 +29,7 @@ import {
   getOpenAIReasoningEffort,
   isGrok46Model,
   isGrokFrontierModel,
+  isGlm53Model,
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
@@ -147,6 +149,7 @@ type ProviderOptions =
   | { google: GoogleGenerativeAIProviderOptions }
   | { openrouter: OpenRouterReasoningOptions }
   | { moonshotai: MoonshotAIProviderOptions }
+  | { zai: ZaiLanguageModelChatOptions }
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
@@ -588,6 +591,29 @@ export function buildProviderOptions(
       return options;
     }
     return {};
+  }
+
+  // Build Z.ai-specific options
+  if (formatProvider === "zai") {
+    if (!isGlm53Model(capabilityModel)) {
+      return {};
+    }
+
+    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
+      effectiveThinking === "max"
+        ? "max"
+        : effectiveThinking === "high" || effectiveThinking === "xhigh"
+          ? "high"
+          : "low";
+    const options = {
+      zai: {
+        thinking: { type: "enabled" },
+        reasoningEffort,
+        toolStream: true,
+      },
+    } satisfies { zai: ZaiLanguageModelChatOptions };
+    log.debug("buildProviderOptions: Returning Z.ai options", options);
+    return options;
   }
 
   // Build OpenRouter-specific options

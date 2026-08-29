@@ -78,7 +78,8 @@ import {
 import {
   prepareCompactionMessage,
   processSlashCommand,
-  type SlashCommandContext,
+  type CommandAction,
+  type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import {
   addWorkflowRunCardMessageForRun,
@@ -2474,62 +2475,104 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // Prepare file parts for commands that need to send messages with attachments
     const commandFileParts = chatAttachmentsToFileParts(attachments, { validate: true });
     const asyncCommandToken = ++asyncCommandTokenRef.current;
-    const commandContext: SlashCommandContext = {
+    const commandEnv: SlashCommandEnv = {
       api,
       variant,
       workspaceId: commandWorkspaceId,
       projectPath: commandProjectPath,
       rawInput: restoreInput,
       dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
-      openSettings: open,
       currentModel: workspaceSidebarState?.currentModel ?? null,
       sendMessageOptions: commandSendMessageOptions,
-      getInput: () => getDraft().text,
-      setInput,
-      setAttachments,
-      setSendingState: (increment: boolean) => setSendingCount((c) => c + (increment ? 1 : -1)),
-      setToast,
-      setPreferredModel,
-      setVimEnabled,
-      asyncCommandToken,
-      isAsyncCommandCurrent: (token, originWorkspaceId) => {
-        const scope = asyncCommandScopeRef.current;
-        return (
-          token === asyncCommandTokenRef.current &&
-          scope.variant === "workspace" &&
-          scope.workspaceId === originWorkspaceId
-        );
-      },
-      onResetContext: variant === "workspace" ? props.onResetContext : undefined,
-      onTruncateHistory: variant === "workspace" ? props.onTruncateHistory : undefined,
-      resetInputHeight: () => {
-        if (inputRef.current) {
-          inputRef.current.style.height = "";
-        }
-      },
+      resetContext: variant === "workspace" ? props.onResetContext : undefined,
+      truncateHistory: variant === "workspace" ? props.onTruncateHistory : undefined,
       editMessageId: editingMessageForUi?.id,
-      onCancelEdit: commandOnCancelEdit,
       reviews: reviewsData,
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
-      onMessageSent: variant === "workspace" ? props.onMessageSent : undefined,
-      onDetachAllReviews: variant === "workspace" ? props.onDetachAllReviews : undefined,
-      onCheckReviews: variant === "workspace" ? props.onCheckReviews : undefined,
       attachedReviewIds: reviewIdsForCheck,
+      isCurrent: () => {
+        const scope = asyncCommandScopeRef.current;
+        return (
+          asyncCommandToken === asyncCommandTokenRef.current &&
+          scope.variant === "workspace" &&
+          scope.workspaceId === commandWorkspaceId
+        );
+      },
     };
 
-    const result = await processSlashCommand(parsed, commandContext);
-
-    if (!result.clearInput) {
-      setInput(restoreInput);
-    } else {
-      setDraftReviews(null);
-      if (variant === "workspace" && parsed.type === "compact") {
-        if (reviewIdsForCheck.length > 0) {
-          props.onCheckReviews?.(reviewIdsForCheck);
+    // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
+    const applyCommandActions = (actions: CommandAction[]) => {
+      for (const action of actions) {
+        switch (action.type) {
+          case "clear-input":
+            setInput("");
+            break;
+          case "reset-input-height":
+            if (inputRef.current) inputRef.current.style.height = "";
+            break;
+          case "show-toast":
+            setToast(action.toast);
+            break;
+          case "set-preferred-model":
+            setPreferredModel(action.model);
+            break;
+          case "toggle-vim":
+            setVimEnabled((enabled) => !enabled);
+            break;
+          case "set-sending":
+            setSendingCount((count) => count + (action.sending ? 1 : -1));
+            break;
+          case "clear-attachments":
+            setAttachments([]);
+            break;
+          case "detach-reviews":
+            if (variant === "workspace") props.onDetachAllReviews?.();
+            break;
+          case "check-reviews":
+            if (variant === "workspace" && action.reviewIds.length > 0) {
+              props.onCheckReviews?.(action.reviewIds);
+            }
+            break;
+          case "message-sent":
+            if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
+            break;
+          case "cancel-edit":
+            commandOnCancelEdit?.();
+            break;
         }
-        props.onMessageSent?.(dispatchMode);
       }
+    };
+
+    let result = await processSlashCommand(parsed, commandEnv);
+    while (result.kind === "phase") {
+      applyCommandActions(result.actions);
+      result = await result.continue();
+    }
+    applyCommandActions(result.actions);
+    if (result.backgroundTask) {
+      void result.backgroundTask().then(applyCommandActions);
+    }
+
+    switch (result.inputDisposition) {
+      case "consume":
+        // Commands clear the composer through their own clear-input actions;
+        // clearing again here would wipe a draft typed while phases ran.
+        setDraftReviews(null);
+        break;
+      case "restore":
+        setInput(restoreInput);
+        break;
+      case "restore-if-empty":
+        // Async phases can outlive the invoking render, so check the live
+        // persisted draft: the getDraft closure captured here still reports
+        // this render's input and would refuse to restore over a newer draft.
+        if (readPersistedState(storageKeys.inputKey, "").trim().length === 0) {
+          setInput(restoreInput);
+        } else {
+          setDraftReviews(null);
+        }
+        break;
     }
 
     return true;

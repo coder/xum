@@ -9,6 +9,7 @@ import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { HistoryService } from "@/node/services/historyService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -112,6 +113,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue } from "./messageQueue";
+import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -190,6 +192,15 @@ import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
+
+/**
+ * Result shape for turn-starting session methods. failureHandled marks errors
+ * whose retry/abandon bookkeeping already ran inside streamWithHistory, so
+ * callers must not re-handle them (would double-increment backoff attempts).
+ */
+type AgentSessionResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: SendMessageError; failureHandled?: true };
 
 /**
  * Tracked file state for detecting external edits.
@@ -747,18 +758,6 @@ export class AgentSession {
   private lastEmittedStreamLifecycle: StreamLifecycleSnapshot | null = null;
 
   /**
-   * True when AIService has already emitted an `error` event for the current stream attempt.
-   * Used to avoid duplicate retry scheduling when streamMessage later returns the same failure.
-   */
-  private activeStreamErrorEventReceived = false;
-
-  /**
-   * True when the latest streamWithHistory() failure path already updated retry/abandon state.
-   * retryActiveStream() uses this to avoid double-processing handled failures.
-   */
-  private activeStreamFailureHandled = false;
-
-  /**
    * Stream-error recovery decisions keyed by the failed assistant messageId.
    * Per-attempt tracking (not a single shared decision) because recovery
    * episodes can overlap: a retry stream can emit its own error before the
@@ -1269,10 +1268,7 @@ export class AgentSession {
         return;
       }
 
-      if (this.activeStreamFailureHandled) {
-        // resumeStream() failure paths already flowed through streamWithHistory() /
-        // handleStreamError(), which scheduled retry and persisted abandon state.
-        // Re-processing here would double-increment backoff attempts.
+      if (result.failureHandled === true) {
         return;
       }
 
@@ -3018,7 +3014,7 @@ export class AgentSession {
        */
       admissionStale?: () => boolean;
     }
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<AgentSessionResult<void>> {
     this.assertNotDisposed("sendMessage");
 
     assert(typeof message === "string", "sendMessage requires a string message");
@@ -4025,7 +4021,7 @@ export class AgentSession {
     // service-side preflight reservation (see onTurnAdmissionCommitted doc).
     internal?.onTurnAdmissionCommitted?.();
 
-    const startPreparedStream = async (): Promise<Result<void, SendMessageError>> => {
+    const startPreparedStream = async (): Promise<AgentSessionResult<void>> => {
       try {
         if (preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4126,7 +4122,7 @@ export class AgentSession {
   async resumeStream(
     options: SendMessageOptions,
     internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
-  ): Promise<Result<{ started: boolean }, SendMessageError>> {
+  ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
 
     assert(options, "resumeStream requires options");
@@ -4756,7 +4752,7 @@ export class AgentSession {
         });
 
         const failureType = sendResult.error.type;
-        const handledByNestedSend = this.activeStreamFailureHandled;
+        const handledByNestedSend = sendResult.failureHandled === true;
 
         if (!handledByNestedSend) {
           await this.handleStreamFailureForAutoRetry({
@@ -4835,6 +4831,76 @@ export class AgentSession {
     return Ok(undefined);
   }
 
+  private async handleStreamWithHistoryFailure(
+    error: SendMessageError,
+    acpPromptId?: string,
+    preStartErrors?: StreamErrorPayload[] | null
+  ): Promise<AgentSessionResult<void>> {
+    // A disposed session must not persist retry/goal state or error rows
+    // post-teardown (mirrors consumeTurnCompletion). Settle collected recovery
+    // decisions in memory so waiters cannot hang, then skip all recovery
+    // bookkeeping; failureHandled keeps callers from running theirs.
+    if (this.disposed) {
+      for (const payload of preStartErrors ?? []) {
+        this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+      }
+      return { success: false, error, failureHandled: true };
+    }
+
+    // Collected pre-start error events own this failure; the branches below
+    // only cover failures that produced no error event.
+    if (preStartErrors != null && preStartErrors.length > 0) {
+      for (const payload of preStartErrors) {
+        try {
+          await this.handleStreamError({
+            ...payload,
+            acpPromptId: payload.acpPromptId ?? acpPromptId,
+          });
+        } finally {
+          this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+        }
+      }
+      return { success: false, error, failureHandled: true };
+    }
+
+    const failureType = error.type;
+
+    if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
+      const failedUserMessageId = this.activeStreamUserMessageId;
+      this.activeCompactionRequest = undefined;
+      this.resetActiveStreamState();
+      await this.handleStreamFailureForAutoRetry({
+        type: failureType,
+        message: this.extractRetryFailureMessage(error),
+      });
+      await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    } else {
+      await this.handleStreamError(buildStreamErrorEventData(error, { acpPromptId }));
+    }
+
+    return { success: false, error, failureHandled: true };
+  }
+
+  private consumeTurnCompletion(handle: TurnStreamHandle): void {
+    void handle.completion
+      .then(async (outcome) => {
+        // A disposed session must not persist retry/goal state post-teardown.
+        if (outcome.status !== "failed" || this.disposed) return;
+
+        try {
+          await this.handleStreamError(outcome.streamError);
+        } finally {
+          this.resolveStreamErrorRecoveryDecision(outcome.streamError.messageId, "terminal");
+        }
+      })
+      .catch((error: unknown) => {
+        log.error("Failed to consume turn completion", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+  }
+
   private async streamWithHistory(
     modelString: string,
     options?: SendMessageOptions,
@@ -4848,7 +4914,7 @@ export class AgentSession {
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
     if (this.disposed || isStartupAbortRequested()) {
@@ -4860,8 +4926,6 @@ export class AgentSession {
     this.clearLiveUsageState();
     this.ackPendingPostCompactionStateOnStreamEnd = false;
     this.activeStreamHadAnyDelta = false;
-    this.activeStreamErrorEventReceived = false;
-    this.activeStreamFailureHandled = false;
     this.activeStreamHadPostCompactionInjection = false;
     const providersConfig = this.getProvidersConfigSafe();
     this.activeStreamContext = {
@@ -4877,7 +4941,9 @@ export class AgentSession {
 
     const commitResult = await this.historyService.commitPartial(this.workspaceId);
     if (!commitResult.success) {
-      return Err(createUnknownSendMessageError(commitResult.error));
+      return await this.handleStreamWithHistoryFailure(
+        createUnknownSendMessageError(commitResult.error)
+      );
     }
 
     if (isStartupAbortRequested()) {
@@ -4902,7 +4968,9 @@ export class AgentSession {
         createFileChangeNotificationMessage(fileChangeDetection.attachments)
       );
       if (!notificationAppendResult.success) {
-        return Err(createUnknownSendMessageError(notificationAppendResult.error));
+        return await this.handleStreamWithHistoryFailure(
+          createUnknownSendMessageError(notificationAppendResult.error)
+        );
       }
       fileChangeDetection.commit();
     }
@@ -4913,7 +4981,9 @@ export class AgentSession {
     }
 
     if (!historyResult.success) {
-      return Err(createUnknownSendMessageError(historyResult.error));
+      return await this.handleStreamWithHistoryFailure(
+        createUnknownSendMessageError(historyResult.error)
+      );
     }
 
     // A crash between snapshot and user-row appends can leave orphaned prompt
@@ -4921,7 +4991,7 @@ export class AgentSession {
     let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
 
     if (requestMessages.length === 0) {
-      return Err(
+      return await this.handleStreamWithHistoryFailure(
         createUnknownSendMessageError(
           "Cannot resume stream: workspace history is empty. Send a new message instead."
         )
@@ -5041,6 +5111,10 @@ export class AgentSession {
       normalizeDelegatedToolNames(options?.delegatedToolNames) ??
       extractAcpDelegatedTools(optionsMuxMetadata);
 
+    // Fatal pre-start failures (runtime readiness, strict agent resolution)
+    // emit an error event for fire-and-forget senders and then return Err;
+    // collect them so the Err path resolves each exactly once.
+    const preStartErrors: StreamErrorPayload[] = [];
     const streamResult = await this.aiService.streamMessage({
       messages: requestMessages,
       workspaceId: this.workspaceId,
@@ -5078,41 +5152,19 @@ export class AgentSession {
       // send-time level above (single source of truth for the floor).
       minThinkingLevel,
       activeTurnThinkingOverride,
+      onPreStartError: ({ workspaceId: _workspaceId, ...payload }) => preStartErrors.push(payload),
     });
 
     if (!streamResult.success) {
-      // Deduplicate failures when AIService already emitted an `error` event for
-      // this stream attempt. attachAiListeners schedules retry via handleStreamError
-      // on that channel; re-handling here would bump attempt/backoff twice.
-      if (this.activeStreamErrorEventReceived) {
-        this.activeStreamFailureHandled = true;
-        return streamResult;
-      }
-
-      const failureType = streamResult.error.type;
-
-      // Runtime startup failures can happen before any stream events are emitted.
-      // Handle them directly when the `error` channel did not fire.
-      if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
-        this.activeStreamFailureHandled = true;
-        const failedUserMessageId = this.activeStreamUserMessageId;
-        this.activeCompactionRequest = undefined;
-        this.resetActiveStreamState();
-        await this.handleStreamFailureForAutoRetry({
-          type: failureType,
-          message: this.extractRetryFailureMessage(streamResult.error),
-        });
-        await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
-      } else {
-        this.activeStreamFailureHandled = true;
-        const streamError = buildStreamErrorEventData(streamResult.error, {
-          acpPromptId,
-        });
-        await this.handleStreamError(streamError);
-      }
+      return await this.handleStreamWithHistoryFailure(
+        streamResult.error,
+        acpPromptId,
+        preStartErrors
+      );
     }
 
-    return streamResult;
+    this.consumeTurnCompletion(streamResult.data);
+    return Ok(undefined);
   }
 
   private resolveCompactionRequest(
@@ -6107,21 +6159,9 @@ export class AgentSession {
         return;
       }
       const data = raw as StreamErrorPayload & { workspaceId: string };
-      this.activeStreamErrorEventReceived = true;
-      // Begin synchronously at event emission so settlement waiters (which
-      // observe the same AIService error event) always find this attempt's
-      // decision when they run.
+      // Begin synchronously at event emission so completion waiters always find
+      // this attempt's decision before they run.
       this.beginStreamErrorRecoveryDecision(data.messageId);
-      void this.handleStreamError({
-        messageId: data.messageId,
-        error: data.error,
-        errorType: data.errorType,
-      })
-        // Safety net for exceptions inside handleStreamError: a successful
-        // retry already resolved "retry-started" for this attempt (no-op
-        // here); an unwound handler means no retry survived, so record
-        // terminal.
-        .finally(() => this.resolveStreamErrorRecoveryDecision(data.messageId, "terminal"));
     };
 
     this.aiListeners.push({ event: "error", handler: errorHandler });
@@ -6618,6 +6658,30 @@ export class AgentSession {
       dispatching.ownerWorkspaceId === metadata.ownerWorkspaceId &&
       dispatching.turnId === metadata.turnId
     );
+  }
+
+  /**
+   * Input poised to take over this session at a queue cut. Engaged stages win
+   * over the queue head; an engaged stage is reported even when its metadata is
+   * undefined (manual message) so callers cannot misattribute the cut to an
+   * entry queued behind it. Pure read.
+   */
+  getQueueCutCutter(): QueueCutCutter | undefined {
+    // PREPARING covers both direct sends (preparingWorkspaceTurnMetadata set
+    // alongside setTurnPhase(PREPARING)) and dequeued entries (set at dequeue in
+    // sendQueuedMessages). The metadata is already parsed workspace-turn
+    // correlation or undefined for any other input.
+    if (this.turnPhase === TurnPhase.PREPARING) {
+      return { stage: "preparing", muxMetadata: this.preparingWorkspaceTurnMetadata };
+    }
+    // Dequeue-to-stream-start window after PREPARING released (e.g. a
+    // background send resolved before stream-start): the dispatched entry is
+    // still the engaged cutter.
+    if (this.dispatchingQueuedEntry) {
+      return { stage: "dispatching", muxMetadata: this.dispatchingQueuedEntryMuxMetadata };
+    }
+    const candidate = this.messageQueue.getNextQueueCutCandidate();
+    return candidate != null ? { stage: "queued", ...candidate } : undefined;
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */

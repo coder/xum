@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { AgentSession, clearProviderConfigFixableAbandonMarkers } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -21,6 +21,19 @@ interface AutoRetryResumeRequest {
   options: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: typeof GOAL_CONTINUATION_KIND;
+}
+
+interface RetryableSessionForTests {
+  retryActiveStream: () => Promise<void>;
+  lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+  resumeStream: (options: SendMessageOptions) => Promise<
+    | { success: true; data: { started: boolean } }
+    | {
+        success: false;
+        error: { type: "runtime_start_failed"; message: string };
+        failureHandled?: true;
+      }
+  >;
 }
 
 interface SessionBundle {
@@ -258,7 +271,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
     const streamMessageMock = mock((_payload: Parameters<AIService["streamMessage"]>[0]) =>
-      Promise.resolve(Ok(undefined))
+      Promise.resolve(Ok(createStartedTurnHandle()))
     );
     aiService.streamMessage = streamMessageMock as unknown as AIService["streamMessage"];
     const privateSession = session as unknown as {
@@ -302,7 +315,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
     const streamMessageMock = mock((_payload: Parameters<AIService["streamMessage"]>[0]) =>
-      Promise.resolve(Ok(undefined))
+      Promise.resolve(Ok(createStartedTurnHandle()))
     );
     aiService.streamMessage = streamMessageMock as unknown as AIService["streamMessage"];
     const privateSession = session as unknown as {
@@ -1177,17 +1190,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     const { session, events, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      activeStreamFailureHandled: boolean;
-      resumeStream: (
-        options: SendMessageOptions
-      ) => Promise<
-        | { success: true; data: { started: boolean } }
-        | { success: false; error: { type: "runtime_start_failed"; message: string } }
-      >;
-    };
+    const privateSession = session as unknown as RetryableSessionForTests;
 
     privateSession.lastAutoRetryResumeRequest = {
       options: {
@@ -1196,7 +1199,6 @@ describe("AgentSession startup auto-retry recovery", () => {
       },
     };
 
-    privateSession.activeStreamFailureHandled = true;
     const resumeStreamMock = mock((_options: SendMessageOptions) =>
       Promise.resolve({
         success: false as const,
@@ -1204,6 +1206,7 @@ describe("AgentSession startup auto-retry recovery", () => {
           type: "runtime_start_failed" as const,
           message: "runtime is still starting",
         },
+        failureHandled: true as const,
       })
     );
     privateSession.resumeStream = resumeStreamMock;
@@ -1224,17 +1227,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     const { session, events, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      activeStreamFailureHandled: boolean;
-      resumeStream: (
-        options: SendMessageOptions
-      ) => Promise<
-        | { success: true; data: { started: boolean } }
-        | { success: false; error: { type: "runtime_start_failed"; message: string } }
-      >;
-    };
+    const privateSession = session as unknown as RetryableSessionForTests;
 
     privateSession.lastAutoRetryResumeRequest = {
       options: {
@@ -1243,7 +1236,6 @@ describe("AgentSession startup auto-retry recovery", () => {
       },
     };
 
-    privateSession.activeStreamFailureHandled = false;
     const resumeStreamMock = mock((_options: SendMessageOptions) =>
       Promise.resolve({
         success: false as const,
@@ -1382,7 +1374,7 @@ describe("AgentSession startup auto-retry recovery", () => {
         });
       }
 
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     aiService.streamMessage = streamMessageMock as unknown as AIService["streamMessage"];
 
@@ -1476,7 +1468,11 @@ describe("AgentSession startup auto-retry recovery", () => {
         agentInitiated?: boolean
       ) => Promise<
         | { success: true; data: undefined }
-        | { success: false; error: { type: "runtime_start_failed"; message: string } }
+        | {
+            success: false;
+            error: { type: "runtime_start_failed"; message: string };
+            failureHandled?: true;
+          }
       >;
     };
 
@@ -1555,7 +1551,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     const aiService = Object.assign(aiEmitter, {
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
       isStreaming: mock(() => false),
-      streamMessage: mock(() => Promise.resolve(Ok(undefined))),
+      streamMessage: mock(() => Promise.resolve(Ok(createStartedTurnHandle()))),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
     }) as unknown as AIService;
 
