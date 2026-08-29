@@ -55,8 +55,8 @@ describe("router agent skill routes", () => {
 
       const context = {
         config: new Config(tempDir),
+        initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
-          waitForInit: mock(async () => undefined),
           resolveXumToolScopeForWorkspace: mock(() => ({
             type: "project",
             xumHome: tempDir,
@@ -123,8 +123,8 @@ describe("router agent skill routes", () => {
 
       const context = {
         config: new Config(tempDir),
+        initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
-          waitForInit: mock(async () => undefined),
           resolveXumToolScopeForWorkspace: mock(() => ({
             type: "project",
             xumHome: tempDir,
