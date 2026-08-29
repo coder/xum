@@ -273,7 +273,7 @@ describe("budget wrap-up origins", () => {
   ];
   for (const allowUserOriginBudgetWrapup of [false, true]) {
     for (const origin of origins) {
-      test(String({ origin, allowUserOriginBudgetWrapup }), () => {
+      test(`${origin} with user-origin ${allowUserOriginBudgetWrapup ? "allowed" : "blocked"}`, () => {
         expect(isBudgetWrapupEligibleOrigin(origin, allowUserOriginBudgetWrapup)).toBe(
           origin !== "user" || allowUserOriginBudgetWrapup
         );

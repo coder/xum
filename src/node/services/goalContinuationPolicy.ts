@@ -1,73 +1,67 @@
 import type { GoalRecordV1 } from "@/common/types/goal";
 
 const MICRO_CENTS_PER_CENT = 1_000_000;
+const _SKIP_REASONS = [
+  "not_registered",
+  "no_pending_candidate",
+  "workspace_not_found",
+  "archived",
+  "transcript_only",
+  "initializing",
+  "incompatible_runtime",
+  "child_workspace",
+  "active_descendant_tasks",
+  "currently_streaming",
+  "queued_user_input",
+  "pending_follow_up",
+  "plan_mode",
+  "compact_mode",
+  "user_stop",
+  "goal_missing",
+  "goal_mismatch",
+  "goal_not_active",
+  "requires_ack",
+  "budget_wrapup_already_fired",
+  "budget_wrapup_suppressed",
+  "cooldown",
+] as const;
 
-export type GoalContinuationSkipReason =
-  | "not_registered"
-  | "no_pending_candidate"
-  | "workspace_not_found"
-  | "archived"
-  | "transcript_only"
-  | "initializing"
-  | "incompatible_runtime"
-  | "child_workspace"
-  | "active_descendant_tasks"
-  | "currently_streaming"
-  | "queued_user_input"
-  | "pending_follow_up"
-  | "plan_mode"
-  | "compact_mode"
-  | "user_stop"
-  | "goal_missing"
-  | "goal_mismatch"
-  | "goal_not_active"
-  | "requires_ack"
-  | "budget_wrapup_already_fired"
-  | "budget_wrapup_suppressed"
-  | "cooldown";
-
+export type GoalContinuationSkipReason = (typeof _SKIP_REASONS)[number];
 export type GoalStreamOriginKind = "goal_continuation" | "goal_budget_limit" | "user" | "other";
-
 export type GoalContinuationDecision =
   | { kind: "continue"; mode: "continuation" | "budget_wrapup" }
   | { kind: "defer"; reason: GoalContinuationSkipReason; untilMs: number }
   | { kind: "stop"; reason: GoalContinuationSkipReason; dropCandidate: boolean };
 
-type Candidate = {
-  goalId: string;
-  source: "stream_end" | "kickoff" | "budget_wrapup";
-  sendOptions: { agentId?: string | null; mode?: string | null };
-};
-type WorkspaceState = { found: boolean; archived: boolean; hasPath: boolean; isChild: boolean };
-type RuntimeState = {
-  isInitializing: boolean;
-  isRuntimeCompatible: boolean;
-  isBusy: boolean;
-  hasQueuedMessages: boolean;
-  hasPendingFollowUp: boolean;
-};
-type PolicyGoal = Pick<
-  GoalRecordV1,
-  | "goalId"
-  | "status"
-  | "requireUserAcknowledgmentSinceMs"
-  | "budgetLimitInjectedForGoalId"
-  | "lastContinuationFiredAtMs"
->;
-export type GoalStreamStamp = { goalId: string | null; originKind: GoalStreamOriginKind };
-
 export interface GoalContinuationPolicyState {
   nowMs: number;
   bridgeRegistered: boolean;
-  candidate: Candidate | null;
-  workspace: WorkspaceState;
+  candidate: {
+    goalId: string;
+    source: "stream_end" | "kickoff" | "budget_wrapup";
+    sendOptions: { agentId?: string | null; mode?: string | null };
+  } | null;
+  workspace: { found: boolean; archived: boolean; hasPath: boolean; isChild: boolean };
   hasActiveDescendantTasks: boolean;
-  runtime: RuntimeState;
+  runtime: {
+    isInitializing: boolean;
+    isRuntimeCompatible: boolean;
+    isBusy: boolean;
+    hasQueuedMessages: boolean;
+    hasPendingFollowUp: boolean;
+  };
   isStreaming: boolean;
   userStopAtMs: number | null;
   stopCheckGoal: Pick<GoalRecordV1, "createdAtMs"> | null;
-  goal: PolicyGoal | null;
-  lastStreamStamp: GoalStreamStamp | null;
+  goal: Pick<
+    GoalRecordV1,
+    | "goalId"
+    | "status"
+    | "requireUserAcknowledgmentSinceMs"
+    | "budgetLimitInjectedForGoalId"
+    | "lastContinuationFiredAtMs"
+  > | null;
+  lastStreamStamp: { goalId: string | null; originKind: GoalStreamOriginKind } | null;
   continuationCooldownMs: number;
   allowUserOriginBudgetWrapup: boolean;
 }
@@ -92,6 +86,11 @@ const stop = (
   reason: GoalContinuationSkipReason,
   dropCandidate: boolean
 ): GoalContinuationDecision => ({ kind: "stop", reason, dropCandidate });
+const defer = (reason: GoalContinuationSkipReason, untilMs: number): GoalContinuationDecision => ({
+  kind: "defer",
+  reason,
+  untilMs,
+});
 
 export function evaluateGoalContinuationBeforeGoal(
   state: GoalContinuationPolicyProbe
@@ -107,17 +106,11 @@ export function evaluateGoalContinuationBeforeGoal(
   if (state.hasActiveDescendantTasks == null) return null;
   if (state.hasActiveDescendantTasks) return stop("active_descendant_tasks", false);
   if (!state.runtime) return null;
-  if (state.runtime.isInitializing) {
-    return { kind: "defer", reason: "initializing", untilMs: state.nowMs + 1_000 };
-  }
+  if (state.runtime.isInitializing) return defer("initializing", state.nowMs + 1_000);
   if (!state.runtime.isRuntimeCompatible) return stop("incompatible_runtime", true);
-  if (state.runtime.isBusy) {
-    return { kind: "defer", reason: "currently_streaming", untilMs: state.nowMs + 1_000 };
-  }
+  if (state.runtime.isBusy) return defer("currently_streaming", state.nowMs + 1_000);
   if (state.isStreaming == null) return null;
-  if (state.isStreaming) {
-    return { kind: "defer", reason: "currently_streaming", untilMs: state.nowMs + 1_000 };
-  }
+  if (state.isStreaming) return defer("currently_streaming", state.nowMs + 1_000);
   if (state.runtime.hasQueuedMessages) return stop("queued_user_input", false);
   if (state.runtime.hasPendingFollowUp) return stop("pending_follow_up", false);
   if (candidate.sendOptions.agentId === "plan" || candidate.sendOptions.mode === "plan") {
@@ -127,12 +120,10 @@ export function evaluateGoalContinuationBeforeGoal(
     return stop("compact_mode", true);
   }
   if (state.userStopAtMs === undefined) return null;
-  if (state.userStopAtMs != null) {
-    if (state.stopCheckGoal === undefined) return null;
-    if (!state.stopCheckGoal) return stop("goal_missing", true);
-    if (state.userStopAtMs >= state.stopCheckGoal.createdAtMs) return stop("user_stop", true);
-  }
-  return null;
+  if (state.userStopAtMs == null) return null;
+  if (state.stopCheckGoal === undefined) return null;
+  if (!state.stopCheckGoal) return stop("goal_missing", true);
+  return state.userStopAtMs >= state.stopCheckGoal.createdAtMs ? stop("user_stop", true) : null;
 }
 
 export function evaluateGoalContinuationGoal(
@@ -174,11 +165,7 @@ export function evaluateGoalContinuationGoal(
   }
   const lastFiredAtMs = goal.lastContinuationFiredAtMs ?? null;
   return lastFiredAtMs != null && state.nowMs - lastFiredAtMs < state.continuationCooldownMs
-    ? {
-        kind: "defer",
-        reason: "cooldown",
-        untilMs: lastFiredAtMs + state.continuationCooldownMs,
-      }
+    ? defer("cooldown", lastFiredAtMs + state.continuationCooldownMs)
     : { kind: "continue", mode: "continuation" };
 }
 
@@ -189,11 +176,11 @@ export function evaluateGoalContinuation(
 }
 
 export function hasReachedGoalBudgetLimit(goal: GoalRecordV1): boolean {
-  const costMicroCents = goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
+  const cost = goal.costMicroCents ?? goal.costCents * MICRO_CENTS_PER_CENT;
   return (
     goal.budgetCents != null &&
     goal.budgetCents > 0 &&
-    costMicroCents >= goal.budgetCents * MICRO_CENTS_PER_CENT
+    cost >= goal.budgetCents * MICRO_CENTS_PER_CENT
   );
 }
 
