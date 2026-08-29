@@ -695,7 +695,7 @@ function repriceSessionUsage(
  * components re-render when workspace state changes.
  */
 function getStreamingMessageKey(workspaceId: string, messageId: string): string {
-  return workspaceId + " " + messageId;
+  return workspaceId + "\0" + messageId;
 }
 
 function getAdvisorLiveKey(workspaceId: string, toolCallId: string): string {
@@ -1674,11 +1674,7 @@ export class WorkspaceStore {
     this.pendingStreamingMessageBump.delete(workspaceId);
   }
 
-  getStreamingMessage(
-    workspaceId: string,
-    displayedId: string,
-    _messageId: string
-  ): DisplayedMessage | null {
+  getStreamingMessage(workspaceId: string, displayedId: string): DisplayedMessage | null {
     return (
       this.aggregators
         .get(workspaceId)
@@ -5232,7 +5228,7 @@ export function useStreamingMessageDelta(
     },
     () => {
       if (!workspaceId || !messageId) return message;
-      return store.getStreamingMessage(workspaceId, message.id, messageId) ?? message;
+      return store.getStreamingMessage(workspaceId, message.id) ?? message;
     }
   );
 }

@@ -2111,7 +2111,7 @@ describe("WorkspaceStore", () => {
       const displayed = aggregator
         .getDisplayedMessages()
         .find((message) => message.type === "assistant" && message.historyId === messageId)!;
-      const live = store.getStreamingMessage(workspaceId, displayed.id, messageId);
+      const live = store.getStreamingMessage(workspaceId, displayed.id);
       expect(live?.type === "assistant" ? live.content : null).toBe("hello world");
 
       send(
@@ -2180,8 +2180,8 @@ describe("WorkspaceStore", () => {
       const tool = displayed.find((message) => message.type === "tool")!;
       const text = displayed.find((message) => message.type === "assistant")!;
 
-      expect(store.getStreamingMessage(workspaceId, tool.id, messageId)?.type).toBe("tool");
-      const liveText = store.getStreamingMessage(workspaceId, text.id, messageId);
+      expect(store.getStreamingMessage(workspaceId, tool.id)?.type).toBe("tool");
+      const liveText = store.getStreamingMessage(workspaceId, text.id);
       expect(liveText?.type === "assistant" ? liveText.content : null).toBe("summary");
     });
 
