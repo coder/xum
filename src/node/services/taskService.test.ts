@@ -447,6 +447,7 @@ function createAIServiceMocks(
     mock((): Promise<Result<never>> => Promise.resolve(Err("createModel not mocked")));
   const getStreamInfo = overrides?.getStreamInfo ?? mock(() => undefined);
   const getProvidersConfig = overrides?.getProvidersConfig ?? mock(() => null);
+  const replayStream = mock(() => Promise.resolve());
 
   const on = overrides?.on ?? mock(() => undefined);
   const off = overrides?.off ?? mock(() => undefined);
@@ -459,6 +460,7 @@ function createAIServiceMocks(
       createModel,
       getStreamInfo,
       getProvidersConfig,
+      replayStream,
       on,
       off,
     } as unknown as AIService,
@@ -640,7 +642,9 @@ function createTaskServiceHarness(
     workspaceService,
     initStateManager,
     overrides?.sessionUsageService,
-    overrides?.workspaceGoalService
+    overrides?.workspaceGoalService,
+    // The engine reads only getStreamInfo here; the AI mock carries the same mock the tests override.
+    aiService as unknown as ConstructorParameters<typeof TaskService>[7]
   );
 
   return {
