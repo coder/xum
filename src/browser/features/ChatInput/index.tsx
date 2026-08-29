@@ -462,34 +462,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setToast(null);
   }, []);
 
-  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
-  const {
-    storageKeys,
-    input,
-    setInput,
-    latestInputValueRef,
-    attachments,
-    setAttachments,
-    draftReviews,
-    setDraftReviews,
-    getDraft,
-    setDraft,
-    preEditDraftRef,
-    preEditReviewsRef,
-    reviewOverrideActive,
-    reviewData,
-    reviewIdsForCheck,
-    reviewPanelItems,
-    removeDraftReview,
-    updateDraftReviewNote,
-  } = useComposerDraft({
+  const draft = useComposerDraft({
     variant,
     workspaceId,
     creationProjectPath: creationParentProjectPath,
     pendingDraftId: variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined,
-    attachedReviews,
+    attachedReviews: variant === "workspace" ? (props.attachedReviews ?? []) : [],
     pushToast,
   });
+  const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
+  const { getDraft, setDraft, preEditDraftRef, preEditReviewsRef } = draft;
+  const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
+  const { removeDraftReview, updateDraftReviewNote, storageKeys, latestInputValueRef } = draft;
   const lastAtMentionInputRef = useRef<string>(input);
   const {
     processingAttachmentCount,

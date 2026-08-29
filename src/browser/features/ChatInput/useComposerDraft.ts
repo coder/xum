@@ -22,11 +22,6 @@ import {
   readPersistedChatAttachments,
 } from "./draftAttachmentsStorage";
 
-interface DraftState {
-  text: string;
-  attachments: ChatAttachment[];
-}
-
 interface UseComposerDraftOptions {
   variant: "creation" | "workspace";
   workspaceId: string | null;
@@ -37,10 +32,12 @@ interface UseComposerDraftOptions {
 }
 
 export function useComposerDraft(options: UseComposerDraftOptions) {
-  const pendingScopeId = options.pendingDraftId?.trim().length
-    ? getDraftScopeId(options.creationProjectPath, options.pendingDraftId)
-    : getPendingScopeId(options.creationProjectPath);
-  const scopeId = options.variant === "creation" ? pendingScopeId : (options.workspaceId ?? "");
+  const scopeId =
+    options.variant === "workspace"
+      ? (options.workspaceId ?? "")
+      : options.pendingDraftId?.trim().length
+        ? getDraftScopeId(options.creationProjectPath, options.pendingDraftId)
+        : getPendingScopeId(options.creationProjectPath);
   const inputKey = getInputKey(scopeId);
   const attachmentsKey = getInputAttachmentsKey(scopeId);
   const modelKey = getModelKey(
@@ -49,142 +46,104 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const [input, setInput] = usePersistedState(inputKey, "", { listener: true });
   const latestInputValueRef = useRef(input);
   latestInputValueRef.current = input;
-
   const tooLargeToastKeyRef = useRef<string | null>(null);
   const selfWriteRef = useRef(false);
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(attachmentsKey)
   );
-  const persistAttachments = useCallback(
-    (next: ChatAttachment[]) => {
-      selfWriteRef.current = true;
-      try {
-        if (next.length === 0) {
-          tooLargeToastKeyRef.current = null;
-          updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, undefined);
-        } else if (
-          estimatePersistedChatAttachmentsChars(next) > MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS
-        ) {
-          updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, undefined);
-          if (tooLargeToastKeyRef.current !== attachmentsKey) {
-            tooLargeToastKeyRef.current = attachmentsKey;
-            options.pushToast({
-              type: "error",
-              message:
-                "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-              duration: 5000,
-            });
-          }
-        } else {
-          tooLargeToastKeyRef.current = null;
-          updatePersistedState<ChatAttachment[] | undefined>(attachmentsKey, next);
-        }
-      } finally {
-        selfWriteRef.current = false;
-      }
-    },
-    [attachmentsKey, options.pushToast]
-  );
   const setAttachments = useCallback(
-    (value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])) => {
+    (value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])) =>
       setAttachmentsState((previous) => {
         const next = value instanceof Function ? value(previous) : value;
-        persistAttachments(next);
+        const persists =
+          next.length > 0 &&
+          estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+        selfWriteRef.current = true;
+        try {
+          updatePersistedState<ChatAttachment[] | undefined>(
+            attachmentsKey,
+            persists ? next : undefined
+          );
+        } finally {
+          selfWriteRef.current = false;
+        }
+        if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
+        else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+          tooLargeToastKeyRef.current = attachmentsKey;
+          options.pushToast({
+            type: "error",
+            message:
+              "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
+            duration: 5000,
+          });
+        }
         return next;
-      });
-    },
-    [persistAttachments]
+      }),
+    [attachmentsKey, options.pushToast]
   );
-
   useEffect(() => {
     tooLargeToastKeyRef.current = null;
     setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+    return subscribePersistedStateWrites((event) => {
+      if (event.key === attachmentsKey && !selfWriteRef.current) {
+        setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+      }
+    });
   }, [attachmentsKey]);
-  useEffect(
-    () =>
-      subscribePersistedStateWrites((event) => {
-        if (event.key === attachmentsKey && !selfWriteRef.current) {
-          setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
-        }
-      }),
-    [attachmentsKey]
-  );
-
   const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
-  const draftReviewIdsByValueRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
+  const draftReviewIdsRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
   const nextDraftReviewIdRef = useRef(0);
   const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
     typeof value === "object" && value !== null;
-  const getDraftReviewId = (review: ReviewNoteDataForDisplay): string => {
-    const existingId = draftReviewIdsByValueRef.current.get(review);
+  const idForReview = (review: ReviewNoteDataForDisplay) => {
+    const existingId = draftReviewIdsRef.current.get(review);
     if (existingId) return existingId;
     const newId = "draft-review-" + nextDraftReviewIdRef.current++;
-    draftReviewIdsByValueRef.current.set(review, newId);
+    draftReviewIdsRef.current.set(review, newId);
     return newId;
   };
-  const withDraftReview = (
-    reviewId: string,
-    update: (reviews: ReviewNoteDataForDisplay[], reviewIndex: number) => ReviewNoteDataForDisplay[]
-  ) =>
+  const mutateDraftReview = (reviewId: string, userNote?: string) =>
     setDraftReviews((previous) => {
       if (previous === null) return previous;
-      const reviewIndex = previous.findIndex(
-        (review) => isDraftReviewData(review) && getDraftReviewId(review) === reviewId
+      const index = previous.findIndex(
+        (review) => isDraftReviewData(review) && idForReview(review) === reviewId
       );
-      return reviewIndex === -1 ? previous : update(previous, reviewIndex);
-    });
-  const removeDraftReview = (reviewId: string) =>
-    withDraftReview(reviewId, (previous, reviewIndex) =>
-      previous.filter((_, index) => index !== reviewIndex)
-    );
-  const updateDraftReviewNote = (reviewId: string, userNote: string) =>
-    withDraftReview(reviewId, (previous, reviewIndex) => {
-      const review = previous[reviewIndex];
+      if (index === -1) return previous;
+      if (userNote === undefined) return previous.filter((_, itemIndex) => itemIndex !== index);
+      const review = previous[index];
       if (!review || review.userNote === userNote) return previous;
       const next = [...previous];
-      const updatedReview = { ...review, userNote };
-      draftReviewIdsByValueRef.current.set(updatedReview, reviewId);
-      next[reviewIndex] = updatedReview;
+      next[index] = { ...review, userNote };
+      draftReviewIdsRef.current.set(next[index], reviewId);
       return next;
     });
-
   const reviewOverrideActive = draftReviews !== null;
   const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
-  const reviewData = reviewOverrideActive
-    ? draftReviewItems.length > 0
-      ? draftReviewItems
-      : undefined
-    : options.attachedReviews.length > 0
-      ? options.attachedReviews.map((review) => review.data)
-      : undefined;
-  const reviewIdsForCheck = reviewOverrideActive
-    ? []
-    : options.attachedReviews.map((review) => review.id);
-  const reviewPanelItems: Review[] = reviewOverrideActive
+  const reviews = reviewOverrideActive
+    ? draftReviewItems
+    : options.attachedReviews.map((review) => review.data);
+  const reviewData = reviews.length > 0 ? reviews : undefined;
+  const reviewIdsForCheck = reviewOverrideActive ? [] : options.attachedReviews.map(({ id }) => id);
+  const reviewPanelItems = reviewOverrideActive
     ? draftReviewItems.map((data) => ({
-        id: getDraftReviewId(data),
+        id: idForReview(data),
         data,
-        status: "attached",
+        status: "attached" as const,
         createdAt: 0,
       }))
     : options.attachedReviews;
-
-  const getDraft = useCallback(
-    (): DraftState => ({ text: input, attachments }),
-    [input, attachments]
-  );
+  const getDraft = useCallback(() => ({ text: input, attachments }), [input, attachments]);
   const setDraft = useCallback(
-    (draft: DraftState) => {
+    (draft: { text: string; attachments: ChatAttachment[] }) => {
       setInput(draft.text);
       setAttachments(draft.attachments);
     },
     [setAttachments, setInput]
   );
-  const preEditDraftRef = useRef<DraftState>({ text: "", attachments: [] });
+  const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
   const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
-
   return {
-    storageKeys: { inputKey, attachmentsKey, modelKey },
+    storageKeys: { inputKey, modelKey },
     input,
     setInput,
     latestInputValueRef,
@@ -200,7 +159,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     reviewData,
     reviewIdsForCheck,
     reviewPanelItems,
-    removeDraftReview,
-    updateDraftReviewNote,
+    removeDraftReview: (reviewId: string) => mutateDraftReview(reviewId),
+    updateDraftReviewNote: mutateDraftReview,
   };
 }
