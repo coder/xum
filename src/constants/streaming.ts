@@ -13,6 +13,13 @@ export const WORKSPACE_STREAMING_STATUS_TRANSITION_MS = 150;
  */
 export const APPROX_CHARS_PER_TOKEN = 4;
 
+/**
+ * Abort a provider stream that emits no SDK progress for this interval.
+ * A half-open connection otherwise leaves the workspace busy forever.
+ * Local tool execution pauses this deadline because tools have their own bounds.
+ */
+export const PROVIDER_STREAM_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+
 export const STREAM_SMOOTHING = {
   /** Baseline reveal speed in characters per second when no live model rate is known yet. */
   BASE_CHARS_PER_SEC: 72,

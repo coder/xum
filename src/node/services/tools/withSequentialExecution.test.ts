@@ -168,6 +168,64 @@ describe("withSequentialExecution", () => {
     expect(events).toEqual(["execution-start call-a", "run A", "execution-start call-b", "run B"]);
   });
 
+  test("reports execution end after success and failure", async () => {
+    const events: string[] = [];
+    const tools = {
+      success: tool({
+        description: "Successful tool",
+        inputSchema: z.object({}),
+        execute: () => {
+          events.push("run success");
+          return Promise.resolve({ ok: true });
+        },
+      }),
+      failure: tool({
+        description: "Failing tool",
+        inputSchema: z.object({}),
+        execute: (): Promise<{ ok: boolean }> => {
+          events.push("run failure");
+          return Promise.reject(new Error("failed"));
+        },
+      }),
+    };
+    const wrappedTools = withSequentialExecution(
+      tools,
+      (toolCallId) => events.push(`start ${toolCallId}`),
+      (toolCallId) => events.push(`end ${toolCallId}`)
+    );
+
+    await callWrappedExecute(
+      wrappedTools!.success as Record<string, unknown>,
+      {},
+      {
+        toolCallId: "success-call",
+      }
+    );
+    let failure: unknown;
+    try {
+      await callWrappedExecute(
+        wrappedTools!.failure as Record<string, unknown>,
+        {},
+        {
+          toolCallId: "failure-call",
+        }
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("failed");
+
+    expect(events).toEqual([
+      "start success-call",
+      "run success",
+      "end success-call",
+      "start failure-call",
+      "run failure",
+      "end failure-call",
+    ]);
+  });
+
   test("does not execute queued siblings after stream abort", async () => {
     const executionLog: string[] = [];
     const startedA = createDeferred<void>();

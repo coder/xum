@@ -103,6 +103,10 @@ import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getOpenAIResponsesBaseUrlHint } from "@/node/services/utils/openAIResponsesBaseUrlHint";
 
+import { PROVIDER_STREAM_IDLE_TIMEOUT_MS } from "@/constants/streaming";
+import { formatDuration } from "@/common/utils/formatDuration";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
 
@@ -147,10 +151,23 @@ class ModelRefusalError extends Error {
 class StreamTruncatedError extends Error {
   readonly providerDisplayName: string;
 
-  constructor(providerDisplayName: string) {
-    super(`${providerDisplayName} ${STREAM_TRUNCATED_MESSAGE_SUFFIX}`);
+  constructor(providerDisplayName: string, message?: string) {
+    super(message ?? `${providerDisplayName} ${STREAM_TRUNCATED_MESSAGE_SUFFIX}`);
     this.name = "StreamTruncatedError";
     this.providerDisplayName = providerDisplayName;
+  }
+}
+
+class StreamIdleTimeoutError extends StreamTruncatedError {
+  readonly timeoutMs: number;
+
+  constructor(providerDisplayName: string, timeoutMs: number) {
+    super(
+      providerDisplayName,
+      `${providerDisplayName} produced no stream progress for ${formatDuration(timeoutMs)}. Xum aborted the stalled stream. Retry the turn or switch models.`
+    );
+    this.name = "StreamIdleTimeoutError";
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -575,6 +592,10 @@ interface WorkspaceStreamInfo {
   // and apply it as soon as the part lands.
   pendingToolExecutionStarts: Map<string, number>;
 
+  // Local tool execution can legitimately produce no provider events for a long time.
+  // Pause the provider idle deadline until each execute() call returns.
+  activeLocalToolExecutions: Set<string>;
+
   model: string;
   /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
   metadataModel: string;
@@ -677,6 +698,7 @@ export class StreamManager extends EventEmitter {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
   private streamLocks = new Map<WorkspaceId, AsyncMutex>();
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
+  private readonly providerStreamIdleTimeoutMs = PROVIDER_STREAM_IDLE_TIMEOUT_MS;
   private readonly historyService: HistoryService;
   private mcpServerManager?: MCPServerManager;
   private readonly sessionUsageService?: SessionUsageService;
@@ -860,6 +882,8 @@ export class StreamManager extends EventEmitter {
       return;
     }
 
+    streamInfo.activeLocalToolExecutions.add(toolCallId);
+
     // Use the stream's monotonic clock, not raw Date.now(): the tool-call part timestamp
     // was monotonicized by nextPartTimestamp(), so a same-millisecond raw reading could be
     // <= it. Reconnect replay repairs missed execution starts only when
@@ -871,6 +895,19 @@ export class StreamManager extends EventEmitter {
       // consumes this entry right after storing the part.
       (streamInfo.pendingToolExecutionStarts ??= new Map()).set(toolCallId, timestamp);
     }
+  }
+
+  private handleToolExecutionEnd(
+    workspaceId: WorkspaceId,
+    messageId: string,
+    toolCallId: string
+  ): void {
+    const streamInfo = this.workspaceStreams.get(workspaceId);
+    if (streamInfo?.messageId !== messageId) {
+      return;
+    }
+
+    streamInfo.activeLocalToolExecutions.delete(toolCallId);
   }
 
   /**
@@ -1707,6 +1744,7 @@ export class StreamManager extends EventEmitter {
     onStepMessages?: (messages: ModelMessage[]) => void,
     toolSearchState?: ToolSearchStreamState,
     onToolExecutionStart?: (toolCallId: string) => void,
+    onToolExecutionEnd?: (toolCallId: string) => void,
     thinkingOverrideState?: ActiveTurnThinkingOverride,
     rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
     forcedFirstStepToolNames?: string[],
@@ -1795,7 +1833,7 @@ export class StreamManager extends EventEmitter {
       system: finalSystem,
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
-      tools: withSequentialExecution(finalTools, onToolExecutionStart),
+      tools: withSequentialExecution(finalTools, onToolExecutionStart, onToolExecutionEnd),
       providerOptions: finalProviderOptions,
       headers,
       maxOutputTokens: effectiveMaxOutputTokens,
@@ -2100,6 +2138,7 @@ export class StreamManager extends EventEmitter {
       onStepMessages,
       toolSearchState,
       (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
+      (toolCallId) => this.handleToolExecutionEnd(workspaceId, messageId, toolCallId),
       thinkingOverrideState,
       rebuildProviderOptionsForThinkingLevel,
       forcedFirstStepToolNames,
@@ -2131,6 +2170,7 @@ export class StreamManager extends EventEmitter {
       toolCompletionTimestamps: new Map(),
       pendingWorkflowRunAttachments: new Map(),
       pendingToolExecutionStarts: new Map(),
+      activeLocalToolExecutions: new Set(),
       model: modelString,
       metadataModel,
       thinkingLevel,
@@ -2856,6 +2896,7 @@ export class StreamManager extends EventEmitter {
       // against the fallback toolset, so prepareStep keeps reading live state.
       streamInfo.request.toolSearchState,
       (toolCallId) => this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
+      (toolCallId) => this.handleToolExecutionEnd(workspaceId, streamInfo.messageId, toolCallId),
       // Same holder object (the session's setter keeps working across the
       // hop) with a closure bound to the FALLBACK model. Attached before
       // createStreamResult below in case the SDK eagerly prepares step 1.
@@ -3017,6 +3058,55 @@ export class StreamManager extends EventEmitter {
     return true;
   }
 
+  private async readNextStreamPart<T>(
+    iterator: AsyncIterator<T>,
+    streamInfo: WorkspaceStreamInfo,
+    workspaceLog: Logger
+  ): Promise<IteratorResult<T> | null> {
+    const waitStartedAt = Date.now();
+    const nextPartPromise = iterator.next();
+
+    while (true) {
+      const outcome = await raceWithAbortAndTimeout(nextPartPromise, {
+        signal: streamInfo.abortController.signal,
+        timeoutMs: this.providerStreamIdleTimeoutMs,
+      });
+      if (outcome.kind === "ok") {
+        return outcome.value;
+      }
+      if (outcome.kind === "aborted") {
+        return null;
+      }
+
+      // Tool execute() calls have their own bounds. They can legitimately keep
+      // fullStream.next() pending while no provider event exists to observe.
+      if (streamInfo.activeLocalToolExecutions.size > 0) {
+        continue;
+      }
+
+      const timeoutError = new StreamIdleTimeoutError(
+        getStreamProviderDisplayName(streamInfo.model),
+        this.providerStreamIdleTimeoutMs
+      );
+      workspaceLog.warn("Aborting provider stream after idle timeout", {
+        messageId: streamInfo.messageId,
+        model: streamInfo.model,
+        timeoutMs: this.providerStreamIdleTimeoutMs,
+        idleDurationMs: Date.now() - waitStartedAt,
+        lastProgressAt: new Date(waitStartedAt).toISOString(),
+      });
+
+      streamInfo.abortController.abort();
+      const returnPromise = iterator.return?.();
+      if (returnPromise != null) {
+        void Promise.resolve(returnPromise).catch(() => {
+          // The provider abort is authoritative. Iterator cleanup is best-effort.
+        });
+      }
+      throw timeoutError;
+    }
+  }
+
   /**
    * Processes a stream with guaranteed cleanup, regardless of success or failure
    */
@@ -3047,12 +3137,17 @@ export class StreamManager extends EventEmitter {
         const toolCalls: ToolCallMap = new Map();
 
         try {
-          for await (const part of streamInfo.streamResult.fullStream) {
-            // Check if stream was cancelled BEFORE processing any parts
-            // This improves interruption responsiveness by catching aborts earlier
-            if (streamInfo.abortController.signal.aborted) {
+          const streamIterator = streamInfo.streamResult.fullStream[Symbol.asyncIterator]();
+          while (true) {
+            const nextPart = await this.readNextStreamPart(
+              streamIterator,
+              streamInfo,
+              workspaceLog
+            );
+            if (nextPart == null || nextPart.done) {
               break;
             }
+            const part = nextPart.value;
 
             // Log all stream parts to debug reasoning (commented out - too spammy)
             // console.log("[DEBUG streamManager]: Stream part", {
