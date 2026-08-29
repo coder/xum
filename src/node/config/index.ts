@@ -6,6 +6,7 @@ import writeFileAtomic from "write-file-atomic";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import { ProvidersConfigStore } from "./ProvidersConfigStore";
+import { WorkspaceSessionLocator } from "./sessionLocator";
 import type { WorkspaceMetadata, FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Result } from "@/common/types/result";
 import assert from "node:assert/strict";
@@ -46,7 +47,6 @@ import { SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { LEGACY_MUX_PRODUCT_NAME, LEGACY_MUX_PRODUCT_SLUG } from "@/common/compat/legacyMux";
-import { getXumHome } from "@/common/constants/paths";
 import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { GATEWAY_PROVIDERS } from "@/common/constants/providers";
 import {
@@ -87,6 +87,7 @@ export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig, Canonica
 export { FileLeaseManager } from "./FileLeaseManager";
 export { ProvidersConfigStore, type ProvidersConfig } from "./ProvidersConfigStore";
 export { SecretsStore } from "./SecretsStore";
+export { WorkspaceSessionLocator } from "./sessionLocator";
 
 /** True only for fs errors whose errno code is ENOENT (genuinely missing path). */
 function isEnoentError(error: unknown): boolean {
@@ -896,6 +897,7 @@ export class Config {
   readonly sessionsDir: string;
   readonly srcDir: string;
   private readonly configFile: string;
+  private readonly sessionLocator: WorkspaceSessionLocator;
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly emitter = new EventEmitter();
   /**
@@ -909,10 +911,15 @@ export class Config {
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
   private migrationPersist: Promise<void> | null = null;
 
-  constructor(rootDir?: string, providersConfigStore?: ProvidersConfigStore) {
-    this.rootDir = rootDir ?? getXumHome();
-    this.sessionsDir = path.join(this.rootDir, "sessions");
-    this.srcDir = path.join(this.rootDir, "src");
+  constructor(
+    rootDir?: string,
+    providersConfigStore?: ProvidersConfigStore,
+    sessionLocator = new WorkspaceSessionLocator(rootDir)
+  ) {
+    this.sessionLocator = sessionLocator;
+    this.rootDir = sessionLocator.rootDir;
+    this.sessionsDir = sessionLocator.sessionsDir;
+    this.srcDir = sessionLocator.srcDir;
     this.configFile = path.join(this.rootDir, "config.json");
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(this.rootDir);
   }
@@ -1645,7 +1652,7 @@ export class Config {
                 }
 
                 const usagePath = path.join(
-                  this.getSessionDir(sessionEntry.name),
+                  this.sessionLocator.getSessionDir(sessionEntry.name),
                   "session-usage.json"
                 );
                 if (fs.existsSync(usagePath)) {
@@ -2665,7 +2672,7 @@ export class Config {
             workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
 
           // Try loading metadata with basename as ID (works for old workspaces)
-          const metadataPath = path.join(this.getSessionDir(workspaceBasename), "metadata.json");
+          const metadataPath = path.join(this.sessionLocator.getSessionDir(workspaceBasename), "metadata.json");
           try {
             const data = fs.readFileSync(metadataPath, "utf-8");
             const metadata = JSON.parse(data) as WorkspaceMetadata;
@@ -2714,7 +2721,7 @@ export class Config {
           // only in that file would be reported absent while its workspace
           // remains registered.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
-          const legacyMetadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
+          const legacyMetadataPath = path.join(this.sessionLocator.getSessionDir(legacyId), "metadata.json");
           try {
             const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
             const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
@@ -2782,13 +2789,6 @@ export class Config {
    * WorkspaceMetadata.workspacePath is deprecated and will be removed. Use computed
    * paths from getWorkspacePath() or getWorkspacePaths() instead.
    */
-
-  /**
-   * Get the session directory for a specific workspace
-   */
-  getSessionDir(workspaceId: string): string {
-    return path.join(this.sessionsDir, workspaceId);
-  }
 
   /**
    * Get all workspace metadata by loading config and metadata files.
@@ -3024,7 +3024,7 @@ export class Config {
           const candidateIds =
             workspaceBasename === legacyId ? [legacyId] : [legacyId, workspaceBasename];
           for (const candidateId of candidateIds) {
-            const candidatePath = path.join(this.getSessionDir(candidateId), "metadata.json");
+            const candidatePath = path.join(this.sessionLocator.getSessionDir(candidateId), "metadata.json");
             let candidateRaw: string | undefined;
             try {
               candidateRaw = fs.readFileSync(candidatePath, "utf-8");
