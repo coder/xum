@@ -526,28 +526,35 @@ type WorkspaceHostMockOverrides = Partial<{
 
 function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {
   const defaults = makeWorkspaceHostFake();
-  const sendMessage = overrides.sendMessage ?? mock(defaults.sendMessage);
-  const resumeStream = overrides.resumeStream ?? mock(defaults.resumeStream);
-  const clearQueue = overrides.clearQueue ?? mock(defaults.clearQueue);
+  const sendMessage = overrides.sendMessage ?? mock(defaults.sendMessage.bind(defaults));
+  const resumeStream = overrides.resumeStream ?? mock(defaults.resumeStream.bind(defaults));
+  const clearQueue = overrides.clearQueue ?? mock(defaults.clearQueue.bind(defaults));
   const removeQueuedWorkspaceTurn =
-    overrides.removeQueuedWorkspaceTurn ?? mock(defaults.removeQueuedWorkspaceTurn);
-  const isBusyForMessage = overrides.isBusyForMessage ?? mock(defaults.isBusyForMessage);
-  const getQueueCutCutter = overrides.getQueueCutCutter ?? mock(defaults.getQueueCutCutter);
-  const remove = overrides.remove ?? overrides.removeWhileTaskTreeLocked ?? mock(defaults.remove);
-  const updateTitle = overrides.updateTitle ?? mock(defaults.updateTitle);
-  const emitChatEvent = overrides.emitChatEvent ?? mock(defaults.emitChatEvent);
+    overrides.removeQueuedWorkspaceTurn ?? mock(defaults.removeQueuedWorkspaceTurn.bind(defaults));
+  const isBusyForMessage =
+    overrides.isBusyForMessage ?? mock(defaults.isBusyForMessage.bind(defaults));
+  const getQueueCutCutter =
+    overrides.getQueueCutCutter ?? mock(defaults.getQueueCutCutter.bind(defaults));
+  const remove =
+    overrides.remove ?? overrides.removeWhileTaskTreeLocked ?? mock(defaults.remove.bind(defaults));
+  const updateTitle = overrides.updateTitle ?? mock(defaults.updateTitle.bind(defaults));
+  const emitChatEvent = overrides.emitChatEvent ?? mock(defaults.emitChatEvent.bind(defaults));
   const emit = overrides.emit ?? mock(() => true);
   const archive =
-    overrides.archive ?? overrides.archiveWhileTaskTreeLocked ?? mock(defaults.archive);
+    overrides.archive ??
+    overrides.archiveWhileTaskTreeLocked ??
+    mock(defaults.archive.bind(defaults));
   const unarchive =
     overrides.unarchive ??
     overrides.unarchiveWhileTaskTreeLocked ??
-    mock(defaults.unarchiveWhileTaskTreeLocked);
+    mock(defaults.unarchiveWhileTaskTreeLocked.bind(defaults));
   const isWorkflowInvocationCurrent =
-    overrides.isWorkflowInvocationCurrent ?? mock(defaults.isWorkflowInvocationCurrent);
-  const create = overrides.create ?? mock(defaults.create);
+    overrides.isWorkflowInvocationCurrent ??
+    mock(defaults.isWorkflowInvocationCurrent.bind(defaults));
+  const create = overrides.create ?? mock(defaults.create.bind(defaults));
   const discardExtensionMetadataEntry =
-    overrides.discardExtensionMetadataEntry ?? mock(defaults.discardExtensionMetadataEntry);
+    overrides.discardExtensionMetadataEntry ??
+    mock(defaults.discardExtensionMetadataEntry.bind(defaults));
 
   const workspaceService = makeWorkspaceHostFake({
     ...overrides,
@@ -555,7 +562,8 @@ function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {})
     discardExtensionMetadataEntry,
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace:
-      overrides.sanitizeMaterializedTaskWorkspace ?? defaults.sanitizeMaterializedTaskWorkspace,
+      overrides.sanitizeMaterializedTaskWorkspace ??
+      defaults.sanitizeMaterializedTaskWorkspace.bind(defaults),
     sendMessage,
     resumeStream,
     clearQueue,
@@ -565,10 +573,11 @@ function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {})
     // Keep-style behavior makes archive eligibility independent of untracked files.
     isSnapshotArchiveEligibilityMutationSensitive:
       overrides.isSnapshotArchiveEligibilityMutationSensitive ??
-      defaults.isSnapshotArchiveEligibilityMutationSensitive,
+      defaults.isSnapshotArchiveEligibilityMutationSensitive.bind(defaults),
     // No live activity grants the archive hold so tests reach interruption behavior.
     acquirePreInterruptionArchiveHold:
-      overrides.acquirePreInterruptionArchiveHold ?? defaults.acquirePreInterruptionArchiveHold,
+      overrides.acquirePreInterruptionArchiveHold ??
+      defaults.acquirePreInterruptionArchiveHold.bind(defaults),
     archive,
     archiveWhileTaskTreeLocked: archive,
     unarchiveWhileTaskTreeLocked: unarchive,
