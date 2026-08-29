@@ -2,6 +2,7 @@ import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import type { IncomingHttpHeaders } from "http";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { HistoryService } from "@/node/services/historyService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
@@ -54,6 +55,7 @@ import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenMa
 export interface ORPCContext {
   config: Config;
   aiService: AIService;
+  historyService: HistoryService;
   projectService: ProjectService;
   workspaceService: WorkspaceService;
   taskService: TaskService;

@@ -622,6 +622,7 @@ export class ServiceContainer {
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
       aiService: this.aiService,
+      historyService: this.historyService,
       projectService: this.projectService,
       workspaceService: this.workspaceService,
       taskService: this.taskService,

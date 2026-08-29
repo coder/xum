@@ -3,6 +3,7 @@ import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
+import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
@@ -2520,6 +2521,91 @@ describe("HistoryService", () => {
       await fs.rm(chatPath(wsId));
 
       expect(await service.hasHistory(wsId)).toBe(true);
+    });
+  });
+  describe("getSubagentTranscript", () => {
+    const dependencies = {
+      taskService: {
+        isDescendantAgentTask: () => Promise.resolve(false),
+        listDescendantAgentTasks: () => [],
+      },
+      aiService: {
+        getWorkspaceMetadata: () => Promise.resolve({ success: false as const, error: "unused" }),
+      },
+    };
+
+    async function writeArtifact(
+      ownerId: string,
+      taskId: string,
+      chatLines: string[] | null,
+      partial: MuxMessage
+    ): Promise<void> {
+      const ownerDir = config.getSessionDir(ownerId);
+      const transcriptDir = path.join(ownerDir, "subagent-transcripts", taskId);
+      const chatPath = path.join(transcriptDir, "chat.jsonl");
+      const partialPath = path.join(transcriptDir, "partial.json");
+      await fs.mkdir(transcriptDir, { recursive: true });
+      if (chatLines) await fs.writeFile(chatPath, chatLines.join("\n") + "\n");
+      await fs.writeFile(partialPath, JSON.stringify(partial));
+      await updateSubagentTranscriptArtifactsFile({
+        workspaceId: ownerId,
+        workspaceSessionDir: ownerDir,
+        update: (file) => {
+          file.artifactsByChildTaskId[taskId] = {
+            childTaskId: taskId,
+            parentWorkspaceId: ownerId,
+            createdAtMs: 1,
+            updatedAtMs: 1,
+            model: " openai:gpt-5 ",
+            thinkingLevel: "high",
+            chatPath,
+            partialPath,
+          };
+        },
+      });
+    }
+
+    it("reads cross-session fixtures, filters malformed lines, and merges partials", async () => {
+      const committed = createMuxMessage("committed", "assistant", "old", { historySequence: 1 });
+      const next = createMuxMessage("next", "user", "next", { historySequence: 2 });
+      const partial = createMuxMessage("partial", "assistant", "new", { historySequence: 1 });
+      partial.parts?.push({ type: "text", text: "continued" });
+      await writeArtifact(
+        "owner",
+        "merged-task",
+        [JSON.stringify(committed), "bad", JSON.stringify(next)],
+        partial
+      );
+
+      const merged = await service.getSubagentTranscript(
+        { taskId: "merged-task", requestingWorkspaceId: null },
+        dependencies
+      );
+      expect(merged.messages.map((message) => message.id)).toEqual(["partial", "next"]);
+      expect(merged).toMatchObject({ model: "openai:gpt-5", thinkingLevel: "high" });
+
+      const partialOnly = createMuxMessage("partial-only", "assistant", "saved", {
+        historySequence: 3,
+      });
+      await writeArtifact("owner", "missing-chat-task", null, partialOnly);
+      expect(
+        (
+          await service.getSubagentTranscript(
+            { taskId: "missing-chat-task", requestingWorkspaceId: null },
+            dependencies
+          )
+        ).messages.map((message) => message.id)
+      ).toEqual(["partial-only"]);
+    });
+
+    it("reports a cross-session miss", async () => {
+      const error = await service
+        .getSubagentTranscript(
+          { taskId: "missing-task", requestingWorkspaceId: null },
+          dependencies
+        )
+        .catch((caught: unknown) => caught);
+      expect(error).toHaveProperty("message", "No transcript found for task missing-task");
     });
   });
 });
