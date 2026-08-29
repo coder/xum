@@ -1,43 +1,32 @@
-import * as fs from "fs/promises";
-
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
-import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
-import { Ok, Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
-import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import {
   ADVISOR_DEFAULT_MAX_USES_PER_TURN,
   resolveAdvisorEnabledForAgent,
 } from "@/common/constants/advisor";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
-import type { GoalRecordV1 } from "@/common/types/goal";
-import type { ModelMessage, MuxMessage } from "@/common/types/message";
-import { createMuxMessage } from "@/common/types/message";
-import type { Config } from "@/node/config";
 import {
-  StreamManager,
-  type ModelFallbackOptions,
-  type StreamTextOnChunk,
-  type TurnCompletion,
-  type TurnEngineEvent,
-  type TurnExecutionOptions,
-  type TurnStreamHandle,
-} from "./streamManager";
-import { emitTurnEnvelope } from "./turnEnvelope";
-import {
-  sharedDurableEventJournal,
-  type DurableEventJournal,
-} from "@/node/utils/journal/durableEventJournal";
-import { runLanguageModelCleanup } from "./languageModelCleanup";
-import type { InitStateManager } from "./initStateManager";
+  addInterruptedSentinel,
+  filterEmptyAssistantMessages,
+} from "@/browser/utils/messages/modelMessageTransform";
 import type { SendMessageError } from "@/common/types/errors";
+import type { GoalRecordV1 } from "@/common/types/goal";
+import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import { createMuxMessage } from "@/common/types/message";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import { secretsToRecord } from "@/common/types/secrets";
+import type { XumToolScope } from "@/common/types/toolScope";
+import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
 import {
   deriveToolHookConfig,
   getForcedXaiSearchToolNames,
@@ -46,99 +35,88 @@ import {
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
-import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
+import type { Config } from "@/node/config";
+import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
+import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
-import {
-  createRuntimeContextForWorkspace,
-  createRuntimeForWorkspace,
-  resolveWorkspaceExecutionPath,
-  resolveWorkspaceRootPath,
-  type WorkspaceRuntimeContext,
-} from "@/node/runtime/runtimeHelpers";
-import type { Runtime } from "@/node/runtime/Runtime";
-import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
+import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
-import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
-import { getXumEnv, getRuntimeType } from "@/node/runtime/initHook";
-import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
-import { ContainerManager } from "@/node/multiProject/containerManager";
-import { secretsToRecord } from "@/common/types/secrets";
-import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
-import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { XumToolScope } from "@/common/types/toolScope";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import type { InitStateManager } from "./initStateManager";
+import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
+import type { StreamManager } from "./streamManager";
 import {
-  addInterruptedSentinel,
-  filterEmptyAssistantMessages,
-} from "@/browser/utils/messages/modelMessageTransform";
+  type ModelFallbackOptions,
+  type StreamTextOnChunk,
+  type TurnCompletion,
+  type TurnExecutionOptions,
+  type TurnStreamHandle,
+} from "./streamManager";
+import { emitTurnEnvelope } from "./turnEnvelope";
 
-import type { HistoryService } from "./historyService";
-import { delegatedToolCallManager } from "./delegatedToolCallManager";
-import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
-import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
-import { createAssistantMessageId } from "./utils/messageIds";
-import type { SessionUsageService } from "./sessionUsageService";
-import { sumUsageHistory, getTotalCost } from "@/common/utils/tokens/usageAggregator";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
-import { readToolInstructions } from "./systemMessage";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import {
   effectiveAdditionalSystemContext,
   mergeAdditionalSystemInstructions,
   readAdditionalSystemContext,
 } from "./additionalSystemContext";
-import type { TelemetryService } from "@/node/services/telemetryService";
-import type { DevToolsService } from "@/node/services/devToolsService";
-import type { ExperimentsService } from "@/node/services/experimentsService";
-import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { HistoryService } from "./historyService";
+import type { SessionUsageService } from "./sessionUsageService";
+import { readToolInstructions } from "./systemMessage";
+import { createAssistantMessageId } from "./utils/messageIds";
+import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
-import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
-import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
-import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
-import type { TaskService } from "@/node/services/taskService";
-import {
-  resolveMemoryProjectIdentity,
-  type MemoryService,
-  type MemorySessionContext,
-} from "@/node/services/memoryService";
-import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
-import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
-import {
-  buildProviderOptions,
-  buildRequestHeaders,
-  resolveProviderOptionsNamespaceKey,
-} from "@/common/utils/ai/providerOptions";
-import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
-import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import {
   coderGatewayWireProtocol,
   resolveCoderWireCanonicalModel,
 } from "@/common/constants/coderOAuth";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
+import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
+import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import {
-  customProviderWireOrigin,
-  isCustomProviderConfig,
-} from "@/common/utils/providers/customProviders";
+  buildProviderOptions,
+  buildRequestHeaders,
+  resolveProviderOptionsNamespaceKey,
+} from "@/common/utils/ai/providerOptions";
+import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
-import { uniqueSuffix } from "@/common/utils/hasher";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
+import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
+import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
+import type { TaskService } from "@/node/services/taskService";
+import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import type { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
-import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
-import { mergeGoalDefaults } from "@/common/utils/goals/resolveGoalSetIntent";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { THINKING_LEVEL_OFF, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  THINKING_LEVEL_OFF,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import { mergeGoalDefaults } from "@/common/utils/goals/resolveGoalSetIntent";
 import {
   enforceThinkingPolicy,
   isXaiGrokFastVariantSwap,
@@ -146,12 +124,18 @@ import {
   resolveEffectiveThinkingLevel,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
+import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import type {
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
 
-import type { StreamAbortEvent, StreamAbortReason } from "@/common/types/stream";
+import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
+import { getErrorMessage } from "@/common/utils/errors";
+import {
+  normalizeUsageModelKey,
+  resolveModelForMetadata,
+} from "@/common/utils/providers/modelEntries";
 import {
   computeActiveToolNames,
   prepareToolSearch,
@@ -160,17 +144,34 @@ import {
   TOOL_SEARCH_TOOL_NAME,
   type ToolSearchRuntime,
 } from "@/common/utils/tools/toolCatalog";
-import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
-import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
-import { ProviderModelFactory, modelCostsIncluded } from "./providerModelFactory";
-import { prepareMessagesForProvider } from "./messagePipeline";
-import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
-import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
-import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import {
-  normalizeUsageModelKey,
-  resolveModelForMetadata,
-} from "@/common/utils/providers/modelEntries";
+  buildWorkflowResultContextMessage,
+  filterWorkflowDisplayOnlyMessages,
+  WORKFLOW_RESULT_METADATA_TYPE,
+} from "@/common/utils/workflowRunMessages";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
+import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
+import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
+import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import {
+  WorkflowService,
+  type WorkflowRunStatusChangedEvent,
+} from "@/node/services/workflows/WorkflowService";
+import {
+  DEFAULT_WORKFLOW_AGENT_ID,
+  WorkflowTaskServiceAdapter,
+} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
+import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
+import { prepareMessagesForProvider } from "./messagePipeline";
+import type { ProviderModelFactory } from "./providerModelFactory";
+import { modelCostsIncluded } from "./providerModelFactory";
+import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
 import {
   simulateContextLimitError,
   simulateToolPolicyNoop,
@@ -181,41 +182,45 @@ import {
   captureMcpToolTelemetry,
   resolveBackendGatedPtcExperiments,
 } from "./toolAssembly";
-import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
-import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
-import { getErrorMessage } from "@/common/utils/errors";
-import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
-import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
-import {
-  WORKFLOW_RESULT_METADATA_TYPE,
-  buildWorkflowResultContextMessage,
-  filterWorkflowDisplayOnlyMessages,
-} from "@/common/utils/workflowRunMessages";
-import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import {
-  WorkflowService,
-  type WorkflowRunStatusChangedEvent,
-} from "@/node/services/workflows/WorkflowService";
-import {
-  DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
-} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
-import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
-import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
 
-import type { SendMessageOptions } from "@/common/orpc/types";
+export function resolveMuxProjectRootForHostFs(
+  metadata: WorkspaceMetadata,
+  workspacePath: string
+): string {
+  const runtimeType = metadata.runtimeConfig.type;
+  return runtimeType === "ssh" || runtimeType === "docker" ? metadata.projectPath : workspacePath;
+}
+
+export function resolveXumToolScope(
+  config: Config,
+  metadata: WorkspaceMetadata,
+  workspacePath: string,
+  checkoutRoot?: string | null
+): XumToolScope {
+  const projectConfig = config.loadConfigOrDefault().projects.get(metadata.projectPath);
+  if (
+    projectConfig?.projectKind === "system" &&
+    metadata.projectPath !== MULTI_PROJECT_CONFIG_KEY
+  ) {
+    return { type: "global", xumHome: config.rootDir };
+  }
+  const runtimeType = metadata.runtimeConfig.type;
+  return {
+    type: "project",
+    xumHome: config.rootDir,
+    projectRoot: resolveMuxProjectRootForHostFs(metadata, workspacePath),
+    projectStorageAuthority:
+      runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
+    ...(checkoutRoot != null ? { checkoutRoot } : {}),
+  };
+}
+
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
-import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
-import type { MemorySessionContext } from "@/node/services/memoryService";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 
@@ -390,28 +395,6 @@ function waitForWorkflowContinuationRetry(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
 }
 
-interface ToolExecutionContext {
-  toolCallId?: string;
-  abortSignal?: AbortSignal;
-}
-
-function isToolExecutionContext(value: unknown): value is ToolExecutionContext {
-  if (typeof value !== "object" || value == null || Array.isArray(value)) {
-    return false;
-  }
-
-  const record = value as Record<string, unknown>;
-  const toolCallId = record.toolCallId;
-  const abortSignal = record.abortSignal;
-
-  const validToolCallId = toolCallId == null || typeof toolCallId === "string";
-  const validAbortSignal = abortSignal == null || abortSignal instanceof AbortSignal;
-
-  return validToolCallId && validAbortSignal;
-}
-
-/**
-
 /**
  * Pin the factory-resolved Coder instance type into a providers-config view.
  *
@@ -479,7 +462,7 @@ function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
   return `${metadata.projectName}-${uniqueSuffix([metadata.projectPath])}`;
 }
 
-interface WorkflowResultContinuationSender {
+export interface WorkflowResultContinuationSender {
   isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
   sendMessage(
     workspaceId: string,
@@ -504,6 +487,8 @@ export interface TurnRequestBuildStartupState {
 export interface TurnRequestBuildContext {
   abortSignal: AbortSignal;
   syntheticMessageId: string;
+  startTime: number;
+  startupPhaseTimingsMs: Record<string, number>;
   startupState: TurnRequestBuildStartupState;
   recordStartupPhaseTiming: (phase: string, phaseStartedAt: number) => void;
 }
@@ -944,6 +929,8 @@ export class TurnRequestBuilder {
     );
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
+    const startTime = context.startTime;
+    const startupPhaseTimingsMs = context.startupPhaseTimingsMs;
     const recordStartupPhaseTiming = context.recordStartupPhaseTiming;
     let pendingRunMetadataId: string | null = context.startupState.pendingRunMetadataId;
     let logSlowStreamStartup: ((details: Record<string, unknown>) => void) | undefined;
@@ -961,86 +948,8 @@ export class TurnRequestBuilder {
     };
     // Mode (plan|exec|compact) is derived from the selected agent definition.
     const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
-    // Preliminary clamp for the factory call only: the factory reads the
-    // thinking level solely for the xAI Grok variant swap, which never
-    // depends on Coder instance metadata, so a pre-snapshot resolution is
-    // safe there. The FINAL effectiveThinkingLevel is re-resolved below
-    // from the pinned request snapshot — resolving it from this earlier
-    // read would race a concurrent instance retag and disagree with the
-    // wire the factory created the SDK model for.
-    const preliminaryThinkingLevel: ThinkingLevel = resolveEffectiveThinkingLevel(
-      modelString,
-      thinkingLevel,
-      this.providerService.getConfig()
-    );
+    const userOpenAIWireFormat = effectiveMuxProviderOptions.openai?.wireFormat;
 
-    // Resolve model string (xAI variant mapping + gateway routing) and create the model.
-    const resolveAndCreateModelStartedAt = Date.now();
-    const modelResult = await this.providerModelFactory.resolveAndCreateModel(
-      modelString,
-      preliminaryThinkingLevel,
-      effectiveMuxProviderOptions,
-      { agentInitiated, workspaceId }
-    );
-    recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
-    if (!modelResult.success) {
-      return { type: "finished", result: Err(modelResult.error) };
-    }
-    const {
-      effectiveModelString,
-      canonicalModelString,
-      canonicalProviderName,
-      wireProviderName,
-      routedThroughGateway,
-      routeProvider,
-    } = modelResult.data;
-    // ONE providers-config snapshot for every request builder (messages,
-    // options, headers, overrides, capability lookups, mid-turn rebuild
-    // closures). Re-reading ProviderService per builder races concurrent
-    // catalog refreshes: an instance-type change mid-request would hand the
-    // already-created SDK model another wire's options/headers. The
-    // factory-resolved instance type is PINNED into the snapshot so every
-    // coder-wire resolution matches the created model even when the change
-    // lands between the factory's read and this capture.
-    const requestProvidersConfig = pinCoderInstanceProvidersConfig(
-      this.providerService.getConfig(),
-      modelString,
-      modelResult.data.coderSelectedInstance
-    );
-    // FINAL thinking clamp from the pinned snapshot. Models that cannot disable
-    // thinking, including aliases mapped to them, get the same treatment.
-    // Resolved here — not from the pre-factory read — so a
-    // concurrent instance retag cannot leave the level derived from one
-    // type while options/messages are built for the other's wire.
-    const effectiveThinkingLevel: ThinkingLevel = resolveEffectiveThinkingLevel(
-      modelString,
-      thinkingLevel,
-      requestProvidersConfig
-    );
-    // Capability lookups must see the RAW coder identity: name-based
-    // canonicalization can rewrite a cross-typed instance (coder:openai/x
-    // with type anthropic) to openai:x, hiding the instance metadata that
-    // resolveModelForMetadata needs to derive the real capability model.
-    // Non-coder strings keep the canonical form (raw gateway strings like
-    // mux-gateway:origin/x would otherwise leak through unresolved).
-    const capabilityModelString = resolveModelForMetadata(
-      modelString.startsWith("coder:") ? modelString : canonicalModelString,
-      requestProvidersConfig
-    );
-    // Provider-specific tool assembly keys on the WIRE identity of the
-    // EFFECTIVE route: raw coder:<instance>/<model> strings parse as
-    // provider "coder" inside getToolsForModel, which skips the Anthropic
-    // branch (native web tools) and the OpenAI branch (MCP schema
-    // sanitization). The wire variant matters too: openai-chat instance
-    // types (openrouter/google/azure/openai-compat/vercel) are created via
-    // provider.chat(...), so Responses-only assembly (native web_search)
-    // and Responses-only providerOptions must be suppressed via the
-    // existing wireFormat knob. When routing fell away from Coder, the
-    // effective route IS the identity (a coder:openrouter selection that
-    // fell back to direct OpenRouter must not be treated as OpenAI-wire).
-    // The capability identity above stays raw-derived. A custom provider
-    // shadowing the "coder" prefix keeps its raw identity; unknown
-    // instances fall back to the name-canonical form.
     const resolveToolsIdentity = (
       raw: string,
       effective: string,
@@ -1123,41 +1032,135 @@ export class TurnRequestBuilder {
             : {}),
       };
     };
-    const toolsIdentity = resolveToolsIdentity(
-      modelString,
-      effectiveModelString,
-      canonicalModelString,
-      modelResult.data.coderWire,
-      requestProvidersConfig
-    );
-    const toolsModelString = toolsIdentity.modelString;
-    // Option/header builder identity: raw selections resolve via the
-    // pinned instance config (coder-routed requests need the wire), but a
-    // Coder selection whose routing FELL AWAY from the gateway must build
-    // options for the EFFECTIVE route. Example: coder:google/gemini-* with
-    // Coder unavailable routes through the passthrough mux-gateway and
-    // sends native Google bytes — resolving the raw string against the
-    // pinned instance would emit the gateway wire's OpenAI options and
-    // drop Google settings such as thinkingConfig. Tool assembly
-    // (toolsModelString) already follows the effective route; reuse it.
-    const optionsModelString =
-      modelString.startsWith("coder:") && !effectiveModelString.startsWith("coder:")
-        ? toolsModelString
-        : modelString;
-    // The user's own wireFormat, captured BEFORE wire injection: the
-    // refusal-fallback prepare() must reset to it when swapping to a model
-    // whose route is not an OpenAI-wire Coder instance.
-    const userOpenAIWireFormat = effectiveMuxProviderOptions.openai?.wireFormat;
-    if (toolsIdentity.openaiWireFormat != null) {
-      // Deliberate in-place update: every downstream consumer
-      // (buildProviderOptions, toolsForModelConfig.openaiWireFormat, header
-      // building, mid-turn thinking rebuilds) reads this object, and the
-      // actual request bytes go over Chat Completions.
-      effectiveMuxProviderOptions.openai = {
-        ...(effectiveMuxProviderOptions.openai ?? {}),
-        wireFormat: toolsIdentity.openaiWireFormat,
-      };
+    const prepareModelSeed = async (options: {
+      rawModelString: string;
+      requestedThinkingLevel: ThinkingLevel | undefined;
+      minimumThinkingLevelOverride: ThinkingLevel | undefined;
+      enforceMinimum: boolean;
+      recordTiming?: boolean;
+    }) => {
+      if (
+        options.enforceMinimum &&
+        effectiveMuxProviderOptions.openai?.wireFormat !== userOpenAIWireFormat
+      ) {
+        effectiveMuxProviderOptions.openai = {
+          ...(effectiveMuxProviderOptions.openai ?? {}),
+          wireFormat: userOpenAIWireFormat,
+        };
+      }
+
+      const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
+      const preliminaryProvidersConfig = this.providerService.getConfig();
+      const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
+        options.rawModelString,
+        options.minimumThinkingLevelOverride,
+        preliminaryProvidersConfig
+      );
+      const preliminaryThinkingLevel = options.enforceMinimum
+        ? enforceThinkingPolicy(
+            options.rawModelString,
+            requestedThinkingLevel,
+            preliminaryMinThinkingLevel,
+            preliminaryProvidersConfig
+          )
+        : resolveEffectiveThinkingLevel(
+            options.rawModelString,
+            requestedThinkingLevel,
+            preliminaryProvidersConfig
+          );
+
+      const resolveAndCreateModelStartedAt = Date.now();
+      const resolved = await this.providerModelFactory.resolveAndCreateModel(
+        options.rawModelString,
+        preliminaryThinkingLevel,
+        effectiveMuxProviderOptions,
+        { agentInitiated, workspaceId }
+      );
+      if (options.recordTiming) {
+        recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
+      }
+      if (!resolved.success) {
+        return resolved;
+      }
+
+      const providersConfig = pinCoderInstanceProvidersConfig(
+        this.providerService.getConfig(),
+        options.rawModelString,
+        resolved.data.coderSelectedInstance
+      );
+      const minThinkingLevel = resolveMinimumThinkingLevel(
+        options.rawModelString,
+        options.minimumThinkingLevelOverride,
+        providersConfig
+      );
+      const effectiveThinkingLevel = options.enforceMinimum
+        ? enforceThinkingPolicy(
+            options.rawModelString,
+            requestedThinkingLevel,
+            minThinkingLevel,
+            providersConfig
+          )
+        : resolveEffectiveThinkingLevel(
+            options.rawModelString,
+            requestedThinkingLevel,
+            providersConfig
+          );
+      const toolsIdentity = resolveToolsIdentity(
+        options.rawModelString,
+        resolved.data.effectiveModelString,
+        resolved.data.canonicalModelString,
+        resolved.data.coderWire,
+        providersConfig
+      );
+      const optionsModelString =
+        options.rawModelString.startsWith("coder:") &&
+        !resolved.data.effectiveModelString.startsWith("coder:")
+          ? toolsIdentity.modelString
+          : options.rawModelString;
+      if (toolsIdentity.openaiWireFormat != null) {
+        effectiveMuxProviderOptions.openai = {
+          ...(effectiveMuxProviderOptions.openai ?? {}),
+          wireFormat: toolsIdentity.openaiWireFormat,
+        };
+      }
+
+      return Ok({
+        ...resolved.data,
+        rawModelString: options.rawModelString,
+        providersConfig,
+        minThinkingLevel,
+        effectiveThinkingLevel,
+        capabilityModelString: resolveModelForMetadata(
+          options.rawModelString.startsWith("coder:")
+            ? options.rawModelString
+            : resolved.data.canonicalModelString,
+          providersConfig
+        ),
+        toolsModelString: toolsIdentity.modelString,
+        optionsModelString,
+      });
+    };
+
+    const modelResult = await prepareModelSeed({
+      rawModelString: modelString,
+      requestedThinkingLevel: thinkingLevel,
+      minimumThinkingLevelOverride: providedMinThinkingLevel,
+      enforceMinimum: false,
+      recordTiming: true,
+    });
+    if (!modelResult.success) {
+      return { type: "finished", result: Err(modelResult.error) };
     }
+    const {
+      canonicalModelString,
+      canonicalProviderName,
+      wireProviderName,
+      routedThroughGateway,
+      routeProvider,
+      providersConfig: requestProvidersConfig,
+      effectiveThinkingLevel,
+      capabilityModelString,
+    } = modelResult.data;
 
     // Dump original messages for debugging
     log.debug_obj(`${workspaceId}/1_original_messages.json`, messages);
@@ -1738,7 +1741,6 @@ export class TurnRequestBuilder {
 
     // Get model-specific tools with workspace path (correct for local or remote)
     emitStartupBreadcrumb("loading_tools");
-    const getToolsForModelStartedAt = Date.now();
     assert(
       workspaceId.trim().length > 0,
       "AIService.streamMessage requires a non-empty workspaceId"
@@ -2307,208 +2309,327 @@ export class TurnRequestBuilder {
       // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
       trusted: sharedExecutionTrusted,
     };
-    const allTools = await getToolsForModel(
-      toolsModelString,
-      toolsForModelConfig,
-      workspaceId,
-      this.initStateManager,
-      toolInstructions,
-      mcpTools
-    );
-    recordStartupPhaseTiming("getToolsForModelMs", getToolsForModelStartedAt);
-    const toolsWithDelegation = this.wrapToolsForDelegation(
-      workspaceId,
-      allTools,
-      delegatedToolNames
-    );
-
-    // Forward nested PTC tool events to the stream (tool-call-start/end only,
-    // not console events which appear in final result only). Shared with the
-    // refusal-fallback prepare() tool rebuild.
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
         this.streamManager.emitNestedToolEvent(workspaceId, assistantMessageId, event);
       }
     };
-
-    // Host file loader backing mux.load (r12 bulk kernel ingestion). Built
-    // from the same cwd/runtime pair the file tools use so path resolution
-    // matches mux.file_read. Only honored by kernel-mode code_execution.
-    // SECURITY: the loader shares the tool hook trust gate — its bulk read
-    // runs through the same tool.execute pipeline as a hook-wrapped
-    // file_read call, so a trusted tool_pre denying sensitive paths gates
-    // mux.load too (it must not be a hook bypass for file_read).
     const kernelFileLoader = createKernelFileLoader({
       cwd: toolsForModelConfig.cwd,
       runtime: toolsForModelConfig.runtime,
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
-
-    // Apply tool policy and PTC experiments (lazy-loads PTC dependencies only when needed).
-    const applyToolPolicyAndExperimentsStartedAt = Date.now();
-    let tools = await applyToolPolicyAndExperiments({
-      allTools: toolsWithDelegation,
-      extraTools: this.extraTools,
-      effectiveToolPolicy,
-      experiments,
-      emitNestedToolEvent: emitNestedPtcToolEvent,
-      sandbox: {
-        workspaceId,
-        sessionDir: this.config.getSessionDir(workspaceId),
-        kernelFileLoader,
-      },
-    });
-    recordStartupPhaseTiming(
-      "applyToolPolicyAndExperimentsMs",
-      applyToolPolicyAndExperimentsStartedAt
-    );
-
-    // Tool search (tool-search experiment): post-policy gate. Classification
-    // must consume the policy-filtered record so policy-disabled tools never
-    // enter the deferred catalog. This runs before every downstream consumer
-    // of `tools` (system-prompt rebuild, sentinel tool names, telemetry,
-    // streaming) so a dropped tool_catalog_search cannot leak anywhere.
-    // PTC gate uses the same condition toolAssembly uses to add code_execution:
-    // presence-sniffing the record would misfire on an MCP tool named
-    // code_execution (see prepareToolSearch).
     const ptcEnabled = experiments?.programmaticToolCalling === true;
-    if (toolSearchRuntime) {
-      const toolSearchPrep = prepareToolSearch({
-        tools,
-        mcpToolNames: Object.keys(mcpTools ?? {}),
-        mcpToolServers: mcpToolServerNames,
-        toolPolicy: effectiveToolPolicy,
-        ptcEnabled,
-      });
-      tools = toolSearchPrep.tools;
-      if (toolSearchPrep.state) {
-        toolSearchRuntime.state = toolSearchPrep.state;
-      }
-    }
-
-    const advisorToolAvailable = tools.advisor !== undefined;
-    const memoryToolAvailable = tools.memory !== undefined;
-    const finalMemoryContext = await upgradeMemoryContextForModel(memoryToolAvailable, modelString);
-    const finalStreamSystemContext =
-      advisorToolAvailable === advisorToolEligible &&
-      memoryToolAvailable === memoryToolEligible &&
-      finalMemoryContext === memoryContext
-        ? prePolicyStreamSystemContext
-        : await (async () => {
-            // Rebuild when policy/experiments changed advisor or memory tool
-            // availability (stale advisor guidance / memory index must not advertise
-            // absent tools), or when the post-policy memory tool enables the
-            // token-budgeted hot block. On SSH this context build scans agents,
-            // skills, and instruction files over many small remote ops.
-            const rebuildStreamSystemContextStartedAt = Date.now();
-            const rebuiltContext = await buildStreamSystemContextForToolset(
-              {
-                advisorToolAvailable,
-                memoryToolAvailable,
-              },
-              modelString,
-              finalMemoryContext
-            );
-            recordStartupPhaseTiming(
-              "rebuildStreamSystemContextMs",
-              rebuildStreamSystemContextStartedAt
-            );
-            return rebuiltContext;
-          })();
-    systemMessageTokens = finalStreamSystemContext.systemMessageTokens;
-    systemMessage = finalStreamSystemContext.systemMessage;
-
-    // Kept as a standalone prefix so the refusal-fallback prepare() can reapply
-    // it to a system prompt rebuilt for the fallback model.
     let mcpWarningPrefix: string | undefined;
     if (mcpStats && mcpStats.failedServerCount > 0) {
       const failedNames = mcpStats.failedServerNames.join(", ");
       workspaceLog.warn("MCP servers failed to start", { failedNames });
-      // Reapply the MCP startup warning after rebuilding the final system prompt.
-      mcpWarningPrefix = `[Warning: ${mcpStats.failedServerCount} MCP server(s) failed to start: ${failedNames}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n`;
-      systemMessage = `${mcpWarningPrefix}${systemMessage}`;
-      // Keep context-size estimation accurate after mutating the system prompt.
-      const metadataModel = resolveModelForMetadata(modelString, requestProvidersConfig);
-      const tokenizer = await getTokenizerForModel(modelString, metadataModel);
-      systemMessageTokens = await tokenizer.countTokens(systemMessage);
+      mcpWarningPrefix =
+        "[Warning: " +
+        mcpStats.failedServerCount +
+        " MCP server(s) failed to start: " +
+        failedNames +
+        ". Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n";
     }
 
-    // Waterfall hook point: registered middleware may rewrite the final system
-    // prompt or filter the toolset. Contract for future consumers: any content
-    // middleware adds to a request must exist as a durable event first
-    // (append-time materialization) — see eventSpine module docs. Gated on
-    // hasMiddleware so the empty-pipeline hot path skips ctx construction.
-    if (eventSpine.hasMiddleware("request.assemble")) {
-      const assembleCtx: RequestAssembleContext = {
-        workspaceId,
-        modelString,
-        systemMessage,
-        tools,
-      };
-      await eventSpine.run("request.assemble", assembleCtx);
-      tools = assembleCtx.tools;
-      // PTC needs no post-hook bridge reconcile: bridgeable tools are not
-      // in the hook-visible record, so middleware cannot invalidate the
-      // ToolBridge code_execution closes over. Tools promoted to the
-      // model-visible set (policy-required tools, mcp_prompt_get) are
-      // excluded from the bridge at assembly time (see toolAssembly), so
-      // a hook that filters or wraps them affects the only dispatch path.
-      // Tool-search state was classified from the pre-hook record; a hook
-      // that added/removed tools would leave allToolNames/deferred/active
-      // sets stale (prepareStep scoping + sentinel names both read them).
-      // Rebuild in place so the state describes the post-hook toolset.
-      if (toolSearchRuntime?.state) {
-        tools = rebuildToolSearchState(toolSearchRuntime.state, {
-          tools,
-          mcpToolNames: Object.keys(mcpTools ?? {}),
-          mcpToolServers: mcpToolServerNames,
-          toolPolicy: effectiveToolPolicy,
-          ptcEnabled,
-        }).tools;
+    type ModelSeed = typeof modelResult.data;
+    const prepareModelRequest = async (options: {
+      seed: ModelSeed;
+      sourceMessages: MuxMessage[];
+      providerRequestMessages?: MuxMessage[];
+      initializeToolSearch: boolean;
+      reusePrePolicySystemContext: boolean;
+      requestHistorySequence: number;
+      partialContinuationMessage?: MuxMessage;
+      recordTimings?: boolean;
+      cleanupModelOnError?: boolean;
+    }) => {
+      const { seed } = options;
+      try {
+        const attemptProviderRequestMessages =
+          options.providerRequestMessages ??
+          prepareProviderRequestMessages(
+            options.sourceMessages,
+            seed.wireProviderName,
+            seed.effectiveThinkingLevel
+          ).providerRequestMessages;
+
+        const getToolsStartedAt = Date.now();
+        const allTools = await getToolsForModel(
+          seed.toolsModelString,
+          {
+            ...toolsForModelConfig,
+            capabilityModelString: seed.capabilityModelString,
+            openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
+            xaiNativeToolsEnabled: seed.routeProvider === "xai",
+          },
+          workspaceId,
+          this.initStateManager,
+          toolInstructions,
+          mcpTools
+        );
+        if (options.recordTimings) {
+          recordStartupPhaseTiming("getToolsForModelMs", getToolsStartedAt);
+        }
+
+        const applyPolicyStartedAt = Date.now();
+        let attemptTools = await applyToolPolicyAndExperiments({
+          allTools: this.wrapToolsForDelegation(workspaceId, allTools, delegatedToolNames),
+          extraTools: this.extraTools,
+          effectiveToolPolicy,
+          experiments,
+          emitNestedToolEvent: emitNestedPtcToolEvent,
+          sandbox: {
+            workspaceId,
+            sessionDir: this.config.getSessionDir(workspaceId),
+            kernelFileLoader,
+          },
+        });
+        if (options.recordTimings) {
+          recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
+        }
+
+        if (toolSearchRuntime) {
+          if (options.initializeToolSearch) {
+            const preparedSearch = prepareToolSearch({
+              tools: attemptTools,
+              mcpToolNames: Object.keys(mcpTools ?? {}),
+              mcpToolServers: mcpToolServerNames,
+              toolPolicy: effectiveToolPolicy,
+              ptcEnabled,
+            });
+            attemptTools = preparedSearch.tools;
+            if (preparedSearch.state) {
+              toolSearchRuntime.state = preparedSearch.state;
+            }
+          } else if (toolSearchRuntime.state) {
+            attemptTools = rebuildToolSearchState(toolSearchRuntime.state, {
+              tools: attemptTools,
+              mcpToolNames: Object.keys(mcpTools ?? {}),
+              mcpToolServers: mcpToolServerNames,
+              toolPolicy: effectiveToolPolicy,
+              ptcEnabled,
+            }).tools;
+          } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
+            const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
+            attemptTools = rest;
+          }
+        }
+
+        const advisorToolAvailable = attemptTools.advisor !== undefined;
+        const memoryToolAvailable = attemptTools.memory !== undefined;
+        const memoryContextForModel = await upgradeMemoryContextForModel(
+          memoryToolAvailable,
+          seed.rawModelString
+        );
+        const canReuseSystemContext =
+          options.reusePrePolicySystemContext &&
+          advisorToolAvailable === advisorToolEligible &&
+          memoryToolAvailable === memoryToolEligible &&
+          memoryContextForModel === memoryContext;
+        const rebuildSystemStartedAt = Date.now();
+        const systemContext = canReuseSystemContext
+          ? prePolicyStreamSystemContext
+          : await buildStreamSystemContextForToolset(
+              { advisorToolAvailable, memoryToolAvailable },
+              seed.rawModelString,
+              memoryContextForModel
+            );
+        if (options.recordTimings && !canReuseSystemContext) {
+          recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
+        }
+        let attemptSystem = systemContext.systemMessage;
+        let attemptSystemTokens = systemContext.systemMessageTokens;
+        if (mcpWarningPrefix != null) {
+          attemptSystem = mcpWarningPrefix + attemptSystem;
+          const tokenizer = await getTokenizerForModel(
+            seed.rawModelString,
+            seed.capabilityModelString
+          );
+          attemptSystemTokens = await tokenizer.countTokens(attemptSystem);
+        }
+
+        if (eventSpine.hasMiddleware("request.assemble")) {
+          const assembleCtx: RequestAssembleContext = {
+            workspaceId,
+            modelString: seed.rawModelString,
+            systemMessage: attemptSystem,
+            tools: attemptTools,
+          };
+          await eventSpine.run("request.assemble", assembleCtx);
+          attemptTools = assembleCtx.tools;
+          if (toolSearchRuntime?.state) {
+            attemptTools = rebuildToolSearchState(toolSearchRuntime.state, {
+              tools: attemptTools,
+              mcpToolNames: Object.keys(mcpTools ?? {}),
+              mcpToolServers: mcpToolServerNames,
+              toolPolicy: effectiveToolPolicy,
+              ptcEnabled,
+            }).tools;
+          }
+          if (assembleCtx.systemMessage !== attemptSystem) {
+            attemptSystem = assembleCtx.systemMessage;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens = await tokenizer.countTokens(attemptSystem);
+          }
+        }
+
+        if (options.initializeToolSearch && toolSearchRuntime?.state) {
+          seedToolSearchActivationsFromMessages(toolSearchRuntime.state, messagesWithSentinel);
+        }
+        const toolNamesForSentinel = (
+          computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
+        ).sort();
+        const finalMessages = await prepareMessagesForProvider({
+          messagesWithSentinel: addInterruptedSentinel(attemptProviderRequestMessages),
+          effectiveAgentId,
+          toolNamesForSentinel,
+          planContentForTransition,
+          planFilePath,
+          postCompactionAttachments,
+          providerForMessages: seed.wireProviderName,
+          effectiveThinkingLevel: seed.effectiveThinkingLevel,
+          modelString: seed.rawModelString,
+          providersConfig: seed.providersConfig,
+          anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
+          workspaceId,
+        });
+        const preparedAttempt = this.prepareModelAttempt({
+          rawModelString: seed.rawModelString,
+          canonicalModelString: seed.canonicalModelString,
+          canonicalProviderName: seed.canonicalProviderName,
+          effectiveModelString: seed.effectiveModelString,
+          optionsModelString: seed.optionsModelString,
+          wireProviderName: seed.wireProviderName,
+          routeProvider: seed.routeProvider,
+          effectiveThinkingLevel: seed.effectiveThinkingLevel,
+          minThinkingLevel: seed.minThinkingLevel,
+          providerRequestMessages: attemptProviderRequestMessages,
+          muxProviderOptions: effectiveMuxProviderOptions,
+          workspaceId,
+          truncationMode: openaiTruncationModeOverride,
+          providersConfigSnapshot: seed.providersConfig,
+          coderSelectedInstance: seed.coderSelectedInstance,
+          promptCacheScope: derivePromptCacheScope(metadata),
+          reasoningMode,
+          ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
+        });
+        const forcedFirstStepToolNames =
+          seed.routeProvider === "xai"
+            ? getForcedXaiSearchToolNames(
+                seed.capabilityModelString,
+                effectiveMuxProviderOptions.xai?.searchParameters
+              )?.filter((toolName) => toolName in attemptTools)
+            : undefined;
+        const firstStepToolNames = new Set(
+          forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
+        );
+        const emitEnvelopeWith = async (
+          level: string,
+          providerOptionsForEnvelope: unknown
+        ): Promise<void> => {
+          await emitTurnEnvelope({
+            journal: this.durableEventJournalFor(workspaceId),
+            workspaceId,
+            systemMessage: attemptSystem,
+            tools: Object.fromEntries(
+              Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
+            ),
+            modelString: seed.rawModelString,
+            thinkingLevel: level,
+            providerOptions: providerOptionsForEnvelope,
+            requestHistorySequence: options.requestHistorySequence,
+            sentinelToolNames: toolNamesForSentinel,
+            wireProviderName: seed.wireProviderName,
+            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+            planContentForTransition,
+            planFilePath,
+            postCompactionAttachments,
+            partialContinuationMessage: options.partialContinuationMessage,
+          });
+        };
+        const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
+          const rebuiltMessages = prepareProviderRequestMessages(
+            options.sourceMessages,
+            seed.wireProviderName,
+            level
+          ).providerRequestMessages;
+          return prepareMessagesForProvider({
+            messagesWithSentinel: addInterruptedSentinel(rebuiltMessages),
+            effectiveAgentId,
+            toolNamesForSentinel,
+            planContentForTransition,
+            planFilePath,
+            postCompactionAttachments,
+            providerForMessages: seed.wireProviderName,
+            effectiveThinkingLevel: level,
+            modelString: seed.rawModelString,
+            providersConfig: seed.providersConfig,
+            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
+            workspaceId,
+          });
+        };
+        const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
+          level,
+          providerOptionsForEnvelope
+        ) => {
+          const rebuiltMessages = await rebuildMessagesForThinkingLevel(level);
+          await emitEnvelopeWith(level, providerOptionsForEnvelope);
+          return rebuiltMessages;
+        };
+
+        return {
+          ...seed,
+          providerRequestMessages: attemptProviderRequestMessages,
+          messages: finalMessages,
+          system: attemptSystem,
+          systemMessageTokens: attemptSystemTokens,
+          tools: attemptTools,
+          toolNamesForSentinel,
+          forcedFirstStepToolNames,
+          providerOptions: preparedAttempt.providerOptions,
+          headers: preparedAttempt.requestHeaders,
+          resolvedOverrides: preparedAttempt.resolvedOverrides,
+          currentEffectiveLevelRef: preparedAttempt.currentEffectiveLevelRef,
+          computeRebuiltProviderOptions: preparedAttempt.computeRebuiltProviderOptions,
+          rebuildProviderOptionsForThinkingLevel:
+            preparedAttempt.rebuildProviderOptionsForThinkingLevel,
+          rebuildMessagesForThinkingLevel,
+          emitEnvelopeWith,
+          onStreamConstructed: () =>
+            emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
+          rebuildFirstStepForThinkingLevel,
+        };
+      } catch (error) {
+        if (options.cleanupModelOnError) {
+          runLanguageModelCleanup(options.seed.model);
+        }
+        throw error;
       }
-      if (assembleCtx.systemMessage !== systemMessage) {
-        systemMessage = assembleCtx.systemMessage;
-        // Keep context-size estimation accurate after middleware mutation.
-        const metadataModel = resolveModelForMetadata(modelString, requestProvidersConfig);
-        const tokenizer = await getTokenizerForModel(modelString, metadataModel);
-        systemMessageTokens = await tokenizer.countTokens(systemMessage);
-      }
-    }
+    };
 
-    // Re-activate deferred tools discovered by tool_catalog_search in earlier turns
-    // without requiring a new search. Must run before the sentinel list is
-    // computed so pre-activated tools are advertised in agent transitions.
-    if (toolSearchRuntime?.state) {
-      seedToolSearchActivationsFromMessages(toolSearchRuntime.state, messagesWithSentinel);
-    }
-
-    // Agent-transition sentinels must list only tools the model can actually
-    // see on the first step: deferred, not-yet-activated MCP tools are
-    // hidden by activeTools scoping, so advertising them would steer the
-    // model toward unavailable tool calls.
-    const toolNamesForSentinel = (
-      computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(tools)
-    ).sort();
-
-    // Run the full message preparation pipeline (inject context, transform, validate).
-    // This is a purely functional pipeline with no service dependencies.
-    emitStartupBreadcrumb("preparing_request");
+    const requestHistorySequence = providerRequestMessages.reduce(
+      (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
+      -1
+    );
     const prepareMessagesForProviderStartedAt = Date.now();
-    const finalMessages = await prepareMessagesForProvider({
-      messagesWithSentinel,
-      effectiveAgentId,
-      toolNamesForSentinel,
-      planContentForTransition,
-      planFilePath,
-      postCompactionAttachments,
-      providerForMessages: wireProviderName,
-      effectiveThinkingLevel,
-      modelString,
-      providersConfig: requestProvidersConfig,
-      anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-      workspaceId,
+    const primaryRequest = await prepareModelRequest({
+      seed: modelResult.data,
+      sourceMessages: messages,
+      providerRequestMessages,
+      initializeToolSearch: true,
+      reusePrePolicySystemContext: true,
+      requestHistorySequence,
+      recordTimings: true,
     });
     recordStartupPhaseTiming("prepareMessagesForProviderMs", prepareMessagesForProviderStartedAt);
+    const tools = primaryRequest.tools;
+    systemMessage = primaryRequest.system;
+    systemMessageTokens = primaryRequest.systemMessageTokens;
+    const finalMessages = primaryRequest.messages;
 
     captureMcpToolTelemetry({
       telemetryService: this.telemetryService,
@@ -2527,10 +2648,6 @@ export class TurnRequestBuilder {
       return { type: "finished", result: Ok(this.createAbortedTurnHandle(assistantMessageId)) };
     }
 
-    const requestHistorySequence = providerRequestMessages.reduce(
-      (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
-      -1
-    );
     const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
       ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
       timestamp: Date.now(),
@@ -2592,38 +2709,13 @@ export class TurnRequestBuilder {
       };
     }
 
-    const truncationMode = openaiTruncationModeOverride;
-    const promptCacheScope = derivePromptCacheScope(metadata);
-    const minThinkingLevel =
-      providedMinThinkingLevel ??
-      resolveMinimumThinkingLevel(modelString, undefined, requestProvidersConfig);
-    const preparedModelAttempt = this.prepareModelAttempt({
-      rawModelString: modelString,
-      canonicalModelString,
-      canonicalProviderName,
-      effectiveModelString,
-      optionsModelString,
-      wireProviderName,
-      routeProvider,
-      effectiveThinkingLevel,
-      minThinkingLevel,
-      providerRequestMessages,
-      muxProviderOptions: effectiveMuxProviderOptions,
-      workspaceId,
-      truncationMode,
-      providersConfigSnapshot: requestProvidersConfig,
-      coderSelectedInstance: modelResult.data.coderSelectedInstance,
-      promptCacheScope,
-      reasoningMode,
-      recordStartupPhaseTiming,
-    });
-    let requestHeaders = preparedModelAttempt.requestHeaders;
-    const mergedProviderOptions = preparedModelAttempt.providerOptions;
-    const resolvedOverrides = preparedModelAttempt.resolvedOverrides;
-    const currentEffectiveLevelRef = preparedModelAttempt.currentEffectiveLevelRef;
-    const computeRebuiltProviderOptions = preparedModelAttempt.computeRebuiltProviderOptions;
+    let requestHeaders = primaryRequest.headers;
+    const mergedProviderOptions = primaryRequest.providerOptions;
+    const resolvedOverrides = primaryRequest.resolvedOverrides;
+    const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
+    const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
     const rebuildProviderOptionsForThinkingLevel =
-      preparedModelAttempt.rebuildProviderOptionsForThinkingLevel;
+      primaryRequest.rebuildProviderOptionsForThinkingLevel;
     // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
     if (resolveXumEnvironmentValue("DEBUG_LLM_REQUEST", process.env) === "1") {
       log.info(
@@ -2737,463 +2829,72 @@ export class TurnRequestBuilder {
         ? {
             chain: modelFallbackChain,
             prepare: async (nextModelString, prepareOptions) => {
-              const fallbackSourceMessages = prepareOptions?.continuation
+              const sourceMessages = prepareOptions?.continuation
                 ? replaceOrAppendMessageById(messages, prepareOptions.continuation.assistantMessage)
                 : messages;
-
-              // Preliminary thinking clamp for the factory call only (xAI
-              // variant swap; never Coder-metadata-dependent — same split
-              // as the main path). The FINAL level is recomputed below from
-              // the pinned nextProvidersConfig so a concurrent instance
-              // retag cannot leave the level derived from older metadata
-              // than the created SDK model.
-              const requestedNextThinkingLevel =
+              const requestedThinkingLevel =
                 prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel;
-              const preliminaryNextThinkingLevel = enforceThinkingPolicy(
-                nextModelString,
-                requestedNextThinkingLevel,
-                resolveMinimumThinkingLevel(
-                  nextModelString,
-                  lookupMinThinkingLevelOverride(
-                    this.config.loadConfigOrDefault().minThinkingLevelByModel,
-                    nextModelString
-                  ),
-                  this.providerService.getConfig()
-                ),
-                this.providerService.getConfig()
-              );
-
-              // Reset the primary model's injected chat-wire format before
-              // resolving the fallback: the fallback's wire is decided by
-              // ITS effective route, and the factory's direct-OpenAI branch
-              // reads this knob for model selection.
-              if (effectiveMuxProviderOptions.openai?.wireFormat !== userOpenAIWireFormat) {
-                effectiveMuxProviderOptions.openai = {
-                  ...(effectiveMuxProviderOptions.openai ?? {}),
-                  wireFormat: userOpenAIWireFormat,
-                };
-              }
-
-              const nextModelResult = await this.providerModelFactory.resolveAndCreateModel(
-                nextModelString,
-                preliminaryNextThinkingLevel,
-                effectiveMuxProviderOptions,
-                { agentInitiated, workspaceId }
-              );
-              if (!nextModelResult.success) {
-                return Err(formatSendMessageError(nextModelResult.error).message);
-              }
-              const next = nextModelResult.data;
-              // Same single-snapshot rule as the main path, pinned to the
-              // fallback selection's factory-resolved instance.
-              const nextProvidersConfig = pinCoderInstanceProvidersConfig(
-                this.providerService.getConfig(),
-                nextModelString,
-                next.coderSelectedInstance
-              );
-              // FINAL thinking clamp from the pinned snapshot: the message
-              // and option builders below must agree with the wire the
-              // factory created the fallback SDK model for. Re-clamps the
-              // source level against the fallback model's policy/floor (a
-              // mid-turn thinking override folded in by StreamManager wins
-              // over the send-time level).
-              const nextMinThinkingLevel = resolveMinimumThinkingLevel(
-                nextModelString,
-                lookupMinThinkingLevelOverride(
+              const nextSeedResult = await prepareModelSeed({
+                rawModelString: nextModelString,
+                requestedThinkingLevel,
+                minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
                   this.config.loadConfigOrDefault().minThinkingLevelByModel,
                   nextModelString
                 ),
-                nextProvidersConfig
-              );
-              const nextThinkingLevel = enforceThinkingPolicy(
-                nextModelString,
-                requestedNextThinkingLevel,
-                nextMinThinkingLevel,
-                nextProvidersConfig
-              );
-              const nextToolsIdentity = resolveToolsIdentity(
-                nextModelString,
-                next.effectiveModelString,
-                next.canonicalModelString,
-                next.coderWire,
-                nextProvidersConfig
-              );
-              // Same effective-route rule as the main path's
-              // optionsModelString: a Coder fallback selection that itself
-              // fell away from the gateway must build options/headers for
-              // its effective route, not the pinned instance's wire.
-              const nextOptionsModelString =
-                nextModelString.startsWith("coder:") &&
-                !next.effectiveModelString.startsWith("coder:")
-                  ? nextToolsIdentity.modelString
-                  : nextModelString;
-              if (nextToolsIdentity.openaiWireFormat != null) {
-                // Same in-place injection as the main path: the primary
-                // stream is dead once a refusal fallback runs, so every
-                // consumer (option/header rebuilds, mid-turn thinking
-                // rebuild closures) must see the fallback's wire.
-                effectiveMuxProviderOptions.openai = {
-                  ...(effectiveMuxProviderOptions.openai ?? {}),
-                  wireFormat: nextToolsIdentity.openaiWireFormat,
+                enforceMinimum: true,
+              });
+              if (!nextSeedResult.success) {
+                return Err(formatSendMessageError(nextSeedResult.error).message);
+              }
+
+              const nextRequest = await prepareModelRequest({
+                seed: nextSeedResult.data,
+                sourceMessages,
+                initializeToolSearch: false,
+                reusePrePolicySystemContext: false,
+                requestHistorySequence,
+                partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
+                cleanupModelOnError: true,
+              });
+              let nextHeaders = nextRequest.headers;
+              if (pendingRunMetadataId != null) {
+                nextHeaders = {
+                  ...nextHeaders,
+                  [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
                 };
               }
 
-              try {
-                // Rebuild the toolset for the fallback model: provider-native
-                // web tools and MCP schema sanitization are provider-specific
-                // (reusing Anthropic-shaped tools on OpenAI 400s, and vice
-                // versa silently drops web tooling).
-                // Same raw-identity rule as the main path's capability
-                // lookup: cross-typed Coder instances need the raw string.
-                const nextCapabilityModelString = resolveModelForMetadata(
-                  nextModelString.startsWith("coder:")
-                    ? nextModelString
-                    : next.canonicalModelString,
-                  nextProvidersConfig
-                );
-                const nextAllTools = await getToolsForModel(
-                  // Wire identity, mirroring the main path: provider-specific
-                  // tool branches (Anthropic native web tools, OpenAI MCP
-                  // schema sanitization) must key on the wire, not on the
-                  // "coder" prefix or the name-canonical form.
-                  nextToolsIdentity.modelString,
-                  {
-                    ...toolsForModelConfig,
-                    capabilityModelString: nextCapabilityModelString,
-                    // Snapshot from the main path is stale here: the
-                    // fallback's wire decides Responses-only tool assembly.
-                    openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
-                    xaiNativeToolsEnabled: next.routeProvider === "xai",
-                  },
-                  workspaceId,
-                  this.initStateManager,
-                  toolInstructions,
-                  mcpTools
-                );
-                let nextTools = await applyToolPolicyAndExperiments({
-                  allTools: this.wrapToolsForDelegation(
-                    workspaceId,
-                    nextAllTools,
-                    delegatedToolNames
-                  ),
-                  extraTools: this.extraTools,
-                  effectiveToolPolicy,
-                  experiments,
-                  emitNestedToolEvent: emitNestedPtcToolEvent,
-                  sandbox: {
-                    workspaceId,
-                    sessionDir: this.config.getSessionDir(workspaceId),
-                    kernelFileLoader,
-                  },
-                });
-                // Tool search: keep the per-stream state consistent with the
-                // fallback model's re-assembled toolset. rebuildToolSearchState
-                // mutates the state object in place — StreamManager's request
-                // holds a reference to it, so prepareStep reads current state.
-                if (toolSearchRuntime) {
-                  if (toolSearchRuntime.state) {
-                    nextTools = rebuildToolSearchState(toolSearchRuntime.state, {
-                      tools: nextTools,
-                      mcpToolNames: Object.keys(mcpTools ?? {}),
-                      mcpToolServers: mcpToolServerNames,
-                      toolPolicy: effectiveToolPolicy,
-                      ptcEnabled,
-                    }).tools;
-                  } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
-                    // The primary-path gate deactivated deferral (e.g. every
-                    // MCP tool was policy-disabled). StreamManager was never
-                    // handed scoping state, so tool_catalog_search must not appear in
-                    // the fallback toolset either. Skipped when an MCP tool
-                    // collides with the name: that record entry is a
-                    // legitimate MCP tool, not our search tool.
-                    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = nextTools;
-                    nextTools = rest;
-                  }
-                }
-                const nextMemoryToolAvailable = nextTools.memory !== undefined;
-                // Raw identity for prompt rebuilding too (the main path
-                // passes its raw modelString): "Model:"-scoped instructions
-                // and tokenizer-dependent memory budgeting must see the
-                // instance-typed identity, not the name-canonicalized one.
-                const nextMemoryContext = await upgradeMemoryContextForModel(
-                  nextMemoryToolAvailable,
-                  nextModelString
-                );
-
-                // Rebuild the system prompt for the fallback model (tool
-                // instructions and "Model:" sections are model-keyed), keeping
-                // the MCP failure warning if one was applied.
-                const nextSystemContext = await buildStreamSystemContextForToolset(
-                  {
-                    advisorToolAvailable: nextTools.advisor !== undefined,
-                    memoryToolAvailable: nextMemoryToolAvailable,
-                  },
-                  nextModelString,
-                  nextMemoryContext
-                );
-                let nextSystem = nextSystemContext.systemMessage;
-                let nextSystemTokens = nextSystemContext.systemMessageTokens;
-                if (mcpWarningPrefix != null) {
-                  nextSystem = `${mcpWarningPrefix}${nextSystem}`;
-                  // nextCapabilityModelString already resolved the raw
-                  // coder identity; reuse it as the metadata model.
-                  const nextTokenizer = await getTokenizerForModel(
-                    nextModelString,
-                    nextCapabilityModelString
-                  );
-                  nextSystemTokens = await nextTokenizer.countTokens(nextSystem);
-                }
-
-                // Waterfall hook point: the fallback request is rebuilt from
-                // scratch, so middleware-applied tool restrictions / prompt
-                // context from the primary run would otherwise be lost — run
-                // request.assemble over the rebuilt request too (see the
-                // primary-path run above).
-                if (eventSpine.hasMiddleware("request.assemble")) {
-                  const nextAssembleCtx: RequestAssembleContext = {
-                    workspaceId,
-                    modelString: nextModelString,
-                    systemMessage: nextSystem,
-                    tools: nextTools,
-                  };
-                  await eventSpine.run("request.assemble", nextAssembleCtx);
-                  nextTools = nextAssembleCtx.tools;
-                  // Same reconcile as the primary path: tool-search state
-                  // must describe the post-hook toolset.
-                  if (toolSearchRuntime?.state) {
-                    nextTools = rebuildToolSearchState(toolSearchRuntime.state, {
-                      tools: nextTools,
-                      mcpToolNames: Object.keys(mcpTools ?? {}),
-                      mcpToolServers: mcpToolServerNames,
-                      toolPolicy: effectiveToolPolicy,
-                      ptcEnabled,
-                    }).tools;
-                  }
-                  if (nextAssembleCtx.systemMessage !== nextSystem) {
-                    nextSystem = nextAssembleCtx.systemMessage;
-                    const nextTokenizer = await getTokenizerForModel(
-                      nextModelString,
-                      nextCapabilityModelString
-                    );
-                    nextSystemTokens = await nextTokenizer.countTokens(nextSystem);
-                  }
-                }
-
-                // Same active-set scoping as the primary sentinel: never
-                // advertise deferred, not-yet-activated MCP tools. Computed
-                // AFTER the request.assemble hook (like the primary path) so
-                // transition guidance never advertises middleware-removed
-                // tools.
-                const nextToolNamesForSentinel = (
-                  computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(nextTools)
-                ).sort();
-
-                const { providerRequestMessages: nextProviderRequestMessages } =
-                  prepareProviderRequestMessages(
-                    fallbackSourceMessages,
-                    next.wireProviderName,
-                    nextThinkingLevel
-                  );
-                const nextFinalMessages = await prepareMessagesForProvider({
-                  messagesWithSentinel: addInterruptedSentinel(nextProviderRequestMessages),
-                  effectiveAgentId,
-                  toolNamesForSentinel: nextToolNamesForSentinel,
-                  planContentForTransition,
-                  planFilePath,
-                  postCompactionAttachments,
-                  providerForMessages: next.wireProviderName,
-                  effectiveThinkingLevel: nextThinkingLevel,
-                  // RAW fallback identity, matching the main path's raw
-                  // modelString: canonicalization can rewrite cross-typed
-                  // Coder instances (coder:openai/x, type anthropic) to a
-                  // direct-provider string, hiding the instance metadata
-                  // from cache/option/header builders.
-                  modelString: nextModelString,
-                  providersConfig: nextProvidersConfig,
-                  anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-                  workspaceId,
-                });
-
-                const preparedFallbackAttempt = this.prepareModelAttempt({
-                  rawModelString: nextModelString,
-                  canonicalModelString: next.canonicalModelString,
-                  canonicalProviderName: next.canonicalProviderName,
-                  effectiveModelString: next.effectiveModelString,
-                  optionsModelString: nextOptionsModelString,
-                  wireProviderName: next.wireProviderName,
-                  routeProvider: next.routeProvider,
-                  effectiveThinkingLevel: nextThinkingLevel,
-                  minThinkingLevel: nextMinThinkingLevel,
-                  providerRequestMessages: nextProviderRequestMessages,
-                  muxProviderOptions: effectiveMuxProviderOptions,
-                  workspaceId,
-                  truncationMode,
-                  providersConfigSnapshot: nextProvidersConfig,
-                  coderSelectedInstance: next.coderSelectedInstance,
-                  promptCacheScope,
-                  reasoningMode,
-                });
-                let nextHeaders = preparedFallbackAttempt.requestHeaders;
-                if (pendingRunMetadataId != null) {
-                  nextHeaders = {
-                    ...nextHeaders,
-                    [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
-                  };
-                }
-                const nextMergedProviderOptions = preparedFallbackAttempt.providerOptions;
-                const nextOverrides = preparedFallbackAttempt.resolvedOverrides;
-                const rebuildNextProviderOptionsForThinkingLevel =
-                  preparedFallbackAttempt.rebuildProviderOptionsForThinkingLevel;
-                // Shared with the return payload below: the fallback stream
-                // restarts at step 0, where StreamManager scopes to these
-                // forced tools when present.
-                const nextForcedFirstStepToolNames =
-                  next.routeProvider === "xai"
-                    ? getForcedXaiSearchToolNames(
-                        nextCapabilityModelString,
-                        effectiveMuxProviderOptions.xai?.searchParameters
-                      )?.filter((toolName) => toolName in nextTools)
-                    : undefined;
-
-                // The fallback request is a different request identity
-                // (model, system prompt, toolset, provider options), so it
-                // needs its own envelope: pairSessionTurns compares the LAST
-                // envelope per requestHistorySequence, so this row supersedes
-                // the primary one and replay-verify/cache-audit see the
-                // request that actually streamed. Deferred to
-                // onStreamConstructed: a prepare whose stream construction
-                // later fails must not supersede the primary envelope.
-                // Same step-0 scoping as the primary envelope: fingerprint
-                // only the tools the first fallback step actually sends.
-                const nextFirstStepToolNames = new Set(
-                  nextForcedFirstStepToolNames?.length
-                    ? nextForcedFirstStepToolNames
-                    : nextToolNamesForSentinel
-                );
-                const emitFallbackEnvelopeWith = async (
-                  thinkingLevelForEnvelope: string,
-                  providerOptionsForEnvelope: unknown
-                ): Promise<void> => {
-                  await emitTurnEnvelope({
-                    journal: this.durableEventJournalFor(workspaceId),
-                    workspaceId,
-                    systemMessage: nextSystem,
-                    tools: Object.fromEntries(
-                      Object.entries(nextTools).filter(([name]) => nextFirstStepToolNames.has(name))
-                    ),
-                    modelString: nextModelString,
-                    thinkingLevel: thinkingLevelForEnvelope,
-                    providerOptions: providerOptionsForEnvelope,
-                    requestHistorySequence,
-                    sentinelToolNames: nextToolNamesForSentinel,
-                    wireProviderName: next.wireProviderName,
-                    anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
-                    planContentForTransition,
-                    planFilePath,
-                    postCompactionAttachments,
-                    // The continuation never reaches chat.jsonl at this
-                    // sequence (the assistant row lands later), so replay
-                    // needs the envelope's durable copy to rebuild the
-                    // fallback request.
-                    partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
-                  });
-                };
-                const emitFallbackEnvelope = (): Promise<void> =>
-                  emitFallbackEnvelopeWith(nextThinkingLevel, nextMergedProviderOptions);
-                // Same step-0 race closure as the primary path, bound to the
-                // fallback request's own build inputs.
-                const rebuildNextFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel =
-                  async (effectiveLevel, providerOptionsForEnvelope) => {
-                    const { providerRequestMessages: racedNextMessages } =
-                      prepareProviderRequestMessages(
-                        fallbackSourceMessages,
-                        next.wireProviderName,
-                        effectiveLevel
-                      );
-                    const rebuiltFinal = await prepareMessagesForProvider({
-                      messagesWithSentinel: addInterruptedSentinel(racedNextMessages),
-                      effectiveAgentId,
-                      toolNamesForSentinel: nextToolNamesForSentinel,
-                      planContentForTransition,
-                      planFilePath,
-                      postCompactionAttachments,
-                      providerForMessages: next.wireProviderName,
-                      effectiveThinkingLevel: effectiveLevel,
-                      modelString: nextModelString,
-                      providersConfig: nextProvidersConfig,
-                      anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-                      workspaceId,
-                    });
-                    await emitFallbackEnvelopeWith(effectiveLevel, providerOptionsForEnvelope);
-                    return rebuiltFinal;
-                  };
-
-                return Ok({
-                  onStreamConstructed: emitFallbackEnvelope,
-                  rebuildFirstStepForThinkingLevel: rebuildNextFirstStepForThinkingLevel,
-                  model: next.model,
-                  // RAW identity (matching the main path's raw modelString):
-                  // StreamManager keys createCachedSystemMessage /
-                  // applyCacheControlToTools / metadata resolution on this,
-                  // and the canonical string hides cross-typed Coder
-                  // instance metadata from those lookups.
-                  modelString: nextModelString,
-                  messages: nextFinalMessages,
-                  system: nextSystem,
-                  tools: nextTools,
-                  providerOptions: nextMergedProviderOptions,
-                  headers: nextHeaders,
-                  callSettingsOverrides: nextOverrides.standard,
-                  anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
-                  thinkingLevel: nextThinkingLevel,
-                  forcedFirstStepToolNames: nextForcedFirstStepToolNames,
-                  rebuildProviderOptionsForThinkingLevel:
-                    rebuildNextProviderOptionsForThinkingLevel,
-                  // Pinned snapshot for the swap's request-config rebuild
-                  // and metadata resolution (see PreparedModelFallback).
-                  providersConfig: nextProvidersConfig,
-                  initialMetadataPatch: {
-                    routedThroughGateway: next.routedThroughGateway,
-                    ...(next.routeProvider != null ? { routeProvider: next.routeProvider } : {}),
-                    // Explicit undefined clears a stale costsIncluded when falling
-                    // back from a subscription-routed model to an API model.
-                    costsIncluded: modelCostsIncluded(next.model) ? true : undefined,
-                    systemMessageTokens: nextSystemTokens,
-                  },
-                });
-              } catch (error) {
-                // Release the created fallback model's transport resources when
-                // a later prepare step throws (it never reaches StreamManager,
-                // whose cleanup only covers models it took ownership of).
-                runLanguageModelCleanup(next.model);
-                throw error;
-              }
+              return Ok({
+                onStreamConstructed: nextRequest.onStreamConstructed,
+                rebuildFirstStepForThinkingLevel: nextRequest.rebuildFirstStepForThinkingLevel,
+                model: nextRequest.model,
+                modelString: nextModelString,
+                messages: nextRequest.messages,
+                system: nextRequest.system,
+                tools: nextRequest.tools,
+                providerOptions: nextRequest.providerOptions,
+                headers: nextHeaders,
+                callSettingsOverrides: nextRequest.resolvedOverrides.standard,
+                anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+                thinkingLevel: nextRequest.effectiveThinkingLevel,
+                forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
+                rebuildProviderOptionsForThinkingLevel:
+                  nextRequest.rebuildProviderOptionsForThinkingLevel,
+                providersConfig: nextRequest.providersConfig,
+                initialMetadataPatch: {
+                  routedThroughGateway: nextRequest.routedThroughGateway,
+                  ...(nextRequest.routeProvider != null
+                    ? { routeProvider: nextRequest.routeProvider }
+                    : {}),
+                  costsIncluded: modelCostsIncluded(nextRequest.model) ? true : undefined,
+                  systemMessageTokens: nextRequest.systemMessageTokens,
+                },
+              });
             },
           }
         : undefined;
 
-    const forcedFirstStepToolNames =
-      routeProvider === "xai"
-        ? getForcedXaiSearchToolNames(
-            capabilityModelString,
-            effectiveMuxProviderOptions.xai?.searchParameters
-          )?.filter((toolName) => toolName in toolsForStream)
-        : undefined;
-
-    // Durable turn envelope: fingerprint the FINAL request identity (post
-    // request.assemble middleware, post tool-policy rebuild). Deferred to
-    // StreamManager's construction boundary (like the fallback envelope):
-    // aborts or setup errors before a stream exists must not persist a
-    // phantom request row. Emission never fails the turn.
-    // Step-0 wire truth: StreamManager sends only the first step's active
-    // tools (forced xAI search set, else the tool-search active subset), so
-    // the envelope fingerprints that subset — deferred tools never reach
-    // this request and would otherwise show as false replay divergences.
-    const firstStepToolNames = new Set(
-      forcedFirstStepToolNames?.length
-        ? forcedFirstStepToolNames
-        : (computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(toolsForStream))
-    );
+    const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
 
     // Fold PREPARING-window pending thinking overrides into the ACTUAL
     // request build, not just the envelope: message preparation is
@@ -3219,25 +2920,9 @@ export class TurnRequestBuilder {
         // re-check pending — a change may have raced the previous rebuild.
         continue;
       }
-      const { providerRequestMessages: foldedRequestMessages } = prepareProviderRequestMessages(
-        messages,
-        wireProviderName,
+      streamFinalMessages = await primaryRequest.rebuildMessagesForThinkingLevel(
         folded.effectiveLevel
       );
-      streamFinalMessages = await prepareMessagesForProvider({
-        messagesWithSentinel: addInterruptedSentinel(foldedRequestMessages),
-        effectiveAgentId,
-        toolNamesForSentinel,
-        planContentForTransition,
-        planFilePath,
-        postCompactionAttachments,
-        providerForMessages: wireProviderName,
-        effectiveThinkingLevel: folded.effectiveLevel,
-        modelString,
-        providersConfig: requestProvidersConfig,
-        anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-        workspaceId,
-      });
       streamProviderOptions = folded.providerOptions;
       streamThinkingLevel = folded.effectiveLevel;
       activeTurnThinkingOverride.applied = folded.effectiveLevel;
@@ -3248,68 +2933,15 @@ export class TurnRequestBuilder {
       // against the level just applied.
     }
 
-    const emitPrimaryEnvelopeWith = async (
-      thinkingLevel: string,
-      providerOptions: unknown
-    ): Promise<void> => {
-      await emitTurnEnvelope({
-        journal: this.durableEventJournalFor(workspaceId),
-        workspaceId,
-        systemMessage,
-        tools: Object.fromEntries(
-          Object.entries(toolsForStream).filter(([name]) => firstStepToolNames.has(name))
-        ),
-        modelString,
-        thinkingLevel,
-        providerOptions,
-        // Replay pairing key + request-time inputs that are model-visible but
-        // not derivable from chat.jsonl: the resolved wire provider (instance-
-        // typed gateways need live metadata), the per-send Anthropic cache TTL,
-        // and the injected plan-transition / post-compaction content.
-        requestHistorySequence,
-        // Sentinel names are recorded separately: forced first-step scoping
-        // narrows the wire manifest while the sentinel lists the full active
-        // set, so replay cannot derive one from the other.
-        sentinelToolNames: toolNamesForSentinel,
-        wireProviderName,
-        anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
-        planContentForTransition,
-        planFilePath,
-        postCompactionAttachments,
-      });
-    };
     const emitPrimaryEnvelope = (): Promise<void> =>
-      emitPrimaryEnvelopeWith(streamThinkingLevel, streamProviderOptions);
-    // Step-0 rebuild for a thinking override that raced stream setup
-    // (written during startStream's awaits, after the quiescence loop):
-    // rebuild the wire messages under the consumed level and supersede the
-    // envelope so replay pairing (last row per sequence) sees the request
-    // that actually streamed.
+      primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
     const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
       effectiveLevel,
       providerOptions
     ) => {
-      const { providerRequestMessages: racedRequestMessages } = prepareProviderRequestMessages(
-        messages,
-        wireProviderName,
-        effectiveLevel
-      );
-      const rebuiltFinal = await prepareMessagesForProvider({
-        messagesWithSentinel: addInterruptedSentinel(racedRequestMessages),
-        effectiveAgentId,
-        toolNamesForSentinel,
-        planContentForTransition,
-        planFilePath,
-        postCompactionAttachments,
-        providerForMessages: wireProviderName,
-        effectiveThinkingLevel: effectiveLevel,
-        modelString,
-        providersConfig: requestProvidersConfig,
-        anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-        workspaceId,
-      });
-      await emitPrimaryEnvelopeWith(effectiveLevel, providerOptions);
-      return rebuiltFinal;
+      const rebuiltMessages = await primaryRequest.rebuildMessagesForThinkingLevel(effectiveLevel);
+      await primaryRequest.emitEnvelopeWith(effectiveLevel, providerOptions);
+      return rebuiltMessages;
     };
     const turnExecutionOptions: TurnExecutionOptions = {
       workspaceId,

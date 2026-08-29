@@ -1,62 +1,41 @@
-import * as fs from "fs/promises";
 import { EventEmitter } from "events";
+import * as fs from "fs/promises";
 
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
-import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { ensurePrivateDir } from "@/node/utils/fs";
-import type { Result } from "@/common/types/result";
-import { Ok, Err } from "@/common/types/result";
-import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
-import { TurnRequestBuilder, type StreamMessageOptions } from "./turnRequestBuilder";
+import {
+  TurnRequestBuilder,
+  resolveMuxProjectRootForHostFs,
+  resolveXumToolScope,
+  type StreamMessageOptions,
+  type WorkflowResultContinuationSender,
+} from "./turnRequestBuilder";
 export { prepareProviderRequestMessages, replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
 
-import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
-import {
-  ADVISOR_DEFAULT_MAX_USES_PER_TURN,
-  resolveAdvisorEnabledForAgent,
-} from "@/common/constants/advisor";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
-import type { GoalRecordV1 } from "@/common/types/goal";
-import type { ModelMessage, MuxMessage } from "@/common/types/message";
-import { createMuxMessage } from "@/common/types/message";
-import type { Config } from "@/node/config";
-import {
-  StreamManager,
-  type ModelFallbackOptions,
-  type StreamTextOnChunk,
-  type TurnCompletion,
-  type TurnEngineEvent,
-  type TurnExecutionOptions,
-  type TurnStreamHandle,
-} from "./streamManager";
-import { emitTurnEnvelope } from "./turnEnvelope";
-import {
-  sharedDurableEventJournal,
-  type DurableEventJournal,
-} from "@/node/utils/journal/durableEventJournal";
-import { runLanguageModelCleanup } from "./languageModelCleanup";
-import type { InitStateManager } from "./initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
-import {
-  deriveToolHookConfig,
-  getForcedXaiSearchToolNames,
-  getToolsForModel,
-  type AdvisorStepCaptureRef,
-  type MCPPromptRuntime,
-  type ToolConfiguration,
-} from "@/common/utils/tools/tools";
-import { getGoalToolAvailability } from "@/common/utils/tools/toolAvailability";
+import type { MuxMessage } from "@/common/types/message";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
+import type { XumToolScope } from "@/common/types/toolScope";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
+import { type ToolConfiguration } from "@/common/utils/tools/tools";
+import type { Config } from "@/node/config";
+import { ContainerManager } from "@/node/multiProject/containerManager";
+import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
-import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -64,202 +43,72 @@ import {
   resolveWorkspaceRootPath,
   type WorkspaceRuntimeContext,
 } from "@/node/runtime/runtimeHelpers";
-import type { Runtime } from "@/node/runtime/Runtime";
-import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
-import { isRlmModeEnabled } from "@/node/services/branchSummary";
-import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
-import { getXumEnv, getRuntimeType } from "@/node/runtime/initHook";
-import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
-import { ContainerManager } from "@/node/multiProject/containerManager";
-import { secretsToRecord } from "@/common/types/secrets";
-import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
-import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { XumToolScope } from "@/common/types/toolScope";
+import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import type { CoderOauthService } from "@/node/services/coderOauthService";
+import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
-import type { CodexOauthService } from "@/node/services/codexOauthService";
-import type { CoderOauthService } from "@/node/services/coderOauthService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
+import {
+  sharedDurableEventJournal,
+  type DurableEventJournal,
+} from "@/node/utils/journal/durableEventJournal";
+import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
 import {
-  addInterruptedSentinel,
-  filterEmptyAssistantMessages,
-} from "@/browser/utils/messages/modelMessageTransform";
+  StreamManager,
+  type TurnCompletion,
+  type TurnEngineEvent,
+  type TurnStreamHandle,
+} from "./streamManager";
 
-import type { HistoryService } from "./historyService";
-import { delegatedToolCallManager } from "./delegatedToolCallManager";
-import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
-import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
-import { createAssistantMessageId } from "./utils/messageIds";
-import type { SessionUsageService } from "./sessionUsageService";
-import { sumUsageHistory, getTotalCost } from "@/common/utils/tokens/usageAggregator";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
-import { readToolInstructions } from "./systemMessage";
-import {
-  effectiveAdditionalSystemContext,
-  mergeAdditionalSystemInstructions,
-  readAdditionalSystemContext,
-} from "./additionalSystemContext";
-import type { TelemetryService } from "@/node/services/telemetryService";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import { delegatedToolCallManager } from "./delegatedToolCallManager";
+import type { HistoryService } from "./historyService";
+import type { SessionUsageService } from "./sessionUsageService";
 
-import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
-import type { MCPServerManager, MCPWorkspaceStats } from "@/node/services/mcpServerManager";
-import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
-import type { TaskService } from "@/node/services/taskService";
+import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import { getProjects, isMultiProject } from "@/common/utils/multiProject";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import {
   resolveMemoryProjectIdentity,
   type MemoryService,
   type MemorySessionContext,
 } from "@/node/services/memoryService";
-import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
-import { resolveMemoryAccessPolicy } from "@/node/services/tools/memory";
-import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
-import {
-  buildProviderOptions,
-  buildRequestHeaders,
-  resolveProviderOptionsNamespaceKey,
-} from "@/common/utils/ai/providerOptions";
-import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
-import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
-import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
-import {
-  coderGatewayWireProtocol,
-  resolveCoderWireCanonicalModel,
-} from "@/common/constants/coderOAuth";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import {
-  customProviderWireOrigin,
-  isCustomProviderConfig,
-} from "@/common/utils/providers/customProviders";
-import { isPlainObject } from "@/common/utils/isPlainObject";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
-import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
-import { getProjects, isMultiProject } from "@/common/utils/multiProject";
-import { uniqueSuffix } from "@/common/utils/hasher";
-import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
-
-import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
-import { mergeGoalDefaults } from "@/common/utils/goals/resolveGoalSetIntent";
-import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { THINKING_LEVEL_OFF, type ThinkingLevel } from "@/common/types/thinking";
-import {
-  enforceThinkingPolicy,
-  isXaiGrokFastVariantSwap,
-  lookupMinThinkingLevelOverride,
-  resolveEffectiveThinkingLevel,
-  resolveMinimumThinkingLevel,
-} from "@/common/utils/thinking/policy";
-import type {
-  RebuildFirstStepForThinkingLevel,
-  RebuildProviderOptionsForThinkingLevel,
-} from "@/node/services/thinkingOverride";
+import type { TaskService } from "@/node/services/taskService";
+import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
 import type { StreamAbortEvent, StreamAbortReason } from "@/common/types/stream";
-import {
-  computeActiveToolNames,
-  prepareToolSearch,
-  rebuildToolSearchState,
-  seedToolSearchActivationsFromMessages,
-  TOOL_SEARCH_TOOL_NAME,
-  type ToolSearchRuntime,
-} from "@/common/utils/tools/toolCatalog";
-import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
-import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
-import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
-import { ProviderModelFactory, modelCostsIncluded } from "./providerModelFactory";
-import { prepareMessagesForProvider } from "./messagePipeline";
-import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
-import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
-import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import {
-  normalizeUsageModelKey,
-  resolveModelForMetadata,
-} from "@/common/utils/providers/modelEntries";
-import {
-  simulateContextLimitError,
-  simulateToolPolicyNoop,
-  type SimulationContext,
-} from "./streamSimulation";
-import {
-  applyToolPolicyAndExperiments,
-  captureMcpToolTelemetry,
-  resolveBackendGatedPtcExperiments,
-} from "./toolAssembly";
-import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
-import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
-import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
-import {
-  WORKFLOW_RESULT_METADATA_TYPE,
-  buildWorkflowResultContextMessage,
-  filterWorkflowDisplayOnlyMessages,
-} from "@/common/utils/workflowRunMessages";
-import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import {
-  WorkflowService,
-  type WorkflowRunStatusChangedEvent,
-} from "@/node/services/workflows/WorkflowService";
-import {
-  DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
-} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
-import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
-import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { type WorkflowRunStatusChangedEvent } from "@/node/services/workflows/WorkflowService";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import { ProviderModelFactory } from "./providerModelFactory";
 
-const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
+export { resolveMuxProjectRootForHostFs };
 
-/**
- * Derive the host-local project root for mux managed-file tools (fs/promises).
- * Remote runtimes (ssh, docker) have a workspacePath that is a remote/container
- * path — unusable by host fs. Fall back to metadata.projectPath which is always
- * host-local.
- */
-export function resolveMuxProjectRootForHostFs(
-  metadata: WorkspaceMetadata,
-  workspacePath: string
-): string {
-  const runtimeType = metadata.runtimeConfig.type;
-  return runtimeType === "ssh" || runtimeType === "docker" ? metadata.projectPath : workspacePath;
+interface ToolExecutionContext {
+  toolCallId?: string;
+  abortSignal?: AbortSignal;
 }
 
-function resolveXumToolScope(
-  config: Config,
-  metadata: WorkspaceMetadata,
-  workspacePath: string,
-  /** Checkout root in the project storage authority's filesystem. */
-  checkoutRoot?: string | null
-): XumToolScope {
-  const projectConfig = config.loadConfigOrDefault().projects.get(metadata.projectPath);
-  if (
-    projectConfig?.projectKind === "system" &&
-    metadata.projectPath !== MULTI_PROJECT_CONFIG_KEY
-  ) {
-    // Preserve ~/.xum-backed tool behavior for legacy system workspaces after removing
-    // Chat with Xum. Multi-project workspaces still point at a real checkout under _multi,
-    // so they stay project-scoped.
-    return {
-      type: "global",
-      xumHome: config.rootDir,
-    };
+function isToolExecutionContext(value: unknown): value is ToolExecutionContext {
+  if (typeof value !== "object" || value == null || Array.isArray(value)) {
+    return false;
   }
-
-  const runtimeType = metadata.runtimeConfig.type;
-  return {
-    type: "project",
-    xumHome: config.rootDir,
-    projectRoot: resolveMuxProjectRootForHostFs(metadata, workspacePath),
-    projectStorageAuthority:
-      runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
-    ...(checkoutRoot != null ? { checkoutRoot } : {}),
-  };
+  const record = value as Record<string, unknown>;
+  return (
+    (record.toolCallId == null || typeof record.toolCallId === "string") &&
+    (record.abortSignal == null || record.abortSignal instanceof AbortSignal)
+  );
 }
 
 export class AIService extends EventEmitter {
@@ -1131,6 +980,8 @@ export class AIService extends EventEmitter {
       const buildOutcome = await this.turnRequestBuilder.build(opts, {
         abortSignal: combinedAbortSignal,
         syntheticMessageId,
+        startTime,
+        startupPhaseTimingsMs,
         startupState,
         recordStartupPhaseTiming,
       });
