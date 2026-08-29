@@ -587,6 +587,39 @@ export interface TurnRequestBuilderDependencies {
   ) => void;
 }
 
+interface PrepareModelAttemptOptions {
+  rawModelString: string;
+  canonicalModelString: string;
+  canonicalProviderName: string;
+  effectiveModelString: string;
+  optionsModelString: string;
+  wireProviderName: string;
+  routeProvider?: ProviderName;
+  effectiveThinkingLevel: ThinkingLevel;
+  minThinkingLevel: ThinkingLevel;
+  providerRequestMessages: MuxMessage[];
+  muxProviderOptions: MuxProviderOptions;
+  workspaceId: string;
+  truncationMode: Parameters<typeof buildProviderOptions>[6];
+  providersConfigSnapshot: ProvidersConfigMap;
+  coderSelectedInstance?: { name: string; type: string };
+  promptCacheScope: string;
+  reasoningMode: Parameters<typeof buildProviderOptions>[10];
+  recordStartupPhaseTiming?: (phase: string, phaseStartedAt: number) => void;
+}
+
+interface PreparedModelAttempt {
+  providerOptions: Record<string, unknown>;
+  requestHeaders: Record<string, string> | undefined;
+  resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
+  currentEffectiveLevelRef: { current: ThinkingLevel };
+  computeRebuiltProviderOptions: (
+    level: ThinkingLevel,
+    currentLevel: ThinkingLevel
+  ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
+  rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
+}
+
 export class TurnRequestBuilder {
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
@@ -717,6 +750,158 @@ export class TurnRequestBuilder {
     metadataId: string
   ): void {
     this.dependencies.trackPendingDevToolsRunMetadata(messageId, workspaceId, metadataId);
+  }
+
+  private resolveOverridesIdentity(
+    rawModelString: string,
+    canonical: string,
+    canonicalProvider: string,
+    providersConfig: ProvidersConfigMap
+  ): { providerName: string; modelString: string; coderDerived: boolean } {
+    if (rawModelString.startsWith("coder:")) {
+      const metadataCanonical = resolveCoderGatewayMetadataModel(rawModelString, providersConfig);
+      if (metadataCanonical != null) {
+        const separator = metadataCanonical.indexOf(":");
+        return {
+          providerName: separator > 0 ? metadataCanonical.slice(0, separator) : canonicalProvider,
+          modelString: metadataCanonical,
+          coderDerived: true,
+        };
+      }
+      const coderSection = providersConfig.coder;
+      if (!isCustomProviderConfig(coderSection)) {
+        const wire = resolveCoderWireCanonicalModel(
+          rawModelString.slice("coder:".length),
+          coderSection as
+            | { discoveredProviders?: unknown; additionalProviders?: unknown }
+            | undefined
+        );
+        if (wire) {
+          return { providerName: "coder", modelString: rawModelString, coderDerived: false };
+        }
+      }
+    }
+    const separator = canonical.indexOf(":");
+    return {
+      providerName: separator > 0 ? canonical.slice(0, separator) : canonicalProvider,
+      modelString: canonical,
+      coderDerived: false,
+    };
+  }
+
+  private prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
+    const buildProviderOptionsStartedAt = Date.now();
+    const providerOptions = buildProviderOptions(
+      options.optionsModelString,
+      options.effectiveThinkingLevel,
+      options.providerRequestMessages,
+      (id) => this.streamManager.isResponseIdLost(id),
+      options.muxProviderOptions,
+      options.workspaceId,
+      options.truncationMode,
+      options.providersConfigSnapshot,
+      options.routeProvider,
+      options.promptCacheScope,
+      options.reasoningMode
+    ) as Record<string, unknown>;
+    options.recordStartupPhaseTiming?.("buildProviderOptionsMs", buildProviderOptionsStartedAt);
+    const buildRequestConfigStartedAt = Date.now();
+    const requestHeaders = buildRequestHeaders(
+      options.optionsModelString,
+      options.muxProviderOptions,
+      options.workspaceId,
+      options.providersConfigSnapshot,
+      options.routeProvider
+    );
+    const overridesIdentity = this.resolveOverridesIdentity(
+      options.rawModelString,
+      options.canonicalModelString,
+      options.canonicalProviderName,
+      options.providersConfigSnapshot
+    );
+    const resolvedOverrides = resolveModelParameterOverrides(
+      pinCoderInstanceRawProvidersConfig(
+        this.config.loadProvidersConfig(),
+        options.rawModelString,
+        options.coderSelectedInstance
+      ),
+      overridesIdentity.providerName,
+      overridesIdentity.modelString,
+      options.effectiveModelString
+    );
+    const namespaceKey = resolveProviderOptionsNamespaceKey(
+      options.wireProviderName,
+      options.routeProvider
+    );
+    const extrasWireCompatible =
+      !overridesIdentity.coderDerived || overridesIdentity.providerName === namespaceKey;
+    const mergeExtras = (builtOptions: Record<string, unknown>): Record<string, unknown> => {
+      if (!resolvedOverrides.providerExtras || !extrasWireCompatible) {
+        return builtOptions;
+      }
+      const muxProviderNamespace = builtOptions[namespaceKey];
+      return {
+        ...builtOptions,
+        [namespaceKey]: isPlainObject(muxProviderNamespace)
+          ? mergeProviderExtrasUnderMux(resolvedOverrides.providerExtras, muxProviderNamespace)
+          : resolvedOverrides.providerExtras,
+      };
+    };
+    const currentEffectiveLevelRef = { current: options.effectiveThinkingLevel };
+    const computeRebuiltProviderOptions = (
+      level: ThinkingLevel,
+      currentLevel: ThinkingLevel
+    ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
+      const clamped = enforceThinkingPolicy(
+        options.rawModelString,
+        level,
+        options.minThinkingLevel,
+        options.providersConfigSnapshot
+      );
+      const effective = resolveEffectiveThinkingLevel(
+        options.rawModelString,
+        clamped,
+        options.providersConfigSnapshot
+      );
+      if (
+        effective === currentLevel ||
+        isXaiGrokFastVariantSwap(options.canonicalModelString, currentLevel, effective)
+      ) {
+        return null;
+      }
+      const rebuilt = buildProviderOptions(
+        options.optionsModelString,
+        effective,
+        options.providerRequestMessages,
+        (id) => this.streamManager.isResponseIdLost(id),
+        options.muxProviderOptions,
+        options.workspaceId,
+        options.truncationMode,
+        options.providersConfigSnapshot,
+        options.routeProvider,
+        options.promptCacheScope,
+        options.reasoningMode
+      ) as Record<string, unknown>;
+      return { effectiveLevel: effective, providerOptions: mergeExtras(rebuilt) };
+    };
+    const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
+      level
+    ) => {
+      const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
+      if (result != null) {
+        currentEffectiveLevelRef.current = result.effectiveLevel;
+      }
+      return result;
+    };
+    options.recordStartupPhaseTiming?.("buildRequestConfigMs", buildRequestConfigStartedAt);
+    return {
+      providerOptions: mergeExtras(providerOptions),
+      requestHeaders,
+      resolvedOverrides,
+      currentEffectiveLevelRef,
+      computeRebuiltProviderOptions,
+      rebuildProviderOptionsForThinkingLevel,
+    };
   }
 
   async build(
@@ -2398,233 +2583,38 @@ export class TurnRequestBuilder {
       };
     }
 
-    // Build provider options based on thinking level and request-sliced message history.
     const truncationMode = openaiTruncationModeOverride;
-    // Use the same boundary-sliced payload history that we send to the provider.
-    // This keeps OpenAI request state aligned with the explicit history Xum sends.
-    // Pass workspaceId to derive stable promptCacheKey for OpenAI caching.
-    const buildProviderOptionsStartedAt = Date.now();
     const promptCacheScope = derivePromptCacheScope(metadata);
-    const providerOptions = buildProviderOptions(
-      optionsModelString,
-      effectiveThinkingLevel,
-      providerRequestMessages,
-      (id) => this.streamManager.isResponseIdLost(id),
-      effectiveMuxProviderOptions,
-      workspaceId,
-      truncationMode,
-      requestProvidersConfig,
-      routeProvider,
-      promptCacheScope,
-      reasoningMode
-    );
-    recordStartupPhaseTiming("buildProviderOptionsMs", buildProviderOptionsStartedAt);
-
-    // Build per-request HTTP headers (e.g., workspace correlation and
-    // anthropic-beta for 1M context). This is the single injection site for
-    // provider-specific headers, handling both direct and gateway-routed models
-    // identically.
-    const buildRequestConfigStartedAt = Date.now();
-    let requestHeaders = buildRequestHeaders(
-      optionsModelString,
-      effectiveMuxProviderOptions,
-      workspaceId,
-      requestProvidersConfig,
-      routeProvider
-    );
-
-    // --- Model parameter overrides from providers.jsonc ---
-    // Raw file view pinned to the SAME factory-resolved instance identity
-    // as requestProvidersConfig: resolveModelParameterOverrides resolves
-    // mappedToModel aliases and sampling gates via resolveModelForMetadata
-    // internally, so a live raw load would let a concurrent instance retag
-    // derive those decisions from another type than the created SDK model.
-    const providersConfig = pinCoderInstanceRawProvidersConfig(
-      this.config.loadProvidersConfig(),
-      modelString,
-      modelResult.data.coderSelectedInstance
-    );
-    // Override config identity follows the Coder instance TYPE, not the
-    // name-canonicalized provider: a cross-typed instance ({name: "openai",
-    // type: "anthropic"}) canonicalizes to openai:<model>, which would apply
-    // the OpenAI block's wildcard/model settings to an Anthropic-wire
-    // request and ignore the intended anthropic block. KNOWN instances with
-    // no catalog identity ({name: "anthropic", type: "openai-compat"},
-    // vendor-less vercel) keep the RAW gateway-scoped identity — falling
-    // back to the name-canonical form would apply the name-alike provider's
-    // block (and merge its SDK-shaped extras) onto a different wire.
-    // Unknown instances and shadowed prefixes keep the canonical identity.
-    const resolveOverridesIdentity = (
-      rawModelString: string,
-      canonical: string,
-      canonicalProvider: string,
-      // The request's pinned snapshot (main or fallback) — never a fresh
-      // read, so the override identity matches the created model's wire.
-      currentProvidersConfig: ReturnType<ProviderService["getConfig"]>
-    ): { providerName: string; modelString: string; coderDerived: boolean } => {
-      if (rawModelString.startsWith("coder:")) {
-        const metadataCanonical = resolveCoderGatewayMetadataModel(
-          rawModelString,
-          currentProvidersConfig
-        );
-        if (metadataCanonical != null) {
-          const separator = metadataCanonical.indexOf(":");
-          return {
-            providerName: separator > 0 ? metadataCanonical.slice(0, separator) : canonicalProvider,
-            modelString: metadataCanonical,
-            coderDerived: true,
-          };
-        }
-        const coderSection = currentProvidersConfig?.coder;
-        if (!isCustomProviderConfig(coderSection)) {
-          const wire = resolveCoderWireCanonicalModel(
-            rawModelString.slice("coder:".length),
-            coderSection as
-              | { discoveredProviders?: unknown; additionalProviders?: unknown }
-              | undefined
-          );
-          if (wire) {
-            // Known but unmappable: same coder-scoped identity as
-            // non-canonical unmappable instances (coder:llm-proxy/x), whose
-            // canonical form is already the raw string. coderDerived stays
-            // false: coder-block extras are the user's explicit config for
-            // this exact gateway model and merge into the wire namespace.
-            return { providerName: "coder", modelString: rawModelString, coderDerived: false };
-          }
-        }
-      }
-      const separator = canonical.indexOf(":");
-      return {
-        providerName: separator > 0 ? canonical.slice(0, separator) : canonicalProvider,
-        modelString: canonical,
-        coderDerived: false,
-      };
-    };
-    const overridesIdentity = resolveOverridesIdentity(
-      modelString,
-      canonicalModelString,
-      canonicalProviderName,
-      requestProvidersConfig
-    );
-    const resolvedOverrides = resolveModelParameterOverrides(
-      providersConfig,
-      overridesIdentity.providerName,
-      overridesIdentity.modelString,
-      effectiveModelString
-    );
-
-    // Merge provider extras (user knobs) UNDER Xum-built options (safety-critical).
-    // Recursive merge within the provider namespace preserves non-conflicting nested
-    // subfields (e.g., user reasoning.max_tokens alongside Xum reasoning.enabled).
-    // Xum-built values win on leaf conflicts for safety of thinking/reasoning/cache.
-    // Shared by the initial build and mid-turn thinking-level rebuilds so both
-    // produce identically-shaped options.
-    // Namespace key must match what buildProviderOptions computes internally
-    // (wire origin for gateway-scoped Coder models), or extras merge under a
-    // namespace the SDK never reads.
-    const providerOptionsNamespaceKey = resolveProviderOptionsNamespaceKey(
-      wireProviderName,
-      routeProvider
-    );
-    // Wire-compat gate for provider extras: standard call settings
-    // (temperature, maxOutputTokens, ...) are SDK-agnostic, but extras are
-    // shaped for the override block's own SDK namespace. A type-derived
-    // Coder identity whose native provider differs from the wire SDK
-    // (coder:openrouter/... or coder:google/... speak OpenAI-chat on the
-    // wire) must not merge OpenRouter/Google-shaped extras into the OpenAI
-    // namespace, where the SDK would reject or silently drop them.
-    // Anthropic/openai-typed instances match their wire and keep extras;
-    // non-Coder identities keep existing behavior.
-    const extrasWireCompatible =
-      !overridesIdentity.coderDerived ||
-      overridesIdentity.providerName === providerOptionsNamespaceKey;
-    const mergeModelParameterExtras = (
-      builtOptions: Record<string, unknown>
-    ): Record<string, unknown> => {
-      if (!resolvedOverrides.providerExtras || !extrasWireCompatible) {
-        return builtOptions;
-      }
-      const muxProviderNamespace = builtOptions[providerOptionsNamespaceKey];
-      return {
-        ...builtOptions,
-        [providerOptionsNamespaceKey]: isPlainObject(muxProviderNamespace)
-          ? mergeProviderExtrasUnderMux(resolvedOverrides.providerExtras, muxProviderNamespace)
-          : resolvedOverrides.providerExtras,
-      };
-    };
-    const mergedProviderOptions = mergeModelParameterExtras(
-      providerOptions as Record<string, unknown>
-    );
-
-    recordStartupPhaseTiming("buildRequestConfigMs", buildRequestConfigStartedAt);
-
-    if (Object.keys(resolvedOverrides.standard).length > 0 || resolvedOverrides.providerExtras) {
-      log.debug(
-        `Resolved model parameter overrides for ${canonicalModelString}`,
-        resolvedOverrides
-      );
-    }
-
-    // --- Mid-turn thinking-level override support ---
-    // Floor resolved by AgentSession when present; internal callers fall back
-    // to the model default so clamping never loosens below policy.
     const minThinkingLevel =
       providedMinThinkingLevel ??
       resolveMinimumThinkingLevel(modelString, undefined, requestProvidersConfig);
-    // Rebuilds provider options for a new level using the exact same pipeline
-    // as the initial build (policy clamp → resolveEffectiveThinkingLevel →
-    // buildProviderOptions → providers.jsonc extras merge). Consumed by
-    // StreamManager's prepareStep; `null` ⇒ skip (no-op or model-swap level).
-    const currentEffectiveLevelRef = { current: effectiveThinkingLevel };
-    // Pure recompute shared by the mid-turn rebuild closure and the turn
-    // envelope's pending-override fold: no ref mutation, so envelope
-    // emission can preview the step-0 result without making prepareStep
-    // think the level was already applied.
-    const computeRebuiltProviderOptions = (
-      level: ThinkingLevel,
-      currentLevel: ThinkingLevel
-    ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
-      const clamped = enforceThinkingPolicy(
-        modelString,
-        level,
-        minThinkingLevel,
-        requestProvidersConfig
-      );
-      const effective = resolveEffectiveThinkingLevel(modelString, clamped, requestProvidersConfig);
-      if (effective === currentLevel) {
-        return null;
-      }
-      // off ↔ non-off on grok-4-1-fast selects a different model instance —
-      // not expressible via provider options on the in-flight stream.
-      if (isXaiGrokFastVariantSwap(canonicalModelString, currentLevel, effective)) {
-        return null;
-      }
-      const rebuilt = buildProviderOptions(
-        optionsModelString,
-        effective,
-        providerRequestMessages,
-        (id) => this.streamManager.isResponseIdLost(id),
-        effectiveMuxProviderOptions,
-        workspaceId,
-        truncationMode,
-        requestProvidersConfig,
-        routeProvider,
-        promptCacheScope,
-        reasoningMode
-      );
-      const merged = mergeModelParameterExtras(rebuilt as Record<string, unknown>);
-      return { effectiveLevel: effective, providerOptions: merged };
-    };
-    const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
-      level
-    ) => {
-      const result = computeRebuiltProviderOptions(level, currentEffectiveLevelRef.current);
-      if (result != null) {
-        currentEffectiveLevelRef.current = result.effectiveLevel;
-      }
-      return result;
-    };
-
+    const preparedModelAttempt = this.prepareModelAttempt({
+      rawModelString: modelString,
+      canonicalModelString,
+      canonicalProviderName,
+      effectiveModelString,
+      optionsModelString,
+      wireProviderName,
+      routeProvider,
+      effectiveThinkingLevel,
+      minThinkingLevel,
+      providerRequestMessages,
+      muxProviderOptions: effectiveMuxProviderOptions,
+      workspaceId,
+      truncationMode,
+      providersConfigSnapshot: requestProvidersConfig,
+      coderSelectedInstance: modelResult.data.coderSelectedInstance,
+      promptCacheScope,
+      reasoningMode,
+      recordStartupPhaseTiming,
+    });
+    let requestHeaders = preparedModelAttempt.requestHeaders;
+    const mergedProviderOptions = preparedModelAttempt.providerOptions;
+    const resolvedOverrides = preparedModelAttempt.resolvedOverrides;
+    const currentEffectiveLevelRef = preparedModelAttempt.currentEffectiveLevelRef;
+    const computeRebuiltProviderOptions = preparedModelAttempt.computeRebuiltProviderOptions;
+    const rebuildProviderOptionsForThinkingLevel =
+      preparedModelAttempt.rebuildProviderOptionsForThinkingLevel;
     // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
     if (resolveXumEnvironmentValue("DEBUG_LLM_REQUEST", process.env) === "1") {
       log.info(
@@ -3015,136 +3005,36 @@ export class TurnRequestBuilder {
                   workspaceId,
                 });
 
-                const nextProviderOptions = buildProviderOptions(
-                  nextOptionsModelString,
-                  nextThinkingLevel,
-                  nextProviderRequestMessages,
-                  (id) => this.streamManager.isResponseIdLost(id),
-                  effectiveMuxProviderOptions,
+                const preparedFallbackAttempt = this.prepareModelAttempt({
+                  rawModelString: nextModelString,
+                  canonicalModelString: next.canonicalModelString,
+                  canonicalProviderName: next.canonicalProviderName,
+                  effectiveModelString: next.effectiveModelString,
+                  optionsModelString: nextOptionsModelString,
+                  wireProviderName: next.wireProviderName,
+                  routeProvider: next.routeProvider,
+                  effectiveThinkingLevel: nextThinkingLevel,
+                  minThinkingLevel: nextMinThinkingLevel,
+                  providerRequestMessages: nextProviderRequestMessages,
+                  muxProviderOptions: effectiveMuxProviderOptions,
                   workspaceId,
                   truncationMode,
-                  nextProvidersConfig,
-                  next.routeProvider,
+                  providersConfigSnapshot: nextProvidersConfig,
+                  coderSelectedInstance: next.coderSelectedInstance,
                   promptCacheScope,
-                  reasoningMode
-                );
-
-                // buildProviderOptions re-gates pro mode for each fallback model,
-                // so the native option never leaks onto unsupported fallbacks.
-                let nextHeaders = buildRequestHeaders(
-                  nextOptionsModelString,
-                  effectiveMuxProviderOptions,
-                  workspaceId,
-                  nextProvidersConfig,
-                  next.routeProvider
-                );
+                  reasoningMode,
+                });
+                let nextHeaders = preparedFallbackAttempt.requestHeaders;
                 if (pendingRunMetadataId != null) {
-                  // Keep DevTools run correlation on fallback requests too.
                   nextHeaders = {
                     ...nextHeaders,
                     [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
                   };
                 }
-
-                // Same type-derived override identity as the main path:
-                // cross-typed Coder fallbacks must not read the name-alike
-                // provider's override block.
-                const nextOverridesIdentity = resolveOverridesIdentity(
-                  nextModelString,
-                  next.canonicalModelString,
-                  next.canonicalProviderName,
-                  nextProvidersConfig
-                );
-                const nextOverrides = resolveModelParameterOverrides(
-                  // Same pinned-raw-view rule as the main path, keyed to
-                  // the fallback selection's own instance.
-                  pinCoderInstanceRawProvidersConfig(
-                    this.config.loadProvidersConfig(),
-                    nextModelString,
-                    next.coderSelectedInstance
-                  ),
-                  nextOverridesIdentity.providerName,
-                  nextOverridesIdentity.modelString,
-                  next.effectiveModelString
-                );
-                const nextNamespaceKey = resolveProviderOptionsNamespaceKey(
-                  next.wireProviderName,
-                  next.routeProvider
-                );
-                // Same wire-compat gate as the main path: type-derived
-                // extras only merge when the override block's SDK matches
-                // the wire namespace.
-                const nextExtrasWireCompatible =
-                  !nextOverridesIdentity.coderDerived ||
-                  nextOverridesIdentity.providerName === nextNamespaceKey;
-                // Mirrors mergeModelParameterExtras for the fallback model;
-                // shared by this baseline build and mid-turn rebuilds below.
-                const mergeNextModelParameterExtras = (
-                  builtOptions: Record<string, unknown>
-                ): Record<string, unknown> => {
-                  if (!nextOverrides.providerExtras || !nextExtrasWireCompatible) {
-                    return builtOptions;
-                  }
-                  const nextMuxNamespace = builtOptions[nextNamespaceKey];
-                  return {
-                    ...builtOptions,
-                    [nextNamespaceKey]: isPlainObject(nextMuxNamespace)
-                      ? mergeProviderExtrasUnderMux(nextOverrides.providerExtras, nextMuxNamespace)
-                      : nextOverrides.providerExtras,
-                  };
-                };
-                const nextMergedProviderOptions = mergeNextModelParameterExtras(
-                  nextProviderOptions as Record<string, unknown>
-                );
-
-                // Rebuild closure bound to the FALLBACK model so mid-turn
-                // thinking changes keep working after the hop.
-                const nextCurrentEffectiveLevelRef = { current: nextThinkingLevel };
-                const rebuildNextProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel =
-                  (level) => {
-                    const clamped = enforceThinkingPolicy(
-                      nextModelString,
-                      level,
-                      nextMinThinkingLevel,
-                      nextProvidersConfig
-                    );
-                    const effective = resolveEffectiveThinkingLevel(
-                      nextModelString,
-                      clamped,
-                      nextProvidersConfig
-                    );
-                    if (effective === nextCurrentEffectiveLevelRef.current) {
-                      return null;
-                    }
-                    if (
-                      isXaiGrokFastVariantSwap(
-                        next.canonicalModelString,
-                        nextCurrentEffectiveLevelRef.current,
-                        effective
-                      )
-                    ) {
-                      return null;
-                    }
-                    const rebuilt = buildProviderOptions(
-                      nextOptionsModelString,
-                      effective,
-                      nextProviderRequestMessages,
-                      (id) => this.streamManager.isResponseIdLost(id),
-                      effectiveMuxProviderOptions,
-                      workspaceId,
-                      truncationMode,
-                      nextProvidersConfig,
-                      next.routeProvider,
-                      promptCacheScope,
-                      reasoningMode
-                    );
-                    const merged = mergeNextModelParameterExtras(
-                      rebuilt as Record<string, unknown>
-                    );
-                    nextCurrentEffectiveLevelRef.current = effective;
-                    return { effectiveLevel: effective, providerOptions: merged };
-                  };
-
+                const nextMergedProviderOptions = preparedFallbackAttempt.providerOptions;
+                const nextOverrides = preparedFallbackAttempt.resolvedOverrides;
+                const rebuildNextProviderOptionsForThinkingLevel =
+                  preparedFallbackAttempt.rebuildProviderOptionsForThinkingLevel;
                 // Shared with the return payload below: the fallback stream
                 // restarts at step 0, where StreamManager scopes to these
                 // forced tools when present.
