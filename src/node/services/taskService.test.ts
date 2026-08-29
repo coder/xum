@@ -564,6 +564,8 @@ function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {})
       overrides.discardExtensionMetadataEntry ?? mock(() => Promise.resolve()),
   };
   const { unarchive, ...hostMocks } = mocks;
+  // Same mocks for the locked sinks: the lifecycle path holds the (real) task-tree lock and
+  // calls the WhileTaskTreeLocked variants; assertions target one archive/remove surface.
   const workspaceService = makeWorkspaceHostFake({
     ...overrides,
     ...hostMocks,
