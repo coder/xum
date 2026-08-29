@@ -29,6 +29,11 @@ import {
 } from "@/browser/utils/messages/responseCompletionMetadata";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
+  SUBSCRIPTION_RETRY_BASE_MS,
+  calculateSubscriptionBackoffMs,
+  runSubscriptionLoop,
+} from "@/browser/stores/subscriptionTransport";
+import {
   ADVISOR_LIVE_OUTPUT_MAX_CHARS,
   BASH_TRUNCATE_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
@@ -477,15 +482,6 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
   };
 }
 
-const SUBSCRIPTION_RETRY_BASE_MS = 250;
-const SUBSCRIPTION_RETRY_MAX_MS = 5000;
-
-// Stall detection: server sends heartbeats every 5s, so if we don't receive any events
-// (including heartbeats) for 10s, the connection is likely dead. This handles half-open
-// WebSocket paths (e.g., some WSL localhost forwarding setups).
-const SUBSCRIPTION_STALL_TIMEOUT_MS = 10_000;
-const SUBSCRIPTION_STALL_CHECK_INTERVAL_MS = 2_000;
-
 interface ValidationIssue {
   path?: Array<string | number>;
   message?: string;
@@ -583,10 +579,6 @@ function areAgentStatusesEqual(
   }
 
   return a.emoji === b.emoji && a.message === b.message && (a.url ?? null) === (b.url ?? null);
-}
-
-function calculateSubscriptionBackoffMs(attempt: number): number {
-  return Math.min(SUBSCRIPTION_RETRY_BASE_MS * 2 ** attempt, SUBSCRIPTION_RETRY_MAX_MS);
 }
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
@@ -3405,190 +3397,61 @@ export class WorkspaceStore {
     }
   }
 
-  /**
-   * Wire an attempt-scoped {@link AbortController} to the two signals every
-   * subscription retry loop reacts to:
-   *  - the caller's outer cancellation signal (workspace lifecycle teardown)
-   *  - the current client-change signal (so client swaps abort in-flight attempts)
-   *
-   * Returns a release callback that detaches both listeners. Pair with
-   * {@link createStallWatchdog} inside a try/finally so the listeners and the
-   * watchdog tear down together regardless of how the attempt ends.
-   */
-  private linkAttemptToClientChange(
-    attemptController: AbortController,
-    signal: AbortSignal
-  ): () => void {
-    const onAbort = () => attemptController.abort();
-    signal.addEventListener("abort", onAbort);
-
-    const clientChangeSignal = this.clientChangeController.signal;
-    const onClientChange = () => attemptController.abort();
-    clientChangeSignal.addEventListener("abort", onClientChange, { once: true });
-
-    return () => {
-      signal.removeEventListener("abort", onAbort);
-      clientChangeSignal.removeEventListener("abort", onClientChange);
-    };
-  }
-
-  /**
-   * Creates a stall watchdog that aborts the attempt when no events arrive
-   * within the configured timeout. Call start() only after the subscription
-   * connection is established so handshake latency isn't misclassified as
-   * stream silence.
-   */
-  private createStallWatchdog(
-    attemptController: AbortController,
-    label: string
-  ): { markEvent: () => void; start: () => void; stop: () => void } {
-    let lastEventAt = Date.now();
-    let interval: ReturnType<typeof setInterval> | null = null;
-
-    return {
-      markEvent: () => {
-        lastEventAt = Date.now();
-      },
-      start: () => {
-        if (interval != null) {
-          return;
-        }
-
-        lastEventAt = Date.now();
-        interval = setInterval(() => {
-          if (attemptController.signal.aborted) {
-            return;
-          }
-
-          const elapsedMs = Date.now() - lastEventAt;
-          if (elapsedMs < SUBSCRIPTION_STALL_TIMEOUT_MS) {
-            return;
-          }
-
-          console.warn(
-            `[WorkspaceStore] ${label} stalled (no events for ${elapsedMs}ms); retrying...`
-          );
-          attemptController.abort();
-        }, SUBSCRIPTION_STALL_CHECK_INTERVAL_MS);
-      },
-      stop: () => {
-        if (interval != null) {
-          clearInterval(interval);
-          interval = null;
-        }
-      },
-    };
-  }
-
   private async runTerminalActivitySubscription(controller: AbortController): Promise<void> {
     const signal = controller.signal;
-    let attempt = 0;
-
     try {
-      while (!signal.aborted) {
-        const client = this.client ?? (await this.waitForClient(signal));
-        if (!client || signal.aborted) {
-          return;
-        }
-
-        const subscribe = this.resolveTerminalActivitySubscribe(client);
-        if (!subscribe) {
-          // Client doesn't support terminal activity — clear stale state and exit
-          // without entering the retry loop (this is not an error condition).
-          this.clearAllTerminalActivitySnapshots();
-          return;
-        }
-
-        const attemptController = new AbortController();
-        const releaseAttemptListeners = this.linkAttemptToClientChange(attemptController, signal);
-        const watchdog = this.createStallWatchdog(
-          attemptController,
-          "terminal activity subscription"
-        );
-
-        try {
-          const iterator = await subscribe(undefined, {
-            signal: attemptController.signal,
-          });
-
-          // Start watchdog after subscribe connects so timeout measures
-          // post-connect silence, not handshake latency.
-          watchdog.start();
-
-          for await (const event of iterator) {
-            if (signal.aborted) {
+      await runSubscriptionLoop({
+        name: "terminal activity subscription",
+        signal,
+        getClient: async (attemptSignal) =>
+          this.client ?? (await this.waitForClient(attemptSignal)),
+        getClientChangeSignal: () => this.clientChangeController.signal,
+        subscribe: async (client, attemptSignal) => {
+          const subscribe = this.resolveTerminalActivitySubscribe(client);
+          if (!subscribe) {
+            this.clearAllTerminalActivitySnapshots();
+            return null;
+          }
+          return {
+            events: await subscribe(undefined, { signal: attemptSignal }),
+            context: undefined,
+          };
+        },
+        onEvent: (event, _context, attemptSignal) => {
+          if (event.type === "heartbeat") return;
+          queueMicrotask(() => {
+            if (signal.aborted || attemptSignal.aborted) return;
+            if (event.type === "snapshot") {
+              const seen = new Set<string>();
+              for (const [workspaceId, activity] of Object.entries(event.workspaces)) {
+                seen.add(workspaceId);
+                this.applyTerminalActivity(workspaceId, activity);
+              }
+              for (const workspaceId of Array.from(this.workspaceTerminalActivity.keys())) {
+                if (!seen.has(workspaceId))
+                  this.applyTerminalActivity(workspaceId, { activeCount: 0, totalSessions: 0 });
+              }
               return;
             }
-
-            watchdog.markEvent();
-
-            // Connection is alive again - don't carry old backoff into the next failure.
-            attempt = 0;
-
-            if (event.type === "heartbeat") {
-              continue;
-            }
-
-            queueMicrotask(() => {
-              if (signal.aborted || attemptController.signal.aborted) {
-                return;
-              }
-
-              if (event.type === "snapshot") {
-                const seenWorkspaceIds = new Set<string>();
-                for (const [workspaceId, activity] of Object.entries(event.workspaces)) {
-                  seenWorkspaceIds.add(workspaceId);
-                  this.applyTerminalActivity(workspaceId, activity);
-                }
-
-                for (const workspaceId of Array.from(this.workspaceTerminalActivity.keys())) {
-                  if (seenWorkspaceIds.has(workspaceId)) {
-                    continue;
-                  }
-                  this.applyTerminalActivity(workspaceId, { activeCount: 0, totalSessions: 0 });
-                }
-
-                return;
-              }
-
-              this.applyTerminalActivity(event.workspaceId, event.activity);
-            });
-          }
-
-          if (signal.aborted) {
-            return;
-          }
-
-          if (!attemptController.signal.aborted) {
+            this.applyTerminalActivity(event.workspaceId, event.activity);
+          });
+        },
+        onUnexpectedEnd: ({ attemptAborted }) => {
+          if (!attemptAborted)
             console.warn(
               "[WorkspaceStore] terminal activity subscription ended unexpectedly; retrying..."
             );
-          }
-        } catch (error) {
-          if (signal.aborted) {
-            return;
-          }
-
+        },
+        onError: (error, { attemptAborted }) => {
           const abortError = isAbortError(error);
-          if (attemptController.signal.aborted) {
-            if (!abortError) {
+          if (attemptAborted) {
+            if (!abortError)
               console.warn("[WorkspaceStore] terminal activity subscription aborted; retrying...");
-            }
-          } else if (!abortError) {
+          } else if (!abortError)
             console.warn("[WorkspaceStore] Error in terminal activity subscription:", error);
-          }
-        } finally {
-          releaseAttemptListeners();
-          watchdog.stop();
-        }
-
-        if (!signal.aborted && !attemptController.signal.aborted) {
-          const delayMs = calculateSubscriptionBackoffMs(attempt);
-          attempt++;
-
-          await this.sleepWithAbort(delayMs, signal);
-        }
-      }
+        },
+        backoffAfterAbort: false,
+      });
     } finally {
       this.releaseTerminalActivityController(controller);
     }
@@ -3642,124 +3505,47 @@ export class WorkspaceStore {
   }
 
   private async runActivitySubscription(signal: AbortSignal): Promise<void> {
-    let attempt = 0;
-
-    while (!signal.aborted) {
-      const client = this.client ?? (await this.waitForClient(signal));
-      if (!client || signal.aborted) {
-        return;
-      }
-
-      const attemptController = new AbortController();
-      const releaseAttemptListeners = this.linkAttemptToClientChange(attemptController, signal);
-      const watchdog = this.createStallWatchdog(attemptController, "activity subscription");
-
-      try {
-        // Open the live delta stream first so no state transition can be lost
-        // between the list snapshot fetch and subscribe registration.
+    await runSubscriptionLoop({
+      name: "activity subscription",
+      signal,
+      getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
+      getClientChangeSignal: () => this.clientChangeController.signal,
+      subscribe: async (client, attemptSignal) => {
         const iterator = await client.workspace.activity.subscribe(undefined, {
-          signal: attemptController.signal,
+          signal: attemptSignal,
         });
-
         const snapshots = await client.workspace.activity.list();
-        if (signal.aborted) {
-          return;
-        }
-        // Client changed while list() was in flight — retry with the new client
-        // instead of exiting permanently. The outer while loop will pick up the
-        // replacement client on the next iteration.
-        if (attemptController.signal.aborted) {
-          continue;
-        }
-
+        if (signal.aborted) return null;
+        if (attemptSignal.aborted) return { retryImmediately: true };
         queueMicrotask(() => {
-          if (signal.aborted || attemptController.signal.aborted) {
-            return;
-          }
-          // null is the backend's read-failure signal: keep last-known snapshots and
-          // stay non-authoritative (the background retry below delivers the real
-          // list later). A non-null list — including {} on an all-idle deployment —
-          // is authoritative.
-          if (snapshots != null) {
-            this.applyWorkspaceActivityList(snapshots);
-          }
+          if (signal.aborted || attemptSignal.aborted) return;
+          if (snapshots != null) this.applyWorkspaceActivityList(snapshots);
           this.markActivityHydrated(snapshots != null);
         });
-
-        // A transiently-null bootstrap must not stay non-authoritative for the
-        // life of an otherwise healthy subscription: heartbeats keep the iterator
-        // alive indefinitely and events never confer authority, so another list
-        // read may never happen. Retry in the background (attempt-scoped) instead
-        // of blocking here, so live events keep flowing while the read heals.
-        if (snapshots == null) {
-          void this.retryActivityBootstrapList(client, signal, attemptController.signal);
-        }
-
-        // Start watchdog after bootstrap so slow list() doesn't trigger
-        // false-positive reconnects.
-        watchdog.start();
-
-        for await (const event of iterator) {
-          if (signal.aborted) {
-            return;
-          }
-
-          watchdog.markEvent();
-
-          // Connection is alive again - don't carry old backoff into the next failure.
-          attempt = 0;
-
-          if (event.type === "heartbeat") {
-            continue;
-          }
-
-          queueMicrotask(() => {
-            if (signal.aborted || attemptController.signal.aborted) {
-              return;
-            }
-            this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
-            this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
-          });
-        }
-
-        if (signal.aborted) {
-          return;
-        }
-
-        if (!attemptController.signal.aborted) {
-          console.warn("[WorkspaceStore] activity subscription ended unexpectedly; retrying...");
-        }
-      } catch (error) {
-        if (signal.aborted) {
-          return;
-        }
-
+        if (snapshots == null) void this.retryActivityBootstrapList(client, signal, attemptSignal);
+        return { events: iterator, context: undefined };
+      },
+      onEvent: (event, _context, attemptSignal) => {
+        if (event.type === "heartbeat") return;
+        queueMicrotask(() => {
+          if (signal.aborted || attemptSignal.aborted) return;
+          this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
+          this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+        });
+      },
+      onUnexpectedEnd: () =>
+        console.warn("[WorkspaceStore] activity subscription ended unexpectedly; retrying..."),
+      onError: (error, { attemptAborted }) => {
         const abortError = isAbortError(error);
-        if (attemptController.signal.aborted) {
-          if (!abortError) {
+        if (attemptAborted) {
+          if (!abortError)
             console.warn("[WorkspaceStore] activity subscription aborted; retrying...");
-          }
         } else if (!abortError) {
           console.warn("[WorkspaceStore] Error in activity subscription:", error);
-          // Self-heal: a failing activity subscription must not hold the chat
-          // view's first-paint barrier. Treat the (empty) activity map as
-          // known; the retry loop will deliver real data when it recovers.
-          // Not authoritative: baseline consumers must not read this as "no activity".
           this.markActivityHydrated(false);
         }
-      } finally {
-        releaseAttemptListeners();
-        watchdog.stop();
-      }
-
-      const delayMs = calculateSubscriptionBackoffMs(attempt);
-      attempt++;
-
-      await this.sleepWithAbort(delayMs, signal);
-      if (signal.aborted) {
-        return;
-      }
-    }
+      },
+    });
   }
 
   /**
@@ -3991,228 +3777,106 @@ export class WorkspaceStore {
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
   private async runOnChatSubscription(workspaceId: string, signal: AbortSignal): Promise<void> {
-    let attempt = 0;
-
-    while (!signal.aborted) {
-      const hadClientAtLoopStart = this.client !== null;
-      const client = this.client ?? (await this.waitForClient(signal));
-      if (!client || signal.aborted) {
-        return;
-      }
-
-      // If activation happened while the client was offline, begin hydration now
-      // that we can actually start the subscription loop.
-      const initialTransient = this.chatTransientState.get(workspaceId);
-      if (
-        !hadClientAtLoopStart &&
-        initialTransient &&
-        !initialTransient.caughtUp &&
-        !initialTransient.isHydratingTranscript
-      ) {
-        initialTransient.isHydratingTranscript = true;
-        this.states.bump(workspaceId);
-      }
-
-      // Allow us to abort only this subscription attempt (without unsubscribing the workspace).
-      const attemptController = new AbortController();
-      const releaseAttemptListeners = this.linkAttemptToClientChange(attemptController, signal);
-      const watchdog = this.createStallWatchdog(attemptController, `onChat(${workspaceId})`);
-
-      try {
-        // Always reset caughtUp at subscription start so historical events are
-        // buffered until the caught-up marker arrives, regardless of replay mode.
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          transient.caughtUp = false;
+    await runSubscriptionLoop({
+      name: "onChat(" + workspaceId + ")",
+      signal,
+      getClient: async (attemptSignal) => {
+        const hadClientAtLoopStart = this.client !== null;
+        const client = this.client ?? (await this.waitForClient(attemptSignal));
+        return client ? { client, hadClientAtLoopStart } : null;
+      },
+      getClientChangeSignal: () => this.clientChangeController.signal,
+      subscribe: async ({ client, hadClientAtLoopStart }, attemptSignal, abortAttempt) => {
+        const initialTransient = this.chatTransientState.get(workspaceId);
+        if (
+          !hadClientAtLoopStart &&
+          initialTransient &&
+          !initialTransient.caughtUp &&
+          !initialTransient.isHydratingTranscript
+        ) {
+          initialTransient.isHydratingTranscript = true;
+          this.states.bump(workspaceId);
         }
-
-        // Reconnect incrementally whenever we can build a valid cursor.
-        // Do not gate on transient.caughtUp here: retry paths may optimistically
-        // set caughtUp=false to re-enable buffering, but the cursor can still
-        // represent the latest rendered state for an incremental reconnect.
+        const transient = this.chatTransientState.get(workspaceId);
+        if (transient) transient.caughtUp = false;
         const aggregator = this.aggregators.get(workspaceId);
         let mode: OnChatMode | undefined;
-
-        // Attempt-scoped reconnect context: since-replay reconciliation must only ever
-        // see the anchor from its own attempt's cursor. Routed through the same
-        // attempt-guarded event path as chat events (the abort checks below drop
-        // events from stale attempts), so a caught-up from a previous attempt can
-        // never consume a newer attempt's anchor.
-        const attemptContext: OnChatAttemptContext = {
-          abort: () => attemptController.abort(),
-        };
-
+        const attemptContext: OnChatAttemptContext = { abort: abortAttempt };
         if (aggregator) {
           const cursor = aggregator.getOnChatCursor();
           if (cursor?.history) {
-            mode = {
-              type: "since",
-              cursor: {
-                history: cursor.history,
-                stream: cursor.stream,
-              },
-            };
+            mode = { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
             attemptContext.since = {
               requestedAnchorSequence: cursor.history.historySequence,
               localActiveStreamMessageId: cursor.stream?.messageId,
             };
           }
         }
-
         await this.syncAutoCompactionThresholdAtStartup(client, workspaceId);
-
         const autoRetryKey = getAutoRetryKey(workspaceId);
-        const legacyAutoRetryEnabledRaw = readPersistedState<unknown>(autoRetryKey, undefined);
-        const legacyAutoRetryEnabled =
-          typeof legacyAutoRetryEnabledRaw === "boolean" ? legacyAutoRetryEnabledRaw : undefined;
-
-        if (legacyAutoRetryEnabledRaw !== undefined && legacyAutoRetryEnabled === undefined) {
-          // Self-heal malformed legacy values so onChat subscription retries do not
-          // keep failing schema validation on every reconnect attempt.
+        const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
+        const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
+        if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        }
-
-        const onChatInput =
+        const input =
           legacyAutoRetryEnabled === undefined
             ? { workspaceId, mode }
             : { workspaceId, mode, legacyAutoRetryEnabled };
-
-        const iterator = await client.workspace.onChat(onChatInput, {
-          signal: attemptController.signal,
-        });
-
-        if (legacyAutoRetryEnabled !== undefined) {
-          // One-way migration: once we have successfully forwarded the legacy value
-          // to the backend, clear the renderer key so future sessions rely solely
-          // on backend persistence.
+        const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
+        if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        }
-
-        // Full replay: clear stale derived/transient state now that the subscription
-        // is active. Deferred to after the iterator is established so the UI continues
-        // displaying previous state until replay data actually starts arriving.
-        if (!mode || mode.type === "full") {
-          this.resetChatStateForReplay(workspaceId);
-        }
-
-        // Start watchdog after subscribe connects so timeout measures
-        // post-connect silence, not handshake latency.
-        watchdog.start();
-
-        for await (const data of iterator) {
-          if (signal.aborted) {
-            return;
-          }
-
-          watchdog.markEvent();
-
-          // Connection is alive again - don't carry old backoff into the next failure.
-          attempt = 0;
-
-          const attemptSignal = attemptController.signal;
-          queueMicrotask(() => {
-            // Workspace switches abort the previous attempt before starting a new one.
-            // Drop any already-queued chat events from that aborted attempt so stale
-            // replay buffers cannot be repopulated after we synchronously cleared them.
-            if (signal.aborted || attemptSignal.aborted) {
-              return;
-            }
+        if (!mode || mode.type === "full") this.resetChatStateForReplay(workspaceId);
+        return { events: iterator, context: attemptContext };
+      },
+      onEvent: (data, attemptContext, attemptSignal) =>
+        queueMicrotask(() => {
+          if (!signal.aborted && !attemptSignal.aborted)
             this.handleChatMessage(workspaceId, data, attemptContext);
-          });
-        }
-
-        // Iterator ended without an abort - treat as unexpected and retry.
-        if (signal.aborted) {
-          return;
-        }
-
-        if (attemptController.signal.aborted) {
-          // e.g., stall watchdog fired
-          console.warn(
-            `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
-          );
-        } else {
-          console.warn(
-            `[WorkspaceStore] onChat subscription ended unexpectedly for ${workspaceId}; retrying...`
-          );
-        }
-      } catch (error) {
-        // Suppress errors when subscription was intentionally cleaned up
-        if (signal.aborted) {
-          return;
-        }
-
+        }),
+      onUnexpectedEnd: ({ attemptAborted }) =>
+        console.warn(
+          attemptAborted
+            ? "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
+            : "[WorkspaceStore] onChat subscription ended unexpectedly for " +
+                workspaceId +
+                "; retrying..."
+        ),
+      onError: (error, { attemptAborted }) => {
         const abortError = isAbortError(error);
-
-        if (attemptController.signal.aborted) {
-          if (!abortError) {
+        if (attemptAborted) {
+          if (!abortError)
             console.warn(
-              `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
+              "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
             );
-          }
         } else if (isIteratorValidationFailed(error)) {
-          // EVENT_ITERATOR_VALIDATION_FAILED can happen when:
-          // 1. Schema validation fails (event doesn't match WorkspaceChatMessageSchema)
-          // 2. Workspace was removed on server side (iterator ends with error)
-          // 3. Connection dropped (WebSocket/MessagePort error)
-
-          // Only suppress if workspace no longer exists (was removed during the race)
-          if (!this.isWorkspaceRegistered(workspaceId)) {
-            return;
-          }
-          // Log with detailed validation info for debugging schema mismatches
+          if (!this.isWorkspaceRegistered(workspaceId)) return true;
           console.error(
-            `[WorkspaceStore] Event validation failed for ${workspaceId}: ${formatValidationError(error)}`
+            "[WorkspaceStore] Event validation failed for " +
+              workspaceId +
+              ": " +
+              formatValidationError(error)
           );
-        } else if (!abortError) {
-          console.error(`[WorkspaceStore] Error in onChat subscription for ${workspaceId}:`, error);
-        }
-      } finally {
-        releaseAttemptListeners();
-        watchdog.stop();
-      }
-
-      if (this.isWorkspaceRegistered(workspaceId)) {
-        // Failed reconnect attempts may have buffered partial replay data.
-        // Clear replay buffers before the next attempt so we don't append a
-        // second replay copy and duplicate deltas/tool events on caught-up.
+        } else if (!abortError)
+          console.error(
+            "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
+            error
+          );
+      },
+      onAttemptFinished: () => {
+        if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
-
-        // If catch-up fails before the authoritative marker arrives, fall back to
-        // normal transcript/retry UI immediately so hydration cannot remain pinned
-        // while we wait for client reconnects.
         const transient = this.chatTransientState.get(workspaceId);
         if (transient?.isHydratingTranscript && !transient.caughtUp) {
           transient.isHydratingTranscript = false;
           this.states.bump(workspaceId);
         }
-
-        // Full replay resets can preserve the last usage snapshot until caught-up.
-        // If reconnect fails before caught-up arrives, drop that snapshot so stale
-        // live usage isn't shown indefinitely while retries continue.
-        if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId)) {
+        if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
           this.usageStore.bump(workspaceId);
-        }
-
-        // Preserve pagination across transient reconnect retries. Incremental
-        // caught-up payloads intentionally omit hasOlderHistory, so resetting
-        // here would permanently hide "Load older messages" until a full replay.
         const existingPagination =
           this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
-        this.historyPagination.set(workspaceId, {
-          ...existingPagination,
-          loading: false,
-        });
-      }
-
-      const delayMs = calculateSubscriptionBackoffMs(attempt);
-      attempt++;
-
-      await this.sleepWithAbort(delayMs, signal);
-      if (signal.aborted) {
-        return;
-      }
-    }
+        this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
+      },
+    });
   }
 
   /**
