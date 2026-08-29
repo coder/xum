@@ -857,6 +857,10 @@ function parseDiffGitHeaderPaths(stdout: string): string[] {
   return [...paths].filter((filePath) => filePath.length > 0);
 }
 
+// Git C-quotes each side of the header independently, so a rename between an
+// ASCII and a non-ASCII name yields a mixed quoted/unquoted path pair. An
+// unquoted side never contains a literal quote (git would have quoted it), so
+// a mid-line quote can only open a quoted b side.
 function parseDiffGitHeaderLine(line: string): string[] {
   if (line.startsWith('"')) {
     const first = parseGitQuotedPath(line, 0);
@@ -865,14 +869,25 @@ function parseDiffGitHeaderLine(line: string): string[] {
     while (line[secondStartOffset] === " ") {
       secondStartOffset += 1;
     }
-    const second = parseGitQuotedPath(line, secondStartOffset);
-    return [stripDiffPathPrefix(first.path), stripDiffPathPrefix(second?.path)].filter(
+    const rest = line.slice(secondStartOffset);
+    const second = rest.startsWith('"') ? parseGitQuotedPath(line, secondStartOffset)?.path : rest;
+    return [stripDiffPathPrefix(first.path), stripDiffPathPrefix(second)].filter(
       (filePath): filePath is string => filePath != null && filePath.length > 0
     );
   }
 
   if (!line.startsWith("a/")) {
     return [];
+  }
+
+  const quoteIndex = line.indexOf('"');
+  if (quoteIndex !== -1) {
+    const second = parseGitQuotedPath(line, quoteIndex);
+    if (second == null) return [];
+    return [
+      stripDiffPathPrefix(line.slice(0, quoteIndex).trimEnd()),
+      stripDiffPathPrefix(second.path),
+    ].filter((filePath): filePath is string => filePath != null && filePath.length > 0);
   }
 
   const paths = new Set<string>();

@@ -231,6 +231,77 @@ describe("task git patch engine", () => {
     );
   });
 
+  it("applies renames with mixed-quoted diff headers under allowedPathPrefixes", async () => {
+    const childRepo = path.join(rootDir, "mixed-quote-child");
+    const targetRepo = path.join(rootDir, "mixed-quote-target");
+    const sessionDir = path.join(rootDir, "mixed-quote-session");
+    await fsPromises.mkdir(path.join(childRepo, "src"), { recursive: true });
+    initGitRepo(childRepo);
+    await commitFile(childRepo, "src/simple.txt", "ascii to unicode\n", "base simple");
+    await commitFile(childRepo, "src/résumé.txt", "unicode to ascii\n", "base unicode");
+    execSync("git clone " + JSON.stringify(childRepo) + " " + JSON.stringify(targetRepo), {
+      stdio: "ignore",
+    });
+    execSync('git config user.email "test@example.com"', { cwd: targetRepo, stdio: "ignore" });
+    execSync('git config user.name "test"', { cwd: targetRepo, stdio: "ignore" });
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    // Git C-quotes each header side independently, so each rename direction
+    // yields a mixed quoted/unquoted "diff --git" line.
+    execSync('git mv src/simple.txt "src/café.txt"', { cwd: childRepo, stdio: "ignore" });
+    execSync('git mv "src/résumé.txt" src/plain.txt', { cwd: childRepo, stdio: "ignore" });
+    execSync('git commit -m "rename both directions"', { cwd: childRepo, stdio: "ignore" });
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    const childTaskId = "mixed-quote-renames";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId: "test-workspace",
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "repo",
+          projectPath: targetRepo,
+          projectName: "repo",
+          childRepo,
+          baseSha,
+          headSha,
+        }),
+      ],
+    });
+    const config = {
+      workspaceId: "test-workspace",
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: path.join(rootDir, "mixed-quote-runtime"),
+      workspaceSessionDir: sessionDir,
+    };
+
+    const rejected = await taskGitPatchEngine.applyPatch(
+      config,
+      { task_id: childTaskId, three_way: true, dry_run: true },
+      { allowedPathPrefixes: ["docs"] }
+    );
+    expect(rejected.success).toBe(false);
+    if (!rejected.success) {
+      expect(rejected.error).toContain("src/");
+      expect(rejected.error).not.toContain("<unparseable diff header>");
+    }
+
+    const applied = await taskGitPatchEngine.applyPatch(
+      config,
+      { task_id: childTaskId, three_way: true },
+      { allowedPathPrefixes: ["src"] }
+    );
+    expect(applied.success).toBe(true);
+    expect(await fsPromises.readFile(path.join(targetRepo, "src/café.txt"), "utf-8")).toBe(
+      "ascii to unicode\n"
+    );
+    expect(await fsPromises.readFile(path.join(targetRepo, "src/plain.txt"), "utf-8")).toBe(
+      "unicode to ascii\n"
+    );
+  });
+
   it("finds a nested descendant patch in its direct parent session", async () => {
     const muxRoot = path.join(rootDir, "nested-mux");
     const sessionsDir = path.join(muxRoot, "sessions");
