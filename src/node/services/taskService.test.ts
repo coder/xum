@@ -81,9 +81,10 @@ import {
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { ProvidersConfigMap, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import { makeWorkspaceHostFake } from "@/node/services/taskWorkspaceSeam.testUtils";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
@@ -519,177 +520,68 @@ function simulateAcceptedFamilySends(
   );
 }
 
-function createWorkspaceServiceMocks(
-  overrides?: Partial<{
-    sendMessage: ReturnType<typeof mock>;
-    resumeStream: ReturnType<typeof mock>;
-    clearQueue: ReturnType<typeof mock>;
-    removeQueuedWorkspaceTurn: ReturnType<typeof mock>;
-    removeQueuedMessagesByDedupeKeyPrefix: ReturnType<typeof mock>;
-    hasQueuedWorkspaceTurn: ReturnType<typeof mock>;
-    hasQueuedMessages: ReturnType<typeof mock>;
-    isBusyForMessage: ReturnType<typeof mock>;
-    hasPendingQueuedOrPreparingTurn: ReturnType<typeof mock>;
-    hasPendingBashMonitorWakeContinuation: ReturnType<typeof mock>;
-    hasPendingWorkspaceTurnContinuation: ReturnType<typeof mock>;
-    getQueueCutCutter: ReturnType<typeof mock>;
-    hasPendingAutoRetry: ReturnType<typeof mock>;
-    waitForIdleAndNoQueuedMessages: ReturnType<typeof mock>;
-    waitForPendingCompactionCompletionDecision: ReturnType<typeof mock>;
-    waitForPendingStreamErrorRecoveryDecision: ReturnType<typeof mock>;
-    archive: ReturnType<typeof mock>;
-    unarchive: ReturnType<typeof mock>;
-    preflightArchive: ReturnType<typeof mock>;
-    listLiveWorkspaceActivity: ReturnType<typeof mock>;
-    hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
-    isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
-    hasUntrackableExternalAppOpen: ReturnType<typeof mock>;
-    acquirePreInterruptionArchiveHold: ReturnType<typeof mock>;
-    remove: ReturnType<typeof mock>;
-    emit: ReturnType<typeof mock>;
-    getInfo: ReturnType<typeof mock>;
-    replaceHistory: ReturnType<typeof mock>;
-    updateTitle: ReturnType<typeof mock>;
-    isExperimentEnabled: ReturnType<typeof mock>;
-    emitChatEvent: ReturnType<typeof mock>;
-    isWorkflowInvocationCurrent: ReturnType<typeof mock>;
-    create: ReturnType<typeof mock>;
-    countQueuedAgentPeerMessages: ReturnType<typeof mock>;
-  }>
-) {
-  const sendMessage =
-    overrides?.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const resumeStream =
-    overrides?.resumeStream ??
-    mock((): Promise<Result<{ started: boolean }>> => Promise.resolve(Ok({ started: true })));
-  const clearQueue = overrides?.clearQueue ?? mock((): Result<void> => Ok(undefined));
-  const removeQueuedWorkspaceTurn =
-    overrides?.removeQueuedWorkspaceTurn ?? mock((): Result<boolean> => Ok(true));
-  const removeQueuedMessagesByDedupeKeyPrefix =
-    overrides?.removeQueuedMessagesByDedupeKeyPrefix ?? mock((): Result<number> => Ok(0));
-  const hasQueuedWorkspaceTurn = overrides?.hasQueuedWorkspaceTurn ?? mock(() => false);
-  const hasQueuedMessages = overrides?.hasQueuedMessages ?? mock(() => false);
-  const isBusyForMessage = overrides?.isBusyForMessage ?? mock(() => false);
-  const hasPendingQueuedOrPreparingTurn =
-    overrides?.hasPendingQueuedOrPreparingTurn ?? mock(() => false);
-  const hasPendingBashMonitorWakeContinuation =
-    overrides?.hasPendingBashMonitorWakeContinuation ?? mock(() => false);
-  const hasPendingWorkspaceTurnContinuation =
-    overrides?.hasPendingWorkspaceTurnContinuation ?? mock(() => false);
-  const getQueueCutCutter = overrides?.getQueueCutCutter ?? mock(() => undefined);
-  const hasPendingAutoRetry = overrides?.hasPendingAutoRetry ?? mock(() => false);
-  const waitForIdleAndNoQueuedMessages =
-    overrides?.waitForIdleAndNoQueuedMessages ?? mock((): Promise<void> => Promise.resolve());
-  const waitForPendingCompactionCompletionDecision =
-    overrides?.waitForPendingCompactionCompletionDecision ??
-    mock((): Promise<boolean> => Promise.resolve(true));
-  const waitForPendingStreamErrorRecoveryDecision =
-    overrides?.waitForPendingStreamErrorRecoveryDecision ??
-    mock((): Promise<void> => Promise.resolve());
-  const archive =
-    overrides?.archive ??
-    mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" })));
-  const unarchive =
-    overrides?.unarchive ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const preflightArchive =
-    overrides?.preflightArchive ??
-    mock((): Promise<Result<{ kind: "ready" }>> => Promise.resolve(Ok({ kind: "ready" })));
-  const listLiveWorkspaceActivity =
-    overrides?.listLiveWorkspaceActivity ??
-    mock(() => ({
-      streaming: false,
-      queuedMessages: false,
-      backgroundBashProcesses: false,
-      terminalSessions: false,
-      desktopSession: false,
-    }));
-  const hasRunningBackgroundBashProcesses =
-    overrides?.hasRunningBackgroundBashProcesses ??
-    mock((): Promise<boolean> => Promise.resolve(false));
-  // Default false = "keep"-style behavior where archive eligibility never depends on the
-  // untracked-file set, so interrupt_active tests exercise the interruption path.
-  const isSnapshotArchiveEligibilityMutationSensitive =
-    overrides?.isSnapshotArchiveEligibilityMutationSensitive ?? mock(() => false);
-  const hasUntrackableExternalAppOpen =
-    overrides?.hasUntrackableExternalAppOpen ?? mock(() => false);
-  const remove =
-    overrides?.remove ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const emit = overrides?.emit ?? mock(() => true);
-  const getInfo = overrides?.getInfo ?? mock(() => Promise.resolve(null));
-  const replaceHistory =
-    overrides?.replaceHistory ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const updateTitle =
-    overrides?.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-  const isExperimentEnabled = overrides?.isExperimentEnabled ?? mock(() => false);
-  const emitChatEvent =
-    overrides?.emitChatEvent ??
-    mock((_workspaceId: string, _message: WorkspaceChatMessage) => undefined);
-  const isWorkflowInvocationCurrent =
-    overrides?.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
-  const countQueuedAgentPeerMessages = overrides?.countQueuedAgentPeerMessages ?? mock(() => 0);
-  // Granted by default (no live user activity): interrupt_active tests exercise the
-  // interruption/archive flow; the hold's own refusal logic lives in workspaceService.test.ts.
-  const acquirePreInterruptionArchiveHold =
-    overrides?.acquirePreInterruptionArchiveHold ??
-    mock((): Result<Disposable> => Ok({ [Symbol.dispose]: () => undefined }));
+type WorkspaceHostMockOverrides = Partial<{
+  [K in keyof WorkspaceHost]: ReturnType<typeof mock>;
+}> & { unarchive?: ReturnType<typeof mock> };
 
-  const create =
-    overrides?.create ??
-    mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Err("workspaceService.create not mocked"))
-    );
-  const discardExtensionMetadataEntry = mock((): Promise<void> => Promise.resolve());
+function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {
+  const defaults = makeWorkspaceHostFake();
+  const sendMessage = overrides.sendMessage ?? mock(defaults.sendMessage);
+  const resumeStream = overrides.resumeStream ?? mock(defaults.resumeStream);
+  const clearQueue = overrides.clearQueue ?? mock(defaults.clearQueue);
+  const removeQueuedWorkspaceTurn =
+    overrides.removeQueuedWorkspaceTurn ?? mock(defaults.removeQueuedWorkspaceTurn);
+  const isBusyForMessage = overrides.isBusyForMessage ?? mock(defaults.isBusyForMessage);
+  const getQueueCutCutter = overrides.getQueueCutCutter ?? mock(defaults.getQueueCutCutter);
+  const remove = overrides.remove ?? overrides.removeWhileTaskTreeLocked ?? mock(defaults.remove);
+  const updateTitle = overrides.updateTitle ?? mock(defaults.updateTitle);
+  const emitChatEvent = overrides.emitChatEvent ?? mock(defaults.emitChatEvent);
+  const emit = overrides.emit ?? mock(() => true);
+  const archive =
+    overrides.archive ?? overrides.archiveWhileTaskTreeLocked ?? mock(defaults.archive);
+  const unarchive =
+    overrides.unarchive ??
+    overrides.unarchiveWhileTaskTreeLocked ??
+    mock(defaults.unarchiveWhileTaskTreeLocked);
+  const isWorkflowInvocationCurrent =
+    overrides.isWorkflowInvocationCurrent ?? mock(defaults.isWorkflowInvocationCurrent);
+  const create = overrides.create ?? mock(defaults.create);
+  const discardExtensionMetadataEntry =
+    overrides.discardExtensionMetadataEntry ?? mock(defaults.discardExtensionMetadataEntry);
+
+  const workspaceService = makeWorkspaceHostFake({
+    ...overrides,
+    create,
+    discardExtensionMetadataEntry,
+    // Task-create tests exercise launch flow, not plugin-override sanitization.
+    sanitizeMaterializedTaskWorkspace:
+      overrides.sanitizeMaterializedTaskWorkspace ?? defaults.sanitizeMaterializedTaskWorkspace,
+    sendMessage,
+    resumeStream,
+    clearQueue,
+    removeQueuedWorkspaceTurn,
+    isBusyForMessage,
+    getQueueCutCutter,
+    // Keep-style behavior makes archive eligibility independent of untracked files.
+    isSnapshotArchiveEligibilityMutationSensitive:
+      overrides.isSnapshotArchiveEligibilityMutationSensitive ??
+      defaults.isSnapshotArchiveEligibilityMutationSensitive,
+    // No live activity grants the archive hold so tests reach interruption behavior.
+    acquirePreInterruptionArchiveHold:
+      overrides.acquirePreInterruptionArchiveHold ?? defaults.acquirePreInterruptionArchiveHold,
+    archive,
+    archiveWhileTaskTreeLocked: archive,
+    unarchiveWhileTaskTreeLocked: unarchive,
+    remove,
+    removeWhileTaskTreeLocked: remove,
+    updateTitle,
+    emitChatEvent,
+    emit,
+    isWorkflowInvocationCurrent,
+  });
 
   return {
-    workspaceService: {
-      create,
-      discardExtensionMetadataEntry,
-      // No-op by default: task-create tests exercise launch flow, not the
-      // registration-time plugin-override sanitizer (workspaceService.test.ts
-      // covers it). Returning undefined means "clean".
-      sanitizeMaterializedTaskWorkspace: mock(() => Promise.resolve(undefined)),
-      sendMessage,
-      resumeStream,
-      clearQueue,
-      removeQueuedWorkspaceTurn,
-      removeQueuedMessagesByDedupeKeyPrefix,
-      isBusyForMessage,
-      hasQueuedWorkspaceTurn,
-      hasQueuedMessages,
-      hasPendingQueuedOrPreparingTurn,
-      hasPendingBashMonitorWakeContinuation,
-      hasPendingWorkspaceTurnContinuation,
-      getQueueCutCutter,
-      hasPendingAutoRetry,
-      waitForIdleAndNoQueuedMessages,
-      waitForPendingCompactionCompletionDecision,
-      waitForPendingStreamErrorRecoveryDecision,
-      archive,
-      // Same mocks: the lifecycle path holds the (real) task-tree lock and calls the
-      // WhileTaskTreeLocked sinks; assertions target one archive/unarchive surface.
-      archiveWhileTaskTreeLocked: archive,
-      unarchiveWhileTaskTreeLocked: unarchive,
-      preflightArchive,
-      listLiveWorkspaceActivity,
-      hasRunningBackgroundBashProcesses,
-      isSnapshotArchiveEligibilityMutationSensitive,
-      hasUntrackableExternalAppOpen,
-      acquirePreInterruptionArchiveHold,
-      // Task launches register their fire-and-forget background inits for archive gating;
-      // a no-op suffices since these tests archive nothing mid-init.
-      registerExternalBackgroundInit: mock(() => undefined),
-      removeWhileTaskTreeLocked: remove,
-      remove,
-      emit,
-      getInfo,
-      replaceHistory,
-      updateTitle,
-      isExperimentEnabled,
-      emitChatEvent,
-      isWorkflowInvocationCurrent,
-      countQueuedAgentPeerMessages,
-    } satisfies WorkspaceHost,
+    workspaceService,
     create,
     discardExtensionMetadataEntry,
     sendMessage,

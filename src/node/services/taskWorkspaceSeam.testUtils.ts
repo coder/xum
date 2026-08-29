@@ -1,4 +1,56 @@
-import type { AgentTaskIntegration } from "@/node/services/taskWorkspaceSeam";
+import { Err, Ok } from "@/common/types/result";
+import type { AgentTaskIntegration, WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+
+export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): WorkspaceHost {
+  return {
+    sendMessage: () => Promise.resolve(Ok(undefined)),
+    resumeStream: () => Promise.resolve(Ok({ started: true })),
+    clearQueue: () => Ok(undefined),
+    replaceHistory: () => Promise.resolve(Ok(undefined)),
+    waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
+    waitForPendingCompactionCompletionDecision: () => Promise.resolve(true),
+    waitForPendingStreamErrorRecoveryDecision: () => Promise.resolve(undefined),
+    isBusyForMessage: () => false,
+    hasQueuedMessages: () => false,
+    hasPendingQueuedOrPreparingTurn: () => false,
+    hasPendingAutoRetry: () => false,
+    hasPendingBashMonitorWakeContinuation: () => false,
+    hasPendingWorkspaceTurnContinuation: () => false,
+    hasQueuedWorkspaceTurn: () => false,
+    removeQueuedWorkspaceTurn: () => Ok(true),
+    removeQueuedMessagesByDedupeKeyPrefix: () => Ok(0),
+    getQueueCutCutter: () => undefined,
+    countQueuedAgentPeerMessages: () => 0,
+    archive: () => Promise.resolve(Ok({ kind: "archived" })),
+    archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
+    unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
+    preflightArchive: () => Promise.resolve(Ok({ kind: "ready" })),
+    acquirePreInterruptionArchiveHold: () => Ok({ [Symbol.dispose]: () => undefined }),
+    listLiveWorkspaceActivity: () => ({
+      streaming: false,
+      queuedMessages: false,
+      backgroundBashProcesses: false,
+      terminalSessions: false,
+      desktopSession: false,
+    }),
+    hasRunningBackgroundBashProcesses: () => Promise.resolve(false),
+    hasUntrackableExternalAppOpen: () => Promise.resolve(false),
+    isSnapshotArchiveEligibilityMutationSensitive: () => false,
+    remove: () => Promise.resolve(Ok(undefined)),
+    removeWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
+    create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
+    sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
+    discardExtensionMetadataEntry: () => Promise.resolve(),
+    registerExternalBackgroundInit: () => undefined,
+    getInfo: () => Promise.resolve(null),
+    updateTitle: () => Promise.resolve(Ok(undefined)),
+    emit: () => true,
+    emitChatEvent: () => undefined,
+    isExperimentEnabled: () => false,
+    isWorkflowInvocationCurrent: () => Promise.resolve(true),
+    ...overrides,
+  };
+}
 
 export function makeAgentTaskIntegrationFake(
   overrides: Partial<AgentTaskIntegration> = {}
