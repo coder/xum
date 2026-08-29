@@ -2127,6 +2127,64 @@ describe("WorkspaceStore", () => {
       );
     });
 
+    it("keeps split tool and text rows distinct on fine-grained updates", () => {
+      const workspaceId = "split-streaming-rows";
+      const messageId = "stream-message";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+      }>(store);
+      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
+
+      send({
+        type: "stream-start",
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      send(caughtUpEvent());
+      send({
+        type: "tool-call-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: { command: "ls" },
+        tokens: 1,
+        timestamp: 2,
+      });
+      send({
+        type: "tool-call-end",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-1",
+        toolName: "bash",
+        result: { output: "file.txt" },
+        timestamp: 3,
+      });
+      send({
+        type: "stream-delta",
+        workspaceId,
+        messageId,
+        delta: "summary",
+        tokens: 1,
+        timestamp: 4,
+      });
+
+      const displayed = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .filter((message) => "historyId" in message && message.historyId === messageId);
+      const tool = displayed.find((message) => message.type === "tool")!;
+      const text = displayed.find((message) => message.type === "assistant")!;
+
+      expect(store.getStreamingMessage(workspaceId, tool.id, messageId)?.type).toBe("tool");
+      const liveText = store.getStreamingMessage(workspaceId, text.id, messageId);
+      expect(liveText?.type === "assistant" ? liveText.content : null).toBe("summary");
+    });
+
     it("invalidates streaming-stats cache on stream-error so subscribers don't see stale TPS", async () => {
       const workspaceId = "stream-error-invalidates-stats";
       const streamModel = "anthropic:claude-opus-4-6";

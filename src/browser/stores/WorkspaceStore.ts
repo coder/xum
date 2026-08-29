@@ -843,7 +843,7 @@ export class WorkspaceStore {
   private deltaIdleHandles = new Map<string, number>();
 
   private pendingStreamingMessageBump = new Map<string, string>();
-  private streamingMessageStore = new MapStore<string, DisplayedMessage | null>();
+  private streamingMessageStore = new MapStore<string, void>();
   private advisorLiveStore = new MapStore<string, void>();
   private streamingStatsStore = new MapStore<string, WorkspaceStreamingStats | null>();
 
@@ -1677,15 +1677,13 @@ export class WorkspaceStore {
   getStreamingMessage(
     workspaceId: string,
     displayedId: string,
-    messageId: string
+    _messageId: string
   ): DisplayedMessage | null {
-    return this.streamingMessageStore.get(
-      getStreamingMessageKey(workspaceId, messageId),
-      () =>
-        this.aggregators
-          .get(workspaceId)
-          ?.getDisplayedMessages()
-          .find((message) => message.id === displayedId) ?? null
+    return (
+      this.aggregators
+        .get(workspaceId)
+        ?.getDisplayedMessages()
+        .find((message) => message.id === displayedId) ?? null
     );
   }
 
