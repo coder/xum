@@ -2,19 +2,19 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 
 export const SUBSCRIPTION_RETRY_BASE_MS = 250;
 export const SUBSCRIPTION_RETRY_MAX_MS = 5000;
-export const SUBSCRIPTION_STALL_TIMEOUT_MS = 10_000;
-export const SUBSCRIPTION_STALL_CHECK_INTERVAL_MS = 2_000;
+const SUBSCRIPTION_STALL_TIMEOUT_MS = 10_000;
+const SUBSCRIPTION_STALL_CHECK_INTERVAL_MS = 2_000;
 
 export function calculateSubscriptionBackoffMs(attempt: number): number {
   return Math.min(SUBSCRIPTION_RETRY_BASE_MS * 2 ** attempt, SUBSCRIPTION_RETRY_MAX_MS);
 }
 
-export interface SubscriptionAttemptResult<TEvent, TContext> {
+interface SubscriptionAttemptResult<TEvent, TContext> {
   events: AsyncIterable<TEvent>;
   context: TContext;
 }
 
-export interface SubscriptionRetryImmediately {
+interface SubscriptionRetryImmediately {
   retryImmediately: true;
 }
 
@@ -95,11 +95,7 @@ export async function runSubscriptionLoop<TClient, TEvent, TContext>(
           const elapsedMs = Date.now() - lastEventAt;
           if (elapsedMs < timeoutMs) return;
           console.warn(
-            "[subscriptionTransport] " +
-              options.name +
-              " stalled (no events for " +
-              elapsedMs +
-              "ms); retrying..."
+            `[subscriptionTransport] ${options.name} stalled (no events for ${elapsedMs}ms); retrying...`
           );
           attemptController.abort();
         }, checkIntervalMs);
@@ -120,18 +116,13 @@ export async function runSubscriptionLoop<TClient, TEvent, TContext>(
       }
     } catch (error) {
       if (options.signal.aborted) return;
-      if (isAbortError(error) && attemptController.signal.aborted) {
-        options.onError?.(error, {
-          attemptSignal: attemptController.signal,
-          attemptAborted: true,
-        });
-      } else {
-        const stop = options.onError?.(error, {
-          attemptSignal: attemptController.signal,
-          attemptAborted: attemptController.signal.aborted,
-        });
-        if (stop === true) return;
-      }
+      const stop = options.onError?.(error, {
+        attemptSignal: attemptController.signal,
+        attemptAborted: attemptController.signal.aborted,
+      });
+      // An aborted attempt (watchdog/client change) must retry even if the caller says stop.
+      const expectedAbort = isAbortError(error) && attemptController.signal.aborted;
+      if (stop === true && !expectedAbort) return;
     } finally {
       options.signal.removeEventListener("abort", abortAttempt);
       clientChangeSignal.removeEventListener("abort", abortAttempt);

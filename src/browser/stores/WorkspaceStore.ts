@@ -4925,8 +4925,8 @@ export function useAdvisorToolLiveOutput(
 
   return useSyncExternalStore(
     (listener) => {
-      if (!workspaceId) return () => undefined;
-      return store.subscribeAdvisorLive(workspaceId, toolCallId ?? "", listener);
+      if (!workspaceId || !toolCallId) return () => undefined;
+      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
@@ -4946,8 +4946,8 @@ export function useAdvisorToolLiveReasoning(
 
   return useSyncExternalStore(
     (listener) => {
-      if (!workspaceId) return () => undefined;
-      return store.subscribeAdvisorLive(workspaceId, toolCallId ?? "", listener);
+      if (!workspaceId || !toolCallId) return () => undefined;
+      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
