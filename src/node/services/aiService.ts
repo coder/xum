@@ -1,3 +1,4 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 
@@ -147,7 +148,9 @@ export class AIService extends EventEmitter {
     streamManager?: StreamManager,
     public readonly turnRequestBuilderBindings: TurnRequestBuilderBindings = {},
     providersConfigStore?: ProvidersConfigStore,
-    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
+    private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
+      config.rootDir
+    )
   ) {
     super();
     // Increase max listeners to accommodate multiple concurrent workspace listeners
@@ -457,7 +460,7 @@ export class AIService extends EventEmitter {
 
     try {
       const runStore = new WorkflowRunStore({
-        sessionDir: this.config.getSessionDir(metadata.parentWorkspaceId),
+        sessionDir: path.join(this.config.sessionsDir, metadata.parentWorkspaceId),
       });
       const run = await runStore.getRun(workflowTask.runId);
       return run.agentOutputSchemaRequired !== true;
@@ -485,7 +488,7 @@ export class AIService extends EventEmitter {
    * vars-snapshot writer (independent instances would corrupt seq ordering).
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
-    return sharedDurableEventJournal(this.config.getSessionDir(workspaceId));
+    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
   }
 
   isMockModeEnabled(): boolean {
@@ -959,7 +962,7 @@ export class AIService extends EventEmitter {
 
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {
     try {
-      const workspaceDir = this.config.getSessionDir(workspaceId);
+      const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
       await fs.rm(workspaceDir, { recursive: true, force: true });
       return Ok(undefined);
     } catch (error) {

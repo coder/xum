@@ -492,7 +492,7 @@ export class ServiceContainer {
     // still attribute spend to the workspace's first real project path.
     const ingestWorkspaceAnalytics = (workspaceId: string) => {
       const workspaceLookup = this.config.findWorkspace(workspaceId);
-      const sessionDir = this.config.getSessionDir(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       const analyticsProjectPath =
         workspaceLookup?.attributionProjectPath ?? workspaceLookup?.projectPath;
       this.analyticsService.ingestWorkspace(workspaceId, sessionDir, {
@@ -539,7 +539,7 @@ export class ServiceContainer {
         const parentProjectPath = parentLookup?.attributionProjectPath ?? parentLookup?.projectPath;
         reingestAfterClear = {
           workspaceId: parentWorkspaceId,
-          sessionDir: this.config.getSessionDir(parentWorkspaceId),
+          sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
           meta: {
             projectPath: parentProjectPath,
             projectName: parentProjectPath ? path.basename(parentProjectPath) : undefined,

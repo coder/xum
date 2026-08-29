@@ -1,6 +1,6 @@
+import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
-import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { Config } from "@/node/config";
@@ -67,7 +67,7 @@ describe("ServiceContainer", () => {
 
     expect(ingestWorkspaceSpy).toHaveBeenCalledWith(
       workspaceId,
-      config.getSessionDir(workspaceId),
+      path.join(config.sessionsDir, workspaceId),
       {
         projectPath: primaryProjectPath,
         projectName: path.basename(primaryProjectPath),

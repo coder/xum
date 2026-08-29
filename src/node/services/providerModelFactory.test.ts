@@ -1,3 +1,4 @@
+import { ProvidersConfigStore } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
 import { generateText, jsonSchema, streamText, tool, type Tool } from "ai";
 import { xai } from "@ai-sdk/xai";
@@ -5,7 +6,7 @@ import { writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Config, ProvidersConfigStore } from "@/node/config";
+import { Config } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";

@@ -1,7 +1,7 @@
+import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
-import * as path from "path";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
@@ -2376,7 +2376,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     experimentsService?: ExperimentsService,
     sessionTimingService?: SessionTimingService,
     private readonly streamManager?: StreamManager,
-    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
+    private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
+      config.rootDir
+    )
   ) {
     super();
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
@@ -4138,7 +4140,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     activeRunIds: Set<string>
   ): Promise<Set<string>> {
     try {
-      const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      });
       const runs = await runStore.listRunStatusSnapshots();
       for (const run of runs) {
         if (
@@ -4454,7 +4458,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const nextUpdate = previousUpdate
       .catch(() => undefined)
       .then(async () => {
-        const sessionDir = this.config.getSessionDir(workspaceId);
+        const sessionDir = path.join(this.config.sessionsDir, workspaceId);
         const todos = await readTodosForSessionDir(sessionDir);
         const todoStatus = deriveTodoStatus(todos) ?? null;
 
@@ -4484,7 +4488,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!streaming && (hasTodos === undefined || todoStatus === undefined)) {
         // Stop snapshots need an authoritative todo summary even for background workspaces,
         // and centralizing the read here preserves the fire-and-forget abort/error handlers.
-        const sessionDir = this.config.getSessionDir(workspaceId);
+        const sessionDir = path.join(this.config.sessionsDir, workspaceId);
         const todos = await readTodosForSessionDir(sessionDir);
         hasTodos ??= todos.length > 0;
         // When there are no todos to derive from, leave `todoStatus` undefined
@@ -4907,7 +4911,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private async getPersistedPostCompactionDiffPaths(workspaceId: string): Promise<string[] | null> {
     const postCompactionPath = path.join(
-      this.config.getSessionDir(workspaceId),
+      path.join(this.config.sessionsDir, workspaceId),
       "post-compaction.json"
     );
 
@@ -5031,7 +5035,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Returns empty exclusions if file doesn't exist.
    */
   public async getPostCompactionExclusions(workspaceId: string): Promise<PostCompactionExclusions> {
-    const exclusionsPath = path.join(this.config.getSessionDir(workspaceId), "exclusions.json");
+    const exclusionsPath = path.join(
+      path.join(this.config.sessionsDir, workspaceId),
+      "exclusions.json"
+    );
     try {
       const data = await fsPromises.readFile(exclusionsPath, "utf-8");
       return JSON.parse(data) as PostCompactionExclusions;
@@ -5059,7 +5066,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         set.delete(itemId);
       }
 
-      const sessionDir = this.config.getSessionDir(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       await ensurePrivateDir(sessionDir);
       const exclusionsPath = path.join(sessionDir, "exclusions.json");
       await fsPromises.writeFile(
@@ -6719,7 +6726,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
 
       // Remove session data
-      const sessionDir = this.config.getSessionDir(workspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       // r66: identifies THIS removal attempt in the durable tombstone so the
       // compensating rollback below cannot delete a concurrent backend
       // attempt's marker.
@@ -6727,7 +6734,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       try {
         if (parentWorkspaceId) {
           try {
-            const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+            const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
             await archiveChildSessionArtifactsIntoParentSessionDir({
               parentWorkspaceId,
               parentSessionDir,
@@ -8481,7 +8488,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingExternalEditorRecordings = new Map<string, number>();
 
   private externalEditorMarkerPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "external-editor-opened");
+    return path.join(path.join(this.config.sessionsDir, workspaceId), "external-editor-opened");
   }
 
   /**
@@ -10574,8 +10581,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspacePath: sourceWorkspace?.workspacePath,
       });
 
-      const sourceSessionDir = this.config.getSessionDir(sourceWorkspaceId);
-      const newSessionDir = this.config.getSessionDir(newWorkspaceId);
+      const sourceSessionDir = path.join(this.config.sessionsDir, sourceWorkspaceId);
+      const newSessionDir = path.join(this.config.sessionsDir, newWorkspaceId);
 
       // Removed tail captured inside the try, summarized only after setup
       // survives the rollback window (see the comment at the capture site).
@@ -10851,7 +10858,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           workspaceId: newWorkspaceId,
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
-          sessionDir: this.config.getSessionDir(newWorkspaceId),
+          sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
           abandonedMessages: abandonedBranchMessages,
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
@@ -12846,7 +12853,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // data from the supposedly cleared context through the kernel. Same
       // durable invalidation + partial-failure posture as resetContext.
       try {
-        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+        await sandboxHostService.discardScope(
+          workspaceId,
+          path.join(this.config.sessionsDir, workspaceId)
+        );
       } catch (error) {
         log.error(
           `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
@@ -12957,7 +12967,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         try {
           await sandboxHostService.discardScope(
             workspaceId,
-            this.config.getSessionDir(workspaceId)
+            path.join(this.config.sessionsDir, workspaceId)
           );
         } catch (error) {
           return Err(
@@ -13042,7 +13052,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // snapshotted) — vars must not survive a reset the way they survive
       // archive/un-archive.
       try {
-        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+        await sandboxHostService.discardScope(
+          workspaceId,
+          path.join(this.config.sessionsDir, workspaceId)
+        );
       } catch (error) {
         // The chat-side reset already applied, but the sandbox invalidation
         // is NOT durable: the empty-snapshot tombstone failed to publish, and
@@ -13239,7 +13252,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await sandboxHostService.discardScope(
               workspaceId,
-              this.config.getSessionDir(workspaceId)
+              path.join(this.config.sessionsDir, workspaceId)
             );
           } catch (error) {
             log.error(

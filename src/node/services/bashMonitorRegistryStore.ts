@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { z } from "zod";
 
 import assert from "@/common/utils/assert";
-import type { Config } from "@/node/config";
+import type { WorkspaceSessionLocator } from "@/node/config";
 import type { MonitorArmedPayload } from "@/node/services/backgroundProcessManager";
 import { truncateUtf8Prefix } from "@/node/services/bashMonitorWakeStore";
 import { log } from "@/node/services/log";
@@ -60,14 +60,17 @@ function boundScript(script: string): string {
 export class BashMonitorRegistryStore {
   private readonly locks = new MutexMap<string>();
 
-  constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
+  constructor(private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir">) {}
 
   private dir(ownerWorkspaceId: string): string {
     assert(
       ownerWorkspaceId.trim().length > 0,
       "BashMonitorRegistryStore requires ownerWorkspaceId"
     );
-    return path.join(this.config.getSessionDir(ownerWorkspaceId), BASH_MONITOR_REGISTRY_DIR);
+    return path.join(
+      path.join(this.config.sessionsDir, ownerWorkspaceId),
+      BASH_MONITOR_REGISTRY_DIR
+    );
   }
 
   private file(ownerWorkspaceId: string, processId: string): string {

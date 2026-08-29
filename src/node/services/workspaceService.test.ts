@@ -175,6 +175,9 @@ const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
 };
 
 type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
+type MockWorkspaceConfig = Partial<Config> & {
+  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
+};
 
 function createMockAIService(overrides: Partial<AIService> = {}): AIService {
   return {
@@ -186,7 +189,9 @@ function createMockAIService(overrides: Partial<AIService> = {}): AIService {
 }
 
 function createWorkspaceServiceForTest(options: {
-  config: Partial<Config> | Config;
+  config:
+    | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
+    | Config;
   historyService?: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
@@ -884,7 +889,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       // durably (otherwise the staged-clear grace scan would eventually roll the
       // staging back and resurrect the retired wakes).
       const tombPath = path.join(
-        config.getSessionDir(workspaceId),
+        path.join(config.sessionsDir, workspaceId),
         "bash-monitor-wakes",
         "cleared-at"
       );
@@ -969,7 +974,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       // fires; the retried commitClear's tombstone mutation must not mkdir the
       // session directory back into existence for a removed workspace.
       await config.removeWorkspace(workspaceId);
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fsPromises.rm(sessionDir, { recursive: true, force: true });
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       expect(existsSync(sessionDir)).toBe(false);
@@ -1046,7 +1051,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       // The refused clear touched nothing: no retirement, no staged tombstone.
       expect((await wakeStore.get(workspaceId, "proc-removal-race"))?.status).toBe("pending");
       const tombPath = path.join(
-        config.getSessionDir(workspaceId),
+        path.join(config.sessionsDir, workspaceId),
         "bash-monitor-wakes",
         "cleared-at"
       );
@@ -2301,7 +2306,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       });
       const gen2Start = Date.now() - 1_000;
       const recordFile = path.join(
-        config.getSessionDir(workspaceId),
+        path.join(config.sessionsDir, workspaceId),
         "bash-monitor-wakes",
         "proc-gen.json"
       );
@@ -2383,7 +2388,7 @@ describe("WorkspaceService bash monitor wakes", () => {
         terminal: { status: "exited", exitCode: 1 },
       });
       const recordFile = path.join(
-        config.getSessionDir(workspaceId),
+        path.join(config.sessionsDir, workspaceId),
         "bash-monitor-wakes",
         "proc-nan.json"
       );
@@ -5531,7 +5536,9 @@ describe("WorkspaceService workflow activity", () => {
         historyService,
         extensionMetadata,
       });
-      const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(workspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, workspaceId),
+      });
       const definition = {
         name: "demo",
         description: "Demo workflow",
@@ -5981,13 +5988,14 @@ describe("WorkspaceService activity list scoping", () => {
         path.join(config.rootDir, "config.json"),
         JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]] })
       );
-      const basenameSessionDir = config.getSessionDir("old-ws");
+      const basenameSessionDir = path.join(config.sessionsDir, "old-ws");
       await fsPromises.mkdir(basenameSessionDir, { recursive: true });
       await fsPromises.writeFile(
         path.join(basenameSessionDir, "metadata.json"),
         JSON.stringify({ id: "basename-stable-id", name: "old-ws" })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -6232,7 +6240,7 @@ describe("WorkspaceService activity list scoping", () => {
         })
       );
       const legacyStableId = "legacy-stable-mid-enum";
-      const legacySessionDir = config.getSessionDir("legacy-ws");
+      const legacySessionDir = path.join(config.sessionsDir, "legacy-ws");
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
       await fsPromises.writeFile(
         path.join(legacySessionDir, "metadata.json"),
@@ -7025,7 +7033,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7070,7 +7079,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7229,7 +7239,7 @@ describe("WorkspaceService activity list scoping", () => {
             });
             await extensionMetadata.updateRecency(workspaceId, 888);
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(workspaceId),
+              sessionDir: path.join(config.sessionsDir, workspaceId),
             });
             await runStore.createRun({
               id: "wfr_midlist",
@@ -7294,7 +7304,8 @@ describe("WorkspaceService activity list scoping", () => {
                 projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
               })
             );
-            const legacySessionDir = config.getSessionDir(
+            const legacySessionDir = path.join(
+              config.sessionsDir,
               config.generateLegacyId(projectPath, workspacePath)
             );
             await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7352,7 +7363,7 @@ describe("WorkspaceService activity list scoping", () => {
               runtimeConfig: { type: "local" },
             });
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(workspaceId),
+              sessionDir: path.join(config.sessionsDir, workspaceId),
             });
             await runStore.createRun({
               id: "wfr_workflow_only",
@@ -7522,7 +7533,7 @@ describe("WorkspaceService activity list scoping", () => {
               runtimeConfig: { type: "local" },
             });
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(workspaceId),
+              sessionDir: path.join(config.sessionsDir, workspaceId),
             });
             await runStore.createRun({
               id: "wfr_reread_fail",
@@ -7589,7 +7600,8 @@ describe("WorkspaceService activity list scoping", () => {
                 projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
               })
             );
-            const legacySessionDir = config.getSessionDir(
+            const legacySessionDir = path.join(
+              config.sessionsDir,
               config.generateLegacyId(projectPath, workspacePath)
             );
             await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7598,7 +7610,7 @@ describe("WorkspaceService activity list scoping", () => {
               JSON.stringify({ id: stableId, name: "legacy-ws" })
             );
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(stableId),
+              sessionDir: path.join(config.sessionsDir, stableId),
             });
             await runStore.createRun({
               id: "wfr_legacy_only",
@@ -7662,7 +7674,8 @@ describe("WorkspaceService activity list scoping", () => {
                 projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
               })
             );
-            const legacySessionDir = config.getSessionDir(
+            const legacySessionDir = path.join(
+              config.sessionsDir,
               config.generateLegacyId(projectPath, workspacePath)
             );
             await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7911,7 +7924,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7980,7 +7994,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -8366,7 +8381,8 @@ describe("WorkspaceService activity list scoping", () => {
         })
       );
       // Corrupt the metadata.json holding that entry's stable id.
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -8409,7 +8425,8 @@ describe("WorkspaceService activity list scoping", () => {
             projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
           })
         );
-        const legacySessionDir = config.getSessionDir(
+        const legacySessionDir = path.join(
+          config.sessionsDir,
           config.generateLegacyId(projectPath, workspacePath)
         );
         await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -8477,10 +8494,10 @@ describe("WorkspaceService activity list scoping", () => {
         ...mockExtensionMetadataService,
         deleteWorkspace,
       } as unknown as ExtensionMetadataService;
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
+        sessionsDir: sessionRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -9913,7 +9930,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         workspaceId,
         createMuxMessage("pre-reset-user", "user", "before reset", {})
       );
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fsPromises.mkdir(sessionDir, { recursive: true });
       const pendingStatePath = path.join(sessionDir, "post-compaction.json");
       await fsPromises.writeFile(
@@ -9964,7 +9981,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       // Deterministic unlink failure: a DIRECTORY at the pending-state path
       // fails unlink with EISDIR (read errors are swallowed at load, so this
       // models exactly the stale-undeletable-file case).
-      const pendingStatePath = path.join(config.getSessionDir(workspaceId), "post-compaction.json");
+      const pendingStatePath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "post-compaction.json"
+      );
       await fsPromises.mkdir(pendingStatePath, { recursive: true });
 
       const result = await workspaceService.resetContext(workspaceId);
@@ -11542,9 +11562,9 @@ describe("WorkspaceService rename lock", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -11650,9 +11670,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => ({
         workspacePath: "/tmp/test/workspace",
@@ -12754,9 +12774,9 @@ describe("WorkspaceService idle compaction dispatch", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -13288,9 +13308,9 @@ describe("WorkspaceService streaming generation guard", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock((workspaceId: string) => `/tmp/test/sessions/${workspaceId}`),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -13607,9 +13627,9 @@ describe("WorkspaceService executeBash archive guards", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -13758,7 +13778,7 @@ describe("WorkspaceService executeBash archive guards", () => {
     const service = createWorkspaceServiceForTest({
       config: {
         srcDir: "/tmp/test",
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
         getAllWorkspaceMetadata: mock(() => metadataGate),
       } as unknown as Config,
@@ -13795,7 +13815,6 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
   let waitForInitMock: ReturnType<typeof mock>;
   let getWorkspaceMetadataMock: ReturnType<typeof mock>;
   let findWorkspaceMock: ReturnType<typeof mock>;
-  let getEffectiveSecretsMock: ReturnType<typeof mock>;
   let createRuntimeSpy: Mock<typeof runtimeFactory.createRuntime>;
   let createBashToolSpy: Mock<typeof bashToolModule.createBashTool>;
   let historyService: HistoryService;
@@ -13808,7 +13827,6 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
       projectPath: "/tmp/proj",
       workspaceName: "ws",
     }));
-    getEffectiveSecretsMock = mock(() => []);
     getWorkspaceMetadataMock = mock(() =>
       Promise.resolve(
         Ok({
@@ -13835,9 +13853,9 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: findWorkspaceMock,
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -13852,7 +13870,7 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
       historyService,
       aiService,
       initStateManager: mockInitStateManager as InitStateManager,
-      secretsStore: { getEffectiveSecrets: getEffectiveSecretsMock } as unknown as SecretsStore,
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
 
     createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
@@ -13969,9 +13987,9 @@ describe("WorkspaceService getFileCompletions", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -14254,9 +14272,9 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       },
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -14506,9 +14524,9 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -14643,9 +14661,9 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
 
     const workspacePath = "/tmp/proj/ws";
     const projectPath = "/tmp/proj";
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((workspaceId: string) =>
         workspaceId === "ws" ? { projectPath, workspacePath } : null
@@ -14880,7 +14898,7 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
     return new WorkspaceService(
       {
         srcDir: "/tmp/test",
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         generateStableId: mock(() => "test-id"),
         findWorkspace: mock(() => null),
       } as unknown as Config,
@@ -15374,10 +15392,10 @@ describe("WorkspaceService remove timing rollup", () => {
       }
 
       const aiService = new FakeAIService() as unknown as AIService;
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
+        sessionsDir: sessionRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -15427,7 +15445,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       // <rootDir>/locks, which must not leak across tests or runs.
       rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
-      getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
+      sessionsDir: path.join(tmpdir(), "mux-shared-guard"),
       removeWorkspace: mock(() => Promise.resolve()),
       findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
       loadConfigOrDefault: mock(() => ({
@@ -15519,7 +15537,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     return {
       rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
-      getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
+      sessionsDir: path.join(tmpdir(), "mux-shared-guard"),
       removeWorkspace: mock(() => Promise.resolve()),
       findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
       loadConfigOrDefault: mock(() => ({
@@ -15663,12 +15681,12 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
       // r63: removal serializes session-dir deletion with the memory target
       // locks and removal tombstones under `<rootDir>/locks`.
       rootDir: tempRoot,
-      getSessionDir: mock((id: string) => path.join(tempRoot, "sessions", id)),
+      sessionsDir: path.join(tempRoot, "sessions"),
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -15791,9 +15809,9 @@ describe("WorkspaceService metadata listeners", () => {
     }
 
     const aiService = new FakeAIService() as unknown as AIService;
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -15851,9 +15869,9 @@ describe("WorkspaceService metadata listeners", () => {
     }
 
     const aiService = new FakeAIService() as unknown as AIService;
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -15936,9 +15954,9 @@ describe("WorkspaceService setPinned", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock((id: string) => {
         const entry = getEntry(id);
         if (!entry) return null;
@@ -16140,9 +16158,9 @@ describe("WorkspaceService reorderPinned", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock((id: string) => {
         const entry = getEntry(id);
         if (!entry) return null;
@@ -16329,9 +16347,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -17205,9 +17223,9 @@ describe("WorkspaceService archive init cancellation", () => {
       runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -17328,9 +17346,9 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
       return Promise.resolve();
     });
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -17468,9 +17486,9 @@ describe("WorkspaceService archive snapshots", () => {
       return Promise.resolve();
     });
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -17658,9 +17676,9 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
       worktreeArchiveBehavior: "snapshot",
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) return null;
@@ -17941,9 +17959,9 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       ]),
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -18105,9 +18123,9 @@ describe("WorkspaceService deleteWorktree", () => {
       };
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: tempSrcBaseDir,
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       getAllWorkspaceMetadata: mock(async () => [await getCurrentMetadata()]),
     };
@@ -18317,9 +18335,9 @@ describe("WorkspaceService archiveMergedInProject", () => {
     executeBashMock: ReturnType<typeof mock>;
     archiveMock: ReturnType<typeof mock>;
   } {
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
       getAllWorkspaceMetadata: mock(() => Promise.resolve(allMetadata)),
@@ -18729,10 +18747,10 @@ describe("WorkspaceService init cancellation", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: generateStableIdMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
@@ -18775,10 +18793,10 @@ describe("WorkspaceService init cancellation", () => {
   test("create() rejects slash branches whose sanitized workspace name already exists", async () => {
     const projectPath = "/tmp/proj";
     const generateStableIdMock = mock(() => "ws-conflict");
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: generateStableIdMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
@@ -18826,12 +18844,12 @@ describe("WorkspaceService init cancellation", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
       editConfig: editConfigMock,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -18883,12 +18901,12 @@ describe("WorkspaceService init cancellation", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
       editConfig: editConfigMock,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -18946,10 +18964,10 @@ describe("WorkspaceService init cancellation", () => {
       runtimeConfig: { type: "local" },
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -19022,7 +19040,7 @@ describe("WorkspaceService init cancellation", () => {
       runtimeConfig: { type: "local" },
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
       generateStableId: mock(() => workspaceId),
@@ -19031,7 +19049,7 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
         projects: new Map([
@@ -19093,7 +19111,9 @@ describe("WorkspaceService init cancellation", () => {
         undefined,
         undefined,
         undefined,
-        { getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]) } as unknown as SecretsStore
+        {
+          getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
+        } as unknown as SecretsStore
       );
 
       const metadataEvents: Array<FrontendWorkspaceMetadata | null> = [];
@@ -19177,7 +19197,7 @@ describe("WorkspaceService init cancellation", () => {
       pendingAutoTitle: true,
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
       generateStableId: mock(() => workspaceId),
@@ -19186,7 +19206,7 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       // Two pre-existing workspaces — auto-naming should skip past them.
       loadConfigOrDefault: mock(() => ({
@@ -19303,10 +19323,10 @@ describe("WorkspaceService init cancellation", () => {
         off: mock(() => {}),
       } as unknown as AIService;
 
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
       };
@@ -19380,9 +19400,9 @@ describe("WorkspaceService init cancellation", () => {
         off: mock(() => {}),
       } as unknown as AIService;
 
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        sessionsDir: tempRoot,
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
       };
@@ -19449,10 +19469,10 @@ describe("WorkspaceService init cancellation", () => {
         off: mock(() => {}),
       } as unknown as AIService;
 
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -19497,9 +19517,9 @@ describe("WorkspaceService regenerateTitle", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
     };
@@ -19717,11 +19737,11 @@ describe("WorkspaceService fork", () => {
       enterHookPhase: mock(() => undefined),
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
       generateStableId: mock(() => newWorkspaceId),
       findWorkspace: mock(() => null),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       loadConfigOrDefault: mock(() => ({
         projects: new Map([[sourceProjectPath, { workspaces: [], trusted: true }]]),
       })),
@@ -20483,9 +20503,9 @@ describe("WorkspaceService interruptStream", () => {
   test("sendQueuedImmediately clears hard-interrupt suppression before queued resend", async () => {
     const workspaceId = "ws-interrupt-queue-111";
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -20644,11 +20664,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       off: mock(() => undefined),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -20785,10 +20805,10 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         on: mock(() => undefined as unknown as InitStateManager),
         getInitState: mock(() => undefined),
       };
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         srcDir: "/tmp/test",
         getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         generateStableId: mock(() => "test-id"),
       };
       const { historyService } = await createTestHistoryService();
@@ -21016,10 +21036,10 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         on: mock(() => undefined as unknown as InitStateManager),
         getInitState: mock(() => undefined),
       };
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         srcDir: "/tmp/test",
         getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         generateStableId: mock(() => "test-id"),
         ...configOverrides,
       };
@@ -22085,7 +22105,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
         // session's chat.jsonl was not recreated by a late guarded append.
         expect(await awaitPendingBranchSummary(newWorkspaceId)).toBeNull();
         expect(guardedAppendSpy).not.toHaveBeenCalled();
-        const chatFile = path.join(config.getSessionDir(newWorkspaceId), "chat.jsonl");
+        const chatFile = path.join(path.join(config.sessionsDir, newWorkspaceId), "chat.jsonl");
         const chatExists = await fsPromises.access(chatFile).then(
           () => true,
           () => false

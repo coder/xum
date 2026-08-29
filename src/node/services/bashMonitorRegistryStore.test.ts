@@ -78,7 +78,7 @@ describe("BashMonitorRegistryStore", () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);
     await store.upsert(armedPayload());
-    const dir = path.join(config.getSessionDir("owner-1"), BASH_MONITOR_REGISTRY_DIR);
+    const dir = path.join(path.join(config.sessionsDir, "owner-1"), BASH_MONITOR_REGISTRY_DIR);
     await fsPromises.writeFile(path.join(dir, "bad.json"), "not json", "utf-8");
     await fsPromises.writeFile(
       path.join(dir, "wrong-shape.json"),
@@ -97,7 +97,7 @@ describe("BashMonitorRegistryStore", () => {
     await store.upsert(armedPayload({ workspaceId: "owner-a" }));
     await store.remove("owner-b", "proc-1");
     // Session dir without a registry dir must be skipped, not crash the walk.
-    await fsPromises.mkdir(config.getSessionDir("owner-empty"), { recursive: true });
+    await fsPromises.mkdir(path.join(config.sessionsDir, "owner-empty"), { recursive: true });
 
     expect(await store.listOwnerWorkspaceIds()).toEqual({
       ownerWorkspaceIds: ["owner-a"],
@@ -110,7 +110,7 @@ describe("BashMonitorRegistryStore", () => {
     const store = new BashMonitorRegistryStore(config);
     await store.upsert(armedPayload({ workspaceId: "owner-good" }));
     // A plain file where the registry directory should be makes listAll reject with ENOTDIR.
-    const badSession = config.getSessionDir("owner-bad");
+    const badSession = path.join(config.sessionsDir, "owner-bad");
     await fsPromises.mkdir(badSession, { recursive: true });
     await fsPromises.writeFile(path.join(badSession, BASH_MONITOR_REGISTRY_DIR), "not a dir");
 

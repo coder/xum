@@ -1,8 +1,9 @@
+import { ProvidersConfigStore } from "@/node/config";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
 import type { BrowserWindow, WebContents } from "electron";
-import { Config, ProvidersConfigStore } from "../../src/node/config";
+import { Config } from "../../src/node/config";
 import { ServiceContainer } from "../../src/node/services/serviceContainer";
 import { setOpenSSHHostKeyPolicyMode } from "../../src/node/runtime/sshConnectionPool";
 import {

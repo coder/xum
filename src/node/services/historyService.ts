@@ -1,6 +1,6 @@
+import * as path from "path";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
-import * as path from "path";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -11,7 +11,7 @@ import {
   type MuxMessage,
   type MuxMetadata,
 } from "@/common/types/message";
-import type { Config } from "@/node/config";
+import type { WorkspaceSessionLocator } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { TaskService } from "@/node/services/taskService";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
@@ -216,9 +216,9 @@ export class HistoryService {
   // Shared file operation lock across all workspace file services
   // This prevents deadlocks when operations compose while touching the same workspace files.
   private readonly fileLocks = workspaceFileLocks;
-  private readonly config: Pick<Config, "getSessionDir" | "rootDir">;
+  private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir" | "rootDir">;
 
-  constructor(config: Pick<Config, "getSessionDir" | "rootDir">) {
+  constructor(config: Pick<WorkspaceSessionLocator, "sessionsDir" | "rootDir">) {
     this.config = config;
   }
 
@@ -237,7 +237,7 @@ export class HistoryService {
       entry: SubagentTranscriptArtifactIndexEntry;
     } | null> => {
       const artifacts = await readSubagentTranscriptArtifactsFile(
-        this.config.getSessionDir(workspaceId)
+        path.join(this.config.sessionsDir, workspaceId)
       );
       const entry = artifacts.artifactsByChildTaskId[taskId] ?? null;
       return entry ? { workspaceId, entry } : null;
@@ -286,7 +286,7 @@ export class HistoryService {
     // Pending artifacts still have a live task session, so read it directly while it exists.
     if (!resolved) {
       if (requestingWorkspaceId && isDescendant) {
-        const taskSessionDir = this.config.getSessionDir(taskId);
+        const taskSessionDir = path.join(this.config.sessionsDir, taskId);
         const messages = await this.readTranscriptFromPaths({
           workspaceId: taskId,
           chatPath: path.join(taskSessionDir, CHAT_FILE_NAME),
@@ -432,7 +432,7 @@ export class HistoryService {
     partialPath?: string;
     logLabel: string;
   }): Promise<MuxMessage[]> {
-    const workspaceSessionDir = this.config.getSessionDir(params.workspaceId);
+    const workspaceSessionDir = path.join(this.config.sessionsDir, params.workspaceId);
     // Refuse path traversal from a corrupted transcript index.
     if (params.chatPath && !isPathInsideDir(workspaceSessionDir, params.chatPath)) {
       throw new Error("Refusing to read transcript outside workspace session dir");
@@ -485,11 +485,11 @@ export class HistoryService {
   }
 
   private getChatHistoryPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.CHAT_FILE);
+    return path.join(path.join(this.config.sessionsDir, workspaceId), this.CHAT_FILE);
   }
 
   private getChatArchivePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.CHAT_ARCHIVE_FILE);
+    return path.join(path.join(this.config.sessionsDir, workspaceId), this.CHAT_ARCHIVE_FILE);
   }
 
   private getTruncateTransactionPath(workspaceId: string): string {
@@ -754,7 +754,7 @@ export class HistoryService {
   }
 
   private getPartialPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.PARTIAL_FILE);
+    return path.join(path.join(this.config.sessionsDir, workspaceId), this.PARTIAL_FILE);
   }
 
   // ── Reverse-read infrastructure ─────────────────────────────────────────────
@@ -1301,7 +1301,7 @@ export class HistoryService {
     }
 
     try {
-      await ensurePrivateDir(this.config.getSessionDir(targetWorkspaceId));
+      await ensurePrivateDir(path.join(this.config.sessionsDir, targetWorkspaceId));
       for (const [targetPath, contents] of [
         [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
         [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
@@ -1874,7 +1874,7 @@ export class HistoryService {
           if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
             return Err(`workspace ${workspaceId} was removed; refusing partial write`);
           }
-          const workspaceDir = this.config.getSessionDir(workspaceId);
+          const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
           await ensurePrivateDir(workspaceDir);
           const partialPath = this.getPartialPath(workspaceId);
 
@@ -2083,7 +2083,7 @@ export class HistoryService {
     message: MuxMessage
   ): Promise<Result<void>> {
     try {
-      const workspaceDir = this.config.getSessionDir(workspaceId);
+      const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
       await ensurePrivateDir(workspaceDir);
       const historyPath = this.getChatHistoryPath(workspaceId);
 
@@ -2210,7 +2210,7 @@ export class HistoryService {
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
-    const sessionDir = this.config.getSessionDir(workspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     // Lock BEFORE any directory creation (r63): the lockfile lives outside
     // the session dir, and removal holds this same lock while it tombstones
     // and deletes — so a mutation serializes with removal instead of racing
@@ -2329,7 +2329,7 @@ export class HistoryService {
       async () => {
         try {
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-          const workspaceDir = this.config.getSessionDir(workspaceId);
+          const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
           await ensurePrivateDir(workspaceDir);
           const historyPath = this.getChatHistoryPath(workspaceId);
           for (const message of messages) {
@@ -2541,7 +2541,7 @@ export class HistoryService {
           // duplicate a foreign backend's sequences and let a later
           // updateHistory() replace an unrelated row.
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
-          await ensurePrivateDir(this.config.getSessionDir(workspaceId));
+          await ensurePrivateDir(path.join(this.config.sessionsDir, workspaceId));
           const historyPath = this.getChatHistoryPath(workspaceId);
           const messages = await this.readChatHistory(workspaceId);
 

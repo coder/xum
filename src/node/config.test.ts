@@ -1,7 +1,7 @@
+import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
-import * as path from "path";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -995,7 +995,7 @@ describe("Config", () => {
           generateLegacyId(projectPath: string, workspacePath: string): string;
         }
       ).generateLegacyId(projectPath, workspacePath);
-      const canonicalDir = config.getSessionDir(canonicalId);
+      const canonicalDir = path.join(config.sessionsDir, canonicalId);
       fs.mkdirSync(canonicalDir, { recursive: true });
       fs.writeFileSync(
         path.join(canonicalDir, "metadata.json"),
@@ -1003,7 +1003,7 @@ describe("Config", () => {
       );
       // Basename-backed second candidate is unreadable: a directory at the
       // metadata.json path fails reads with EISDIR (non-ENOENT).
-      fs.mkdirSync(path.join(config.getSessionDir("legacy-ws"), "metadata.json"), {
+      fs.mkdirSync(path.join(path.join(config.sessionsDir, "legacy-ws"), "metadata.json"), {
         recursive: true,
       });
 
@@ -2551,7 +2551,10 @@ describe("Config", () => {
         })
       );
 
-      const usagePath = path.join(config.getSessionDir("workspace-1"), "session-usage.json");
+      const usagePath = path.join(
+        path.join(config.sessionsDir, "workspace-1"),
+        "session-usage.json"
+      );
       fs.mkdirSync(path.dirname(usagePath), { recursive: true });
       fs.writeFileSync(usagePath, JSON.stringify({ totalCost: 1.23 }));
 
@@ -3372,7 +3375,7 @@ describe("Config", () => {
       // Test backward compatibility: Create metadata file using legacy ID format.
       // This simulates workspaces created before stable IDs were introduced.
       const legacyId = config.generateLegacyId(projectPath, workspacePath);
-      const sessionDir = config.getSessionDir(legacyId);
+      const sessionDir = path.join(config.sessionsDir, legacyId);
       fs.mkdirSync(sessionDir, { recursive: true });
       const metadataPath = path.join(sessionDir, "metadata.json");
       const existingMetadata = {
@@ -3424,7 +3427,7 @@ describe("Config", () => {
       const workspacePath = path.join(config.srcDir, "project", workspaceName);
       fs.mkdirSync(workspacePath, { recursive: true });
 
-      const sessionDir = config.getSessionDir(workspaceName);
+      const sessionDir = path.join(config.sessionsDir, workspaceName);
       fs.mkdirSync(sessionDir, { recursive: true });
       fs.writeFileSync(
         path.join(sessionDir, "metadata.json"),
@@ -3462,14 +3465,14 @@ describe("Config", () => {
       const workspacePath = path.join(config.srcDir, "project", workspaceName);
       fs.mkdirSync(workspacePath, { recursive: true });
 
-      const basenameSessionDir = config.getSessionDir(workspaceName);
+      const basenameSessionDir = path.join(config.sessionsDir, workspaceName);
       fs.mkdirSync(basenameSessionDir, { recursive: true });
       fs.writeFileSync(
         path.join(basenameSessionDir, "metadata.json"),
         JSON.stringify({ id: "stale-basename-id", name: workspaceName })
       );
       const legacyId = config.generateLegacyId(projectPath, workspacePath);
-      const legacySessionDir = config.getSessionDir(legacyId);
+      const legacySessionDir = path.join(config.sessionsDir, legacyId);
       fs.mkdirSync(legacySessionDir, { recursive: true });
       fs.writeFileSync(
         path.join(legacySessionDir, "metadata.json"),

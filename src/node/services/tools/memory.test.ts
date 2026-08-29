@@ -416,7 +416,7 @@ describe("memory tool refinement journal", () => {
     expect(result.success).toBe(true);
 
     // Same session-dir resolution the service uses (Config path derivation is pure).
-    const sessionDir = new Config(fixture.xumHome).getSessionDir("ws-tool");
+    const sessionDir = path.join(new Config(fixture.xumHome).sessionsDir, "ws-tool");
     const events = await readRefinementEvents(sessionDir);
     expect(events).toHaveLength(1);
     const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);

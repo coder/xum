@@ -21,14 +21,14 @@ export function resolveReplaySessionDir(workspaceId: string): {
     return {
       sessionDir: REPLAY_FIXTURE_DIR,
       historyService: new HistoryService({
-        getSessionDir: () => REPLAY_FIXTURE_DIR,
+        sessionsDir: REPLAY_FIXTURE_DIR,
         // Read-only verification: rootDir only locates write locks/tombstones.
         rootDir: path.dirname(REPLAY_FIXTURE_DIR),
       }),
     };
   }
   return {
-    sessionDir: defaultConfig.getSessionDir(workspaceId),
+    sessionDir: path.join(defaultConfig.sessionsDir, workspaceId),
     historyService: new HistoryService(defaultConfig),
   };
 }

@@ -1,6 +1,6 @@
+import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
-import * as path from "path";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -926,7 +926,7 @@ export class AgentSession {
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
       historyService: this.historyService,
-      sessionDir: this.config.getSessionDir(this.workspaceId),
+      sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       telemetryService,
       emitter: this.emitter,
       onCompactionComplete: (metadata) => {
@@ -1348,7 +1348,10 @@ export class AgentSession {
   }
 
   private getAutoRetryPreferencePath(): string {
-    return path.join(this.config.getSessionDir(this.workspaceId), AUTO_RETRY_PREFERENCE_FILE);
+    return path.join(
+      path.join(this.config.sessionsDir, this.workspaceId),
+      AUTO_RETRY_PREFERENCE_FILE
+    );
   }
 
   setLegacyAutoRetryEnabledHint(enabled: boolean): void {
@@ -3342,7 +3345,7 @@ export class AgentSession {
       this.workspaceId,
       // Session dir enables the cross-process pending-marker wait (r48): a
       // fork registered in another backend has no entry in this process.
-      this.config.getSessionDir(this.workspaceId)
+      path.join(this.config.sessionsDir, this.workspaceId)
     );
     // Workspace removal disposes the session and cancels the summary writer
     // while this send is parked on the await above; every append between here
@@ -7656,7 +7659,7 @@ export class AgentSession {
     // Host-side disk read (session dir), independent of workspace metadata/runtime.
     const completedReportsAttachment = await AttachmentService.generateCompletedReportsAttachment({
       workspaceId: this.workspaceId,
-      sessionDir: this.config.getSessionDir(this.workspaceId),
+      sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       completedBeforeMs: context.reportsCompletedBeforeMs,
     });
 
@@ -8104,7 +8107,7 @@ export class AgentSession {
    */
   private async loadExcludedItems(): Promise<Set<string>> {
     const exclusionsPath = path.join(
-      this.config.getSessionDir(this.workspaceId),
+      path.join(this.config.sessionsDir, this.workspaceId),
       "exclusions.json"
     );
     try {
@@ -8144,7 +8147,7 @@ export class AgentSession {
       return null;
     }
 
-    const todoPath = path.join(this.config.getSessionDir(this.workspaceId), "todos.json");
+    const todoPath = path.join(path.join(this.config.sessionsDir, this.workspaceId), "todos.json");
 
     try {
       const data = await readFile(todoPath, "utf-8");

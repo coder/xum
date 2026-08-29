@@ -1,3 +1,4 @@
+import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -465,7 +466,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
 interface TurnRequestBuilderDependencies {
   config: Config;
   providersConfigStore: ProvidersConfigStore;
-  secretsStore: SecretsStore;
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">;
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
@@ -1340,7 +1341,7 @@ export class TurnRequestBuilder {
     try {
       await agentPluginHookService.ensureWorkspaceHooks({
         workspaceId,
-        sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+        sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
         journal: this.dependencies.durableEventJournalFor(workspaceId),
         enabled: this.dependencies.isAgentPluginsEnabled(),
         xumHome: this.dependencies.config.rootDir,
@@ -1693,7 +1694,7 @@ export class TurnRequestBuilder {
       dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             runStore: new WorkflowRunStore({
-              sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+              sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             }),
             onRunStatusChanged: async (event) => {
               if (!isTerminalWorkflowRunStatus(event.status)) {
@@ -1717,7 +1718,7 @@ export class TurnRequestBuilder {
                   cwd: workspacePath,
                   runtime,
                   runtimeTempDir,
-                  workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
+                  workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
@@ -2007,7 +2008,7 @@ export class TurnRequestBuilder {
       },
       workspaceProjectPath: metadata.projectPath,
       workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
-      workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
+      workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,
@@ -2228,7 +2229,7 @@ export class TurnRequestBuilder {
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
-            sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+            sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
         });

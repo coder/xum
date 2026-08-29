@@ -106,7 +106,7 @@ export function createReplayFixtureSessionContext(
     sessionDir,
     workspaceId,
     historyService: new HistoryService({
-      getSessionDir: () => sessionDir,
+      sessionsDir: sessionDir,
       // Fixture writes take the history write lock under `<rootDir>/locks`;
       // lockfiles are transient (removed on release).
       rootDir: path.dirname(sessionDir),

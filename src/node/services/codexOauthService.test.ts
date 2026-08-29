@@ -1,8 +1,9 @@
+import { ProvidersConfigStore } from "@/node/config";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
 import type { Result } from "@/common/types/result";
 import { Ok } from "@/common/types/result";
-import type { ProvidersConfig, ProvidersConfigStore } from "@/node/config";
+import type { ProvidersConfig } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import type { CodexOauthAuth } from "@/node/utils/codexOauthAuth";

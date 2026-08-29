@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import {
@@ -1066,7 +1066,7 @@ export class WorkspaceGoalService {
   // doesn't re-assert and re-join the same way.
   private resolveSessionFilePath(workspaceId: string, fileName: string): string {
     assert(workspaceId.trim().length > 0, "WorkspaceGoalService requires non-empty workspaceId");
-    return path.join(this.config.getSessionDir(workspaceId), fileName);
+    return path.join(path.join(this.config.sessionsDir, workspaceId), fileName);
   }
 
   private getFilePath(workspaceId: string): string {

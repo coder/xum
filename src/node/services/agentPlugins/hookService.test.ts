@@ -633,7 +633,7 @@ describe("replay determinism with hooks active", () => {
 
     // ...and byte-level replay verification passes with the hook active.
     const historyService = new HistoryService({
-      getSessionDir: () => harness.sessionDir,
+      sessionsDir: harness.sessionDir,
       rootDir: path.dirname(harness.sessionDir),
     });
     const history = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);

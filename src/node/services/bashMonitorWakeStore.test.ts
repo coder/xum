@@ -3970,7 +3970,7 @@ describe("BashMonitorWakeStore", () => {
     const store = new BashMonitorWakeStore(config);
     await store.enqueueOrMergePending(payload());
     await fsPromises.writeFile(
-      path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes", "bad.json"),
+      path.join(path.join(config.sessionsDir, "owner-1"), "bash-monitor-wakes", "bad.json"),
       "not json",
       "utf-8"
     );
@@ -3982,7 +3982,7 @@ describe("BashMonitorWakeStore", () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);
     // Write a pre-kind record shape directly (what older builds persisted).
-    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    const dir = path.join(path.join(config.sessionsDir, "owner-1"), "bash-monitor-wakes");
     await fsPromises.mkdir(dir, { recursive: true });
     await fsPromises.writeFile(
       path.join(dir, "proc-legacy.json"),
@@ -4011,7 +4011,7 @@ describe("BashMonitorWakeStore", () => {
   test("legacy monitor-lost records without lostReason default to restart", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);
-    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    const dir = path.join(path.join(config.sessionsDir, "owner-1"), "bash-monitor-wakes");
     await fsPromises.mkdir(dir, { recursive: true });
     await fsPromises.writeFile(
       path.join(dir, "proc-legacy-lost.json"),
@@ -4042,7 +4042,7 @@ describe("BashMonitorWakeStore", () => {
   test("malformed lostReason values degrade to restart instead of dropping the record", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);
-    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    const dir = path.join(path.join(config.sessionsDir, "owner-1"), "bash-monitor-wakes");
     await fsPromises.mkdir(dir, { recursive: true });
     await fsPromises.writeFile(
       path.join(dir, "proc-future-lost.json"),
@@ -4075,7 +4075,7 @@ describe("BashMonitorWakeStore", () => {
   test("malformed failureMessage and partially unknown failedOperations degrade without dropping the record", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);
-    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    const dir = path.join(path.join(config.sessionsDir, "owner-1"), "bash-monitor-wakes");
     await fsPromises.mkdir(dir, { recursive: true });
     await fsPromises.writeFile(
       path.join(dir, "proc-newer-lost.json"),
@@ -4841,7 +4841,7 @@ describe("BashMonitorWakeStore", () => {
       payload({ lines: ["[monitor] process settled: exited (code 1)"] })
     );
     const file = path.join(
-      config.getSessionDir("owner-1"),
+      path.join(config.sessionsDir, "owner-1"),
       "bash-monitor-wakes",
       `${encodeURIComponent(record.processId)}.json`
     );
@@ -4867,7 +4867,7 @@ describe("BashMonitorWakeStore", () => {
       payload({ lines: ["[monitor] process settled: exited (code 1)"] })
     );
     const file = path.join(
-      config.getSessionDir("owner-1"),
+      path.join(config.sessionsDir, "owner-1"),
       "bash-monitor-wakes",
       `${encodeURIComponent(record.processId)}.json`
     );
@@ -4892,7 +4892,7 @@ describe("BashMonitorWakeStore", () => {
       })
     );
     const file = path.join(
-      config.getSessionDir("owner-1"),
+      path.join(config.sessionsDir, "owner-1"),
       "bash-monitor-wakes",
       `${encodeURIComponent(record.processId)}.json`
     );

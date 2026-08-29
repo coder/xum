@@ -13,9 +13,10 @@ import * as fs from "fs/promises";
 const NATIVE_TERMINAL_SESSIONS_DIR = `/tmp/xum-test-native-terminal-sessions-${process.pid}-${Date.now()}`;
 
 const getEffectiveSecretsMock = mock(() => [{ key: "TEST_SECRET", value: "secret-value" }]);
-const mockSecretsStore = {
-  getEffectiveSecrets: getEffectiveSecretsMock,
-} as unknown as SecretsStore;
+const mockSecretsStore = { getEffectiveSecrets: getEffectiveSecretsMock } as Pick<
+  SecretsStore,
+  "getEffectiveSecrets"
+>;
 
 // Mock dependencies
 const mockConfig = {

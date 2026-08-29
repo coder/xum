@@ -366,7 +366,7 @@ export class GitPatchArtifactService {
       await this.waitForGeneration(childWorkspaceId);
     }
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
 
     // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
     // while we're still reading commits from it.
@@ -546,7 +546,7 @@ export class GitPatchArtifactService {
     assert(parentWorkspaceId.length > 0, "generate: parentWorkspaceId must be non-empty");
     assert(childWorkspaceId.length > 0, "generate: childWorkspaceId must be non-empty");
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
 
     const updateArtifact = async (
       updater: Parameters<typeof upsertSubagentGitPatchArtifact>[0]["updater"]

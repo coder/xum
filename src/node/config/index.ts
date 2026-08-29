@@ -1,5 +1,5 @@
-import * as fs from "fs";
 import * as path from "path";
+import * as fs from "fs";
 import * as crypto from "crypto";
 import { EventEmitter } from "events";
 import writeFileAtomic from "write-file-atomic";
@@ -1652,7 +1652,7 @@ export class Config {
                 }
 
                 const usagePath = path.join(
-                  this.sessionLocator.getSessionDir(sessionEntry.name),
+                  path.join(this.sessionLocator.sessionsDir, sessionEntry.name),
                   "session-usage.json"
                 );
                 if (fs.existsSync(usagePath)) {
@@ -2672,7 +2672,10 @@ export class Config {
             workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
 
           // Try loading metadata with basename as ID (works for old workspaces)
-          const metadataPath = path.join(this.sessionLocator.getSessionDir(workspaceBasename), "metadata.json");
+          const metadataPath = path.join(
+            path.join(this.sessionLocator.sessionsDir, workspaceBasename),
+            "metadata.json"
+          );
           try {
             const data = fs.readFileSync(metadataPath, "utf-8");
             const metadata = JSON.parse(data) as WorkspaceMetadata;
@@ -2721,7 +2724,10 @@ export class Config {
           // only in that file would be reported absent while its workspace
           // remains registered.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
-          const legacyMetadataPath = path.join(this.sessionLocator.getSessionDir(legacyId), "metadata.json");
+          const legacyMetadataPath = path.join(
+            path.join(this.sessionLocator.sessionsDir, legacyId),
+            "metadata.json"
+          );
           try {
             const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
             const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
@@ -3024,7 +3030,10 @@ export class Config {
           const candidateIds =
             workspaceBasename === legacyId ? [legacyId] : [legacyId, workspaceBasename];
           for (const candidateId of candidateIds) {
-            const candidatePath = path.join(this.sessionLocator.getSessionDir(candidateId), "metadata.json");
+            const candidatePath = path.join(
+              path.join(this.sessionLocator.sessionsDir, candidateId),
+              "metadata.json"
+            );
             let candidateRaw: string | undefined;
             try {
               candidateRaw = fs.readFileSync(candidatePath, "utf-8");

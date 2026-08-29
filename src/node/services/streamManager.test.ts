@@ -5598,7 +5598,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
       );
       await cleanupAborted.call(streamManager, workspaceId, streamInfo, "user");
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const records = (await fs.readFile(sidecarPath, "utf-8"))
         .trim()
         .split("\n")
@@ -5636,7 +5639,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
         "user"
       );
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       expect(existsSync(sidecarPath)).toBe(false);
       // Usage still reaches history via the partial (asserted in the test above).
       const partial = await hs.readPartial(workspaceId);
@@ -5679,7 +5685,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
         errorType: "empty_output",
       });
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -5725,7 +5734,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
         errorType: "stream_truncated",
       });
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -5768,7 +5780,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
       const partial = await hs.readPartial(workspaceId);
       expect(partial).toBeNull();
       // … but the billed usage still reaches analytics via the sidecar.
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown

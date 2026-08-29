@@ -67,12 +67,12 @@ function createMockExperimentsService(enabled: boolean): ExperimentsService {
 }
 type BashToolConfig = Parameters<typeof bashToolModule.createBashTool>[0];
 interface WorkspaceServiceTestOptions {
-  config: Partial<Config>;
+  config: Partial<Config> & { secretsStore?: Pick<SecretsStore, "getEffectiveSecrets"> };
   historyService: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
   experimentsEnabled?: boolean;
-  secretsStore?: SecretsStore;
+  secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
 }
 function createMockAIService(metadata?: WorkspaceMetadata): AIService {
   return {
@@ -113,7 +113,7 @@ interface ExecuteBashHarnessOptions {
   runtimeWorkspacePaths?: Record<string, string>;
   findWorkspaceProjectPath?: string;
   getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
-  secretsStore?: SecretsStore;
+  secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
   onCreateRuntime?: (
     projectPath: string,
     options: Parameters<typeof runtimeFactory.createRuntime>[1]
@@ -186,9 +186,15 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
       getInitState: mock(() => undefined),
       waitForInit: waitForInitMock,
     } as unknown as InitStateManager,
+    secretsStore:
+      options.secretsStore ??
+      ({ getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []) } satisfies Pick<
+        SecretsStore,
+        "getEffectiveSecrets"
+      >),
     config: {
       srcDir,
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => ({
         projectPath: options.findWorkspaceProjectPath ?? projectAPath,
         workspacePath: primaryWorkspacePath,
@@ -202,11 +208,6 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
         ),
       })),
     },
-    secretsStore:
-      options.secretsStore ??
-      ({
-        getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []),
-      } as unknown as SecretsStore),
   });
   return {
     bashExecuteMock,
@@ -399,8 +400,11 @@ describe("WorkspaceService executeBash runtime selection", () => {
       workspaceId,
       workspaceName,
       secretsStore: {
-        getEffectiveSecrets: getEffectiveSecretsMock as SecretsStore["getEffectiveSecrets"],
-      } as unknown as SecretsStore,
+        getEffectiveSecrets: getEffectiveSecretsMock as Pick<
+          SecretsStore,
+          "getEffectiveSecrets"
+        >["getEffectiveSecrets"],
+      } as Pick<SecretsStore, "getEffectiveSecrets">,
     });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "pwd");
@@ -507,7 +511,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       } as unknown as InitStateManager,
       config: {
         srcDir: "/tmp/src",
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         findWorkspace: mock(() => ({ projectPath, workspacePath })),
         loadConfigOrDefault: mock(() => ({
           projects: new Map([[projectPath, { workspaces: [], trusted: true }]]),
@@ -722,7 +726,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           );
         }),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
@@ -888,7 +892,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             }))
           );
         }),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
@@ -1038,7 +1042,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         srcDir,
         generateStableId: mock(() => workspaceId),
         loadConfigOrDefault: mock(() => configState),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
@@ -1183,7 +1187,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             }))
           );
         }),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
@@ -1297,7 +1301,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         rootDir,
         srcDir: path.join(rootDir, "src"),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
@@ -1341,7 +1345,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             [projectBPath, { workspaces: [], trusted: true }],
           ]),
         })),
-        getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         ...createStreamLifecycleMocks(),
@@ -1397,7 +1401,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             [projectBPath, { workspaces: [], trusted: true }],
           ]),
         })),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
       };
@@ -1493,7 +1497,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             [projectBPath, { workspaces: [], trusted: true }],
           ]),
         })),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
       };
@@ -1642,7 +1646,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
               : []
           );
         }),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -1815,7 +1819,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
               : []
           );
         }),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -1968,7 +1972,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             } satisfies FrontendWorkspaceMetadata,
           ])
         ),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -2161,7 +2165,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             } satisfies FrontendWorkspaceMetadata,
           ])
         ),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),
@@ -2408,7 +2412,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             } satisfies FrontendWorkspaceMetadata,
           ])
         ),
-        getSessionDir: mock((id: string) => path.join(rootDir, "sessions", id)),
+        sessionsDir: path.join(rootDir, "sessions"),
       };
       const mockAIService = {
         isStreaming: mock(() => false),

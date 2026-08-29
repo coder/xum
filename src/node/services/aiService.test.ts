@@ -2579,7 +2579,7 @@ describe("AIService.streamMessage turn envelope", () => {
     await streamTurn(harness, workspaceId);
     expect(harness.startStreamCalls).toHaveLength(2);
 
-    const journal = new DurableEventJournal(harness.config.getSessionDir(workspaceId));
+    const journal = new DurableEventJournal(path.join(harness.config.sessionsDir, workspaceId));
     const events = await journal.read();
     expect(events).toHaveLength(2);
     expect(new Set(events.map((event) => event.id)).size).toBe(2);
@@ -2612,7 +2612,7 @@ describe("AIService.streamMessage turn envelope", () => {
 
     // A regular file where the session dir should be makes every journal write
     // fail (ENOTDIR); the turn must still stream.
-    const sessionDir = harness.config.getSessionDir(workspaceId);
+    const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
     await fs.mkdir(path.dirname(sessionDir), { recursive: true });
     await fs.writeFile(sessionDir, "not a directory", "utf-8");
 

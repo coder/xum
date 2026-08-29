@@ -33,7 +33,7 @@ import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 
 async function readFixtureHistory(): Promise<MuxMessage[]> {
   const historyService = new HistoryService({
-    getSessionDir: () => REPLAY_FIXTURE_DIR,
+    sessionsDir: REPLAY_FIXTURE_DIR,
     rootDir: path.dirname(REPLAY_FIXTURE_DIR),
   });
   const result = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);

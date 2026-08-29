@@ -1048,7 +1048,7 @@ export async function resolveWorkflowContext(
     service: new WorkflowService({
       notifyInterruptedBackgroundRunTerminal:
         options.notifyInterruptedBackgroundRunTerminal === true,
-      runStore: new WorkflowRunStore({ sessionDir: context.config.getSessionDir(workspaceId) }),
+      runStore: new WorkflowRunStore({ sessionDir: path.join(context.config.sessionsDir, workspaceId) }),
       runtimeFactory: context.workflowRuntimeFactory,
       taskAdapterFactory: (runId, workflowName) =>
         new WorkflowTaskServiceAdapter({
@@ -1062,7 +1062,7 @@ export async function resolveWorkflowContext(
             cwd: workspacePath,
             runtime,
             runtimeTempDir: workflowRuntimeTempDir,
-            workspaceSessionDir: context.config.getSessionDir(workspaceId),
+            workspaceSessionDir: path.join(context.config.sessionsDir, workspaceId),
             trusted: projectTrusted,
           },
           getProjectTrusted: resolveWorkflowProjectTrusted,

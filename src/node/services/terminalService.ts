@@ -1,6 +1,6 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs";
-import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -125,7 +125,7 @@ export class TerminalService {
   private readonly pendingNativeTerminalOpens = new Map<string, number>();
 
   private nativeTerminalMarkerPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "native-terminal-opened");
+    return path.join(path.join(this.config.sessionsDir, workspaceId), "native-terminal-opened");
   }
 
   /**
@@ -195,7 +195,9 @@ export class TerminalService {
   constructor(
     config: Config,
     ptyService: PTYService,
-    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
+    private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
+      config.rootDir
+    )
   ) {
     this.config = config;
     this.ptyService = ptyService;

@@ -405,7 +405,7 @@ async function findPatch(params: {
       const parent = parentById.get(currentDescendant);
       if (!parent) break;
       if (parent === params.workspaceId) {
-        const artifactSessionDir = configService.getSessionDir(childParentWorkspaceId);
+        const artifactSessionDir = path.join(configService.sessionsDir, childParentWorkspaceId);
         const artifact = await readSubagentGitPatchArtifact(artifactSessionDir, params.childTaskId);
         if (artifact) {
           return {
@@ -457,7 +457,7 @@ async function findPatch(params: {
 
     visited.add(parent);
 
-    const parentSessionDir = configService.getSessionDir(parent);
+    const parentSessionDir = path.join(configService.sessionsDir, parent);
     const artifact = await readSubagentGitPatchArtifact(parentSessionDir, params.childTaskId);
     if (artifact) {
       return {

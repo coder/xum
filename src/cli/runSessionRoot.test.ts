@@ -62,7 +62,7 @@ describe("prepareRunSessionRootOverride", () => {
       path.join(config.rootDir, "secrets.json"),
       JSON.stringify({ token: "secret-value" })
     );
-    const sessionDir = config.getSessionDir("workspace-1");
+    const sessionDir = path.join(config.sessionsDir, "workspace-1");
     await fs.mkdir(sessionDir, { recursive: true });
     await fs.writeFile(path.join(sessionDir, "chat.jsonl"), "chat");
     await fs.writeFile(path.join(sessionDir, "session-usage.json"), "usage");

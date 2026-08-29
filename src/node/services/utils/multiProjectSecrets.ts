@@ -5,7 +5,7 @@ import type { SecretsStore } from "@/node/config";
 
 export function mergeMultiProjectSecrets(
   metadata: WorkspaceMetadata,
-  secretsStore: SecretsStore
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">
 ): Secret[] {
   const projects = getProjects(metadata);
   const primaryProject = projects.find((project) => project.projectPath === metadata.projectPath);

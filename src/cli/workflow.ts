@@ -472,7 +472,7 @@ function createWorkflowService(input: {
     workspaceName: input.ctx.workspaceId,
     workspacePath: input.ctx.workspacePath,
   });
-  const workspaceSessionDir = input.ctx.config.getSessionDir(input.ctx.workspaceId);
+  const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),

@@ -1,3 +1,4 @@
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
@@ -7,7 +8,7 @@ import * as path from "path";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { Config, FileLeaseManager, ProvidersConfigStore } from "@/node/config";
+import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "./providerService";
