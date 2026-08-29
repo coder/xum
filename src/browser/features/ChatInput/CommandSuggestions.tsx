@@ -81,6 +81,8 @@ interface CommandSuggestionsProps {
   highlightQuery?: string;
   /** Whether suggestions are file paths (enables file icons) */
   isFileSuggestion?: boolean;
+  selectedIndex?: number;
+  onSelectedIndexChange?: (index: number) => void;
 }
 
 // Main component
@@ -94,49 +96,14 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
   anchorRef,
   highlightQuery,
   isFileSuggestion = false,
+  selectedIndex = 0,
+  onSelectedIndexChange = () => undefined,
 }) => {
-  const [selectedIndex, setSelectedIndex] = useState(0);
   const [position, setPosition] = useState<{ top: number; left: number; width: number } | null>(
     null
   );
   const menuRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<HTMLDivElement>(null);
-  const previousSuggestionsRef = useRef<SlashSuggestion[]>(suggestions);
-  const wasVisibleRef = useRef(isVisible);
-
-  // Keep selection stable while suggestions update (e.g. user keeps typing).
-  // We reset selection only when the menu becomes visible.
-  useLayoutEffect(() => {
-    const wasVisible = wasVisibleRef.current;
-    wasVisibleRef.current = isVisible;
-
-    const prevSuggestions = previousSuggestionsRef.current;
-    previousSuggestionsRef.current = suggestions;
-
-    if (!isVisible || suggestions.length === 0) {
-      setSelectedIndex(0);
-      return;
-    }
-
-    // Menu just opened: default to the first suggestion.
-    if (!wasVisible) {
-      setSelectedIndex(0);
-      return;
-    }
-
-    // Preserve the previously-selected suggestion if it still exists; otherwise clamp.
-    setSelectedIndex((prevIndex) => {
-      const prevSelected = prevSuggestions[prevIndex];
-      if (prevSelected) {
-        const nextIndex = suggestions.findIndex((s) => s.id === prevSelected.id);
-        if (nextIndex !== -1) {
-          return nextIndex;
-        }
-      }
-      return Math.min(prevIndex, suggestions.length - 1);
-    });
-  }, [isVisible, suggestions]);
-
   // Scroll selected item into view
   useLayoutEffect(() => {
     selectedRef.current?.scrollIntoView({ block: "nearest" });
@@ -173,44 +140,6 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
       window.removeEventListener("scroll", updatePosition, true);
     };
   }, [anchorRef, isVisible, suggestions]);
-
-  // Handle keyboard navigation
-  useEffect(() => {
-    if (!isVisible || suggestions.length === 0) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case "ArrowDown":
-          e.preventDefault();
-          setSelectedIndex((i) => (i + 1) % suggestions.length);
-          break;
-        case "ArrowUp":
-          e.preventDefault();
-          setSelectedIndex((i) => (i - 1 + suggestions.length) % suggestions.length);
-          break;
-        case "Tab":
-          if (!e.shiftKey && suggestions.length > 0) {
-            e.preventDefault();
-            onSelectSuggestion(suggestions[selectedIndex]);
-          }
-          break;
-        case "Enter":
-          if (!e.shiftKey && suggestions.length > 0) {
-            e.preventDefault();
-            onSelectSuggestion(suggestions[selectedIndex]);
-          }
-          break;
-        case "Escape":
-          e.preventDefault();
-          e.stopPropagation();
-          onDismiss();
-          break;
-      }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [isVisible, suggestions, selectedIndex, onSelectSuggestion, onDismiss, isFileSuggestion]);
 
   // Click outside handler
   useEffect(() => {
@@ -264,7 +193,7 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
         <div
           key={suggestion.id}
           ref={index === selectedIndex ? selectedRef : undefined}
-          onMouseEnter={() => setSelectedIndex(index)}
+          onMouseEnter={() => onSelectedIndexChange(index)}
           onClick={() => onSelectSuggestion(suggestion)}
           id={`${resolvedListId}-option-${suggestion.id}`}
           role="option"

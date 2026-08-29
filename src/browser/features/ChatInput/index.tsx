@@ -3,9 +3,7 @@ import React, {
   useRef,
   useCallback,
   useEffect,
-  useId,
   useMemo,
-  useLayoutEffect,
   useSyncExternalStore,
 } from "react";
 import {
@@ -24,7 +22,6 @@ import type { SendMessageError } from "@/common/types/errors";
 import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
-import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
 import {
   readPersistedState,
@@ -83,34 +80,17 @@ import {
 import { Button } from "@/browser/components/Button/Button";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { findAtMentionAtCursor } from "@/common/utils/atMentions";
-import {
-  extractInlineSkillReferenceCandidates,
-  findInlineSkillReferenceAtCursor,
-} from "@/browser/utils/agentSkills/inlineSkillReferences";
+import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import {
   convertSymbolCommandAtCursor,
   convertTerminatedSymbolCommand,
-  findSymbolCommandAtCursor,
-  getSymbolSuggestions,
 } from "@/browser/features/ChatInput/symbolShortcuts";
-import {
-  getInlineSkillInsertionTrailingText,
-  getInlineSkillSuggestions,
-  shouldRefreshInlineSkillSuggestions,
-} from "@/browser/utils/agentSkills/inlineSkillSuggestions";
 import {
   formatProjectHierarchyLabel,
   resolveWorkspaceCreationScope,
 } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
-import { getCommandGhostHint } from "@/browser/utils/slashCommands/registry";
-import {
-  getSlashCommandSuggestions,
-  type SlashSuggestion,
-} from "@/browser/utils/slashCommands/suggestions";
-import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
 import { ContextUsageIndicatorButton } from "@/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
@@ -152,9 +132,6 @@ import {
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
-import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
 import {
@@ -235,16 +212,7 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
-
-// Normal typing usually has no active suggestion menu. Reuse the existing empty array
-// so suggestion effects do not schedule an avoidable second render on every keypress.
-function clearSuggestions(prev: SlashSuggestion[]): SlashSuggestion[] {
-  return prev.length === 0 ? prev : [];
-}
-
-function replaceSuggestions(prev: SlashSuggestion[], next: SlashSuggestion[]): SlashSuggestion[] {
-  return prev.length === 0 && next.length === 0 ? prev : next;
-}
+import { useComposerSuggestions } from "./useComposerSuggestions";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -384,41 +352,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSending = sendingCount > 0;
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
-  const [showAtMentionSuggestions, setShowAtMentionSuggestions] = useState(false);
-  const [atMentionSuggestions, setAtMentionSuggestions] = useState<SlashSuggestion[]>([]);
-  const [showSkillSuggestions, setShowSkillSuggestions] = useState(false);
-  const [skillSuggestions, setSkillSuggestions] = useState<SlashSuggestion[]>([]);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
   const workflowsRequestIdRef = useRef(0);
-  const agentSkillsRequestIdRef = useRef(0);
-  const mcpPromptsRequestIdRef = useRef(0);
-  const mcpPromptsRequestRef = useRef<Promise<void> | null>(null);
-  const mcpPromptsLoadedAtRef = useRef(0);
-  const mcpPromptsWorkspaceRef = useRef<string | null>(null);
-  // Abandoned cold discovery would otherwise keep starting servers and
-  // waiting out prompts/list deadlines for a workspace we already left.
-  const mcpPromptsAbortRef = useRef<AbortController | null>(null);
-  const atMentionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const atMentionRequestIdRef = useRef(0);
-  const lastAtMentionScopeIdRef = useRef<string | null>(null);
-  const lastAtMentionQueryRef = useRef<string | null>(null);
-  const lastSkillInputRef = useRef<string | null>(null);
-  const lastSkillQueryRef = useRef<string | null>(null);
-  const lastSkillDescriptorsRef = useRef<AgentSkillDescriptor[] | null>(null);
-  const lastMcpPromptDescriptorsRef = useRef<MCPPromptDescriptor[] | null>(null);
-  const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
-
-  const [commandSuggestions, setCommandSuggestions] = useState<SlashSuggestion[]>([]);
-  // Backslash symbol-shortcut autocomplete (e.g. typing "\alpha" or "\leq").
-  const [showSymbolSuggestions, setShowSymbolSuggestions] = useState(false);
-  const [symbolSuggestions, setSymbolSuggestions] = useState<SlashSuggestion[]>([]);
-  const lastSymbolQueryRef = useRef<string>("");
-  const [agentSkillDescriptors, setAgentSkillDescriptors] = useState<AgentSkillDescriptor[]>([]);
-  const [mcpPromptDescriptors, setMcpPromptDescriptors] = useState<MCPPromptDescriptor[]>([]);
-  // Agent Plugins: manifest-contributed slash commands (empty when the experiment is off).
-  const [pluginCommandDescriptors, setPluginCommandDescriptors] = useState<
-    PluginSlashCommandDescriptor[]
-  >([]);
   const [toast, setToast] = useState<Toast | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
@@ -474,7 +409,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { getDraft, setDraft, preEditDraftRef, preEditReviewsRef } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
   const { removeDraftReview, updateDraftReviewNote, storageKeys, latestInputValueRef } = draft;
-  const lastAtMentionInputRef = useRef<string>(input);
   const {
     processingAttachmentCount,
     handlePaste,
@@ -499,30 +433,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   useEffect(() => {
     return () => {
       isMountedRef.current = false;
-      mcpPromptsAbortRef.current?.abort();
-      mcpPromptsAbortRef.current = null;
     };
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const powerMode = usePowerMode();
-  const [atMentionCursorNonce, setAtMentionCursorNonce] = useState(0);
-  const lastAtMentionCursorRef = useRef<number | null>(null);
-  const handleAtMentionCursorActivity = useCallback(() => {
-    const el = inputRef.current;
-    if (!el) {
-      return;
-    }
-
-    const nextCursor = el.selectionStart ?? input.length;
-    if (lastAtMentionCursorRef.current === nextCursor) {
-      return;
-    }
-
-    lastAtMentionCursorRef.current = nextCursor;
-    setAtMentionCursorNonce((n) => n + 1);
-  }, [input.length]);
-
   const handleInputChange = useCallback(
     (next: string, caretFromEvent?: number) => {
       if (powerMode.enabled) {
@@ -612,10 +527,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       listener: true,
     }
   );
-  const atMentionListId = useId();
-  const skillListId = useId();
-  const commandListId = useId();
-  const symbolListId = useId();
   const telemetry = useTelemetry();
   const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
     listener: true,
@@ -665,6 +576,33 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // For creation variant, use project-scoped key; for workspace, use workspace ID
   const sendMessageOptions = useSendMessageOptions(
     variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath)
+  );
+  const composerSuggestions = useComposerSuggestions({
+    input,
+    setInput,
+    inputRef,
+    variant,
+    workspaceId,
+    projectPath: atMentionProjectPath,
+    disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents === true,
+    transferredDraftProjectDiscovery,
+    agentPluginsEnabled: agentPluginsExperimentEnabled,
+    experiments: {
+      workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
+      dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
+      memory: memoryExperimentEnabled,
+      memoryConsolidation: memoryConsolidationExperimentEnabled,
+      rlm: rlmExperimentEnabled,
+      programmaticToolCalling: ptcExperimentEnabled,
+    },
+  });
+  const { agentSkillDescriptors, mcpPromptDescriptors } = composerSuggestions;
+  const handleComposerInputChange = useCallback(
+    (next: string, caret?: number) => {
+      composerSuggestions.handleInputCaretChange(caret, next.length);
+      handleInputChange(next, caret);
+    },
+    [composerSuggestions.handleInputCaretChange, handleInputChange]
   );
   const additionalSystemContext = useAdditionalSystemContextSnapshot(
     variant === "workspace" ? props.workspaceId : ""
@@ -1298,318 +1236,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only run when editingMessage changes
   }, [editingMessage, applyDraftFromPending]);
 
-  // Watch input/cursor for @file mentions
-  useEffect(() => {
-    if (atMentionDebounceRef.current) {
-      clearTimeout(atMentionDebounceRef.current);
-      atMentionDebounceRef.current = null;
-    }
-
-    const inputChanged = lastAtMentionInputRef.current !== input;
-    lastAtMentionInputRef.current = input;
-
-    const atMentionScopeId = variant === "workspace" ? workspaceId : atMentionProjectPath;
-
-    if (!api || !atMentionScopeId) {
-      // Invalidate any in-flight completion request.
-      atMentionRequestIdRef.current++;
-      lastAtMentionScopeIdRef.current = null;
-      lastAtMentionQueryRef.current = null;
-      setAtMentionSuggestions(clearSuggestions);
-      setShowAtMentionSuggestions(false);
-      return;
-    }
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const match = findAtMentionAtCursor(input, cursor);
-
-    if (!match) {
-      // Invalidate any in-flight completion request.
-      atMentionRequestIdRef.current++;
-      lastAtMentionScopeIdRef.current = null;
-      lastAtMentionQueryRef.current = null;
-      setAtMentionSuggestions(clearSuggestions);
-      setShowAtMentionSuggestions(false);
-      return;
-    }
-
-    // If the user is moving the caret and we aren't already showing suggestions, don't re-open.
-    if (!inputChanged && !showAtMentionSuggestions) {
-      return;
-    }
-
-    // Avoid refetching on caret movement within the same token/query.
-    if (
-      !inputChanged &&
-      lastAtMentionScopeIdRef.current === atMentionScopeId &&
-      lastAtMentionQueryRef.current === match.query
-    ) {
-      return;
-    }
-
-    lastAtMentionScopeIdRef.current = atMentionScopeId;
-    lastAtMentionQueryRef.current = match.query;
-
-    const requestId = ++atMentionRequestIdRef.current;
-    const runRequest = () => {
-      void (async () => {
-        try {
-          const result =
-            variant === "workspace"
-              ? await api.workspace.getFileCompletions({
-                  workspaceId: atMentionScopeId,
-                  query: match.query,
-                  limit: 20,
-                })
-              : await api.projects.getFileCompletions({
-                  projectPath: atMentionScopeId,
-                  query: match.query,
-                  limit: 20,
-                });
-
-          if (atMentionRequestIdRef.current !== requestId) {
-            return;
-          }
-
-          const nextSuggestions = result.paths
-            // File @mentions are whitespace-delimited (extractAtMentions uses /@(\S+)/), so
-            // suggestions containing spaces would be inserted incorrectly (e.g. "@foo bar.ts").
-            .filter((p) => !/\s/.test(p))
-            .map((p) => {
-              // Determine file type from extension or mark as directory
-              const getFileType = (path: string): string => {
-                if (path.endsWith("/")) return "Directory";
-                const lastDot = path.lastIndexOf(".");
-                const lastSlash = path.lastIndexOf("/");
-                // Only use extension if it's after the last slash (in the filename)
-                if (lastDot > lastSlash && lastDot < path.length - 1) {
-                  return path.slice(lastDot + 1).toUpperCase();
-                }
-                return "File";
-              };
-              return {
-                id: `file:${p}`,
-                display: p,
-                description: getFileType(p),
-                replacement: `@${p}`,
-              };
-            });
-
-          setAtMentionSuggestions(nextSuggestions);
-          setShowAtMentionSuggestions(nextSuggestions.length > 0);
-        } catch {
-          if (atMentionRequestIdRef.current === requestId) {
-            setAtMentionSuggestions(clearSuggestions);
-            setShowAtMentionSuggestions(false);
-          }
-        }
-      })();
-    };
-
-    // Our backend autocomplete is cheap (indexed) and cached, so update suggestions on every
-    // character rather than waiting for a debounce window.
-    runRequest();
-  }, [
-    api,
-    input,
-    showAtMentionSuggestions,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    atMentionCursorNonce,
-  ]);
-
-  useEffect(() => {
-    if (!api || variant !== "workspace" || !workspaceId) {
-      if (mcpPromptsWorkspaceRef.current !== null) {
-        mcpPromptsWorkspaceRef.current = null;
-        mcpPromptsLoadedAtRef.current = 0;
-        mcpPromptsRequestIdRef.current++;
-        mcpPromptsRequestRef.current = null;
-        mcpPromptsAbortRef.current?.abort();
-        mcpPromptsAbortRef.current = null;
-        setMcpPromptDescriptors([]);
-      }
-      return;
-    }
-
-    if (mcpPromptsWorkspaceRef.current !== workspaceId) {
-      mcpPromptsWorkspaceRef.current = workspaceId;
-      mcpPromptsLoadedAtRef.current = 0;
-      mcpPromptsRequestIdRef.current++;
-      mcpPromptsRequestRef.current = null;
-      mcpPromptsAbortRef.current?.abort();
-      mcpPromptsAbortRef.current = null;
-      setMcpPromptDescriptors([]);
-    }
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const opensPromptSurface =
-      input.trimStart().startsWith("/") || findInlineSkillReferenceAtCursor(input, cursor) !== null;
-    if (!opensPromptSurface || Date.now() - mcpPromptsLoadedAtRef.current < 30_000) return;
-    if (mcpPromptsRequestRef.current) return;
-
-    const requestId = ++mcpPromptsRequestIdRef.current;
-    const abortController = new AbortController();
-    mcpPromptsAbortRef.current = abortController;
-    const request = api.workspace.mcp.prompts
-      .list({ workspaceId }, { signal: abortController.signal })
-      .then((prompts) => {
-        if (
-          mcpPromptsWorkspaceRef.current !== workspaceId ||
-          mcpPromptsRequestIdRef.current !== requestId
-        ) {
-          return;
-        }
-        setMcpPromptDescriptors(prompts);
-        mcpPromptsLoadedAtRef.current = Date.now();
-      })
-      .catch(() => {
-        if (
-          mcpPromptsWorkspaceRef.current === workspaceId &&
-          mcpPromptsRequestIdRef.current === requestId
-        ) {
-          mcpPromptsLoadedAtRef.current = Date.now();
-        }
-      })
-      .finally(() => {
-        if (mcpPromptsRequestRef.current === request) {
-          mcpPromptsRequestRef.current = null;
-        }
-        if (mcpPromptsAbortRef.current === abortController) {
-          mcpPromptsAbortRef.current = null;
-        }
-      });
-    mcpPromptsRequestRef.current = request;
-    // Caret movement must retrigger discovery when the input text is unchanged.
-  }, [api, input, variant, workspaceId, atMentionCursorNonce]);
-
-  useEffect(() => {
-    if (showAtMentionSuggestions) {
-      // File mentions win precedence if an edge-case token could match both menus.
-      setSkillSuggestions((prev) => (prev.length === 0 ? prev : []));
-      setShowSkillSuggestions(false);
-      lastSkillQueryRef.current = null;
-      return;
-    }
-
-    const inputChanged = lastSkillInputRef.current !== input;
-    lastSkillInputRef.current = input;
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const match = findInlineSkillReferenceAtCursor(input, cursor);
-
-    if (!match) {
-      setSkillSuggestions(clearSuggestions);
-      setShowSkillSuggestions(false);
-      lastSkillQueryRef.current = null;
-      return;
-    }
-
-    if (
-      !shouldRefreshInlineSkillSuggestions({
-        inputChanged,
-        previousPartial: lastSkillQueryRef.current,
-        partial: match.partial,
-        previousDescriptors: lastSkillDescriptorsRef.current,
-        descriptors: agentSkillDescriptors,
-        previousMcpPrompts: lastMcpPromptDescriptorsRef.current,
-        mcpPrompts: mcpPromptDescriptors,
-      })
-    ) {
-      return;
-    }
-
-    lastSkillQueryRef.current = match.partial;
-
-    const nextSuggestions = getInlineSkillSuggestions({
-      partial: match.partial,
-      descriptors: agentSkillDescriptors,
-      mcpPrompts: mcpPromptDescriptors,
-    });
-    lastSkillDescriptorsRef.current = agentSkillDescriptors;
-    lastMcpPromptDescriptorsRef.current = mcpPromptDescriptors;
-    setSkillSuggestions(nextSuggestions);
-    setShowSkillSuggestions(nextSuggestions.length > 0);
-  }, [
-    input,
-    showAtMentionSuggestions,
-    agentSkillDescriptors,
-    mcpPromptDescriptors,
-    atMentionCursorNonce,
-  ]);
-
-  // Keep slash suggestions current before Enter can accept a stale item.
-  useLayoutEffect(() => {
-    const suggestions = getSlashCommandSuggestions(input, {
-      agentSkills: agentSkillDescriptors,
-      mcpPrompts: mcpPromptDescriptors,
-      pluginCommands: pluginCommandDescriptors,
-      variant,
-      isExperimentEnabled: (experimentId) =>
-        resolveSlashCommandExperimentValue(experimentId, {
-          workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-          dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-          memory: memoryExperimentEnabled,
-          memoryConsolidation: memoryConsolidationExperimentEnabled,
-          rlm: rlmExperimentEnabled,
-          programmaticToolCalling: ptcExperimentEnabled,
-        }),
-    });
-    setCommandSuggestions((prev) => replaceSuggestions(prev, suggestions));
-    setShowCommandSuggestions(suggestions.length > 0);
-  }, [
-    input,
-    agentSkillDescriptors,
-    mcpPromptDescriptors,
-    pluginCommandDescriptors,
-    variant,
-    workspaceHeartbeatsExperimentEnabled,
-    dynamicWorkflowsExperimentEnabled,
-    memoryExperimentEnabled,
-    memoryConsolidationExperimentEnabled,
-    rlmExperimentEnabled,
-    ptcExperimentEnabled,
-  ]);
-
-  // Watch input/cursor for `\symbol` backslash commands and surface the menu.
-  useLayoutEffect(() => {
-    if (showAtMentionSuggestions) {
-      // File mentions win precedence if an edge-case token could match both menus.
-      setSymbolSuggestions(clearSuggestions);
-      setShowSymbolSuggestions(false);
-      return;
-    }
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const match = findSymbolCommandAtCursor(input, cursor);
-    if (!match) {
-      setSymbolSuggestions(clearSuggestions);
-      setShowSymbolSuggestions(false);
-      return;
-    }
-
-    const suggestions = getSymbolSuggestions(match.partial);
-    lastSymbolQueryRef.current = match.partial;
-    setSymbolSuggestions((prev) => replaceSuggestions(prev, suggestions));
-    setShowSymbolSuggestions(suggestions.length > 0);
-  }, [input, showAtMentionSuggestions, atMentionCursorNonce]);
-
-  // Derive ghost hint for slash-command argument syntax.
-  // Show only when suggestions are hidden and the input is exactly "/command " with no args yet.
-  const commandGhostHint = getCommandGhostHint(input, showCommandSuggestions, {
-    variant,
-    isExperimentEnabled: (experimentId) =>
-      resolveSlashCommandExperimentValue(experimentId, {
-        workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-        dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-        memory: memoryExperimentEnabled,
-        memoryConsolidation: memoryConsolidationExperimentEnabled,
-        rlm: rlmExperimentEnabled,
-        programmaticToolCalling: ptcExperimentEnabled,
-      }),
-  });
-
   // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
     let isMounted = true;
@@ -1666,114 +1292,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     isTranscriptCaughtUp,
     store,
   ]);
-
-  // Agent plugin installs/updates/uninstalls change contributed slash
-  // commands and skills while the composer stays mounted (palette and
-  // Settings flows never remount the workspace); bump a tick so both loader
-  // effects below re-query instead of serving descriptors from the old tree.
-  const [pluginMutationTick, setPluginMutationTick] = useState(0);
-  useEffect(
-    () =>
-      subscribeAgentPluginsMutated(() => {
-        setPluginMutationTick((tick) => tick + 1);
-      }),
-    []
-  );
-
-  // Load agent skills for suggestions
-  useEffect(() => {
-    let isMounted = true;
-    const requestId = ++agentSkillsRequestIdRef.current;
-
-    const loadAgentSkills = async () => {
-      if (!api) {
-        if (isMounted && agentSkillsRequestIdRef.current === requestId) {
-          setAgentSkillDescriptors([]);
-        }
-        return;
-      }
-
-      const discoveryInput =
-        variant === "workspace" && workspaceId
-          ? {
-              workspaceId,
-              disableWorkspaceAgents:
-                sendMessageOptions.disableWorkspaceAgents === true ||
-                transferredDraftProjectDiscovery,
-            }
-          : variant === "creation" && atMentionProjectPath
-            ? { projectPath: atMentionProjectPath }
-            : null;
-
-      if (!discoveryInput) {
-        if (isMounted && agentSkillsRequestIdRef.current === requestId) {
-          setAgentSkillDescriptors([]);
-        }
-        return;
-      }
-
-      try {
-        const skills = await api.agentSkills.list(discoveryInput);
-        if (!isMounted || agentSkillsRequestIdRef.current !== requestId) {
-          return;
-        }
-        if (Array.isArray(skills)) {
-          setAgentSkillDescriptors(skills);
-        }
-      } catch (error) {
-        console.error("Failed to load agent skills:", error);
-        if (!isMounted || agentSkillsRequestIdRef.current !== requestId) {
-          return;
-        }
-        setAgentSkillDescriptors([]);
-      }
-    };
-
-    void loadAgentSkills();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    sendMessageOptions.disableWorkspaceAgents,
-    transferredDraftProjectDiscovery,
-    // The backend gates plugin-contributed skills on this experiment, so a
-    // toggle must refetch /skill suggestions like it reloads plugin commands.
-    agentPluginsExperimentEnabled,
-    pluginMutationTick,
-  ]);
-
-  // Agent Plugins: load manifest-contributed slash commands for suggestions.
-  // Subscribes to the reactive experiment value so toggling agent-plugins in
-  // Settings immediately loads/clears commands without remounting the composer
-  // (the backend also returns [] while the experiment is disabled).
-  useEffect(() => {
-    let isMounted = true;
-
-    const loadPluginCommands = async () => {
-      if (!api || variant !== "workspace" || !workspaceId || !agentPluginsExperimentEnabled) {
-        if (isMounted) setPluginCommandDescriptors([]);
-        return;
-      }
-      try {
-        const commands = await api.workspace.plugins.slashCommands.list({ workspaceId });
-        if (isMounted) setPluginCommandDescriptors(commands);
-      } catch {
-        // Plugin command discovery must never break the composer.
-        if (isMounted) setPluginCommandDescriptors([]);
-      }
-    };
-
-    void loadPluginCommands();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [api, variant, workspaceId, agentPluginsExperimentEnabled, pluginMutationTick]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {
@@ -2261,116 +1779,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const handleDestructiveCommandCancel = useCallback(() => {
     setPendingDestructiveCommand(false);
   }, []);
-
-  // Handle suggestion selection
-
-  const handleAtMentionSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-      const match = findAtMentionAtCursor(input, cursor);
-      if (!match) {
-        return;
-      }
-
-      // Add trailing space so user can continue typing naturally
-      const next =
-        input.slice(0, match.startIndex) +
-        suggestion.replacement +
-        " " +
-        input.slice(match.endIndex);
-
-      setInput(next);
-      setAtMentionSuggestions(clearSuggestions);
-      setShowAtMentionSuggestions(false);
-
-      requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el || el.disabled) {
-          return;
-        }
-
-        el.focus();
-        // +1 for the trailing space we added
-        const newCursor = match.startIndex + suggestion.replacement.length + 1;
-        el.selectionStart = newCursor;
-        el.selectionEnd = newCursor;
-      });
-    },
-    [input, setInput]
-  );
-  const handleSkillSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-      const match = findInlineSkillReferenceAtCursor(input, cursor);
-      if (!match) {
-        return;
-      }
-
-      // Add a separating space only when the following text does not already provide one.
-      const after = input.slice(match.endIndex);
-      const trailing = getInlineSkillInsertionTrailingText(after);
-      const next = input.slice(0, match.startIndex) + suggestion.replacement + trailing + after;
-
-      setInput(next);
-      setSkillSuggestions(clearSuggestions);
-      setShowSkillSuggestions(false);
-      lastSkillQueryRef.current = null;
-
-      requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el || el.disabled) {
-          return;
-        }
-
-        el.focus();
-        const newCursor = match.startIndex + suggestion.replacement.length + trailing.length;
-        el.selectionStart = newCursor;
-        el.selectionEnd = newCursor;
-      });
-    },
-    [input, setInput]
-  );
-
-  const handleCommandSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      setInput(suggestion.replacement);
-      setShowCommandSuggestions(false);
-      inputRef.current?.focus();
-    },
-    [setInput]
-  );
-
-  const handleSymbolSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-      const match = findSymbolCommandAtCursor(input, cursor);
-      if (!match) {
-        return;
-      }
-
-      // Replace the whole `\name` token with the symbol; no trailing space so the
-      // user can keep typing (e.g. another symbol, an exponent, or a number).
-      const next =
-        input.slice(0, match.startIndex) + suggestion.replacement + input.slice(match.endIndex);
-
-      setInput(next);
-      setSymbolSuggestions(clearSuggestions);
-      setShowSymbolSuggestions(false);
-
-      requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el || el.disabled) {
-          return;
-        }
-
-        el.focus();
-        const newCursor = match.startIndex + suggestion.replacement.length;
-        el.selectionStart = newCursor;
-        el.selectionEnd = newCursor;
-      });
-    },
-    [input, setInput]
-  );
 
   const handleSend = async (overrides?: InternalSendOverrides) => {
     if (!canSend) {
@@ -2977,20 +2385,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Note: ESC handled by VimTextArea (for mode transitions) and CommandSuggestions (for dismissal)
 
-    const hasCommandSuggestionMenu = showCommandSuggestions && commandSuggestions.length > 0;
-    const hasAtMentionSuggestionMenu = showAtMentionSuggestions && atMentionSuggestions.length > 0;
-    const hasSkillSuggestionMenu = showSkillSuggestions && skillSuggestions.length > 0;
-    const hasSymbolSuggestionMenu = showSymbolSuggestions && symbolSuggestions.length > 0;
-
-    // Don't handle keys if suggestions are visible.
-    // Enter/Tab/arrows/Escape are handled by CommandSuggestions for slash, @file, $skill, and \symbol menus.
     if (
-      (hasCommandSuggestionMenu && COMMAND_SUGGESTION_KEYS.includes(e.key)) ||
-      (hasAtMentionSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key)) ||
-      (hasSkillSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key)) ||
-      (hasSymbolSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key))
+      composerSuggestions.isVisible &&
+      (composerSuggestions.suppressionKeys === "command"
+        ? COMMAND_SUGGESTION_KEYS
+        : FILE_SUGGESTION_KEYS
+      ).includes(e.key)
     ) {
-      return; // Let CommandSuggestions handle it
+      return;
     }
 
     const hasOnlyQueuedMessage =
@@ -3197,53 +2599,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             onOpenProviders={() => open("providers", { expandProvider: "openai" })}
           />
 
-          {/* File path suggestions (@src/foo.ts) */}
           <CommandSuggestions
-            suggestions={atMentionSuggestions}
-            onSelectSuggestion={handleAtMentionSelect}
-            onDismiss={() => setShowAtMentionSuggestions(false)}
-            isVisible={showAtMentionSuggestions}
-            ariaLabel="File path suggestions"
-            listId={atMentionListId}
+            suggestions={composerSuggestions.suggestions}
+            onSelectSuggestion={composerSuggestions.select}
+            onDismiss={composerSuggestions.dismiss}
+            isVisible={composerSuggestions.isVisible}
+            ariaLabel={composerSuggestions.ariaLabel}
+            listId={composerSuggestions.listId}
             anchorRef={variant === "creation" ? inputRef : undefined}
-            highlightQuery={lastAtMentionQueryRef.current ?? ""}
-            isFileSuggestion
-          />
-
-          {/* Skill suggestions ($deep-review) */}
-          <CommandSuggestions
-            suggestions={skillSuggestions}
-            onSelectSuggestion={handleSkillSelect}
-            onDismiss={() => setShowSkillSuggestions(false)}
-            isVisible={showSkillSuggestions}
-            ariaLabel="Skill suggestions"
-            listId={skillListId}
-            anchorRef={variant === "creation" ? inputRef : undefined}
-            highlightQuery={lastSkillQueryRef.current ?? ""}
-          />
-
-          {/* Slash command suggestions - available in both variants */}
-          {/* In creation mode, use portal (anchorRef) to escape overflow:hidden containers */}
-          <CommandSuggestions
-            suggestions={commandSuggestions}
-            onSelectSuggestion={handleCommandSelect}
-            onDismiss={() => setShowCommandSuggestions(false)}
-            isVisible={showCommandSuggestions}
-            ariaLabel="Slash command suggestions"
-            listId={commandListId}
-            anchorRef={variant === "creation" ? inputRef : undefined}
-          />
-
-          {/* Symbol shortcut suggestions (\alpha -> α, \leq -> ≤, \euro -> €) */}
-          <CommandSuggestions
-            suggestions={symbolSuggestions}
-            onSelectSuggestion={handleSymbolSelect}
-            onDismiss={() => setShowSymbolSuggestions(false)}
-            isVisible={showSymbolSuggestions}
-            ariaLabel="Symbol shortcuts"
-            listId={symbolListId}
-            anchorRef={variant === "creation" ? inputRef : undefined}
-            highlightQuery={lastSymbolQueryRef.current}
+            highlightQuery={composerSuggestions.highlightQuery}
+            isFileSuggestion={composerSuggestions.isFileSuggestion}
+            selectedIndex={composerSuggestions.selectedIndex}
+            onSelectedIndexChange={composerSuggestions.setSelectedIndex}
           />
 
           {/* Scope the focus border to the textarea so sibling controls do not trigger it. */}
@@ -3272,48 +2639,31 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     ref={inputRef}
                     data-escape-interrupts-stream="true"
                     value={input}
-                    ghostHint={commandGhostHint}
-                    onChange={handleInputChange}
+                    ghostHint={composerSuggestions.ghostHint}
+                    onChange={handleComposerInputChange}
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
-                    onKeyUp={handleAtMentionCursorActivity}
-                    onMouseUp={handleAtMentionCursorActivity}
-                    onSelect={handleAtMentionCursorActivity}
+                    onKeyUp={composerSuggestions.handleCursorActivity}
+                    onMouseUp={composerSuggestions.handleCursorActivity}
+                    onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
                     onDrop={handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
-                      showAtMentionSuggestions
-                        ? FILE_SUGGESTION_KEYS
-                        : showSkillSuggestions
-                          ? FILE_SUGGESTION_KEYS
-                          : showSymbolSuggestions
-                            ? FILE_SUGGESTION_KEYS
-                            : showCommandSuggestions
-                              ? COMMAND_SUGGESTION_KEYS
-                              : undefined
+                      composerSuggestions.isVisible
+                        ? composerSuggestions.suppressionKeys === "command"
+                          ? COMMAND_SUGGESTION_KEYS
+                          : FILE_SUGGESTION_KEYS
+                        : undefined
                     }
                     placeholder={placeholder}
                     disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
                     aria-label={editingMessageForUi ? "Edit your last message" : "Message Claude"}
                     aria-autocomplete="list"
                     aria-controls={
-                      showAtMentionSuggestions && atMentionSuggestions.length > 0
-                        ? atMentionListId
-                        : showSkillSuggestions && skillSuggestions.length > 0
-                          ? skillListId
-                          : showSymbolSuggestions && symbolSuggestions.length > 0
-                            ? symbolListId
-                            : showCommandSuggestions && commandSuggestions.length > 0
-                              ? commandListId
-                              : undefined
+                      composerSuggestions.isVisible ? composerSuggestions.listId : undefined
                     }
-                    aria-expanded={
-                      (showCommandSuggestions && commandSuggestions.length > 0) ||
-                      (showAtMentionSuggestions && atMentionSuggestions.length > 0) ||
-                      (showSkillSuggestions && skillSuggestions.length > 0) ||
-                      (showSymbolSuggestions && symbolSuggestions.length > 0)
-                    }
+                    aria-expanded={composerSuggestions.isVisible}
                     // Creation favors prompt space; workspaces preserve transcript space. Mobile
                     // hides the shortcut hints the workspace floor exists for, so that room is
                     // dead space on a screen that has none to spare.
