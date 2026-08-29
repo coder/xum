@@ -35,6 +35,7 @@ import {
 } from "@/common/types/agentAiDefaults";
 import {
   isWorktreeRuntime,
+  normalizeRuntimeEnablement,
   RUNTIME_ENABLEMENT_IDS,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
@@ -65,7 +66,7 @@ import {
   isHeartbeatWhenBusy,
   isValidHeartbeatScheduleUpdatedAt,
 } from "@/constants/heartbeat";
-import { normalizeGoalDefaults } from "@/constants/goals";
+import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import {
   isValidModelFormat,
   normalizeSelectedModel,
@@ -2120,6 +2121,101 @@ export class Config {
    */
   async editConfig(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
     return this.enqueueConfigEdit(fn);
+  }
+
+  getClientConfig() {
+    const config = this.loadConfigOrDefault();
+    const muxGovernorUrl = config.muxGovernorUrl ?? null;
+    return {
+      userPreferencesInitialized: config.migrations?.userPreferencesInitialized === true,
+      userPreferences: config.userPreferences,
+      taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
+      muxGatewayEnabled: config.muxGatewayEnabled,
+      muxGatewayModels: config.muxGatewayModels,
+      routePriority: config.routePriority,
+      routeOverrides: config.routeOverrides,
+      minThinkingLevelByModel: config.minThinkingLevelByModel,
+      modelFallbacks: config.modelFallbacks,
+      defaultModel: config.defaultModel,
+      advisorModelString: config.advisorModelString ?? null,
+      advisorThinkingLevel: config.advisorThinkingLevel ?? null,
+      advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
+      advisorMaxOutputTokens: config.advisorMaxOutputTokens,
+      hiddenModels: config.hiddenModels,
+      coderWorkspaceArchiveBehavior:
+        config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+      worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
+      runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
+      defaultRuntime: config.defaultRuntime ?? null,
+      agentAiDefaults: config.agentAiDefaults ?? {},
+      muxGovernorUrl,
+      muxGovernorEnrolled: Boolean(config.muxGovernorUrl && config.muxGovernorToken),
+      chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
+      llmDebugLogs: config.llmDebugLogs === true,
+      heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
+      heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
+      goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
+    };
+  }
+
+  async updateMuxGatewayPrefs(input: {
+    muxGatewayEnabled: boolean;
+    muxGatewayModels: string[];
+  }): Promise<void> {
+    await this.editConfig((config) => ({
+      ...config,
+      muxGatewayEnabled: input.muxGatewayEnabled ? undefined : false,
+      muxGatewayModels: [...new Set(input.muxGatewayModels)].sort(),
+    }));
+  }
+
+  async updateCoderPrefs(input: {
+    coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior;
+    worktreeArchiveBehavior: WorktreeArchiveBehavior;
+  }): Promise<void> {
+    await this.editConfig((config) => ({ ...config, ...input }));
+  }
+
+  async updateChatTranscriptFullWidth(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.chatTranscriptFullWidth = true;
+      else delete config.chatTranscriptFullWidth;
+      return config;
+    });
+  }
+
+  async updateLlmDebugLogs(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => ({ ...config, llmDebugLogs: enabled }));
+  }
+
+  async updateHeartbeatDefaultPrompt(defaultPrompt: string | null | undefined): Promise<void> {
+    await this.editConfig((config) => {
+      const trimmed = defaultPrompt?.trim();
+      if (trimmed) config.heartbeatDefaultPrompt = trimmed;
+      else delete config.heartbeatDefaultPrompt;
+      return config;
+    });
+  }
+
+  async updateHeartbeatDefaultIntervalMs(intervalMs: number | null | undefined): Promise<void> {
+    await this.editConfig((config) => {
+      if (intervalMs != null) config.heartbeatDefaultIntervalMs = intervalMs;
+      else delete config.heartbeatDefaultIntervalMs;
+      return config;
+    });
+  }
+
+  async updateGoalDefaults(
+    goalDefaults: Parameters<typeof normalizeGoalDefaults>[0]
+  ): Promise<void> {
+    await this.editConfig((config) => ({
+      ...config,
+      goalDefaults: normalizeGoalDefaults(goalDefaults),
+    }));
+  }
+
+  async unenrollMuxGovernor(): Promise<void> {
+    await this.editConfig(({ muxGovernorUrl: _url, muxGovernorToken: _token, ...rest }) => rest);
   }
 
   async updateAgentAiDefaults(agentAiDefaults: unknown): Promise<void> {

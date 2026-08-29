@@ -1,5 +1,4 @@
 import { os, ORPCError } from "@orpc/server";
-import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import * as schemas from "@/common/orpc/schemas";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ORPCContext } from "./context";
@@ -47,7 +46,6 @@ import {
   setWorkspaceGoal,
   updateUpcomingWorkspaceGoal,
 } from "@/node/services/workspaceOperations";
-import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import { Err, Ok } from "@/common/types/result";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 
@@ -91,8 +89,6 @@ import {
   isLayoutPresetsConfigEmpty,
   normalizeLayoutPresetsConfig,
 } from "@/common/types/uiLayouts";
-import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
-import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 
 import {
   getAgentSkill,
@@ -264,43 +260,7 @@ export const router = (authToken?: string) => {
       getConfig: t
         .input(schemas.config.getConfig.input)
         .output(schemas.config.getConfig.output)
-        .handler(({ context }) => {
-          const config = context.config.loadConfigOrDefault();
-          // Determine governor enrollment: requires both URL and token
-          const muxGovernorUrl = config.muxGovernorUrl ?? null;
-          const muxGovernorEnrolled = Boolean(config.muxGovernorUrl && config.muxGovernorToken);
-          return {
-            userPreferencesInitialized: config.migrations?.userPreferencesInitialized === true,
-            userPreferences: config.userPreferences,
-            taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
-            muxGatewayEnabled: config.muxGatewayEnabled,
-            muxGatewayModels: config.muxGatewayModels,
-            routePriority: config.routePriority,
-            routeOverrides: config.routeOverrides,
-            minThinkingLevelByModel: config.minThinkingLevelByModel,
-            modelFallbacks: config.modelFallbacks,
-            defaultModel: config.defaultModel,
-            advisorModelString: config.advisorModelString ?? null,
-            advisorThinkingLevel: config.advisorThinkingLevel ?? null,
-            advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
-            advisorMaxOutputTokens: config.advisorMaxOutputTokens,
-            hiddenModels: config.hiddenModels,
-            coderWorkspaceArchiveBehavior:
-              config.coderWorkspaceArchiveBehavior ?? DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-            worktreeArchiveBehavior: config.worktreeArchiveBehavior ?? "keep",
-            runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
-            defaultRuntime: config.defaultRuntime ?? null,
-            agentAiDefaults: config.agentAiDefaults ?? {},
-            // Xum Governor enrollment status (safe fields only - token never exposed)
-            muxGovernorUrl,
-            muxGovernorEnrolled,
-            chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
-            llmDebugLogs: config.llmDebugLogs === true,
-            heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
-            heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
-            goalDefaults: normalizeGoalDefaults(config.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
-          };
-        }),
+        .handler(({ context }) => context.config.getClientConfig()),
       onConfigChanged: t
         .input(schemas.config.onConfigChanged.input)
         .output(schemas.config.onConfigChanged.output)
@@ -316,20 +276,7 @@ export const router = (authToken?: string) => {
         .input(schemas.config.updateMuxGatewayPrefs.input)
         .output(schemas.config.updateMuxGatewayPrefs.output)
         .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const nextModels = Array.from(new Set(input.muxGatewayModels));
-            nextModels.sort();
-
-            return {
-              ...config,
-              muxGatewayEnabled: input.muxGatewayEnabled ? undefined : false,
-              // Persist explicit empty selections so startup migration doesn't
-              // rehydrate stale legacy localStorage values.
-              muxGatewayModels: nextModels,
-            };
-          });
-          // Notify subscribers (useProvidersConfig) so the frontend picks up the
-          // new gateway enabled/models state without needing localStorage.
+          await context.config.updateMuxGatewayPrefs(input);
           context.providerService.notifyConfigChanged();
         }),
       updateRoutePreferences: t
@@ -363,15 +310,7 @@ export const router = (authToken?: string) => {
       updateCoderPrefs: t
         .input(schemas.config.updateCoderPrefs.input)
         .output(schemas.config.updateCoderPrefs.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            return {
-              ...config,
-              coderWorkspaceArchiveBehavior: input.coderWorkspaceArchiveBehavior,
-              worktreeArchiveBehavior: input.worktreeArchiveBehavior,
-            };
-          });
-        }),
+        .handler(({ context, input }) => context.config.updateCoderPrefs(input)),
       updateRuntimeEnablement: t
         .input(schemas.config.updateRuntimeEnablement.input)
         .output(schemas.config.updateRuntimeEnablement.output)
@@ -388,70 +327,34 @@ export const router = (authToken?: string) => {
       updateChatTranscriptFullWidth: t
         .input(schemas.config.updateChatTranscriptFullWidth.input)
         .output(schemas.config.updateChatTranscriptFullWidth.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            if (input.enabled) {
-              config.chatTranscriptFullWidth = true;
-            } else {
-              delete config.chatTranscriptFullWidth;
-            }
-            return config;
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.config.updateChatTranscriptFullWidth(input.enabled)
+        ),
       updateLlmDebugLogs: t
         .input(schemas.config.updateLlmDebugLogs.input)
         .output(schemas.config.updateLlmDebugLogs.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            config.llmDebugLogs = input.enabled;
-            return config;
-          });
-        }),
+        .handler(({ context, input }) => context.config.updateLlmDebugLogs(input.enabled)),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const trimmed = input.defaultPrompt?.trim();
-            if (trimmed && trimmed.length > 0) {
-              config.heartbeatDefaultPrompt = trimmed;
-            } else {
-              delete config.heartbeatDefaultPrompt;
-            }
-            return config;
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.config.updateHeartbeatDefaultPrompt(input.defaultPrompt)
+        ),
       updateHeartbeatDefaultIntervalMs: t
         .input(schemas.config.updateHeartbeatDefaultIntervalMs.input)
         .output(schemas.config.updateHeartbeatDefaultIntervalMs.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            if (input.intervalMs != null) {
-              config.heartbeatDefaultIntervalMs = input.intervalMs;
-            } else {
-              delete config.heartbeatDefaultIntervalMs;
-            }
-            return config;
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.config.updateHeartbeatDefaultIntervalMs(input.intervalMs)
+        ),
       updateGoalDefaults: t
         .input(schemas.config.updateGoalDefaults.input)
         .output(schemas.config.updateGoalDefaults.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            config.goalDefaults = normalizeGoalDefaults(input.goalDefaults);
-            return config;
-          });
-        }),
+        .handler(({ context, input }) => context.config.updateGoalDefaults(input.goalDefaults)),
       unenrollMuxGovernor: t
         .input(schemas.config.unenrollMuxGovernor.input)
         .output(schemas.config.unenrollMuxGovernor.output)
         .handler(async ({ context }) => {
-          await context.config.editConfig((config) => {
-            const { muxGovernorUrl: _url, muxGovernorToken: _token, ...rest } = config;
-            return rest;
-          });
-
+          await context.config.unenrollMuxGovernor();
           await context.policyService.refreshNow();
         }),
     },
