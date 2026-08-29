@@ -19,7 +19,12 @@ import assert from "@/common/utils/assert";
 import { ADVISOR_USAGE_GUIDANCE } from "@/common/constants/advisor";
 import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import { filterEmptyAssistantMessages } from "@/browser/utils/messages/modelMessageTransform";
+import type { PostCompactionAttachment } from "@/common/types/attachment";
+import {
+  addInterruptedSentinel,
+  filterEmptyAssistantMessages,
+} from "@/browser/utils/messages/modelMessageTransform";
+import type { ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
@@ -53,6 +58,13 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  applyCacheControlToTools,
+  createCachedSystemMessage,
+  createOpenAICachedSystemMessage,
+  type AnthropicCacheTtl,
+} from "@/common/utils/ai/cacheStrategy";
+import { prepareMessagesForProvider } from "./messagePipeline";
 
 export function prepareProviderRequestMessages(
   messages: MuxMessage[],
@@ -80,6 +92,94 @@ export function prepareProviderRequestMessages(
       preserveReasoningOnly
     ),
     contextBoundarySlicedCount,
+  };
+}
+
+export interface PromptPayload {
+  activeContextMessages: MuxMessage[];
+  providerRequestMessages: MuxMessage[];
+  contextBoundarySlicedCount: number;
+  messages: ModelMessage[];
+  system: string | SystemModelMessage | undefined;
+  tools: Record<string, Tool> | undefined;
+  systemMessageTokens: number;
+}
+
+export interface AssemblePromptPayloadOptions {
+  history: MuxMessage[];
+  systemMessage: string;
+  systemMessageTokens: number;
+  tools?: Record<string, Tool>;
+  modelString: string;
+  routeProvider?: string;
+  providerForMessages: string;
+  effectiveThinkingLevel: ThinkingLevel;
+  effectiveAgentId: string;
+  toolNamesForSentinel: string[];
+  planContentForTransition?: string;
+  planFilePath?: string;
+  postCompactionAttachments?: PostCompactionAttachment[] | null;
+  providersConfig?: ProvidersConfigMap | null;
+  anthropicCacheTtl?: AnthropicCacheTtl | null;
+  workspaceId: string;
+}
+
+export async function assemblePromptPayload(
+  options: AssemblePromptPayloadOptions
+): Promise<PromptPayload> {
+  const prepared = prepareProviderRequestMessages(
+    options.history,
+    options.providerForMessages,
+    options.effectiveThinkingLevel
+  );
+  let messages = await prepareMessagesForProvider({
+    messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+    effectiveAgentId: options.effectiveAgentId,
+    toolNamesForSentinel: options.toolNamesForSentinel,
+    planContentForTransition: options.planContentForTransition,
+    planFilePath: options.planFilePath,
+    postCompactionAttachments: options.postCompactionAttachments,
+    providerForMessages: options.providerForMessages,
+    effectiveThinkingLevel: options.effectiveThinkingLevel,
+    modelString: options.modelString,
+    providersConfig: options.providersConfig,
+    anthropicCacheTtl: options.anthropicCacheTtl,
+    workspaceId: options.workspaceId,
+  });
+  let system: string | SystemModelMessage | undefined = options.systemMessage;
+  const cachedSystemMessage = createCachedSystemMessage(
+    options.systemMessage,
+    options.modelString,
+    options.anthropicCacheTtl,
+    options.providersConfig
+  );
+  if (cachedSystemMessage) {
+    // Anthropic requires the cached system row in messages and no separate system parameter.
+    messages = [cachedSystemMessage, ...messages];
+    system = undefined;
+  } else {
+    system =
+      createOpenAICachedSystemMessage(
+        options.systemMessage,
+        options.modelString,
+        options.routeProvider,
+        options.providersConfig ?? null
+      ) ?? options.systemMessage;
+  }
+
+  return {
+    ...prepared,
+    messages,
+    system,
+    tools: options.tools
+      ? applyCacheControlToTools(
+          options.tools,
+          options.modelString,
+          options.anthropicCacheTtl,
+          options.providersConfig
+        )
+      : undefined,
+    systemMessageTokens: options.systemMessageTokens,
   };
 }
 

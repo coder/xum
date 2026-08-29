@@ -15,10 +15,6 @@ import {
 } from "@/common/constants/advisor";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
-import {
-  addInterruptedSentinel,
-  filterEmptyAssistantMessages,
-} from "@/browser/utils/messages/modelMessageTransform";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
@@ -166,10 +162,10 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
-import { prepareMessagesForProvider } from "./messagePipeline";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import { modelCostsIncluded } from "./providerModelFactory";
 import {
+  assemblePromptPayload,
   buildPlanInstructions,
   buildStreamSystemContext,
   prepareProviderRequestMessages,
@@ -1011,8 +1007,6 @@ export class TurnRequestBuilder {
     if (wireProviderName === "openai") {
       log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
     }
-    const messagesWithSentinel = addInterruptedSentinel(providerRequestMessages);
-
     const getWorkspaceMetadataStartedAt = Date.now();
     const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
     recordStartupPhaseTiming("getWorkspaceMetadataMs", getWorkspaceMetadataStartedAt);
@@ -2329,22 +2323,29 @@ export class TurnRequestBuilder {
         }
 
         if (options.initializeToolSearch && toolSearchRuntime?.state) {
-          seedToolSearchActivationsFromMessages(toolSearchRuntime.state, messagesWithSentinel);
+          seedToolSearchActivationsFromMessages(
+            toolSearchRuntime.state,
+            attemptProviderRequestMessages
+          );
         }
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
         const prepareMessagesForProviderStartedAt = Date.now();
-        const finalMessages = await prepareMessagesForProvider({
-          messagesWithSentinel: addInterruptedSentinel(attemptProviderRequestMessages),
+        const attemptPayload = await assemblePromptPayload({
+          history: options.sourceMessages,
+          systemMessage: attemptSystem,
+          systemMessageTokens: attemptSystemTokens,
+          tools: attemptTools,
+          modelString: seed.rawModelString,
+          routeProvider: seed.routeProvider,
+          providerForMessages: seed.wireProviderName,
+          effectiveThinkingLevel: seed.effectiveThinkingLevel,
           effectiveAgentId,
           toolNamesForSentinel,
           planContentForTransition,
           planFilePath,
           postCompactionAttachments,
-          providerForMessages: seed.wireProviderName,
-          effectiveThinkingLevel: seed.effectiveThinkingLevel,
-          modelString: seed.rawModelString,
           providersConfig: seed.providersConfig,
           anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
           workspaceId,
@@ -2355,6 +2356,7 @@ export class TurnRequestBuilder {
             prepareMessagesForProviderStartedAt
           );
         }
+        const finalMessages = attemptPayload.messages;
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2410,25 +2412,25 @@ export class TurnRequestBuilder {
           });
         };
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
-          const rebuiltMessages = prepareProviderRequestMessages(
-            options.sourceMessages,
-            seed.wireProviderName,
-            level
-          ).providerRequestMessages;
-          return prepareMessagesForProvider({
-            messagesWithSentinel: addInterruptedSentinel(rebuiltMessages),
+          const rebuiltPayload = await assemblePromptPayload({
+            history: options.sourceMessages,
+            systemMessage: attemptSystem,
+            systemMessageTokens: attemptSystemTokens,
+            tools: attemptTools,
+            modelString: seed.rawModelString,
+            routeProvider: seed.routeProvider,
+            providerForMessages: seed.wireProviderName,
+            effectiveThinkingLevel: level,
             effectiveAgentId,
             toolNamesForSentinel,
             planContentForTransition,
             planFilePath,
             postCompactionAttachments,
-            providerForMessages: seed.wireProviderName,
-            effectiveThinkingLevel: level,
-            modelString: seed.rawModelString,
             providersConfig: seed.providersConfig,
             anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
             workspaceId,
           });
+          return rebuiltPayload.messages;
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
           level,
@@ -2444,8 +2446,10 @@ export class TurnRequestBuilder {
           providerRequestMessages: attemptProviderRequestMessages,
           messages: finalMessages,
           system: attemptSystem,
+          engineSystem: attemptPayload.system,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
+          engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
           providerOptions: preparedAttempt.providerOptions,
@@ -2652,7 +2656,7 @@ export class TurnRequestBuilder {
       const errMsg = getErrorMessage(error);
       workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
     }
-    const toolsForStream = tools;
+    const toolsForStream = primaryRequest.engineTools;
 
     const devToolsService = this.dependencies.devToolsService;
     const canQueueDevToolsRunMetadata =
@@ -2750,12 +2754,11 @@ export class TurnRequestBuilder {
                 model: nextRequest.model,
                 modelString: nextModelString,
                 messages: nextRequest.messages,
-                system: nextRequest.system,
-                tools: nextRequest.tools,
+                system: nextRequest.engineSystem,
+                tools: nextRequest.engineTools,
                 providerOptions: nextRequest.providerOptions,
                 headers: nextHeaders,
                 callSettingsOverrides: nextRequest.resolvedOverrides.standard,
-                anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
                 thinkingLevel: nextRequest.effectiveThinkingLevel,
                 forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                 rebuildProviderOptionsForThinkingLevel:
@@ -2822,7 +2825,7 @@ export class TurnRequestBuilder {
       model: modelResult.data.model,
       modelString,
       historySequence,
-      system: systemMessage,
+      system: primaryRequest.engineSystem,
       runtime,
       messageId: assistantMessageId,
       abortSignal: combinedAbortSignal,
@@ -2847,7 +2850,6 @@ export class TurnRequestBuilder {
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,
-      anthropicCacheTtlOverride: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
       callSettingsOverrides: resolvedOverrides.standard,
       onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
       onStepMessages: advisorToolEligible
