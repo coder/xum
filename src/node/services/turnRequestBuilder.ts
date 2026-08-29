@@ -574,7 +574,7 @@ export interface TurnRequestBuilderDependencies {
   ) => void;
 }
 
-interface PrepareModelAttemptOptions {
+export interface PrepareModelAttemptOptions {
   rawModelString: string;
   canonicalModelString: string;
   canonicalProviderName: string;
@@ -595,7 +595,7 @@ interface PrepareModelAttemptOptions {
   recordStartupPhaseTiming?: (phase: string, phaseStartedAt: number) => void;
 }
 
-interface PreparedModelAttempt {
+export interface PreparedModelAttempt {
   providerOptions: Record<string, unknown>;
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
@@ -776,7 +776,7 @@ export class TurnRequestBuilder {
     };
   }
 
-  private prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
+  prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
     const buildProviderOptionsStartedAt = Date.now();
     const providerOptions = buildProviderOptions(
       options.optionsModelString,
