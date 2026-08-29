@@ -96,14 +96,44 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
   anchorRef,
   highlightQuery,
   isFileSuggestion = false,
-  selectedIndex = 0,
-  onSelectedIndexChange = () => undefined,
+  selectedIndex: selectedIndexProp,
+  onSelectedIndexChange,
 }) => {
+  const [uncontrolledSelectedIndex, setUncontrolledSelectedIndex] = useState(0);
+  const selectedIndex = selectedIndexProp ?? uncontrolledSelectedIndex;
+  const isSelectionControlled = selectedIndexProp !== undefined && onSelectedIndexChange != null;
+  const setSelectedIndex = (next: React.SetStateAction<number>) => {
+    const resolved = typeof next === "function" ? next(selectedIndex) : next;
+    if (!isSelectionControlled) setUncontrolledSelectedIndex(resolved);
+    onSelectedIndexChange?.(resolved);
+  };
   const [position, setPosition] = useState<{ top: number; left: number; width: number } | null>(
     null
   );
   const menuRef = useRef<HTMLDivElement>(null);
   const selectedRef = useRef<HTMLDivElement>(null);
+  const previousSuggestionsRef = useRef<SlashSuggestion[]>(suggestions);
+  const wasVisibleRef = useRef(isVisible);
+
+  useLayoutEffect(() => {
+    if (isSelectionControlled) return;
+    const wasVisible = wasVisibleRef.current;
+    wasVisibleRef.current = isVisible;
+    const previousSuggestions = previousSuggestionsRef.current;
+    previousSuggestionsRef.current = suggestions;
+    if (!isVisible || suggestions.length === 0 || !wasVisible) {
+      setUncontrolledSelectedIndex(0);
+      return;
+    }
+    setUncontrolledSelectedIndex((previousIndex) => {
+      const previousSelected = previousSuggestions[previousIndex];
+      const nextIndex = previousSelected
+        ? suggestions.findIndex((suggestion) => suggestion.id === previousSelected.id)
+        : -1;
+      return nextIndex >= 0 ? nextIndex : Math.min(previousIndex, suggestions.length - 1);
+    });
+  }, [isSelectionControlled, isVisible, suggestions]);
+
   // Scroll selected item into view
   useLayoutEffect(() => {
     selectedRef.current?.scrollIntoView({ block: "nearest" });
@@ -140,6 +170,29 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
       window.removeEventListener("scroll", updatePosition, true);
     };
   }, [anchorRef, isVisible, suggestions]);
+
+  useEffect(() => {
+    if (isSelectionControlled || !isVisible || suggestions.length === 0) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const delta = event.key === "ArrowDown" ? 1 : -1;
+        setUncontrolledSelectedIndex(
+          (index) => (index + delta + suggestions.length) % suggestions.length
+        );
+      } else if ((event.key === "Tab" || event.key === "Enter") && !event.shiftKey) {
+        event.preventDefault();
+        const suggestion = suggestions[selectedIndex];
+        if (suggestion) onSelectSuggestion(suggestion);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onDismiss();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [isSelectionControlled, isVisible, onDismiss, onSelectSuggestion, selectedIndex, suggestions]);
 
   // Click outside handler
   useEffect(() => {
@@ -193,7 +246,7 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
         <div
           key={suggestion.id}
           ref={index === selectedIndex ? selectedRef : undefined}
-          onMouseEnter={() => onSelectedIndexChange(index)}
+          onMouseEnter={() => setSelectedIndex(index)}
           onClick={() => onSelectSuggestion(suggestion)}
           id={`${resolvedListId}-option-${suggestion.id}`}
           role="option"

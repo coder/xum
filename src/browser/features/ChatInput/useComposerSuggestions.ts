@@ -159,7 +159,12 @@ interface UseComposerSuggestionsOptions {
 export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const { api } = useAPI();
   const [cursor, setCursor] = useState(options.input.length);
-  const [selection, setSelection] = useState({ tokenKey: "", index: 0, dismissed: false });
+  const [selection, setSelection] = useState({
+    channelKey: "",
+    index: 0,
+    selectedId: null as string | null,
+    dismissedTokenKey: "",
+  });
   const [fileCompletion, setFileCompletion] = useState<{
     tokenKey: string;
     suggestions: SlashSuggestion[];
@@ -179,6 +184,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
 
   const activeToken = detectActiveComposerToken(options.input, cursor);
   const activeTokenKey = tokenKey(activeToken) ?? "";
+  const activeChannelKey = activeToken ? `${activeToken.kind}:${activeToken.startIndex}` : "";
   const synchronousSuggestions = getSynchronousComposerSuggestions(activeToken, {
     agentSkills,
     mcpPrompts,
@@ -190,11 +196,15 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     activeToken?.kind === "file" && fileCompletion.tokenKey === activeTokenKey
       ? fileCompletion.suggestions
       : synchronousSuggestions;
-  const dismissed = selection.tokenKey === activeTokenKey && selection.dismissed;
-  const isVisible = !dismissed && suggestions.length > 0;
+  const isVisible = selection.dismissedTokenKey !== activeTokenKey && suggestions.length > 0;
+  const preservedIndex = selection.selectedId
+    ? suggestions.findIndex((suggestion) => suggestion.id === selection.selectedId)
+    : -1;
   const selectedIndex =
-    selection.tokenKey === activeTokenKey
-      ? Math.min(selection.index, Math.max(0, suggestions.length - 1))
+    selection.channelKey === activeChannelKey
+      ? preservedIndex >= 0
+        ? preservedIndex
+        : Math.min(selection.index, Math.max(0, suggestions.length - 1))
       : 0;
 
   useEffect(
@@ -311,7 +321,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         if (mcpAbort.current === controller) mcpAbort.current = null;
       });
     mcpRequest.current = request;
-  }, [api, activeToken?.kind, options.variant, options.workspaceId]);
+  }, [api, activeToken?.kind, activeTokenKey, options.variant, options.workspaceId]);
 
   useEffect(() => {
     if (!api || activeToken?.kind !== "file") return;
@@ -354,12 +364,23 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   }, [api, activeTokenKey, options.variant, options.workspaceId, options.projectPath]);
 
   const dismiss = useCallback(() => {
-    setSelection({ tokenKey: activeTokenKey, index: selectedIndex, dismissed: true });
-  }, [activeTokenKey, selectedIndex]);
+    setSelection({
+      channelKey: activeChannelKey,
+      index: selectedIndex,
+      selectedId: suggestions[selectedIndex]?.id ?? null,
+      dismissedTokenKey: activeTokenKey,
+    });
+  }, [activeChannelKey, activeTokenKey, selectedIndex, suggestions]);
 
   const setSelectedIndex = useCallback(
-    (index: number) => setSelection({ tokenKey: activeTokenKey, index, dismissed: false }),
-    [activeTokenKey]
+    (index: number) =>
+      setSelection({
+        channelKey: activeChannelKey,
+        index,
+        selectedId: suggestions[index]?.id ?? null,
+        dismissedTokenKey: "",
+      }),
+    [activeChannelKey, suggestions]
   );
 
   const select = useCallback(
@@ -368,7 +389,12 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
       const applied = applyComposerSuggestion(options.input, activeToken, suggestion);
       options.setInput(applied.input);
       setCursor(applied.cursor);
-      setSelection({ tokenKey: activeTokenKey, index: 0, dismissed: true });
+      setSelection({
+        channelKey: activeChannelKey,
+        index: 0,
+        selectedId: null,
+        dismissedTokenKey: tokenKey(detectActiveComposerToken(applied.input, applied.cursor)) ?? "",
+      });
       requestAnimationFrame(() => {
         const element = options.inputRef.current;
         if (!element || element.disabled) return;
@@ -377,7 +403,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         element.selectionEnd = applied.cursor;
       });
     },
-    [activeToken, activeTokenKey, options.input, options.inputRef, options.setInput]
+    [activeChannelKey, activeToken, options.input, options.inputRef, options.setInput]
   );
 
   useEffect(() => {
