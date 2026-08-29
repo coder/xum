@@ -39,6 +39,7 @@ interface SubscriptionLoopOptions<TClient, TEvent, TContext> {
   onAttemptFinished?: (status: AttemptStatus) => void;
   watchdog?: false | { timeoutMs?: number; checkIntervalMs?: number };
   backoffAfterAbort?: boolean;
+  sleep?: (timeoutMs: number, signal: AbortSignal) => Promise<void>;
 }
 
 function sleepWithAbort(timeoutMs: number, signal: AbortSignal): Promise<void> {
@@ -146,7 +147,10 @@ export async function runSubscriptionLoop<TClient, TEvent, TContext>(
     options.onAttemptFinished?.(status);
 
     if (options.backoffAfterAbort !== false || !attemptController.signal.aborted) {
-      await sleepWithAbort(calculateSubscriptionBackoffMs(attempt), options.signal);
+      await (options.sleep ?? sleepWithAbort)(
+        calculateSubscriptionBackoffMs(attempt),
+        options.signal
+      );
       attempt++;
     }
   }
