@@ -7,10 +7,12 @@ import {
 } from "./subscriptionTransport";
 
 const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
+const getClient = () => Promise.resolve({});
+const noSleep = () => Promise.resolve();
 
 function closeOnAbort<T>(signal: AbortSignal) {
   const stream = createControllableAsyncIterable<T>();
-  signal.addEventListener("abort", stream.close, { once: true });
+  signal.addEventListener("abort", () => stream.close(), { once: true });
   return stream;
 }
 
@@ -36,24 +38,25 @@ describe("runSubscriptionLoop", () => {
     await runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => ({}),
+      getClient,
       getClientChangeSignal: () => clientChange.signal,
-      subscribe: async () => {
+      subscribe: () => {
         const events = eventsByAttempt[subscription++] ?? [];
         activeStream = createControllableAsyncIterable<number>();
         for (const event of events) activeStream.push(event);
         if (events.length === 0) activeStream.close();
-        return { events: activeStream.iterable, context: undefined };
+        return Promise.resolve({ events: activeStream.iterable, context: undefined });
       },
       onEvent: () => activeStream?.close(),
       watchdog: false,
-      sleep: async (timeoutMs) => {
+      sleep: (timeoutMs) => {
         sleeps.push(timeoutMs);
         if (sleeps.length === expectedSleeps.length) controller.abort();
+        return Promise.resolve();
       },
     });
 
-    expect(sleeps).toEqual(expectedSleeps);
+    expect(sleeps).toEqual([...expectedSleeps]);
   });
 
   test("retries after subscribe errors", async () => {
@@ -65,19 +68,21 @@ describe("runSubscriptionLoop", () => {
     await runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => ({}),
+      getClient,
       getClientChangeSignal: () => clientChange.signal,
-      subscribe: async (_client, signal) => {
+      subscribe: (_client, signal) => {
         subscriptions++;
-        if (subscriptions === 1) throw new Error("subscribe failed");
+        if (subscriptions === 1) return Promise.reject(new Error("subscribe failed"));
         const stream = closeOnAbort<number>(signal);
         stream.push(1);
-        return { events: stream.iterable, context: undefined };
+        return Promise.resolve({ events: stream.iterable, context: undefined });
       },
       onEvent: () => controller.abort(),
-      onError: (error) => errors.push(error),
+      onError: (error) => {
+        errors.push(error);
+      },
       watchdog: false,
-      sleep: async () => undefined,
+      sleep: noSleep,
     });
 
     expect(subscriptions).toBe(2);
@@ -96,7 +101,7 @@ describe("runSubscriptionLoop", () => {
     const loop = runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => ({}),
+      getClient,
       getClientChangeSignal: () => clientChange.signal,
       subscribe: async (_client, signal) => {
         firstAttemptSignal ??= signal;
@@ -128,12 +133,12 @@ describe("runSubscriptionLoop", () => {
     const loop = runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => ({}),
+      getClient,
       getClientChangeSignal: () => clientChange.signal,
-      subscribe: async (_client, signal) => {
+      subscribe: (_client, signal) => {
         attemptSignal = signal;
         stream = closeOnAbort<number>(signal);
-        return { events: stream.iterable, context: undefined };
+        return Promise.resolve({ events: stream.iterable, context: undefined });
       },
       onEvent: () => undefined,
       watchdog: { timeoutMs: 30, checkIntervalMs: 2 },
@@ -159,12 +164,12 @@ describe("runSubscriptionLoop", () => {
     await runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => ({}),
+      getClient,
       getClientChangeSignal: () => clientChange.signal,
-      subscribe: async (_client, signal) => {
+      subscribe: (_client, signal) => {
         signals.push(signal);
         const stream = closeOnAbort<number>(signal);
-        return { events: stream.iterable, context: undefined };
+        return Promise.resolve({ events: stream.iterable, context: undefined });
       },
       onEvent: () => undefined,
       watchdog: { timeoutMs: 10, checkIntervalMs: 1 },
@@ -187,13 +192,13 @@ describe("runSubscriptionLoop", () => {
     const loop = runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => client,
+      getClient: () => Promise.resolve(client),
       getClientChangeSignal: () => clientChange.signal,
-      subscribe: async (currentClient, signal) => {
+      subscribe: (currentClient, signal) => {
         attached.push(currentClient);
         const stream = closeOnAbort<number>(signal);
         if (currentClient === "second") stream.push(1);
-        return { events: stream.iterable, context: undefined };
+        return Promise.resolve({ events: stream.iterable, context: undefined });
       },
       onEvent: () => controller.abort(),
       watchdog: false,
@@ -218,12 +223,12 @@ describe("runSubscriptionLoop", () => {
     const loop = runSubscriptionLoop({
       name: "test",
       signal: controller.signal,
-      getClient: async () => ({}),
+      getClient,
       getClientChangeSignal: () => clientChange.signal,
-      subscribe: async (_client, signal) => {
+      subscribe: (_client, signal) => {
         subscriptions++;
         const stream = closeOnAbort<number>(signal);
-        return { events: stream.iterable, context: undefined };
+        return Promise.resolve({ events: stream.iterable, context: undefined });
       },
       onEvent: () => undefined,
       watchdog: false,

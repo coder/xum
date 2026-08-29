@@ -839,22 +839,12 @@ export class WorkspaceStore {
   private fileModifyingToolMs = new Map<string, number>();
   private fileModifyingToolSubs = new MapStore<string, void>();
 
-  // Idle callback handles for high-frequency, terminal-style output (init logs).
-  // Data is always updated immediately in the aggregator; only UI notification is scheduled.
-  // Using requestIdleCallback adapts to actual CPU availability rather than a fixed timer.
-  // NOTE: Streaming text/reasoning/tool deltas do NOT use this — they use
-  // scheduleStreamingStateBump() (microtask coalescing) so the smoothing engine's
-  // RAF presentation clock isn't competing with a 100ms ingestion clock.
+  // Idle callbacks keep high-frequency init logs from blocking the renderer.
   private deltaIdleHandles = new Map<string, number>();
 
   private pendingStreamingMessageBump = new Map<string, string>();
   private streamingMessageStore = new MapStore<string, DisplayedMessage | null>();
   private advisorLiveStore = new MapStore<string, void>();
-
-  // Live streaming stats (tokens/sec) — exposed via useWorkspaceStreamingStats() as a
-  // leaf subscription. Updated on every stream-delta in the same coalesced microtask
-  // as states.bump(), but separate so changes only re-render the StreamingBarrier
-  // pill and not the entire ChatPane subtree.
   private streamingStatsStore = new MapStore<string, WorkspaceStreamingStats | null>();
 
   /**

@@ -303,21 +303,6 @@ async function waitUntil(condition: () => boolean, timeoutMs = 2000): Promise<bo
   return false;
 }
 
-/** Like {@link waitUntil} but with an attempt budget instead of a wall clock. */
-async function waitForCondition(
-  condition: () => boolean,
-  maxAttempts = 400,
-  intervalMs = 10
-): Promise<boolean> {
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    if (condition()) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return false;
-}
-
 /**
  * Sleep helper used to flush microtasks/timers between synchronous test steps.
  * Equivalent to `await new Promise(r => setTimeout(r, ms))` but easier to grep.
@@ -513,19 +498,6 @@ const streamEndEvent = (
   messageId,
   metadata: { model: TEST_MODEL, historySequence: 1, timestamp: 1_001 },
   parts: [],
-  ...overrides,
-});
-
-const streamAbortEvent = (
-  workspaceId: string,
-  messageId: string,
-  overrides: Partial<ChatEvent<"stream-abort">> = {}
-): WorkspaceChatMessage => ({
-  type: "stream-abort",
-  workspaceId,
-  messageId,
-  abortReason: "user",
-  metadata: {},
   ...overrides,
 });
 
@@ -2105,7 +2077,6 @@ describe("WorkspaceStore", () => {
         type: "reasoning-end",
         workspaceId,
         messageId,
-        timestamp: 5,
       });
       expect(bump).toHaveBeenCalledWith(workspaceId);
       unsubscribe();
