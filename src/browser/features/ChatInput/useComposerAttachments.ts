@@ -53,7 +53,7 @@ export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
 export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   const { api } = useAPI();
   const tooLargeToastKeyRef = useRef<string | null>(null);
-  // External draft transfers must not overwrite an oversized attachment kept only in memory.
+  // External draft transfers must not replace an oversized attachment kept only in memory.
   const selfWriteRef = useRef(false);
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(options.attachmentsKey)
