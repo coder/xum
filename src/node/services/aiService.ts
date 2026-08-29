@@ -9,7 +9,6 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { linkAbortSignal } from "@/node/utils/abort";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
@@ -83,7 +82,7 @@ import {
 import type { TaskService } from "@/node/services/taskService";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
-import type { StreamAbortEvent, StreamAbortReason } from "@/common/types/stream";
+import type { StreamAbortReason } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -130,18 +129,6 @@ export class AIService extends EventEmitter {
   private readonly devToolsService?: DevToolsService;
   private readonly experimentsService?: ExperimentsService;
 
-  // Tracks in-flight stream startup (before StreamManager emits stream-start).
-  // This enables user interrupts (Esc/Ctrl+C) during the UI "starting..." phase.
-  private readonly pendingStreamStarts = new Map<
-    string,
-    {
-      abortController: AbortController;
-      startTime: number;
-      syntheticMessageId: string;
-      acpPromptId?: string;
-    }
-  >();
-
   /**
    * Tracks queued DevTools run metadata by assistant message id so stream-end/abort
    * can clear orphaned entries when a stream starts but never reaches middleware run creation.
@@ -176,7 +163,8 @@ export class AIService extends EventEmitter {
     policyService?: PolicyService,
     telemetryService?: TelemetryService,
     devToolsService?: DevToolsService,
-    experimentsService?: ExperimentsService
+    experimentsService?: ExperimentsService,
+    streamManager?: StreamManager
   ) {
     super();
     // Increase max listeners to accommodate multiple concurrent workspace listeners
@@ -194,12 +182,12 @@ export class AIService extends EventEmitter {
     this.experimentsService = experimentsService;
     this.providerService = providerService;
     this.providerService.onConfigChanged(() => this.emit("providers-config-changed"));
-    this.streamManager = new StreamManager(
-      historyService,
-      sessionUsageService,
-      () => this.providerService.getConfig(),
-      (event) => this.emitEngineEvent(event)
-    );
+    this.streamManager =
+      streamManager ??
+      new StreamManager(historyService, sessionUsageService, () =>
+        this.providerService.getConfig()
+      );
+    this.streamManager.setEventSink((event) => this.emitEngineEvent(event));
     this.devToolsService = devToolsService;
     this.providerModelFactory = new ProviderModelFactory(
       config,
@@ -251,7 +239,7 @@ export class AIService extends EventEmitter {
         this.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata),
       createModel: (modelString, providerOptions, options) =>
         this.createModel(modelString, providerOptions, options),
-      isStreaming: (workspaceId) => this.isStreaming(workspaceId),
+      isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
       trackPendingDevToolsRunMetadata: (messageId, workspaceId, metadataId) =>
         this.trackPendingDevToolsRunMetadata(messageId, workspaceId, metadataId),
     });
@@ -593,6 +581,7 @@ export class AIService extends EventEmitter {
       aiService: this,
       historyService: this.historyService,
     });
+    this.streamManager.setMockStreamLifecycle(this.mockAiStreamPlayer);
   }
 
   async getWorkspaceMetadata(workspaceId: string): Promise<Result<WorkspaceMetadata>> {
@@ -921,20 +910,15 @@ export class AIService extends EventEmitter {
   ): Promise<Result<TurnStreamHandle, SendMessageError>> {
     const { messages, workspaceId, modelString, thinkingLevel, abortSignal, agentId, muxMetadata } =
       opts;
-    const pendingAbortController = new AbortController();
-    const startTime = Date.now();
-    const syntheticMessageId =
-      "starting-" + startTime + "-" + Math.random().toString(36).substring(2, 11);
-    const unlinkAbortSignal = linkAbortSignal(abortSignal, pendingAbortController);
-
-    this.pendingStreamStarts.set(workspaceId, {
-      abortController: pendingAbortController,
-      startTime,
-      syntheticMessageId,
+    // Register before the first await so interrupts can cancel slow preparation.
+    const pendingStart = this.streamManager.beginStreamStart({
+      workspaceId,
+      abortSignal,
       acpPromptId: opts.acpPromptId,
     });
-
-    const combinedAbortSignal = pendingAbortController.signal;
+    const startTime = Date.now();
+    const syntheticMessageId = pendingStart.syntheticMessageId;
+    const combinedAbortSignal = pendingStart.abortSignal;
     const startupPhaseTimingsMs: Record<string, number> = {};
     const recordStartupPhaseTiming = (phase: string, phaseStartedAt: number): void => {
       startupPhaseTimingsMs[phase] = Date.now() - phaseStartedAt;
@@ -1025,11 +1009,7 @@ export class AIService extends EventEmitter {
       log.error("Stream message error:", error);
       return Err({ type: "unknown", raw: "Failed to stream message: " + errorMessage });
     } finally {
-      unlinkAbortSignal();
-      const pending = this.pendingStreamStarts.get(workspaceId);
-      if (pending?.abortController === pendingAbortController) {
-        this.pendingStreamStarts.delete(workspaceId);
-      }
+      pendingStart.finish();
     }
   }
 
@@ -1037,35 +1017,6 @@ export class AIService extends EventEmitter {
     workspaceId: string,
     options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
   ): Promise<Result<void>> {
-    const pending = this.pendingStreamStarts.get(workspaceId);
-    const isActuallyStreaming =
-      this.mockModeEnabled && this.mockAiStreamPlayer
-        ? this.mockAiStreamPlayer.isStreaming(workspaceId)
-        : this.streamManager.isStreaming(workspaceId);
-
-    if (pending) {
-      pending.abortController.abort();
-
-      // If we're still in pre-stream startup (no StreamManager stream yet), emit a synthetic
-      // stream-abort so the renderer can exit the "starting..." UI immediately.
-      const abortReason = options?.abortReason ?? "startup";
-      if (!isActuallyStreaming) {
-        this.emit("stream-abort", {
-          type: "stream-abort",
-          workspaceId,
-          abortReason,
-          messageId: pending.syntheticMessageId,
-          metadata: { duration: Date.now() - pending.startTime },
-          abandonPartial: options?.abandonPartial,
-          acpPromptId: pending.acpPromptId,
-        } satisfies StreamAbortEvent);
-      }
-    }
-
-    if (this.mockModeEnabled && this.mockAiStreamPlayer) {
-      await this.mockAiStreamPlayer.stop(workspaceId);
-      return Ok(undefined);
-    }
     return this.streamManager.stopStream(workspaceId, options);
   }
 
@@ -1073,9 +1024,6 @@ export class AIService extends EventEmitter {
    * Check if a workspace is currently streaming
    */
   isStreaming(workspaceId: string): boolean {
-    if (this.mockModeEnabled && this.mockAiStreamPlayer) {
-      return this.mockAiStreamPlayer.isStreaming(workspaceId);
-    }
     return this.streamManager.isStreaming(workspaceId);
   }
 

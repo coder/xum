@@ -812,7 +812,7 @@ export class StreamManager {
   private mcpServerManager?: MCPServerManager;
   private readonly sessionUsageService?: SessionUsageService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
-  private readonly eventSink: TurnEngineEventSink;
+  private eventSink: TurnEngineEventSink;
   // Token tracker for live streaming statistics
   private tokenTracker = new StreamingTokenTracker();
   // Track OpenAI previousResponseIds that have been invalidated
@@ -828,6 +828,10 @@ export class StreamManager {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
+    this.eventSink = eventSink;
+  }
+
+  setEventSink(eventSink: TurnEngineEventSink): void {
     this.eventSink = eventSink;
   }
 
