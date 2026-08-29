@@ -1,16 +1,6 @@
 /**
- * Stream context builder: assembles plan instructions and system prompt for a stream.
- *
- * Extracted from `streamMessage()` to make these purely functional
- * preparation steps explicit and testable. Contains:
- * - Plan file reading, mode instructions, task nesting warnings
- * - Plan→exec handoff transition content
- * - Agent body resolution with inheritance + subagent prompt append
- * - Subagent discovery for tool descriptions
- * - Skill discovery for tool descriptions
- * - System message construction and token counting
- *
- * All functions are pure — no service dependencies (`this.*`).
+ * Owns provider prompt synthesis plus the plan and system context it consumes.
+ * All functions are independent of mutable service state.
  */
 
 import * as path from "node:path";

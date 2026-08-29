@@ -6,13 +6,8 @@
  * if a request can be rebuilt byte-for-byte from the log, no request-time
  * injection of live state exists.
  *
- * The reconstruction reuses the SAME production code paths, never a
- * reimplementation:
- * - prepareProviderRequestMessages / addInterruptedSentinel (aiService)
- * - prepareMessagesForProvider (messagePipeline)
- * - createCachedSystemMessage / createOpenAICachedSystemMessage
- *   (StreamManager.buildStreamRequestConfig applies the same wrapping)
- * - the real AI SDK streamText conversion (ModelMessage → LanguageModelV4
+ * The reconstruction reuses the production assemblePromptPayload entry point
+ * and the real AI SDK streamText conversion (ModelMessage → LanguageModelV4
  *   prompt), captured through a stub model that never performs network I/O,
  *   with the same per-step message transforms StreamManager's prepareStep
  *   applies.

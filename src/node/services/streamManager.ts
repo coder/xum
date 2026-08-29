@@ -279,12 +279,7 @@ interface StepMessageTracker {
 interface StreamRequestConfig {
   model: LanguageModel;
   messages: ModelMessage[];
-  /**
-   * System instructions for streamText. Direct official OpenAI GPT-5.6
-   * requests carry a structured SystemModelMessage with an explicit prompt
-   * cache breakpoint (createOpenAICachedSystemMessage); everything else keeps
-   * the plain string.
-   */
+  /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
@@ -2190,8 +2185,7 @@ export class StreamManager {
       model: request.model,
       messages: request.messages,
       system: request.system,
-      // For Anthropic prompt caching, the system prompt is prepended to
-      // `messages` as a { role: "system" } message (createCachedSystemMessage).
+      // The assembler prepends Anthropic cached system prompts to `messages`.
       // AI SDK 7 rejects system messages inside `messages` unless opted in.
       // Trusted: mux builds these messages server-side.
       allowSystemInMessages: true,
