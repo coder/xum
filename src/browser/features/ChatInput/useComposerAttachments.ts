@@ -30,11 +30,9 @@ interface UseComposerAttachmentsOptions {
   editingMessage: boolean;
   pushToast: PushToast;
 }
-
 export function getBaseMediaType(mediaType: string): string {
   return mediaType.toLowerCase().trim().split(";")[0];
 }
-
 export function isPdfAttachment(
   attachment: ChatAttachment
 ): attachment is Extract<ChatAttachment, { kind: "provider" }> {
@@ -42,7 +40,6 @@ export function isPdfAttachment(
     attachment.kind === "provider" && getBaseMediaType(attachment.mediaType) === PDF_MEDIA_TYPE
   );
 }
-
 export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
   if (!dataUrl.startsWith("data:")) return null;
   const commaIndex = dataUrl.indexOf(",");
@@ -53,10 +50,10 @@ export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
   const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
   return Math.floor((base64.length * 3) / 4) - padding;
 }
-
 export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   const { api } = useAPI();
   const tooLargeToastKeyRef = useRef<string | null>(null);
+  // External draft transfers must not overwrite an oversized attachment kept only in memory.
   const selfWriteRef = useRef(false);
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(options.attachmentsKey)

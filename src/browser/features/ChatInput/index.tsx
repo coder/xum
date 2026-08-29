@@ -171,7 +171,7 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
-  withMcpPromptRefs,
+withMcpPromptRefs,
 } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
 import {
@@ -240,6 +240,8 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 
+// Normal typing usually has no active suggestion menu. Reuse the existing empty array
+// so suggestion effects do not schedule an avoidable second render on every keypress.
 function clearSuggestions(prev: SlashSuggestion[]): SlashSuggestion[] {
   return prev.length === 0 ? prev : [];
 }
