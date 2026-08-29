@@ -2,7 +2,7 @@ import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
 import { AgentSession, type AgentSessionAIService } from "@/node/services/agentSession";
@@ -54,6 +54,18 @@ function createMockInitStateManager(overrides?: Partial<InitStateManager>): Init
   return Object.assign(new EventEmitter(), overrides) as unknown as InitStateManager;
 }
 
+/** Stream-lifecycle surface AgentSession's constructor requires from its engine seam. */
+export function createStreamLifecycleMocks() {
+  return {
+    isStreaming: mock((_workspaceId: string) => false),
+    stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+    getStreamInfo: mock((_workspaceId: string) => undefined),
+    replayStream: mock((_workspaceId: string, _options?: { afterTimestamp?: number }) =>
+      Promise.resolve()
+    ),
+  };
+}
+
 function createMockAiService(args?: {
   emitter?: EventEmitter;
   overrides?: Partial<AgentSessionAIService>;
@@ -63,20 +75,18 @@ function createMockAiService(args?: {
 } {
   const aiEmitter = args?.emitter ?? new EventEmitter();
   const aiService: AgentSessionAIService = Object.assign(aiEmitter, {
+    // Real implementations report failures as Err results, never rejections.
     createModelWithPinnedMetadata: mock(() =>
-      Promise.reject(new Error("Test AI service cannot create models"))
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
     ),
     getWorkspaceMetadata: mock(() =>
-      Promise.reject(new Error("Test AI service has no workspace metadata"))
+      Promise.resolve(Err("Test AI service has no workspace metadata"))
     ),
     getProvidersConfig: mock(() => null),
     isExperimentEnabled: mock((_experimentId) => false),
-    isStreaming: mock((_workspaceId: string) => false),
-    stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    getStreamInfo: mock((_workspaceId: string) => undefined),
-    replayStream: mock((_workspaceId: string, _options?: { afterTimestamp?: number }) =>
-      Promise.resolve()
-    ),
+    ...createStreamLifecycleMocks(),
     streamMessage: mock(() =>
       Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))
     ),

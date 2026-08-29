@@ -13,7 +13,11 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
-import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createFailedTurnHandle,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 
 function contextExceededResult(messageId: string) {
   return {
@@ -113,6 +117,7 @@ describe("AgentSession post-compaction context retry", () => {
     });
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -264,6 +269,7 @@ describe("AgentSession post-compaction context retry", () => {
     });
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;
@@ -406,6 +412,7 @@ describe("AgentSession post-compaction context retry", () => {
     });
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiEmitter.on(String(eventName), listener);
         return this;

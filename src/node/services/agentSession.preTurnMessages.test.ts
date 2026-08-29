@@ -8,7 +8,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle } from "./agentSession.testHarness";
+import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const config = {
@@ -29,6 +29,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
 
     const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
     const aiService = Object.assign(new EventEmitter(), {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as AIService["streamMessage"],

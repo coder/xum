@@ -4,6 +4,7 @@ import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/messa
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { Config } from "@/node/config";
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
@@ -104,6 +105,7 @@ function createAiService(): AIService {
     off() {
       return this;
     },
+    ...createStreamLifecycleMocks(),
     isStreaming: () => false,
     stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
   } as unknown as AIService;

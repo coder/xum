@@ -12,7 +12,7 @@ import type { AIService, StreamMessageOptions } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle } from "./agentSession.testHarness";
+import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>
@@ -51,6 +51,7 @@ describe("AgentSession file-change notification (turn start)", () => {
       return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => aiService),
       off: mock(() => aiService),
       stopStream: mock(() => Promise.resolve(Ok(undefined))),

@@ -14,6 +14,7 @@ import type { Config } from "@/node/config";
 
 import type { AIService } from "./aiService";
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
@@ -104,6 +105,7 @@ function getAttachmentTypes(
 function createSessionForHistory(historyService: HistoryService, sessionDir: string): AgentSession {
   const aiEmitter = new EventEmitter();
   const aiService: AIService = {
+    ...createStreamLifecycleMocks(),
     on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
       aiEmitter.on(String(eventName), listener);
       return this;

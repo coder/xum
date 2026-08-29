@@ -8,7 +8,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 
 // NOTE: These tests focus on the event wiring (tool-call-end -> callback).
 // The actual post-compaction state computation is covered elsewhere.
@@ -173,6 +173,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
     const handlers = new Map<string, (...args: unknown[]) => void>();
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         handlers.set(String(eventName), listener);
         return this;

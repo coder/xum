@@ -1,6 +1,7 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
 
 import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -18,6 +19,7 @@ describe("AgentSession.resumeStream", () => {
     const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => aiService),
       off: mock(() => aiService),
       stopStream: mock(() => Promise.resolve(Ok(undefined))),

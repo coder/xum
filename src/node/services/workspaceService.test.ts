@@ -3,7 +3,11 @@ import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./w
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { askUserQuestionManager } from "./askUserQuestionManager";
@@ -176,7 +180,7 @@ function createMockAIService(overrides: Partial<AIService> = {}): AIService {
   return {
     on: mock(() => undefined),
     off: mock(() => undefined),
-    isStreaming: mock(() => false),
+    ...createStreamLifecycleMocks(),
     ...overrides,
   } as unknown as AIService;
 }
@@ -193,6 +197,7 @@ function createWorkspaceServiceForTest(options: {
   telemetryService?: WorkspaceServiceArgs[8];
   experimentsService?: WorkspaceServiceArgs[9];
   sessionTimingService?: WorkspaceServiceArgs[10];
+  streamManager?: WorkspaceServiceArgs[11];
 }): WorkspaceService {
   // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -208,7 +213,8 @@ function createWorkspaceServiceForTest(options: {
     options.policyService,
     options.telemetryService,
     options.experimentsService,
-    options.sessionTimingService
+    options.sessionTimingService,
+    options.streamManager
   );
 }
 
@@ -4032,6 +4038,7 @@ describe("WorkspaceService bash monitor wakes", () => {
         cleanup: mock(() => Promise.resolve()),
       }) as unknown as BackgroundProcessManager & EventEmitter;
       const aiService = Object.assign(new EventEmitter(), {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => false),
       }) as unknown as AIService & EventEmitter;
       const workspaceService = createWorkspaceServiceForTest({
@@ -4440,6 +4447,7 @@ describe("WorkspaceService bash monitor wakes", () => {
         cleanup: mock(() => Promise.resolve()),
       }) as unknown as BackgroundProcessManager & EventEmitter;
       const aiService = Object.assign(new EventEmitter(), {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => true),
       }) as unknown as AIService & EventEmitter;
       const workspaceService = createWorkspaceServiceForTest({
@@ -4507,6 +4515,7 @@ describe("WorkspaceService bash monitor wakes", () => {
         cleanup: mock(() => Promise.resolve()),
       }) as unknown as BackgroundProcessManager & EventEmitter;
       const aiService = Object.assign(new EventEmitter(), {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => true),
       }) as unknown as AIService & EventEmitter;
       const workspaceService = createWorkspaceServiceForTest({
@@ -5010,6 +5019,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       }) as unknown as BackgroundProcessManager & EventEmitter;
       let streaming = true;
       const aiService = Object.assign(new EventEmitter(), {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => streaming),
       }) as unknown as AIService & EventEmitter;
       const workspaceService = createWorkspaceServiceForTest({
@@ -9230,6 +9240,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     const aiService =
       aiServiceOverride ??
       ({
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         isStreaming: mock(() => false),
       } as unknown as AIService);
@@ -10185,6 +10196,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // lock must fail the mutation instead of truncating under a live stream.
     let streaming = false;
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       isStreaming: mock(() => streaming),
     } as unknown as AIService;
@@ -10240,6 +10252,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // published row cannot land inside a PREPARING snapshot window.
     let streaming = true;
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       isStreaming: mock(() => streaming),
     } as unknown as AIService;
@@ -10720,6 +10733,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
 
   test("context reset rejects active streams", async () => {
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       isStreaming: mock(() => true),
     } as unknown as AIService;
@@ -10984,6 +10998,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   test("user-aborted streams do NOT replay queued goal mutations", async () => {
     const aiEmitter = new EventEmitter();
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
     }) as unknown as AIService;
     const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
@@ -11059,6 +11074,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   test("mid-stream activity emits surface the optimistic goal, then revert on user abort", async () => {
     const aiEmitter = new EventEmitter();
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
     }) as unknown as AIService;
     const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
@@ -11148,6 +11164,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // in-flight stream can be charged to the replacement goal.
     const aiEmitter = new EventEmitter();
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
     }) as unknown as AIService;
     const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
@@ -11214,6 +11231,7 @@ describe("WorkspaceService initialize", () => {
     } as unknown as Config;
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       off: mock(() => undefined),
     } as unknown as AIService;
@@ -11280,6 +11298,7 @@ describe("WorkspaceService initialize", () => {
     await fsPromises.writeFile(path.join(realConfig.rootDir, "config.json"), "{invalid-json");
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       off: mock(() => undefined),
     } as unknown as AIService;
@@ -11330,6 +11349,7 @@ describe("WorkspaceService initialize", () => {
     }
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       off: mock(() => undefined),
     } as unknown as AIService;
@@ -11371,6 +11391,7 @@ describe("WorkspaceService initialize", () => {
     await fsPromises.writeFile(path.join(realConfig.rootDir, "config.json"), "{invalid-json");
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       off: mock(() => undefined),
     } as unknown as AIService;
@@ -11507,6 +11528,7 @@ describe("WorkspaceService rename lock", () => {
   beforeEach(async () => {
     // Create minimal mocks for the services
     mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve({ success: false, error: "not found" })),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -11612,6 +11634,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
   beforeEach(async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve({ success: false as const, error: "not found" })
@@ -12458,6 +12481,7 @@ describe("WorkspaceService pending auto-title", () => {
       namedWorkspacePath: workspacePath,
     };
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -12714,6 +12738,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
 
   beforeEach(async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve({ success: false as const, error: "not found" })
@@ -13247,6 +13272,7 @@ describe("WorkspaceService streaming generation guard", () => {
 
   beforeEach(async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve({ success: false as const, error: "not found" })
@@ -13567,6 +13593,7 @@ describe("WorkspaceService executeBash archive guards", () => {
     );
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: getWorkspaceMetadataMock,
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -13793,6 +13820,7 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
     );
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: getWorkspaceMetadataMock,
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -13924,6 +13952,7 @@ describe("WorkspaceService getFileCompletions", () => {
 
   beforeEach(async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve({ success: false as const, error: "not found" })
@@ -14212,6 +14241,7 @@ describe("WorkspaceService getProjectGitStatuses", () => {
   } {
     const getWorkspaceMetadataMock = mock(() => Promise.resolve(Ok(params.metadata)));
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: getWorkspaceMetadataMock,
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -14459,6 +14489,7 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 
   beforeEach(async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve({ success: false as const, error: "not found" })
@@ -14595,6 +14626,7 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
 
   beforeEach(async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -14836,6 +14868,7 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
 
   async function makeService(): Promise<WorkspaceService> {
     const aiService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       on: mock(() => undefined),
       off: mock(() => undefined),
@@ -15618,6 +15651,7 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     removeWorkspaceMock = mock(() => Promise.resolve());
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
       getWorkspaceMetadata: mock(() => Promise.resolve(Err("not found"))),
@@ -16255,6 +16289,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   let workspaceService: WorkspaceService;
   let mockAIService: AIService;
+  let mockStreamManager: { getStreamInfo: ReturnType<typeof mock> };
   let configState: ProjectsConfig;
   let editConfigSpy: ReturnType<typeof mock>;
   let historyService: HistoryService;
@@ -16308,6 +16343,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       loadConfigOrDefault: mock(() => configState),
     };
     mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -16316,11 +16352,13 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
+    mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
     workspaceService = createWorkspaceServiceForTest({
       config: mockConfig,
       historyService,
       aiService: mockAIService,
       initStateManager: mockInitStateManager as InitStateManager,
+      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[11],
     });
   });
 
@@ -16661,10 +16699,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   test("acquirePreInterruptionArchiveHold binds the stream exemption to the delegated turns", () => {
     const delegated = { taskHandleId: "wt-1", ownerWorkspaceId: "owner-1", turnId: "turn-1" };
     const streamMeta: Record<string, unknown> = { type: "workspace-turn-task", ...delegated };
-    Object.assign(mockAIService, {
-      isStreaming: mock(() => true),
-      getStreamInfo: mock(() => ({ muxMetadata: streamMeta })),
-    });
+    Object.assign(mockAIService, { isStreaming: mock(() => true) });
+    // The delegated-turn correlation is read from the engine, not the AI facade.
+    mockStreamManager.getStreamInfo = mock(() => ({ muxMetadata: streamMeta }));
 
     // The active stream carries the collected turn's exact correlation: interruptible
     // delegated work, so the hold is granted.
@@ -17183,6 +17220,7 @@ describe("WorkspaceService archive init cancellation", () => {
     };
 
     const mockAIService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -17303,6 +17341,7 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
       getAllWorkspaceMetadata: mock(() => Promise.resolve([workspaceMetadata])),
     };
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -17443,6 +17482,7 @@ describe("WorkspaceService archive snapshots", () => {
       loadConfigOrDefault: mock(() => configState),
     };
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       on: mock(() => undefined),
@@ -17632,6 +17672,7 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
       loadConfigOrDefault: mock(() => configState),
     };
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       on: mock(() => undefined),
@@ -17917,6 +17958,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       loadConfigOrDefault: mock(() => configState),
     };
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       on: mock(() => undefined),
@@ -18069,6 +18111,7 @@ describe("WorkspaceService deleteWorktree", () => {
     };
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       on: mock(() => undefined),
       off: mock(() => undefined),
     } as unknown as AIService;
@@ -18281,6 +18324,7 @@ describe("WorkspaceService archiveMergedInProject", () => {
     };
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },
@@ -18517,6 +18561,7 @@ describe("WorkspaceService init cancellation", () => {
     configWithStableId.generateStableId = () => parentId;
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
       getWorkspaceMetadata: mock(async (workspaceId: string) => {
@@ -18586,6 +18631,7 @@ describe("WorkspaceService init cancellation", () => {
     configWithStableId.generateStableId = () => victimId;
 
     const aiService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
       getWorkspaceMetadata: mock(async (workspaceId: string) => {
@@ -18673,6 +18719,7 @@ describe("WorkspaceService init cancellation", () => {
     const generateStableIdMock = mock(() => "ws-untrusted");
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
@@ -18769,6 +18816,7 @@ describe("WorkspaceService init cancellation", () => {
     const clearInMemoryStateMock = mock((_workspaceId: string) => undefined);
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
@@ -18825,6 +18873,7 @@ describe("WorkspaceService init cancellation", () => {
     const editConfigMock = mock(() => Promise.resolve());
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
@@ -18877,6 +18926,7 @@ describe("WorkspaceService init cancellation", () => {
     const workspaceId = "ws-list-initializing";
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
@@ -18996,6 +19046,7 @@ describe("WorkspaceService init cancellation", () => {
     };
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
@@ -19148,6 +19199,7 @@ describe("WorkspaceService init cancellation", () => {
     };
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
@@ -19227,6 +19279,7 @@ describe("WorkspaceService init cancellation", () => {
       } as unknown as InitStateManager;
 
       const mockAIService = {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => false),
         stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
         getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "na" })),
@@ -19293,6 +19346,7 @@ describe("WorkspaceService init cancellation", () => {
     const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ws-remove-fail-"));
     try {
       const mockAIService = {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => false),
         stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
         getWorkspaceMetadata: mock(() =>
@@ -19361,6 +19415,7 @@ describe("WorkspaceService init cancellation", () => {
     const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ws-remove-runtime-"));
     try {
       const mockAIService = {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => false),
         stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
         getWorkspaceMetadata: mock(() =>
@@ -19415,6 +19470,7 @@ describe("WorkspaceService regenerateTitle", () => {
 
   beforeEach(async () => {
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve({ success: false as const, error: "workspace metadata unavailable" })
@@ -19617,6 +19673,7 @@ describe("WorkspaceService fork", () => {
     const sourceProjectPath = "/tmp/project";
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() =>
         Promise.resolve(
@@ -19737,6 +19794,7 @@ describe("WorkspaceService fork", () => {
     });
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       on: mock(() => undefined),
@@ -19864,6 +19922,7 @@ describe("WorkspaceService fork", () => {
     expect(sourceUsage?.byModel["claude-sonnet-4-20250514"]?.input.tokens).toBe(100);
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -19984,6 +20043,7 @@ describe("WorkspaceService fork", () => {
     expect(writePartialResult.success).toBe(true);
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       on: mock(() => undefined),
@@ -20094,6 +20154,7 @@ describe("WorkspaceService fork", () => {
     });
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -20204,6 +20265,7 @@ describe("WorkspaceService fork", () => {
     });
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -20313,6 +20375,7 @@ describe("WorkspaceService fork", () => {
     });
 
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -20414,6 +20477,7 @@ describe("WorkspaceService interruptStream", () => {
     };
 
     const mockAIService: AIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve({ success: false, error: "not found" })),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -20560,6 +20624,7 @@ describe("generateForkTitle", () => {
 describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
   async function makeService(initState: InitStatus | undefined): Promise<WorkspaceService> {
     const mockAIService = {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock(() => false),
       on: mock(() => undefined),
       off: mock(() => undefined),
@@ -20697,6 +20762,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       historyService: HistoryService;
     }> {
       const mockAIService = {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => false),
         on: mock(() => undefined),
         off: mock(() => undefined),
@@ -20927,6 +20993,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       configOverrides: Partial<Config>
     ): Promise<WorkspaceService> {
       const mockAIService = {
+        ...createStreamLifecycleMocks(),
         isStreaming: mock(() => false),
         on: mock(() => undefined),
         off: mock(() => undefined),
@@ -21933,6 +22000,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
         },
       ];
       const aiService = {
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
         isStreaming: mock(() => false),
