@@ -17,17 +17,8 @@ import {
   WorkspaceGoalChildWorkspaceError,
   WorkspaceGoalTransitionError,
 } from "@/node/services/workspaceGoalService";
-import type {
-  UpdateStatus,
-  WorkspaceActivitySnapshot,
-  WorkspaceChatMessage,
-  WorkspaceStatsSnapshot,
-  FrontendWorkspaceMetadataSchemaType,
-} from "@/common/orpc/types";
-import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
-import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
+
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import {
   createAuthMiddleware,
   extractClientIpAddress,
@@ -35,11 +26,32 @@ import {
   getFirstHeaderValue,
 } from "./authMiddleware";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
-import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { clearLogFiles, getLogFilePath } from "@/node/services/log";
-import type { LogEntry } from "@/node/services/logBuffer";
-import { clearLogEntries, subscribeLogFeed } from "@/node/services/logBuffer";
-import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
+import { clearLogEntries } from "@/node/services/logBuffer";
+
+import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
+import {
+  attachTerminal,
+  createTickIterable,
+  subscribeBackgroundBashes,
+  subscribeConfigChanges,
+  subscribeDevTools,
+  subscribeLogs,
+  subscribeMemoryChanges as createMemoryChangeSubscription,
+  subscribeMetadata,
+  subscribeOpenSettings,
+  subscribePolicyChanges,
+  subscribeProviderConfig,
+  subscribeSshPrompts,
+  subscribeTerminalActivity,
+  subscribeTerminalExit,
+  subscribeTerminalOutput,
+  subscribeTimeline,
+  subscribeUpdateStatus,
+  subscribeWorkspaceActivity,
+  subscribeWorkspaceChat,
+  subscribeWorkspaceStats,
+} from "./routerSubscriptions";
 
 import { createRuntime, checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import {
@@ -56,21 +68,13 @@ import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   parseMemoryPath,
   resolveMemoryProjectIdentity,
-  type MemoryChangeEvent,
   type MemoryScopeContext,
 } from "@/node/services/memoryService";
-import type {
-  MemoryChangeEventPayload,
-  MemoryConsolidationStatusChangeEventPayload,
-} from "@/common/orpc/schemas/memory";
 import { memoryLogicalKey } from "@/node/services/memoryMeta";
 import { secretsToRecord } from "@/common/types/secrets";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
-import { createAsyncEventQueue, createLatestValueQueue } from "@/common/utils/asyncEventIterator";
-import { createCoalescedReader } from "@/common/utils/coalescedReader";
-import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
   isLayoutPresetsConfigEmpty,
@@ -105,7 +109,6 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 
-import type { DevToolsEvent } from "@/common/types/devtools";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { log } from "@/node/services/log";
@@ -505,6 +508,36 @@ async function runBrowserCommandWithLoadingState<T extends { success: boolean }>
   }
 }
 
+function subscribeMemoryChanges(
+  context: ORPCContext,
+  workspaceId: string | null,
+  signal?: AbortSignal
+) {
+  return createMemoryChangeSubscription(context, workspaceId, signal, () =>
+    assertMemoryEnabled(context)
+  );
+}
+
+function subscribeWorkflowRuns(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<WorkflowRunStreamEvent> {
+  return asyncIterableFromSubscription<WorkflowRunStreamEvent>({
+    signal,
+    validate: () => assertDynamicWorkflowsEnabled(context),
+    subscribe: (push) =>
+      workflowRunStreamHub.subscribe(workspaceId, (run) => {
+        if (run.parentWorkflow == null) push({ type: "run-changed", run });
+      }),
+    initial: async () => {
+      const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
+      await service.resumeCrashedRuns({ workspaceId, projectTrusted });
+      return { type: "snapshot" as const, runs: await service.listRuns({ workspaceId }) };
+    },
+  });
+}
+
 export const router = (authToken?: string) => {
   const t = os.$context<ORPCContext>().use(createAuthMiddleware(authToken));
 
@@ -783,69 +816,7 @@ export const router = (authToken?: string) => {
       onConfigChanged: t
         .input(schemas.config.onConfigChanged.input)
         .output(schemas.config.onConfigChanged.output)
-        .handler(async function* ({ context, signal }) {
-          let resolveNext: (() => void) | null = null;
-          let pendingNotification = false;
-          let ended = false;
-
-          const push = () => {
-            if (ended) return;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve();
-            } else {
-              pendingNotification = true;
-            }
-          };
-
-          const unsubscribe = context.config.onConfigChanged(push);
-
-          // Consumers often cancel this subscription while there are no pending config changes.
-          // If we block on a never-resolving Promise, AbortSignal cancellation can't unwind the
-          // generator, and we leak EventEmitter listeners across tests.
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve();
-            } else {
-              pendingNotification = true;
-            }
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            while (!ended) {
-              if (pendingNotification) {
-                pendingNotification = false;
-                if (ended) break;
-                yield undefined;
-                continue;
-              }
-
-              await new Promise<void>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (ended) break;
-              yield undefined;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, signal }) => subscribeConfigChanges(context, signal)),
       updateAgentAiDefaults: t
         .input(schemas.config.updateAgentAiDefaults.input)
         .output(schemas.config.updateAgentAiDefaults.output)
@@ -1215,82 +1186,9 @@ export const router = (authToken?: string) => {
       subscribe: t
         .input(schemas.devtools.subscribe.input)
         .output(schemas.devtools.subscribe.output)
-        .handler(async function* ({ context, input, signal }) {
-          const service = context.devToolsService;
-          let resolveNext: ((value: DevToolsEvent | null) => void) | null = null;
-          const queue: DevToolsEvent[] = [];
-          let ended = false;
-
-          const push = (event: DevToolsEvent) => {
-            if (ended) {
-              return;
-            }
-
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(event);
-              return;
-            }
-
-            queue.push(event);
-          };
-
-          const eventName = `update:${input.workspaceId}`;
-          const onEvent = (event: DevToolsEvent) => {
-            push(event);
-          };
-
-          service.on(eventName, onEvent);
-
-          const onAbort = () => {
-            if (ended) {
-              return;
-            }
-
-            ended = true;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(null);
-            }
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            const runs = await service.getRuns(input.workspaceId);
-            yield { type: "snapshot", runs };
-
-            while (!ended) {
-              const queuedEvent = queue.shift();
-              if (queuedEvent) {
-                yield queuedEvent;
-                continue;
-              }
-
-              const event = await new Promise<DevToolsEvent | null>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (event == null || ended) {
-                break;
-              }
-
-              yield event;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            service.off(eventName, onEvent);
-          }
-        }),
+        .handler(({ context, input, signal }) =>
+          subscribeDevTools(context, input.workspaceId, signal)
+        ),
     },
     browser: {
       listSessions: t
@@ -1658,87 +1556,9 @@ export const router = (authToken?: string) => {
       subscribe: t
         .input(schemas.workflows.subscribe.input)
         .output(schemas.workflows.subscribe.output)
-        .handler(async function* ({ context, input, signal }) {
-          assertDynamicWorkflowsEnabled(context);
-          let resolveNext: ((value: WorkflowRunStreamEvent | null) => void) | null = null;
-          const queue: WorkflowRunStreamEvent[] = [];
-          let ended = false;
-
-          const push = (event: WorkflowRunStreamEvent) => {
-            if (ended) {
-              return;
-            }
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(event);
-              return;
-            }
-            queue.push(event);
-          };
-
-          // Register before snapshotting so writes between the two are queued, not dropped.
-          // Only top-level runs are surfaced (mirrors listRuns); nested child runs are an
-          // implementation detail of their parent.
-          const unsubscribe = workflowRunStreamHub.subscribe(input.workspaceId, (run) => {
-            if (run.parentWorkflow != null) {
-              return;
-            }
-            push({ type: "run-changed", run });
-          });
-
-          const onAbort = () => {
-            if (ended) {
-              return;
-            }
-            ended = true;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(null);
-            }
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            const { service, projectTrusted } = await resolveWorkflowContext(
-              context,
-              input.workspaceId
-            );
-            await service.resumeCrashedRuns({ workspaceId: input.workspaceId, projectTrusted });
-            const runs = await service.listRuns({ workspaceId: input.workspaceId });
-            yield { type: "snapshot", runs };
-
-            while (!ended) {
-              const queuedEvent = queue.shift();
-              if (queuedEvent) {
-                yield queuedEvent;
-                continue;
-              }
-
-              const event = await new Promise<WorkflowRunStreamEvent | null>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (event == null || ended) {
-                break;
-              }
-
-              yield event;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, input, signal }) =>
+          subscribeWorkflowRuns(context, input.workspaceId, signal)
+        ),
       listScripts: t
         .input(schemas.workflows.listScripts.input)
         .output(schemas.workflows.listScripts.output)
@@ -1785,74 +1605,7 @@ export const router = (authToken?: string) => {
       onConfigChanged: t
         .input(schemas.providers.onConfigChanged.input)
         .output(schemas.providers.onConfigChanged.output)
-        .handler(async function* ({ context, signal }) {
-          let resolveNext: (() => void) | null = null;
-          let pendingNotification = false;
-          let ended = false;
-
-          const push = () => {
-            if (ended) return;
-            if (resolveNext) {
-              // Listener is waiting - wake it up
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve();
-            } else {
-              // No listener waiting yet - queue the notification
-              pendingNotification = true;
-            }
-          };
-
-          const unsubscribe = context.providerService.onConfigChanged(push);
-
-          // Consumers often cancel this subscription while there are no pending provider changes.
-          // If we block on a never-resolving Promise, AbortSignal cancellation can't unwind the
-          // generator, and we leak EventEmitter listeners across tests.
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-            // Wake up the iterator if it's currently waiting.
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve();
-            } else {
-              pendingNotification = true;
-            }
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            while (!ended) {
-              // If notification arrived before we started waiting, yield immediately
-              if (pendingNotification) {
-                pendingNotification = false;
-                if (ended) break;
-                yield undefined;
-                continue;
-              }
-
-              // Wait for next notification (or abort)
-              await new Promise<void>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (ended) break;
-              yield undefined;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, signal }) => subscribeProviderConfig(context, signal)),
     },
     policy: {
       get: t
@@ -1862,66 +1615,7 @@ export const router = (authToken?: string) => {
       onChanged: t
         .input(schemas.policy.onChanged.input)
         .output(schemas.policy.onChanged.output)
-        .handler(async function* ({ context, signal }) {
-          let resolveNext: (() => void) | null = null;
-          let pendingNotification = false;
-          let ended = false;
-
-          const push = () => {
-            if (ended) return;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve();
-            } else {
-              pendingNotification = true;
-            }
-          };
-
-          const unsubscribe = context.policyService.onPolicyChanged(push);
-
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve();
-            } else {
-              pendingNotification = true;
-            }
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            while (!ended) {
-              if (pendingNotification) {
-                pendingNotification = false;
-                if (ended) break;
-                yield undefined;
-                continue;
-              }
-
-              await new Promise<void>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (ended) break;
-              yield undefined;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, signal }) => subscribePolicyChanges(context, signal)),
       refreshNow: t
         .input(schemas.policy.refreshNow.input)
         .output(schemas.policy.refreshNow.output)
@@ -2115,14 +1809,7 @@ export const router = (authToken?: string) => {
       tick: t
         .input(schemas.general.tick.input)
         .output(schemas.general.tick.output)
-        .handler(async function* ({ input }) {
-          for (let i = 1; i <= input.count; i++) {
-            yield { tick: i, timestamp: Date.now() };
-            if (i < input.count) {
-              await new Promise((r) => setTimeout(r, input.intervalMs));
-            }
-          }
-        }),
+        .handler(({ input }) => createTickIterable(input.count, input.intervalMs)),
       getLogPath: t
         .input(schemas.general.getLogPath.input)
         .output(schemas.general.getLogPath.output)
@@ -2145,68 +1832,7 @@ export const router = (authToken?: string) => {
       subscribeLogs: t
         .input(schemas.general.subscribeLogs.input)
         .output(schemas.general.subscribeLogs.output)
-        .handler(async function* ({ input, signal }) {
-          const LOG_LEVEL_PRIORITY: Record<LogEntry["level"], number> = {
-            error: 0,
-            warn: 1,
-            info: 2,
-            debug: 3,
-          };
-
-          function shouldInclude(
-            entryLevel: LogEntry["level"],
-            minLevel: LogEntry["level"]
-          ): boolean {
-            return (
-              (LOG_LEVEL_PRIORITY[entryLevel] ?? LOG_LEVEL_PRIORITY.debug) <=
-              (LOG_LEVEL_PRIORITY[minLevel] ?? LOG_LEVEL_PRIORITY.info)
-            );
-          }
-
-          const minLevel = input.level ?? "info";
-
-          const queue = createAsyncMessageQueue<
-            | { type: "snapshot"; epoch: number; entries: LogEntry[] }
-            | { type: "append"; epoch: number; entries: LogEntry[] }
-            | { type: "reset"; epoch: number }
-          >();
-
-          // Atomic handshake: register listener + snapshot in one step.
-          // No events can be lost between snapshot and subscription.
-          const { snapshot, unsubscribe } = subscribeLogFeed((event) => {
-            if (signal?.aborted) {
-              return;
-            }
-
-            if (event.type === "append") {
-              if (shouldInclude(event.entry.level, minLevel)) {
-                queue.push({ type: "append", epoch: event.epoch, entries: [event.entry] });
-              }
-              return;
-            }
-
-            queue.push({ type: "reset", epoch: event.epoch });
-          }, minLevel);
-
-          queue.push({
-            type: "snapshot",
-            epoch: snapshot.epoch,
-            entries: snapshot.entries.filter((e) => shouldInclude(e.level, minLevel)),
-          });
-
-          const onAbort = () => {
-            queue.end();
-          };
-          signal?.addEventListener("abort", onAbort);
-
-          try {
-            yield* queue.iterate();
-          } finally {
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-            queue.end();
-          }
-        }),
+        .handler(({ input, signal }) => subscribeLogs(input.level ?? "info", signal)),
       restartApp: t
         .input(schemas.general.restartApp.input)
         .output(schemas.general.restartApp.output)
@@ -2822,9 +2448,9 @@ export const router = (authToken?: string) => {
       clone: t
         .input(schemas.projects.clone.input)
         .output(schemas.projects.clone.output)
-        .handler(async function* ({ context, input, signal }) {
-          yield* context.projectService.cloneWithProgress(input, signal);
-        }),
+        .handler(({ context, input, signal }) =>
+          context.projectService.cloneWithProgress(input, signal)
+        ),
       pickDirectory: t
         .input(schemas.projects.pickDirectory.input)
         .output(schemas.projects.pickDirectory.output)
@@ -3682,59 +3308,9 @@ export const router = (authToken?: string) => {
       onChange: t
         .input(schemas.memory.onChange.input)
         .output(schemas.memory.onChange.output)
-        .handler(async function* ({ context, input, signal }) {
-          assertMemoryEnabled(context);
-          // Resolve the subscriber's identity once: the same virtual path in
-          // another workspace (workspace scope) or another project (project
-          // scope) is a physically different file, so those events are
-          // dropped here rather than badging unrelated files in the UI.
-          const boundWorkspaceId = input.workspaceId ?? null;
-          const boundMetadata = boundWorkspaceId
-            ? await context.workspaceService.getInfo(boundWorkspaceId)
-            : null;
-          // Same identity resolution as the scope context: multi-project
-          // subscribers bind "" so no project-keyed events match.
-          const boundProjectPath = boundMetadata
-            ? resolveMemoryProjectIdentity(boundMetadata)
-            : null;
-          const queue = createAsyncEventQueue<MemoryChangeEventPayload>();
-
-          // Global file events are always forwarded (shared across everything).
-          const onChange = (event: MemoryChangeEvent) => {
-            if (event.scope === "workspace" && event.workspaceId !== boundWorkspaceId) return;
-            // Project memory is keyed by project identity: the same virtual
-            // path in another project is a different file.
-            if (event.scope === "project" && event.projectPath !== boundProjectPath) {
-              return;
-            }
-            queue.push(event);
-          };
-          // Consolidation status includes global coverage, so every open Memory
-          // tab should refetch when a run completes, even if it made no file changes.
-          const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) => {
-            queue.push(event);
-          };
-          context.memoryService.on("change", onChange);
-          context.memoryConsolidationService.on("statusChange", onStatusChange);
-
-          const onAbort = () => queue.end();
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            yield* queue.iterate();
-          } finally {
-            queue.end();
-            signal?.removeEventListener("abort", onAbort);
-            context.memoryService.off("change", onChange);
-            context.memoryConsolidationService.off("statusChange", onStatusChange);
-          }
-        }),
+        .handler(({ context, input, signal }) =>
+          subscribeMemoryChanges(context, input.workspaceId ?? null, signal)
+        ),
     },
     refinements: {
       // /refine trajectory distillation (RLM r11). Gating lives in the
@@ -3859,63 +3435,9 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.workspace.timeline.subscribe.input)
           .output(schemas.workspace.timeline.subscribe.output)
-          .handler(async function* ({ context, input, signal }) {
-            const queue = createAsyncEventQueue<TimelineSubscriptionEvent>();
-            const pendingEvents: TimelineSubscriptionEvent["events"] = [];
-            let snapshotSequence: number | undefined;
-            const onAppended = (event: {
-              workspaceId: string;
-              events: TimelineSubscriptionEvent["events"];
-            }) => {
-              if (event.workspaceId !== input.workspaceId) {
-                return;
-              }
-              const currentSequence = snapshotSequence;
-              if (currentSequence == null) {
-                pendingEvents.push(...event.events);
-                return;
-              }
-              const events = event.events.filter((item) => item.seq > currentSequence);
-              if (events.length > 0) {
-                queue.push({ type: "appended", events });
-              }
-            };
-            context.timelineService.on("appended", onAppended);
-            const onAbort = () => queue.end();
-            if (signal) {
-              if (signal.aborted) {
-                onAbort();
-              } else {
-                signal.addEventListener("abort", onAbort, { once: true });
-              }
-            }
-
-            try {
-              const snapshotMaxSequence = await context.timelineService.getLastSequence(
-                input.workspaceId
-              );
-              snapshotSequence = snapshotMaxSequence;
-              const snapshot = await context.timelineService.list(input.workspaceId, {
-                cursor: snapshotMaxSequence + 1,
-                limit: TIMELINE_DEFAULT_PAGE_LIMIT,
-              });
-              const appended = pendingEvents.filter((event) => event.seq > snapshotMaxSequence);
-              if (appended.length > 0) {
-                queue.push({ type: "appended", events: appended });
-              }
-              yield {
-                type: "snapshot" as const,
-                events: snapshot.events,
-                nextCursor: snapshot.nextCursor,
-                hasOlder: snapshot.hasOlder,
-              };
-              yield* queue.iterate();
-            } finally {
-              queue.end();
-              signal?.removeEventListener("abort", onAbort);
-              context.timelineService.off("appended", onAppended);
-            }
-          }),
+          .handler(({ context, input, signal }) =>
+            subscribeTimeline(context, input.workspaceId, signal)
+          ),
         preview: t
           .input(schemas.workspace.timeline.preview.input)
           .output(schemas.workspace.timeline.preview.output)
@@ -4360,137 +3882,11 @@ export const router = (authToken?: string) => {
       onChat: t
         .input(schemas.workspace.onChat.input)
         .output(schemas.workspace.onChat.output)
-        .handler(async function* ({ context, input, signal }) {
-          const session = context.workspaceService.getOrCreateSession(input.workspaceId);
-          if (typeof input.legacyAutoRetryEnabled === "boolean") {
-            session.setLegacyAutoRetryEnabledHint(input.legacyAutoRetryEnabled);
-          }
-
-          const queue = withQueueHeartbeat(createAsyncMessageQueue<WorkspaceChatMessage>(), {
-            type: "heartbeat" as const,
-          });
-
-          const onAbort = () => {
-            // Ensure we tear down the async generator even if the client stops iterating without
-            // calling iterator.return(). This prevents orphaned heartbeat timers.
-            queue.end();
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          // 1. Subscribe to new events (including those triggered by replay)
-          //
-          // IMPORTANT: We subscribe before replay so we can receive stream replay (`replayStream()`)
-          // and init replay events (which now set `replay: true` like other replayed payloads).
-          //
-          // Live stream deltas can overlap with replayed deltas on reconnect. Buffer live stream
-          // events during replay and flush after `caught-up`, skipping any deltas already delivered
-          // by replay.
-          const replayRelay = createReplayBufferedStreamMessageRelay(queue.push);
-
-          const unsubscribe = session.onChatEvent(({ message }) => {
-            replayRelay.handleSessionMessage(message);
-          });
-
-          // 2. Replay history (sends caught-up at the end)
-          await session.replayHistory(({ message }) => {
-            queue.push(message);
-          }, input.mode);
-
-          replayRelay.finishReplay();
-
-          // Startup recovery: after replay catches the client up, recover any
-          // crash-stranded compaction follow-ups and then evaluate auto-retry.
-          session.scheduleStartupRecovery();
-
-          try {
-            yield* queue.iterate();
-          } finally {
-            signal?.removeEventListener("abort", onAbort);
-            queue.end();
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, input, signal }) => subscribeWorkspaceChat(context, input, signal)),
       onMetadata: t
         .input(schemas.workspace.onMetadata.input)
         .output(schemas.workspace.onMetadata.output)
-        .handler(async function* ({ context, signal }) {
-          const service = context.workspaceService;
-
-          interface MetadataEvent {
-            workspaceId: string;
-            metadata: FrontendWorkspaceMetadataSchemaType | null;
-          }
-
-          let resolveNext: ((value: MetadataEvent | null) => void) | null = null;
-          const queue: MetadataEvent[] = [];
-          let ended = false;
-
-          const push = (event: MetadataEvent) => {
-            if (ended) return;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(event);
-            } else {
-              queue.push(event);
-            }
-          };
-
-          const onMetadata = (event: MetadataEvent) => {
-            push(event);
-          };
-
-          service.on("metadata", onMetadata);
-
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(null);
-            }
-          };
-
-          if (signal) {
-            if (signal.aborted) {
-              onAbort();
-            } else {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-          }
-
-          try {
-            while (!ended) {
-              if (queue.length > 0) {
-                yield queue.shift()!;
-                continue;
-              }
-
-              const event = await new Promise<MetadataEvent | null>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (event === null || ended) {
-                break;
-              }
-
-              yield event;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            service.off("metadata", onMetadata);
-          }
-        }),
+        .handler(({ context, signal }) => subscribeMetadata(context, signal)),
       activity: {
         list: t
           .input(schemas.workspace.activity.list.input)
@@ -4501,59 +3897,7 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.workspace.activity.subscribe.input)
           .output(schemas.workspace.activity.subscribe.output)
-          .handler(async function* ({ context, signal }) {
-            const service = context.workspaceService;
-
-            interface ActivityEvent {
-              type: "activity";
-              workspaceId: string;
-              activity: WorkspaceActivitySnapshot | null;
-            }
-
-            const queue = withQueueHeartbeat(
-              createAsyncEventQueue<ActivityEvent | { type: "heartbeat" }>(),
-              {
-                type: "heartbeat" as const,
-              }
-            );
-
-            const onActivity = (event: {
-              workspaceId: string;
-              activity: WorkspaceActivitySnapshot | null;
-            }) => {
-              queue.push({
-                type: "activity" as const,
-                workspaceId: event.workspaceId,
-                activity: event.activity,
-              });
-            };
-
-            service.on("activity", onActivity);
-
-            const onAbort = () => {
-              queue.end();
-            };
-
-            if (signal) {
-              if (signal.aborted) {
-                onAbort();
-              } else {
-                signal.addEventListener("abort", onAbort, { once: true });
-              }
-            }
-
-            try {
-              // Bootstrap snapshots are the responsibility of workspace.activity.list().
-              // This subscription emits only live activity deltas and heartbeats to
-              // preserve strict event ordering — replaying historical snapshots here
-              // could overwrite fresher live events queued by the listener above.
-              yield* queue.iterate();
-            } finally {
-              signal?.removeEventListener("abort", onAbort);
-              queue.end();
-              service.off("activity", onActivity);
-            }
-          }),
+          .handler(({ context, signal }) => subscribeWorkspaceActivity(context, signal)),
       },
       history: {
         loadMore: t
@@ -4601,94 +3945,9 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.workspace.backgroundBashes.subscribe.input)
           .output(schemas.workspace.backgroundBashes.subscribe.output)
-          .handler(async function* ({ context, input, signal }) {
-            const service = context.workspaceService;
-            const { workspaceId } = input;
-
-            if (signal?.aborted) {
-              return;
-            }
-
-            const getState = async () => ({
-              processes: await service.listBackgroundProcesses(workspaceId),
-              foregroundToolCallIds: service.getForegroundToolCallIds(workspaceId),
-            });
-
-            // Latest-value queue, not FIFO: each pushed value is a FULL state snapshot,
-            // so an unconsumed older snapshot is disposable. A FIFO would retain every
-            // snapshot a slow ORPC consumer has not yet serialized — unbounded memory
-            // and stale intermediate UI replays under sustained monitor output.
-            const queue = createLatestValueQueue<Awaited<ReturnType<typeof getState>>>();
-
-            const onAbort = () => {
-              queue.end();
-            };
-
-            if (signal) {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-
-            // Coalesce event-driven reads: a monitor with cooldown_ms 0 can emit one
-            // change per matching output line, and reading full state once per event
-            // would launch an unbounded backlog of manager refreshes while only the
-            // latest state matters. The reader also serializes reads (overlapping
-            // getState() calls could resolve out of order and publish a stale
-            // pre-persistence snapshot over a newer one) and retries failed reads —
-            // a change event may be the only signal an exited process ever emits, so
-            // dropping it would leave the renderer stale with no reconnect.
-            // Bootstrap failures FAIL OPEN: if the very first read keeps failing (e.g.
-            // a remote status probe is down), endless silent retries would leave the
-            // subscriber without any signal — BackgroundBashStore could never run its
-            // error path that marks workspace state known, blocking the chat view's
-            // first-paint barrier indefinitely. Surface the first pre-snapshot failure
-            // as a subscription error instead; once a snapshot has been delivered the
-            // reader's silent retry loop takes over (the renderer has state to show).
-            // Boxed (not bare `let`s) so the reader closure's writes stay visible to
-            // the generator body: TS flow analysis keeps a captured let narrowed to
-            // its initial null in this scope, so `throw bootstrap.error` would be
-            // rejected as throwing a non-Error.
-            const bootstrap = { delivered: false, error: null as Error | null };
-            const reader = createCoalescedReader({
-              read: async () => {
-                let state: Awaited<ReturnType<typeof getState>>;
-                try {
-                  state = await getState();
-                } catch (error) {
-                  if (!bootstrap.delivered) {
-                    bootstrap.error =
-                      error instanceof Error ? error : new Error(getErrorMessage(error));
-                    queue.end();
-                    return;
-                  }
-                  throw error;
-                }
-                bootstrap.delivered = true;
-                queue.push(state);
-              },
-              retryDelayMs: 1_000,
-            });
-            const onChange = (changedWorkspaceId: string) => {
-              if (changedWorkspaceId === workspaceId) reader.trigger();
-            };
-
-            service.onBackgroundBashChange(onChange);
-
-            try {
-              // Bootstrap through the SAME serialized reader as event-driven reads. A
-              // separate `yield await getState()` can race an onChange-triggered read:
-              // the event read's snapshot waits in the queue while the slower bootstrap
-              // yields a NEWER snapshot first, and consuming the queued older value then
-              // regresses the renderer with no later event to repair it.
-              reader.trigger();
-              yield* queue.iterate();
-              if (bootstrap.error != null) throw bootstrap.error;
-            } finally {
-              signal?.removeEventListener("abort", onAbort);
-              queue.end();
-              reader.stop();
-              service.offBackgroundBashChange(onChange);
-            }
-          }),
+          .handler(({ context, input, signal }) =>
+            subscribeBackgroundBashes(context, input.workspaceId, signal)
+          ),
         terminate: t
           .input(schemas.workspace.backgroundBashes.terminate.input)
           .output(schemas.workspace.backgroundBashes.terminate.output)
@@ -4891,206 +4150,9 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.workspace.stats.subscribe.input)
           .output(schemas.workspace.stats.subscribe.output)
-          .handler(async function* ({ context, input, signal }) {
-            const workspaceId = input.workspaceId;
-
-            if (signal?.aborted) {
-              return;
-            }
-
-            context.sessionTimingService.addSubscriber(workspaceId);
-
-            const queue = (() => {
-              // Coalesce snapshots: keep only the most recent snapshot to avoid an
-              // unbounded queue under high-frequency stream deltas.
-              let buffered: WorkspaceStatsSnapshot | undefined;
-              let hasBuffered = false;
-              let resolveNext: ((value: WorkspaceStatsSnapshot | null) => void) | null = null;
-              let ended = false;
-
-              const push = (value: WorkspaceStatsSnapshot) => {
-                if (ended) return;
-
-                if (resolveNext) {
-                  const resolve = resolveNext;
-                  resolveNext = null;
-                  resolve(value);
-                  return;
-                }
-
-                buffered = value;
-                hasBuffered = true;
-              };
-
-              async function* iterate(): AsyncGenerator<WorkspaceStatsSnapshot> {
-                while (true) {
-                  if (ended) {
-                    return;
-                  }
-
-                  if (hasBuffered) {
-                    const value = buffered;
-                    buffered = undefined;
-                    hasBuffered = false;
-                    if (value !== undefined) {
-                      yield value;
-                    }
-                    continue;
-                  }
-
-                  const next = await new Promise<WorkspaceStatsSnapshot | null>((resolve) => {
-                    resolveNext = resolve;
-                  });
-
-                  if (ended || next === null) {
-                    return;
-                  }
-
-                  yield next;
-                }
-              }
-
-              const end = () => {
-                ended = true;
-                if (resolveNext) {
-                  const resolve = resolveNext;
-                  resolveNext = null;
-                  resolve(null);
-                }
-              };
-
-              return { push, iterate, end };
-            })();
-
-            // Snapshot computation is async; without coalescing, we can build an unbounded
-            // backlog when token deltas arrive quickly.
-            const SNAPSHOT_THROTTLE_MS = 100;
-
-            let lastPushedAtMs = 0;
-            let inFlight = false;
-            let pendingTimer: ReturnType<typeof setTimeout> | undefined;
-            let pendingSnapshot = false;
-            let closed = false;
-
-            const onAbort = () => {
-              closed = true;
-
-              if (pendingTimer) {
-                clearTimeout(pendingTimer);
-                pendingTimer = undefined;
-              }
-
-              queue.end();
-            };
-
-            if (signal) {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-
-            const pushSnapshot = async () => {
-              if (closed) return;
-              if (inFlight) return;
-              if (!pendingSnapshot) return;
-
-              pendingSnapshot = false;
-              inFlight = true;
-
-              try {
-                const snapshot = await context.sessionTimingService.getSnapshot(workspaceId);
-                if (closed) return;
-
-                lastPushedAtMs = snapshot.generatedAt;
-                queue.push(snapshot);
-              } finally {
-                inFlight = false;
-
-                if (!closed && pendingSnapshot) {
-                  scheduleSnapshot();
-                }
-              }
-            };
-
-            const runPushSnapshot = () => {
-              void pushSnapshot().catch(() => {
-                // Defensive: a failed snapshot fetch should never brick the subscription.
-              });
-            };
-
-            const scheduleSnapshot = () => {
-              pendingSnapshot = true;
-
-              if (closed) {
-                return;
-              }
-
-              if (inFlight) {
-                return;
-              }
-
-              if (pendingTimer) {
-                return;
-              }
-
-              const now = Date.now();
-              const timeSinceLastPush = now - lastPushedAtMs;
-
-              if (timeSinceLastPush >= SNAPSHOT_THROTTLE_MS) {
-                runPushSnapshot();
-                return;
-              }
-
-              const remaining = SNAPSHOT_THROTTLE_MS - timeSinceLastPush;
-              pendingTimer = setTimeout(() => {
-                pendingTimer = undefined;
-                runPushSnapshot();
-              }, remaining);
-
-              // Avoid keeping Node (or Jest workers) alive due to a leaked throttle timer.
-              pendingTimer.unref?.();
-            };
-
-            const onChange = (changedWorkspaceId: string) => {
-              if (changedWorkspaceId !== workspaceId) {
-                return;
-              }
-              scheduleSnapshot();
-            };
-
-            // Subscribe before awaiting the initial snapshot so we don't miss a
-            // stats-change event that happens while getSnapshot() is in-flight.
-            //
-            // Treat the initial snapshot fetch as inFlight to prevent scheduleSnapshot()
-            // from starting a concurrent fetch that could push a newer snapshot before
-            // the initial one.
-            inFlight = true;
-            context.sessionTimingService.onStatsChange(onChange);
-
-            try {
-              const initial = await context.sessionTimingService.getSnapshot(workspaceId);
-              lastPushedAtMs = initial.generatedAt;
-              queue.push(initial);
-            } finally {
-              inFlight = false;
-
-              if (!closed && pendingSnapshot) {
-                scheduleSnapshot();
-              }
-            }
-
-            try {
-              yield* queue.iterate();
-            } finally {
-              closed = true;
-              signal?.removeEventListener("abort", onAbort);
-              if (pendingTimer) {
-                clearTimeout(pendingTimer);
-              }
-
-              queue.end();
-              context.sessionTimingService.offStatsChange(onChange);
-              context.sessionTimingService.removeSubscriber(workspaceId);
-            }
-          }),
+          .handler(({ context, input, signal }) =>
+            subscribeWorkspaceStats(context, input.workspaceId, signal)
+          ),
         clear: t
           .input(schemas.workspace.stats.clear.input)
           .output(schemas.workspace.stats.clear.output)
@@ -5395,209 +4457,19 @@ export const router = (authToken?: string) => {
       onOutput: t
         .input(schemas.terminal.onOutput.input)
         .output(schemas.terminal.onOutput.output)
-        .handler(async function* ({ context, input, signal }) {
-          if (signal?.aborted) {
-            return;
-          }
-
-          let resolveNext: ((value: string | null) => void) | null = null;
-          const queue: string[] = [];
-          let ended = false;
-
-          const push = (data: string) => {
-            if (ended) return;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(data);
-            } else {
-              queue.push(data);
-            }
-          };
-
-          const unsubscribe = context.terminalService.onOutput(input.sessionId, push);
-
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(null);
-            }
-          };
-
-          if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-
-          try {
-            while (!ended) {
-              if (queue.length > 0) {
-                yield queue.shift()!;
-                continue;
-              }
-
-              const data = await new Promise<string | null>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (data === null || ended) {
-                break;
-              }
-
-              yield data;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, input, signal }) =>
+          subscribeTerminalOutput(context, input.sessionId, signal)
+        ),
       attach: t
         .input(schemas.terminal.attach.input)
         .output(schemas.terminal.attach.output)
-        .handler(async function* ({ context, input, signal }) {
-          if (signal?.aborted) {
-            return;
-          }
-
-          type AttachMessage =
-            | { type: "screenState"; data: string }
-            | { type: "output"; data: string };
-
-          let resolveNext: ((value: AttachMessage | null) => void) | null = null;
-          const queue: AttachMessage[] = [];
-          let ended = false;
-
-          const push = (msg: AttachMessage) => {
-            if (ended) return;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(msg);
-            } else {
-              queue.push(msg);
-            }
-          };
-
-          // CRITICAL: Subscribe to output FIRST, BEFORE capturing screen state.
-          // This ensures any output that arrives during/after getScreenState() is queued.
-          const unsubscribe = context.terminalService.onOutput(input.sessionId, (data) => {
-            push({ type: "output", data });
-          });
-
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(null);
-            }
-          };
-
-          if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-
-          try {
-            // Capture screen state AFTER subscription is set up - guarantees no missed output
-            const screenState = context.terminalService.getScreenState(input.sessionId);
-
-            // First message is always the screen state (may be empty for new sessions)
-            yield { type: "screenState" as const, data: screenState };
-
-            // Now yield any queued output and continue with live stream
-            while (!ended) {
-              if (queue.length > 0) {
-                yield queue.shift()!;
-                continue;
-              }
-
-              const msg = await new Promise<AttachMessage | null>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (msg === null || ended) {
-                break;
-              }
-
-              yield msg;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, input, signal }) => attachTerminal(context, input.sessionId, signal)),
       onExit: t
         .input(schemas.terminal.onExit.input)
         .output(schemas.terminal.onExit.output)
-        .handler(async function* ({ context, input, signal }) {
-          if (signal?.aborted) {
-            return;
-          }
-
-          let resolveNext: ((value: number | null) => void) | null = null;
-          const queue: number[] = [];
-          let ended = false;
-
-          const push = (code: number) => {
-            if (ended) return;
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(code);
-            } else {
-              queue.push(code);
-            }
-          };
-
-          const unsubscribe = context.terminalService.onExit(input.sessionId, push);
-
-          const onAbort = () => {
-            if (ended) return;
-            ended = true;
-
-            if (resolveNext) {
-              const resolve = resolveNext;
-              resolveNext = null;
-              resolve(null);
-            }
-          };
-
-          if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-
-          try {
-            while (!ended) {
-              if (queue.length > 0) {
-                yield queue.shift()!;
-                // Terminal only exits once, so we can finish the stream
-                break;
-              }
-
-              const code = await new Promise<number | null>((resolve) => {
-                resolveNext = resolve;
-              });
-
-              if (code === null || ended) {
-                break;
-              }
-
-              yield code;
-              break;
-            }
-          } finally {
-            ended = true;
-            signal?.removeEventListener("abort", onAbort);
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, input, signal }) =>
+          subscribeTerminalExit(context, input.sessionId, signal)
+        ),
       openWindow: t
         .input(schemas.terminal.openWindow.input)
         .output(schemas.terminal.openWindow.output)
@@ -5630,53 +4502,7 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.terminal.activity.subscribe.input)
           .output(schemas.terminal.activity.subscribe.output)
-          .handler(async function* ({ context, signal }) {
-            if (signal?.aborted) {
-              return;
-            }
-
-            const queue = withQueueHeartbeat(
-              createAsyncEventQueue<
-                | {
-                    type: "update";
-                    workspaceId: string;
-                    activity: { activeCount: number; totalSessions: number };
-                  }
-                | { type: "heartbeat" }
-              >(),
-              { type: "heartbeat" as const }
-            );
-
-            const unsubscribe = context.terminalService.onActivityChange((workspaceId: string) => {
-              queue.push({
-                type: "update" as const,
-                workspaceId,
-                activity: context.terminalService.getWorkspaceActivity(workspaceId),
-              });
-            });
-
-            const onAbort = () => {
-              queue.end();
-            };
-
-            if (signal) {
-              signal.addEventListener("abort", onAbort, { once: true });
-            }
-
-            try {
-              // Yield initial snapshot (listener registered before snapshot, so no transition lost)
-              yield {
-                type: "snapshot" as const,
-                workspaces: context.terminalService.getAllWorkspaceActivity(),
-              };
-
-              yield* queue.iterate();
-            } finally {
-              signal?.removeEventListener("abort", onAbort);
-              queue.end();
-              unsubscribe();
-            }
-          }),
+          .handler(({ context, signal }) => subscribeTerminalActivity(context, signal)),
       },
     },
     desktop: {
@@ -5763,30 +4589,7 @@ export const router = (authToken?: string) => {
       onStatus: t
         .input(schemas.update.onStatus.input)
         .output(schemas.update.onStatus.output)
-        .handler(async function* ({ context, signal }) {
-          if (signal?.aborted) {
-            return;
-          }
-
-          const queue = createAsyncEventQueue<UpdateStatus>();
-          const unsubscribe = context.updateService.onStatus(queue.push);
-
-          const onAbort = () => {
-            queue.end();
-          };
-
-          if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-
-          try {
-            yield* queue.iterate();
-          } finally {
-            signal?.removeEventListener("abort", onAbort);
-            queue.end();
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, signal }) => subscribeUpdateStatus(context, signal)),
       getChannel: t
         .input(schemas.update.getChannel.input)
         .output(schemas.update.getChannel.output)
@@ -5804,33 +4607,7 @@ export const router = (authToken?: string) => {
       onOpenSettings: t
         .input(schemas.menu.onOpenSettings.input)
         .output(schemas.menu.onOpenSettings.output)
-        .handler(async function* ({ context, signal }) {
-          if (signal?.aborted) {
-            return;
-          }
-
-          // Use a sentinel value to signal events since void/undefined can't be queued
-          const queue = createAsyncEventQueue<true>();
-          const unsubscribe = context.menuEventService.onOpenSettings(() => queue.push(true));
-
-          const onAbort = () => {
-            queue.end();
-          };
-
-          if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-
-          try {
-            for await (const _ of queue.iterate()) {
-              yield undefined;
-            }
-          } finally {
-            signal?.removeEventListener("abort", onAbort);
-            queue.end();
-            unsubscribe();
-          }
-        }),
+        .handler(({ context, signal }) => subscribeOpenSettings(context, signal)),
     },
     voice: {
       transcribe: t
@@ -6063,37 +4840,7 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.ssh.prompt.subscribe.input)
           .output(schemas.ssh.prompt.subscribe.output)
-          .handler(async function* ({ context, signal }) {
-            if (signal?.aborted) return;
-
-            const service = context.sshPromptService;
-            const releaseResponder = service.registerInteractiveResponder();
-            const queue = createAsyncEventQueue<SshPromptEvent>();
-
-            const onRequest = (req: SshPromptRequest) =>
-              queue.push({ type: "request" as const, ...req });
-            const onRemoved = (requestId: string) =>
-              queue.push({ type: "removed" as const, requestId });
-
-            // Atomic handshake: register listener + snapshot in one step.
-            // No requests can be lost between snapshot and subscription.
-            const { snapshot, unsubscribe } = service.subscribeRequests(onRequest, onRemoved);
-            for (const req of snapshot) {
-              queue.push({ type: "request" as const, ...req });
-            }
-
-            const onAbort = () => queue.end();
-            signal?.addEventListener("abort", onAbort, { once: true });
-
-            try {
-              yield* queue.iterate();
-            } finally {
-              signal?.removeEventListener("abort", onAbort);
-              releaseResponder();
-              queue.end();
-              unsubscribe();
-            }
-          }),
+          .handler(({ context, signal }) => subscribeSshPrompts(context, signal)),
         respond: t
           .input(schemas.ssh.prompt.respond.input)
           .output(schemas.ssh.prompt.respond.output)
