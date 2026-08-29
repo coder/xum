@@ -172,14 +172,12 @@ import {
   normalizeRuntimeEnablement,
   type CoderWorkspaceConfig,
 } from "@/common/types/runtime";
-import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import {
   type AgentSkillReference,
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
-  prepareUserMessageForSend,
   withAgentSkillRefs,
-  withMcpPromptRefs,
+withMcpPromptRefs,
 } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
 import {
@@ -246,6 +244,7 @@ import {
   CREATION_COLUMN_MAX_WIDTH_CLASS,
 } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
+import { prepareMessagePayload } from "./prepareMessagePayload";
 
 // localStorage quotas are environment-dependent and relatively small.
 // Be conservative here so we can warn the user before writes start failing.
@@ -3122,51 +3121,33 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           }
         }
 
-        const userMessageText = appendStagedNoticeToUserMessage
-          ? appendStagedAttachmentNotice(actualMessageText, sendAttachments)
-          : actualMessageText;
-        const { finalText: finalMessageText, metadata: reviewMetadata } = prepareUserMessageForSend(
-          { text: userMessageText, reviews: reviewsData },
-          muxMetadata
-        );
-        // When editing /compact, compactionOptions already includes the base sendMessageOptions.
-        // Avoid duplicating additionalSystemInstructions.
-        const additionalSystemInstructions =
-          compactionOptions.additionalSystemInstructions ??
-          sendMessageOptions.additionalSystemInstructions;
-
-        muxMetadata = reviewMetadata;
-
-        const effectiveModel = modelOverride ?? compactionOptions.model ?? sendMessageOptions.model;
-        // For one-shot overrides, store the original input as rawCommand so the
-        // command prefix (e.g., "/opus+high") stays visible in the user message.
-        const oneshotCommandPrefix = modelOneShot
-          ? messageText
-              .trim()
-              .slice(0, messageText.trim().length - modelOneShot.message.length)
-              .trimEnd()
-          : undefined;
-        const oneshotRawCommand = oneshotCommandPrefix
-          ? appendStagedAttachmentNotice(messageText.trim(), sendAttachments)
-          : undefined;
-        muxMetadata = muxMetadata
-          ? {
-              ...muxMetadata,
-              requestedModel: effectiveModel,
-              ...(oneshotRawCommand
-                ? { rawCommand: oneshotRawCommand, commandPrefix: oneshotCommandPrefix }
-                : {}),
-            }
-          : {
-              type: "normal",
-              requestedModel: effectiveModel,
-              ...(oneshotRawCommand
-                ? { rawCommand: oneshotRawCommand, commandPrefix: oneshotCommandPrefix }
-                : {}),
-            };
-
-        // Capture review IDs before clearing (for marking as checked on success)
-        const sentReviewIds = reviewIdsForCheck;
+        const preparedMessage = prepareMessagePayload({
+          messageText,
+          messageTextForSend,
+          attachments: sendAttachments,
+          fileParts,
+          reviews: reviewsData,
+          reviewIds: reviewIdsForCheck,
+          editMessageId: editMessageForSend?.id,
+          baseMetadata: muxMetadata,
+          agentSkillRefs: combinedSkillRefs,
+          mcpPromptRefs: combinedMcpPromptRefs,
+          sendMessageOptions,
+          compactionOptions,
+          compactionMessageText: actualMessageText,
+          appendStagedNotice: appendStagedNoticeToUserMessage,
+          modelOneShot,
+          policyModel,
+          transferredDraftProjectDiscovery,
+          additionalSystemContextHydrated,
+          additionalSystemContext,
+          goalInterventionPolicy: overrides?.goalInterventionPolicy,
+          queueDispatchMode: overrides?.queueDispatchMode,
+        });
+        const finalMessageText = preparedMessage.message;
+        const sendOptions = preparedMessage.options;
+        const effectiveModel = preparedMessage.effectiveModel;
+        const sentReviewIds = preparedMessage.sentReviewIds;
 
         if (editMessageForSend) {
           setOptimisticallyDismissedEditId(editMessageForSend.id);
@@ -3183,46 +3164,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (inputRef.current) {
           inputRef.current.style.height = "";
         }
-
-        // One-shot models/thinking shouldn't update the persisted session defaults.
-        // Resolve thinking level: numeric indices are model-relative (0 = model's lowest allowed level)
-        const rawThinkingOverride = modelOneShot?.thinkingLevel;
-        const thinkingOverride =
-          rawThinkingOverride != null
-            ? resolveThinkingInput(rawThinkingOverride, policyModel)
-            : undefined;
-        const goalInterventionPolicy = overrides?.goalInterventionPolicy;
-
-        const sendOptions = {
-          ...sendMessageOptions,
-          ...compactionOptions,
-          // Match the original creation send: project-scoped skill refs must
-          // resolve from the project path, not the new worktree.
-          ...(transferredDraftProjectDiscovery && hasProjectScopedSkillRef(combinedSkillRefs)
-            ? { disableWorkspaceAgents: true }
-            : {}),
-          ...(modelOverride ? { model: modelOverride } : {}),
-          ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
-          ...(modelOneShot ? { skipAiSettingsPersistence: true } : {}),
-          ...(goalInterventionPolicy ? { goalInterventionPolicy } : {}),
-          ...(overrides?.queueDispatchMode
-            ? { queueDispatchMode: overrides.queueDispatchMode }
-            : {}),
-          // Honor the per-workspace "Chat Instructions" toggle: when the user
-          // has disabled the scratchpad, send an empty string so the backend
-          // doesn't fall back to reading the durable content from disk.
-          ...(additionalSystemContextHydrated
-            ? {
-                additionalSystemContext: additionalSystemContext.enabled
-                  ? additionalSystemContext.content
-                  : "",
-              }
-            : {}),
-          additionalSystemInstructions,
-          editMessageId: editMessageForSend?.id,
-          fileParts: sendFileParts,
-          muxMetadata,
-        };
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 

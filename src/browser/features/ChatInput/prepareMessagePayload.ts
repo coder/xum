@@ -1,7 +1,7 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { SendMessageOptions } from "@/common/orpc/types";
+import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -22,6 +22,7 @@ export interface PrepareMessagePayloadInput {
   messageText: string;
   messageTextForSend: string;
   attachments: ChatAttachment[];
+  fileParts?: FilePart[];
   reviews?: ReviewNoteDataForDisplay[];
   reviewIds: string[];
   editMessageId?: string;
@@ -43,13 +44,13 @@ export interface PrepareMessagePayloadInput {
 
 export interface PreparedMessagePayload {
   message: string;
-  options: SendMessageOptions;
+  options: SendMessageOptions & { fileParts?: FilePart[] };
   effectiveModel: string;
   sentReviewIds: string[];
 }
 
 export function prepareMessagePayload(input: PrepareMessagePayloadInput): PreparedMessagePayload {
-  const fileParts = chatAttachmentsToFileParts(input.attachments, { validate: true });
+  const fileParts = input.fileParts ?? chatAttachmentsToFileParts(input.attachments, { validate: true });
   const sendFileParts = input.editMessageId
     ? fileParts
     : fileParts.length > 0

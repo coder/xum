@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { prepareMessagePayload } from "./prepareMessagePayload";
 
-const baseOptions = { model: "anthropic:claude-sonnet-4", thinkingLevel: "off" } satisfies SendMessageOptions;
+const baseOptions = { model: "anthropic:claude-sonnet-4", thinkingLevel: "off", agentId: "exec" } satisfies SendMessageOptions;
 
 const baseInput = {
   messageText: "hello",
@@ -16,7 +16,7 @@ const baseInput = {
   transferredDraftProjectDiscovery: false,
   additionalSystemContextHydrated: false,
   additionalSystemContext: { enabled: false, content: "" },
-} as const;
+};
 
 describe("prepareMessagePayload", () => {
   it.each([
@@ -26,7 +26,7 @@ describe("prepareMessagePayload", () => {
       expected: {
         message: "hello",
         effectiveModel: baseOptions.model,
-        fileParts: undefined,
+        filePartCount: undefined,
       },
     },
     {
@@ -43,7 +43,7 @@ describe("prepareMessagePayload", () => {
       expected: {
         message: "hello",
         effectiveModel: "anthropic:claude-opus-4-1",
-        fileParts: undefined,
+        filePartCount: undefined,
       },
     },
     {
@@ -52,14 +52,14 @@ describe("prepareMessagePayload", () => {
       expected: {
         message: "hello",
         effectiveModel: baseOptions.model,
-        fileParts: [],
+        filePartCount: 0,
       },
     },
   ])("prepares $name", ({ input, expected }) => {
     const result = prepareMessagePayload({ ...baseInput, ...input });
     expect(result.message).toBe(expected.message);
     expect(result.effectiveModel).toBe(expected.effectiveModel);
-    expect(result.options.fileParts).toEqual(expected.fileParts);
+    expect(result.options.fileParts?.length).toBe(expected.filePartCount);
   });
 
   it("applies compaction, context, and dispatch overrides", () => {
