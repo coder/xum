@@ -28,7 +28,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
@@ -117,6 +117,7 @@ export class AIService extends EventEmitter {
   private readonly providerService: ProviderService;
   private readonly providerModelFactory: ProviderModelFactory;
   private readonly devToolsService?: DevToolsService;
+  private readonly providersConfigStore: ProvidersConfigStore;
   private readonly experimentsService?: ExperimentsService;
 
   /**
@@ -144,7 +145,8 @@ export class AIService extends EventEmitter {
     devToolsService?: DevToolsService,
     experimentsService?: ExperimentsService,
     streamManager?: StreamManager,
-    public readonly turnRequestBuilderBindings: TurnRequestBuilderBindings = {}
+    public readonly turnRequestBuilderBindings: TurnRequestBuilderBindings = {},
+    providersConfigStore?: ProvidersConfigStore
   ) {
     super();
     // Increase max listeners to accommodate multiple concurrent workspace listeners
@@ -152,6 +154,7 @@ export class AIService extends EventEmitter {
     this.setMaxListeners(50);
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
     this.config = config;
     this.historyService = historyService;
     this.initStateManager = initStateManager;
@@ -174,10 +177,12 @@ export class AIService extends EventEmitter {
       providerService,
       policyService,
       turnRequestBuilderBindings,
-      devToolsService
+      devToolsService,
+      this.providersConfigStore
     );
     this.turnRequestBuilder = new TurnRequestBuilder({
       config: this.config,
+      providersConfigStore: this.providersConfigStore,
       historyService: this.historyService,
       initStateManager: this.initStateManager,
       providerService: this.providerService,
@@ -548,7 +553,7 @@ export class AIService extends EventEmitter {
     modelString: string,
     opts?: { agentInitiated?: boolean; workspaceId?: string }
   ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const result = await this.providerModelFactory.createModel(modelString, undefined, {
       ...opts,
       providersConfig,

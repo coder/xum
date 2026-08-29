@@ -18,7 +18,7 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -10279,9 +10279,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           hasBudgetedResumableGoal(goal) &&
           !modelHasPricingData(
             normalized.data.model,
-            typeof this.config.loadProvidersConfig === "function"
-              ? this.config.loadProvidersConfig()
-              : null
+            new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig()
           )
         ) {
           return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);

@@ -1,5 +1,6 @@
 import { EventEmitter } from "events";
 import type { Config, ProjectsConfig } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import {
   PROVIDER_DEFINITIONS,
   SUPPORTED_PROVIDERS,
@@ -140,13 +141,19 @@ export class ProviderService {
   // granularity (FAT, some network mounts) can collide on mtimeMs across
   // distinct writes, and an external edit that produces byte-identical
   // contents is a no-op anyway.
+  public readonly providersConfigStore: ProvidersConfigStore;
+  public readonly fileLeaseManager: FileLeaseManager;
   private lastSelfWriteFingerprint: string | null = null;
 
   constructor(
     private readonly config: Config,
-    policyService?: PolicyService
+    policyService?: PolicyService,
+    providersConfigStore?: ProvidersConfigStore,
+    fileLeaseManager?: FileLeaseManager
   ) {
     this.policyService = policyService ?? null;
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+    this.fileLeaseManager = fileLeaseManager ?? new FileLeaseManager(config.rootDir);
     // The provider config subscription may have many concurrent listeners (e.g. multiple windows).
     // Avoid noisy MaxListenersExceededWarning for normal usage.
     this.emitter.setMaxListeners(50);
@@ -158,9 +165,9 @@ export class ProviderService {
     // the fingerprint captured by notifyFromMutation(); any external
     // edit that changes the bytes between the in-app save and the
     // watcher fire produces a different fingerprint and is forwarded.
-    this.stopWatchingProvidersFile = this.config.watchProvidersFile(() => {
+    this.stopWatchingProvidersFile = this.providersConfigStore.watchProvidersFile(() => {
       const expected = this.lastSelfWriteFingerprint;
-      const current = this.config.getProvidersFileFingerprint();
+      const current = this.providersConfigStore.getProvidersFileFingerprint();
       if (expected !== null && current !== null && current === expected) {
         // This watcher fire corresponds to our own write (or a benign
         // no-op external save with identical bytes). Clear the
@@ -209,7 +216,7 @@ export class ProviderService {
    * accidentally suppressed.
    */
   private notifyFromMutation(): void {
-    this.lastSelfWriteFingerprint = this.config.getProvidersFileFingerprint();
+    this.lastSelfWriteFingerprint = this.providersConfigStore.getProvidersFileFingerprint();
     this.notifyConfigChanged();
   }
 
@@ -268,7 +275,7 @@ export class ProviderService {
   public list(): string[] {
     try {
       const providers = this.listBuiltInProviders();
-      const providersConfig = this.config.loadProvidersConfig() ?? {};
+      const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
       const customProviderIds = getCustomProviderIds(providersConfig);
       this.detectAndLogShadowedProviders(providersConfig);
       const allowedCustomProviderIds = this.policyService?.isEnforced()
@@ -285,7 +292,7 @@ export class ProviderService {
    * Get the full providers config with safe info (no actual API keys)
    */
   public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
@@ -658,9 +665,11 @@ export class ProviderService {
       // Read-modify-write under the cross-process lock so concurrent writers
       // (other windows, CLI processes) cannot clobber each other's saves.
       // The callback returns an error result to bail, or null once saved.
-      const lockError = await this.config.withProvidersFileLock(
+      const lockError = await this.fileLeaseManager.withProvidersFileLock(
         (): CustomProviderMutationResult<ProviderConfigInfo> | null => {
-          const providersConfig = getProviderConfigRecord(this.config.loadProvidersConfig() ?? {});
+          const providersConfig = getProviderConfigRecord(
+            this.providersConfigStore.loadProvidersConfig() ?? {}
+          );
           if (Object.hasOwn(providersConfig, provider)) {
             return {
               success: false,
@@ -727,7 +736,7 @@ export class ProviderService {
           };
 
           providersConfig[provider] = providerConfig;
-          this.config.saveProvidersConfig(providersConfig);
+          this.providersConfigStore.saveProvidersConfig(providersConfig);
           return null;
         }
       );
@@ -763,7 +772,9 @@ export class ProviderService {
     providerInput: string
   ): Promise<CustomProviderMutationResult<void>> {
     const provider = providerInput.trim();
-    const providersConfig = getProviderConfigRecord(this.config.loadProvidersConfig() ?? {});
+    const providersConfig = getProviderConfigRecord(
+      this.providersConfigStore.loadProvidersConfig() ?? {}
+    );
     const providerConfig = providersConfig[provider];
     // Manual providers.jsonc edits can shadow a built-in id. Removing that entry
     // restores the built-in default, so only reject bona fide built-in configs.
@@ -812,10 +823,10 @@ export class ProviderService {
 
     try {
       // Re-validate and delete under the cross-process lock (see setConfigValue).
-      const lockError = await this.config.withProvidersFileLock(
+      const lockError = await this.fileLeaseManager.withProvidersFileLock(
         (): CustomProviderMutationResult<void> | null => {
           const latestProvidersConfig = getProviderConfigRecord(
-            this.config.loadProvidersConfig() ?? {}
+            this.providersConfigStore.loadProvidersConfig() ?? {}
           );
           if (!isCustomProviderConfig(latestProvidersConfig[provider])) {
             return {
@@ -828,7 +839,7 @@ export class ProviderService {
           }
 
           delete latestProvidersConfig[provider];
-          this.config.saveProvidersConfig(latestProvidersConfig);
+          this.providersConfigStore.saveProvidersConfig(latestProvidersConfig);
           return null;
         }
       );
@@ -991,13 +1002,13 @@ export class ProviderService {
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
       // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
+      const policyDenial = await this.fileLeaseManager.withProvidersFileLock((): string | null => {
         const denial = this.validateModelsEditPolicy(provider, normalizedModels);
         if (denial != null) {
           return denial;
         }
 
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
 
         if (!providersConfig[provider]) {
           providersConfig[provider] = {};
@@ -1011,7 +1022,7 @@ export class ProviderService {
         } else {
           providersConfig[provider].models = normalizedModels;
         }
-        this.config.saveProvidersConfig(providersConfig);
+        this.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
       if (policyDenial != null) {
@@ -1102,7 +1113,7 @@ export class ProviderService {
     const def = PROVIDER_DEFINITIONS[providerName];
     if (def.kind !== "gateway") return;
 
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const rawProviderConfig = providersConfig[providerName] ?? {};
     // Coder credentials are issuer-bound and its deploymentUrl field stays
     // editable under an enforced forcedBaseUrl: lifecycle checks must resolve
@@ -1196,13 +1207,13 @@ export class ProviderService {
       // writer must cooperate or a whole-file save from one process could
       // resurrect credentials another process just rotated/cleared.
       // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
+      const policyDenial = await this.fileLeaseManager.withProvidersFileLock((): string | null => {
         const denial = this.validateProviderEditPolicy(provider, keyPath);
         if (denial != null) {
           return denial;
         }
 
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
 
         // Ensure provider exists
         if (!providersConfig[provider]) {
@@ -1238,7 +1249,7 @@ export class ProviderService {
         }
 
         // Save updated config
-        this.config.saveProvidersConfig(providersConfig);
+        this.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
       if (policyDenial != null) {
@@ -1283,10 +1294,10 @@ export class ProviderService {
     }
 
     try {
-      const applied = await this.config.withProvidersFileLock(() => {
+      const applied = await this.fileLeaseManager.withProvidersFileLock(() => {
         // Load, decide, and write under the lock — no awaits in between, so
         // the predicate result cannot be invalidated by any cooperating writer.
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
         let current: unknown = providersConfig[provider];
         for (const key of keyPath) {
           current =
@@ -1318,7 +1329,7 @@ export class ProviderService {
           target[lastKey] = decision.value;
         }
 
-        this.config.saveProvidersConfig(providersConfig);
+        this.providersConfigStore.saveProvidersConfig(providersConfig);
         return true;
       });
 
@@ -1370,8 +1381,8 @@ export class ProviderService {
     ) => { value: Record<string, unknown> } | null
   ): Promise<Result<{ applied: boolean }, string>> {
     try {
-      const applied = await this.config.withProvidersFileLock(() => {
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+      const applied = await this.fileLeaseManager.withProvidersFileLock(() => {
+        const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
         const section = providersConfig[provider] as Record<string, unknown> | undefined;
 
         const decision = update(section);
@@ -1387,7 +1398,7 @@ export class ProviderService {
         }
 
         providersConfig[provider] = decision.value as BaseProviderConfig;
-        this.config.saveProvidersConfig(providersConfig);
+        this.providersConfigStore.saveProvidersConfig(providersConfig);
         return true;
       });
 
@@ -1432,13 +1443,13 @@ export class ProviderService {
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
       // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
+      const policyDenial = await this.fileLeaseManager.withProvidersFileLock((): string | null => {
         const denial = this.validateProviderEditPolicy(provider, keyPath);
         if (denial != null) {
           return denial;
         }
 
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
 
         // The add-time id collision rule applies only when this write would
         // CONVERT a non-custom entry into a custom provider. An entry that is
@@ -1522,7 +1533,7 @@ export class ProviderService {
         }
 
         // Save updated config
-        this.config.saveProvidersConfig(providersConfig);
+        this.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
       if (policyDenial != null) {
@@ -1548,7 +1559,7 @@ export class ProviderService {
   }
 
   public validateRouteOverrides(routeOverrides: Record<string, string>): Result<void, string> {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     for (const routeTarget of Object.values(routeOverrides)) {
       const targetConfig = providersConfig[routeTarget];
       if (isCustomProviderConfig(targetConfig)) {

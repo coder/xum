@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
-import { Config } from "@/node/config";
+import { Config, ProvidersConfigStore } from "@/node/config";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "./providerService";
 import { VoiceService } from "./voiceService";
@@ -48,7 +48,7 @@ describe("VoiceService.transcribe", () => {
 
   it("returns provider-disabled error without calling fetch", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
           enabled: false,
@@ -75,7 +75,7 @@ describe("VoiceService.transcribe", () => {
 
   it("calls fetch when OpenAI provider is enabled with an API key", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: "sk-test",
         },
@@ -97,7 +97,7 @@ describe("VoiceService.transcribe", () => {
 
   it("uses gateway when couponCode is set and OpenAI key is absent", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -125,7 +125,7 @@ describe("VoiceService.transcribe", () => {
 
   it("preserves reverse-proxy path prefix from gateway baseURL", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           baseURL: "https://proxy.example.com/gateway/api/v1/ai-gateway/v1/ai",
@@ -154,7 +154,7 @@ describe("VoiceService.transcribe", () => {
 
   it("prefers gateway over OpenAI when both are configured", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -185,7 +185,7 @@ describe("VoiceService.transcribe", () => {
 
   it("respects direct-before-gateway route priority when both are configured", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -220,7 +220,7 @@ describe("VoiceService.transcribe", () => {
 
   it("falls back to OpenAI when gateway is disabled", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           enabled: false,
@@ -252,7 +252,7 @@ describe("VoiceService.transcribe", () => {
 
   it("returns error when the mux-gateway provider is disabled and OpenAI is unavailable", async () => {
     await withTempConfig(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           enabled: false,
@@ -279,7 +279,7 @@ describe("VoiceService.transcribe", () => {
 
   it("falls back to OpenAI when policy disallows mux-gateway", async () => {
     await withTempConfig(async (config, service, _providerService, policyService) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
         },
@@ -313,7 +313,7 @@ describe("VoiceService.transcribe", () => {
 
   it("uses policy forced base URL for gateway transcription", async () => {
     await withTempConfig(async (config, service, _providerService, policyService) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           baseURL: "https://config.example.com/config-prefix/api/v1/ai-gateway/v1/ai",
@@ -350,7 +350,7 @@ describe("VoiceService.transcribe", () => {
 
   it("clears gateway credentials on 401", async () => {
     await withTempConfig(async (config, service, providerService) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "mux-gateway": {
           couponCode: "gateway-token",
           voucher: "legacy-token",

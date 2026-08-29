@@ -18,7 +18,7 @@ import { HistoryService } from "./historyService";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { Config } from "@/node/config";
+import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -182,7 +182,7 @@ function configureOpenAICodexOAuth(
   requests: RecordedFetchRequest[],
   options?: { defaultAuth?: "apiKey"; responseModel?: string; setOauthService?: boolean }
 ): void {
-  config.loadProvidersConfig = () => ({
+  new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
     openai: {
       apiKey: "test-openai-api-key",
       codexOauth: TEST_CODEX_OAUTH,
@@ -2048,7 +2048,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } as unknown as SessionUsageService;
     const harness = createHarness(xumHome.path, metadata, { sessionUsageService });
     const metadataModel = KNOWN_MODELS.SONNET.id;
-    harness.config.saveProvidersConfig({
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
       anthropic: {
         models: [{ id: "custom-sonnet", mappedToModel: metadataModel }],
       },
@@ -2166,7 +2166,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } as unknown as SessionUsageService;
     const harness = createHarness(xumHome.path, metadata, { sessionUsageService });
 
-    harness.config.saveProvidersConfig({
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
       openai: {
         codexOauth: {
           type: "oauth",

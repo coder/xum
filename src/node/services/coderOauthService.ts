@@ -17,7 +17,7 @@ import {
   normalizeCoderDeploymentUrl,
   type CoderGatewayProvider,
 } from "@/common/constants/coderOAuth";
-import type { Config } from "@/node/config";
+import type { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
@@ -254,7 +254,8 @@ export class CoderOauthService {
   private readonly unsubscribeConfigChanged: () => void;
 
   constructor(
-    private readonly config: Config,
+    private readonly providersConfigStore: ProvidersConfigStore,
+    private readonly fileLeaseManager: FileLeaseManager,
     private readonly providerService: ProviderService,
     private readonly windowService?: WindowService,
     private readonly policyService?: PolicyService
@@ -340,7 +341,7 @@ export class CoderOauthService {
       auth: CoderOauthAuth | null;
     };
     try {
-      clearOutcome = await this.config.withCoderOauthLoginCommitLock(async () => {
+      clearOutcome = await this.fileLeaseManager.withCoderOauthLoginCommitLock(async () => {
         const auth = this.readStoredAuth();
         const clearResult = await this.providerService.updateProviderSection("coder", (section) => {
           const stored = parseCoderOauthAuth(section?.coderOauth);
@@ -567,7 +568,9 @@ export class CoderOauthService {
     // lease goes stale after the flow timeout.
     let releaseClientLease: (() => void) | null = null;
     try {
-      releaseClientLease = this.config.tryAcquireCoderOauthClientLease(DEFAULT_DESKTOP_TIMEOUT_MS);
+      releaseClientLease = this.fileLeaseManager.tryAcquireCoderOauthClientLease(
+        DEFAULT_DESKTOP_TIMEOUT_MS
+      );
     } catch (error) {
       // Lease failures must not break login; degrade to a fresh client.
       log.debug(`[Coder OAuth] Client lease unavailable: ${getErrorMessage(error)}`);
@@ -734,7 +737,7 @@ export class CoderOauthService {
    * refuses once it changed (see coderDisconnectGeneration in the schema).
    */
   private readPersistedDisconnectGeneration(): number {
-    const section = this.config.loadProvidersConfig()?.coder as
+    const section = this.providersConfigStore.loadProvidersConfig()?.coder as
       | { coderDisconnectGeneration?: unknown }
       | undefined;
     return sanitizeGenerationCounter(section?.coderDisconnectGeneration);
@@ -790,7 +793,7 @@ export class CoderOauthService {
     // after which our persist CAS fails too and both processes discard the
     // only valid token. Inside the lock the loser re-reads disk and adopts
     // the winner's rotation without ever sending a doomed request.
-    return await this.config.withCoderOauthRefreshLock(async () => {
+    return await this.fileLeaseManager.withCoderOauthRefreshLock(async () => {
       // Re-read after acquiring both locks in case another caller (this
       // process or another) refreshed first. Drop the in-memory cache so the
       // read reflects cross-process writes.
@@ -829,7 +832,7 @@ export class CoderOauthService {
   }
 
   getDeploymentUrl(): string | null {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const coderConfig = providersConfig.coder as Record<string, unknown> | undefined;
     const raw = coderConfig?.deploymentUrl;
     const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
@@ -1083,7 +1086,7 @@ export class CoderOauthService {
    */
   private async quarantineStoredClient(clientId: string): Promise<boolean> {
     try {
-      const result = await this.config.withCoderOauthRefreshLock(() =>
+      const result = await this.fileLeaseManager.withCoderOauthRefreshLock(() =>
         this.providerService.updateProviderSection("coder", (section) => {
           const stored = parseCoderOauthAuth(section?.coderOauth);
           if (stored?.clientId !== clientId) {
@@ -1238,7 +1241,7 @@ export class CoderOauthService {
       "sendSuccessResponse" | "sendFailureResponse"
     >
   ): Promise<CoderLoginCommitResult> {
-    return await this.config.withCoderOauthLoginCommitLock(async () => {
+    return await this.fileLeaseManager.withCoderOauthLoginCommitLock(async () => {
       // The flow may have been cancelled (or timed out) while the exchange
       // round-trip was in flight (or while waiting for the locks). Persisting
       // anyway would leave the account connected after the user clicked
@@ -1820,8 +1823,11 @@ export class CoderOauthService {
     // committed mid-flight. A stale snapshot read here is safe: it can only
     // cause a conservative refusal, never a stale commit.
     const refreshStartGeneration = sanitizeGenerationCounter(
-      (this.config.loadProvidersConfig()?.coder as { coderCatalogGeneration?: unknown } | undefined)
-        ?.coderCatalogGeneration
+      (
+        this.providersConfigStore.loadProvidersConfig()?.coder as
+          | { coderCatalogGeneration?: unknown }
+          | undefined
+      )?.coderCatalogGeneration
     );
     // The deployment's configured provider instances decide which gateway
     // routes exist (each is mounted at /<name>/...), so list them first.
@@ -1844,7 +1850,7 @@ export class CoderOauthService {
     if (authoritative) {
       providers = listing.providers;
     } else {
-      const section = this.config.loadProvidersConfig()?.coder as
+      const section = this.providersConfigStore.loadProvidersConfig()?.coder as
         | Record<string, unknown>
         | undefined;
       const known = new Map<string, CoderGatewayProvider>();
@@ -2139,11 +2145,11 @@ export class CoderOauthService {
     // un-revoked credential in use after the user disconnected it. The
     // fingerprint is captured BEFORE the read, so a write racing this load
     // at worst forces an extra re-read on the next call, never a stale hit.
-    const fingerprint = this.config.getProvidersFileFingerprint();
+    const fingerprint = this.providersConfigStore.getProvidersFileFingerprint();
     if (this.cachedAuth && fingerprint != null && fingerprint === this.cachedAuthFingerprint) {
       return this.cachedAuth;
     }
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const coderConfig = providersConfig.coder as Record<string, unknown> | undefined;
     const auth = parseCoderOauthAuth(coderConfig?.coderOauth);
     this.cachedAuth = auth;

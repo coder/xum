@@ -37,7 +37,7 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import type { SendMessageError } from "@/common/types/errors";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
@@ -2642,14 +2642,8 @@ export class WorkspaceGoalService {
   }
 
   private getProvidersConfigForPricing(): ProvidersConfigMap | null {
-    const maybeConfig = this.config as Config & {
-      loadProvidersConfig?: () => ProvidersConfigMap | null;
-    };
-    if (typeof maybeConfig.loadProvidersConfig !== "function") {
-      return null;
-    }
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    return maybeConfig.loadProvidersConfig() as unknown as ProvidersConfigMap | null;
+    const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
+    return providersConfig as unknown as ProvidersConfigMap | null;
   }
 
   async requestPendingGoalContinuationDispatch(workspaceId: string): Promise<void> {

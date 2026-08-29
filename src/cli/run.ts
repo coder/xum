@@ -14,7 +14,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { Config } from "../node/config";
+import { Config, FileLeaseManager, ProvidersConfigStore } from "../node/config";
 import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
@@ -516,7 +516,9 @@ async function main(): Promise<number> {
   const config = await createRunConfig(tempDir.path, preparedSessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config
-  const existingProviders = realConfig.loadProvidersConfig();
+  const realProvidersStore = new ProvidersConfigStore(realConfig.rootDir);
+  const runProvidersStore = new ProvidersConfigStore(config.rootDir);
+  const existingProviders = realProvidersStore.loadProvidersConfig();
   const providersFile = path.join(config.rootDir, "providers.jsonc");
   await replacePrivateRunConfigFile(
     providersFile,
@@ -618,7 +620,7 @@ async function main(): Promise<number> {
   if (!hasAnyConfiguredProvider(existingProviders)) {
     const providersFromEnv = buildProvidersFromEnv();
     if (hasAnyConfiguredProvider(providersFromEnv)) {
-      config.saveProvidersConfig(providersFromEnv);
+      runProvidersStore.saveProvidersConfig(providersFromEnv);
     } else {
       throw new Error(
         "No provider credentials found. Configure providers.jsonc or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY / MOONSHOT_API_KEY."
@@ -676,16 +678,23 @@ async function main(): Promise<number> {
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
   // Codex OAuth explicitly to ensure Codex-routed OpenAI requests can load/refresh
   // OAuth tokens from providers.jsonc.
-  const codexOauthService = new CodexOauthService(config, providerService);
+  const codexOauthService = new CodexOauthService(runProvidersStore, providerService);
   turnRequestBuilderBindings.codexOauthService = codexOauthService;
   // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
   // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
   // the refresh token on every use, so persisting rotations only to tempDir
   // would strand ~/.xum/providers.jsonc with a consumed (dead) refresh token
   // once this CLI session exits.
-  const realProviderService = new ProviderService(realConfig, policyService);
-  const coderOauthService = new CoderOauthService(
+  const realFileLeaseManager = new FileLeaseManager(realConfig.rootDir);
+  const realProviderService = new ProviderService(
     realConfig,
+    policyService,
+    realProvidersStore,
+    realFileLeaseManager
+  );
+  const coderOauthService = new CoderOauthService(
+    realProvidersStore,
+    realFileLeaseManager,
     realProviderService,
     undefined,
     // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for

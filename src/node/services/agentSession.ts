@@ -7,7 +7,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
@@ -4299,17 +4299,8 @@ export class AgentSession {
         return maybeAIService.getProvidersConfig();
       }
 
-      // Some unit tests provide minimal service mocks; fall back to raw config so custom
-      // provider model context overrides still work in those environments.
-      const maybeConfig = this.config as Config & {
-        loadProvidersConfig?: () => ProvidersConfigMap | null;
-      };
-      if (typeof maybeConfig.loadProvidersConfig !== "function") {
-        return null;
-      }
-
-      // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-      return maybeConfig.loadProvidersConfig() as unknown as ProvidersConfigMap | null;
+      const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
+      return providersConfig as unknown as ProvidersConfigMap | null;
     } catch {
       // Best-effort read: if config cannot be loaded, keep null and rely on
       // built-in model limits. This matches prior behavior without crashing.

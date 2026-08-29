@@ -5,6 +5,7 @@
 import * as os from "os";
 import * as path from "path";
 import type { Config } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
@@ -46,6 +47,8 @@ import type { DevToolsService } from "@/node/services/devToolsService";
 
 export interface CoreServicesOptions {
   config: Config;
+  providersConfigStore?: ProvidersConfigStore;
+  fileLeaseManager?: FileLeaseManager;
   extensionMetadataPath: string;
   /** Overrides config for MCPConfigService; CLI passes its persistent realConfig. */
   mcpConfig?: Config;
@@ -92,7 +95,15 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
 
   const historyService = new HistoryService(config);
   const initStateManager = new InitStateManager(config);
-  const providerService = new ProviderService(config, opts.policyService);
+  const providersConfigStore =
+    opts.providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  const fileLeaseManager = opts.fileLeaseManager ?? new FileLeaseManager(config.rootDir);
+  const providerService = new ProviderService(
+    config,
+    opts.policyService,
+    providersConfigStore,
+    fileLeaseManager
+  );
   const backgroundProcessManager = new BackgroundProcessManager(
     path.join(os.tmpdir(), "mux-bashes")
   );
@@ -173,7 +184,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.devToolsService,
     opts.experimentsService,
     streamManager,
-    turnRequestBuilderBindings
+    turnRequestBuilderBindings,
+    providersConfigStore
   );
 
   // Agent memory (memory experiment): scope roots derive from Config (xum home

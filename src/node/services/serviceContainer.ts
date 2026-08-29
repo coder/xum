@@ -3,6 +3,7 @@ import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBeha
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import { createCoreServices, type CoreServices } from "@/node/services/coreServices";
 import { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -89,6 +90,8 @@ import type { ORPCContext } from "@/node/orpc/context";
 export class ServiceContainer {
   public readonly workflowRuntimeFactory = new QuickJSRuntimeFactory();
   public readonly config: Config;
+  public readonly providersConfigStore: ProvidersConfigStore;
+  public readonly fileLeaseManager: FileLeaseManager;
   // Core services — instantiated by createCoreServices (shared with `xum run` CLI)
   private readonly historyService: CoreServices["historyService"];
   public readonly aiService: CoreServices["aiService"];
@@ -153,6 +156,8 @@ export class ServiceContainer {
 
   constructor(config: Config) {
     this.config = config;
+    this.providersConfigStore = new ProvidersConfigStore(config.rootDir);
+    this.fileLeaseManager = new FileLeaseManager(config.rootDir);
 
     // Cross-cutting services: created first so they can be passed to core
     // services via constructor params (no setter injection needed).
@@ -179,6 +184,8 @@ export class ServiceContainer {
 
     const core = createCoreServices({
       config,
+      providersConfigStore: this.providersConfigStore,
+      fileLeaseManager: this.fileLeaseManager,
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
       policyService: this.policyService,
@@ -335,7 +342,7 @@ export class ServiceContainer {
     this.mcpServerManager.setMcpOauthService(this.mcpOauthService);
 
     this.muxGatewayOauthService = new MuxGatewayOauthService(
-      config,
+      this.providersConfigStore,
       this.providerService,
       this.windowService
     );
@@ -345,13 +352,14 @@ export class ServiceContainer {
       this.policyService
     );
     this.codexOauthService = new CodexOauthService(
-      config,
+      this.providersConfigStore,
       this.providerService,
       this.windowService
     );
     core.turnRequestBuilderBindings.codexOauthService = this.codexOauthService;
     this.coderOauthService = new CoderOauthService(
-      config,
+      this.providersConfigStore,
+      this.fileLeaseManager,
       this.providerService,
       this.windowService,
       // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
@@ -405,7 +413,12 @@ export class ServiceContainer {
     );
     this.serverService = new ServerService();
     this.menuEventService = new MenuEventService();
-    this.voiceService = new VoiceService(config, this.providerService, this.policyService);
+    this.voiceService = new VoiceService(
+      config,
+      this.providerService,
+      this.policyService,
+      this.providersConfigStore
+    );
     this.coderService = coderService;
 
     this.serverAuthService = new ServerAuthService(config);
@@ -631,6 +644,8 @@ export class ServiceContainer {
     return {
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
+      providersConfigStore: this.providersConfigStore,
+      fileLeaseManager: this.fileLeaseManager,
       aiService: this.aiService,
       historyService: this.historyService,
       streamManager: this.streamManager,

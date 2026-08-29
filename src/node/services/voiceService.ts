@@ -4,7 +4,7 @@ import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 
@@ -32,11 +32,16 @@ interface MuxGatewayTranscriptionConfig {
  * Voice input service using OpenAI-compatible transcription APIs.
  */
 export class VoiceService {
+  private readonly providersConfigStore: ProvidersConfigStore;
+
   constructor(
     private readonly config: Config,
     private readonly providerService?: ProviderService,
-    private readonly policyService?: PolicyService
-  ) {}
+    private readonly policyService?: PolicyService,
+    providersConfigStore?: ProvidersConfigStore
+  ) {
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  }
 
   /**
    * Transcribe audio from base64-encoded data using mux-gateway or OpenAI.
@@ -45,7 +50,7 @@ export class VoiceService {
    */
   async transcribe(audioBase64: string): Promise<Result<string, string>> {
     try {
-      const providersConfig = this.config.loadProvidersConfig() ?? {};
+      const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
       const gatewayConfig = providersConfig["mux-gateway"] as
         | MuxGatewayTranscriptionConfig
         | undefined;

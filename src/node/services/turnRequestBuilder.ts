@@ -31,7 +31,7 @@ import {
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
-import type { Config } from "@/node/config";
+import type { Config, ProvidersConfigStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
@@ -464,6 +464,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
 
 interface TurnRequestBuilderDependencies {
   config: Config;
+  providersConfigStore: ProvidersConfigStore;
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
@@ -621,7 +622,7 @@ export class TurnRequestBuilder {
     );
     const resolvedOverrides = resolveModelParameterOverrides(
       pinCoderInstanceRawProvidersConfig(
-        this.dependencies.config.loadProvidersConfig(),
+        this.dependencies.providersConfigStore.loadProvidersConfig(),
         options.rawModelString,
         options.coderSelectedInstance
       ),
@@ -1895,7 +1896,8 @@ export class TurnRequestBuilder {
                 // pinned pricing identity: two independent reads would let
                 // a catalog refresh land between them, running the request
                 // on one wire while recording usage under another type.
-                const advisorProvidersConfig = this.dependencies.config.loadProvidersConfig() ?? {};
+                const advisorProvidersConfig =
+                  this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
                 // View snapshot captured at creation time for option
                 // building (buildProviderOptions takes the oRPC view, not
                 // the raw config shape).

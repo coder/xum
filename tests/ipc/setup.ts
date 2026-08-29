@@ -2,7 +2,7 @@ import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
 import type { BrowserWindow, WebContents } from "electron";
-import { Config } from "../../src/node/config";
+import { Config, ProvidersConfigStore } from "../../src/node/config";
 import { ServiceContainer } from "../../src/node/services/serviceContainer";
 import { setOpenSSHHostKeyPolicyMode } from "../../src/node/runtime/sshConnectionPool";
 import {
@@ -66,7 +66,7 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   // For integration tests (TEST_INTEGRATION=1), do NOT write dummy keys here (they would override
   // real env-backed credentials used by tests like name generation).
   if (!shouldRunIntegrationTests()) {
-    config.saveProvidersConfig({
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
       anthropic: { apiKey: "test-key-for-ui-tests" },
     });
   }

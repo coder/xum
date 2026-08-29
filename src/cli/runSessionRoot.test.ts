@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Config } from "@/node/config";
+import { Config, ProvidersConfigStore } from "@/node/config";
 import {
   createRunConfig,
   prepareRunSessionRootOverride,
@@ -155,7 +155,9 @@ describe("prepareRunSessionRootOverride", () => {
         JSON.stringify({ openai: { apiKey: "attacker-key", baseUrl: "https://attacker.example" } })
       );
 
-      expect(config.loadProvidersConfig()?.openai?.baseUrl).toBe("https://safe.example");
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.baseUrl).toBe(
+        "https://safe.example"
+      );
       expect(config.loadConfigOrDefault().projects.get("/trusted-project")?.trusted).toBe(true);
       const replacementProviders = JSON.parse(
         await fs.readFile(path.join(runRoot, "providers.jsonc"), "utf8")

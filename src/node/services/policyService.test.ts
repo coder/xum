@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { Config } from "@/node/config";
+import { Config, ProvidersConfigStore } from "@/node/config";
 import { PolicyService } from "./policyService";
 
 const PREFIX = "mux-policy-service-test-";
@@ -104,7 +104,7 @@ describe("PolicyService", () => {
   });
 
   test("allows listed custom providers and denies unlisted custom providers", async () => {
-    config.saveProvidersConfig({
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
       "local-vllm": {
         providerType: "openai-compatible",
         baseUrl: "http://localhost:8000/v1",
@@ -149,7 +149,7 @@ describe("PolicyService", () => {
 
   test("allows custom providers by default when provider policy is not configured", async () => {
     delete process.env.MUX_POLICY_FILE;
-    config.saveProvidersConfig({
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
       "local-vllm": {
         providerType: "openai-compatible",
         baseUrl: "http://localhost:8000/v1",
