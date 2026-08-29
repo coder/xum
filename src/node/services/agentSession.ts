@@ -535,6 +535,11 @@ interface AgentSessionActiveStreamInfo {
 }
 
 export interface AgentSessionStreamManager {
+  stopStream(
+    workspaceId: string,
+    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+  ): Promise<Result<void>>;
+  isStreaming(workspaceId: string): boolean;
   getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
   replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
 }
@@ -544,11 +549,11 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   on(event: string, listener: (...args: unknown[]) => void): void;
   off(event: string, listener: (...args: unknown[]) => void): void;
   streamMessage(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
-  stopStream(
+  stopStream?(
     workspaceId: string,
     options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
   ): Promise<Result<void>>;
-  isStreaming(workspaceId: string): boolean;
+  isStreaming?(workspaceId: string): boolean;
   getStreamInfo?(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
   replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
@@ -901,7 +906,9 @@ export class AgentSession {
     this.aiService = aiService;
     const streamManagerCandidate = streamManager ?? aiService;
     assert(
-      typeof streamManagerCandidate.getStreamInfo === "function" &&
+      typeof streamManagerCandidate.stopStream === "function" &&
+        typeof streamManagerCandidate.isStreaming === "function" &&
+        typeof streamManagerCandidate.getStreamInfo === "function" &&
         typeof streamManagerCandidate.replayStream === "function",
       "AgentSession requires stream lifecycle access"
     );
@@ -971,7 +978,7 @@ export class AgentSession {
     // flip the process exit code after the run already completed.
     // Promise.resolve guards test doubles that return non-promises.
     void Promise.resolve(
-      this.aiService.stopStream(this.workspaceId, { abandonPartial: true })
+      this.streamManager.stopStream(this.workspaceId, { abandonPartial: true })
     ).catch((error) => {
       log.debug(`dispose: stopStream failed: ${getErrorMessage(error)}`);
     });
@@ -2455,7 +2462,7 @@ export class AgentSession {
       this.startupAutoRetryCheckScheduled = false;
       if (
         this.isBusy() ||
-        this.aiService.isStreaming(this.workspaceId) ||
+        this.streamManager.isStreaming(this.workspaceId) ||
         this.retryManager.isRetryPending
       ) {
         return;
@@ -2482,7 +2489,7 @@ export class AgentSession {
   shouldRetainAfterStartupRecovery(): boolean {
     return (
       this.isBusy() ||
-      this.aiService.isStreaming(this.workspaceId) ||
+      this.streamManager.isStreaming(this.workspaceId) ||
       this.retryManager.isRetryPending
     );
   }
@@ -4752,7 +4759,7 @@ export class AgentSession {
 
     this.midStreamCompactionPending = true;
     try {
-      const stopResult = await this.aiService.stopStream(this.workspaceId, {
+      const stopResult = await this.streamManager.stopStream(this.workspaceId, {
         abortReason: "system",
       });
       if (!stopResult.success) {
@@ -4874,7 +4881,7 @@ export class AgentSession {
       }
     }
 
-    const stopResult = await this.aiService.stopStream(this.workspaceId, {
+    const stopResult = await this.streamManager.stopStream(this.workspaceId, {
       ...options,
       abortReason: "user",
     });
@@ -6771,7 +6778,7 @@ export class AgentSession {
     }
 
     this.queuedProviderToolEndAbortInFlight = true;
-    const result = await this.aiService.stopStream(this.workspaceId, {
+    const result = await this.streamManager.stopStream(this.workspaceId, {
       soft: true,
       abortReason: "system",
     });

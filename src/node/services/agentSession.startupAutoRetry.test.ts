@@ -1559,6 +1559,8 @@ describe("AgentSession startup auto-retry recovery", () => {
     const aiService = Object.assign(aiEmitter, {
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
       isStreaming: mock(() => false),
+      getStreamInfo: mock(() => undefined),
+      replayStream: mock(() => Promise.resolve()),
       streamMessage: mock(() => Promise.resolve(Ok(createStartedTurnHandle()))),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
     }) as unknown as AgentSessionAIService;
