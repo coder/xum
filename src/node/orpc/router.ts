@@ -53,18 +53,15 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
-import type { WorkspaceMetadata } from "@/common/types/workspace";
 import {
   createAuthMiddleware,
   extractClientIpAddress,
   extractCookieValues,
   getFirstHeaderValue,
 } from "./authMiddleware";
-import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { clearLogFiles, getLogFilePath } from "@/node/services/log";
 import { clearLogEntries } from "@/node/services/logBuffer";
 
-import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
 import {
   attachTerminal,
   createTickIterable,
@@ -88,12 +85,7 @@ import {
   subscribeWorkspaceStats,
 } from "./routerSubscriptions";
 
-import { createRuntime, checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
-import {
-  appendSubProjectRelativePath,
-  createRuntimeForWorkspace,
-  resolveWorkspaceRootPath,
-} from "@/node/runtime/runtimeHelpers";
+import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
   isLayoutPresetsConfigEmpty,
@@ -103,156 +95,36 @@ import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 
 import {
-  discoverAgentSkills,
-  discoverAgentSkillsDiagnostics,
-  readAgentSkill,
+  getAgentSkill,
+  listAgentSkillDiagnostics,
+  listAgentSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
-import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import type { SkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
-  discoverAgentDefinitions,
-  getSkipScopesAboveForKnownScope,
-  readAgentDefinition,
-  resolveAgentFrontmatter,
+  getAgentDefinition,
+  listAgentDefinitions,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
-import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
-import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
 
-import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
 import { getErrorMessage } from "@/common/utils/errors";
 
 import {
-  getWorkflowRunStatusesForOwners,
-  listActiveWorkflowRunsForOwners,
-} from "@/node/services/workflows/WorkflowRunStore";
-import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
-
-import {
+  getWorkflowRun,
+  getWorkflowRunStatuses,
+  interruptWorkflowRun,
+  listActiveWorkflowRuns,
+  listWorkflowRuns,
   listWorkflowScripts,
-  resolveWorkflowContext,
   resumeWorkflowRun,
   retryWorkflowRunFromCheckpoint,
   startWorkflowRun,
+  subscribeWorkflowRuns,
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
   return request().catch(throwWorkflowOrpcError);
-}
-
-/**
- * Resolves runtime and discovery path for agent operations.
- * - When workspaceId is provided: uses workspace's runtime config (SSH, local, worktree)
- * - When only projectPath is provided: uses local runtime with project path
- * - When disableWorkspaceAgents is true: still uses workspace runtime but discovers from projectPath
- */
-async function resolveAgentDiscoveryContext(
-  context: ORPCContext,
-  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
-): Promise<{
-  runtime: ReturnType<typeof createRuntime>;
-  discoveryPath: string;
-  metadata?: WorkspaceMetadata;
-}> {
-  if (!input.projectPath && !input.workspaceId) {
-    throw new Error("Either projectPath or workspaceId must be provided");
-  }
-
-  if (input.workspaceId) {
-    const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
-    if (!metadataResult.success) {
-      throw new Error(metadataResult.error);
-    }
-    const metadata = metadataResult.data;
-    const runtime = createRuntimeForWorkspace(metadata);
-    // When workspace agents disabled, discover from project path instead of worktree
-    // (but still use the workspace's runtime for SSH compatibility)
-    const discoveryPath = input.disableWorkspaceAgents
-      ? metadata.projectPath
-      : runtime.getWorkspacePath(metadata.projectPath, metadata.name);
-    return { runtime, discoveryPath, metadata };
-  }
-
-  // No workspace - use local runtime with project path
-  const runtime = createRuntime(
-    { type: "local", srcBaseDir: context.config.srcDir },
-    { projectPath: input.projectPath! }
-  );
-  return { runtime, discoveryPath: input.projectPath! };
-}
-
-async function resolveAgentSkillDiscoveryContext(
-  context: ORPCContext,
-  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean },
-  options: { includeClaudeSkills: boolean; includeAgentPlugins: boolean }
-): Promise<SkillStorageContext> {
-  const resolved = await resolveAgentDiscoveryContext(context, input);
-  if (resolved.metadata == null) {
-    const projectPath = input.projectPath ?? resolved.discoveryPath;
-    const creationScope = resolveWorkspaceCreationScope(
-      projectPath,
-      context.config.loadConfigOrDefault().projects
-    );
-    return resolveSkillStorageContext({
-      runtime: resolved.runtime,
-      workspacePath: resolved.discoveryPath,
-      xumScope: {
-        type: "project",
-        xumHome: context.config.rootDir,
-        projectRoot: resolved.discoveryPath,
-        projectStorageAuthority: "host-local",
-        checkoutRoot: creationScope.projectPath,
-      },
-      ...options,
-    });
-  }
-
-  const workspacePath =
-    input.disableWorkspaceAgents === true
-      ? resolved.discoveryPath
-      : appendSubProjectRelativePath(
-          resolved.metadata,
-          resolved.runtime,
-          resolveWorkspaceRootPath(resolved.metadata, resolved.runtime)
-        );
-  const xumScope = context.aiService.resolveXumToolScopeForWorkspace(
-    resolved.metadata,
-    resolved.runtime,
-    workspacePath
-  );
-  return resolveSkillStorageContext({
-    runtime: resolved.runtime,
-    workspacePath,
-    xumScope:
-      input.disableWorkspaceAgents === true && xumScope.type === "project"
-        ? { ...xumScope, checkoutRoot: workspacePath }
-        : xumScope,
-    ...options,
-  });
-}
-
-/**
- * Agent Plugins MCP context for an optional workspaceId input (agent-plugins
- * experiment). Returns undefined (project-level default: scan under
- * projectPath) when no workspace is given or its metadata cannot be resolved;
- * otherwise the workspace's own context — worktree-scanning for host
- * workspaces, null for off-host workspaces so plugin servers match what the
- * engine actually offers there.
- *
- * SECURITY: the workspace must belong to the request's project. The caller's
- * `trusted` flag is derived from `projectPath`, so honoring a workspaceId from
- * a DIFFERENT (untrusted) project would scan that project's checkout under
- * another project's trust and let mcp.test execute its repo-local stdio
- * plugins. Mismatches fall back to the projectPath-scoped default, whose
- * trust and scan root describe the same project.
- */
-function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-    throw new ORPCError("BAD_REQUEST", { message: "Dynamic workflows are disabled" });
-  }
 }
 
 async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<string | null> {
@@ -276,26 +148,6 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
   }
 
   return null;
-}
-
-function subscribeWorkflowRuns(
-  context: ORPCContext,
-  workspaceId: string,
-  signal?: AbortSignal
-): AsyncGenerator<WorkflowRunStreamEvent> {
-  return asyncIterableFromSubscription<WorkflowRunStreamEvent>({
-    signal,
-    validate: () => assertDynamicWorkflowsEnabled(context),
-    subscribe: (push) =>
-      workflowRunStreamHub.subscribe(workspaceId, (run) => {
-        if (run.parentWorkflow == null) push({ type: "run-changed", run });
-      }),
-    initial: async () => {
-      const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
-      await service.resumeCrashedRuns({ workspaceId, projectTrusted });
-      return { type: "snapshot" as const, runs: await service.listRuns({ workspaceId }) };
-    },
-  });
 }
 
 export const router = (authToken?: string) => {
@@ -685,235 +537,52 @@ export const router = (authToken?: string) => {
       list: t
         .input(schemas.agents.list.input)
         .output(schemas.agents.list.output)
-        .handler(async ({ context, input }) => {
-          // Wait for workspace init before discovery (SSH may not be ready yet)
-          if (input.workspaceId) {
-            await context.aiService.waitForInit(input.workspaceId);
-          }
-
-          const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-
-          const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
-            EXPERIMENT_IDS.AGENT_PLUGINS
-          );
-          const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
-            includeAgentPlugins,
-          });
-
-          const cfg = context.config.loadConfigOrDefault();
-
-          const resolved = await Promise.all(
-            descriptors.map(async (descriptor) => {
-              try {
-                const resolvedFrontmatter = await resolveAgentFrontmatter(
-                  runtime,
-                  discoveryPath,
-                  descriptor.id,
-                  {
-                    includeAgentPlugins,
-                    skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
-                  }
-                );
-
-                const effectivelyDisabled = isAgentEffectivelyDisabled({
-                  cfg,
-                  agentId: descriptor.id,
-                  resolvedFrontmatter,
-                });
-
-                // By default, disabled agents are omitted from discovery so they cannot be
-                // selected or cycled in the UI.
-                //
-                // Settings passes includeDisabled: true so users can opt in/out locally.
-                if (effectivelyDisabled && input.includeDisabled !== true) {
-                  return null;
-                }
-
-                const { selectable: uiSelectableBase } = resolveAgentVisibility(
-                  resolvedFrontmatter.ui
-                );
-
-                return {
-                  kind: "resolved" as const,
-                  descriptor,
-                  resolvedFrontmatter,
-                  uiSelectableBase,
-                };
-              } catch {
-                return { kind: "fallback" as const, descriptor };
-              }
-            })
-          );
-
-          return resolved.flatMap((entry) => {
-            if (!entry) {
-              return [];
-            }
-            if (entry.kind === "fallback") {
-              return [entry.descriptor];
-            }
-
-            return [
-              {
-                ...entry.descriptor,
-                name: entry.resolvedFrontmatter.name,
-                description: entry.resolvedFrontmatter.description,
-                uiSelectable: entry.uiSelectableBase,
-                uiColor: entry.resolvedFrontmatter.ui?.color,
-                subagentRunnable: entry.resolvedFrontmatter.subagent?.runnable ?? false,
-                base: entry.resolvedFrontmatter.base,
-                aiDefaults: entry.resolvedFrontmatter.ai,
-                tools: entry.resolvedFrontmatter.tools,
-              },
-            ];
-          });
-        }),
+        .handler(({ context, input }) => listAgentDefinitions(context, input)),
       get: t
         .input(schemas.agents.get.input)
         .output(schemas.agents.get.output)
-        .handler(async ({ context, input }) => {
-          // Wait for workspace init before discovery (SSH may not be ready yet)
-          if (input.workspaceId) {
-            await context.aiService.waitForInit(input.workspaceId);
-          }
-          const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-          return readAgentDefinition(runtime, discoveryPath, input.agentId, {
-            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-          });
-        }),
+        .handler(({ context, input }) => getAgentDefinition(context, input)),
     },
     agentSkills: {
       list: t
         .input(schemas.agentSkills.list.input)
         .output(schemas.agentSkills.list.output)
-        .handler(async ({ context, input }) => {
-          // Wait for workspace init before agent discovery (SSH may not be ready yet)
-          if (input.workspaceId) {
-            await context.aiService.waitForInit(input.workspaceId);
-          }
-          const skillCtx = await resolveAgentSkillDiscoveryContext(context, input, {
-            includeClaudeSkills: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
-            ),
-            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-          });
-          return discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-          });
-        }),
+        .handler(({ context, input }) => listAgentSkills(context, input)),
       listDiagnostics: t
         .input(schemas.agentSkills.listDiagnostics.input)
         .output(schemas.agentSkills.listDiagnostics.output)
-        .handler(async ({ context, input }) => {
-          // Wait for workspace init before agent discovery (SSH may not be ready yet)
-          if (input.workspaceId) {
-            await context.aiService.waitForInit(input.workspaceId);
-          }
-          const skillCtx = await resolveAgentSkillDiscoveryContext(context, input, {
-            includeClaudeSkills: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
-            ),
-            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-          });
-          const diagnostics = await discoverAgentSkillsDiagnostics(
-            skillCtx.runtime,
-            skillCtx.workspacePath,
-            {
-              roots: skillCtx.roots,
-              containment: skillCtx.containment,
-            }
-          );
-          return diagnostics;
-        }),
+        .handler(({ context, input }) => listAgentSkillDiagnostics(context, input)),
       get: t
         .input(schemas.agentSkills.get.input)
         .output(schemas.agentSkills.get.output)
-        .handler(async ({ context, input }) => {
-          // Wait for workspace init before agent discovery (SSH may not be ready yet)
-          if (input.workspaceId) {
-            await context.aiService.waitForInit(input.workspaceId);
-          }
-          const skillCtx = await resolveAgentSkillDiscoveryContext(context, input, {
-            includeClaudeSkills: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
-            ),
-            includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-          });
-          const result = await readAgentSkill(
-            skillCtx.runtime,
-            skillCtx.workspacePath,
-            input.skillName,
-            {
-              roots: skillCtx.roots,
-              containment: skillCtx.containment,
-            }
-          );
-          return result.package;
-        }),
+        .handler(({ context, input }) => getAgentSkill(context, input)),
     },
     workflows: {
       listRuns: t
         .input(schemas.workflows.listRuns.input)
         .output(schemas.workflows.listRuns.output)
         .handler(({ context, input }) =>
-          handleWorkflowRequest(async () => {
-            const { service, projectTrusted } = await resolveWorkflowContext(
-              context,
-              input.workspaceId
-            );
-            await service.resumeCrashedRuns({ workspaceId: input.workspaceId, projectTrusted });
-            return service.listRuns({ workspaceId: input.workspaceId });
-          })
+          handleWorkflowRequest(() => listWorkflowRuns(context, input.workspaceId))
         ),
       getRun: t
         .input(schemas.workflows.getRun.input)
         .output(schemas.workflows.getRun.output)
         .handler(({ context, input }) =>
-          handleWorkflowRequest(async () => {
-            const { service } = await resolveWorkflowContext(context, input.workspaceId);
-            return service.getRun(input);
-          })
+          handleWorkflowRequest(() => getWorkflowRun(context, input))
         ),
       getRunStatuses: t
         .input(schemas.workflows.getRunStatuses.input)
         .output(schemas.workflows.getRunStatuses.output)
-        .handler(async ({ context, input }) => {
-          // Read owner stores without waiting for workspace initialization so one stuck
-          // workspace cannot stall the batch. Transient failures are omitted; missing runs
-          // retain a null status so callers can distinguish them from retryable reads.
-          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-            return [];
-          }
-          return getWorkflowRunStatusesForOwners(context.config, input.runs);
-        }),
+        .handler(({ context, input }) => getWorkflowRunStatuses(context, input.runs)),
       listActiveRuns: t
         .input(schemas.workflows.listActiveRuns.input)
         .output(schemas.workflows.listActiveRuns.output)
-        .handler(async ({ context, input }) => {
-          // Keep discovery strict per owner: missing session dirs are empty, while transient
-          // store failures reject the call so the tray retries instead of caching no runs.
-          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
-            return [];
-          }
-          return listActiveWorkflowRunsForOwners(context.config, input.workspaceIds);
-        }),
+        .handler(({ context, input }) => listActiveWorkflowRuns(context, input.workspaceIds)),
       interrupt: t
         .input(schemas.workflows.interrupt.input)
         .output(schemas.workflows.interrupt.output)
         .handler(({ context, input }) =>
-          handleWorkflowRequest(async () => {
-            const { service } = await resolveWorkflowContext(context, input.workspaceId);
-            return service.interruptRun(input);
-          })
+          handleWorkflowRequest(() => interruptWorkflowRun(context, input))
         ),
       resume: t
         .input(schemas.workflows.resume.input)
@@ -933,10 +602,6 @@ export const router = (authToken?: string) => {
         .handler(({ context, input, signal }) =>
           handleWorkflowRequest(() => startWorkflowRun(context, input, signal))
         ),
-      // Live run stream for the Workflows tab. Mirrors devtools.subscribe (queue +
-      // resolve-next async generator). The event source is the module-level
-      // workflowRunStreamHub, fed by WorkflowRunStore on every durable write, so
-      // updates surface regardless of which flow is executing the run.
       subscribe: t
         .input(schemas.workflows.subscribe.input)
         .output(schemas.workflows.subscribe.output)

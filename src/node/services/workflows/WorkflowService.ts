@@ -6,6 +6,7 @@ import {
   type WorkflowScriptDescriptor,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
+  type WorkflowRunStreamEvent,
 } from "@/common/types/workflow";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -29,7 +30,15 @@ import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRe
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
-import { WorkflowRunStore, type WorkflowRunStatusSnapshot } from "./WorkflowRunStore";
+import {
+  WorkflowRunStore,
+  getWorkflowRunStatusesForOwners,
+  listActiveWorkflowRunsForOwners,
+  type WorkflowRunStatusSnapshot,
+} from "./WorkflowRunStore";
+import { workflowRunStreamHub } from "./workflowRunStreamHub";
+import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
+import { ORPCError } from "@orpc/server";
 import {
   WorkflowRunBackgroundedError,
   WorkflowRunner,
@@ -1075,6 +1084,67 @@ export async function resolveWorkflowContext(
       runnerId: "workflow-runner:" + workspaceId,
     }),
   };
+}
+
+export async function listWorkflowRuns(context: WorkflowServiceContext, workspaceId: string) {
+  const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
+  await service.resumeCrashedRuns({ workspaceId, projectTrusted });
+  return service.listRuns({ workspaceId });
+}
+
+export async function getWorkflowRun(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+) {
+  const { service } = await resolveWorkflowContext(context, input.workspaceId);
+  return service.getRun(input);
+}
+
+export async function interruptWorkflowRun(
+  context: WorkflowServiceContext,
+  input: { workspaceId: string; runId: string }
+) {
+  const { service } = await resolveWorkflowContext(context, input.workspaceId);
+  return service.interruptRun(input);
+}
+
+export async function getWorkflowRunStatuses(
+  context: WorkflowServiceContext,
+  runs: Array<{ workspaceId: string; runId: string }>
+) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
+  return getWorkflowRunStatusesForOwners(context.config, runs);
+}
+
+export async function listActiveWorkflowRuns(
+  context: WorkflowServiceContext,
+  workspaceIds: string[]
+) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) return [];
+  return listActiveWorkflowRunsForOwners(context.config, workspaceIds);
+}
+
+export function subscribeWorkflowRuns(
+  context: WorkflowServiceContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<WorkflowRunStreamEvent> {
+  return asyncIterableFromSubscription<WorkflowRunStreamEvent>({
+    signal,
+    validate: () => {
+      if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+        throw new ORPCError("BAD_REQUEST", { message: DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE });
+      }
+    },
+    subscribe: (push) =>
+      workflowRunStreamHub.subscribe(workspaceId, (run) => {
+        if (run.parentWorkflow == null) push({ type: "run-changed", run });
+      }),
+    initial: async () => ({
+      type: "snapshot" as const,
+      runs: await listWorkflowRuns(context, workspaceId),
+    }),
+  });
 }
 
 export async function resumeWorkflowRun(

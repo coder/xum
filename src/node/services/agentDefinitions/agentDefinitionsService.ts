@@ -2,6 +2,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { ORPCContext } from "@/node/orpc/context";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import { isAgentEffectivelyDisabled } from "./agentEnablement";
+import { resolveAgentVisibility } from "./agentVisibility";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -33,7 +40,6 @@ import {
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
-import { resolveAgentVisibility } from "./agentVisibility";
 import {
   AgentDefinitionParseError,
   parseAgentDefinitionMarkdown,
@@ -932,4 +938,114 @@ export async function resolveAgentFrontmatter(
   }
 
   return resolve(agentId, 0, options?.skipScopesAbove);
+}
+
+export type AgentDefinitionsContext = Pick<
+  ORPCContext,
+  "config" | "aiService" | "experimentsService"
+>;
+
+export async function resolveAgentDiscoveryContext(
+  context: AgentDefinitionsContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+): Promise<{ runtime: Runtime; discoveryPath: string; metadata?: WorkspaceMetadata }> {
+  if (!input.projectPath && !input.workspaceId)
+    throw new Error("Either projectPath or workspaceId must be provided");
+  if (input.workspaceId) {
+    const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
+    if (!metadataResult.success) throw new Error(metadataResult.error);
+    const metadata = metadataResult.data;
+    const runtime = createRuntimeForWorkspace(metadata);
+    return {
+      runtime,
+      discoveryPath: input.disableWorkspaceAgents
+        ? metadata.projectPath
+        : runtime.getWorkspacePath(metadata.projectPath, metadata.name),
+      metadata,
+    };
+  }
+  const projectPath = input.projectPath!;
+  return {
+    runtime: createRuntime({ type: "local", srcBaseDir: context.config.srcDir }, { projectPath }),
+    discoveryPath: projectPath,
+  };
+}
+
+export async function listAgentDefinitions(
+  context: AgentDefinitionsContext,
+  input: {
+    projectPath?: string;
+    workspaceId?: string;
+    disableWorkspaceAgents?: boolean;
+    includeDisabled?: boolean;
+  }
+) {
+  if (input.workspaceId) await context.aiService.waitForInit(input.workspaceId);
+  const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
+  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
+    EXPERIMENT_IDS.AGENT_PLUGINS
+  );
+  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
+    includeAgentPlugins,
+  });
+  const cfg = context.config.loadConfigOrDefault();
+  const resolved = await Promise.all(
+    descriptors.map(async (descriptor) => {
+      try {
+        const resolvedFrontmatter = await resolveAgentFrontmatter(
+          runtime,
+          discoveryPath,
+          descriptor.id,
+          {
+            includeAgentPlugins,
+            skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
+          }
+        );
+        if (
+          isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
+          input.includeDisabled !== true
+        )
+          return null;
+        return { descriptor, resolvedFrontmatter };
+      } catch {
+        return { descriptor };
+      }
+    })
+  );
+  return resolved.flatMap((entry) => {
+    if (entry == null) return [];
+    if (entry.resolvedFrontmatter == null) return [entry.descriptor];
+    const frontmatter = entry.resolvedFrontmatter;
+    return [
+      {
+        ...entry.descriptor,
+        name: frontmatter.name,
+        description: frontmatter.description,
+        uiSelectable: resolveAgentVisibility(frontmatter.ui).selectable,
+        uiColor: frontmatter.ui?.color,
+        subagentRunnable: frontmatter.subagent?.runnable ?? false,
+        base: frontmatter.base,
+        aiDefaults: frontmatter.ai,
+        tools: frontmatter.tools,
+      },
+    ];
+  });
+}
+
+export async function getAgentDefinition(
+  context: AgentDefinitionsContext,
+  input: {
+    projectPath?: string;
+    workspaceId?: string;
+    disableWorkspaceAgents?: boolean;
+    agentId: AgentId;
+  }
+) {
+  if (input.workspaceId) await context.aiService.waitForInit(input.workspaceId);
+  const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
+  return readAgentDefinition(runtime, discoveryPath, input.agentId, {
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+  });
 }

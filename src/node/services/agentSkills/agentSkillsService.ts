@@ -2,6 +2,15 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { ORPCContext } from "@/node/orpc/context";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
+import {
+  appendSubProjectRelativePath,
+  resolveWorkspaceRootPath,
+} from "@/node/runtime/runtimeHelpers";
+import { resolveAgentDiscoveryContext } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { resolveSkillStorageContext, type SkillStorageContext } from "./skillStorageContext";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
@@ -1043,4 +1052,110 @@ export async function readAgentSkill(
   }
 
   throw new Error(`Agent skill not found: ${name}`);
+}
+
+export type AgentSkillsContext = Pick<ORPCContext, "config" | "aiService" | "experimentsService">;
+
+async function resolveAgentSkillDiscoveryContext(
+  context: AgentSkillsContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+): Promise<SkillStorageContext> {
+  const resolved = await resolveAgentDiscoveryContext(context, input);
+  const options = {
+    includeClaudeSkills: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
+    ),
+    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    ),
+  };
+  if (resolved.metadata == null) {
+    const projectPath = input.projectPath ?? resolved.discoveryPath;
+    const creationScope = resolveWorkspaceCreationScope(
+      projectPath,
+      context.config.loadConfigOrDefault().projects
+    );
+    return resolveSkillStorageContext({
+      runtime: resolved.runtime,
+      workspacePath: resolved.discoveryPath,
+      xumScope: {
+        type: "project",
+        xumHome: context.config.rootDir,
+        projectRoot: resolved.discoveryPath,
+        projectStorageAuthority: "host-local",
+        checkoutRoot: creationScope.projectPath,
+      },
+      ...options,
+    });
+  }
+  const workspacePath = input.disableWorkspaceAgents
+    ? resolved.discoveryPath
+    : appendSubProjectRelativePath(
+        resolved.metadata,
+        resolved.runtime,
+        resolveWorkspaceRootPath(resolved.metadata, resolved.runtime)
+      );
+  const xumScope = context.aiService.resolveXumToolScopeForWorkspace(
+    resolved.metadata,
+    resolved.runtime,
+    workspacePath
+  );
+  return resolveSkillStorageContext({
+    runtime: resolved.runtime,
+    workspacePath,
+    xumScope:
+      input.disableWorkspaceAgents && xumScope.type === "project"
+        ? { ...xumScope, checkoutRoot: workspacePath }
+        : xumScope,
+    ...options,
+  });
+}
+
+async function getAgentSkillContext(
+  context: AgentSkillsContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+) {
+  if (input.workspaceId) await context.aiService.waitForInit(input.workspaceId);
+  return resolveAgentSkillDiscoveryContext(context, input);
+}
+
+export async function listAgentSkills(
+  context: AgentSkillsContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+) {
+  const skillContext = await getAgentSkillContext(context, input);
+  return discoverAgentSkills(skillContext.runtime, skillContext.workspacePath, {
+    roots: skillContext.roots,
+    containment: skillContext.containment,
+  });
+}
+
+export async function listAgentSkillDiagnostics(
+  context: AgentSkillsContext,
+  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
+) {
+  const skillContext = await getAgentSkillContext(context, input);
+  return discoverAgentSkillsDiagnostics(skillContext.runtime, skillContext.workspacePath, {
+    roots: skillContext.roots,
+    containment: skillContext.containment,
+  });
+}
+
+export async function getAgentSkill(
+  context: AgentSkillsContext,
+  input: {
+    projectPath?: string;
+    workspaceId?: string;
+    disableWorkspaceAgents?: boolean;
+    skillName: string;
+  }
+) {
+  const skillContext = await getAgentSkillContext(context, input);
+  const result = await readAgentSkill(
+    skillContext.runtime,
+    skillContext.workspacePath,
+    input.skillName,
+    { roots: skillContext.roots, containment: skillContext.containment }
+  );
+  return result.package;
 }
