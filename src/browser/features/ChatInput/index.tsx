@@ -1147,19 +1147,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const onReady = props.onReady;
 
-  // Provide API to parent via callback
+  // Provide API to parent via callback. Latest-ref wrappers (see handleSendRef)
+  // keep the handed-out object stable even though the draft helpers are not
+  // identity-stable without manual memoization; re-invoking onReady per render
+  // would churn parent state.
+  const composerApiRef = useRef({ restoreText, restoreDraft, appendText, prependText });
+  useEffect(() => {
+    composerApiRef.current = { restoreText, restoreDraft, appendText, prependText };
+  });
   useEffect(() => {
     if (onReady) {
       onReady({
         focus: focusMessageInput,
         send,
-        restoreText,
-        restoreDraft,
-        appendText,
-        prependText,
+        restoreText: (text) => composerApiRef.current.restoreText(text),
+        restoreDraft: (pending) => composerApiRef.current.restoreDraft(pending),
+        appendText: (text) => composerApiRef.current.appendText(text),
+        prependText: (text) => composerApiRef.current.prependText(text),
       });
     }
-  }, [onReady, focusMessageInput, send, restoreText, restoreDraft, appendText, prependText]);
+  }, [onReady, focusMessageInput, send]);
 
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
@@ -1209,8 +1216,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
       }, 0);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only run when editingMessage changes
-  }, [editingMessage, applyDraftFromPending]);
+    // Key on the edit target only: function deps (applyDraftFromPending via the
+    // draft hook) are not identity-stable without manual memoization, and
+    // re-running would clobber the user's in-progress edit text every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingMessage?.id]);
 
   // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
