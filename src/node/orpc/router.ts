@@ -2185,27 +2185,7 @@ export const router = (authToken?: string) => {
       create: t
         .input(schemas.tasks.create.input)
         .output(schemas.tasks.create.output)
-        .handler(({ context, input }) => {
-          const thinkingLevel =
-            input.thinkingLevel === "off" ||
-            input.thinkingLevel === "low" ||
-            input.thinkingLevel === "medium" ||
-            input.thinkingLevel === "high" ||
-            input.thinkingLevel === "xhigh"
-              ? input.thinkingLevel
-              : undefined;
-
-          return context.taskService.create({
-            parentWorkspaceId: input.parentWorkspaceId,
-            kind: input.kind,
-            agentId: input.agentId,
-            agentType: input.agentType,
-            prompt: input.prompt,
-            title: input.title,
-            modelString: input.modelString,
-            thinkingLevel,
-          });
-        }),
+        .handler(({ context, input }) => context.taskService.createFromRpc(input)),
     },
     window: {
       setTitle: t

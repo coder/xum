@@ -327,6 +327,18 @@ export interface TaskCreateArgs {
   };
 }
 
+type RpcTaskCreateArgs = Omit<TaskCreateArgs, "thinkingLevel"> & { thinkingLevel?: string };
+
+function normalizeRpcTaskThinkingLevel(value: string | undefined): ThinkingLevel | undefined {
+  return value === "off" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh"
+    ? value
+    : undefined;
+}
+
 function formatSubagentReportUserMessage(params: {
   childWorkspaceId: string;
   agentType: string;
@@ -4964,6 +4976,13 @@ export class TaskService implements AgentTaskIntegration {
       status: acceptedStatus === "queued" ? "queued" : "running",
       workspaceId: targetWorkspaceId,
       ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
+    });
+  }
+
+  createFromRpc(args: RpcTaskCreateArgs): Promise<Result<TaskCreateResult, string>> {
+    return this.create({
+      ...args,
+      thinkingLevel: normalizeRpcTaskThinkingLevel(args.thinkingLevel),
     });
   }
 
