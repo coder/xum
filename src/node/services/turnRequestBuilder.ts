@@ -1204,10 +1204,13 @@ export class TurnRequestBuilder {
 
     if (this.policyService?.isEnforced()) {
       if (!this.policyService.isRuntimeAllowed(metadata.runtimeConfig)) {
-        return Err({
-          type: "policy_denied",
-          message: "Workspace runtime is not allowed by policy",
-        });
+        return {
+          type: "finished",
+          result: Err({
+            type: "policy_denied",
+            message: "Workspace runtime is not allowed by policy",
+          }),
+        };
       }
     }
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
@@ -1350,10 +1353,13 @@ export class TurnRequestBuilder {
         errorMessage,
       });
 
-      return Err({
-        type: errorType,
-        message: errorMessage,
-      });
+      return {
+        type: "finished",
+        result: Err({
+          type: errorType,
+          message: errorMessage,
+        }),
+      };
     }
 
     // Memory context (memory experiment): resolved only after ensureReady so
@@ -2572,9 +2578,12 @@ export class TurnRequestBuilder {
       // handle settles immediately with the matching terminal outcome.
       if (forceContextLimitError) {
         const streamError = await simulateContextLimitError(simulationCtx, this.historyService);
-        return Ok(
-          this.createSettledTurnHandle(assistantMessageId, { status: "failed", streamError })
-        );
+        return {
+          type: "finished",
+          result: Ok(
+            this.createSettledTurnHandle(assistantMessageId, { status: "failed", streamError })
+          ),
+        };
       }
       await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
       return {
