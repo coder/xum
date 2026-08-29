@@ -244,6 +244,8 @@ export class ServiceContainer {
 
     this.projectService = new ProjectService(config, this.sshPromptService);
     this.projectService.setWorkspaceService(this.workspaceService);
+    this.projectService.setWorkspaceMetadataRefresher(this.workspaceService);
+    this.projectService.setMcpServerManager(this.mcpServerManager);
     this.desktopSessionManager = new DesktopSessionManager({
       config,
       experimentsService: this.experimentsService,

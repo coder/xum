@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -142,6 +142,23 @@ describe("MCPConfigService", () => {
         process.env[DISABLE_PROJECT_AUTOMATION_ENV] = prev;
       }
     }
+  });
+  test("API mutations enforce policy and emit telemetry", async () => {
+    const capture = mock(() => undefined);
+    const apiService = new MCPConfigService(config, {
+      policyService: {
+        isEnforced: () => true,
+        isMcpTransportAllowed: (transport: string) => transport === "stdio",
+      },
+      telemetryService: { capture },
+    });
+    expect(
+      await apiService.addForApi({ name: "remote", transport: "http", url: "https://x" })
+    ).toEqual({ success: false, error: "MCP transport is disabled by policy" });
+    await apiService.addForApi({ name: "local", command: "node server.js" });
+    expect(capture).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "mcp_server_config_changed" })
+    );
   });
 });
 

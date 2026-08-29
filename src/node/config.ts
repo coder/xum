@@ -8,6 +8,8 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import type { WorkspaceMetadata, FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isSecretReferenceValue, type Secret, type SecretsConfig } from "@/common/types/secrets";
+import type { Result } from "@/common/types/result";
+import assert from "node:assert/strict";
 import type {
   Workspace,
   ProjectConfig,
@@ -887,6 +889,16 @@ function configLoadFailureState(configFile: string): ConfigLoadFailureState {
  * Encapsulates all config paths and operations, making them dependency-injectable
  * and testable. Pass a custom rootDir for tests to avoid polluting ~/.xum
  */
+
+function normalizeAdvisorPositiveInteger(value: number | null, label: string): number | null {
+  if (value == null) {
+    return null;
+  }
+  assert(Number.isInteger(value), `${label} must be an integer`);
+  assert(value > 0, `${label} must be positive`);
+  return value;
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -2108,6 +2120,189 @@ export class Config {
    */
   async editConfig(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
     return this.enqueueConfigEdit(fn);
+  }
+
+  async updateAgentAiDefaults(agentAiDefaults: unknown): Promise<void> {
+    await this.editConfig((config) => {
+      const normalized = normalizeAgentAiDefaults(agentAiDefaults);
+      return {
+        ...config,
+        agentAiDefaults: Object.keys(normalized).length > 0 ? normalized : undefined,
+      };
+    });
+  }
+
+  async updateRoutePreferences(input: {
+    routePriority: ProjectsConfig["routePriority"];
+    routeOverrides?: ProjectsConfig["routeOverrides"];
+    validateRouteOverrides: (overrides: Record<string, string>) => Result<void, string>;
+  }): Promise<void> {
+    const routeOverrides = input.routeOverrides ?? this.loadConfigOrDefault().routeOverrides ?? {};
+    const validation = input.validateRouteOverrides(routeOverrides);
+    if (!validation.success) {
+      throw new Error(validation.error);
+    }
+
+    await this.editConfig((config) => ({
+      ...config,
+      routePriority: input.routePriority,
+      routeOverrides,
+    }));
+  }
+
+  async updateMinThinkingLevels(
+    minThinkingLevelByModel: ProjectsConfig["minThinkingLevelByModel"]
+  ): Promise<void> {
+    await this.editConfig((config) => ({ ...config, minThinkingLevelByModel }));
+  }
+
+  async updateModelFallbacks(modelFallbacks: ModelFallbacks): Promise<void> {
+    const sanitized = sanitizeModelFallbacks(modelFallbacks);
+    await this.editConfig((config) => ({
+      ...config,
+      modelFallbacks: Object.keys(sanitized).length > 0 ? sanitized : undefined,
+    }));
+  }
+
+  async updateModelPreferences(input: {
+    defaultModel?: string;
+    hiddenModels?: string[];
+  }): Promise<void> {
+    await this.editConfig((config) => {
+      const next = { ...config };
+      if (input.defaultModel !== undefined) {
+        next.defaultModel = normalizeOptionalModelString(input.defaultModel);
+      }
+      if (input.hiddenModels !== undefined) {
+        next.hiddenModels = normalizeOptionalModelStringArray(input.hiddenModels) ?? [];
+      }
+      return next;
+    });
+  }
+
+  async updateRuntimeEnablement(input: {
+    runtimeEnablement?: Partial<Record<RuntimeEnablementId, boolean>> | null;
+    defaultRuntime?: RuntimeEnablementId | null;
+    runtimeOverridesEnabled?: boolean | null;
+    projectPath?: string | null;
+  }): Promise<void> {
+    await this.editConfig((config) => {
+      const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
+      const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
+      const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
+      const projectPath = input.projectPath?.trim();
+
+      if (
+        !shouldUpdateRuntimeEnablement &&
+        !shouldUpdateDefaultRuntime &&
+        !shouldUpdateOverridesEnabled
+      ) {
+        return config;
+      }
+
+      const runtimeEnablement =
+        input.runtimeEnablement == null
+          ? undefined
+          : normalizeRuntimeEnablementOverrides(input.runtimeEnablement);
+      const defaultRuntime = input.defaultRuntime ?? undefined;
+      const runtimeOverridesEnabled = input.runtimeOverridesEnabled === true ? true : undefined;
+
+      if (projectPath) {
+        const project = config.projects.get(projectPath);
+        if (!project) {
+          log.warn("Runtime settings update requested for missing project", { projectPath });
+          return config;
+        }
+
+        const nextProject = { ...project };
+        if (shouldUpdateRuntimeEnablement) {
+          if (runtimeEnablement) nextProject.runtimeEnablement = runtimeEnablement;
+          else delete nextProject.runtimeEnablement;
+        }
+        if (shouldUpdateDefaultRuntime) {
+          if (defaultRuntime) nextProject.defaultRuntime = defaultRuntime;
+          else delete nextProject.defaultRuntime;
+        }
+        if (shouldUpdateOverridesEnabled) {
+          if (runtimeOverridesEnabled) nextProject.runtimeOverridesEnabled = true;
+          else delete nextProject.runtimeOverridesEnabled;
+        }
+        const nextProjects = new Map(config.projects);
+        nextProjects.set(projectPath, nextProject);
+        return { ...config, projects: nextProjects };
+      }
+
+      const next = { ...config };
+      if (shouldUpdateRuntimeEnablement) {
+        next.runtimeEnablement = runtimeEnablement;
+      }
+      if (shouldUpdateDefaultRuntime) {
+        next.defaultRuntime = defaultRuntime;
+      }
+      return next;
+    });
+  }
+
+  async saveUserConfig(input: {
+    taskSettings?: unknown;
+    userPreferences?: unknown;
+    advisorModelString?: string | null;
+    advisorThinkingLevel?: string | null;
+    advisorMaxUsesPerTurn?: number | null;
+    advisorMaxOutputTokens?: number | null;
+    agentAiDefaults?: unknown;
+  }): Promise<void> {
+    await this.editConfig((config) => {
+      const result = { ...config };
+
+      if (input.taskSettings != null) {
+        const inputRecord =
+          input.taskSettings && typeof input.taskSettings === "object"
+            ? (input.taskSettings as Record<string, unknown>)
+            : {};
+        const definedInput = Object.fromEntries(
+          Object.entries(inputRecord).filter(([, value]) => value !== undefined)
+        );
+        // Preserve optional flags when older settings clients send only the required limits.
+        result.taskSettings = normalizeTaskSettings({
+          ...normalizeTaskSettings(config.taskSettings),
+          ...definedInput,
+        });
+      }
+
+      if (input.userPreferences !== undefined) {
+        result.userPreferences = normalizeUserPreferences(input.userPreferences);
+        result.migrations = {
+          ...(result.migrations ?? {}),
+          userPreferencesInitialized: true,
+        };
+      }
+
+      if (input.advisorModelString !== undefined) {
+        result.advisorModelString = parseOptionalNonEmptyString(input.advisorModelString);
+      }
+      if (input.advisorThinkingLevel !== undefined) {
+        result.advisorThinkingLevel = parseOptionalThinkingLevel(input.advisorThinkingLevel);
+      }
+      if (input.advisorMaxUsesPerTurn !== undefined) {
+        result.advisorMaxUsesPerTurn = normalizeAdvisorPositiveInteger(
+          input.advisorMaxUsesPerTurn,
+          "Advisor max uses per turn"
+        );
+      }
+      if (input.advisorMaxOutputTokens !== undefined) {
+        result.advisorMaxOutputTokens = normalizeAdvisorPositiveInteger(
+          input.advisorMaxOutputTokens,
+          "Advisor max output tokens"
+        );
+      }
+      if (input.agentAiDefaults !== undefined) {
+        const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
+        result.agentAiDefaults = Object.keys(normalized).length > 0 ? normalized : undefined;
+      }
+
+      return result;
+    });
   }
 
   /**

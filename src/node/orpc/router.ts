@@ -50,11 +50,7 @@ import {
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import { Err, Ok } from "@/common/types/result";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
-import {
-  CODE_WORKSPACE_EXTENSION,
-  managedRootsByProject,
-  syncProjectCodeWorkspace,
-} from "@/node/worktree/codeWorkspaceSync";
+
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -99,28 +95,13 @@ import {
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
 import {
-  resolveAgentPluginsMcpContext,
-  type AgentPluginsMcpContext,
-} from "@/node/services/agentPlugins/mcpConfig";
-
-import { secretsToRecord } from "@/common/types/secrets";
-import { roundToBase2 } from "@/common/telemetry/utils";
-
-import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
   isLayoutPresetsConfigEmpty,
   normalizeLayoutPresetsConfig,
 } from "@/common/types/uiLayouts";
-import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
-import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
-import { sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
-import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
-import {
-  normalizeRuntimeEnablement,
-  RUNTIME_ENABLEMENT_IDS,
-  type RuntimeEnablementId,
-} from "@/common/types/runtime";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { normalizeRuntimeEnablement } from "@/common/types/runtime";
+
 import {
   discoverAgentSkills,
   discoverAgentSkillsDiagnostics,
@@ -140,8 +121,6 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
 
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
-import { coerceThinkingLevel } from "@/common/types/thinking";
-import { log } from "@/node/services/log";
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -159,7 +138,6 @@ import {
   startWorkflowRun,
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
   return request().catch(throwWorkflowOrpcError);
@@ -271,97 +249,10 @@ async function resolveAgentSkillDiscoveryContext(
  * plugins. Mismatches fall back to the projectPath-scoped default, whose
  * trust and scan root describe the same project.
  */
-async function resolveWorkspaceAgentPluginsMcpContext(
-  context: ORPCContext,
-  workspaceId: string | null | undefined,
-  projectPath: string | null | undefined
-): Promise<AgentPluginsMcpContext | null | undefined> {
-  const trimmed = workspaceId?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  try {
-    const metadataResult = await context.aiService.getWorkspaceMetadata(trimmed);
-    if (!metadataResult.success) {
-      return undefined;
-    }
-    const metadata = metadataResult.data;
-    if (metadata.projectPath !== projectPath?.trim()) {
-      log.debug("Ignoring Agent Plugins workspace context for mismatched project", {
-        workspaceId: trimmed,
-        requestedProjectPath: projectPath,
-        workspaceProjectPath: metadata.projectPath,
-      });
-      return undefined;
-    }
-    const runtime = createRuntimeForWorkspace(metadata);
-    const workspacePath = resolveWorkspaceRootPath(metadata, runtime);
-    return resolveAgentPluginsMcpContext(metadata, workspacePath);
-  } catch (error) {
-    log.debug("Failed to resolve Agent Plugins MCP context for workspace", {
-      workspaceId: trimmed,
-      error,
-    });
-    return undefined;
-  }
-}
-
-function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null): boolean {
-  return isProjectTrusted(context.config, projectPath);
-}
-
 function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
     throw new ORPCError("BAD_REQUEST", { message: "Dynamic workflows are disabled" });
   }
-}
-
-function normalizeOptionalConfigString(value: string | null | undefined): string | undefined {
-  const trimmedValue = value?.trim();
-  if (!trimmedValue) {
-    return undefined;
-  }
-
-  return trimmedValue;
-}
-
-function normalizeOptionalConfigThinkingLevel(value: string | null | undefined) {
-  return coerceThinkingLevel(value);
-}
-
-function normalizeAdvisorMaxUsesPerTurn(value: number | null | undefined): number | null {
-  if (value == null) {
-    return null;
-  }
-
-  assert(Number.isInteger(value), "Advisor max uses per turn must be an integer");
-  assert(value > 0, "Advisor max uses per turn must be positive");
-  return value;
-}
-
-function normalizeAdvisorMaxOutputTokens(value: number | null | undefined): number | null {
-  if (value == null) {
-    return null;
-  }
-
-  assert(Number.isInteger(value), "Advisor max output tokens must be an integer");
-  assert(value > 0, "Advisor max output tokens must be positive");
-  return value;
-}
-
-function mergeTaskSettingsForConfigSave(current: unknown, input: unknown) {
-  const inputRecord = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
-  const definedInput: Record<string, unknown> = {};
-
-  for (const [key, value] of Object.entries(inputRecord)) {
-    if (value !== undefined) {
-      definedInput[key] = value;
-    }
-  }
-
-  // saveConfig predates optional task flags. Preserve existing values when a client only sends
-  // the required numeric limits; otherwise unrelated settings saves can silently reset newer flags.
-  return normalizeTaskSettings({ ...normalizeTaskSettings(current), ...definedInput });
 }
 
 async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<string | null> {
@@ -565,16 +456,10 @@ export const router = (authToken?: string) => {
       updateAgentAiDefaults: t
         .input(schemas.config.updateAgentAiDefaults.input)
         .output(schemas.config.updateAgentAiDefaults.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
+        .handler(({ context, input }) =>
+          context.config.updateAgentAiDefaults(input.agentAiDefaults)
+        ),
 
-            return {
-              ...config,
-              agentAiDefaults: Object.keys(normalized).length > 0 ? normalized : undefined,
-            };
-          });
-        }),
       updateMuxGatewayPrefs: t
         .input(schemas.config.updateMuxGatewayPrefs.input)
         .output(schemas.config.updateMuxGatewayPrefs.output)
@@ -598,92 +483,31 @@ export const router = (authToken?: string) => {
       updateRoutePreferences: t
         .input(schemas.config.updateRoutePreferences.input)
         .output(schemas.config.updateRoutePreferences.output)
-        .handler(async ({ context, input }) => {
-          const routeOverrides =
-            input.routeOverrides ?? context.config.loadConfigOrDefault().routeOverrides ?? {};
-          const validation = context.providerService.validateRouteOverrides(routeOverrides);
-          if (!validation.success) {
-            throw new Error(validation.error);
-          }
+        .handler(({ context, input }) =>
+          context.config.updateRoutePreferences({
+            ...input,
+            validateRouteOverrides: (overrides) =>
+              context.providerService.validateRouteOverrides(overrides),
+          })
+        ),
 
-          await context.config.editConfig((config) => ({
-            ...config,
-            routePriority: input.routePriority,
-            routeOverrides,
-          }));
-        }),
       updateMinThinkingLevels: t
         .input(schemas.config.updateMinThinkingLevels.input)
         .output(schemas.config.updateMinThinkingLevels.output)
-        .handler(async ({ context, input }) => {
-          // Full-map replacement; the frontend drops entries that match the default floor
-          // so the stored map stays sparse.
-          await context.config.editConfig((config) => ({
-            ...config,
-            minThinkingLevelByModel: input.minThinkingLevelByModel,
-          }));
-        }),
+        .handler(({ context, input }) =>
+          context.config.updateMinThinkingLevels(input.minThinkingLevelByModel)
+        ),
+
       updateModelFallbacks: t
         .input(schemas.config.updateModelFallbacks.input)
         .output(schemas.config.updateModelFallbacks.output)
-        .handler(async ({ context, input }) => {
-          // Full-map replacement. Strict-on-write sanitization: canonical keys,
-          // self-fallbacks/duplicates dropped, chain length capped, empty
-          // chains removed.
-          const sanitized = sanitizeModelFallbacks(input.modelFallbacks);
-          await context.config.editConfig((config) => ({
-            ...config,
-            modelFallbacks: Object.keys(sanitized).length > 0 ? sanitized : undefined,
-          }));
-        }),
+        .handler(({ context, input }) => context.config.updateModelFallbacks(input.modelFallbacks)),
+
       updateModelPreferences: t
         .input(schemas.config.updateModelPreferences.input)
         .output(schemas.config.updateModelPreferences.output)
-        .handler(async ({ context, input }) => {
-          const normalizeModelString = (value: string): string | undefined => {
-            const trimmed = value.trim();
-            if (!trimmed) {
-              return undefined;
-            }
+        .handler(({ context, input }) => context.config.updateModelPreferences(input)),
 
-            // Reject malformed mux-gateway strings ("mux-gateway:provider" without "/model").
-            if (trimmed.startsWith("mux-gateway:") && !trimmed.includes("/")) {
-              return undefined;
-            }
-
-            const normalized = normalizeSelectedModel(trimmed);
-            if (!isValidModelFormat(normalized)) {
-              return undefined;
-            }
-
-            return normalized;
-          };
-
-          await context.config.editConfig((config) => {
-            const next = { ...config };
-
-            if (input.defaultModel !== undefined) {
-              next.defaultModel = normalizeModelString(input.defaultModel);
-            }
-
-            if (input.hiddenModels !== undefined) {
-              const seen = new Set<string>();
-              const normalizedHidden: string[] = [];
-
-              for (const modelString of input.hiddenModels) {
-                const normalized = normalizeModelString(modelString);
-                if (!normalized) continue;
-                if (seen.has(normalized)) continue;
-                seen.add(normalized);
-                normalizedHidden.push(normalized);
-              }
-
-              next.hiddenModels = normalizedHidden;
-            }
-
-            return next;
-          });
-        }),
       updateCoderPrefs: t
         .input(schemas.config.updateCoderPrefs.input)
         .output(schemas.config.updateCoderPrefs.output)
@@ -699,145 +523,16 @@ export const router = (authToken?: string) => {
       updateRuntimeEnablement: t
         .input(schemas.config.updateRuntimeEnablement.input)
         .output(schemas.config.updateRuntimeEnablement.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const shouldUpdateRuntimeEnablement = input.runtimeEnablement !== undefined;
-            const shouldUpdateDefaultRuntime = input.defaultRuntime !== undefined;
-            const shouldUpdateOverridesEnabled = input.runtimeOverridesEnabled !== undefined;
-            const projectPath = input.projectPath?.trim();
+        .handler(({ context, input }) => context.config.updateRuntimeEnablement(input)),
 
-            if (
-              !shouldUpdateRuntimeEnablement &&
-              !shouldUpdateDefaultRuntime &&
-              !shouldUpdateOverridesEnabled
-            ) {
-              return config;
-            }
-
-            const runtimeEnablementOverrides =
-              input.runtimeEnablement == null
-                ? undefined
-                : (() => {
-                    const normalized = normalizeRuntimeEnablement(input.runtimeEnablement);
-                    const disabled: Partial<Record<RuntimeEnablementId, false>> = {};
-
-                    for (const runtimeId of RUNTIME_ENABLEMENT_IDS) {
-                      if (!normalized[runtimeId]) {
-                        disabled[runtimeId] = false;
-                      }
-                    }
-
-                    return Object.keys(disabled).length > 0 ? disabled : undefined;
-                  })();
-
-            const defaultRuntime = input.defaultRuntime ?? undefined;
-            const runtimeOverridesEnabled =
-              input.runtimeOverridesEnabled === true ? true : undefined;
-
-            if (projectPath) {
-              const project = config.projects.get(projectPath);
-              if (!project) {
-                log.warn("Runtime settings update requested for missing project", { projectPath });
-                return config;
-              }
-
-              const nextProject = { ...project };
-
-              if (shouldUpdateRuntimeEnablement) {
-                if (runtimeEnablementOverrides) {
-                  nextProject.runtimeEnablement = runtimeEnablementOverrides;
-                } else {
-                  delete nextProject.runtimeEnablement;
-                }
-              }
-
-              if (shouldUpdateDefaultRuntime) {
-                if (defaultRuntime !== undefined) {
-                  nextProject.defaultRuntime = defaultRuntime;
-                } else {
-                  delete nextProject.defaultRuntime;
-                }
-              }
-
-              if (shouldUpdateOverridesEnabled) {
-                if (runtimeOverridesEnabled) {
-                  nextProject.runtimeOverridesEnabled = true;
-                } else {
-                  delete nextProject.runtimeOverridesEnabled;
-                }
-              }
-              const nextProjects = new Map(config.projects);
-              nextProjects.set(projectPath, nextProject);
-              return { ...config, projects: nextProjects };
-            }
-
-            const next = { ...config };
-            if (shouldUpdateRuntimeEnablement) {
-              next.runtimeEnablement = runtimeEnablementOverrides;
-            }
-
-            if (shouldUpdateDefaultRuntime) {
-              next.defaultRuntime = defaultRuntime;
-            }
-
-            return next;
-          });
-        }),
       saveConfig: t
         .input(schemas.config.saveConfig.input)
         .output(schemas.config.saveConfig.output)
         .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const result = { ...config };
-
-            if (input.taskSettings != null) {
-              result.taskSettings = mergeTaskSettingsForConfigSave(
-                config.taskSettings,
-                input.taskSettings
-              );
-            }
-
-            if (input.userPreferences !== undefined) {
-              result.userPreferences = normalizeUserPreferences(input.userPreferences);
-              result.migrations = {
-                ...(result.migrations ?? {}),
-                userPreferencesInitialized: true,
-              };
-            }
-
-            if (input.advisorModelString !== undefined) {
-              result.advisorModelString = normalizeOptionalConfigString(input.advisorModelString);
-            }
-
-            if (input.advisorThinkingLevel !== undefined) {
-              result.advisorThinkingLevel = normalizeOptionalConfigThinkingLevel(
-                input.advisorThinkingLevel
-              );
-            }
-
-            if (input.advisorMaxUsesPerTurn !== undefined) {
-              result.advisorMaxUsesPerTurn = normalizeAdvisorMaxUsesPerTurn(
-                input.advisorMaxUsesPerTurn
-              );
-            }
-
-            if (input.advisorMaxOutputTokens !== undefined) {
-              result.advisorMaxOutputTokens = normalizeAdvisorMaxOutputTokens(
-                input.advisorMaxOutputTokens
-              );
-            }
-
-            if (input.agentAiDefaults !== undefined) {
-              const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
-              result.agentAiDefaults = Object.keys(normalized).length > 0 ? normalized : undefined;
-            }
-
-            return result;
-          });
-
-          // Re-evaluate task queue in case more slots opened up
+          await context.config.saveUserConfig(input);
           await context.taskService.maybeStartQueuedTasks();
         }),
+
       updateChatTranscriptFullWidth: t
         .input(schemas.config.updateChatTranscriptFullWidth.input)
         .output(schemas.config.updateChatTranscriptFullWidth.output)
@@ -1629,311 +1324,36 @@ export const router = (authToken?: string) => {
       list: t
         .input(schemas.mcp.list.input)
         .output(schemas.mcp.list.output)
-        .handler(async ({ context, input }) => {
-          const servers = await context.mcpConfigService.listServers(
-            input.projectPath,
-            isTrustedProjectPath(context, input.projectPath),
-            {
-              agentPlugins: await resolveWorkspaceAgentPluginsMcpContext(
-                context,
-                input.workspaceId,
-                input.projectPath
-              ),
-            }
-          );
+        .handler(({ context, input }) => context.mcpConfigService.listForApi(input)),
 
-          if (!context.policyService.isEnforced()) {
-            return servers;
-          }
-
-          const filtered: typeof servers = {};
-          for (const [name, info] of Object.entries(servers)) {
-            if (context.policyService.isMcpTransportAllowed(info.transport)) {
-              filtered[name] = info;
-            }
-          }
-
-          return filtered;
-        }),
       add: t
         .input(schemas.mcp.add.input)
         .output(schemas.mcp.add.output)
-        .handler(async ({ context, input }) => {
-          const existing = await context.mcpConfigService.listServers();
-          const existingServer = existing[input.name];
+        .handler(({ context, input }) => context.mcpConfigService.addForApi(input)),
 
-          const transport = input.transport ?? "stdio";
-          if (context.policyService.isEnforced()) {
-            if (!context.policyService.isMcpTransportAllowed(transport)) {
-              return { success: false, error: "MCP transport is disabled by policy" };
-            }
-          }
-
-          const hasHeaders = Boolean(input.headers && Object.keys(input.headers).length > 0);
-          const usesSecretHeaders = Boolean(
-            input.headers &&
-            Object.values(input.headers).some(
-              (v) => typeof v === "object" && v !== null && "secret" in v
-            )
-          );
-
-          const action = (() => {
-            if (!existingServer) {
-              return "add";
-            }
-
-            if (
-              existingServer.transport !== "stdio" &&
-              transport !== "stdio" &&
-              existingServer.transport === transport &&
-              existingServer.url === input.url &&
-              JSON.stringify(existingServer.headers ?? {}) !== JSON.stringify(input.headers ?? {})
-            ) {
-              return "set_headers";
-            }
-
-            return "edit";
-          })();
-
-          const result = await context.mcpConfigService.addServer(input.name, {
-            transport,
-            command: input.command,
-            url: input.url,
-            headers: input.headers,
-          });
-
-          if (result.success) {
-            context.telemetryService.capture({
-              event: "mcp_server_config_changed",
-              properties: {
-                action,
-                transport,
-                has_headers: hasHeaders,
-                uses_secret_headers: usesSecretHeaders,
-              },
-            });
-          }
-
-          return result;
-        }),
       remove: t
         .input(schemas.mcp.remove.input)
         .output(schemas.mcp.remove.output)
-        .handler(async ({ context, input }) => {
-          const existing = await context.mcpConfigService.listServers();
-          const server = existing[input.name];
+        .handler(({ context, input }) => context.mcpConfigService.removeForApi(input.name)),
 
-          if (context.policyService.isEnforced() && server) {
-            if (!context.policyService.isMcpTransportAllowed(server.transport)) {
-              return { success: false, error: "MCP transport is disabled by policy" };
-            }
-          }
-
-          const result = await context.mcpConfigService.removeServer(input.name);
-
-          if (result.success && server) {
-            const hasHeaders =
-              server.transport !== "stdio" &&
-              Boolean(server.headers && Object.keys(server.headers).length > 0);
-            const usesSecretHeaders =
-              server.transport !== "stdio" &&
-              Boolean(
-                server.headers &&
-                Object.values(server.headers).some(
-                  (v) => typeof v === "object" && v !== null && "secret" in v
-                )
-              );
-
-            context.telemetryService.capture({
-              event: "mcp_server_config_changed",
-              properties: {
-                action: "remove",
-                transport: server.transport,
-                has_headers: hasHeaders,
-                uses_secret_headers: usesSecretHeaders,
-              },
-            });
-          }
-
-          return result;
-        }),
       test: t
         .input(schemas.mcp.test.input)
         .output(schemas.mcp.test.output)
-        .handler(async ({ context, input }) => {
-          const start = Date.now();
+        .handler(({ context, input }) => context.mcpServerManager.testForApi(input)),
 
-          const projectPathProvided =
-            typeof input.projectPath === "string" && input.projectPath.trim().length > 0;
-          const resolvedProjectPath = projectPathProvided
-            ? input.projectPath!
-            : context.config.rootDir;
-          const trusted = projectPathProvided
-            ? isTrustedProjectPath(context, resolvedProjectPath)
-            : false;
-          const secrets = await secretsToRecord(
-            projectPathProvided
-              ? context.config.getEffectiveSecrets(resolvedProjectPath)
-              : context.config.getGlobalSecrets()
-          );
-
-          const agentPlugins = await resolveWorkspaceAgentPluginsMcpContext(
-            context,
-            input.workspaceId,
-            projectPathProvided ? resolvedProjectPath : undefined
-          );
-          const configuredTransport = input.name
-            ? (
-                await context.mcpConfigService.listServers(
-                  projectPathProvided ? resolvedProjectPath : undefined,
-                  trusted,
-                  { agentPlugins }
-                )
-              )[input.name]?.transport
-            : undefined;
-
-          const transport =
-            configuredTransport ?? (input.command ? "stdio" : (input.transport ?? "auto"));
-
-          if (context.policyService.isEnforced()) {
-            if (!context.policyService.isMcpTransportAllowed(transport)) {
-              return { success: false, error: "MCP transport is disabled by policy" };
-            }
-          }
-
-          const result = await context.mcpServerManager.test({
-            projectPath: resolvedProjectPath,
-            trusted,
-            name: input.name,
-            command: input.command,
-            transport: input.transport,
-            url: input.url,
-            headers: input.headers,
-            projectSecrets: secrets,
-            agentPlugins,
-          });
-
-          const durationMs = Date.now() - start;
-
-          const categorizeError = (
-            error: string
-          ): "timeout" | "connect" | "http_status" | "unknown" => {
-            const lower = error.toLowerCase();
-            if (lower.includes("timed out")) {
-              return "timeout";
-            }
-            if (
-              lower.includes("econnrefused") ||
-              lower.includes("econnreset") ||
-              lower.includes("enotfound") ||
-              lower.includes("ehostunreach")
-            ) {
-              return "connect";
-            }
-            if (/\b(400|401|403|404|405|500|502|503)\b/.test(lower)) {
-              return "http_status";
-            }
-            return "unknown";
-          };
-
-          context.telemetryService.capture({
-            event: "mcp_server_tested",
-            properties: {
-              transport,
-              success: result.success,
-              duration_ms_b2: roundToBase2(durationMs),
-              ...(result.success ? {} : { error_category: categorizeError(result.error) }),
-            },
-          });
-
-          return result;
-        }),
       setEnabled: t
         .input(schemas.mcp.setEnabled.input)
         .output(schemas.mcp.setEnabled.output)
-        .handler(async ({ context, input }) => {
-          const existing = await context.mcpConfigService.listServers();
-          const server = existing[input.name];
+        .handler(({ context, input }) =>
+          context.mcpConfigService.setEnabledForApi(input.name, input.enabled)
+        ),
 
-          if (context.policyService.isEnforced() && server) {
-            if (!context.policyService.isMcpTransportAllowed(server.transport)) {
-              return { success: false, error: "MCP transport is disabled by policy" };
-            }
-          }
-
-          const result = await context.mcpConfigService.setServerEnabled(input.name, input.enabled);
-
-          if (result.success && server) {
-            const hasHeaders =
-              server.transport !== "stdio" &&
-              Boolean(server.headers && Object.keys(server.headers).length > 0);
-            const usesSecretHeaders =
-              server.transport !== "stdio" &&
-              Boolean(
-                server.headers &&
-                Object.values(server.headers).some(
-                  (v) => typeof v === "object" && v !== null && "secret" in v
-                )
-              );
-
-            context.telemetryService.capture({
-              event: "mcp_server_config_changed",
-              properties: {
-                action: input.enabled ? "enable" : "disable",
-                transport: server.transport,
-                has_headers: hasHeaders,
-                uses_secret_headers: usesSecretHeaders,
-              },
-            });
-          }
-
-          return result;
-        }),
       setToolAllowlist: t
         .input(schemas.mcp.setToolAllowlist.input)
         .output(schemas.mcp.setToolAllowlist.output)
-        .handler(async ({ context, input }) => {
-          const existing = await context.mcpConfigService.listServers();
-          const server = existing[input.name];
-
-          if (context.policyService.isEnforced() && server) {
-            if (!context.policyService.isMcpTransportAllowed(server.transport)) {
-              return { success: false, error: "MCP transport is disabled by policy" };
-            }
-          }
-
-          const result = await context.mcpConfigService.setToolAllowlist(
-            input.name,
-            input.toolAllowlist
-          );
-
-          if (result.success && server) {
-            const hasHeaders =
-              server.transport !== "stdio" &&
-              Boolean(server.headers && Object.keys(server.headers).length > 0);
-            const usesSecretHeaders =
-              server.transport !== "stdio" &&
-              Boolean(
-                server.headers &&
-                Object.values(server.headers).some(
-                  (v) => typeof v === "object" && v !== null && "secret" in v
-                )
-              );
-
-            context.telemetryService.capture({
-              event: "mcp_server_config_changed",
-              properties: {
-                action: "set_tool_allowlist",
-                transport: server.transport,
-                has_headers: hasHeaders,
-                uses_secret_headers: usesSecretHeaders,
-                tool_allowlist_size_b2: roundToBase2(input.toolAllowlist.length),
-              },
-            });
-          }
-
-          return result;
-        }),
+        .handler(({ context, input }) =>
+          context.mcpConfigService.setToolAllowlistForApi(input.name, input.toolAllowlist)
+        ),
     },
     // Managed Agent Plugin installs (agent-plugins experiment). The service
     // gates every method on the experiment flag and throws user-facing
@@ -2018,97 +1438,43 @@ export const router = (authToken?: string) => {
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
         .output(schemas.mcpOauth.startDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          // Global MCP settings can start OAuth without selecting a project.
-          // Use mux home as a stable fallback so existing flow codepaths remain unchanged.
-          const projectPath = input.projectPath ?? context.config.rootDir;
-
-          return context.mcpOauthService.startDesktopFlow({ ...input, projectPath });
-        }),
+        .handler(({ context, input }) => context.mcpOauthService.startDesktopFlowForApi(input)),
       waitForDesktopFlow: t
         .input(schemas.mcpOauth.waitForDesktopFlow.input)
         .output(schemas.mcpOauth.waitForDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          return context.mcpOauthService.waitForDesktopFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.mcpOauthService.waitForDesktopFlow(input.flowId, { timeoutMs: input.timeoutMs })
+        ),
       cancelDesktopFlow: t
         .input(schemas.mcpOauth.cancelDesktopFlow.input)
         .output(schemas.mcpOauth.cancelDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.mcpOauthService.cancelDesktopFlow(input.flowId);
-        }),
+        .handler(({ context, input }) => context.mcpOauthService.cancelDesktopFlow(input.flowId)),
       startServerFlow: t
         .input(schemas.mcpOauth.startServerFlow.input)
         .output(schemas.mcpOauth.startServerFlow.output)
-        .handler(async ({ context, input }) => {
-          // Global MCP settings can start OAuth without selecting a project.
-          // Use mux home as a stable fallback so existing flow codepaths remain unchanged.
-          const projectPath = input.projectPath ?? context.config.rootDir;
-
-          const headers = context.headers;
-
-          const origin = typeof headers?.origin === "string" ? headers.origin.trim() : "";
-          if (origin) {
-            try {
-              const redirectUri = new URL("/auth/mcp-oauth/callback", origin).toString();
-              return context.mcpOauthService.startServerFlow({
-                ...input,
-                projectPath,
-                redirectUri,
-              });
-            } catch {
-              // Fall back to Host header.
-            }
-          }
-
-          const hostHeader = headers?.["x-forwarded-host"] ?? headers?.host;
-          const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]?.trim() : "";
-          if (!host) {
-            return Err("Missing Host header");
-          }
-
-          const protoHeader = headers?.["x-forwarded-proto"];
-          const forwardedProto =
-            typeof protoHeader === "string" ? protoHeader.split(",")[0]?.trim() : "";
-          const proto = forwardedProto.length ? forwardedProto : "http";
-
-          const redirectUri = `${proto}://${host}/auth/mcp-oauth/callback`;
-
-          return context.mcpOauthService.startServerFlow({
-            ...input,
-            projectPath,
-            redirectUri,
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.mcpOauthService.startServerFlowForApi(input, context.headers)
+        ),
       waitForServerFlow: t
         .input(schemas.mcpOauth.waitForServerFlow.input)
         .output(schemas.mcpOauth.waitForServerFlow.output)
-        .handler(async ({ context, input }) => {
-          return context.mcpOauthService.waitForServerFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.mcpOauthService.waitForServerFlow(input.flowId, { timeoutMs: input.timeoutMs })
+        ),
       cancelServerFlow: t
         .input(schemas.mcpOauth.cancelServerFlow.input)
         .output(schemas.mcpOauth.cancelServerFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.mcpOauthService.cancelServerFlow(input.flowId);
-        }),
+        .handler(({ context, input }) => context.mcpOauthService.cancelServerFlow(input.flowId)),
       getAuthStatus: t
         .input(schemas.mcpOauth.getAuthStatus.input)
         .output(schemas.mcpOauth.getAuthStatus.output)
-        .handler(async ({ context, input }) => {
-          return context.mcpOauthService.getAuthStatus({ serverUrl: input.serverUrl });
-        }),
+        .handler(({ context, input }) => context.mcpOauthService.getAuthStatus(input)),
       logout: t
         .input(schemas.mcpOauth.logout.input)
         .output(schemas.mcpOauth.logout.output)
-        .handler(async ({ context, input }) => {
-          return context.mcpOauthService.logout({ serverUrl: input.serverUrl });
-        }),
+        .handler(({ context, input }) => context.mcpOauthService.logout(input)),
     },
+
     projects: {
       list: t
         .input(schemas.projects.list.input)
@@ -2177,38 +1543,10 @@ export const router = (authToken?: string) => {
       setTrust: t
         .input(schemas.projects.setTrust.input)
         .output(schemas.projects.setTrust.output)
-        .handler(async ({ context, input }) => {
-          const normalizedPath = stripTrailingSlashes(input.projectPath);
-          await context.config.editConfig((config) => {
-            let project = config.projects.get(normalizedPath);
-            if (!project) {
-              // Create a minimal project entry so trust can be set before
-              // the first workspace.create (which normally adds the project)
-              project = { workspaces: [] };
-              config.projects.set(normalizedPath, project);
-            }
-            project.trusted = input.trusted;
-            return config;
-          });
-          // Prompt invocation revives servers from recorded request options, so
-          // sync the trust change (owner plus inheriting children) immediately.
-          // Child trust is inherited from parentProjectPath, not the child's stored flag.
-          const affectedPaths = [normalizedPath];
-          for (const [projectPath, project] of context.config.loadConfigOrDefault().projects) {
-            if (
-              project.parentProjectPath !== undefined &&
-              stripTrailingSlashes(project.parentProjectPath) === normalizedPath
-            ) {
-              affectedPaths.push(projectPath);
-            }
-          }
-          context.mcpServerManager.applyProjectTrust(
-            affectedPaths.map((projectPath) => ({
-              projectPath,
-              trusted: isProjectTrusted(context.config, projectPath),
-            }))
-          );
-        }),
+        .handler(({ context, input }) =>
+          context.projectService.setTrust(input.projectPath, input.trusted)
+        ),
+
       setDisplayName: t
         .input(schemas.projects.setDisplayName.input)
         .output(schemas.projects.setDisplayName.output)
@@ -2258,48 +1596,13 @@ export const router = (authToken?: string) => {
       setCodeWorkspaceSyncPath: t
         .input(schemas.projects.setCodeWorkspaceSyncPath.input)
         .output(schemas.projects.setCodeWorkspaceSyncPath.output)
-        .handler(async ({ context, input }) => {
-          const normalizedPath = stripTrailingSlashes(input.projectPath);
-          const trimmed = input.codeWorkspaceSyncPath?.trim() ?? "";
-          if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
-            // The sync read-modify-writes this file, so refuse arbitrary targets.
-            // ORPCError so the message reaches the UI instead of "Internal server error".
-            throw new ORPCError("BAD_REQUEST", {
-              message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
-            });
-          }
-          let previousValue: string | undefined;
-          await context.config.editConfig((config) => {
-            const project = config.projects.get(normalizedPath);
-            if (!project) {
-              throw new Error(`Project not found: ${normalizedPath}`);
-            }
-            previousValue = project.codeWorkspaceSyncPath;
-            // Store undefined for blank input to keep config.json minimal.
-            project.codeWorkspaceSyncPath = trimmed ? trimmed : undefined;
-            return config;
-          });
-          // Sync immediately so enabling takes effect without waiting for the
-          // next workspace lifecycle event. Clearing or changing the path never
-          // deletes previously written files (they belong to the user).
-          if (trimmed) {
-            const result = await syncProjectCodeWorkspace(context.config, normalizedPath);
-            if (!result.ok) {
-              // Roll back so a broken integration is not retried on every
-              // later lifecycle event, and surface the reason to the user.
-              // Guarded: a concurrent save may have stored a newer value that
-              // this failing request must not discard.
-              await context.config.editConfig((config) => {
-                const project = config.projects.get(normalizedPath);
-                if (project?.codeWorkspaceSyncPath === trimmed) {
-                  project.codeWorkspaceSyncPath = previousValue;
-                }
-                return config;
-              });
-              throw new ORPCError("BAD_REQUEST", { message: result.error });
-            }
-          }
-        }),
+        .handler(({ context, input }) =>
+          context.projectService.setCodeWorkspaceSyncPath(
+            input.projectPath,
+            input.codeWorkspaceSyncPath
+          )
+        ),
+
       remove: t
         .input(schemas.projects.remove.input)
         .output(schemas.projects.remove.output)
@@ -2340,388 +1643,76 @@ export const router = (authToken?: string) => {
         list: t
           .input(schemas.projects.mcp.list.input)
           .output(schemas.projects.mcp.list.output)
-          .handler(async ({ context, input }) => {
-            const servers = await context.mcpConfigService.listServers(
-              input.projectPath,
-              isTrustedProjectPath(context, input.projectPath)
-            );
-
-            if (!context.policyService.isEnforced()) {
-              return servers;
-            }
-
-            const filtered: typeof servers = {};
-            for (const [name, info] of Object.entries(servers)) {
-              if (context.policyService.isMcpTransportAllowed(info.transport)) {
-                filtered[name] = info;
-              }
-            }
-
-            return filtered;
-          }),
+          .handler(({ context, input }) => context.mcpConfigService.listForApi(input)),
         add: t
           .input(schemas.projects.mcp.add.input)
           .output(schemas.projects.mcp.add.output)
-          .handler(async ({ context, input }) => {
-            const existing = await context.mcpConfigService.listServers();
-            const existingServer = existing[input.name];
-
-            const transport = input.transport ?? "stdio";
-            if (context.policyService.isEnforced()) {
-              if (!context.policyService.isMcpTransportAllowed(transport)) {
-                return { success: false, error: "MCP transport is disabled by policy" };
-              }
-            }
-            const hasHeaders = Boolean(input.headers && Object.keys(input.headers).length > 0);
-            const usesSecretHeaders = Boolean(
-              input.headers &&
-              Object.values(input.headers).some(
-                (v) => typeof v === "object" && v !== null && "secret" in v
-              )
-            );
-
-            const action = (() => {
-              if (!existingServer) {
-                return "add";
-              }
-
-              if (
-                existingServer.transport !== "stdio" &&
-                transport !== "stdio" &&
-                existingServer.transport === transport &&
-                existingServer.url === input.url &&
-                JSON.stringify(existingServer.headers ?? {}) !== JSON.stringify(input.headers ?? {})
-              ) {
-                return "set_headers";
-              }
-
-              return "edit";
-            })();
-
-            const result = await context.mcpConfigService.addServer(input.name, {
-              transport,
-              command: input.command,
-              url: input.url,
-              headers: input.headers,
-            });
-
-            if (result.success) {
-              context.telemetryService.capture({
-                event: "mcp_server_config_changed",
-                properties: {
-                  action,
-                  transport,
-                  has_headers: hasHeaders,
-                  uses_secret_headers: usesSecretHeaders,
-                },
-              });
-            }
-
-            return result;
-          }),
+          .handler(({ context, input }) => context.mcpConfigService.addForApi(input)),
         remove: t
           .input(schemas.projects.mcp.remove.input)
           .output(schemas.projects.mcp.remove.output)
-          .handler(async ({ context, input }) => {
-            const existing = await context.mcpConfigService.listServers();
-            const server = existing[input.name];
-
-            if (context.policyService.isEnforced() && server) {
-              if (!context.policyService.isMcpTransportAllowed(server.transport)) {
-                return { success: false, error: "MCP transport is disabled by policy" };
-              }
-            }
-
-            const result = await context.mcpConfigService.removeServer(input.name);
-
-            if (result.success && server) {
-              const hasHeaders =
-                server.transport !== "stdio" &&
-                Boolean(server.headers && Object.keys(server.headers).length > 0);
-              const usesSecretHeaders =
-                server.transport !== "stdio" &&
-                Boolean(
-                  server.headers &&
-                  Object.values(server.headers).some(
-                    (v) => typeof v === "object" && v !== null && "secret" in v
-                  )
-                );
-
-              context.telemetryService.capture({
-                event: "mcp_server_config_changed",
-                properties: {
-                  action: "remove",
-                  transport: server.transport,
-                  has_headers: hasHeaders,
-                  uses_secret_headers: usesSecretHeaders,
-                },
-              });
-            }
-
-            return result;
-          }),
+          .handler(({ context, input }) => context.mcpConfigService.removeForApi(input.name)),
         test: t
           .input(schemas.projects.mcp.test.input)
           .output(schemas.projects.mcp.test.output)
-          .handler(async ({ context, input }) => {
-            const start = Date.now();
-            const secrets = await secretsToRecord(
-              context.config.getEffectiveSecrets(input.projectPath)
-            );
-
-            const configuredTransport = input.name
-              ? (
-                  await context.mcpConfigService.listServers(
-                    input.projectPath,
-                    isTrustedProjectPath(context, input.projectPath)
-                  )
-                )[input.name]?.transport
-              : undefined;
-
-            const transport =
-              configuredTransport ?? (input.command ? "stdio" : (input.transport ?? "auto"));
-
-            if (context.policyService.isEnforced()) {
-              if (!context.policyService.isMcpTransportAllowed(transport)) {
-                return { success: false, error: "MCP transport is disabled by policy" };
-              }
-            }
-
-            const result = await context.mcpServerManager.test({
-              projectPath: input.projectPath,
-              trusted: isTrustedProjectPath(context, input.projectPath),
-              name: input.name,
-              command: input.command,
-              transport: input.transport,
-              url: input.url,
-              headers: input.headers,
-              projectSecrets: secrets,
-            });
-
-            const durationMs = Date.now() - start;
-
-            const categorizeError = (
-              error: string
-            ): "timeout" | "connect" | "http_status" | "unknown" => {
-              const lower = error.toLowerCase();
-              if (lower.includes("timed out")) {
-                return "timeout";
-              }
-              if (
-                lower.includes("econnrefused") ||
-                lower.includes("econnreset") ||
-                lower.includes("enotfound") ||
-                lower.includes("ehostunreach")
-              ) {
-                return "connect";
-              }
-              if (/\b(400|401|403|404|405|500|502|503)\b/.test(lower)) {
-                return "http_status";
-              }
-              return "unknown";
-            };
-
-            context.telemetryService.capture({
-              event: "mcp_server_tested",
-              properties: {
-                transport,
-                success: result.success,
-                duration_ms_b2: roundToBase2(durationMs),
-                ...(result.success ? {} : { error_category: categorizeError(result.error) }),
-              },
-            });
-
-            return result;
-          }),
+          .handler(({ context, input }) =>
+            context.mcpServerManager.testForApi(input, { includeAgentPlugins: false })
+          ),
         setEnabled: t
           .input(schemas.projects.mcp.setEnabled.input)
           .output(schemas.projects.mcp.setEnabled.output)
-          .handler(async ({ context, input }) => {
-            const existing = await context.mcpConfigService.listServers();
-            const server = existing[input.name];
-
-            if (context.policyService.isEnforced() && server) {
-              if (!context.policyService.isMcpTransportAllowed(server.transport)) {
-                return { success: false, error: "MCP transport is disabled by policy" };
-              }
-            }
-
-            const result = await context.mcpConfigService.setServerEnabled(
-              input.name,
-              input.enabled
-            );
-
-            if (result.success && server) {
-              const hasHeaders =
-                server.transport !== "stdio" &&
-                Boolean(server.headers && Object.keys(server.headers).length > 0);
-              const usesSecretHeaders =
-                server.transport !== "stdio" &&
-                Boolean(
-                  server.headers &&
-                  Object.values(server.headers).some(
-                    (v) => typeof v === "object" && v !== null && "secret" in v
-                  )
-                );
-
-              context.telemetryService.capture({
-                event: "mcp_server_config_changed",
-                properties: {
-                  action: input.enabled ? "enable" : "disable",
-                  transport: server.transport,
-                  has_headers: hasHeaders,
-                  uses_secret_headers: usesSecretHeaders,
-                },
-              });
-            }
-
-            return result;
-          }),
+          .handler(({ context, input }) =>
+            context.mcpConfigService.setEnabledForApi(input.name, input.enabled)
+          ),
         setToolAllowlist: t
           .input(schemas.projects.mcp.setToolAllowlist.input)
           .output(schemas.projects.mcp.setToolAllowlist.output)
-          .handler(async ({ context, input }) => {
-            const existing = await context.mcpConfigService.listServers();
-            const server = existing[input.name];
-
-            if (context.policyService.isEnforced() && server) {
-              if (!context.policyService.isMcpTransportAllowed(server.transport)) {
-                return { success: false, error: "MCP transport is disabled by policy" };
-              }
-            }
-
-            const result = await context.mcpConfigService.setToolAllowlist(
-              input.name,
-              input.toolAllowlist
-            );
-
-            if (result.success && server) {
-              const hasHeaders =
-                server.transport !== "stdio" &&
-                Boolean(server.headers && Object.keys(server.headers).length > 0);
-              const usesSecretHeaders =
-                server.transport !== "stdio" &&
-                Boolean(
-                  server.headers &&
-                  Object.values(server.headers).some(
-                    (v) => typeof v === "object" && v !== null && "secret" in v
-                  )
-                );
-
-              context.telemetryService.capture({
-                event: "mcp_server_config_changed",
-                properties: {
-                  action: "set_tool_allowlist",
-                  transport: server.transport,
-                  has_headers: hasHeaders,
-                  uses_secret_headers: usesSecretHeaders,
-                  tool_allowlist_size_b2: roundToBase2(input.toolAllowlist.length),
-                },
-              });
-            }
-
-            return result;
-          }),
+          .handler(({ context, input }) =>
+            context.mcpConfigService.setToolAllowlistForApi(input.name, input.toolAllowlist)
+          ),
       },
+
       mcpOauth: {
         startDesktopFlow: t
           .input(schemas.projects.mcpOauth.startDesktopFlow.input)
           .output(schemas.projects.mcpOauth.startDesktopFlow.output)
-          .handler(async ({ context, input }) => {
-            return context.mcpOauthService.startDesktopFlow(input);
-          }),
+          .handler(({ context, input }) => context.mcpOauthService.startDesktopFlowForApi(input)),
         waitForDesktopFlow: t
           .input(schemas.projects.mcpOauth.waitForDesktopFlow.input)
           .output(schemas.projects.mcpOauth.waitForDesktopFlow.output)
-          .handler(async ({ context, input }) => {
-            return context.mcpOauthService.waitForDesktopFlow(input.flowId, {
-              timeoutMs: input.timeoutMs,
-            });
-          }),
+          .handler(({ context, input }) =>
+            context.mcpOauthService.waitForDesktopFlow(input.flowId, { timeoutMs: input.timeoutMs })
+          ),
         cancelDesktopFlow: t
           .input(schemas.projects.mcpOauth.cancelDesktopFlow.input)
           .output(schemas.projects.mcpOauth.cancelDesktopFlow.output)
-          .handler(async ({ context, input }) => {
-            await context.mcpOauthService.cancelDesktopFlow(input.flowId);
-          }),
+          .handler(({ context, input }) => context.mcpOauthService.cancelDesktopFlow(input.flowId)),
         startServerFlow: t
           .input(schemas.projects.mcpOauth.startServerFlow.input)
           .output(schemas.projects.mcpOauth.startServerFlow.output)
-          .handler(async ({ context, input }) => {
-            const headers = context.headers;
-
-            const origin = typeof headers?.origin === "string" ? headers.origin.trim() : "";
-            if (origin) {
-              try {
-                const redirectUri = new URL("/auth/mcp-oauth/callback", origin).toString();
-                return context.mcpOauthService.startServerFlow({ ...input, redirectUri });
-              } catch {
-                // Fall back to Host header.
-              }
-            }
-
-            const hostHeader = headers?.["x-forwarded-host"] ?? headers?.host;
-            const host = typeof hostHeader === "string" ? hostHeader.split(",")[0]?.trim() : "";
-            if (!host) {
-              return Err("Missing Host header");
-            }
-
-            const protoHeader = headers?.["x-forwarded-proto"];
-            const forwardedProto =
-              typeof protoHeader === "string" ? protoHeader.split(",")[0]?.trim() : "";
-            const proto = forwardedProto.length ? forwardedProto : "http";
-
-            const redirectUri = `${proto}://${host}/auth/mcp-oauth/callback`;
-
-            return context.mcpOauthService.startServerFlow({ ...input, redirectUri });
-          }),
+          .handler(({ context, input }) =>
+            context.mcpOauthService.startServerFlowForApi(input, context.headers)
+          ),
         waitForServerFlow: t
           .input(schemas.projects.mcpOauth.waitForServerFlow.input)
           .output(schemas.projects.mcpOauth.waitForServerFlow.output)
-          .handler(async ({ context, input }) => {
-            return context.mcpOauthService.waitForServerFlow(input.flowId, {
-              timeoutMs: input.timeoutMs,
-            });
-          }),
+          .handler(({ context, input }) =>
+            context.mcpOauthService.waitForServerFlow(input.flowId, { timeoutMs: input.timeoutMs })
+          ),
         cancelServerFlow: t
           .input(schemas.projects.mcpOauth.cancelServerFlow.input)
           .output(schemas.projects.mcpOauth.cancelServerFlow.output)
-          .handler(async ({ context, input }) => {
-            await context.mcpOauthService.cancelServerFlow(input.flowId);
-          }),
+          .handler(({ context, input }) => context.mcpOauthService.cancelServerFlow(input.flowId)),
         getAuthStatus: t
           .input(schemas.projects.mcpOauth.getAuthStatus.input)
           .output(schemas.projects.mcpOauth.getAuthStatus.output)
-          .handler(async ({ context, input }) => {
-            const servers = await context.mcpConfigService.listServers(
-              input.projectPath,
-              isTrustedProjectPath(context, input.projectPath)
-            );
-            const server = servers[input.serverName];
-
-            if (!server || server.transport === "stdio") {
-              return { isLoggedIn: false, hasRefreshToken: false };
-            }
-
-            return context.mcpOauthService.getAuthStatus({ serverUrl: server.url });
-          }),
+          .handler(({ context, input }) => context.mcpOauthService.getProjectAuthStatus(input)),
         logout: t
           .input(schemas.projects.mcpOauth.logout.input)
           .output(schemas.projects.mcpOauth.logout.output)
-          .handler(async ({ context, input }) => {
-            const servers = await context.mcpConfigService.listServers(
-              input.projectPath,
-              isTrustedProjectPath(context, input.projectPath)
-            );
-            const server = servers[input.serverName];
-
-            if (!server || server.transport === "stdio") {
-              return Ok(undefined);
-            }
-
-            return context.mcpOauthService.logout({ serverUrl: server.url });
-          }),
+          .handler(({ context, input }) => context.mcpOauthService.logoutProjectServer(input)),
       },
+
       idleCompaction: {
         get: t
           .input(schemas.projects.idleCompaction.get.input)
@@ -2740,47 +1731,13 @@ export const router = (authToken?: string) => {
         assignWorkspace: t
           .input(schemas.projects.subProjects.assignWorkspace.input)
           .output(schemas.projects.subProjects.assignWorkspace.output)
-          .handler(async ({ context, input }) => {
-            // Reassignment moves the workspace between sub-project workspace
-            // files. Capture the previous assignment (and the managed roots
-            // the workspace contributed to it) before it changes: afterwards
-            // the old file could no longer remove the entry, for the same
-            // reason workspace removal captures managedRootsByProject.
-            const previousMetadata = (await context.config.getAllWorkspaceMetadata()).find(
-              (m) => m.id === input.workspaceId
-            );
-            const result = await context.projectService.assignWorkspaceToSubProject(
+          .handler(({ context, input }) =>
+            context.projectService.assignWorkspaceToSubProjectAndSync(
               input.projectPath,
               input.workspaceId,
               input.subProjectPath
-            );
-            if (result.success) {
-              await context.workspaceService.refreshAndEmitMetadata(input.workspaceId);
-              // Best-effort (results logged inside): reconcile both sides of
-              // the reassignment so the old file drops the entry and the new
-              // one gains it without waiting for the next lifecycle event.
-              if (input.subProjectPath !== null) {
-                await syncProjectCodeWorkspace(context.config, input.subProjectPath);
-              }
-              const previousSubProjectPath =
-                previousMetadata?.subProjectPath != null
-                  ? stripTrailingSlashes(previousMetadata.subProjectPath)
-                  : null;
-              const newSubProjectPath =
-                input.subProjectPath !== null ? stripTrailingSlashes(input.subProjectPath) : null;
-              if (
-                previousMetadata &&
-                previousSubProjectPath !== null &&
-                previousSubProjectPath !== newSubProjectPath
-              ) {
-                await syncProjectCodeWorkspace(context.config, previousSubProjectPath, {
-                  extraManagedRootDirs:
-                    managedRootsByProject(previousMetadata).get(previousSubProjectPath),
-                });
-              }
-            }
-            return result;
-          }),
+            )
+          ),
       },
     },
     nameGeneration: {

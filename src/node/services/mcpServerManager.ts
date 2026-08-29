@@ -30,6 +30,11 @@ import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
 import type { PolicyService } from "@/node/services/policyService";
+import type { Config } from "@/node/config";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import { secretsToRecord } from "@/common/types/secrets";
+import { roundToBase2 } from "@/common/telemetry/utils";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import {
   parseBearerWwwAuthenticate,
@@ -1035,6 +1040,8 @@ interface WorkspaceServers {
 }
 
 export interface MCPServerManagerOptions {
+  config?: Config;
+  telemetryService?: Pick<TelemetryService, "capture">;
   /** Inline stdio servers to use (merged with config file servers by default) */
   inlineServers?: Record<string, string>;
   /** If true, ignore config file servers and use only inline servers */
@@ -1062,6 +1069,21 @@ export interface MCPServerManagerOptions {
      */
     readWorkspaceOverrides?: (workspaceId: string) => Promise<WorkspaceMCPOverrides | undefined>;
   };
+}
+
+function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_status" | "unknown" {
+  const lower = error.toLowerCase();
+  if (lower.includes("timed out")) return "timeout";
+  if (
+    lower.includes("econnrefused") ||
+    lower.includes("econnreset") ||
+    lower.includes("enotfound") ||
+    lower.includes("ehostunreach")
+  ) {
+    return "connect";
+  }
+  if (/\b(400|401|403|404|405|500|502|503)\b/.test(lower)) return "http_status";
+  return "unknown";
 }
 
 export class MCPServerManager {
@@ -1120,6 +1142,8 @@ export class MCPServerManager {
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
   private readonly policyService: PolicyService | null;
+  private readonly config: Config | null;
+  private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
   private mcpOauthService: McpOauthService | null = null;
   private secretsResolver: MCPWorkspaceSecretsResolver | null = null;
   private ignoreConfigFile = false;
@@ -1137,6 +1161,8 @@ export class MCPServerManager {
     policyService?: PolicyService
   ) {
     this.policyService = policyService ?? null;
+    this.config = options?.config ?? null;
+    this.telemetryService = options?.telemetryService ?? null;
     this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
     this.idleCheckInterval.unref?.();
     if (options?.inlineServers) {
@@ -3006,6 +3032,81 @@ export class MCPServerManager {
         log.warn("Failed to stop MCP server", { error, name: instance.name });
       }
     }
+  }
+
+  async testForApi(
+    input: {
+      projectPath?: string;
+      workspaceId?: string;
+      name?: string;
+      command?: string;
+      transport?: MCPServerTransport;
+      url?: string;
+      headers?: Record<string, MCPHeaderValue>;
+    },
+    options: { includeAgentPlugins?: boolean } = {}
+  ): Promise<MCPTestResult> {
+    assert(this.config, "MCPServerManager.testForApi requires config");
+    const start = Date.now();
+    const projectPathProvided =
+      typeof input.projectPath === "string" && input.projectPath.trim().length > 0;
+    const resolvedProjectPath = projectPathProvided ? input.projectPath! : this.config.rootDir;
+    const trusted = projectPathProvided
+      ? isProjectTrusted(this.config, resolvedProjectPath)
+      : false;
+    const projectSecrets = await secretsToRecord(
+      projectPathProvided
+        ? this.config.getEffectiveSecrets(resolvedProjectPath)
+        : this.config.getGlobalSecrets()
+    );
+    const agentPlugins =
+      options.includeAgentPlugins === false
+        ? undefined
+        : await this.configService.resolveWorkspaceAgentPluginsContext(
+            input.workspaceId,
+            projectPathProvided ? resolvedProjectPath : undefined
+          );
+    const configuredTransport = input.name
+      ? (
+          await this.configService.listServers(
+            projectPathProvided ? resolvedProjectPath : undefined,
+            trusted,
+            { agentPlugins }
+          )
+        )[input.name]?.transport
+      : undefined;
+    const transport =
+      configuredTransport ?? (input.command ? "stdio" : (input.transport ?? "auto"));
+
+    if (
+      this.policyService?.isEnforced() === true &&
+      !this.policyService.isMcpTransportAllowed(transport)
+    ) {
+      return { success: false, error: "MCP transport is disabled by policy" };
+    }
+
+    const result = await this.test({
+      projectPath: resolvedProjectPath,
+      trusted,
+      name: input.name,
+      command: input.command,
+      transport: input.transport,
+      url: input.url,
+      headers: input.headers,
+      projectSecrets,
+      agentPlugins,
+    });
+    const errorCategory = result.success ? undefined : categorizeMcpTestError(result.error);
+    this.telemetryService?.capture({
+      event: "mcp_server_tested",
+      properties: {
+        transport,
+        success: result.success,
+        duration_ms_b2: roundToBase2(Date.now() - start),
+        ...(errorCategory ? { error_category: errorCategory } : {}),
+      },
+    });
+    return result;
   }
 
   /**
