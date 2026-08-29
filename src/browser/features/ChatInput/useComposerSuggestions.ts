@@ -20,7 +20,7 @@ import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 
-export type ComposerSuggestionToken =
+type ComposerSuggestionToken =
   | { kind: "file"; startIndex: number; endIndex: number; query: string }
   | { kind: "inline"; startIndex: number; endIndex: number; query: string }
   | { kind: "symbol"; startIndex: number; endIndex: number; query: string }

@@ -18,7 +18,7 @@ import type { GoalInterventionPolicy, QueueDispatchMode } from "./types";
 
 type ModelOneShot = Extract<NonNullable<ParsedCommand>, { type: "model-oneshot" }>;
 
-export interface PrepareMessagePayloadInput {
+interface PrepareMessagePayloadInput {
   messageText: string;
   messageTextForSend: string;
   attachments: ChatAttachment[];
@@ -42,7 +42,7 @@ export interface PrepareMessagePayloadInput {
   queueDispatchMode?: QueueDispatchMode;
 }
 
-export interface PreparedMessagePayload {
+interface PreparedMessagePayload {
   message: string;
   options: SendMessageOptions & { fileParts?: FilePart[] };
   effectiveModel: string;

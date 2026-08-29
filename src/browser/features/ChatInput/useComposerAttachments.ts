@@ -24,7 +24,7 @@ interface UseComposerAttachmentsOptions {
   editingMessage: boolean;
   pushToast: PushToast;
 }
-export function getBaseMediaType(mediaType: string): string {
+function getBaseMediaType(mediaType: string): string {
   return mediaType.toLowerCase().trim().split(";")[0];
 }
 export function isPdfAttachment(

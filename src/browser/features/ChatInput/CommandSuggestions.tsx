@@ -4,19 +4,9 @@ import { cn } from "@/common/lib/utils";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
 import { FileIcon } from "@/browser/components/FileIcon/FileIcon";
 
-// Keys for navigating slash command suggestions.
-// Enter or Tab accepts the highlighted suggestion; Shift+Enter inserts a newline.
 export const COMMAND_SUGGESTION_KEYS = ["Tab", "Enter", "ArrowUp", "ArrowDown", "Escape"];
 
-// Keys for navigating file path (@mention) suggestions.
-//
-// Enter accepts the selected file path (then a subsequent Enter sends the message).
 export const FILE_SUGGESTION_KEYS = ["Tab", "Enter", "ArrowUp", "ArrowDown", "Escape"];
-
-/**
- * Highlight matching portions of text based on a query.
- * Performs case-insensitive substring matching and highlights all occurrences.
- */
 function HighlightedText({
   text,
   query,
@@ -37,7 +27,6 @@ function HighlightedText({
   let matchIndex = lowerText.indexOf(lowerQuery);
 
   while (matchIndex !== -1) {
-    // Add non-matching prefix
     if (matchIndex > lastIndex) {
       parts.push(
         <span key={`text-${lastIndex}`} className="opacity-60">
@@ -45,7 +34,6 @@ function HighlightedText({
         </span>
       );
     }
-    // Add highlighted match
     parts.push(
       <span key={`match-${matchIndex}`} className="text-light">
         {text.slice(matchIndex, matchIndex + query.length)}
@@ -55,7 +43,6 @@ function HighlightedText({
     matchIndex = lowerText.indexOf(lowerQuery, lastIndex);
   }
 
-  // Add remaining non-matching suffix
   if (lastIndex < text.length) {
     parts.push(
       <span key={`text-${lastIndex}`} className="opacity-60">
@@ -67,7 +54,6 @@ function HighlightedText({
   return <span className={className}>{parts}</span>;
 }
 
-// Props interface
 interface CommandSuggestionsProps {
   suggestions: SlashSuggestion[];
   onSelectSuggestion: (suggestion: SlashSuggestion) => void;
@@ -75,17 +61,13 @@ interface CommandSuggestionsProps {
   isVisible: boolean;
   ariaLabel?: string;
   listId?: string;
-  /** Reference to the input element for portal positioning */
   anchorRef?: React.RefObject<HTMLElement | null>;
-  /** Query string to highlight in suggestions (for file path autocomplete) */
   highlightQuery?: string;
-  /** Whether suggestions are file paths (enables file icons) */
   isFileSuggestion?: boolean;
   selectedIndex?: number;
   onSelectedIndexChange?: (index: number) => void;
 }
 
-// Main component
 export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
   suggestions,
   onSelectSuggestion,
@@ -134,12 +116,10 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     });
   }, [isSelectionControlled, isVisible, suggestions]);
 
-  // Scroll selected item into view
   useLayoutEffect(() => {
     selectedRef.current?.scrollIntoView({ block: "nearest" });
   }, [selectedIndex]);
 
-  // Calculate position when using portal mode
   useLayoutEffect(() => {
     if (!anchorRef?.current || !isVisible) {
       setPosition(null);
@@ -162,7 +142,6 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
 
     updatePosition();
 
-    // Update on resize/scroll
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
     return () => {
@@ -194,7 +173,6 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [isSelectionControlled, isVisible, onDismiss, onSelectSuggestion, selectedIndex, suggestions]);
 
-  // Click outside handler
   useEffect(() => {
     if (!isVisible) return;
 
@@ -228,7 +206,6 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
       data-command-suggestions
       className={cn(
         "bg-separator border-border-light z-[1010] flex max-h-[200px] flex-col overflow-y-auto rounded border shadow-[0_-4px_12px_rgba(0,0,0,0.4)]",
-        // Use absolute positioning relative to parent when not in portal mode
         !anchorRef && "absolute right-0 bottom-full left-0 mb-2"
       )}
       style={
