@@ -44,7 +44,11 @@ interface PrepareMessagePayloadInput {
 
 interface PreparedMessagePayload {
   message: string;
-  options: SendMessageOptions & { fileParts?: FilePart[] };
+  // The schema leaves muxMetadata untyped (z.any()); narrow it at this seam.
+  options: Omit<SendMessageOptions, "muxMetadata"> & {
+    fileParts?: FilePart[];
+    muxMetadata?: MuxMessageMetadata;
+  };
   effectiveModel: string;
   sentReviewIds: string[];
 }
@@ -58,11 +62,15 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ? fileParts
       : undefined;
   let metadata = input.baseMetadata;
-  if (input.agentSkillRefs.length > 0) {
-    metadata = withAgentSkillRefs(metadata, input.agentSkillRefs);
-  }
-  if (input.mcpPromptRefs.length > 0) {
-    metadata = withMcpPromptRefs(metadata, input.mcpPromptRefs);
+  // Refs on a compaction request would make the summarization turn materialize
+  // skill snapshots; the caller carries them on the compaction follow-up instead.
+  if (metadata?.type !== "compaction-request") {
+    if (input.agentSkillRefs.length > 0) {
+      metadata = withAgentSkillRefs(metadata, input.agentSkillRefs);
+    }
+    if (input.mcpPromptRefs.length > 0) {
+      metadata = withMcpPromptRefs(metadata, input.mcpPromptRefs);
+    }
   }
 
   const actualMessageText = input.compactionMessageText ?? input.messageTextForSend;

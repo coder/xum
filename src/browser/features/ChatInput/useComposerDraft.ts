@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   subscribePersistedStateWrites,
   updatePersistedState,
@@ -48,36 +48,35 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(attachmentsKey)
   );
-  const setAttachments = useCallback(
-    (value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])) =>
-      setAttachmentsState((previous) => {
-        const next = value instanceof Function ? value(previous) : value;
-        const persists =
-          next.length > 0 &&
-          estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
-        selfWriteRef.current = true;
-        try {
-          updatePersistedState<ChatAttachment[] | undefined>(
-            attachmentsKey,
-            persists ? next : undefined
-          );
-        } finally {
-          selfWriteRef.current = false;
-        }
-        if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-        else if (tooLargeToastKeyRef.current !== attachmentsKey) {
-          tooLargeToastKeyRef.current = attachmentsKey;
-          pushToast({
-            type: "error",
-            message:
-              "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-            duration: 5000,
-          });
-        }
-        return next;
-      }),
-    [attachmentsKey, pushToast]
-  );
+  const setAttachments = (
+    value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
+  ) =>
+    setAttachmentsState((previous) => {
+      const next = value instanceof Function ? value(previous) : value;
+      const persists =
+        next.length > 0 &&
+        estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+      selfWriteRef.current = true;
+      try {
+        updatePersistedState<ChatAttachment[] | undefined>(
+          attachmentsKey,
+          persists ? next : undefined
+        );
+      } finally {
+        selfWriteRef.current = false;
+      }
+      if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
+      else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+        tooLargeToastKeyRef.current = attachmentsKey;
+        pushToast({
+          type: "error",
+          message:
+            "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
+          duration: 5000,
+        });
+      }
+      return next;
+    });
   useEffect(() => {
     tooLargeToastKeyRef.current = null;
     setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
@@ -129,14 +128,11 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         createdAt: 0,
       }))
     : attachedReviews;
-  const getDraft = useCallback(() => ({ text: input, attachments }), [input, attachments]);
-  const setDraft = useCallback(
-    (draft: { text: string; attachments: ChatAttachment[] }) => {
-      setInput(draft.text);
-      setAttachments(draft.attachments);
-    },
-    [setAttachments, setInput]
-  );
+  const getDraft = () => ({ text: input, attachments });
+  const setDraft = (draft: { text: string; attachments: ChatAttachment[] }) => {
+    setInput(draft.text);
+    setAttachments(draft.attachments);
+  };
   const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
   const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   return {

@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getPendingDraftSkillDiscoveryKey } from "@/common/constants/storage";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { findAtMentionAtCursor } from "@/common/utils/atMentions";
 import { findInlineSkillReferenceAtCursor } from "@/browser/utils/agentSkills/inlineSkillReferences";
@@ -151,25 +155,38 @@ interface UseComposerSuggestionsOptions {
   workspaceId: string | null;
   projectPath: string | null;
   disableWorkspaceAgents: boolean;
-  transferredDraftProjectDiscovery: boolean;
-  agentPluginsEnabled: boolean;
-  experiments: SuggestionExperiments;
 }
 
 export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
-  const {
-    agentPluginsEnabled,
-    disableWorkspaceAgents,
-    experiments,
-    input,
-    inputRef,
-    projectPath,
-    setInput,
-    transferredDraftProjectDiscovery,
-    variant,
-    workspaceId,
-  } = options;
+  const { disableWorkspaceAgents, input, inputRef, projectPath, setInput, variant, workspaceId } =
+    options;
   const { api } = useAPI();
+  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
+  const dynamicWorkflowsEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
+  const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
+  const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
+  const rlmEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
+  const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const experiments: SuggestionExperiments = {
+    workspaceHeartbeats: workspaceHeartbeatsEnabled,
+    dynamicWorkflows: dynamicWorkflowsEnabled,
+    memory: memoryEnabled,
+    memoryConsolidation: memoryConsolidationEnabled,
+    rlm: rlmEnabled,
+    programmaticToolCalling: ptcEnabled,
+  };
+  // A draft transferred from a failed creation send may have resolved its
+  // slash skill against the project path; honor that choice on the retry.
+  // listener keeps the descriptor reload in sync when the transfer lands
+  // after mount and when a successful send clears the key.
+  const [transferredDraftProjectDiscovery] = usePersistedState<boolean>(
+    variant === "workspace" && workspaceId
+      ? getPendingDraftSkillDiscoveryKey(workspaceId)
+      : "__unused__",
+    false,
+    { listener: true }
+  );
   const [cursor, setCursor] = useState(input.length);
   const [selection, setSelection] = useState({
     channelKey: "",
@@ -329,9 +346,19 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   }, [api, activeToken?.kind, activeTokenKey, variant, workspaceId]);
 
   useEffect(() => {
-    if (!api || activeToken?.kind !== "file") return;
     const scope = variant === "workspace" ? workspaceId : projectPath;
-    if (!scope) return;
+    if (!api || activeToken?.kind !== "file" || !scope) {
+      // Invalidate in-flight requests and drop the cached completion when the
+      // file token or its scope goes away, so a stale response (e.g. from a
+      // previous workspace) cannot resurface for a later identical token.
+      fileRequestId.current++;
+      setFileCompletion((prev) =>
+        prev.tokenKey === "" && prev.suggestions.length === 0
+          ? prev
+          : { tokenKey: "", suggestions: [] }
+      );
+      return;
+    }
     const requestId = ++fileRequestId.current;
     const requestedTokenKey = activeTokenKey;
     const request =
@@ -376,52 +403,49 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     workspaceId,
   ]);
 
-  const dismiss = useCallback(() => {
+  const dismiss = () => {
     setSelection({
       channelKey: activeChannelKey,
       index: selectedIndex,
       selectedId: suggestions[selectedIndex]?.id ?? null,
       dismissedTokenKey: activeTokenKey,
     });
-  }, [activeChannelKey, activeTokenKey, selectedIndex, suggestions]);
+  };
 
-  const setSelectedIndex = useCallback(
-    (index: number) =>
-      setSelection({
-        channelKey: activeChannelKey,
-        index,
-        selectedId: suggestions[index]?.id ?? null,
-        dismissedTokenKey: "",
-      }),
-    [activeChannelKey, suggestions]
-  );
+  const setSelectedIndex = (index: number) =>
+    setSelection({
+      channelKey: activeChannelKey,
+      index,
+      selectedId: suggestions[index]?.id ?? null,
+      dismissedTokenKey: "",
+    });
 
-  const select = useCallback(
-    (suggestion: SlashSuggestion) => {
-      if (!activeToken) return;
-      const applied = applyComposerSuggestion(input, activeToken, suggestion);
-      setInput(applied.input);
-      setCursor(applied.cursor);
-      setSelection({
-        channelKey: activeChannelKey,
-        index: 0,
-        selectedId: null,
-        dismissedTokenKey: tokenKey(detectActiveComposerToken(applied.input, applied.cursor)) ?? "",
-      });
-      requestAnimationFrame(() => {
-        const element = inputRef.current;
-        if (!element || element.disabled) return;
-        element.focus();
-        element.selectionStart = applied.cursor;
-        element.selectionEnd = applied.cursor;
-      });
-    },
-    [activeChannelKey, activeToken, input, inputRef, setInput]
-  );
+  const select = (suggestion: SlashSuggestion) => {
+    if (!activeToken) return;
+    const applied = applyComposerSuggestion(input, activeToken, suggestion);
+    setInput(applied.input);
+    setCursor(applied.cursor);
+    setSelection({
+      channelKey: activeChannelKey,
+      index: 0,
+      selectedId: null,
+      dismissedTokenKey: tokenKey(detectActiveComposerToken(applied.input, applied.cursor)) ?? "",
+    });
+    requestAnimationFrame(() => {
+      const element = inputRef.current;
+      if (!element || element.disabled) return;
+      element.focus();
+      element.selectionStart = applied.cursor;
+      element.selectionEnd = applied.cursor;
+    });
+  };
 
+  // Latest-ref listener: the document handler reads fresh state per event so
+  // attaching only depends on visibility, without useCallback dependency lists
+  // (manual memoization is banned; React Compiler owns stabilization).
+  const keydownHandlerRef = useRef<((event: KeyboardEvent) => void) | null>(null);
   useEffect(() => {
-    if (!isVisible) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
+    keydownHandlerRef.current = (event: KeyboardEvent) => {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         const delta = event.key === "ArrowDown" ? 1 : -1;
@@ -436,20 +460,24 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         dismiss();
       }
     };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [dismiss, isVisible, select, selectedIndex, setSelectedIndex, suggestions]);
+  });
+  useEffect(() => {
+    if (!isVisible) return;
+    const listener = (event: KeyboardEvent) => keydownHandlerRef.current?.(event);
+    document.addEventListener("keydown", listener);
+    return () => document.removeEventListener("keydown", listener);
+  }, [isVisible]);
 
   useEffect(() => () => mcpAbort.current?.abort(), []);
 
-  const handleCursorActivity = useCallback(() => {
+  const handleCursorActivity = () => {
     const element = inputRef.current;
     if (element) setCursor(element.selectionStart ?? input.length);
-  }, [input.length, inputRef]);
+  };
 
-  const handleInputCaretChange = useCallback((caret: number | undefined, inputLength: number) => {
+  const handleInputCaretChange = (caret: number | undefined, inputLength: number) => {
     setCursor(caret ?? inputLength);
-  }, []);
+  };
 
   const ghostHint = getCommandGhostHint(input, isVisible && activeToken?.kind === "slash", {
     variant,

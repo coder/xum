@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import type React from "react";
 import { useAPI } from "@/browser/contexts/API";
 import {
@@ -48,137 +48,111 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   const { setAttachments, editingMessage, pushToast, variant, workspaceId } = options;
   const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
 
-  const showResizeToast = useCallback(
-    (next: ChatAttachment[]) => {
-      const resized = next.filter(
-        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
-          attachment.kind === "provider" && attachment.resizeInfo != null
-      );
-      const resizeInfo = resized[0]?.resizeInfo;
-      if (!resizeInfo) return;
-      pushToast({
-        type: "info",
-        message:
-          resized.length === 1
-            ? `Image resized from ${resizeInfo.originalWidth}×${resizeInfo.originalHeight} to ${resizeInfo.newWidth}×${resizeInfo.newHeight}`
-            : `${resized.length} images resized to fit provider limits`,
-      });
-    },
-    [pushToast]
-  );
+  const showResizeToast = (next: ChatAttachment[]) => {
+    const resized = next.filter(
+      (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
+        attachment.kind === "provider" && attachment.resizeInfo != null
+    );
+    const resizeInfo = resized[0]?.resizeInfo;
+    if (!resizeInfo) return;
+    pushToast({
+      type: "info",
+      message:
+        resized.length === 1
+          ? `Image resized from ${resizeInfo.originalWidth}×${resizeInfo.originalHeight} to ${resizeInfo.newWidth}×${resizeInfo.newHeight}`
+          : `${resized.length} images resized to fit provider limits`,
+    });
+  };
 
-  const processFiles = useCallback(
-    (files: File[]) => {
-      setProcessingAttachmentCount((count) => count + 1);
-      return processAttachmentFiles(files, {
-        stageAttachment:
-          variant === "workspace"
-            ? async (file, dataBase64) => {
-                if (!api) throw new Error("Not connected to server");
-                if (workspaceId == null)
-                  throw new Error("Files can be staged after opening a workspace.");
-                const result = await api.workspace.stageAttachment({
-                  workspaceId,
-                  filename: file.name,
-                  mediaType: file.type || null,
-                  sizeBytes: file.size,
-                  dataBase64,
-                });
-                if (!result.success) throw new Error(result.error);
-                return result.data;
-              }
-            : undefined,
-        holdNonProviderFiles: variant === "creation",
-      }).finally(() => setProcessingAttachmentCount((count) => Math.max(0, count - 1)));
-    },
-    [api, variant, workspaceId]
-  );
+  const processFiles = (files: File[]) => {
+    setProcessingAttachmentCount((count) => count + 1);
+    return processAttachmentFiles(files, {
+      stageAttachment:
+        variant === "workspace"
+          ? async (file, dataBase64) => {
+              if (!api) throw new Error("Not connected to server");
+              if (workspaceId == null)
+                throw new Error("Files can be staged after opening a workspace.");
+              const result = await api.workspace.stageAttachment({
+                workspaceId,
+                filename: file.name,
+                mediaType: file.type || null,
+                sizeBytes: file.size,
+                dataBase64,
+              });
+              if (!result.success) throw new Error(result.error);
+              return result.data;
+            }
+          : undefined,
+      holdNonProviderFiles: variant === "creation",
+    }).finally(() => setProcessingAttachmentCount((count) => Math.max(0, count - 1)));
+  };
 
-  const attachFiles = useCallback(
-    (files: File[]) => {
-      void Promise.all(
-        files.map((file) =>
-          processFiles([file]).then(
-            (processed) => ({ ok: true as const, attachments: processed }),
-            (error: unknown) => ({ ok: false as const, error })
-          )
+  const attachFiles = (files: File[]) => {
+    void Promise.all(
+      files.map((file) =>
+        processFiles([file]).then(
+          (processed) => ({ ok: true as const, attachments: processed }),
+          (error: unknown) => ({ ok: false as const, error })
         )
-      ).then((outcomes) => {
-        const successes = outcomes.flatMap((outcome) => (outcome.ok ? outcome.attachments : []));
-        if (successes.length > 0) {
-          setAttachments((previous) => [...previous, ...successes]);
-          showResizeToast(successes);
-        }
-        for (const outcome of outcomes) {
-          if (outcome.ok) continue;
-          console.error("Failed to process attached file:", outcome.error);
-          pushToast({
-            type: "error",
-            message:
-              outcome.error instanceof Error
-                ? outcome.error.message
-                : "Failed to process attachment",
-          });
-        }
-      });
-    },
-    [pushToast, processFiles, setAttachments, showResizeToast]
-  );
-
-  const rejectEditAttachment = useCallback(() => {
-    pushToast({ type: "error", message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE });
-  }, [pushToast]);
-
-  const handlePaste = useCallback(
-    (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const files = event.clipboardData?.items
-        ? extractAttachmentsFromClipboard(event.clipboardData.items)
-        : [];
-      if (files.length === 0) return;
-      if (editingMessage) {
-        rejectEditAttachment();
-        return;
+      )
+    ).then((outcomes) => {
+      const successes = outcomes.flatMap((outcome) => (outcome.ok ? outcome.attachments : []));
+      if (successes.length > 0) {
+        setAttachments((previous) => [...previous, ...successes]);
+        showResizeToast(successes);
       }
-      event.preventDefault();
-      attachFiles(files);
-    },
-    [attachFiles, editingMessage, rejectEditAttachment]
-  );
+      for (const outcome of outcomes) {
+        if (outcome.ok) continue;
+        console.error("Failed to process attached file:", outcome.error);
+        pushToast({
+          type: "error",
+          message:
+            outcome.error instanceof Error ? outcome.error.message : "Failed to process attachment",
+        });
+      }
+    });
+  };
 
-  const handleAttachFiles = useCallback(
-    (files: File[]) => {
-      if (editingMessage) rejectEditAttachment();
-      else attachFiles(files);
-    },
-    [attachFiles, editingMessage, rejectEditAttachment]
-  );
+  const rejectEditAttachment = () => {
+    pushToast({ type: "error", message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE });
+  };
 
-  const handleDragOver = useCallback(
-    (event: React.DragEvent<HTMLTextAreaElement>) => {
-      if (!event.dataTransfer.types.includes("Files")) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = editingMessage ? "none" : "copy";
-    },
-    [editingMessage]
-  );
+  const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = event.clipboardData?.items
+      ? extractAttachmentsFromClipboard(event.clipboardData.items)
+      : [];
+    if (files.length === 0) return;
+    if (editingMessage) {
+      rejectEditAttachment();
+      return;
+    }
+    event.preventDefault();
+    attachFiles(files);
+  };
 
-  const handleDrop = useCallback(
-    (event: React.DragEvent<HTMLTextAreaElement>) => {
-      event.preventDefault();
-      const files = extractAttachmentsFromDrop(event.dataTransfer);
-      if (files.length === 0) return;
-      if (editingMessage) rejectEditAttachment();
-      else attachFiles(files);
-    },
-    [attachFiles, editingMessage, rejectEditAttachment]
-  );
+  const handleAttachFiles = (files: File[]) => {
+    if (editingMessage) rejectEditAttachment();
+    else attachFiles(files);
+  };
 
-  const handleRemoveAttachment = useCallback(
-    (id: string) => {
-      setAttachments((previous) => previous.filter((item) => item.id !== id));
-    },
-    [setAttachments]
-  );
+  const handleDragOver = (event: React.DragEvent<HTMLTextAreaElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = editingMessage ? "none" : "copy";
+  };
+
+  const handleDrop = (event: React.DragEvent<HTMLTextAreaElement>) => {
+    event.preventDefault();
+    const files = extractAttachmentsFromDrop(event.dataTransfer);
+    if (files.length === 0) return;
+    if (editingMessage) rejectEditAttachment();
+    else attachFiles(files);
+  };
+
+  const handleRemoveAttachment = (id: string) => {
+    setAttachments((previous) => previous.filter((item) => item.id !== id));
+  };
 
   return {
     processingAttachmentCount,

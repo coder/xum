@@ -143,6 +143,7 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
+  withMcpPromptRefs,
 } from "@/common/types/message";
 import {
   getModelCapabilities,
@@ -245,16 +246,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
   const dynamicWorkflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
-  const workspaceHeartbeatsExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
-  );
-  const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const agentPluginsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
-  const memoryConsolidationExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.MEMORY_CONSOLIDATION
-  );
-  const rlmExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
-  const ptcExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -582,16 +573,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     workspaceId,
     projectPath: atMentionProjectPath,
     disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents === true,
-    transferredDraftProjectDiscovery,
-    agentPluginsEnabled: agentPluginsExperimentEnabled,
-    experiments: {
-      workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-      dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-      memory: memoryExperimentEnabled,
-      memoryConsolidation: memoryConsolidationExperimentEnabled,
-      rlm: rlmExperimentEnabled,
-      programmaticToolCalling: ptcExperimentEnabled,
-    },
   });
   const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
     composerSuggestions;
@@ -2124,6 +2105,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (editMessageForSend && actualMessageText.startsWith("/")) {
           const parsed = parseCommand(messageText);
           if (parsed?.type === "compact") {
+            // Inline refs ride the follow-up message so their snapshots
+            // materialize after compaction, not on the summarization turn.
+            const followUpMuxMetadata = withMcpPromptRefs(
+              withAgentSkillRefs(undefined, combinedSkillRefs),
+              combinedMcpPromptRefs
+            );
             const {
               messageText: regeneratedText,
               metadata,
@@ -2138,7 +2125,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 parsed.continueMessage ||
                 sendFileParts?.length ||
                 reviewsData?.length ||
-                getStagedAttachments(sendAttachments).length
+                getStagedAttachments(sendAttachments).length ||
+                followUpMuxMetadata
                   ? {
                       text: appendStagedAttachmentNotice(
                         parsed.continueMessage ?? "",
@@ -2146,6 +2134,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       ),
                       fileParts: sendFileParts,
                       reviews: reviewsData,
+                      ...(followUpMuxMetadata ? { muxMetadata: followUpMuxMetadata } : {}),
                     }
                   : undefined,
               model: parsed.model,

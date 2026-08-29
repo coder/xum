@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { MuxMessageMetadata } from "@/common/types/message";
 import { prepareMessagePayload } from "./prepareMessagePayload";
 
 const model = "anthropic:claude-sonnet-4";
@@ -44,6 +45,27 @@ describe("prepareMessagePayload", () => {
       effectiveModel,
       fileParts,
     ]);
+  });
+
+  it.each([
+    ["normal", undefined, ["demo"]],
+    [
+      "compaction-request",
+      {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: {},
+      } satisfies MuxMessageMetadata,
+      undefined,
+    ],
+  ])("attaches skill refs to %s metadata only", (_name, baseMetadata, expectedSkills) => {
+    const result = prepare({
+      baseMetadata,
+      agentSkillRefs: [{ skillName: "demo", scope: "project", source: "inline" }],
+    });
+    expect(result.options.muxMetadata?.agentSkillRefs?.map((ref) => ref.skillName)).toEqual(
+      expectedSkills
+    );
   });
 
   it("applies compaction, context, and dispatch overrides", () => {
