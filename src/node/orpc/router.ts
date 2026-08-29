@@ -107,7 +107,6 @@ import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/age
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
-import * as path from "node:path";
 
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
 import { coerceThinkingLevel } from "@/common/types/thinking";
