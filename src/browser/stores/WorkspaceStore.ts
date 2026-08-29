@@ -699,7 +699,7 @@ function getStreamingMessageKey(workspaceId: string, messageId: string): string 
 }
 
 function getAdvisorLiveKey(workspaceId: string, toolCallId: string): string {
-  return workspaceId + " " + toolCallId;
+  return workspaceId + "\0" + toolCallId;
 }
 
 export class WorkspaceStore {
