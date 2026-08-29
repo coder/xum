@@ -111,7 +111,7 @@ export function applyComposerSuggestion(
   input: string,
   token: ComposerSuggestionToken,
   suggestion: SlashSuggestion
-): { input: string; cursor: number } {
+) {
   if (token.kind === "slash") {
     return { input: suggestion.replacement, cursor: suggestion.replacement.length };
   }
@@ -230,7 +230,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     const discovery =
       variant === "workspace" && workspaceId
         ? {
-            workspaceId: workspaceId,
+            workspaceId,
             disableWorkspaceAgents: disableWorkspaceAgents || transferredDraftProjectDiscovery,
           }
         : variant === "creation" && projectPath
@@ -270,7 +270,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
       return;
     }
     api.workspace.plugins.slashCommands
-      .list({ workspaceId: workspaceId })
+      .list({ workspaceId })
       .then((commands) => {
         if (mounted) setPluginCommands(commands);
       })
@@ -458,7 +458,6 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   });
 
   return {
-    activeToken,
     suggestions,
     selectedIndex,
     setSelectedIndex,
@@ -481,7 +480,6 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         ? activeToken.query
         : undefined,
     isFileSuggestion: activeToken?.kind === "file",
-    suppressionKeys: activeToken?.kind === "slash" ? "command" : "file",
     ghostHint,
     handleCursorActivity,
     handleInputCaretChange,

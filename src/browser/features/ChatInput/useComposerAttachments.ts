@@ -17,7 +17,6 @@ type PushToast = (toast: Omit<Toast, "id" | "type"> & { type: Toast["type"] | "i
 interface UseComposerAttachmentsOptions {
   variant: "creation" | "workspace";
   workspaceId: string | null;
-  attachments: ChatAttachment[];
   setAttachments: (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
   ) => void;
@@ -46,7 +45,7 @@ export function estimateBase64DataUrlBytes(dataUrl: string): number | null {
 }
 export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   const { api } = useAPI();
-  const { attachments, setAttachments, editingMessage, pushToast, variant, workspaceId } = options;
+  const { setAttachments, editingMessage, pushToast, variant, workspaceId } = options;
   const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
 
   const showResizeToast = useCallback(
@@ -79,7 +78,7 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
                 if (workspaceId == null)
                   throw new Error("Files can be staged after opening a workspace.");
                 const result = await api.workspace.stageAttachment({
-                  workspaceId: workspaceId,
+                  workspaceId,
                   filename: file.name,
                   mediaType: file.type || null,
                   sizeBytes: file.size,
@@ -182,8 +181,6 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
   );
 
   return {
-    attachments,
-    setAttachments,
     processingAttachmentCount,
     handlePaste,
     handleAttachFiles,

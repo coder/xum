@@ -8,9 +8,7 @@ import {
   getDraftScopeId,
   getInputAttachmentsKey,
   getInputKey,
-  getModelKey,
   getPendingScopeId,
-  getProjectScopeId,
 } from "@/common/constants/storage";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
@@ -42,9 +40,6 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         : getPendingScopeId(creationProjectPath);
   const inputKey = getInputKey(scopeId);
   const attachmentsKey = getInputAttachmentsKey(scopeId);
-  const modelKey = getModelKey(
-    variant === "creation" ? getProjectScopeId(creationProjectPath) : scopeId
-  );
   const [input, setInput] = usePersistedState(inputKey, "", { listener: true });
   const latestInputValueRef = useRef(input);
   latestInputValueRef.current = input;
@@ -145,7 +140,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
   const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   return {
-    storageKeys: { inputKey, modelKey },
+    storageKeys: { inputKey },
     input,
     setInput,
     latestInputValueRef,

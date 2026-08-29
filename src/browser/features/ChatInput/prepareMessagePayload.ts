@@ -80,14 +80,14 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
     input.sendMessageOptions.additionalSystemInstructions;
   const effectiveModel =
     input.modelOneShot?.modelString ?? compactionOptions.model ?? input.sendMessageOptions.model;
+  const trimmedMessageText = input.messageText.trim();
   const commandPrefix = input.modelOneShot
-    ? input.messageText
-        .trim()
-        .slice(0, input.messageText.trim().length - input.modelOneShot.message.length)
+    ? trimmedMessageText
+        .slice(0, trimmedMessageText.length - input.modelOneShot.message.length)
         .trimEnd()
     : undefined;
   const rawCommand = commandPrefix
-    ? appendStagedAttachmentNotice(input.messageText.trim(), input.attachments)
+    ? appendStagedAttachmentNotice(trimmedMessageText, input.attachments)
     : undefined;
   metadata = {
     ...(prepared.metadata ?? { type: "normal" }),

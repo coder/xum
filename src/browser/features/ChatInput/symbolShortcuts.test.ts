@@ -44,11 +44,11 @@ describe("symbol shortcuts", () => {
       expect(getSymbolSuggestions(partial)[0]).toMatchObject({ display: cmd(name), replacement });
     const suggestions = getSymbolSuggestions("");
     expect(
-      suggestions.map(({ display, replacement, description }) => [
-        display.startsWith(bs),
-        replacement === description,
-      ])
-    ).toEqual(suggestions.map(() => [true, true]));
+      suggestions.every(
+        ({ display, replacement, description }) =>
+          display.startsWith(bs) && replacement === description
+      )
+    ).toBe(true);
     expect(new Set(displays("")).size).toBe(suggestions.length);
     expect(getSymbolSuggestions("zzz")).toEqual([]);
   });

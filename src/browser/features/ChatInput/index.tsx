@@ -13,7 +13,6 @@ import {
 import {
   CommandSuggestions,
   COMMAND_SUGGESTION_KEYS,
-  FILE_SUGGESTION_KEYS,
 } from "@/browser/features/ChatInput/CommandSuggestions";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import { ConnectionStatusToast } from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
@@ -144,7 +143,6 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
-  withMcpPromptRefs,
 } from "@/common/types/message";
 import {
   getModelCapabilities,
@@ -419,7 +417,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   } = useComposerAttachments({
     variant,
     workspaceId,
-    attachments,
     setAttachments,
     editingMessage: editingMessageForUi != null,
     pushToast,
@@ -2121,12 +2118,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // When editing a /compact command, regenerate the actual summarization request
         let actualMessageText = messageTextForSend;
         let muxMetadata: MuxMessageMetadata | undefined = skillMuxMetadata ?? promptMuxMetadata;
-        if (combinedSkillRefs.length > 0) {
-          muxMetadata = withAgentSkillRefs(muxMetadata, combinedSkillRefs);
-        }
-        if (combinedMcpPromptRefs.length > 0) {
-          muxMetadata = withMcpPromptRefs(muxMetadata, combinedMcpPromptRefs);
-        }
         let compactionOptions: Partial<SendMessageOptions> = {};
 
         let appendStagedNoticeToUserMessage = true;
@@ -2389,13 +2380,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Note: ESC handled by VimTextArea (for mode transitions) and CommandSuggestions (for dismissal)
 
-    if (
-      composerSuggestions.isVisible &&
-      (composerSuggestions.suppressionKeys === "command"
-        ? COMMAND_SUGGESTION_KEYS
-        : FILE_SUGGESTION_KEYS
-      ).includes(e.key)
-    ) {
+    if (composerSuggestions.isVisible && COMMAND_SUGGESTION_KEYS.includes(e.key)) {
       return;
     }
 
@@ -2654,11 +2639,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     onDrop={handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
                     suppressKeys={
-                      composerSuggestions.isVisible
-                        ? composerSuggestions.suppressionKeys === "command"
-                          ? COMMAND_SUGGESTION_KEYS
-                          : FILE_SUGGESTION_KEYS
-                        : undefined
+                      composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
                     disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
