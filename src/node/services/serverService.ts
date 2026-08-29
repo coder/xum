@@ -512,3 +512,97 @@ export class ServerService {
     return this.lockfile?.getLockPath() ?? null;
   }
 }
+
+type ServerSettingsContext = ORPCContext;
+
+function getApiServerStatusSnapshot(context: ServerSettingsContext) {
+  const config = context.config.loadConfigOrDefault();
+  const info = context.serverService.getServerInfo();
+  return {
+    running: info !== null,
+    baseUrl: info?.baseUrl ?? null,
+    bindHost: info?.bindHost ?? null,
+    port: info?.port ?? null,
+    networkBaseUrls: info?.networkBaseUrls ?? [],
+    tailscaleBindHosts: context.serverService.getTailscaleBindHosts(),
+    token: info?.token ?? null,
+    configuredBindHost: config.apiServerBindHost ?? null,
+    configuredPort: config.apiServerPort ?? null,
+    configuredServeWebUi: config.apiServerServeWebUi === true,
+  };
+}
+
+export async function setServerSshHost(
+  context: ServerSettingsContext,
+  sshHost: string | null | undefined
+): Promise<void> {
+  context.serverService.setSshHost(sshHost ?? undefined);
+  await context.config.editConfig((config) => ({ ...config, serverSshHost: sshHost ?? undefined }));
+}
+
+export function getApiServerStatus(context: ServerSettingsContext) {
+  return getApiServerStatusSnapshot(context);
+}
+
+export async function setApiServerSettings(
+  context: ServerSettingsContext,
+  input: { bindHost?: string | null; serveWebUi?: boolean | null; port?: number | null }
+) {
+  const prevConfig = context.config.loadConfigOrDefault();
+  const prevBindHost = prevConfig.apiServerBindHost;
+  const prevServeWebUi = prevConfig.apiServerServeWebUi;
+  const prevPort = prevConfig.apiServerPort;
+  const wasRunning = context.serverService.isServerRunning();
+  const bindHost = input.bindHost?.trim() ? input.bindHost.trim() : undefined;
+  const serveWebUi =
+    input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
+  const port = input.port === null || input.port === 0 ? undefined : input.port;
+
+  if (wasRunning) await context.serverService.stopServer();
+  await context.config.editConfig((config) => {
+    config.apiServerServeWebUi = serveWebUi;
+    config.apiServerBindHost = bindHost;
+    config.apiServerPort = port;
+    return config;
+  });
+
+  if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
+    const authToken = context.serverService.getApiAuthToken();
+    if (!authToken) throw new Error("API server auth token not initialized");
+    const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
+    const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
+    try {
+      await context.serverService.startServer({
+        xumHome: context.config.rootDir,
+        context,
+        authToken,
+        serveStatic: serveWebUi === true,
+        host: bindHost ?? "127.0.0.1",
+        port: envPort ?? port ?? 0,
+      });
+    } catch (error) {
+      await context.config.editConfig((config) => {
+        config.apiServerServeWebUi = prevServeWebUi;
+        config.apiServerBindHost = prevBindHost;
+        config.apiServerPort = prevPort;
+        return config;
+      });
+      if (wasRunning) {
+        try {
+          await context.serverService.startServer({
+            xumHome: context.config.rootDir,
+            context,
+            serveStatic: prevServeWebUi === true,
+            authToken,
+            host: prevBindHost ?? "127.0.0.1",
+            port: envPort ?? prevPort ?? 0,
+          });
+        } catch {
+          // Best effort: preserve the original settings error.
+        }
+      }
+      throw error;
+    }
+  }
+  return getApiServerStatusSnapshot(context);
+}

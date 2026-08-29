@@ -1,3 +1,5 @@
+import { ORPCError } from "@orpc/server";
+import { getErrorMessage } from "@/common/utils/errors";
 import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -22,7 +24,6 @@ import type { SavedQuery } from "@/common/types/savedQueries";
 import { getModelProvider } from "@/common/utils/ai/models";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import type { Config } from "@/node/config";
-import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import type { RawQueryResult } from "./queries";
@@ -982,5 +983,28 @@ export class AnalyticsService {
           error: getErrorMessage(error),
         });
       });
+  }
+}
+
+const RAW_QUERY_USER_ERROR_PATTERNS = [
+  /^parser error:/i,
+  /^binder error:/i,
+  /^catalog error:/i,
+  /^conversion error:/i,
+  /^invalid input error:/i,
+  /^out of range error:/i,
+  /^not implemented error:/i,
+  /query contains disallowed sql/i,
+  /string literals cannot be used as table sources/i,
+] as const;
+
+export async function executeRawQueryForApi(service: AnalyticsService, sql: string) {
+  try {
+    return await service.executeRawQuery(sql);
+  } catch (error) {
+    if (error instanceof ORPCError) throw error;
+    const message = getErrorMessage(error);
+    if (!RAW_QUERY_USER_ERROR_PATTERNS.some((pattern) => pattern.test(message))) throw error;
+    throw new ORPCError("BAD_REQUEST", { message, cause: error });
   }
 }

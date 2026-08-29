@@ -1,9 +1,52 @@
 import { os, ORPCError } from "@orpc/server";
-import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import * as schemas from "@/common/orpc/schemas";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ORPCContext } from "./context";
+import {
+  getWorkspaceMcpOverrides,
+  getWorkspacePluginComposition,
+  listWorkspaceMcpPrompts,
+  listWorkspacePluginSlashCommands,
+  setWorkspaceMcpOverrides,
+} from "@/node/services/agentPlugins/workspacePluginOperations";
+import {
+  assertMemoryEnabled,
+  consolidateMemory,
+  deleteMemory,
+  getMemoryConsolidationStatus,
+  listMemory,
+  readMemory,
+  saveMemory,
+  setMemoryPinned,
+} from "@/node/services/memoryOperations";
+import {
+  controlBrowser,
+  getBrowserBootstrap,
+  listBrowserSessions,
+  selectBrowserTab,
+} from "@/node/services/browser/browserOperations";
+import { getDesktopBootstrap } from "@/node/services/desktop/desktopOperations";
+import {
+  getApiServerStatus,
+  setApiServerSettings,
+  setServerSshHost,
+} from "@/node/services/serverService";
+import { executeRawQueryForApi } from "@/node/services/analytics/analyticsService";
+import {
+  addUpcomingWorkspaceGoal,
+  archiveWorkspaceGoal,
+  clearWorkspaceGoal,
+  getBackgroundBashOutput,
+  getWorkspaceGoal,
+  getWorkspaceGoalBoard,
+  getWorkspacePlanContent,
+  promoteUpcomingWorkspaceGoal,
+  reorderUpcomingWorkspaceGoals,
+  reviveArchivedWorkspaceGoal,
+  setWorkspaceGoal,
+  updateUpcomingWorkspaceGoal,
+} from "@/node/services/workspaceOperations";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import { Err, Ok } from "@/common/types/result";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -13,10 +56,6 @@ import {
   syncProjectCodeWorkspace,
 } from "@/node/worktree/codeWorkspaceSync";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
-import {
-  WorkspaceGoalChildWorkspaceError,
-  WorkspaceGoalTransitionError,
-} from "@/node/services/workspaceGoalService";
 
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import {
@@ -33,11 +72,11 @@ import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator
 import {
   attachTerminal,
   createTickIterable,
-  subscribeBackgroundBashes,
   subscribeConfigChanges,
   subscribeDevTools,
   subscribeLogs,
-  subscribeMemoryChanges as createMemoryChangeSubscription,
+  subscribeBackgroundBashes,
+  subscribeMemoryChanges,
   subscribeMetadata,
   subscribeOpenSettings,
   subscribePolicyChanges,
@@ -60,21 +99,13 @@ import {
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
 import {
-  buildAddedPluginKeyValidator,
   resolveAgentPluginsMcpContext,
   type AgentPluginsMcpContext,
 } from "@/node/services/agentPlugins/mcpConfig";
-import { readPlanFile } from "@/node/utils/runtime/helpers";
-import {
-  parseMemoryPath,
-  resolveMemoryProjectIdentity,
-  type MemoryScopeContext,
-} from "@/node/services/memoryService";
-import { memoryLogicalKey } from "@/node/services/memoryMeta";
+
 import { secretsToRecord } from "@/common/types/secrets";
-import { isMultiProject } from "@/common/utils/multiProject";
-import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
+
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
   isLayoutPresetsConfigEmpty,
@@ -111,18 +142,15 @@ import assert from "node:assert/strict";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { log } from "@/node/services/log";
-import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "@/node/orpc/wsPaths";
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
 import { getErrorMessage } from "@/common/utils/errors";
-import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
+
 import {
   getWorkflowRunStatusesForOwners,
   listActiveWorkflowRunsForOwners,
 } from "@/node/services/workflows/WorkflowRunStore";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
-import { buildWorkspaceComposition } from "@/node/services/agentPlugins/composition";
-import { discoverWorkspaceAgentPlugins } from "@/node/services/agentPlugins/discovery";
-import { collectPluginSlashCommands } from "@/node/services/agentPlugins/slashCommands";
+
 import {
   listWorkflowScripts,
   resolveWorkflowContext,
@@ -131,24 +159,7 @@ import {
   startWorkflowRun,
 } from "@/node/services/workflows/WorkflowService";
 import { throwWorkflowOrpcError } from "./formatOrpcError";
-import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
-
-const RAW_QUERY_USER_ERROR_PATTERNS = [
-  /^parser error:/i,
-  /^binder error:/i,
-  /^catalog error:/i,
-  /^conversion error:/i,
-  /^invalid input error:/i,
-  /^out of range error:/i,
-  /^not implemented error:/i,
-  /query contains disallowed sql/i,
-  /string literals cannot be used as table sources/i,
-] as const;
-
-function shouldExposeRawQueryError(error: unknown): boolean {
-  const message = getErrorMessage(error);
-  return RAW_QUERY_USER_ERROR_PATTERNS.some((pattern) => pattern.test(message));
-}
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function handleWorkflowRequest<T>(request: () => Promise<T>): Promise<T> {
   return request().catch(throwWorkflowOrpcError);
@@ -305,46 +316,6 @@ function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
   }
 }
 
-/** Server-side enforcement: memory.* routes reject while the experiment is off. */
-function assertMemoryEnabled(context: ORPCContext): void {
-  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY)) {
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Agent memory is disabled",
-    });
-  }
-}
-
-/**
- * Resolve a workspace's MemoryScopeContext (runtime + checkout cwd) the same
- * way plan-file IPC does. Returns null for unknown workspaces. A nullish
- * workspaceId (Settings → Memory manages global files without any workspace)
- * yields a stub context where only the global scope is reachable —
- * MemoryService fails project/workspace paths with a recoverable error.
- */
-async function resolveMemoryScopeContext(
-  context: ORPCContext,
-  workspaceId: string | null | undefined
-): Promise<{ projectPath: string; scopeCtx: MemoryScopeContext } | null> {
-  if (workspaceId == null) {
-    return {
-      projectPath: "",
-      scopeCtx: { runtime: null, checkoutCwd: "", workspaceId: "", projectPath: "" },
-    };
-  }
-  const metadata = await context.workspaceService.getInfo(workspaceId);
-  if (!metadata) {
-    return null;
-  }
-  const runtime = createRuntimeForWorkspace(metadata);
-  // "" for multi-project workspaces: metadata.projectPath is the first
-  // project's path, not a single stable identity.
-  const projectPath = resolveMemoryProjectIdentity(metadata);
-  return {
-    projectPath,
-    scopeCtx: { runtime, checkoutCwd: "", workspaceId, projectPath },
-  };
-}
-
 function normalizeOptionalConfigString(value: string | null | undefined): string | undefined {
   const trimmedValue = value?.trim();
   if (!trimmedValue) {
@@ -414,107 +385,6 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
   }
 
   return null;
-}
-
-/**
- * Translate goal-board service errors (`WorkspaceGoalTransitionError`,
- * `WorkspaceGoalChildWorkspaceError`) into `ORPCError("BAD_REQUEST", …)`
- * so the original message reaches the renderer. Without this wrapper,
- * the oRPC server normalizes thrown plain Errors to the generic
- * `INTERNAL_SERVER_ERROR` ("Internal server error"), making the UI
- * unable to explain why a click did nothing. Unrelated errors are
- * rethrown untouched so the existing logging path still fires.
- */
-async function withGoalErrorTranslation<T>(fn: () => Promise<T>): Promise<T> {
-  try {
-    return await fn();
-  } catch (error) {
-    if (
-      error instanceof WorkspaceGoalTransitionError ||
-      error instanceof WorkspaceGoalChildWorkspaceError
-    ) {
-      throw new ORPCError("BAD_REQUEST", {
-        message: error.message,
-        cause: error,
-        data: { code: error.code },
-      });
-    }
-    throw error;
-  }
-}
-
-interface BrowserCommandLoadingParams<T extends { success: boolean }> {
-  context: ORPCContext;
-  workspaceId: string;
-  sessionName: string;
-  run: () => Promise<T>;
-}
-
-// Browser commands mark the preview loading before they run; callers validate the session
-// before invoking this helper, so the URL refresh can skip the duplicate discovery pass.
-async function markBrowserCommandLoadedFromCurrentUrl(params: {
-  context: ORPCContext;
-  workspaceId: string;
-  sessionName: string;
-  commandToken: number;
-}): Promise<void> {
-  try {
-    const urlResult = await params.context.browserControlService.getUrl(
-      params.workspaceId,
-      params.sessionName,
-      { skipSessionValidation: true }
-    );
-    params.context.browserSessionStateHub.markLoaded(
-      params.workspaceId,
-      params.sessionName,
-      urlResult.error == null ? urlResult.url : undefined,
-      params.commandToken
-    );
-  } catch {
-    params.context.browserSessionStateHub.markLoaded(
-      params.workspaceId,
-      params.sessionName,
-      undefined,
-      params.commandToken
-    );
-  }
-}
-
-async function runBrowserCommandWithLoadingState<T extends { success: boolean }>(
-  params: BrowserCommandLoadingParams<T>
-): Promise<T> {
-  const commandToken = params.context.browserSessionStateHub.markLoading(
-    params.workspaceId,
-    params.sessionName
-  );
-
-  try {
-    const result = await params.run();
-    if (result.success) {
-      await markBrowserCommandLoadedFromCurrentUrl({ ...params, commandToken });
-    } else {
-      params.context.browserSessionStateHub.markLoaded(
-        params.workspaceId,
-        params.sessionName,
-        undefined,
-        commandToken
-      );
-    }
-    return result;
-  } catch (error) {
-    await markBrowserCommandLoadedFromCurrentUrl({ ...params, commandToken });
-    throw error;
-  }
-}
-
-function subscribeMemoryChanges(
-  context: ORPCContext,
-  workspaceId: string | null,
-  signal?: AbortSignal
-) {
-  return createMemoryChangeSubscription(context, workspaceId, signal, () =>
-    assertMemoryEnabled(context)
-  );
 }
 
 function subscribeWorkflowRuns(
@@ -612,139 +482,15 @@ export const router = (authToken?: string) => {
       setSshHost: t
         .input(schemas.server.setSshHost.input)
         .output(schemas.server.setSshHost.output)
-        .handler(async ({ context, input }) => {
-          // Update in-memory value
-          context.serverService.setSshHost(input.sshHost ?? undefined);
-          // Persist to config file
-          await context.config.editConfig((config) => ({
-            ...config,
-            serverSshHost: input.sshHost ?? undefined,
-          }));
-        }),
+        .handler(({ context, input }) => setServerSshHost(context, input.sshHost)),
       getApiServerStatus: t
         .input(schemas.server.getApiServerStatus.input)
         .output(schemas.server.getApiServerStatus.output)
-        .handler(({ context }) => {
-          const config = context.config.loadConfigOrDefault();
-          const configuredBindHost = config.apiServerBindHost ?? null;
-          const configuredServeWebUi = config.apiServerServeWebUi === true;
-          const configuredPort = config.apiServerPort ?? null;
-
-          const info = context.serverService.getServerInfo();
-
-          return {
-            running: info !== null,
-            baseUrl: info?.baseUrl ?? null,
-            bindHost: info?.bindHost ?? null,
-            port: info?.port ?? null,
-            networkBaseUrls: info?.networkBaseUrls ?? [],
-            tailscaleBindHosts: context.serverService.getTailscaleBindHosts(),
-            token: info?.token ?? null,
-            configuredBindHost,
-            configuredPort,
-            configuredServeWebUi,
-          };
-        }),
+        .handler(({ context }) => getApiServerStatus(context)),
       setApiServerSettings: t
         .input(schemas.server.setApiServerSettings.input)
         .output(schemas.server.setApiServerSettings.output)
-        .handler(async ({ context, input }) => {
-          const prevConfig = context.config.loadConfigOrDefault();
-          const prevBindHost = prevConfig.apiServerBindHost;
-          const prevServeWebUi = prevConfig.apiServerServeWebUi;
-          const prevPort = prevConfig.apiServerPort;
-          const wasRunning = context.serverService.isServerRunning();
-
-          const bindHost = input.bindHost?.trim() ? input.bindHost.trim() : undefined;
-          const serveWebUi =
-            input.serveWebUi === undefined
-              ? prevServeWebUi
-              : input.serveWebUi === true
-                ? true
-                : undefined;
-          const port = input.port === null || input.port === 0 ? undefined : input.port;
-
-          if (wasRunning) {
-            await context.serverService.stopServer();
-          }
-
-          await context.config.editConfig((config) => {
-            config.apiServerServeWebUi = serveWebUi;
-            config.apiServerBindHost = bindHost;
-            config.apiServerPort = port;
-            return config;
-          });
-
-          if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
-            const authToken = context.serverService.getApiAuthToken();
-            if (!authToken) {
-              throw new Error("API server auth token not initialized");
-            }
-
-            const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
-            const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
-            const portToUse = envPort ?? port ?? 0;
-            const hostToUse = bindHost ?? "127.0.0.1";
-
-            try {
-              await context.serverService.startServer({
-                xumHome: context.config.rootDir,
-                context,
-                authToken,
-                serveStatic: serveWebUi === true,
-                host: hostToUse,
-                port: portToUse,
-              });
-            } catch (error) {
-              await context.config.editConfig((config) => {
-                config.apiServerServeWebUi = prevServeWebUi;
-                config.apiServerBindHost = prevBindHost;
-                config.apiServerPort = prevPort;
-                return config;
-              });
-
-              if (wasRunning) {
-                const portToRestore = envPort ?? prevPort ?? 0;
-                const hostToRestore = prevBindHost ?? "127.0.0.1";
-
-                try {
-                  await context.serverService.startServer({
-                    xumHome: context.config.rootDir,
-                    context,
-                    serveStatic: prevServeWebUi === true,
-                    authToken,
-                    host: hostToRestore,
-                    port: portToRestore,
-                  });
-                } catch {
-                  // Best effort - we'll surface the original error.
-                }
-              }
-
-              throw error;
-            }
-          }
-
-          const nextConfig = context.config.loadConfigOrDefault();
-          const configuredBindHost = nextConfig.apiServerBindHost ?? null;
-          const configuredServeWebUi = nextConfig.apiServerServeWebUi === true;
-          const configuredPort = nextConfig.apiServerPort ?? null;
-
-          const info = context.serverService.getServerInfo();
-
-          return {
-            running: info !== null,
-            baseUrl: info?.baseUrl ?? null,
-            bindHost: info?.bindHost ?? null,
-            port: info?.port ?? null,
-            networkBaseUrls: info?.networkBaseUrls ?? [],
-            tailscaleBindHosts: context.serverService.getTailscaleBindHosts(),
-            token: info?.token ?? null,
-            configuredBindHost,
-            configuredPort,
-            configuredServeWebUi,
-          };
-        }),
+        .handler(({ context, input }) => setApiServerSettings(context, input)),
     },
     serverAuth: {
       listSessions: t
@@ -1193,87 +939,31 @@ export const router = (authToken?: string) => {
       listSessions: t
         .input(schemas.browser.listSessions.input)
         .output(schemas.browser.listSessions.output)
-        .handler(async ({ context, input }) => {
-          const sessionGroups = await context.browserSessionDiscoveryService.listSessionGroups(
-            input.workspaceId
-          );
-          return {
-            sessions: sessionGroups.sessions.map((session) => ({
-              sessionName: session.sessionName,
-              status: session.status,
-            })),
-            otherSessions: sessionGroups.otherSessions.map((session) => ({
-              sessionName: session.sessionName,
-              status: session.status,
-              cwd: session.cwd,
-            })),
-          };
-        }),
+        .handler(({ context, input }) => listBrowserSessions(context, input.workspaceId)),
       listTabs: t
         .input(schemas.browser.listTabs.input)
         .output(schemas.browser.listTabs.output)
-        .handler(async ({ context, input }) => {
-          return await context.browserControlService.listTabs(input);
-        }),
+        .handler(({ context, input }) => context.browserControlService.listTabs(input)),
       getBootstrap: t
         .input(schemas.browser.getBootstrap.input)
         .output(schemas.browser.getBootstrap.output)
-        .handler(async ({ context, input }) => {
-          const serverInfo = context.serverService.getServerInfo();
-          if (serverInfo == null) {
-            throw new Error("Browser bridge bootstrap failed: API server unavailable");
-          }
-
-          const allowOtherWorkspaceSession = input.allowOtherWorkspaceSession === true;
-          const connection = await context.browserSessionDiscoveryService.ensureSessionAttachable(
-            input.workspaceId,
-            input.sessionName,
-            { allowOtherWorkspaceSession }
-          );
-
-          const token = context.browserBridgeTokenManager.mint(
-            input.workspaceId,
-            connection.sessionName,
-            connection.streamPort,
-            { allowOtherWorkspaceSession }
-          );
-
-          return {
-            bridgePath: BROWSER_BRIDGE_WS_PATH,
-            token,
-            localBridgeBaseUrl: serverInfo.baseUrl,
-          };
-        }),
+        .handler(({ context, input }) => getBrowserBootstrap(context, input)),
       control: t
         .input(schemas.browser.control.input)
         .output(schemas.browser.control.output)
-        .handler(async ({ context, input }) => {
-          return await runBrowserCommandWithLoadingState({
-            context,
-            workspaceId: input.workspaceId,
-            sessionName: input.sessionName,
-            run: () => context.browserControlService.executeControl(input),
-          });
-        }),
+        .handler(({ context, input }) => controlBrowser(context, input)),
       selectTab: t
         .input(schemas.browser.selectTab.input)
         .output(schemas.browser.selectTab.output)
-        .handler(async ({ context, input }) => {
-          return await runBrowserCommandWithLoadingState({
-            context,
-            workspaceId: input.workspaceId,
-            sessionName: input.sessionName,
-            run: () => context.browserControlService.selectTab(input),
-          });
-        }),
+        .handler(({ context, input }) => selectBrowserTab(context, input)),
       getUrl: t
         .input(schemas.browser.getUrl.input)
         .output(schemas.browser.getUrl.output)
-        .handler(async ({ context, input }) => {
-          return await context.browserControlService.getUrl(input.workspaceId, input.sessionName, {
+        .handler(({ context, input }) =>
+          context.browserControlService.getUrl(input.workspaceId, input.sessionName, {
             allowOtherWorkspaceSession: input.allowOtherWorkspaceSession === true,
-          });
-        }),
+          })
+        ),
     },
     uiLayouts: {
       getAll: t
@@ -3148,167 +2838,39 @@ export const router = (authToken?: string) => {
       list: t
         .input(schemas.memory.list.input)
         .output(schemas.memory.list.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const resolved = await resolveMemoryScopeContext(context, input.workspaceId);
-          if (!resolved) {
-            return {
-              success: false as const,
-              error: `Workspace not found: ${input.workspaceId ?? "<none>"}`,
-            };
-          }
-          const entries = await context.memoryService.listIndexEntries(resolved.scopeCtx);
-          const meta = await context.memoryMetaService.getEntries();
-          const ids = { projectPath: resolved.projectPath, workspaceId: input.workspaceId ?? "" };
-          return {
-            success: true as const,
-            data: {
-              files: entries.map((entry) => {
-                const stats = meta.get(memoryLogicalKey(entry.scope, entry.relPath, ids));
-                return {
-                  path: entry.path,
-                  scope: entry.scope,
-                  description: entry.description,
-                  pinned: stats?.pinned ?? false,
-                  accessCount: stats?.accessCount ?? 0,
-                  lastAccessedAt: stats?.lastAccessedAt ?? null,
-                };
-              }),
-            },
-          };
-        }),
+        .handler(({ context, input }) => listMemory(context, input)),
       read: t
         .input(schemas.memory.read.input)
         .output(schemas.memory.read.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const resolved = await resolveMemoryScopeContext(context, input.workspaceId);
-          if (!resolved) {
-            return {
-              success: false as const,
-              error: `Workspace not found: ${input.workspaceId ?? "<none>"}`,
-            };
-          }
-          return context.memoryService.readFileWithSha(resolved.scopeCtx, input.path);
-        }),
+        .handler(({ context, input }) => readMemory(context, input)),
       save: t
         .input(schemas.memory.save.input)
         .output(schemas.memory.save.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const resolved = await resolveMemoryScopeContext(context, input.workspaceId);
-          if (!resolved) {
-            return {
-              success: false as const,
-              error: {
-                kind: "error" as const,
-                message: `Workspace not found: ${input.workspaceId ?? "<none>"}`,
-              },
-            };
-          }
-          return context.memoryService.saveFile(
-            resolved.scopeCtx,
-            input.path,
-            input.content,
-            input.expectedSha256,
-            "user"
-          );
-        }),
+        .handler(({ context, input }) => saveMemory(context, input)),
       delete: t
         .input(schemas.memory.delete.input)
         .output(schemas.memory.delete.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const resolved = await resolveMemoryScopeContext(context, input.workspaceId);
-          if (!resolved) {
-            return {
-              success: false as const,
-              error: `Workspace not found: ${input.workspaceId ?? "<none>"}`,
-            };
-          }
-          // Stale pin/stats hygiene happens inside deletePath (the MemoryService
-          // chokepoint drops sidecar entries for the deleted subtree).
-          const result = await context.memoryService.deletePath(
-            resolved.scopeCtx,
-            input.path,
-            "user"
-          );
-          if (!result.success) {
-            return { success: false as const, error: result.error };
-          }
-          return { success: true as const, data: undefined };
-        }),
+        .handler(({ context, input }) => deleteMemory(context, input)),
       setPinned: t
         .input(schemas.memory.setPinned.input)
         .output(schemas.memory.setPinned.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const resolved = await resolveMemoryScopeContext(context, input.workspaceId);
-          if (!resolved) {
-            return {
-              success: false as const,
-              error: `Workspace not found: ${input.workspaceId ?? "<none>"}`,
-            };
-          }
-          let scope;
-          let relPath;
-          try {
-            ({ scope, relPath } = parseMemoryPath(input.path));
-          } catch (error) {
-            return { success: false as const, error: getErrorMessage(error) };
-          }
-          if (scope === null || relPath === "") {
-            return { success: false as const, error: `Cannot pin a directory: ${input.path}` };
-          }
-          // Pins bypass MemoryService stores, so mirror its scope guards here:
-          // without a workspace, only global files have a stable logical key.
-          if (input.workspaceId == null && scope !== "global") {
-            return {
-              success: false as const,
-              error: `${scope === "project" ? "Project" : "Workspace"} memory is unavailable: no workspace is associated with this request`,
-            };
-          }
-          if (scope === "project" && resolved.projectPath === "") {
-            return {
-              success: false as const,
-              error: "Project memory is unavailable: no project is associated with this session",
-            };
-          }
-          await context.memoryMetaService.setPinned(
-            memoryLogicalKey(scope, relPath, {
-              projectPath: resolved.projectPath,
-              workspaceId: input.workspaceId ?? "",
-            }),
-            input.pinned
-          );
-          return { success: true as const, data: undefined };
-        }),
+        .handler(({ context, input }) => setMemoryPinned(context, input)),
       consolidationStatus: t
         .input(schemas.memory.consolidationStatus.input)
         .output(schemas.memory.consolidationStatus.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const status = await context.memoryConsolidationService.getStatus(input.workspaceId);
-          return { success: true as const, data: status };
-        }),
+        .handler(({ context, input }) => getMemoryConsolidationStatus(context, input)),
       consolidate: t
         .input(schemas.memory.consolidate.input)
         .output(schemas.memory.consolidate.output)
-        .handler(async ({ context, input }) => {
-          assertMemoryEnabled(context);
-          const result = await context.memoryConsolidationService.maybeRun(
-            input.workspaceId,
-            "manual"
-          );
-          return result.success
-            ? { success: true as const, data: result.data }
-            : { success: false as const, error: result.error };
-        }),
+        .handler(({ context, input }) => consolidateMemory(context, input)),
       onChange: t
         .input(schemas.memory.onChange.input)
         .output(schemas.memory.onChange.output)
+
         .handler(({ context, input, signal }) =>
-          subscribeMemoryChanges(context, input.workspaceId ?? null, signal)
+          subscribeMemoryChanges(context, input.workspaceId ?? null, signal, () =>
+            assertMemoryEnabled(context)
+          )
         ),
     },
     refinements: {
@@ -3915,38 +3477,16 @@ export const router = (authToken?: string) => {
       getPlanContent: t
         .input(schemas.workspace.getPlanContent.input)
         .output(schemas.workspace.getPlanContent.output)
-        .handler(async ({ context, input }) => {
-          // Get workspace metadata to determine runtime and paths
-          const metadata = await context.workspaceService.getInfo(input.workspaceId);
-          if (!metadata) {
-            return {
-              success: false as const,
-              error: `Workspace not found: ${input.workspaceId ?? "<none>"}`,
-            };
-          }
-
-          // Create runtime to read plan file (supports both local and SSH)
-          const runtime = createRuntimeForWorkspace(metadata);
-
-          const result = await readPlanFile(
-            runtime,
-            metadata.name,
-            metadata.projectName,
-            input.workspaceId
-          );
-
-          if (!result.exists) {
-            return { success: false as const, error: `Plan file not found at ${result.path}` };
-          }
-          return { success: true as const, data: { content: result.content, path: result.path } };
-        }),
+        .handler(({ context, input }) => getWorkspacePlanContent(context, input.workspaceId)),
       backgroundBashes: {
         subscribe: t
           .input(schemas.workspace.backgroundBashes.subscribe.input)
           .output(schemas.workspace.backgroundBashes.subscribe.output)
+
           .handler(({ context, input, signal }) =>
             subscribeBackgroundBashes(context, input.workspaceId, signal)
           ),
+
         terminate: t
           .input(schemas.workspace.backgroundBashes.terminate.input)
           .output(schemas.workspace.backgroundBashes.terminate.output)
@@ -3955,35 +3495,23 @@ export const router = (authToken?: string) => {
               input.workspaceId,
               input.processId
             );
-            if (!result.success) {
-              return { success: false, error: result.error };
-            }
-            return { success: true, data: undefined };
+            return result.success
+              ? { success: true, data: undefined }
+              : { success: false, error: result.error };
           }),
         sendToBackground: t
           .input(schemas.workspace.backgroundBashes.sendToBackground.input)
           .output(schemas.workspace.backgroundBashes.sendToBackground.output)
           .handler(({ context, input }) => {
             const result = context.workspaceService.sendToBackground(input.toolCallId);
-            if (!result.success) {
-              return { success: false, error: result.error };
-            }
-            return { success: true, data: undefined };
+            return result.success
+              ? { success: true, data: undefined }
+              : { success: false, error: result.error };
           }),
         getOutput: t
           .input(schemas.workspace.backgroundBashes.getOutput.input)
           .output(schemas.workspace.backgroundBashes.getOutput.output)
-          .handler(async ({ context, input }) => {
-            const result = await context.workspaceService.getBackgroundProcessOutput(
-              input.workspaceId,
-              input.processId,
-              { fromOffset: input.fromOffset, tailBytes: input.tailBytes }
-            );
-            if (!result.success) {
-              return { success: false, error: result.error };
-            }
-            return { success: true, data: result.data };
-          }),
+          .handler(({ context, input }) => getBackgroundBashOutput(context, input)),
       },
       getPostCompactionState: t
         .input(schemas.workspace.getPostCompactionState.input)
@@ -4004,110 +3532,51 @@ export const router = (authToken?: string) => {
       getGoal: t
         .input(schemas.workspace.getGoal.input)
         .output(schemas.workspace.getGoal.output)
-        .handler(async ({ context, input }) => {
-          const workspace = await context.workspaceService.getInfo(input.workspaceId);
-          if (!workspace) {
-            return { goal: null };
-          }
-          return { goal: await context.workspaceGoalService.getGoal(input.workspaceId) };
-        }),
+        .handler(({ context, input }) => getWorkspaceGoal(context, input.workspaceId)),
       setGoal: t
         .input(schemas.workspace.setGoal.input)
         .output(schemas.workspace.setGoal.output)
-        .handler(async ({ context, input }) => {
-          const workspace = await context.workspaceService.getInfo(input.workspaceId);
-          if (!workspace) {
-            return {
-              success: false,
-              error: { type: "invalid_transition", message: "Workspace not found." },
-            };
-          }
-          return context.workspaceGoalService.setGoal(input);
-        }),
+        .handler(({ context, input }) => setWorkspaceGoal(context, input)),
       clearGoal: t
         .input(schemas.workspace.clearGoal.input)
         .output(schemas.workspace.clearGoal.output)
-        .handler(async ({ context, input }) => {
-          const workspace = await context.workspaceService.getInfo(input.workspaceId);
-          if (!workspace) {
-            return { cleared: false };
-          }
-          const cleared = await context.workspaceGoalService.clearGoal(input.workspaceId);
-          return { cleared: cleared !== null };
-        }),
-      // ────────────────────────────────────────────────────────────────
-      // Goal board (multi-goal queue) endpoints. Each handler forwards
-      // to `workspaceGoalService` after a missing-workspace short-circuit
-      // so the renderer can race a board fetch against workspace deletion
-      // without hitting a 500.
-      // ────────────────────────────────────────────────────────────────
+        .handler(({ context, input }) => clearWorkspaceGoal(context, input.workspaceId)),
       getGoalBoard: t
         .input(schemas.workspace.getGoalBoard.input)
         .output(schemas.workspace.getGoalBoard.output)
-        .handler(async ({ context, input }) => {
-          const workspace = await context.workspaceService.getInfo(input.workspaceId);
-          if (!workspace) return { entries: [] };
-          return context.workspaceGoalService.getGoalBoard(input.workspaceId);
-        }),
+        .handler(({ context, input }) => getWorkspaceGoalBoard(context, input.workspaceId)),
       addUpcomingGoal: t
         .input(schemas.workspace.addUpcomingGoal.input)
         .output(schemas.workspace.addUpcomingGoal.output)
-        .handler(async ({ context, input }) => {
-          return withGoalErrorTranslation(() =>
-            context.workspaceGoalService.addUpcomingGoal({
-              workspaceId: input.workspaceId,
-              objective: input.objective,
-              budgetCents: input.budgetCents,
-              turnCap: input.turnCap,
-            })
-          );
-        }),
+        .handler(({ context, input }) => addUpcomingWorkspaceGoal(context, input)),
       archiveGoal: t
         .input(schemas.workspace.archiveGoal.input)
         .output(schemas.workspace.archiveGoal.output)
-        .handler(async ({ context, input }) => {
-          await withGoalErrorTranslation(() =>
-            context.workspaceGoalService.archiveGoal(input.workspaceId, input.goalId)
-          );
-        }),
+        .handler(({ context, input }) =>
+          archiveWorkspaceGoal(context, input.workspaceId, input.goalId)
+        ),
       reviveArchivedGoal: t
         .input(schemas.workspace.reviveArchivedGoal.input)
         .output(schemas.workspace.reviveArchivedGoal.output)
-        .handler(async ({ context, input }) => {
-          await withGoalErrorTranslation(() =>
-            context.workspaceGoalService.reviveArchivedGoal(input.workspaceId, input.goalId)
-          );
-        }),
+        .handler(({ context, input }) =>
+          reviveArchivedWorkspaceGoal(context, input.workspaceId, input.goalId)
+        ),
       reorderUpcomingGoals: t
         .input(schemas.workspace.reorderUpcomingGoals.input)
         .output(schemas.workspace.reorderUpcomingGoals.output)
-        .handler(async ({ context, input }) => {
-          await withGoalErrorTranslation(() =>
-            context.workspaceGoalService.reorderUpcomingGoals(input.workspaceId, input.upcomingIds)
-          );
-        }),
+        .handler(({ context, input }) =>
+          reorderUpcomingWorkspaceGoals(context, input.workspaceId, input.upcomingIds)
+        ),
       promoteUpcomingGoal: t
         .input(schemas.workspace.promoteUpcomingGoal.input)
         .output(schemas.workspace.promoteUpcomingGoal.output)
-        .handler(async ({ context, input }) => {
-          return withGoalErrorTranslation(() =>
-            context.workspaceGoalService.promoteUpcomingGoal(input.workspaceId, input.goalId)
-          );
-        }),
+        .handler(({ context, input }) =>
+          promoteUpcomingWorkspaceGoal(context, input.workspaceId, input.goalId)
+        ),
       updateUpcomingGoal: t
         .input(schemas.workspace.updateUpcomingGoal.input)
         .output(schemas.workspace.updateUpcomingGoal.output)
-        .handler(async ({ context, input }) => {
-          return withGoalErrorTranslation(() =>
-            context.workspaceGoalService.updateUpcomingGoal({
-              workspaceId: input.workspaceId,
-              goalId: input.goalId,
-              objective: input.objective,
-              budgetCents: input.budgetCents,
-              turnCap: input.turnCap,
-            })
-          );
-        }),
+        .handler(({ context, input }) => updateUpcomingWorkspaceGoal(context, input)),
       getSessionUsage: t
         .input(schemas.workspace.getSessionUsage.input)
         .output(schemas.workspace.getSessionUsage.output)
@@ -4169,228 +3638,36 @@ export const router = (authToken?: string) => {
         get: t
           .input(schemas.workspace.mcp.get.input)
           .output(schemas.workspace.mcp.get.output)
-          .handler(async ({ context, input }) => {
-            const policy = context.policyService.getEffectivePolicy();
-            const mcpDisabledByPolicy =
-              context.policyService.isEnforced() &&
-              policy?.mcp.allowUserDefined.stdio === false &&
-              policy.mcp.allowUserDefined.remote === false;
-
-            if (mcpDisabledByPolicy) {
-              return { overrides: {}, revision: "mcp-disabled-by-policy" };
-            }
-
-            try {
-              return await context.workspaceMcpOverridesService.getOverridesForWorkspace(
-                input.workspaceId
-              );
-            } catch {
-              // Defensive: overrides must never brick workspace UI. The
-              // sentinel revision never matches a real one, so a save from
-              // this unknown state is rejected instead of clobbering data.
-              return { overrides: {}, revision: "unavailable" };
-            }
-          }),
+          .handler(({ context, input }) => getWorkspaceMcpOverrides(context, input.workspaceId)),
         prompts: {
           list: t
             .input(schemas.workspace.mcp.prompts.list.input)
             .output(schemas.workspace.mcp.prompts.list.output)
-            .handler(async ({ context, input, signal }) => {
-              // Preflight waits (init, Coder/SSH/devcontainer startup) can take
-              // minutes; forward the handler signal so navigating away cancels
-              // the whole request, not just the MCP manager phase.
-              await context.aiService.waitForInit(input.workspaceId, signal);
-              const metadataResult = await context.aiService.getWorkspaceMetadata(
-                input.workspaceId
-              );
-              if (!metadataResult.success) throw new Error(metadataResult.error);
-              const metadata = metadataResult.data;
-              // Build the exact runtime context stream startup uses (including the
-              // multi-project shared root) so servers started here match the start
-              // signature streams later reuse.
-              const runtimeContextResult = context.aiService.createWorkspaceRuntimeContext(
-                input.workspaceId,
-                metadata
-              );
-              if (!runtimeContextResult.success) {
-                throw new Error(formatSendMessageError(runtimeContextResult.error).message);
-              }
-              const { runtime, workspacePath, hostCheckoutRoot } = runtimeContextResult.data;
-              // Cold prompt discovery can start stdio servers through runtime.exec,
-              // so wait until the runtime is ready.
-              const readyResult = await runtime.ensureReady(
-                signal !== undefined ? { signal } : undefined
-              );
-              if (!readyResult.ready) {
-                throw new Error(readyResult.error);
-              }
-              const { overrides } =
-                await context.workspaceMcpOverridesService.getOverridesForWorkspace(
-                  input.workspaceId
-                );
-              // Match streamMessage and the prompt-invocation resolver: multi-project
-              // workspaces need every project's secrets, not just the primary's.
-              const projectSecrets = await secretsToRecord(
-                isMultiProject(metadata)
-                  ? mergeMultiProjectSecrets(metadata, context.config)
-                  : context.config.getEffectiveSecrets(metadata.projectPath)
-              );
-              // Agent Plugin containers anchor at the checkout root, not a subproject directory.
-              const agentPlugins = hostCheckoutRoot
-                ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
-                : null;
-              return context.mcpServerManager.getPromptsForWorkspace(
-                {
-                  workspaceId: input.workspaceId,
-                  projectPath: metadata.projectPath,
-                  runtime,
-                  workspacePath,
-                  trusted: isWorkspaceProjectTrusted(context.config, metadata),
-                  overrides,
-                  projectSecrets,
-                  agentPlugins,
-                },
-                signal !== undefined ? { signal } : undefined
-              );
-            }),
+            .handler(({ context, input, signal }) =>
+              listWorkspaceMcpPrompts(context, input.workspaceId, signal)
+            ),
         },
         set: t
           .input(schemas.workspace.mcp.set.input)
           .output(schemas.workspace.mcp.set.output)
-          .handler(async ({ context, input }) => {
-            try {
-              await context.workspaceMcpOverridesService.setOverridesForWorkspace(
-                input.workspaceId,
-                input.overrides,
-                {
-                  expectedRevision: input.expectedRevision,
-                  // Content-derived revisions cannot detect an uninstall that
-                  // left overrides byte-identical ({} before and after), so a
-                  // stale dialog could persist a plugin: key for a plugin
-                  // that is gone. Validate additions against the DISCOVERED
-                  // plugin server keys for this workspace (managed installs,
-                  // project containers, ~/.agents/plugins, unmanaged dirs) —
-                  // the same set the modal lists from.
-                  validateAgainstCurrent: buildAddedPluginKeyValidator(async () => {
-                    const metadataResult = await context.aiService.getWorkspaceMetadata(
-                      input.workspaceId
-                    );
-                    if (!metadataResult.success) {
-                      throw new Error(metadataResult.error);
-                    }
-                    const projectPath = metadataResult.data.projectPath;
-                    const servers = await context.mcpConfigService.listServers(
-                      projectPath,
-                      isTrustedProjectPath(context, projectPath),
-                      {
-                        agentPlugins: await resolveWorkspaceAgentPluginsMcpContext(
-                          context,
-                          input.workspaceId,
-                          projectPath
-                        ),
-                      }
-                    );
-                    return new Set(Object.keys(servers).filter((key) => key.startsWith("plugin:")));
-                  }),
-                  // Prompt invocation can hit cached servers before the next
-                  // stream recomputes enablement, so sync the manager's view —
-                  // INSIDE the write queue, so a concurrent plugin-uninstall
-                  // prune cannot interleave its own publication and leave the
-                  // cache holding the older snapshot (in either direction).
-                  publish: (persisted) =>
-                    context.mcpServerManager.applyWorkspaceOverrides(input.workspaceId, persisted),
-                }
-              );
-              return { success: true, data: undefined };
-            } catch (error) {
-              const message = getErrorMessage(error);
-              return { success: false, error: message };
-            }
-          }),
+          .handler(({ context, input }) => setWorkspaceMcpOverrides(context, input)),
       },
-      // Agent Plugins: manifest-contributed slash commands (host-local discovery).
       plugins: {
         slashCommands: {
           list: t
             .input(schemas.workspace.plugins.slashCommands.list.input)
             .output(schemas.workspace.plugins.slashCommands.list.output)
-            .handler(async ({ context, input, signal }) => {
-              // LOADING third-party plugin contributions stays experiment-gated.
-              if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)) {
-                return [];
-              }
-              await context.aiService.waitForInit(input.workspaceId, signal);
-              const metadataResult = await context.aiService.getWorkspaceMetadata(
-                input.workspaceId
-              );
-              if (!metadataResult.success) throw new Error(metadataResult.error);
-              const metadata = metadataResult.data;
-              const runtimeContextResult = context.aiService.createWorkspaceRuntimeContext(
-                input.workspaceId,
-                metadata
-              );
-              if (!runtimeContextResult.success) {
-                throw new Error(formatSendMessageError(runtimeContextResult.error).message);
-              }
-              // Agent Plugin containers anchor at the host checkout root; plugin
-              // discovery is host-filesystem-only, so off-host workspaces have none.
-              const { hostCheckoutRoot } = runtimeContextResult.data;
-              if (!hostCheckoutRoot) {
-                return [];
-              }
-              const { plugins } = await discoverWorkspaceAgentPlugins({
-                workspacePath: hostCheckoutRoot,
-                xumHome: context.config.rootDir,
-                projectTrusted: isWorkspaceProjectTrusted(context.config, metadata),
-              });
-              return collectPluginSlashCommands(plugins);
-            }),
+            .handler(({ context, input, signal }) =>
+              listWorkspacePluginSlashCommands(context, input.workspaceId, signal)
+            ),
         },
-        // Composition inspector: effective skills/agents/workflows/MCP servers/
-        // slash commands/hooks by layer, with shadowing. Works regardless of the
-        // agent-plugins experiment (the gate only controls plugin LOADING).
         composition: {
           get: t
             .input(schemas.workspace.plugins.composition.get.input)
             .output(schemas.workspace.plugins.composition.get.output)
-            .handler(async ({ context, input, signal }) => {
-              await context.aiService.waitForInit(input.workspaceId, signal);
-              const metadataResult = await context.aiService.getWorkspaceMetadata(
-                input.workspaceId
-              );
-              if (!metadataResult.success) throw new Error(metadataResult.error);
-              const metadata = metadataResult.data;
-              const runtimeContextResult = context.aiService.createWorkspaceRuntimeContext(
-                input.workspaceId,
-                metadata
-              );
-              if (!runtimeContextResult.success) {
-                throw new Error(formatSendMessageError(runtimeContextResult.error).message);
-              }
-              const { runtime, workspacePath, hostCheckoutRoot } = runtimeContextResult.data;
-              const projectTrusted = isWorkspaceProjectTrusted(context.config, metadata);
-              const agentPlugins = hostCheckoutRoot
-                ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
-                : null;
-              return buildWorkspaceComposition({
-                runtime,
-                // Execution path: production skill/agent/workflow/hook loaders
-                // discover from here (subProjectPath workspaces run in the
-                // subdirectory). Plugin containers anchor separately at the
-                // nullable host checkout root.
-                workspacePath,
-                hostCheckoutRoot,
-                xumHome: context.config.rootDir,
-                projectTrusted,
-                agentPluginsEnabled: context.experimentsService.isExperimentEnabled(
-                  EXPERIMENT_IDS.AGENT_PLUGINS
-                ),
-                listMcpServerLayers: () =>
-                  context.mcpConfigService.listServerLayers(metadata.projectPath, projectTrusted, {
-                    agentPlugins,
-                  }),
-              });
-            }),
+            .handler(({ context, input, signal }) =>
+              getWorkspacePluginComposition(context, input.workspaceId, signal)
+            ),
         },
       },
     },
@@ -4456,6 +3733,7 @@ export const router = (authToken?: string) => {
       onOutput: t
         .input(schemas.terminal.onOutput.input)
         .output(schemas.terminal.onOutput.output)
+
         .handler(({ context, input, signal }) =>
           subscribeTerminalOutput(context, input.sessionId, signal)
         ),
@@ -4469,6 +3747,7 @@ export const router = (authToken?: string) => {
         .handler(({ context, input, signal }) =>
           subscribeTerminalExit(context, input.sessionId, signal)
         ),
+
       openWindow: t
         .input(schemas.terminal.openWindow.input)
         .output(schemas.terminal.openWindow.output)
@@ -4501,6 +3780,7 @@ export const router = (authToken?: string) => {
         subscribe: t
           .input(schemas.terminal.activity.subscribe.input)
           .output(schemas.terminal.activity.subscribe.output)
+
           .handler(({ context, signal }) => subscribeTerminalActivity(context, signal)),
       },
     },
@@ -4520,51 +3800,7 @@ export const router = (authToken?: string) => {
       getBootstrap: t
         .input(schemas.desktop.getBootstrap.input)
         .output(schemas.desktop.getBootstrap.output)
-        .handler(async ({ context, input }) => {
-          const capability = await context.desktopSessionManager.getCapability(input.workspaceId);
-          if (!capability.available) {
-            return { capability };
-          }
-
-          const serverInfo = context.serverService.getServerInfo();
-          if (serverInfo == null) {
-            log.error("Desktop bootstrap failed: API server unavailable", {
-              workspaceId: input.workspaceId,
-            });
-            return {
-              capability: { available: false as const, reason: "startup_failed" as const },
-            };
-          }
-
-          try {
-            const session = await context.desktopSessionManager.ensureStarted(input.workspaceId);
-            const sessionInfo = session.getSessionInfo();
-            const startedCapability = {
-              available: true as const,
-              width: sessionInfo.width,
-              height: sessionInfo.height,
-              sessionId: sessionInfo.sessionId ?? capability.sessionId,
-            };
-            const token = context.desktopTokenManager.mint(
-              input.workspaceId,
-              startedCapability.sessionId
-            );
-            return {
-              capability: startedCapability,
-              bridgePath: DESKTOP_WS_PATH,
-              token,
-              localBridgeBaseUrl: serverInfo.baseUrl,
-            };
-          } catch (error) {
-            log.error("Desktop bootstrap failed", {
-              workspaceId: input.workspaceId,
-              error,
-            });
-            return {
-              capability: { available: false as const, reason: "startup_failed" as const },
-            };
-          }
-        }),
+        .handler(({ context, input }) => getDesktopBootstrap(context, input.workspaceId)),
     },
     update: {
       check: t
@@ -4745,27 +3981,9 @@ export const router = (authToken?: string) => {
       executeRawQuery: t
         .input(schemas.analytics.executeRawQuery.input)
         .output(schemas.analytics.executeRawQuery.output)
-        .handler(async ({ context, input }) => {
-          try {
-            return await context.analyticsService.executeRawQuery(input.sql);
-          } catch (error) {
-            if (error instanceof ORPCError) {
-              throw error;
-            }
-
-            // Only surface user-authored SQL issues as BAD_REQUEST. Worker/service
-            // infrastructure faults must remain internal errors for correct health
-            // signaling and retry semantics.
-            if (!shouldExposeRawQueryError(error)) {
-              throw error;
-            }
-
-            throw new ORPCError("BAD_REQUEST", {
-              message: getErrorMessage(error),
-              cause: error,
-            });
-          }
-        }),
+        .handler(({ context, input }) =>
+          executeRawQueryForApi(context.analyticsService, input.sql)
+        ),
 
       getSavedQueries: t
         .input(schemas.analytics.getSavedQueries.input)
