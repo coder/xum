@@ -51,6 +51,7 @@ import {
   type WorkspaceTurnTaskHandleRecord,
 } from "@/node/services/taskHandleStore";
 import { TaskService, ForegroundWaitBackgroundedError } from "@/node/services/taskService";
+import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { log } from "@/node/services/log";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
@@ -788,13 +789,8 @@ function reserveFamilyMessageTargetSlots(
   targetId: string,
   count: number
 ): void {
-  const broker = (
-    taskService as unknown as {
-      agentPeerMessageBroker: {
-        reserveBudget(senderId: string, targetId: string, chars: number): (() => void) | null;
-      };
-    }
-  ).agentPeerMessageBroker;
+  const broker = (taskService as unknown as { agentPeerMessageBroker: AgentPeerMessageBroker })
+    .agentPeerMessageBroker;
   for (let i = 0; i < count; i++) {
     expect(broker.reserveBudget(`prefill-${i}`, targetId, 1)).not.toBeNull();
   }
@@ -19721,11 +19717,7 @@ describe("TaskService", () => {
     // lifecycle lock, which is free while the send waits on the delivery
     // lock, so a real removal can interleave exactly here.)
     const deliveryLocks = (
-      taskService as unknown as {
-        agentPeerMessageBroker: {
-          withDeliveryLock<T>(key: string, operation: () => Promise<T>): Promise<T>;
-        };
-      }
+      taskService as unknown as { agentPeerMessageBroker: AgentPeerMessageBroker }
     ).agentPeerMessageBroker;
     let releaseWindow!: () => void;
     const windowGate = new Promise<void>((resolve) => {

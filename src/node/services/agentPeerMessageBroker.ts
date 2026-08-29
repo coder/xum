@@ -131,7 +131,7 @@ export class AgentPeerMessageBroker {
     const fromTitle = params.senderTitle != null ? this.capTitle(params.senderTitle) : undefined;
     const envelope = formatAgentMessageEnvelope({
       from: params.senderWorkspaceId,
-      ...(fromTitle != null ? { fromTitle } : {}),
+      fromTitle,
       relationship,
       message: params.message,
     });
@@ -195,7 +195,7 @@ export class AgentPeerMessageBroker {
 
   budgetExhaustedError(): { code: "send_failed"; message: string } {
     return {
-      code: "send_failed",
+      code: "send_failed" as const,
       message:
         `Family-message budget to this target is exhausted for this session ` +
         `(max ${TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES} messages / ` +
