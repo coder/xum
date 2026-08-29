@@ -100,9 +100,6 @@ import {
   listAgentDefinitions,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 
-import { isWorkspaceArchived } from "@/common/utils/archive";
-import assert from "node:assert/strict";
-
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
 import { getErrorMessage } from "@/common/utils/errors";
 

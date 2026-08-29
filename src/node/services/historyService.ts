@@ -228,7 +228,8 @@ export class HistoryService {
   ): Promise<{ messages: MuxMessage[]; model?: string; thinkingLevel?: ThinkingLevel }> {
     const taskId = input.taskId.trim();
     assert(taskId.length > 0, "workspace.getSubagentTranscript: taskId must be non-empty");
-    const requestingWorkspaceId = input.requestingWorkspaceId?.trim() || null;
+    const trimmedRequestingId = input.requestingWorkspaceId?.trim() ?? "";
+    const requestingWorkspaceId = trimmedRequestingId.length > 0 ? trimmedRequestingId : null;
     const tryLoadFromWorkspace = async (
       workspaceId: string
     ): Promise<{
