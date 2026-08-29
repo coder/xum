@@ -30,7 +30,6 @@ import {
   readPersistedState,
   usePersistedState,
   updatePersistedState,
-  subscribePersistedStateWrites,
 } from "@/browser/hooks/usePersistedState";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
@@ -151,12 +150,7 @@ import { SendHorizontal } from "lucide-react";
 import { AttachFileButton } from "./AttachFileButton";
 import { VimTextArea } from "@/browser/components/VimTextArea/VimTextArea";
 import { ChatAttachments, type ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
-import {
-  extractAttachmentsFromClipboard,
-  extractAttachmentsFromDrop,
-  chatAttachmentsToFileParts,
-  processAttachmentFiles,
-} from "@/browser/utils/attachmentsHandling";
+import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
 import {
   buildPendingFromRestoredInput,
   type PendingUserMessage,
@@ -177,7 +171,7 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
-withMcpPromptRefs,
+  withMcpPromptRefs,
 } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
 import {
@@ -207,11 +201,6 @@ import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import { usePowerMode } from "@/browser/contexts/PowerModeContext";
 import { useVoiceInput } from "@/browser/hooks/useVoiceInput";
 import { VoiceInputButton } from "./VoiceInputButton";
-import {
-  estimatePersistedChatAttachmentsChars,
-  MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
-  readPersistedChatAttachments,
-} from "./draftAttachmentsStorage";
 import {
   formatPendingFileStagingError,
   getPendingFileAttachments,
@@ -245,12 +234,12 @@ import {
 } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
 import { prepareMessagePayload } from "./prepareMessagePayload";
+import {
+  estimateBase64DataUrlBytes,
+  isPdfAttachment,
+  useComposerAttachments,
+} from "./useComposerAttachments";
 
-// localStorage quotas are environment-dependent and relatively small.
-// Be conservative here so we can warn the user before writes start failing.
-
-// Normal typing usually has no active suggestion menu. Reuse the existing empty array
-// so suggestion effects do not schedule an avoidable second render on every keypress.
 function clearSuggestions(prev: SlashSuggestion[]): SlashSuggestion[] {
   return prev.length === 0 ? prev : [];
 }
@@ -258,30 +247,6 @@ function clearSuggestions(prev: SlashSuggestion[]): SlashSuggestion[] {
 function replaceSuggestions(prev: SlashSuggestion[], next: SlashSuggestion[]): SlashSuggestion[] {
   return prev.length === 0 && next.length === 0 ? prev : next;
 }
-
-const PDF_MEDIA_TYPE = "application/pdf";
-
-function getBaseMediaType(mediaType: string): string {
-  return mediaType.toLowerCase().trim().split(";")[0];
-}
-
-function estimateBase64DataUrlBytes(dataUrl: string): number | null {
-  if (!dataUrl.startsWith("data:")) return null;
-
-  const commaIndex = dataUrl.indexOf(",");
-  if (commaIndex === -1) return null;
-
-  const header = dataUrl.slice("data:".length, commaIndex);
-  if (!header.includes(";base64")) return null;
-
-  const base64 = dataUrl.slice(commaIndex + 1);
-  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
-  return Math.floor((base64.length * 3) / 4) - padding;
-}
-
-// Shared so the three "blocked while editing a message" attachment guards surface identical copy
-// and can't drift if one is reworded.
-const EDIT_MODE_ATTACHMENT_ERROR_MESSAGE = "Attachments cannot be added while editing a message.";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -526,85 +491,24 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setToast(null);
   }, []);
 
-  const attachmentDraftTooLargeToastKeyRef = useRef<string | null>(null);
-
-  const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() => {
-    return readPersistedChatAttachments(storageKeys.attachmentsKey);
+  const {
+    attachments,
+    setAttachments,
+    processingAttachmentCount,
+    handlePaste,
+    handleAttachFiles,
+    handleDragOver,
+    handleDrop,
+    handleRemoveAttachment,
+  } = useComposerAttachments({
+    variant,
+    workspaceId,
+    attachmentsKey: storageKeys.attachmentsKey,
+    editingMessage: editingMessageForUi != null,
+    pushToast,
   });
-  const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
   // Reviews restored from edits/queued drafts override attached review state while active.
   const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
-  // Distinguishes this component's own persisted writes from external ones
-  // (e.g. a creation-flow draft transfer landing after this composer mounted).
-  const selfAttachmentWriteRef = useRef(false);
-  const persistAttachments = useCallback(
-    (nextAttachments: ChatAttachment[]) => {
-      selfAttachmentWriteRef.current = true;
-      try {
-        if (nextAttachments.length === 0) {
-          attachmentDraftTooLargeToastKeyRef.current = null;
-          updatePersistedState<ChatAttachment[] | undefined>(storageKeys.attachmentsKey, undefined);
-          return;
-        }
-
-        const estimatedChars = estimatePersistedChatAttachmentsChars(nextAttachments);
-        if (estimatedChars > MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS) {
-          // Clear persisted value to avoid restoring stale attachments on restart.
-          updatePersistedState<ChatAttachment[] | undefined>(storageKeys.attachmentsKey, undefined);
-
-          if (attachmentDraftTooLargeToastKeyRef.current !== storageKeys.attachmentsKey) {
-            attachmentDraftTooLargeToastKeyRef.current = storageKeys.attachmentsKey;
-            pushToast({
-              type: "error",
-              message:
-                "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-              duration: 5000,
-            });
-          }
-          return;
-        }
-
-        attachmentDraftTooLargeToastKeyRef.current = null;
-        updatePersistedState<ChatAttachment[] | undefined>(
-          storageKeys.attachmentsKey,
-          nextAttachments
-        );
-      } finally {
-        selfAttachmentWriteRef.current = false;
-      }
-    },
-    [storageKeys.attachmentsKey, pushToast]
-  );
-
-  // Keep attachment drafts in sync when the storage scope changes (e.g. switching creation projects).
-  useEffect(() => {
-    attachmentDraftTooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(storageKeys.attachmentsKey));
-  }, [storageKeys.attachmentsKey]);
-
-  // Attachments live in local state (a too-large draft stays in memory after
-  // its persisted copy is cleared), so external writes to the draft key, such
-  // as a creation-flow transfer that lands after this composer mounted, must
-  // be synced in explicitly. Self-writes are skipped to keep that in-memory
-  // exception intact.
-  useEffect(() => {
-    return subscribePersistedStateWrites((event) => {
-      if (event.key !== storageKeys.attachmentsKey || selfAttachmentWriteRef.current) {
-        return;
-      }
-      setAttachmentsState(readPersistedChatAttachments(storageKeys.attachmentsKey));
-    });
-  }, [storageKeys.attachmentsKey]);
-  const setAttachments = useCallback(
-    (value: ChatAttachment[] | ((prev: ChatAttachment[]) => ChatAttachment[])) => {
-      setAttachmentsState((prev) => {
-        const next = value instanceof Function ? value(prev) : value;
-        persistAttachments(next);
-        return next;
-      });
-    },
-    [persistAttachments]
-  );
   // Attached reviews come from parent via props (persisted in pendingReviews state).
   const workspaceIdForComposerClear = variant === "workspace" ? props.workspaceId : null;
   const onDetachAllReviewsForComposerClear =
@@ -2272,140 +2176,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [variant, workspaceIdForFocus, focusMessageInput, setChatInputAutoFocusState]);
 
-  const showResizeToast = useCallback(
-    (nextAttachments: ChatAttachment[]) => {
-      const resized = nextAttachments.filter(
-        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
-          attachment.kind === "provider" && attachment.resizeInfo != null
-      );
-      if (resized.length === 0) {
-        return;
-      }
-
-      const firstResizeInfo = resized[0].resizeInfo;
-      if (!firstResizeInfo) {
-        return;
-      }
-
-      // Tell users when we auto-resize so the attachment dimensions are never surprising.
-      const message =
-        resized.length === 1
-          ? `Image resized from ${firstResizeInfo.originalWidth}×${firstResizeInfo.originalHeight} to ${firstResizeInfo.newWidth}×${firstResizeInfo.newHeight}`
-          : `${resized.length} images resized to fit provider limits`;
-
-      pushToast({ type: "info", message });
-    },
-    [pushToast]
-  );
-
-  const processAttachmentFilesForComposer = useCallback(
-    (files: File[]): Promise<ChatAttachment[]> => {
-      setProcessingAttachmentCount((count) => count + 1);
-      return processAttachmentFiles(files, {
-        stageAttachment:
-          variant === "workspace"
-            ? async (file, dataBase64) => {
-                if (!api) {
-                  throw new Error("Not connected to server");
-                }
-                if (workspaceId == null) {
-                  throw new Error("Files can be staged after opening a workspace.");
-                }
-                const result = await api.workspace.stageAttachment({
-                  workspaceId,
-                  filename: file.name,
-                  mediaType: file.type || null,
-                  sizeBytes: file.size,
-                  dataBase64,
-                });
-                if (!result.success) {
-                  throw new Error(result.error);
-                }
-                return result.data;
-              }
-            : undefined,
-        holdNonProviderFiles: variant === "creation",
-      }).finally(() => {
-        setProcessingAttachmentCount((count) => Math.max(0, count - 1));
-      });
-    },
-    [api, variant, workspaceId]
-  );
-
-  const attachFiles = useCallback(
-    (files: File[]) => {
-      const results = files.map((file) =>
-        processAttachmentFilesForComposer([file]).then(
-          (attachments) => ({ ok: true as const, attachments }),
-          (error: unknown) => ({ ok: false as const, error })
-        )
-      );
-      void Promise.all(results).then((outcomes) => {
-        const successes = outcomes.flatMap((outcome) => (outcome.ok ? outcome.attachments : []));
-        if (successes.length > 0) {
-          setAttachments((prev) => [...prev, ...successes]);
-          showResizeToast(successes);
-        }
-        for (const outcome of outcomes) {
-          if (!outcome.ok) {
-            const message =
-              outcome.error instanceof Error
-                ? outcome.error.message
-                : "Failed to process attachment";
-            console.error("Failed to process attached file:", outcome.error);
-            pushToast({ type: "error", message });
-          }
-        }
-      });
-    },
-    [processAttachmentFilesForComposer, pushToast, setAttachments, showResizeToast]
-  );
-
-  // Handle paste events to extract attachments
-  const handlePaste = useCallback(
-    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-
-      const attachmentFiles = extractAttachmentsFromClipboard(items);
-      if (attachmentFiles.length === 0) return;
-
-      // When editing an existing message, we only allow changing the text.
-      // Don't preventDefault here so any clipboard text can still paste normally.
-      if (editingMessageForUi) {
-        pushToast({
-          type: "error",
-          message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
-        });
-        return;
-      }
-
-      e.preventDefault(); // Prevent default paste behavior for attachments
-
-      attachFiles(attachmentFiles);
-    },
-    [attachFiles, editingMessageForUi, pushToast]
-  );
-
-  // Handle removing an attachment
-  const handleRemoveAttachment = useCallback(
-    (id: string) => {
-      setAttachments((prev) => prev.filter((img) => img.id !== id));
-    },
-    [setAttachments]
-  );
-
-  const handleAttachFiles = (files: File[]) => {
-    if (editingMessageForUi) {
-      pushToast({
-        type: "error",
-        message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
-      });
-      return;
-    }
-    attachFiles(files);
-  };
-
   // Shared slash command execution for creation + workspace inputs.
   const commandWorkspaceId = variant === "workspace" ? props.workspaceId : undefined;
   const commandProjectPath =
@@ -2590,39 +2360,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const handleDestructiveCommandCancel = useCallback(() => {
     setPendingDestructiveCommand(false);
   }, []);
-
-  // Handle drag over to allow drop
-  const handleDragOver = useCallback(
-    (e: React.DragEvent<HTMLTextAreaElement>) => {
-      // Check if drag contains files
-      if (e.dataTransfer.types.includes("Files")) {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = editingMessageForUi ? "none" : "copy";
-      }
-    },
-    [editingMessageForUi]
-  );
-
-  // Handle drop to extract attachments
-  const handleDrop = useCallback(
-    (e: React.DragEvent<HTMLTextAreaElement>) => {
-      e.preventDefault();
-
-      const attachmentFiles = extractAttachmentsFromDrop(e.dataTransfer);
-      if (attachmentFiles.length === 0) return;
-
-      if (editingMessageForUi) {
-        pushToast({
-          type: "error",
-          message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
-        });
-        return;
-      }
-
-      attachFiles(attachmentFiles);
-    },
-    [attachFiles, editingMessageForUi, pushToast]
-  );
 
   // Handle suggestion selection
 
@@ -3010,11 +2747,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const policyModel = modelOverride ?? baseModel;
 
       // Preflight: if the message includes PDFs, ensure the selected model can accept them.
-      const pdfAttachments = attachments.filter(
-        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
-          attachment.kind === "provider" &&
-          getBaseMediaType(attachment.mediaType) === PDF_MEDIA_TYPE
-      );
+      const pdfAttachments = attachments.filter(isPdfAttachment);
       if (pdfAttachments.length > 0) {
         const caps = getModelCapabilitiesResolved(policyModel, providersConfig);
         if (caps && !caps.supportsPdfInput) {
