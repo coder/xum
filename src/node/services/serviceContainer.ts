@@ -92,6 +92,7 @@ export class ServiceContainer {
   // Core services — instantiated by createCoreServices (shared with `xum run` CLI)
   private readonly historyService: CoreServices["historyService"];
   public readonly aiService: CoreServices["aiService"];
+  public readonly initStateManager: CoreServices["initStateManager"];
   public readonly workspaceService: CoreServices["workspaceService"];
   public readonly taskService: CoreServices["taskService"];
   public readonly providerService: CoreServices["providerService"];
@@ -190,6 +191,7 @@ export class ServiceContainer {
     // Spread core services into class fields
     this.historyService = core.historyService;
     this.aiService = core.aiService;
+    this.initStateManager = core.initStateManager;
     this.aiService.setAnalyticsService(this.analyticsService);
     this.browserSessionDiscoveryService = new AgentBrowserSessionDiscoveryService({
       resolveWorkspaceCandidatePathsFn: async (workspaceId: string) => {
@@ -629,6 +631,7 @@ export class ServiceContainer {
       config: this.config,
       aiService: this.aiService,
       historyService: this.historyService,
+      initStateManager: this.initStateManager,
       projectService: this.projectService,
       workspaceService: this.workspaceService,
       taskService: this.taskService,

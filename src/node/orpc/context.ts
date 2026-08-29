@@ -3,6 +3,7 @@ import type { IncomingHttpHeaders } from "http";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { HistoryService } from "@/node/services/historyService";
+import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
@@ -56,6 +57,7 @@ export interface ORPCContext {
   config: Config;
   aiService: AIService;
   historyService: HistoryService;
+  initStateManager: InitStateManager;
   projectService: ProjectService;
   workspaceService: WorkspaceService;
   taskService: TaskService;
