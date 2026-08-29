@@ -25,6 +25,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     preflightArchive: () => Promise.resolve(Ok({ kind: "ready" })),
+    // No live activity grants the hold so task tests reach interruption behavior.
     acquirePreInterruptionArchiveHold: () => Ok({ [Symbol.dispose]: () => undefined }),
     listLiveWorkspaceActivity: () => ({
       streaming: false,
@@ -35,10 +36,12 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     }),
     hasRunningBackgroundBashProcesses: () => Promise.resolve(false),
     hasUntrackableExternalAppOpen: () => Promise.resolve(false),
+    // Keep-style behavior makes archive eligibility independent of untracked files.
     isSnapshotArchiveEligibilityMutationSensitive: () => false,
     remove: () => Promise.resolve(Ok(undefined)),
     removeWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
+    // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
     discardExtensionMetadataEntry: () => Promise.resolve(),
     registerExternalBackgroundInit: () => undefined,
