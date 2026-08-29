@@ -4301,6 +4301,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |",
       "| **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |",
       "| **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |",
+      "| **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |",
       "| **OpenRouter**     | 300+ models                 | [openrouter.ai](https://openrouter.ai/)                 |",
       "| **Ollama**         | Local models                | [ollama.com](https://ollama.com/) (no key needed)       |",
       "| **Bedrock**        | Claude via AWS              | AWS Console                                             |",
