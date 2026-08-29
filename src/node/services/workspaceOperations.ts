@@ -1,4 +1,6 @@
 import { ORPCError } from "@orpc/server";
+import { z } from "zod";
+import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -170,4 +172,129 @@ export function updateUpcomingWorkspaceGoal(
   }
 ) {
   return withGoalErrorTranslation(() => context.workspaceGoalService.updateUpcomingGoal(input));
+}
+
+type CreateWorkspaceInput = z.infer<typeof schemas.workspace.create.input>;
+type ForkWorkspaceInput = z.infer<typeof schemas.workspace.fork.input>;
+type ResumeStreamInput = z.infer<typeof schemas.workspace.resumeStream.input>;
+
+export async function createWorkspace(context: ORPCContext, input: CreateWorkspaceInput) {
+  const result = await context.workspaceService.create(
+    input.projectPath,
+    input.branchName,
+    input.trunkBranch,
+    input.title,
+    input.runtimeConfig,
+    input.subProjectPath,
+    input.pendingAutoTitle,
+    input.tags
+  );
+  return result.success
+    ? { success: true as const, metadata: result.data.metadata }
+    : { success: false as const, error: result.error };
+}
+
+export async function createScratchWorkspace(context: ORPCContext, title?: string) {
+  const result = await context.workspaceService.createScratch(title);
+  return result.success
+    ? { success: true as const, metadata: result.data.metadata }
+    : { success: false as const, error: result.error };
+}
+
+export async function removeWorkspace(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.remove.input>
+) {
+  const result = await context.workspaceService.remove(input.workspaceId, input.options?.force);
+  return result.success
+    ? { success: true as const }
+    : { success: false as const, error: result.error };
+}
+
+export async function forkWorkspace(context: ORPCContext, input: ForkWorkspaceInput) {
+  const result = await context.workspaceService.fork(
+    input.sourceWorkspaceId,
+    input.newName,
+    input.sourceMessageId,
+    input.pendingAutoTitle
+  );
+  return result.success
+    ? {
+        success: true as const,
+        metadata: result.data.metadata,
+        projectPath: result.data.projectPath,
+      }
+    : { success: false as const, error: result.error };
+}
+
+export async function sendWorkspaceMessage(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.sendMessage.input>
+) {
+  const result = await context.workspaceService.sendMessage(
+    input.workspaceId,
+    input.message,
+    input.options
+  );
+  return result.success
+    ? { success: true as const, data: {} }
+    : { success: false as const, error: result.error };
+}
+
+export async function answerWorkspaceQuestion(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.answerAskUserQuestion.input>
+) {
+  const result = await context.workspaceService.answerAskUserQuestion(
+    input.workspaceId,
+    input.toolCallId,
+    input.answers
+  );
+  return result.success
+    ? { success: true as const, data: undefined }
+    : { success: false as const, error: result.error };
+}
+
+export function answerDelegatedWorkspaceToolCall(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.answerDelegatedToolCall.input>
+) {
+  const result = context.workspaceService.answerDelegatedToolCall(
+    input.workspaceId,
+    input.toolCallId,
+    input.result
+  );
+  return result.success
+    ? { success: true as const, data: undefined }
+    : { success: false as const, error: result.error };
+}
+
+export async function resumeWorkspaceStream(context: ORPCContext, input: ResumeStreamInput) {
+  const result = await context.workspaceService.resumeStream(input.workspaceId, input.options);
+  if (result.success) {
+    return { success: true as const, data: result.data };
+  }
+  return {
+    success: false as const,
+    error:
+      typeof result.error === "string"
+        ? { type: "unknown" as const, raw: result.error }
+        : result.error,
+  };
+}
+
+export async function setWorkspaceHeartbeat(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.heartbeat.set.input>
+) {
+  const result = await context.workspaceService.setHeartbeatSettings(input.workspaceId, {
+    enabled: input.enabled,
+    intervalMs: input.intervalMs,
+    ...(input.message != null ? { message: input.message } : {}),
+    ...(input.contextMode != null ? { contextMode: input.contextMode } : {}),
+    // Presence with null clears these values; absence preserves them.
+    ...("trigger" in input ? { trigger: input.trigger ?? null } : {}),
+    ...("whenBusy" in input ? { whenBusy: input.whenBusy ?? null } : {}),
+  });
+  return result.success ? { success: true as const, data: undefined } : result;
 }

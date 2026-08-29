@@ -1,6 +1,16 @@
 import { os } from "@orpc/server";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
+import { removeProject } from "@/node/services/projectOperations";
+import { calculateWorkspaceStats } from "@/node/services/tokenizerOperations";
+import {
+  getInjectedGlobalSecretKeys,
+  getSecrets,
+  markSplashScreenViewed,
+  saveLayoutPresets,
+  updateRoutePreferences,
+  updateSecrets,
+} from "@/node/services/configOperations";
 import {
   getWorkspaceMcpOverrides,
   getWorkspacePluginComposition,
@@ -42,8 +52,13 @@ import { executeRawQueryForApi } from "@/node/services/analytics/analyticsServic
 import {
   addUpcomingWorkspaceGoal,
   archiveWorkspaceGoal,
+  answerDelegatedWorkspaceToolCall,
+  answerWorkspaceQuestion,
   clearWorkspaceGoal,
   createMultiProjectWorkspace,
+  createScratchWorkspace,
+  createWorkspace,
+  forkWorkspace,
   getBackgroundBashOutput,
   getWorkspaceGoal,
   getWorkspaceGoalBoard,
@@ -51,13 +66,16 @@ import {
   promoteUpcomingWorkspaceGoal,
   reorderUpcomingWorkspaceGoals,
   reviveArchivedWorkspaceGoal,
+  resumeWorkspaceStream,
+  sendWorkspaceMessage,
+  setWorkspaceHeartbeat,
   setWorkspaceGoal,
   updateUpcomingWorkspaceGoal,
+  removeWorkspace,
 } from "@/node/services/workspaceOperations";
-import { Err, Ok } from "@/common/types/result";
-import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { Ok } from "@/common/types/result";
 
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
+import { generateWorkspaceIdentityForApi } from "@/node/services/workspaceTitleGenerator";
 
 import {
   createAuthMiddleware,
@@ -65,8 +83,7 @@ import {
   extractCookieValues,
   getFirstHeaderValue,
 } from "./authMiddleware";
-import { clearLogFiles, getLogFilePath } from "@/node/services/log";
-import { clearLogEntries } from "@/node/services/logBuffer";
+import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 
 import {
   attachTerminal,
@@ -92,11 +109,7 @@ import {
 } from "./routerSubscriptions";
 
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
-import {
-  DEFAULT_LAYOUT_PRESETS_CONFIG,
-  isLayoutPresetsConfigEmpty,
-  normalizeLayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
+import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 
 import {
   getAgentSkill,
@@ -109,7 +122,6 @@ import {
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 
 import { SERVER_AUTH_SESSION_COOKIE_NAME } from "@/node/services/serverAuthService";
-import { getErrorMessage } from "@/common/utils/errors";
 
 import {
   getWorkflowRun,
@@ -172,20 +184,7 @@ export const router = (authToken?: string) => {
       calculateStats: t
         .input(schemas.tokenizer.calculateStats.input)
         .output(schemas.tokenizer.calculateStats.output)
-        .handler(async ({ context, input }) => {
-          const metadataResult = await context.aiService.getWorkspaceMetadata(input.workspaceId);
-          const parentWorkspaceId = metadataResult.success
-            ? (metadataResult.data.parentWorkspaceId ?? null)
-            : null;
-
-          return context.tokenizerService.calculateStats(
-            input.workspaceId,
-            input.messages,
-            input.model,
-            context.providerService.getConfig(),
-            parentWorkspaceId
-          );
-        }),
+        .handler(({ context, input }) => calculateWorkspaceStats(context, input)),
     },
     splashScreens: {
       getViewedSplashScreens: t
@@ -198,18 +197,7 @@ export const router = (authToken?: string) => {
       markSplashScreenViewed: t
         .input(schemas.splashScreens.markSplashScreenViewed.input)
         .output(schemas.splashScreens.markSplashScreenViewed.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const viewed = config.viewedSplashScreens ?? [];
-            if (!viewed.includes(input.splashId)) {
-              viewed.push(input.splashId);
-            }
-            return {
-              ...config,
-              viewedSplashScreens: viewed,
-            };
-          });
-        }),
+        .handler(({ context, input }) => markSplashScreenViewed(context, input.splashId)),
     },
     server: {
       getLaunchProject: t
@@ -284,13 +272,7 @@ export const router = (authToken?: string) => {
       updateRoutePreferences: t
         .input(schemas.config.updateRoutePreferences.input)
         .output(schemas.config.updateRoutePreferences.output)
-        .handler(({ context, input }) =>
-          context.config.updateRoutePreferences({
-            ...input,
-            validateRouteOverrides: (overrides) =>
-              context.providerService.validateRouteOverrides(overrides),
-          })
-        ),
+        .handler(({ context, input }) => updateRoutePreferences(context, input)),
 
       updateMinThinkingLevels: t
         .input(schemas.config.updateMinThinkingLevels.input)
@@ -426,15 +408,7 @@ export const router = (authToken?: string) => {
       saveAll: t
         .input(schemas.uiLayouts.saveAll.input)
         .output(schemas.uiLayouts.saveAll.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const normalized = normalizeLayoutPresetsConfig(input.layoutPresets);
-            return {
-              ...config,
-              layoutPresets: isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized,
-            };
-          });
-        }),
+        .handler(({ context, input }) => saveLayoutPresets(context, input.layoutPresets)),
     },
     agents: {
       list: t
@@ -571,13 +545,7 @@ export const router = (authToken?: string) => {
       refreshNow: t
         .input(schemas.policy.refreshNow.input)
         .output(schemas.policy.refreshNow.output)
-        .handler(async ({ context }) => {
-          const result = await context.policyService.refreshNow();
-          if (!result.success) {
-            return Err(result.error);
-          }
-          return Ok(context.policyService.getPolicyGetResponse());
-        }),
+        .handler(({ context }) => context.policyService.refreshNowForApi()),
     },
     muxGateway: {
       getAccountStatus: t
@@ -751,16 +719,7 @@ export const router = (authToken?: string) => {
       clearLogs: t
         .input(schemas.general.clearLogs.input)
         .output(schemas.general.clearLogs.output)
-        .handler(async () => {
-          try {
-            await clearLogFiles();
-            clearLogEntries();
-            return { success: true };
-          } catch (err) {
-            const message = getErrorMessage(err);
-            return { success: false, error: message };
-          }
-        }),
+        .handler(() => clearLogsForApi()),
       subscribeLogs: t
         .input(schemas.general.subscribeLogs.input)
         .output(schemas.general.subscribeLogs.output)
@@ -790,53 +749,15 @@ export const router = (authToken?: string) => {
       get: t
         .input(schemas.secrets.get.input)
         .output(schemas.secrets.get.output)
-        .handler(({ context, input }) => {
-          const projectPath =
-            typeof input.projectPath === "string" && input.projectPath.trim().length > 0
-              ? input.projectPath
-              : undefined;
-
-          return projectPath
-            ? context.config.getProjectSecrets(projectPath)
-            : context.config.getGlobalSecrets();
-        }),
+        .handler(({ context, input }) => getSecrets(context, input.projectPath)),
       getInjectedGlobals: t
         .input(schemas.secrets.getInjectedGlobals.input)
         .output(schemas.secrets.getInjectedGlobals.output)
-        .handler(({ context, input }) => {
-          const projectPath =
-            typeof input.projectPath === "string" && input.projectPath.trim().length > 0
-              ? input.projectPath
-              : undefined;
-
-          if (!projectPath) {
-            return [];
-          }
-
-          return context.config.getInjectedGlobalSecrets(projectPath).map((secret) => secret.key);
-        }),
+        .handler(({ context, input }) => getInjectedGlobalSecretKeys(context, input.projectPath)),
       update: t
         .input(schemas.secrets.update.input)
         .output(schemas.secrets.update.output)
-        .handler(async ({ context, input }) => {
-          const projectPath =
-            typeof input.projectPath === "string" && input.projectPath.trim().length > 0
-              ? input.projectPath
-              : undefined;
-
-          try {
-            if (projectPath) {
-              await context.config.updateProjectSecrets(projectPath, input.secrets);
-            } else {
-              await context.config.updateGlobalSecrets(input.secrets);
-            }
-
-            return Ok(undefined);
-          } catch (error) {
-            const message = getErrorMessage(error);
-            return Err(message);
-          }
-        }),
+        .handler(({ context, input }) => updateSecrets(context, input)),
     },
     mcp: {
       list: t
@@ -1010,49 +931,21 @@ export const router = (authToken?: string) => {
       setDisplayName: t
         .input(schemas.projects.setDisplayName.input)
         .output(schemas.projects.setDisplayName.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const normalizedPath = stripTrailingSlashes(input.projectPath);
-            const project = config.projects.get(normalizedPath);
-            if (!project) {
-              throw new Error(`Project not found: ${normalizedPath}`);
-            }
-            project.displayName = input.displayName ?? undefined;
-            return config;
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.projectService.setDisplayName(input.projectPath, input.displayName)
+        ),
       setColor: t
         .input(schemas.projects.setColor.input)
         .output(schemas.projects.setColor.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const normalizedPath = stripTrailingSlashes(input.projectPath);
-            const project = config.projects.get(normalizedPath);
-            if (!project) {
-              throw new Error(`Project not found: ${normalizedPath}`);
-            }
-            project.color = input.color ?? undefined;
-            return config;
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.projectService.setColor(input.projectPath, input.color)
+        ),
       setCustomInstructions: t
         .input(schemas.projects.setCustomInstructions.input)
         .output(schemas.projects.setCustomInstructions.output)
-        .handler(async ({ context, input }) => {
-          await context.config.editConfig((config) => {
-            const normalizedPath = stripTrailingSlashes(input.projectPath);
-            const project = config.projects.get(normalizedPath);
-            if (!project) {
-              throw new Error(`Project not found: ${normalizedPath}`);
-            }
-            // Store undefined for blank input to keep config.json minimal.
-            const customInstructions = input.customInstructions ?? undefined;
-            project.customInstructions = customInstructions?.trim()
-              ? customInstructions
-              : undefined;
-            return config;
-          });
-        }),
+        .handler(({ context, input }) =>
+          context.projectService.setCustomInstructions(input.projectPath, input.customInstructions)
+        ),
       setCodeWorkspaceSyncPath: t
         .input(schemas.projects.setCodeWorkspaceSyncPath.input)
         .output(schemas.projects.setCodeWorkspaceSyncPath.output)
@@ -1066,19 +959,7 @@ export const router = (authToken?: string) => {
       remove: t
         .input(schemas.projects.remove.input)
         .output(schemas.projects.remove.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.projectService.remove(
-            input.projectPath,
-            input.force ?? false
-          );
-          if (!result.success) return result;
-          // Removal cascades to child projects, whose retained trust must also
-          // be forgotten or a re-registered path would inherit the old grant.
-          for (const removedPath of result.data.removedProjectPaths) {
-            context.mcpServerManager.forgetProjectTrust(removedPath);
-          }
-          return Ok(undefined);
-        }),
+        .handler(({ context, input }) => removeProject(context, input)),
       getRemovalBlockers: t
         .input(schemas.projects.getRemovalBlockers.input)
         .output(schemas.projects.getRemovalBlockers.output)
@@ -1202,26 +1083,7 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(async ({ context, input }) => {
-          // Frontend provides ordered candidate list; gateway routing resolved by createModel.
-          // Backend tries candidates in order with retry on API errors.
-          const result = await generateWorkspaceIdentity(
-            input.message,
-            input.candidates,
-            context.aiService
-          );
-          if (!result.success) {
-            return result;
-          }
-          return {
-            success: true,
-            data: {
-              name: result.data.name,
-              title: result.data.title,
-              modelUsed: result.data.modelUsed,
-            },
-          };
-        }),
+        .handler(({ context, input }) => generateWorkspaceIdentityForApi(input, context.aiService)),
     },
     coder: {
       getInfo: t
@@ -1314,32 +1176,11 @@ export const router = (authToken?: string) => {
       create: t
         .input(schemas.workspace.create.input)
         .output(schemas.workspace.create.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.create(
-            input.projectPath,
-            input.branchName,
-            input.trunkBranch,
-            input.title,
-            input.runtimeConfig,
-            input.subProjectPath,
-            input.pendingAutoTitle,
-            input.tags
-          );
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-          return { success: true, metadata: result.data.metadata };
-        }),
+        .handler(({ context, input }) => createWorkspace(context, input)),
       createScratch: t
         .input(schemas.workspace.createScratch.input)
         .output(schemas.workspace.createScratch.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.createScratch(input.title);
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-          return { success: true, metadata: result.data.metadata };
-        }),
+        .handler(({ context, input }) => createScratchWorkspace(context, input.title)),
       createMultiProject: t
         .input(schemas.workspace.createMultiProject.input)
         .output(schemas.workspace.createMultiProject.output)
@@ -1347,16 +1188,7 @@ export const router = (authToken?: string) => {
       remove: t
         .input(schemas.workspace.remove.input)
         .output(schemas.workspace.remove.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.remove(
-            input.workspaceId,
-            input.options?.force
-          );
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-          return { success: true };
-        }),
+        .handler(({ context, input }) => removeWorkspace(context, input)),
       timeline: {
         list: t
           .input(schemas.workspace.timeline.list.input)
@@ -1389,22 +1221,7 @@ export const router = (authToken?: string) => {
         set: t
           .input(schemas.workspace.heartbeat.set.input)
           .output(schemas.workspace.heartbeat.set.output)
-          .handler(async ({ context, input }) => {
-            const result = await context.workspaceService.setHeartbeatSettings(input.workspaceId, {
-              enabled: input.enabled,
-              intervalMs: input.intervalMs,
-              ...(input.message != null ? { message: input.message } : {}),
-              ...(input.contextMode != null ? { contextMode: input.contextMode } : {}),
-              // trigger/whenBusy use key-presence semantics: a present key with null clears the
-              // persisted value back to unset (read-time default), an absent key preserves it.
-              ...("trigger" in input ? { trigger: input.trigger ?? null } : {}),
-              ...("whenBusy" in input ? { whenBusy: input.whenBusy ?? null } : {}),
-            });
-            if (!result.success) {
-              return result;
-            }
-            return Ok(undefined);
-          }),
+          .handler(({ context, input }) => setWorkspaceHeartbeat(context, input)),
       },
       goalDefaults: {
         // Per-workspace override of the global `goalDefaults` block.
@@ -1548,22 +1365,7 @@ export const router = (authToken?: string) => {
       fork: t
         .input(schemas.workspace.fork.input)
         .output(schemas.workspace.fork.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.fork(
-            input.sourceWorkspaceId,
-            input.newName,
-            input.sourceMessageId,
-            input.pendingAutoTitle
-          );
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-          return {
-            success: true,
-            metadata: result.data.metadata,
-            projectPath: result.data.projectPath,
-          };
-        }),
+        .handler(({ context, input }) => forkWorkspace(context, input)),
       stageAttachment: t
         .input(schemas.workspace.stageAttachment.input)
         .output(schemas.workspace.stageAttachment.output)
@@ -1577,68 +1379,19 @@ export const router = (authToken?: string) => {
       sendMessage: t
         .input(schemas.workspace.sendMessage.input)
         .output(schemas.workspace.sendMessage.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.sendMessage(
-            input.workspaceId,
-            input.message,
-            input.options
-          );
-
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-
-          return { success: true, data: {} };
-        }),
+        .handler(({ context, input }) => sendWorkspaceMessage(context, input)),
       answerAskUserQuestion: t
         .input(schemas.workspace.answerAskUserQuestion.input)
         .output(schemas.workspace.answerAskUserQuestion.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.answerAskUserQuestion(
-            input.workspaceId,
-            input.toolCallId,
-            input.answers
-          );
-
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-
-          return { success: true, data: undefined };
-        }),
+        .handler(({ context, input }) => answerWorkspaceQuestion(context, input)),
       answerDelegatedToolCall: t
         .input(schemas.workspace.answerDelegatedToolCall.input)
         .output(schemas.workspace.answerDelegatedToolCall.output)
-        .handler(({ context, input }) => {
-          const result = context.workspaceService.answerDelegatedToolCall(
-            input.workspaceId,
-            input.toolCallId,
-            input.result
-          );
-
-          if (!result.success) {
-            return { success: false, error: result.error };
-          }
-
-          return { success: true, data: undefined };
-        }),
+        .handler(({ context, input }) => answerDelegatedWorkspaceToolCall(context, input)),
       resumeStream: t
         .input(schemas.workspace.resumeStream.input)
         .output(schemas.workspace.resumeStream.output)
-        .handler(async ({ context, input }) => {
-          const result = await context.workspaceService.resumeStream(
-            input.workspaceId,
-            input.options
-          );
-          if (!result.success) {
-            const error =
-              typeof result.error === "string"
-                ? { type: "unknown" as const, raw: result.error }
-                : result.error;
-            return { success: false, error };
-          }
-          return { success: true, data: result.data };
-        }),
+        .handler(({ context, input }) => resumeWorkspaceStream(context, input)),
       setAutoRetryEnabled: t
         .input(schemas.workspace.setAutoRetryEnabled.input)
         .output(schemas.workspace.setAutoRetryEnabled.output)
@@ -1918,15 +1671,9 @@ export const router = (authToken?: string) => {
         clear: t
           .input(schemas.workspace.stats.clear.input)
           .output(schemas.workspace.stats.clear.output)
-          .handler(async ({ context, input }) => {
-            try {
-              await context.sessionTimingService.clearTimingFile(input.workspaceId);
-              return { success: true, data: undefined };
-            } catch (error) {
-              const message = getErrorMessage(error);
-              return { success: false, error: message };
-            }
-          }),
+          .handler(({ context, input }) =>
+            context.sessionTimingService.clearTimingFileForApi(input.workspaceId)
+          ),
       },
       mcp: {
         get: t
@@ -2139,13 +1886,7 @@ export const router = (authToken?: string) => {
       getSummary: t
         .input(schemas.analytics.getSummary.input)
         .output(schemas.analytics.getSummary.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getSummary(
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
-        ),
+        .handler(({ context, input }) => context.analyticsService.getSummary(input)),
       getSpendOverTime: t
         .input(schemas.analytics.getSpendOverTime.input)
         .output(schemas.analytics.getSpendOverTime.output)
@@ -2159,64 +1900,29 @@ export const router = (authToken?: string) => {
       getSpendByModel: t
         .input(schemas.analytics.getSpendByModel.input)
         .output(schemas.analytics.getSpendByModel.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getSpendByModel(
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
-        ),
+        .handler(({ context, input }) => context.analyticsService.getSpendByModel(input)),
       getTokensByModel: t
         .input(schemas.analytics.getTokensByModel.input)
         .output(schemas.analytics.getTokensByModel.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getTokensByModel(
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
-        ),
+        .handler(({ context, input }) => context.analyticsService.getTokensByModel(input)),
       getTimingDistribution: t
         .input(schemas.analytics.getTimingDistribution.input)
         .output(schemas.analytics.getTimingDistribution.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getTimingDistribution(
-            input.metric,
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
-        ),
+        .handler(({ context, input }) => context.analyticsService.getTimingDistribution(input)),
       getAgentCostBreakdown: t
         .input(schemas.analytics.getAgentCostBreakdown.input)
         .output(schemas.analytics.getAgentCostBreakdown.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getAgentCostBreakdown(
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
-        ),
+        .handler(({ context, input }) => context.analyticsService.getAgentCostBreakdown(input)),
       getCacheHitRatioByProvider: t
         .input(schemas.analytics.getCacheHitRatioByProvider.input)
         .output(schemas.analytics.getCacheHitRatioByProvider.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getCacheHitRatioByProvider(
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
+        .handler(({ context, input }) =>
+          context.analyticsService.getCacheHitRatioByProvider(input)
         ),
       getDelegationSummary: t
         .input(schemas.analytics.getDelegationSummary.input)
         .output(schemas.analytics.getDelegationSummary.output)
-        .handler(async ({ context, input }) =>
-          context.analyticsService.getDelegationSummary(
-            input.projectPath ?? null,
-            input.from ?? null,
-            input.to ?? null
-          )
-        ),
+        .handler(({ context, input }) => context.analyticsService.getDelegationSummary(input)),
       executeRawQuery: t
         .input(schemas.analytics.executeRawQuery.input)
         .output(schemas.analytics.executeRawQuery.output)
@@ -2265,21 +1971,11 @@ export const router = (authToken?: string) => {
       push: t
         .input(schemas.backup.push.input)
         .output(schemas.backup.push.output)
-        .handler(({ context, input }) => {
-          const { approvedSecretDigest, ...settings } = input;
-          return context.backupService.push(settings, {
-            approvedSecretDigest: approvedSecretDigest ?? undefined,
-          });
-        }),
+        .handler(({ context, input }) => context.backupService.pushWithApproval(input)),
       restore: t
         .input(schemas.backup.restore.input)
         .output(schemas.backup.restore.output)
-        .handler(({ context, input }) => {
-          const { approvedCommandTokens, ...settings } = input;
-          return context.backupService.restore(settings, {
-            approvedCommandTokens: approvedCommandTokens ?? undefined,
-          });
-        }),
+        .handler(({ context, input }) => context.backupService.restoreWithApproval(input)),
     },
     ssh: {
       prompt: {

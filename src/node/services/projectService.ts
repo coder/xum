@@ -1840,6 +1840,45 @@ export class ProjectService {
     );
   }
 
+  async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.displayName = displayName ?? undefined;
+      return config;
+    });
+  }
+
+  async setColor(projectPath: string, color: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setCustomInstructions(
+    projectPath: string,
+    customInstructions: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.customInstructions = customInstructions?.trim() ? customInstructions : undefined;
+      return config;
+    });
+  }
+
   async setCodeWorkspaceSyncPath(
     projectPath: string,
     codeWorkspaceSyncPath: string | null | undefined

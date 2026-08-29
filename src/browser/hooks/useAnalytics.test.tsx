@@ -245,8 +245,12 @@ function createAnalyticsServiceStub(summary: Summary): {
   return {
     calls,
     service: {
-      getSummary: (projectPath, from, to) => {
-        calls.summary.push({ projectPath, from, to });
+      getSummary: (input) => {
+        calls.summary.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve(summary);
       },
       getSpendOverTime: (input) => {
@@ -260,14 +264,22 @@ function createAnalyticsServiceStub(summary: Summary): {
         return Promise.resolve([]);
       },
       getSpendByProject: () => Promise.resolve([]),
-      getSpendByModel: (projectPath, from, to) => {
-        calls.spendByModel.push({ projectPath, from, to });
+      getSpendByModel: (input) => {
+        calls.spendByModel.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       getTimingDistribution: () => Promise.resolve({ p50: 0, p90: 0, p99: 0, histogram: [] }),
       getAgentCostBreakdown: () => Promise.resolve([]),
-      getCacheHitRatioByProvider: (projectPath, from, to) => {
-        calls.cacheHitRatioByProvider.push({ projectPath, from, to });
+      getCacheHitRatioByProvider: (input) => {
+        calls.cacheHitRatioByProvider.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       rebuildAll: () => Promise.resolve({ success: true, workspacesIngested: 0 }),

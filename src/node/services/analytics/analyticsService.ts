@@ -192,6 +192,12 @@ export function aggregateProviderCacheHitRows(
     });
 }
 
+interface AnalyticsFilterInput {
+  projectPath?: string | null;
+  from?: Date | null;
+  to?: Date | null;
+}
+
 export class AnalyticsService {
   private worker: Worker | null = null;
   private messageIdCounter = 0;
@@ -603,11 +609,7 @@ export class AnalyticsService {
     });
   }
 
-  async getSummary(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
-  ): Promise<{
+  async getSummary(params: AnalyticsFilterInput): Promise<{
     totalSpendUsd: number;
     todaySpendUsd: number;
     avgDailySpendUsd: number;
@@ -616,9 +618,9 @@ export class AnalyticsService {
     totalResponses: number;
   }> {
     const row = await this.executeQuery<SummaryRow>("getSummary", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return {
@@ -673,14 +675,12 @@ export class AnalyticsService {
   }
 
   async getSpendByModel(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput
   ): Promise<Array<{ model: string; costUsd: number; tokenCount: number; responseCount: number }>> {
     const rows = await this.executeQuery<SpendByModelRow[]>("getSpendByModel", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return rows.map((row) => ({
@@ -691,11 +691,7 @@ export class AnalyticsService {
     }));
   }
 
-  async getTokensByModel(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
-  ): Promise<
+  async getTokensByModel(params: AnalyticsFilterInput): Promise<
     Array<{
       model: string;
       inputTokens: number;
@@ -708,9 +704,9 @@ export class AnalyticsService {
     }>
   > {
     const rows = await this.executeQuery<TokensByModelRow[]>("getTokensByModel", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return rows.map((row) => ({
@@ -726,10 +722,7 @@ export class AnalyticsService {
   }
 
   async getTimingDistribution(
-    metric: "ttft" | "duration" | "tps",
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput & { metric: "ttft" | "duration" | "tps" }
   ): Promise<{
     p50: number;
     p90: number;
@@ -737,10 +730,10 @@ export class AnalyticsService {
     histogram: Array<{ bucket: number; count: number }>;
   }> {
     const row = await this.executeQuery<TimingDistributionRow>("getTimingDistribution", {
-      metric,
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      metric: params.metric,
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return {
@@ -755,16 +748,14 @@ export class AnalyticsService {
   }
 
   async getAgentCostBreakdown(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput
   ): Promise<
     Array<{ agentId: string; costUsd: number; tokenCount: number; responseCount: number }>
   > {
     const rows = await this.executeQuery<AgentCostRow[]>("getAgentCostBreakdown", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return rows.map((row) => ({
@@ -776,24 +767,18 @@ export class AnalyticsService {
   }
 
   async getCacheHitRatioByProvider(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
+    params: AnalyticsFilterInput
   ): Promise<Array<{ provider: string; cacheHitRatio: number; responseCount: number }>> {
     const rows = await this.executeQuery<ProviderCacheHitModelRow[]>("getCacheHitRatioByProvider", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return aggregateProviderCacheHitRows(rows);
   }
 
-  async getDelegationSummary(
-    projectPath: string | null,
-    from?: Date | null,
-    to?: Date | null
-  ): Promise<{
+  async getDelegationSummary(params: AnalyticsFilterInput): Promise<{
     totalChildren: number;
     totalTokensConsumed: number;
     totalReportTokens: number;
@@ -811,9 +796,9 @@ export class AnalyticsService {
     }>;
   }> {
     const result = await this.executeQuery<DelegationSummaryQueryResult>("getDelegationSummary", {
-      projectPath,
-      from: toDateFilterString(from),
-      to: toDateFilterString(to),
+      projectPath: params.projectPath ?? null,
+      from: toDateFilterString(params.from),
+      to: toDateFilterString(params.to),
     });
 
     return {

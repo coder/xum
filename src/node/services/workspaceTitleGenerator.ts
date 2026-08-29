@@ -178,6 +178,22 @@ export function buildWorkspaceIdentityPrompt(
   ].join("");
 }
 
+export async function generateWorkspaceIdentityForApi(
+  input: { message: string; candidates: string[] },
+  aiService: AIService
+) {
+  const result = await generateWorkspaceIdentity(input.message, input.candidates, aiService);
+  return result.success
+    ? {
+        success: true as const,
+        data: {
+          name: result.data.name,
+          title: result.data.title,
+          modelUsed: result.data.modelUsed,
+        },
+      }
+    : result;
+}
 export async function generateWorkspaceIdentity(
   message: string,
   candidates: string[],
