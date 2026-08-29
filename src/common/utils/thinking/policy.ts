@@ -21,6 +21,7 @@ import {
   anthropicSupportsNativeXhigh,
   isGrok46Model,
   isGrokFrontierModel,
+  isGlm53Model,
   isKimiK3Model,
   openaiSupportsNativeMaxEffort,
   stripModelProviderPrefixes,
@@ -71,6 +72,7 @@ export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean 
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
  * - xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
  * - xai:grok-4.5 → ["low", "medium", "high"] (reasoning cannot be disabled)
+ * - zai:glm-5.3-flash → ["low", "high", "max"] (reasoning cannot be disabled)
  * - default → ["off", "low", "medium", "high"] (standard 4 levels; xhigh is opt-in per model)
  *
  * Tolerates version suffixes (e.g., gpt-5-pro-2025-10-06).
@@ -187,6 +189,11 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "medium", "high"];
   }
 
+  // GLM 5.3 always reasons and exposes exactly the effort values accepted by Z.ai.
+  if (isGlm53Model(withoutProviderNamespace)) {
+    return ["low", "high", "max"];
+  }
+
   // Kimi K3 always reasons and supports only the max reasoning effort, so the
   // policy is a fixed single level.
   if (isKimiK3Model(withoutProviderNamespace)) {
@@ -289,17 +296,13 @@ export function lookupMinThinkingLevelOverride(
  * Resolve the effective thinking level for an outgoing stream request.
  *
  * Most models treat an unset level as "off". Models that reject disabled
- * thinking (Mythos-class Anthropic, see {@link anthropicRejectsDisabledThinking})
- * clamp unset/legacy "off" up through the thinking policy instead, so the
- * level Xum tracks (provider options, replay transforms, metadata) matches the
- * provider's actual always-thinking behavior. Without this, the wire request
- * would run adaptive thinking while the message pipeline skips the Anthropic
- * thinking replay transforms (`anthropicThinkingEnabled` keys off "off"),
- * losing required signed thinking context on follow-up requests.
+ * thinking clamp unset/legacy "off" through their policy so Xum's tracked level
+ * matches the provider's always-thinking behavior. This keeps provider options,
+ * reasoning metadata, and provider-specific replay transforms consistent.
  *
  * Pass `providersConfig` so configured aliases (`mappedToModel`, e.g.
  * `anthropic:internal-fable` -> `anthropic:claude-fable-5`) are resolved to
- * their capability model before the Mythos check — matching how
+ * their capability model before the forced-thinking check, matching how
  * `buildProviderOptions` detects capabilities.
  */
 export function resolveEffectiveThinkingLevel(
@@ -309,7 +312,7 @@ export function resolveEffectiveThinkingLevel(
 ): ThinkingLevel {
   const level = requested ?? THINKING_LEVEL_OFF;
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  return anthropicRejectsDisabledThinking(capabilityModel)
+  return anthropicRejectsDisabledThinking(capabilityModel) || isGlm53Model(capabilityModel)
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
 }

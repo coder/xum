@@ -1862,6 +1862,28 @@ describe("buildProviderOptions - Moonshot", () => {
   });
 });
 
+describe("buildProviderOptions - Z.ai", () => {
+  test("enables thinking and maps every GLM 5.3 policy level", () => {
+    for (const [level, reasoningEffort] of [
+      ["low", "low"],
+      ["high", "high"],
+      ["max", "max"],
+    ] as const) {
+      expect(buildProviderOptions("zai:glm-5.3-flash", level)).toEqual({
+        zai: {
+          thinking: { type: "enabled" },
+          reasoningEffort,
+          toolStream: true,
+        },
+      });
+    }
+  });
+
+  test("does not apply forced GLM 5.3 options to other Z.ai models", () => {
+    expect(buildProviderOptions("zai:glm-4.7-flash", "high")).toEqual({});
+  });
+});
+
 describe("buildProviderOptions - OpenRouter", () => {
   test("sends the explicit max effort for OpenRouter-routed Kimi K3", () => {
     // `enabled: true` alone falls back to OpenRouter's default (medium) effort,

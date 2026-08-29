@@ -184,6 +184,16 @@ describe("getModelStats", () => {
     expect(expectStats("openrouter:moonshotai/kimi-k3")).toEqual(stats);
   });
 
+  test("resolves GLM 5.3 Flash limits, list pricing, and supported inputs", () => {
+    const stats = expectStats("zai:glm-5.3-flash");
+
+    expect(stats.max_input_tokens).toBe(1_048_576);
+    expect(stats.max_output_tokens).toBe(131_072);
+    expect(stats.input_cost_per_token).toBe(0.00000015);
+    expect(stats.output_cost_per_token).toBe(0.0000005);
+    expect(stats.cache_read_input_token_cost).toBe(0.00000003);
+  });
+
   test("resolves the default image generation model pricing", () => {
     const stats = expectStats(DEFAULT_IMAGE_MODEL);
 

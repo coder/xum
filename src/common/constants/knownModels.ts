@@ -4,7 +4,7 @@
 
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai";
+type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -224,6 +224,13 @@ const MODEL_DEFINITIONS = {
     // K3's tokenizer isn't published in ai-tokenizer yet; reuse Kimi K2 (the newest
     // Moonshot tokenizer available) for approximate counting.
     tokenizerOverride: "moonshotai/kimi-k2",
+  },
+  GLM_53_FLASH: {
+    provider: "zai",
+    providerModelId: "glm-5.3-flash",
+    aliases: ["glm", "glm-flash", "glm-5.3-flash"],
+    // GLM 5.3 is not in ai-tokenizer yet; use the closest published GLM encoding.
+    tokenizerOverride: "zai/glm-4.5",
   },
 } as const satisfies Record<string, KnownModelDefinition>;
 

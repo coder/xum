@@ -1470,9 +1470,9 @@ export class AIService extends EventEmitter {
         modelString,
         modelResult.data.coderSelectedInstance
       );
-      // FINAL thinking clamp from the pinned snapshot (Mythos-class Anthropic
-      // cannot disable thinking; aliases mapped to Mythos models get the same
-      // treatment). Resolved here — not from the pre-factory read — so a
+      // FINAL thinking clamp from the pinned snapshot. Models that cannot disable
+      // thinking, including aliases mapped to them, get the same treatment.
+      // Resolved here — not from the pre-factory read — so a
       // concurrent instance retag cannot leave the level derived from one
       // type while options/messages are built for the other's wire.
       const effectiveThinkingLevel: ThinkingLevel = resolveEffectiveThinkingLevel(

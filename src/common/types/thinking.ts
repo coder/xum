@@ -325,6 +325,12 @@ export function isGrok46Model(modelString: string): boolean {
   return /^grok-4\.6(?:$|-)/.test(withoutPrefix);
 }
 
+/** GLM 5.3 and GLM 5.3 Flash always reason with low, high, or max effort. */
+export function isGlm53Model(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^glm-5\.3(?:-flash)?(?:$|-(?:latest|\d))/.test(withoutPrefix);
+}
+
 /**
  * Kimi K3 (Moonshot AI) always reasons and supports only the max reasoning
  * effort; the thinking policy and the Moonshot/OpenRouter provider-options

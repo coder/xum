@@ -458,7 +458,7 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Mythos-class only", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for forced-thinking models", () => {
     // Mythos-class cannot disable thinking: unset and "off" both resolve to "low"
     // so provider options, replay transforms, and metadata stay consistent with
     // the provider's always-thinking behavior.
@@ -953,6 +953,29 @@ describe("Grok 4.6 thinking policy", () => {
     expect(getDefaultMinimumThinkingLevel("xai:grok-4.6")).toBe("medium");
     expect(enforceThinkingPolicy("xai:grok-4.6", "off")).toBe("low");
     expect(enforceThinkingPolicy("xai:grok-4.6", "max")).toBe("xhigh");
+  });
+});
+
+describe("GLM 5.3 thinking policy", () => {
+  test("offers only Z.ai's forced-thinking effort levels", () => {
+    for (const model of ["glm-5.3-flash", "zai:glm-5.3", "zai:glm-5.3-flash-2026-08-26"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "high", "max"]);
+    }
+
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "off")).toBe("low");
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "medium")).toBe("low");
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "xhigh")).toBe("high");
+    expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", "off")).toBe("low");
+  });
+
+  test("does not apply the GLM 5.3 policy to named variants", () => {
+    expect(getThinkingPolicyForModel("zai:glm-5.3-flashx")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
   });
 });
 
