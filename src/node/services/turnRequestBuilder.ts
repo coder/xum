@@ -64,6 +64,8 @@ import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
@@ -503,19 +505,19 @@ export type TurnRequestBuildOutcome =
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
     };
 
-interface TurnRequestBuilderLateBoundDependencies {
-  mcpServerManager: () => MCPServerManager | undefined;
-  taskService: () => TaskService | undefined;
-  memoryService: () => MemoryService | undefined;
-  timelineService: () => ToolConfiguration["timelineService"];
-  extraTools: () => Record<string, Tool> | undefined;
-  onWorkflowRunStatusChanged: () =>
-    | ((event: WorkflowRunStatusChangedEvent) => Promise<void> | void)
-    | undefined;
-  workflowResultContinuationSender: () => WorkflowResultContinuationSender | undefined;
-  workspaceHeartbeatService: () => ToolConfiguration["workspaceHeartbeatService"];
-  analyticsService: () => { executeRawQuery(sql: string): Promise<unknown> } | undefined;
-  desktopSessionManager: () => DesktopSessionManager | undefined;
+export interface TurnRequestBuilderBindings {
+  codexOauthService?: CodexOauthService;
+  coderOauthService?: CoderOauthService;
+  mcpServerManager?: MCPServerManager;
+  taskService?: TaskService;
+  memoryService?: MemoryService;
+  timelineService?: ToolConfiguration["timelineService"];
+  extraTools?: Record<string, Tool>;
+  onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
+  workflowResultContinuationSender?: WorkflowResultContinuationSender;
+  workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
+  analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
+  desktopSessionManager?: DesktopSessionManager;
 }
 
 export interface TurnRequestBuilderDependencies {
@@ -533,7 +535,7 @@ export interface TurnRequestBuilderDependencies {
   devToolsService?: DevToolsService;
   experimentsService?: ExperimentsService;
   lastLlmRequestByWorkspace: Map<string, DebugLlmRequestSnapshot>;
-  lateBound: TurnRequestBuilderLateBoundDependencies;
+  bindings: TurnRequestBuilderBindings;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string) => TurnStreamHandle;
   createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
@@ -651,36 +653,36 @@ export class TurnRequestBuilder {
     return this.dependencies.lastLlmRequestByWorkspace;
   }
   private get mcpServerManager(): MCPServerManager | undefined {
-    return this.dependencies.lateBound.mcpServerManager();
+    return this.dependencies.bindings.mcpServerManager;
   }
   private get taskService(): TaskService | undefined {
-    return this.dependencies.lateBound.taskService();
+    return this.dependencies.bindings.taskService;
   }
   private get memoryService(): MemoryService | undefined {
-    return this.dependencies.lateBound.memoryService();
+    return this.dependencies.bindings.memoryService;
   }
   private get timelineService(): ToolConfiguration["timelineService"] {
-    return this.dependencies.lateBound.timelineService();
+    return this.dependencies.bindings.timelineService;
   }
   private get extraTools(): Record<string, Tool> | undefined {
-    return this.dependencies.lateBound.extraTools();
+    return this.dependencies.bindings.extraTools;
   }
   private get onWorkflowRunStatusChanged():
     | ((event: WorkflowRunStatusChangedEvent) => Promise<void> | void)
     | undefined {
-    return this.dependencies.lateBound.onWorkflowRunStatusChanged();
+    return this.dependencies.bindings.onWorkflowRunStatusChanged;
   }
   private get workflowResultContinuationSender(): WorkflowResultContinuationSender | undefined {
-    return this.dependencies.lateBound.workflowResultContinuationSender();
+    return this.dependencies.bindings.workflowResultContinuationSender;
   }
   private get workspaceHeartbeatService(): ToolConfiguration["workspaceHeartbeatService"] {
-    return this.dependencies.lateBound.workspaceHeartbeatService();
+    return this.dependencies.bindings.workspaceHeartbeatService;
   }
   private get analyticsService(): { executeRawQuery(sql: string): Promise<unknown> } | undefined {
-    return this.dependencies.lateBound.analyticsService();
+    return this.dependencies.bindings.analyticsService;
   }
   private get desktopSessionManager(): DesktopSessionManager | undefined {
-    return this.dependencies.lateBound.desktopSessionManager();
+    return this.dependencies.bindings.desktopSessionManager;
   }
 
   private emit(event: string, ...args: unknown[]): boolean {
@@ -893,6 +895,8 @@ export class TurnRequestBuilder {
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
   ): Promise<TurnRequestBuildOutcome> {
+    this.providerModelFactory.codexOauthService = this.dependencies.bindings.codexOauthService;
+    this.providerModelFactory.coderOauthService = this.dependencies.bindings.coderOauthService;
     const {
       messages,
       workspaceId,

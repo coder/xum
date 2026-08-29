@@ -12,10 +12,10 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
+  type TurnRequestBuilderBindings,
   resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type StreamMessageOptions,
-  type WorkflowResultContinuationSender,
 } from "./turnRequestBuilder";
 export { prepareProviderRequestMessages, replaceOrAppendMessageById } from "./turnRequestBuilder";
 export type { StreamMessageOptions } from "./turnRequestBuilder";
@@ -28,7 +28,6 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { getSrcBaseDir, isSSHRuntime } from "@/common/types/runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
-import { type ToolConfiguration } from "@/common/utils/tools/tools";
 import type { Config } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
@@ -42,8 +41,6 @@ import {
   type WorkspaceRuntimeContext,
 } from "@/node/runtime/runtimeHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { CoderOauthService } from "@/node/services/coderOauthService";
-import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
@@ -61,7 +58,6 @@ import {
 } from "./streamManager";
 
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -71,14 +67,11 @@ import type { SessionUsageService } from "./sessionUsageService";
 
 import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
-import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import {
   resolveMemoryProjectIdentity,
-  type MemoryService,
   type MemorySessionContext,
 } from "@/node/services/memoryService";
-import type { TaskService } from "@/node/services/taskService";
+import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
 import type { StreamAbortReason } from "@/common/types/stream";
@@ -86,7 +79,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { type WorkflowRunStatusChangedEvent } from "@/node/services/workflows/WorkflowService";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import { ProviderModelFactory } from "./providerModelFactory";
@@ -115,7 +107,6 @@ export class AIService extends EventEmitter {
   private readonly historyService: HistoryService;
   private readonly config: Config;
   private readonly workspaceMcpOverridesService: WorkspaceMcpOverridesService;
-  private mcpServerManager?: MCPServerManager;
   private readonly policyService?: PolicyService;
   private readonly telemetryService?: TelemetryService;
   private readonly initStateManager: InitStateManager;
@@ -139,17 +130,6 @@ export class AIService extends EventEmitter {
 
   // Debug: captured LLM request payloads for last send per workspace
   private lastLlmRequestByWorkspace = new Map<string, DebugLlmRequestSnapshot>();
-  private taskService?: TaskService;
-  private memoryService?: MemoryService;
-  private timelineService?: ToolConfiguration["timelineService"];
-  private extraTools?: Record<string, Tool>;
-  private onWorkflowRunStatusChanged?: (
-    event: WorkflowRunStatusChangedEvent
-  ) => Promise<void> | void;
-  private workflowResultContinuationSender?: WorkflowResultContinuationSender;
-  private workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
-  private analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
-  private desktopSessionManager?: DesktopSessionManager;
 
   constructor(
     config: Config,
@@ -163,7 +143,8 @@ export class AIService extends EventEmitter {
     telemetryService?: TelemetryService,
     devToolsService?: DevToolsService,
     experimentsService?: ExperimentsService,
-    streamManager?: StreamManager
+    streamManager?: StreamManager,
+    public readonly turnRequestBuilderBindings: TurnRequestBuilderBindings = {}
   ) {
     super();
     // Increase max listeners to accommodate multiple concurrent workspace listeners
@@ -210,18 +191,7 @@ export class AIService extends EventEmitter {
       devToolsService: this.devToolsService,
       experimentsService: this.experimentsService,
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
-      lateBound: {
-        mcpServerManager: () => this.mcpServerManager,
-        taskService: () => this.taskService,
-        memoryService: () => this.memoryService,
-        timelineService: () => this.timelineService,
-        extraTools: () => this.extraTools,
-        onWorkflowRunStatusChanged: () => this.onWorkflowRunStatusChanged,
-        workflowResultContinuationSender: () => this.workflowResultContinuationSender,
-        workspaceHeartbeatService: () => this.workspaceHeartbeatService,
-        analyticsService: () => this.analyticsService,
-        desktopSessionManager: () => this.desktopSessionManager,
-      },
+      bindings: this.turnRequestBuilderBindings,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId) => this.createAbortedTurnHandle(messageId),
       createSettledTurnHandle: (messageId, completion) =>
@@ -249,35 +219,6 @@ export class AIService extends EventEmitter {
       log.info("AIService running in MUX_MOCK_AI mode");
       this.enableMockMode();
     }
-  }
-
-  setCodexOauthService(service: CodexOauthService): void {
-    this.providerModelFactory.codexOauthService = service;
-  }
-  setCoderOauthService(service: CoderOauthService): void {
-    this.providerModelFactory.coderOauthService = service;
-  }
-  setMCPServerManager(manager: MCPServerManager): void {
-    this.mcpServerManager = manager;
-    this.streamManager.setMCPServerManager(manager);
-  }
-
-  setTaskService(taskService: TaskService): void {
-    this.taskService = taskService;
-  }
-
-  setWorkspaceHeartbeatService(
-    service: NonNullable<ToolConfiguration["workspaceHeartbeatService"]>
-  ): void {
-    this.workspaceHeartbeatService = service;
-  }
-
-  setMemoryService(memoryService: MemoryService): void {
-    this.memoryService = memoryService;
-  }
-
-  setTimelineService(timelineService: NonNullable<ToolConfiguration["timelineService"]>): void {
-    this.timelineService = timelineService;
   }
 
   /**
@@ -308,7 +249,7 @@ export class AIService extends EventEmitter {
     modelString: string,
     options?: { includeHotMemories?: boolean }
   ): Promise<MemorySessionContext | null> {
-    if (!this.memoryService) return null;
+    if (!this.turnRequestBuilderBindings.memoryService) return null;
     if (this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) !== true) {
       return null;
     }
@@ -325,7 +266,8 @@ export class AIService extends EventEmitter {
         // disables project memory when no single project identity exists.
         projectPath: resolveMemoryProjectIdentity(metadata),
       };
-      const indexEntries = await this.memoryService.listIndexEntries(ctx);
+      const indexEntries =
+        await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
       // Hot preloading is a sub-experiment: without it, memories stay
       // pull-based like skills (index only, contents fetched on demand).
       let hotMemoriesBlock: string | null = null;
@@ -339,7 +281,7 @@ export class AIService extends EventEmitter {
             this.providerService.getConfig()
           );
           const tokenizer = await getTokenizerForModel(modelString, metadataModel);
-          const items = await this.memoryService.listHotMemories(ctx, {
+          const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
             countTokens: (text) => tokenizer.countTokens(text),
           });
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
@@ -360,34 +302,8 @@ export class AIService extends EventEmitter {
     }
   }
 
-  setWorkflowRunStatusChangedHandler(
-    handler: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void
-  ): void {
-    this.onWorkflowRunStatusChanged = handler;
-  }
-
-  setWorkflowResultContinuationSender(sender: WorkflowResultContinuationSender): void {
-    this.workflowResultContinuationSender = sender;
-  }
-
-  setAnalyticsService(service: { executeRawQuery(sql: string): Promise<unknown> }): void {
-    this.analyticsService = service;
-  }
-
-  setDesktopSessionManager(desktopSessionManager: DesktopSessionManager): void {
-    this.desktopSessionManager = desktopSessionManager;
-  }
-
   getProvidersConfig(): ProvidersConfigMap | null {
     return this.providerService.getConfig();
-  }
-
-  /**
-   * Set extra tools to include in every tool call.
-   * Used by CLI to inject tools like set_exit_code without modifying core tool definitions.
-   */
-  setExtraTools(tools: Record<string, Tool>): void {
-    this.extraTools = tools;
   }
 
   private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {

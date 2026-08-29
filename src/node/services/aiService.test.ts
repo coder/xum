@@ -206,9 +206,9 @@ function configureOpenAICodexOAuth(
   });
 
   if (options?.setOauthService !== false) {
-    service.setCodexOauthService({
+    service.turnRequestBuilderBindings.codexOauthService = {
       getValidAuth: () => Promise.resolve({ success: true, data: TEST_CODEX_OAUTH }),
-    } as CodexOauthService);
+    } as CodexOauthService;
   }
 }
 
@@ -1603,8 +1603,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       useRequestedModelString: true,
       experimentsService,
     });
-    harness.service.setMemoryService(
-      new MemoryService(harness.config, new MemoryMetaService(xumHome.path))
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
     );
 
     const memoryCalls: Array<{ modelString: string; includeHotMemories: boolean }> = [];
@@ -2442,8 +2443,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // description).
       postPolicyTools: {},
     });
-    harness.service.setMemoryService(
-      new MemoryService(harness.config, new MemoryMetaService(xumHome.path))
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
     );
     const memoryCalls: Array<{ includeHotMemories: boolean }> = [];
 
@@ -2476,8 +2478,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const harness = createHarness(xumHome.path, metadata, {
       allTools: { memory: stubTool },
     });
-    harness.service.setMemoryService(
-      new MemoryService(harness.config, new MemoryMetaService(xumHome.path))
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
     );
     const memoryCalls: Array<{ includeHotMemories: boolean }> = [];
 
@@ -2528,7 +2531,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
     const { config, service } = createBasicAIService(xumHome.path, { experimentsService });
     const memoryService = new MemoryService(config, new MemoryMetaService(xumHome.path));
-    service.setMemoryService(memoryService);
+    service.turnRequestBuilderBindings.memoryService = memoryService;
 
     const workspaceId = "workspace-memory-session-context";
     // namedWorkspacePath is the persisted checkout root consumed by
@@ -2587,7 +2590,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
     const { config, service } = createBasicAIService(xumHome.path, { experimentsService });
     const memoryService = new MemoryService(config, new MemoryMetaService(xumHome.path));
-    service.setMemoryService(memoryService);
+    service.turnRequestBuilderBindings.memoryService = memoryService;
 
     const workspaceId = "workspace-memory-hot-failure";
     const metadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
