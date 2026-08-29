@@ -21,6 +21,7 @@ import {
   KERNEL_RETAINED_EXECUTION_BUDGET_BYTES,
 } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
+import { isKernelBoundedMarker } from "@/common/utils/tools/kernelBoundedMarker";
 
 /** Capture-time console retention accounting for one eval (see setupConsole). */
 interface ConsoleCaptureBudget {
@@ -776,11 +777,7 @@ export class QuickJSRuntime implements IJSRuntime {
    * captureArgsRetained merge in boundCaptureArgs). No-op for results that
    * survived bounding inline. */
   private applyRetainedResultFields(bounded: unknown, toolName: string, source: unknown): unknown {
-    if (
-      typeof bounded !== "object" ||
-      bounded === null ||
-      (bounded as { __kernelBounded?: boolean }).__kernelBounded !== true
-    ) {
+    if (!isKernelBoundedMarker(bounded)) {
       return bounded;
     }
     const retained = this.kernelRecordBounds?.captureResultRetained?.(toolName, source);
@@ -796,12 +793,7 @@ export class QuickJSRuntime implements IJSRuntime {
   private static preserveSuccessBit(bounded: unknown, source: unknown): unknown {
     if (typeof source !== "object" || source === null) return bounded;
     const success = (source as { success?: unknown }).success;
-    if (
-      typeof success === "boolean" &&
-      typeof bounded === "object" &&
-      bounded !== null &&
-      (bounded as { __kernelBounded?: boolean }).__kernelBounded === true
-    ) {
+    if (typeof success === "boolean" && isKernelBoundedMarker(bounded)) {
       return { ...bounded, success };
     }
     return bounded;
