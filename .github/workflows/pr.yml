@@ -226,6 +226,9 @@ jobs:
             # reliable in its own process. Took the merge queue down on 2026-08-29
             # when runner file enumeration order changed.
             src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx
+            # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
+            # making catalog-call assertions order-dependent in the shared process.
+            src/node/services/coderOauthService.test.ts
           )
           # One process per file rather than one shared isolated process. Sharing it still
           # segfaults Bun on the runner (exit 132, "Bun has crashed", zero failing assertions)
