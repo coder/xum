@@ -1,6 +1,5 @@
-import { os, ORPCError } from "@orpc/server";
+import { os } from "@orpc/server";
 import * as schemas from "@/common/orpc/schemas";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ORPCContext } from "./context";
 import {
   getWorkspaceMcpOverrides,
@@ -9,6 +8,14 @@ import {
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
+import {
+  checkAgentPluginUpdates,
+  installAgentPlugin,
+  listAgentPlugins,
+  previewAgentPlugin,
+  uninstallAgentPlugin,
+  updateAgentPlugin,
+} from "@/node/services/agentPlugins/installOperations";
 import {
   assertMemoryEnabled,
   consolidateMemory,
@@ -36,6 +43,7 @@ import {
   addUpcomingWorkspaceGoal,
   archiveWorkspaceGoal,
   clearWorkspaceGoal,
+  createMultiProjectWorkspace,
   getBackgroundBashOutput,
   getWorkspaceGoal,
   getWorkspaceGoalBoard,
@@ -764,29 +772,7 @@ export const router = (authToken?: string) => {
       openInEditor: t
         .input(schemas.general.openInEditor.input)
         .output(schemas.general.openInEditor.output)
-        .handler(async ({ context, input }) => {
-          // Custom editors spawn detached and untrackable; record the open (refusing while
-          // the workspace is archiving) before launching. See recordExternalEditorOpen.
-          const recorded = await context.workspaceService.recordExternalEditorOpenForLaunch(
-            input.workspaceId
-          );
-          if (!recorded.success) {
-            return recorded;
-          }
-          const result = await context.editorService.openInEditor(
-            input.workspaceId,
-            input.targetPath,
-            input.editorConfig
-          );
-          if (!result.success) {
-            // EditorService errors occur only before its detached spawn (missing/invalid
-            // command, unsupported runtime), so no editor launched — roll back a marker this
-            // call created, or it would stick and permanently refuse future model-driven
-            // snapshot/Coder-stop archives of the workspace.
-            await recorded.data.rollbackAfterFailedLaunch();
-          }
-          return result;
-        }),
+        .handler(({ context, input }) => context.editorService.openInEditor(input)),
       recordEditorOpen: t
         .input(schemas.general.recordEditorOpen.input)
         .output(schemas.general.recordEditorOpen.output)
@@ -894,40 +880,15 @@ export const router = (authToken?: string) => {
       preview: t
         .input(schemas.agentPlugins.preview.input)
         .output(schemas.agentPlugins.preview.output)
-        .handler(async ({ context, input }) => {
-          try {
-            const data = await context.agentPluginInstallService.preview({
-              input: input.input,
-              ref: input.ref ?? undefined,
-              subpath: input.subpath ?? undefined,
-            });
-            return { success: true, data };
-          } catch (error) {
-            return { success: false, error: getErrorMessage(error) };
-          }
-        }),
+        .handler(({ context, input }) => previewAgentPlugin(context, input)),
       install: t
         .input(schemas.agentPlugins.install.input)
         .output(schemas.agentPlugins.install.output)
-        .handler(async ({ context, input }) => {
-          try {
-            const data = await context.agentPluginInstallService.install(input);
-            return { success: true, data };
-          } catch (error) {
-            return { success: false, error: getErrorMessage(error) };
-          }
-        }),
+        .handler(({ context, input }) => installAgentPlugin(context, input)),
       list: t
         .input(schemas.agentPlugins.list.input)
         .output(schemas.agentPlugins.list.output)
-        .handler(async ({ context }) => {
-          try {
-            const data = await context.agentPluginInstallService.list();
-            return { success: true, data };
-          } catch (error) {
-            return { success: false, error: getErrorMessage(error) };
-          }
-        }),
+        .handler(({ context }) => listAgentPlugins(context)),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)
@@ -935,36 +896,15 @@ export const router = (authToken?: string) => {
       uninstall: t
         .input(schemas.agentPlugins.uninstall.input)
         .output(schemas.agentPlugins.uninstall.output)
-        .handler(async ({ context, input }) => {
-          try {
-            await context.agentPluginInstallService.uninstall(input);
-            return { success: true, data: undefined };
-          } catch (error) {
-            return { success: false, error: getErrorMessage(error) };
-          }
-        }),
+        .handler(({ context, input }) => uninstallAgentPlugin(context, input)),
       checkUpdates: t
         .input(schemas.agentPlugins.checkUpdates.input)
         .output(schemas.agentPlugins.checkUpdates.output)
-        .handler(async ({ context }) => {
-          try {
-            const data = await context.agentPluginInstallService.checkUpdates();
-            return { success: true, data };
-          } catch (error) {
-            return { success: false, error: getErrorMessage(error) };
-          }
-        }),
+        .handler(({ context }) => checkAgentPluginUpdates(context)),
       update: t
         .input(schemas.agentPlugins.update.input)
         .output(schemas.agentPlugins.update.output)
-        .handler(async ({ context, input }) => {
-          try {
-            const data = await context.agentPluginInstallService.update(input);
-            return { success: true, data };
-          } catch (error) {
-            return { success: false, error: getErrorMessage(error) };
-          }
-        }),
+        .handler(({ context, input }) => updateAgentPlugin(context, input)),
     },
     mcpOauth: {
       startDesktopFlow: t
@@ -1403,29 +1343,7 @@ export const router = (authToken?: string) => {
       createMultiProject: t
         .input(schemas.workspace.createMultiProject.input)
         .output(schemas.workspace.createMultiProject.output)
-        .handler(async ({ context, input }) => {
-          if (
-            !context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES)
-          ) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Multi-project workspaces experiment is disabled",
-            });
-          }
-
-          const result = await context.workspaceService.createMultiProject(
-            input.projects,
-            input.branchName,
-            input.trunkBranch,
-            input.title,
-            input.runtimeConfig
-          );
-
-          if (!result.success) {
-            throw new Error(result.error);
-          }
-
-          return result.data;
-        }),
+        .handler(({ context, input }) => createMultiProjectWorkspace(context, input)),
       remove: t
         .input(schemas.workspace.remove.input)
         .output(schemas.workspace.remove.output)

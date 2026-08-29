@@ -365,7 +365,7 @@ export class ServiceContainer {
     // Plugin-override pruning is wired inside createCoreServices (shared with
     // headless CLI registration), using this.workspaceMcpOverridesService.
     // Editor service for opening workspaces in code editors
-    this.editorService = new EditorService(config);
+    this.editorService = new EditorService(config, this.workspaceService);
     this.updateService = new UpdateService(this.config);
     this.tokenizerService = new TokenizerService(this.sessionUsageService);
     this.instructionsService = new InstructionsService(

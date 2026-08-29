@@ -1,11 +1,42 @@
 import { ORPCError } from "@orpc/server";
 import type { ORPCContext } from "@/node/orpc/context";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import type { ProjectRef } from "@/common/types/workspace";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   WorkspaceGoalChildWorkspaceError,
   WorkspaceGoalTransitionError,
 } from "./workspaceGoalService";
+
+export async function createMultiProjectWorkspace(
+  context: ORPCContext,
+  input: {
+    projects: ProjectRef[];
+    branchName: string;
+    trunkBranch?: string;
+    title?: string;
+    runtimeConfig?: RuntimeConfig;
+  }
+) {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES)) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Multi-project workspaces experiment is disabled",
+    });
+  }
+  const result = await context.workspaceService.createMultiProject(
+    input.projects,
+    input.branchName,
+    input.trunkBranch,
+    input.title,
+    input.runtimeConfig
+  );
+  if (!result.success) {
+    throw new Error(result.error);
+  }
+  return result.data;
+}
 
 export async function getWorkspacePlanContent(context: ORPCContext, workspaceId: string) {
   const metadata = await context.workspaceService.getInfo(workspaceId);
