@@ -1538,6 +1538,15 @@ export class ProviderService {
     }
   }
 
+  updateRoutePreferences(
+    input: Omit<Parameters<Config["updateRoutePreferences"]>[0], "validateRouteOverrides">
+  ): Promise<void> {
+    return this.config.updateRoutePreferences({
+      ...input,
+      validateRouteOverrides: (overrides) => this.validateRouteOverrides(overrides),
+    });
+  }
+
   public validateRouteOverrides(routeOverrides: Record<string, string>): Result<void, string> {
     const providersConfig = this.config.loadProvidersConfig() ?? {};
     for (const routeTarget of Object.values(routeOverrides)) {

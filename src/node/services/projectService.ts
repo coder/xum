@@ -396,7 +396,7 @@ export class ProjectService {
   private readonly sshPromptService: SshPromptService | undefined;
   private workspaceService?: WorkspaceRemover;
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
-  private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust">;
+  private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
 
   constructor(
     private readonly config: Config,
@@ -413,7 +413,9 @@ export class ProjectService {
     this.workspaceMetadataRefresher = workspaceService;
   }
 
-  setMcpServerManager(mcpServerManager: Pick<MCPServerManager, "applyProjectTrust">): void {
+  setMcpServerManager(
+    mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
+  ): void {
     this.mcpServerManager = mcpServerManager;
   }
 
@@ -1215,11 +1217,7 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
-  /** Success carries every removed path (cascade included) so callers can drop per-path state. */
-  async remove(
-    projectPath: string,
-    force = false
-  ): Promise<Result<{ removedProjectPaths: string[] }, ProjectRemoveError>> {
+  async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();
@@ -1252,7 +1250,8 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
-        return Ok({ removedProjectPaths: [normalizedPath] });
+        this.mcpServerManager?.forgetProjectTrust(normalizedPath);
+        return Ok(undefined);
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
@@ -1417,7 +1416,10 @@ export class ProjectService {
         log.error(`Failed to clean up secrets for project ${normalizedPath}:`, error);
       }
 
-      return Ok({ removedProjectPaths: [normalizedPath, ...removedSubProjectPaths] });
+      for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
+        this.mcpServerManager?.forgetProjectTrust(removedPath);
+      }
+      return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
       return Err({ type: "unknown" as const, message: `Failed to remove project: ${message}` });

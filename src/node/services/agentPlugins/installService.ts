@@ -1743,6 +1743,38 @@ export class AgentPluginInstallService {
    * staged clone is deleted before returning (stateless preview): install
    * re-fetches the exact consented SHA, so cancelling leaves no state.
    */
+  private async captureResult<T>(operation: () => Promise<T>) {
+    try {
+      return { success: true as const, data: await operation() };
+    } catch (error) {
+      return { success: false as const, error: getErrorMessage(error) };
+    }
+  }
+
+  previewResult(args: Parameters<AgentPluginInstallService["preview"]>[0]) {
+    return this.captureResult(() => this.preview(args));
+  }
+
+  installResult(args: Parameters<AgentPluginInstallService["install"]>[0]) {
+    return this.captureResult(() => this.install(args));
+  }
+
+  listResult() {
+    return this.captureResult(() => this.list());
+  }
+
+  uninstallResult(args: Parameters<AgentPluginInstallService["uninstall"]>[0]) {
+    return this.captureResult(() => this.uninstall(args));
+  }
+
+  checkUpdatesResult() {
+    return this.captureResult(() => this.checkUpdates());
+  }
+
+  updateResult(args: Parameters<AgentPluginInstallService["update"]>[0]) {
+    return this.captureResult(() => this.update(args));
+  }
+
   async preview(args: {
     input: string;
     ref?: string | undefined;

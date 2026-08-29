@@ -2274,7 +2274,10 @@ exit 1
         return current;
       });
       const updates: Array<Array<{ projectPath: string; trusted: boolean }>> = [];
-      service.setMcpServerManager({ applyProjectTrust: (value) => updates.push(value) });
+      service.setMcpServerManager({
+        applyProjectTrust: (value) => updates.push(value),
+        forgetProjectTrust: () => undefined,
+      });
 
       await service.setTrust(`${parentPath}/`, true);
 
@@ -2706,21 +2709,21 @@ exit 1
       expect(result.error.type).toBe("project_not_found");
     });
 
-    it("reports cascade-removed sub-project paths so callers can drop per-path state", async () => {
-      // Retained MCP trust is keyed by path; omitting a cascaded child here
-      // would let a re-registered path inherit the removed project's grant.
+    it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/api";
+      const forgottenPaths: string[] = [];
+      service.setMcpServerManager({
+        applyProjectTrust: () => undefined,
+        forgetProjectTrust: (projectPath) => forgottenPaths.push(projectPath),
+      });
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(parentPath, { workspaces: [] });
       cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
       await config.editConfig(() => cfg);
 
-      const result = await service.remove(parentPath);
-
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error("Expected success");
-      expect(result.data.removedProjectPaths.sort()).toEqual([parentPath, childPath]);
+      expect((await service.remove(parentPath)).success).toBe(true);
+      expect(forgottenPaths.sort()).toEqual([parentPath, childPath]);
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(parentPath)).toBe(false);
       expect(after.projects.has(childPath)).toBe(false);

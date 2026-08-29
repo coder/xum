@@ -1,16 +1,6 @@
 import { os } from "@orpc/server";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
-import { removeProject } from "@/node/services/projectOperations";
-import { calculateWorkspaceStats } from "@/node/services/tokenizerOperations";
-import {
-  getInjectedGlobalSecretKeys,
-  getSecrets,
-  markSplashScreenViewed,
-  saveLayoutPresets,
-  updateRoutePreferences,
-  updateSecrets,
-} from "@/node/services/configOperations";
 import {
   getWorkspaceMcpOverrides,
   getWorkspacePluginComposition,
@@ -18,14 +8,6 @@ import {
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
-import {
-  checkAgentPluginUpdates,
-  installAgentPlugin,
-  listAgentPlugins,
-  previewAgentPlugin,
-  uninstallAgentPlugin,
-  updateAgentPlugin,
-} from "@/node/services/agentPlugins/installOperations";
 import {
   assertMemoryEnabled,
   consolidateMemory,
@@ -75,7 +57,7 @@ import {
 } from "@/node/services/workspaceOperations";
 import { Ok } from "@/common/types/result";
 
-import { generateWorkspaceIdentityForApi } from "@/node/services/workspaceTitleGenerator";
+import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
 import {
   createAuthMiddleware,
@@ -184,7 +166,7 @@ export const router = (authToken?: string) => {
       calculateStats: t
         .input(schemas.tokenizer.calculateStats.input)
         .output(schemas.tokenizer.calculateStats.output)
-        .handler(({ context, input }) => calculateWorkspaceStats(context, input)),
+        .handler(({ context, input }) => context.tokenizerService.calculateWorkspaceStats(input)),
     },
     splashScreens: {
       getViewedSplashScreens: t
@@ -197,7 +179,7 @@ export const router = (authToken?: string) => {
       markSplashScreenViewed: t
         .input(schemas.splashScreens.markSplashScreenViewed.input)
         .output(schemas.splashScreens.markSplashScreenViewed.output)
-        .handler(({ context, input }) => markSplashScreenViewed(context, input.splashId)),
+        .handler(({ context, input }) => context.config.markSplashScreenViewed(input.splashId)),
     },
     server: {
       getLaunchProject: t
@@ -272,7 +254,7 @@ export const router = (authToken?: string) => {
       updateRoutePreferences: t
         .input(schemas.config.updateRoutePreferences.input)
         .output(schemas.config.updateRoutePreferences.output)
-        .handler(({ context, input }) => updateRoutePreferences(context, input)),
+        .handler(({ context, input }) => context.providerService.updateRoutePreferences(input)),
 
       updateMinThinkingLevels: t
         .input(schemas.config.updateMinThinkingLevels.input)
@@ -408,7 +390,7 @@ export const router = (authToken?: string) => {
       saveAll: t
         .input(schemas.uiLayouts.saveAll.input)
         .output(schemas.uiLayouts.saveAll.output)
-        .handler(({ context, input }) => saveLayoutPresets(context, input.layoutPresets)),
+        .handler(({ context, input }) => context.config.saveLayoutPresets(input.layoutPresets)),
     },
     agents: {
       list: t
@@ -749,15 +731,17 @@ export const router = (authToken?: string) => {
       get: t
         .input(schemas.secrets.get.input)
         .output(schemas.secrets.get.output)
-        .handler(({ context, input }) => getSecrets(context, input.projectPath)),
+        .handler(({ context, input }) => context.config.getScopedSecrets(input.projectPath)),
       getInjectedGlobals: t
         .input(schemas.secrets.getInjectedGlobals.input)
         .output(schemas.secrets.getInjectedGlobals.output)
-        .handler(({ context, input }) => getInjectedGlobalSecretKeys(context, input.projectPath)),
+        .handler(({ context, input }) =>
+          context.config.getInjectedGlobalSecretKeys(input.projectPath)
+        ),
       update: t
         .input(schemas.secrets.update.input)
         .output(schemas.secrets.update.output)
-        .handler(({ context, input }) => updateSecrets(context, input)),
+        .handler(({ context, input }) => context.config.updateScopedSecrets(input)),
     },
     mcp: {
       list: t
@@ -801,15 +785,21 @@ export const router = (authToken?: string) => {
       preview: t
         .input(schemas.agentPlugins.preview.input)
         .output(schemas.agentPlugins.preview.output)
-        .handler(({ context, input }) => previewAgentPlugin(context, input)),
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewResult({
+            ...input,
+            ref: input.ref ?? undefined,
+            subpath: input.subpath ?? undefined,
+          })
+        ),
       install: t
         .input(schemas.agentPlugins.install.input)
         .output(schemas.agentPlugins.install.output)
-        .handler(({ context, input }) => installAgentPlugin(context, input)),
+        .handler(({ context, input }) => context.agentPluginInstallService.installResult(input)),
       list: t
         .input(schemas.agentPlugins.list.input)
         .output(schemas.agentPlugins.list.output)
-        .handler(({ context }) => listAgentPlugins(context)),
+        .handler(({ context }) => context.agentPluginInstallService.listResult()),
       containerLocation: t
         .input(schemas.agentPlugins.containerLocation.input)
         .output(schemas.agentPlugins.containerLocation.output)
@@ -817,15 +807,15 @@ export const router = (authToken?: string) => {
       uninstall: t
         .input(schemas.agentPlugins.uninstall.input)
         .output(schemas.agentPlugins.uninstall.output)
-        .handler(({ context, input }) => uninstallAgentPlugin(context, input)),
+        .handler(({ context, input }) => context.agentPluginInstallService.uninstallResult(input)),
       checkUpdates: t
         .input(schemas.agentPlugins.checkUpdates.input)
         .output(schemas.agentPlugins.checkUpdates.output)
-        .handler(({ context }) => checkAgentPluginUpdates(context)),
+        .handler(({ context }) => context.agentPluginInstallService.checkUpdatesResult()),
       update: t
         .input(schemas.agentPlugins.update.input)
         .output(schemas.agentPlugins.update.output)
-        .handler(({ context, input }) => updateAgentPlugin(context, input)),
+        .handler(({ context, input }) => context.agentPluginInstallService.updateResult(input)),
     },
     mcpOauth: {
       startDesktopFlow: t
@@ -959,7 +949,9 @@ export const router = (authToken?: string) => {
       remove: t
         .input(schemas.projects.remove.input)
         .output(schemas.projects.remove.output)
-        .handler(({ context, input }) => removeProject(context, input)),
+        .handler(({ context, input }) =>
+          context.projectService.remove(input.projectPath, input.force ?? false)
+        ),
       getRemovalBlockers: t
         .input(schemas.projects.getRemovalBlockers.input)
         .output(schemas.projects.getRemovalBlockers.output)
@@ -1083,7 +1075,9 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(({ context, input }) => generateWorkspaceIdentityForApi(input, context.aiService)),
+        .handler(({ context, input }) =>
+          generateWorkspaceIdentity(input.message, input.candidates, context.aiService)
+        ),
     },
     coder: {
       getInfo: t

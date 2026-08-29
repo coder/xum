@@ -4,6 +4,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { EditorService } from "./editorService";
 import type { WorkspaceService } from "./workspaceService";
 
+const emptyConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
+  getAllWorkspaceMetadata: () => Promise.resolve([]),
+};
+
 const externalEditorOpenRecorder = {
   recordExternalEditorOpenForLaunch: () =>
     Promise.resolve({
@@ -12,13 +16,13 @@ const externalEditorOpenRecorder = {
     }),
 } satisfies Pick<WorkspaceService, "recordExternalEditorOpenForLaunch">;
 
-function createEditorService(config: Config): EditorService {
+function createEditorService(config: Pick<Config, "getAllWorkspaceMetadata">): EditorService {
   return new EditorService(config, externalEditorOpenRecorder);
 }
 
 describe("EditorService", () => {
   test("rejects non-custom editors (renderer must use deep links)", async () => {
-    const editorService = createEditorService({} as Config);
+    const editorService = createEditorService(emptyConfig);
 
     const result = await editorService.openInEditor({
       workspaceId: "ws1",
@@ -45,9 +49,9 @@ describe("EditorService", () => {
 
     const mockConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
       getAllWorkspaceMetadata: () => Promise.resolve([workspace]),
-    } as unknown as Pick<Config, "getAllWorkspaceMetadata">;
+    };
 
-    const editorService = createEditorService(mockConfig as Config);
+    const editorService = createEditorService(mockConfig);
 
     const result = await editorService.openInEditor({
       workspaceId: "ws1",
@@ -74,9 +78,9 @@ describe("EditorService", () => {
 
     const mockConfig: Pick<Config, "getAllWorkspaceMetadata"> = {
       getAllWorkspaceMetadata: () => Promise.resolve([workspace]),
-    } as unknown as Pick<Config, "getAllWorkspaceMetadata">;
+    };
 
-    const editorService = createEditorService(mockConfig as Config);
+    const editorService = createEditorService(mockConfig);
 
     const result = await editorService.openInEditor({
       workspaceId: "ws1",

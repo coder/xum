@@ -72,7 +72,7 @@ type ExternalEditorOpenRecorder = Pick<WorkspaceService, "recordExternalEditorOp
  */
 export class EditorService {
   constructor(
-    private readonly config: Config,
+    private readonly config: Pick<Config, "getAllWorkspaceMetadata">,
     private readonly externalEditorOpenRecorder: ExternalEditorOpenRecorder
   ) {}
 

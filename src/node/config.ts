@@ -8,7 +8,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import type { WorkspaceMetadata, FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isSecretReferenceValue, type Secret, type SecretsConfig } from "@/common/types/secrets";
-import type { Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import assert from "node:assert/strict";
 import type {
   Workspace,
@@ -27,7 +27,12 @@ import { DEFAULT_MODEL_FALLBACKS, sanitizeModelFallbacks } from "@/common/utils/
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
-import { isLayoutPresetsConfigEmpty, normalizeLayoutPresetsConfig } from "@/common/types/uiLayouts";
+import {
+  isLayoutPresetsConfigEmpty,
+  normalizeLayoutPresetsConfig,
+  type LayoutPresetsConfig,
+} from "@/common/types/uiLayouts";
+import { getErrorMessage } from "@/common/utils/errors";
 import {
   deriveLegacySubagentAiDefaultsProjection,
   mergeLegacySubagentAiDefaults,
@@ -2224,6 +2229,50 @@ export class Config {
       return {
         ...config,
         agentAiDefaults: Object.keys(normalized).length > 0 ? normalized : undefined,
+      };
+    });
+  }
+
+  getScopedSecrets(projectPath: string | null | undefined): Secret[] {
+    return projectPath?.trim() ? this.getProjectSecrets(projectPath) : this.getGlobalSecrets();
+  }
+
+  getInjectedGlobalSecretKeys(projectPath: string | null | undefined): string[] {
+    return projectPath?.trim()
+      ? this.getInjectedGlobalSecrets(projectPath).map((secret) => secret.key)
+      : [];
+  }
+
+  async updateScopedSecrets(input: {
+    projectPath?: string | null;
+    secrets: Secret[];
+  }): Promise<Result<void>> {
+    try {
+      if (input.projectPath?.trim()) {
+        await this.updateProjectSecrets(input.projectPath, input.secrets);
+      } else {
+        await this.updateGlobalSecrets(input.secrets);
+      }
+      return Ok(undefined);
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+  }
+
+  async markSplashScreenViewed(splashId: string): Promise<void> {
+    await this.editConfig((config) => {
+      const viewed = config.viewedSplashScreens ?? [];
+      if (!viewed.includes(splashId)) viewed.push(splashId);
+      return { ...config, viewedSplashScreens: viewed };
+    });
+  }
+
+  async saveLayoutPresets(layoutPresets: LayoutPresetsConfig): Promise<void> {
+    await this.editConfig((config) => {
+      const normalized = normalizeLayoutPresetsConfig(layoutPresets);
+      return {
+        ...config,
+        layoutPresets: isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized,
       };
     });
   }

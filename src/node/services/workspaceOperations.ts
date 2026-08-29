@@ -1,5 +1,5 @@
 import { ORPCError } from "@orpc/server";
-import { z } from "zod";
+import type { z } from "zod";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -287,14 +287,15 @@ export async function setWorkspaceHeartbeat(
   context: ORPCContext,
   input: z.infer<typeof schemas.workspace.heartbeat.set.input>
 ) {
-  const result = await context.workspaceService.setHeartbeatSettings(input.workspaceId, {
+  const settings: Parameters<ORPCContext["workspaceService"]["setHeartbeatSettings"]>[1] = {
     enabled: input.enabled,
     intervalMs: input.intervalMs,
-    ...(input.message != null ? { message: input.message } : {}),
-    ...(input.contextMode != null ? { contextMode: input.contextMode } : {}),
-    // Presence with null clears these values; absence preserves them.
-    ...("trigger" in input ? { trigger: input.trigger ?? null } : {}),
-    ...("whenBusy" in input ? { whenBusy: input.whenBusy ?? null } : {}),
-  });
+  };
+  if (input.message != null) settings.message = input.message;
+  if (input.contextMode != null) settings.contextMode = input.contextMode;
+  // Presence with null clears these values; absence preserves them.
+  if ("trigger" in input) settings.trigger = input.trigger ?? null;
+  if ("whenBusy" in input) settings.whenBusy = input.whenBusy ?? null;
+  const result = await context.workspaceService.setHeartbeatSettings(input.workspaceId, settings);
   return result.success ? { success: true as const, data: undefined } : result;
 }
