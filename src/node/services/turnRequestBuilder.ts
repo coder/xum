@@ -168,6 +168,7 @@ import {
   assemblePromptPayload,
   buildPlanInstructions,
   buildStreamSystemContext,
+  formatMcpWarningPrefix,
   prepareProviderRequestMessages,
 } from "./turnContextAssembler";
 export { prepareProviderRequestMessages };
@@ -2161,16 +2162,13 @@ export class TurnRequestBuilder {
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
     const ptcEnabled = experiments?.programmaticToolCalling === true;
-    let mcpWarningPrefix: string | undefined;
-    if (mcpStats && mcpStats.failedServerCount > 0) {
-      const failedNames = mcpStats.failedServerNames.join(", ");
-      workspaceLog.warn("MCP servers failed to start", { failedNames });
-      mcpWarningPrefix =
-        "[Warning: " +
-        mcpStats.failedServerCount +
-        " MCP server(s) failed to start: " +
-        failedNames +
-        ". Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n";
+    const mcpWarningPrefix = mcpStats
+      ? formatMcpWarningPrefix(mcpStats.failedServerCount, mcpStats.failedServerNames)
+      : undefined;
+    if (mcpWarningPrefix != null) {
+      workspaceLog.warn("MCP servers failed to start", {
+        failedNames: mcpStats?.failedServerNames.join(", "),
+      });
     }
 
     type ModelSeed = typeof modelResult.data;

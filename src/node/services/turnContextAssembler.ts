@@ -95,6 +95,16 @@ export function prepareProviderRequestMessages(
   };
 }
 
+export function formatMcpWarningPrefix(
+  failedServerCount: number,
+  failedServerNames: string[]
+): string | undefined {
+  if (failedServerCount === 0) {
+    return undefined;
+  }
+  return `[Warning: ${failedServerCount} MCP server(s) failed to start: ${failedServerNames.join(", ")}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n`;
+}
+
 export interface PromptPayload {
   activeContextMessages: MuxMessage[];
   providerRequestMessages: MuxMessage[];

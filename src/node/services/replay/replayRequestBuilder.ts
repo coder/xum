@@ -31,21 +31,15 @@ import type {
   LanguageModelV4CallOptions,
   LanguageModelV4StreamPart,
 } from "@ai-sdk/provider";
-import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { filterOrphanedMcpPromptSnapshots, type MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import {
-  createCachedSystemMessage,
-  createOpenAICachedSystemMessage,
-  type AnthropicCacheTtl,
-} from "@/common/utils/ai/cacheStrategy";
+import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
 import { replaceOrAppendMessageById } from "@/node/services/aiService";
-import { prepareProviderRequestMessages } from "@/node/services/turnContextAssembler";
-import { prepareMessagesForProvider } from "@/node/services/messagePipeline";
+import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { parseModelString } from "@/node/services/providerModelFactory";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
@@ -212,59 +206,29 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     inputs.partialContinuation != null
       ? replaceOrAppendMessageById(filteredMessages, inputs.partialContinuation)
       : filteredMessages;
-  const { providerRequestMessages } = prepareProviderRequestMessages(
-    requestMessages,
-    wireProviderName,
-    inputs.thinkingLevel
-  );
-  const messagesWithSentinel = addInterruptedSentinel(providerRequestMessages);
-
-  const finalMessages = await prepareMessagesForProvider({
-    messagesWithSentinel,
+  const payload = await assemblePromptPayload({
+    history: requestMessages,
+    systemMessage: inputs.systemPrompt,
+    systemMessageTokens: 0,
+    modelString: inputs.modelString,
+    routeProvider: inputs.routeProvider,
+    providerForMessages: wireProviderName,
+    effectiveThinkingLevel: inputs.thinkingLevel,
     effectiveAgentId: inputs.effectiveAgentId,
     toolNamesForSentinel: inputs.toolNamesForSentinel,
     planContentForTransition: inputs.planContentForTransition,
     planFilePath: inputs.planFilePath,
     postCompactionAttachments: inputs.postCompactionAttachments,
-    providerForMessages: wireProviderName,
-    effectiveThinkingLevel: inputs.thinkingLevel,
-    modelString: inputs.modelString,
     providersConfig: inputs.providersConfig,
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
   });
 
-  // StreamManager.buildStreamRequestConfig's system handling: Anthropic-cache
-  // models move the system prompt into messages[0] with cache control; the
-  // direct-OpenAI explicit-cache path wraps it as a structured message.
-  let system: string | SystemModelMessage | undefined = inputs.systemPrompt;
-  let messages = finalMessages;
-  const cachedSystemMessage = createCachedSystemMessage(
-    inputs.systemPrompt,
-    inputs.modelString,
-    inputs.anthropicCacheTtl,
-    inputs.providersConfig
-  );
-  if (cachedSystemMessage) {
-    messages = [cachedSystemMessage, ...finalMessages];
-    system = undefined;
-  } else {
-    const openaiCachedSystem = createOpenAICachedSystemMessage(
-      inputs.systemPrompt,
-      inputs.modelString,
-      inputs.routeProvider,
-      inputs.providersConfig ?? null
-    );
-    if (openaiCachedSystem) {
-      system = openaiCachedSystem;
-    }
-  }
-
   const { prompt } = await captureLanguageModelPrompt({
-    system,
-    messages,
+    system: payload.system,
+    messages: payload.messages,
     modelId: inputs.modelString,
   });
 
-  return { system, messages, lmPrompt: prompt };
+  return { system: payload.system, messages: payload.messages, lmPrompt: prompt };
 }
