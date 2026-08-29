@@ -7,6 +7,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import * as providerOptionsModule from "@/common/utils/ai/providerOptions";
+import type { ProvidersConfig } from "@/node/config";
 import { InitStateManager } from "./initStateManager";
 import { ProviderModelFactory } from "./providerModelFactory";
 import { ProviderService } from "./providerService";
@@ -49,9 +50,7 @@ async function createPreparationHarness() {
       messageId,
       completion: Promise.resolve(completion),
     }),
-    getWorkspaceMetadata: async () => {
-      throw new Error("not used by request preparation tests");
-    },
+    getWorkspaceMetadata: () => Promise.reject(new Error("not used by request preparation tests")),
     createWorkspaceRuntimeContext: () => {
       throw new Error("not used by request preparation tests");
     },
@@ -61,10 +60,8 @@ async function createPreparationHarness() {
     durableEventJournalFor: () => {
       throw new Error("not used by request preparation tests");
     },
-    shouldAllowLegacyInvalidWorkflowAgentOutputSchema: async () => false,
-    createModel: async () => {
-      throw new Error("not used by request preparation tests");
-    },
+    shouldAllowLegacyInvalidWorkflowAgentOutputSchema: () => Promise.resolve(false),
+    createModel: () => Promise.reject(new Error("not used by request preparation tests")),
     isStreaming: () => false,
     trackPendingDevToolsRunMetadata: () => undefined,
   });
@@ -398,9 +395,7 @@ describe("TurnRequestBuilder model attempt preparation", () => {
   ])("$name", async (testCase) => {
     const harness = await createPreparationHarness();
     try {
-      harness.config.saveProvidersConfig(
-        testCase.rawConfig as unknown as import("@/node/config").ProvidersConfig
-      );
+      harness.config.saveProvidersConfig(testCase.rawConfig as unknown as ProvidersConfig);
       const prepared = harness.builder.prepareModelAttempt(
         preparationOptions(
           testCase.snapshot as unknown as ProvidersConfigMap,

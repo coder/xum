@@ -27,6 +27,7 @@ import {
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
+  type OauthServiceBindings,
 } from "./providerModelFactory";
 import { hasLanguageModelCleanup } from "./languageModelCleanup";
 import type { DevToolsService } from "./devToolsService";
@@ -95,15 +96,20 @@ function expectSuccessfulRouteResult(
 }
 
 async function withTempConfig(
-  run: (config: Config, factory: ProviderModelFactory) => Promise<void> | void
+  run: (
+    config: Config,
+    factory: ProviderModelFactory,
+    oauth: OauthServiceBindings
+  ) => Promise<void> | void
 ): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
 
   try {
     const config = new Config(tmpDir);
     const providerService = new ProviderService(config);
-    const factory = new ProviderModelFactory(config, providerService);
-    await run(config, factory);
+    const oauth: OauthServiceBindings = {};
+    const factory = new ProviderModelFactory(config, providerService, undefined, oauth);
+    await run(config, factory, oauth);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -135,7 +141,8 @@ async function withTempPolicyProviderFactory(
   run: (
     config: Config,
     factory: ProviderModelFactory,
-    policyService: PolicyService
+    policyService: PolicyService,
+    oauth: OauthServiceBindings
   ) => Promise<void> | void
 ): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
@@ -151,8 +158,9 @@ async function withTempPolicyProviderFactory(
     policyService = new PolicyService(config);
     await policyService.initialize();
     const providerService = new ProviderService(config, policyService);
-    const factory = new ProviderModelFactory(config, providerService, policyService);
-    await run(config, factory, policyService);
+    const oauth: OauthServiceBindings = {};
+    const factory = new ProviderModelFactory(config, providerService, policyService, oauth);
+    await run(config, factory, policyService, oauth);
   } finally {
     policyService?.dispose();
     if (prevPolicyFileEnv === undefined) {
@@ -1036,7 +1044,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   });
 
   it("normalizes Request bodies for the Codex OAuth responses endpoint", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       const requests: Array<{
         input: Parameters<typeof fetch>[0];
@@ -1094,7 +1102,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
 
       const codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
       codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
-      factory.codexOauthService = codexOauthService;
+      oauth.codexOauthService = codexOauthService;
 
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
@@ -2316,12 +2324,12 @@ describe("ProviderModelFactory Coder", () => {
   }
 
   it("creates Anthropic-origin models against the deployment's AI Bridge", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
       let capturedBaseURL: string | undefined;
 
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       PROVIDER_REGISTRY.anthropic = async () => {
         const module = await originalAnthropicRegistry();
@@ -2351,12 +2359,12 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("creates OpenAI-origin models via the bridge's Responses endpoint", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       let capturedBaseURL: string | undefined;
 
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
@@ -2386,7 +2394,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("routes custom-named provider instances using the discovered type", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       let capturedBaseURL: string | undefined;
 
@@ -2395,7 +2403,7 @@ describe("ProviderModelFactory Coder", () => {
       saveCoderConfig(config, {
         discoveredProviders: [{ name: "prod-openai", type: "openai" }],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       PROVIDER_REGISTRY.openai = async () => {
         const module = await originalOpenAIRegistry();
@@ -2425,14 +2433,14 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("speaks chat completions to OpenAI-compatible provider types and honors additionalProviders", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // additionalProviders is the user-managed escape hatch for deployments
       // where the member cannot list providers; openai-compat upstreams only
       // guarantee /chat/completions, not the Responses API.
       saveCoderConfig(config, {
         additionalProviders: [{ name: "llm-proxy", type: "openai-compat" }],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:llm-proxy/llama-3.3-70b");
       expect(result.success).toBe(true);
@@ -2445,10 +2453,10 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("speaks the Anthropic wire protocol to bedrock-type provider instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // The gateway serves Bedrock through its Anthropic client (/v1/messages).
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:bedrock/claude-sonnet-4-5");
       expect(result.success).toBe(true);
@@ -2460,7 +2468,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("keeps instances named after other direct providers routed through Coder", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // A default-named google instance: canonicalization must NOT rewrite
       // coder:google/x to google:x (which would route to the direct Google
       // provider, bypassing the gateway the user selected — or fail without
@@ -2476,7 +2484,7 @@ describe("ProviderModelFactory Coder", () => {
         // Direct Google credentials exist: they must NOT capture the request.
         google: { apiKey: "g-key" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:google/gemini-3-pro", "off");
       expect(result.success).toBe(true);
@@ -2494,7 +2502,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("reports the wire provider from instance metadata, not the instance name", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "openai", type: "anthropic"}: the request speaks Anthropic on
       // the wire, so message preparation (reasoning transforms, PDF-filename
       // sanitization) must key on anthropic even though the name says openai.
@@ -2503,7 +2511,7 @@ describe("ProviderModelFactory Coder", () => {
         models: ["openai/claude-opus-4-5"],
         discoveredModels: ["openai/claude-opus-4-5"],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:openai/claude-opus-4-5", "off");
       expect(result.success).toBe(true);
@@ -2521,7 +2529,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("merges backend disableBetaFeatures for custom-named Anthropic-wire instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // The wire (instance type), not the route name, classifies the request
       // as Anthropic: without wire-based classification the authoritative
       // providers.anthropic.disableBetaFeatures never merges and cache_control
@@ -2535,7 +2543,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         anthropic: { disableBetaFeatures: true },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:prod-anthropic/claude-opus-4-5", muxOptions);
@@ -2545,7 +2553,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("does not merge Anthropic beta config for cross-typed anthropic-named instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "anthropic", type: "openai-compat"}: the model ID starts with
       // "anthropic/" but the wire is NOT Anthropic — name-based classification
       // would wrongly merge Anthropic-only config into the request options.
@@ -2558,7 +2566,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         anthropic: { disableBetaFeatures: true },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:anthropic/gpt-5", muxOptions);
@@ -2568,7 +2576,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("merges the OpenAI ZDR store setting for custom-named openai-typed instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Type "openai" = the real OpenAI Responses upstream, where the ZDR
       // store flag applies. Name-based classification (modelId startsWith
       // "openai/") misses custom names entirely.
@@ -2581,7 +2589,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         openai: { store: false },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:prod-openai/gpt-5.2", muxOptions);
@@ -2591,7 +2599,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("does not merge the OpenAI store setting for cross-typed openai-named instances", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "openai", type: "openai-compat"}: the model ID starts with
       // "openai/" but the upstream is NOT the real OpenAI — the ZDR store
       // flag must not leak onto arbitrary compat upstreams.
@@ -2604,7 +2612,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         openai: { store: false },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const muxOptions: MuxProviderOptions = {};
       const result = await factory.createModel("coder:openai/gpt-5", muxOptions);
@@ -2614,7 +2622,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("falls back to the type-derived provider when the catalog excludes the model", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Cross-typed instance {name: "openai", type: "anthropic"} whose
       // catalog does NOT contain the requested model: the explicit coder
       // route cannot be restored, and the fallback identity comes from the
@@ -2632,7 +2640,7 @@ describe("ProviderModelFactory Coder", () => {
         openai: { apiKey: "sk-openai" },
         anthropic: { apiKey: "sk-anthropic" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:openai/claude-sonnet-4-5", "off");
       expect(result.success).toBe(true);
@@ -2649,7 +2657,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("creates the SDK model from the same config snapshot as the wire report", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Another Xum process rewrites providers.jsonc between route/wire
       // resolution and model creation (an authoritative refresh changing the
       // instance's type). The created SDK model must follow the SAME
@@ -2661,7 +2669,7 @@ describe("ProviderModelFactory Coder", () => {
         models: ["prod/claude-opus-4-5"],
         discoveredModels: ["prod/claude-opus-4-5"],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const realLoad = config.loadProvidersConfig.bind(config);
       let loads = 0;
@@ -2695,7 +2703,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("canonicalizes gateway-scoped type-derived fallback seeds for the wire identity", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // A bedrock-typed instance whose catalog excludes the requested model
       // seeds its fallback from the instance type: bedrock:anthropic.<model>.
       // The seed is itself gateway-scoped — the wire identity must be its
@@ -2711,7 +2719,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         bedrock: { region: "us-east-1" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel(
         "coder:bedrock/anthropic.claude-sonnet-4-5",
@@ -2728,7 +2736,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects catalog-excluded models on instances without a canonical fallback", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // openai-compat fronts an arbitrary upstream, so a catalog-excluded
       // model has NO distinct canonical identity to fall back to. Feeding the
       // rejected coder: string back into routing would resolve the last-resort
@@ -2738,7 +2746,7 @@ describe("ProviderModelFactory Coder", () => {
         models: ["llm-proxy/allowed-model"],
         discoveredModels: ["llm-proxy/allowed-model"],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:llm-proxy/excluded-model", "off");
       expect(result.success).toBe(false);
@@ -2754,7 +2762,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects catalog-excluded models on canonical-named instances without a canonical fallback", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // {name: "anthropic", type: "openai-compat"}: metadata resolution is
       // null (arbitrary upstream), so the fallback must not adopt the
       // name-derived anthropic:<model> identity — the rejection applies
@@ -2770,7 +2778,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         anthropic: { apiKey: "sk-ant-test" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:anthropic/excluded-model", "off");
       expect(result.success).toBe(false);
@@ -2786,7 +2794,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects disconnected unmappable canonical-named instances instead of name-canonicalizing", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Coder disconnected (no coderOauth) + {name: "anthropic",
       // type: "openai-compat"} + direct Anthropic credentials: the seed has
       // no canonical fallback identity, so the request must fail on the
@@ -2802,7 +2810,7 @@ describe("ProviderModelFactory Coder", () => {
         ...config.loadProvidersConfig(),
         anthropic: { apiKey: "sk-ant-test" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.resolveAndCreateModel("coder:anthropic/some-model", "off");
       expect(result.success).toBe(false);
@@ -2814,9 +2822,9 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects unknown provider names with an actionable error", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:mystery-provider/some-model");
       expect(result.success).toBe(false);
@@ -2831,13 +2839,13 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects copilot-type provider instances as unsupported", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Copilot gateway routes need request-time tokens only an official
       // Copilot client can mint; Xum's Coder OAuth token is not enough.
       saveCoderConfig(config, {
         discoveredProviders: [{ name: "copilot", type: "copilot" }],
       });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:copilot/gpt-5.2");
       expect(result.success).toBe(false);
@@ -2852,14 +2860,14 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("injects a fresh Bearer token per request and strips the placeholder x-api-key", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
       const originalFetch = globalThis.fetch;
       let capturedFetch: typeof fetch | undefined;
       let forwardedHeaders: Headers | undefined;
 
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService("at_fresh");
+      oauth.coderOauthService = stubCoderOauthService("at_fresh");
 
       PROVIDER_REGISTRY.anthropic = async () => {
         const module = await originalAnthropicRegistry();
@@ -2913,14 +2921,14 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder" }],
       },
-      async (config, factory, policyService) => {
+      async (config, factory, policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         const originalFetch = globalThis.fetch;
         let capturedFetch: typeof fetch | undefined;
         let upstreamCalls = 0;
 
         saveCoderConfig(config);
-        factory.coderOauthService = stubCoderOauthService();
+        oauth.coderOauthService = stubCoderOauthService();
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3019,7 +3027,7 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder" }],
       },
-      async (config, factory, policyService) => {
+      async (config, factory, policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         const originalFetch = globalThis.fetch;
         let capturedFetch: typeof fetch | undefined;
@@ -3043,7 +3051,7 @@ describe("ProviderModelFactory Coder", () => {
           expect(refresh.success).toBe(true);
           return stubbedGetValidAuth();
         };
-        factory.coderOauthService = stub;
+        oauth.coderOauthService = stub;
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3096,7 +3104,7 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder", base_url: LOCKED_URL }],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         let capturedBaseURL: string | undefined;
 
@@ -3117,7 +3125,7 @@ describe("ProviderModelFactory Coder", () => {
             },
           },
         } as Parameters<Config["saveProvidersConfig"]>[0]);
-        factory.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
+        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3142,7 +3150,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("only routes models from the discovered bridge catalog through Coder", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Coder is logged in and preferred over direct, but its discovered
       // catalog only contains one anthropic model. The AI Bridge cannot serve
       // models outside its catalog, so any other model must fall back to the
@@ -3156,7 +3164,7 @@ describe("ProviderModelFactory Coder", () => {
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3176,7 +3184,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("keeps routing through Coder while the catalog is unknown", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // No models key: the catalog is unknown (discovery pending or failed
       // transiently after login). Routing stays permissive — blocking would
       // strand Coder routing until the next login even after the bridge
@@ -3187,7 +3195,7 @@ describe("ProviderModelFactory Coder", () => {
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3201,7 +3209,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("does not restore an explicit coder: prefix for models absent from the catalog", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // The user explicitly selected coder:anthropic/claude-opus-4-1, but the
       // discovered catalog does not contain it. The explicit-gateway restore
       // must apply the same catalog gate as resolveRoute — otherwise the
@@ -3218,7 +3226,7 @@ describe("ProviderModelFactory Coder", () => {
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["direct"]);
 
@@ -3252,7 +3260,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("routes nothing through Coder when the discovered catalog is empty", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Discovery always overwrites the catalog — empty means the bridge
       // exposed no models (e.g. AI Bridge not entitled). Auto-routing must
       // skip Coder entirely rather than send every model to a bridge that
@@ -3263,7 +3271,7 @@ describe("ProviderModelFactory Coder", () => {
         ...providersConfig,
         anthropic: { apiKey: "sk-ant-test" },
       } as Parameters<Config["saveProvidersConfig"]>[0]);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3285,7 +3293,7 @@ describe("ProviderModelFactory Coder", () => {
           { id: "anthropic" },
         ],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         // The persisted catalog is deliberately policy-unfiltered (both
         // models present); the CURRENT policy must gate routing so the
         // disallowed model falls back to direct instead of being rewritten
@@ -3299,7 +3307,7 @@ describe("ProviderModelFactory Coder", () => {
           ...providersConfig,
           anthropic: { apiKey: "sk-ant-test" },
         } as Parameters<Config["saveProvidersConfig"]>[0]);
-        factory.coderOauthService = stubCoderOauthService();
+        oauth.coderOauthService = stubCoderOauthService();
 
         await saveRoutePriority(config, ["coder", "direct"]);
 
@@ -3329,7 +3337,7 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder", base_url: LOCKED_URL }],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
         let capturedBaseURL: string | undefined;
 
@@ -3352,7 +3360,7 @@ describe("ProviderModelFactory Coder", () => {
             },
           },
         } as Parameters<Config["saveProvidersConfig"]>[0]);
-        factory.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
+        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
 
         PROVIDER_REGISTRY.anthropic = async () => {
           const module = await originalAnthropicRegistry();
@@ -3382,14 +3390,14 @@ describe("ProviderModelFactory Coder", () => {
         policy_format_version: "0.1",
         provider_access: [{ id: "coder", base_url: "https://locked.coder.example.com" }],
       },
-      async (config, factory) => {
+      async (config, factory, _policyService, oauth) => {
         // Logged in to a different (user-chosen) deployment: those tokens must
         // not be used for the policy-locked endpoint, nor may traffic flow to
         // the user-chosen deployment while policy is enforced. The coder route
         // is unavailable (issuer mismatch with the forced URL), so the model
         // falls back to the direct origin — which the policy also denies.
         saveCoderConfig(config);
-        factory.coderOauthService = stubCoderOauthService();
+        oauth.coderOauthService = stubCoderOauthService();
 
         const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
         expect(result.success).toBe(false);
@@ -3401,7 +3409,7 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("refuses to attach credentials minted by a different deployment than the model's", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
       const originalFetch = globalThis.fetch;
       let capturedFetch: typeof fetch | undefined;
@@ -3412,7 +3420,7 @@ describe("ProviderModelFactory Coder", () => {
       // by request time the user has re-logged into a different deployment:
       // the wrapper must fail instead of sending that bearer token to the
       // model's (old) base URL.
-      factory.coderOauthService = stubCoderOauthService("at_other", "https://other.example.com");
+      oauth.coderOauthService = stubCoderOauthService("at_other", "https://other.example.com");
 
       PROVIDER_REGISTRY.anthropic = async () => {
         const module = await originalAnthropicRegistry();
@@ -3459,9 +3467,9 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("rejects model ids without a supported bridge origin", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       saveCoderConfig(config);
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       // Known direct origins (e.g. coder:google/...) canonicalize away from the
       // gateway before reaching the coder branch, so only coder-scoped ids
@@ -3477,12 +3485,12 @@ describe("ProviderModelFactory Coder", () => {
   });
 
   it("fails with api_key_not_found when Coder OAuth is not connected", async () => {
-    await withTempConfig(async (config, factory) => {
+    await withTempConfig(async (config, factory, oauth) => {
       // Deployment URL alone is not enough - login is required. Use a
       // coder-scoped id so canonicalization cannot reroute to a direct
       // provider configured via workstation env keys.
       saveCoderConfig(config, { coderOauth: undefined });
-      factory.coderOauthService = stubCoderOauthService();
+      oauth.coderOauthService = stubCoderOauthService();
 
       const result = await factory.createModel("coder:meta-llama/llama-3");
       expect(result.success).toBe(false);

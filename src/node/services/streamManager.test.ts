@@ -5654,16 +5654,15 @@ describe("StreamManager - stopStream", () => {
 
     expect(result.success).toBe(true);
     expect(startup.abortSignal.aborted).toBe(true);
-    expect(events).toEqual([
-      expect.objectContaining({
-        type: "stream-abort",
-        workspaceId: "pending-workspace",
-        messageId: startup.syntheticMessageId,
-        abortReason: "user",
-        abandonPartial: true,
-        acpPromptId: "prompt-1",
-      }),
-    ]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "stream-abort",
+      workspaceId: "pending-workspace",
+      messageId: startup.syntheticMessageId,
+      abortReason: "user",
+      abandonPartial: true,
+      acpPromptId: "prompt-1",
+    });
   });
 
   test("routes mock lifecycle operations through the engine", async () => {

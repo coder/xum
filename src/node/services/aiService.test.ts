@@ -192,9 +192,11 @@ function configureOpenAICodexOAuth(
   });
 
   if (options?.setOauthService !== false) {
-    service.turnRequestBuilderBindings.codexOauthService = {
+    const codexOauthStub = {
       getValidAuth: () => Promise.resolve({ success: true, data: TEST_CODEX_OAUTH }),
-    } as CodexOauthService;
+    };
+    service.turnRequestBuilderBindings.codexOauthService =
+      codexOauthStub as unknown as CodexOauthService;
   }
 }
 

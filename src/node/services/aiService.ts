@@ -173,7 +173,7 @@ export class AIService extends EventEmitter {
       config,
       providerService,
       policyService,
-      undefined,
+      turnRequestBuilderBindings,
       devToolsService
     );
     this.turnRequestBuilder = new TurnRequestBuilder({

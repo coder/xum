@@ -64,8 +64,6 @@ import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
-import type { CodexOauthService } from "@/node/services/codexOauthService";
-import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
@@ -171,7 +169,7 @@ import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import { prepareMessagesForProvider } from "./messagePipeline";
-import type { ProviderModelFactory } from "./providerModelFactory";
+import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import { modelCostsIncluded } from "./providerModelFactory";
 import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
 import {
@@ -505,9 +503,7 @@ export type TurnRequestBuildOutcome =
       logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
     };
 
-export interface TurnRequestBuilderBindings {
-  codexOauthService?: CodexOauthService;
-  coderOauthService?: CoderOauthService;
+export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   mcpServerManager?: MCPServerManager;
   taskService?: TaskService;
   memoryService?: MemoryService;
@@ -895,8 +891,6 @@ export class TurnRequestBuilder {
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
   ): Promise<TurnRequestBuildOutcome> {
-    this.providerModelFactory.codexOauthService = this.dependencies.bindings.codexOauthService;
-    this.providerModelFactory.coderOauthService = this.dependencies.bindings.coderOauthService;
     const {
       messages,
       workspaceId,
@@ -937,7 +931,6 @@ export class TurnRequestBuilder {
     const startupPhaseTimingsMs = context.startupPhaseTimingsMs;
     const recordStartupPhaseTiming = context.recordStartupPhaseTiming;
     let pendingRunMetadataId: string | null = context.startupState.pendingRunMetadataId;
-    let logSlowStreamStartup: ((details: Record<string, unknown>) => void) | undefined;
 
     const deleteAbortedPlaceholder = async (messageId: string): Promise<void> => {
       const deleteResult = await this.historyService.deleteMessage(workspaceId, messageId);
@@ -1221,7 +1214,7 @@ export class TurnRequestBuilder {
       }
     }
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
-    logSlowStreamStartup = (details: Record<string, unknown>) => {
+    const logSlowStreamStartup = (details: Record<string, unknown>): void => {
       const totalMs = Date.now() - startTime;
       if (totalMs < STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS) {
         return;
@@ -1235,6 +1228,8 @@ export class TurnRequestBuilder {
         ...details,
       });
     };
+    // Exposed so the caller's catch path can log slow startups that fail after build().
+    context.startupState.logSlowStreamStartup = logSlowStreamStartup;
 
     const emitStartupBreadcrumb = (
       startupStage:
@@ -1353,7 +1348,7 @@ export class TurnRequestBuilder {
       this.emit("error", errorEvent);
       onPreStartError?.(errorEvent);
 
-      logSlowStreamStartup?.({
+      logSlowStreamStartup({
         outcome: "runtime_not_ready",
         runtimeType,
         errorType,
@@ -3006,7 +3001,7 @@ export class TurnRequestBuilder {
       outcome: "started" | "stream_start_failed",
       errorType?: string
     ): void => {
-      logSlowStreamStartup?.({
+      logSlowStreamStartup({
         outcome,
         providerName: canonicalProviderName,
         routeProvider,
