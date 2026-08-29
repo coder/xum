@@ -1489,6 +1489,7 @@ export default defineConfig([
     // TODO: Gradually migrate these to async operations
     files: [
       "src/node/config/index.ts",
+      "src/node/config/**/*.ts",
       "src/cli/debug/**/*.ts",
       "src/node/git.ts",
       "src/desktop/main.ts",

@@ -75,6 +75,7 @@ interface BasicAIServiceParts {
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
+  providersConfigStore: ProvidersConfigStore;
   service: AIService;
 }
 
@@ -112,7 +113,8 @@ function createBasicAIService(
   const config = new Config(root);
   const historyService = new HistoryService(config);
   const initStateManager = new InitStateManager(config);
-  const providerService = new ProviderService(config);
+  const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+  const providerService = new ProviderService(config, undefined, providersConfigStore);
   const service = new AIService(
     config,
     historyService,
@@ -124,9 +126,19 @@ function createBasicAIService(
     undefined,
     undefined,
     options?.devToolsService,
-    options?.experimentsService
+    options?.experimentsService,
+    undefined,
+    undefined,
+    providersConfigStore
   );
-  return { config, historyService, initStateManager, providerService, service };
+  return {
+    config,
+    historyService,
+    initStateManager,
+    providerService,
+    providersConfigStore,
+    service,
+  };
 }
 
 async function writeMainConfig(root: string, config: object): Promise<void> {
@@ -2518,6 +2530,7 @@ describe("AIService.streamMessage turn envelope", () => {
   interface TurnEnvelopeHarness {
     service: AIService;
     config: Config;
+    providersConfigStore: ProvidersConfigStore;
     startStreamCalls: TurnExecutionOptions[];
   }
 
@@ -2526,7 +2539,8 @@ describe("AIService.streamMessage turn envelope", () => {
     metadata: WorkspaceMetadata,
     options?: { allTools?: Record<string, Tool> }
   ): TurnEnvelopeHarness {
-    const { config, historyService, initStateManager, service } = createBasicAIService(xumHomePath);
+    const { config, historyService, initStateManager, providersConfigStore, service } =
+      createBasicAIService(xumHomePath);
     const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,
@@ -2537,7 +2551,7 @@ describe("AIService.streamMessage turn envelope", () => {
       startStreamCalls,
       allTools: options?.allTools,
     });
-    return { service, config, startStreamCalls };
+    return { service, config, providersConfigStore, startStreamCalls };
   }
 
   async function streamTurn(harness: TurnEnvelopeHarness, workspaceId: string): Promise<void> {

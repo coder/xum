@@ -2643,7 +2643,7 @@ export class WorkspaceGoalService {
 
   private getProvidersConfigForPricing(): ProvidersConfigMap | null {
     const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
-    return providersConfig as unknown as ProvidersConfigMap | null;
+    return providersConfig as ProvidersConfigMap | null;
   }
 
   async requestPendingGoalContinuationDispatch(workspaceId: string): Promise<void> {

@@ -4303,7 +4303,7 @@ export class AgentSession {
       }
 
       const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
-      return providersConfig as unknown as ProvidersConfigMap | null;
+      return providersConfig as ProvidersConfigMap | null;
     } catch {
       // Best-effort read: if config cannot be loaded, keep null and rely on
       // built-in model limits. This matches prior behavior without crashing.

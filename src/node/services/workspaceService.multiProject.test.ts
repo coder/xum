@@ -400,11 +400,8 @@ describe("WorkspaceService executeBash runtime selection", () => {
       workspaceId,
       workspaceName,
       secretsStore: {
-        getEffectiveSecrets: getEffectiveSecretsMock as Pick<
-          SecretsStore,
-          "getEffectiveSecrets"
-        >["getEffectiveSecrets"],
-      } as Pick<SecretsStore, "getEffectiveSecrets">,
+        getEffectiveSecrets: getEffectiveSecretsMock,
+      },
     });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "pwd");

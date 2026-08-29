@@ -1,4 +1,4 @@
-import { ProvidersConfigStore } from "@/node/config";
+import type { ProvidersConfigStore } from "@/node/config";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
 import type { Result } from "@/common/types/result";
