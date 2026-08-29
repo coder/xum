@@ -43,10 +43,8 @@ import {
 } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
-import {
-  prepareProviderRequestMessages,
-  replaceOrAppendMessageById,
-} from "@/node/services/aiService";
+import { replaceOrAppendMessageById } from "@/node/services/aiService";
+import { prepareProviderRequestMessages } from "@/node/services/turnContextAssembler";
 import { prepareMessagesForProvider } from "@/node/services/messagePipeline";
 import { parseModelString } from "@/node/services/providerModelFactory";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";

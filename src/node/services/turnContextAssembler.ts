@@ -18,6 +18,11 @@ import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { ADVISOR_USAGE_GUIDANCE } from "@/common/constants/advisor";
 import type { MuxMessage } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { filterEmptyAssistantMessages } from "@/browser/utils/messages/modelMessageTransform";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -48,6 +53,35 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
 import { getErrorMessage } from "@/common/utils/errors";
+
+export function prepareProviderRequestMessages(
+  messages: MuxMessage[],
+  canonicalProviderName: string,
+  effectiveThinkingLevel: ThinkingLevel
+): {
+  activeContextMessages: MuxMessage[];
+  providerRequestMessages: MuxMessage[];
+  contextBoundarySlicedCount: number;
+} {
+  // Workflow display rows are durable UI history, not main-agent context.
+  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
+  // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
+  const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
+    sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
+  );
+  const contextBoundarySlicedCount =
+    messagesWithoutWorkflowDisplay.length - activeContextMessages.length;
+  const preserveReasoningOnly =
+    canonicalProviderName === "anthropic" && effectiveThinkingLevel !== "off";
+  return {
+    activeContextMessages,
+    providerRequestMessages: filterEmptyAssistantMessages(
+      activeContextMessages,
+      preserveReasoningOnly
+    ),
+    contextBoundarySlicedCount,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Plan & Instructions Assembly

@@ -96,8 +96,6 @@ import {
 } from "@/common/utils/ai/providerOptions";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
-import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import {
@@ -147,7 +145,6 @@ import {
 } from "@/common/utils/tools/toolCatalog";
 import {
   buildWorkflowResultContextMessage,
-  filterWorkflowDisplayOnlyMessages,
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -172,7 +169,12 @@ import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import { modelCostsIncluded } from "./providerModelFactory";
-import { buildPlanInstructions, buildStreamSystemContext } from "./turnContextAssembler";
+import {
+  buildPlanInstructions,
+  buildStreamSystemContext,
+  prepareProviderRequestMessages,
+} from "./turnContextAssembler";
+export { prepareProviderRequestMessages };
 import {
   simulateContextLimitError,
   simulateToolPolicyNoop,
@@ -287,38 +289,6 @@ export interface StreamMessageOptions {
    * stream. See src/node/services/thinkingOverride.ts.
    */
   activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
-}
-
-export function prepareProviderRequestMessages(
-  messages: MuxMessage[],
-  canonicalProviderName: string,
-  effectiveThinkingLevel: ThinkingLevel
-): {
-  activeContextMessages: MuxMessage[];
-  providerRequestMessages: MuxMessage[];
-  contextBoundarySlicedCount: number;
-} {
-  // Workflow display rows are durable UI history, not main-agent context.
-  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
-  // RLM keep-recent floor: a stamped compaction request summarizes only the
-  // older head; the stamped tail is preserved verbatim after the boundary.
-  // No-op (same reference) unless the trailing user row carries the durable
-  // stamp, so RLM-off requests and replay stay byte-identical.
-  const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
-    sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
-  );
-  const contextBoundarySlicedCount =
-    messagesWithoutWorkflowDisplay.length - activeContextMessages.length;
-  const preserveReasoningOnly =
-    canonicalProviderName === "anthropic" && effectiveThinkingLevel !== "off";
-  return {
-    activeContextMessages,
-    providerRequestMessages: filterEmptyAssistantMessages(
-      activeContextMessages,
-      preserveReasoningOnly
-    ),
-    contextBoundarySlicedCount,
-  };
 }
 
 // Exported for the replay builder: fallback requests append the refusal's
