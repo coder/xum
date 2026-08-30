@@ -22,7 +22,7 @@ import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
-import { sendWorkflowRunTerminalContinuation } from "@/node/services/workspaceService";
+import { sendWorkflowRunTerminalContinuation } from "@/node/services/workflowContinuation";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";

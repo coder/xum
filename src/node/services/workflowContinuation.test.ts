@@ -2,7 +2,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import { DisposableTempDir } from "./tempDir";
 import { WorkflowRunStore } from "./workflows/WorkflowRunStore";
-import { sendWorkflowRunTerminalContinuation } from "./workspaceService";
+import { sendWorkflowRunTerminalContinuation } from "./workflowContinuation";
 
 describe("sendWorkflowRunTerminalContinuation", () => {
   test("sends the workflow result with the original invocation settings", async () => {

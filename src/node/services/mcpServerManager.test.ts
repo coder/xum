@@ -183,6 +183,41 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("testForApi resolves project trust from config before delegating", async () => {
+    for (const trusted of [true, false]) {
+      using tmp = new DisposableTempDir(`mcp-api-trust-${trusted}`);
+      const config = new Config(tmp.path);
+      const projectPath = path.join(tmp.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { trusted, workspaces: [] });
+        return cfg;
+      });
+      const apiConfigService = new MCPConfigService(config);
+      const listServers = spyOn(apiConfigService, "listServers").mockResolvedValue({
+        "repo-local": { transport: "stdio", command: "echo repo-local", disabled: false },
+      });
+      const apiManager = new MCPServerManager(apiConfigService, { config });
+      const testServer = spyOn(apiManager, "test").mockResolvedValue({
+        success: true,
+        tools: ["repo_tool"],
+      });
+      try {
+        const result = await apiManager.testForApi(
+          { projectPath, name: "repo-local" },
+          { includeAgentPlugins: false }
+        );
+        expect(result).toMatchObject({ success: true, tools: ["repo_tool"] });
+        expect(listServers).toHaveBeenCalledWith(projectPath, trusted, expect.anything());
+        expect(testServer).toHaveBeenCalledWith(
+          expect.objectContaining({ projectPath, trusted, name: "repo-local" })
+        );
+      } finally {
+        apiManager.dispose();
+      }
+    }
+  });
+
   test("cross-process plugin mutation token retires cached plugin instances before serving", async () => {
     // A sibling process's update/uninstall recycles only its OWN manager;
     // this manager must notice the bumped on-disk mutation token and retire

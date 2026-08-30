@@ -9,7 +9,6 @@ import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, DESKTOP_WS_PATH } from "./server";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
-import { Config } from "@/node/config";
 
 function getErrorCode(error: unknown): string | null {
   if (typeof error !== "object" || error === null) {
@@ -1556,81 +1555,6 @@ describe("createOrpcServer", () => {
     } finally {
       await server?.close();
     }
-  });
-
-  test("passes project trust through to global MCP tests when projectPath is provided", async () => {
-    async function runCase(trusted: boolean): Promise<void> {
-      const muxRoot = await fs.mkdtemp(
-        path.join(os.tmpdir(), `mux-orpc-mcp-test-${trusted ? "trusted" : "untrusted"}-`)
-      );
-      const projectPath = path.join(muxRoot, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-
-      const config = new Config(muxRoot);
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectPath, { trusted, workspaces: [] });
-        return cfg;
-      });
-
-      const listServerCalls: Array<{ projectPath?: string; trusted?: boolean }> = [];
-      const testCalls: Array<{ projectPath: string; trusted?: boolean; name?: string }> = [];
-      const stubContext: Partial<ORPCContext> = {
-        config,
-        mcpConfigService: {
-          listServers: (listedProjectPath?: string, listedTrusted?: boolean) => {
-            listServerCalls.push({ projectPath: listedProjectPath, trusted: listedTrusted });
-            return Promise.resolve({
-              "repo-local": { transport: "stdio", command: "echo repo-local" },
-            });
-          },
-        } as unknown as ORPCContext["mcpConfigService"],
-        mcpServerManager: {
-          test: (options: { projectPath: string; trusted?: boolean; name?: string }) => {
-            testCalls.push(options);
-            return Promise.resolve({ success: true, tools: ["repo_tool"] });
-          },
-        } as unknown as ORPCContext["mcpServerManager"],
-        policyService: {
-          isEnforced: () => false,
-        } as unknown as ORPCContext["policyService"],
-        telemetryService: {
-          capture: () => undefined,
-        } as unknown as ORPCContext["telemetryService"],
-      };
-
-      let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
-
-      try {
-        server = await createOrpcServer({
-          host: "127.0.0.1",
-          port: 0,
-          context: stubContext as ORPCContext,
-        });
-
-        const client = createHttpClient(server.baseUrl);
-        const result = await Promise.resolve(
-          client.mcp.test({
-            projectPath,
-            name: "repo-local",
-          })
-        );
-
-        expect(result).toEqual({ success: true, tools: ["repo_tool"] });
-        expect(listServerCalls).toHaveLength(1);
-        expect(listServerCalls[0]?.projectPath).toBe(projectPath);
-        expect(listServerCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls).toHaveLength(1);
-        expect(testCalls[0]?.projectPath).toBe(projectPath);
-        expect(testCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls[0]?.name).toBe("repo-local");
-      } finally {
-        await server?.close();
-        await fs.rm(muxRoot, { recursive: true, force: true });
-      }
-    }
-
-    await runCase(false);
-    await runCase(true);
   });
 
   test("general.restartApp delegates to the window service restart hook", async () => {
