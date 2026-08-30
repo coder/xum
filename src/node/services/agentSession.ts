@@ -7244,6 +7244,18 @@ export class AgentSession {
       followUp.muxMetadata
     );
 
+    // Same raw JSON boundary as below: a persisted follow-up may carry a malformed toolPolicy,
+    // and restoring it unvalidated would throw during resolution. Invalid values are dropped
+    // like any corrupt persisted policy (self-healing doctrine); a restricted turn's
+    // follow-up must otherwise keep its policy instead of redispatching allow-all.
+    const persistedToolPolicy =
+      followUp.toolPolicy != null ? ToolPolicySchema.safeParse(followUp.toolPolicy) : undefined;
+    if (persistedToolPolicy != null && !persistedToolPolicy.success) {
+      log.warn("Ignoring malformed persisted toolPolicy on compaction follow-up", {
+        workspaceId: this.workspaceId,
+      });
+    }
+
     // Build options for the follow-up message from the preserved send settings captured
     // when the compaction handoff was staged. Avoid forwarding internal-only recovery flags.
     const options: SendMessageOptions & {
@@ -7265,23 +7277,7 @@ export class AgentSession {
       experiments: aliasLegacyPtcExclusive(followUp.experiments),
       allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
-      // Same raw JSON boundary: a persisted follow-up may carry a malformed toolPolicy, and
-      // restoring it unvalidated would throw during resolution. Invalid values are dropped
-      // like any corrupt persisted policy (self-healing doctrine); a restricted turn's
-      // follow-up must otherwise keep its policy instead of redispatching allow-all.
-      ...(() => {
-        if (followUp.toolPolicy == null) {
-          return {};
-        }
-        const parsed = ToolPolicySchema.safeParse(followUp.toolPolicy);
-        if (!parsed.success) {
-          log.warn("Ignoring malformed persisted toolPolicy on compaction follow-up", {
-            workspaceId: this.workspaceId,
-          });
-          return {};
-        }
-        return { toolPolicy: parsed.data };
-      })(),
+      ...(persistedToolPolicy?.success ? { toolPolicy: persistedToolPolicy.data } : {}),
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent
       // may have been removed/hidden/disabled while compaction ran.
       strictAgentResolution: followUp.strictAgentResolution,

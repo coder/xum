@@ -487,9 +487,9 @@ function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string)
 /**
  * The terminal-attention drain delivers workflow results as one synthetic user prompt that may
  * coalesce several runs, so it carries no per-run workflow-result metadata. If a crash lands
- * between the send's durable acceptance and the outbox delivery mark, restart recovery drains
- * the notification again; recognizing the accepted row as consumption is what suppresses the
- * replay. Only synthetic rows qualify: a manual user message is a supersession boundary and is
+ * between the send's durable acceptance and the settled-marker write, the next sweep re-queues
+ * the run; recognizing the accepted row as consumption is what settles it without a re-send.
+ * Only synthetic rows qualify: a manual user message is a supersession boundary and is
  * classified before this check runs.
  */
 function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): boolean {
@@ -10998,9 +10998,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /**
    * Three-state currentness: "indeterminate" means history/provenance could not be read or
-   * ordered, so the answer is unknown rather than no. Callers that would permanently drop a
-   * terminal wake on a negative answer (the terminal-attention drain tombstones notifications)
-   * must retain and retry on "indeterminate" instead; boolean callers treat it as not-current,
+   * ordered, so the answer is unknown rather than no. Callers that would permanently settle a
+   * terminal wake on a negative answer (the terminal-attention drain records a superseded
+   * settlement marker) must retain and retry on "indeterminate" instead; boolean callers treat
+   * it as not-current,
    * the pre-existing fail-safe for non-destructive decisions.
    */
   async getWorkflowInvocationCurrentness(

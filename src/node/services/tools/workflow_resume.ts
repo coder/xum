@@ -4,7 +4,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { isTerminalWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
-import { WorkflowRunRecordSchema, WorkflowRunStatusSchema } from "@/common/orpc/schemas";
+import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
   WorkflowResumeToolResultSchema,
   TOOL_DEFINITIONS,
@@ -158,7 +158,7 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // workflow_resume part in history, so the history-walk consumption predicates cannot see
       // that this turn already received the terminal result. Persist consumption durably so the
       // terminal-attention drain never re-delivers it.
-      const markTerminalAttentionConsumed = async (
+      const markTerminalAttentionSettled = async (
         terminalRun: Pick<WorkflowRunRecord, "id" | "status" | "updatedAt">
       ) => {
         if (!isTerminalWorkflowRunStatus(terminalRun.status)) {
@@ -176,7 +176,7 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // Idempotent success: the work is already done, so hand back the durable result instead
       // of failing the agent's recovery loop (e.g. resuming after a crash that actually finished).
       if (run.status === "completed" && mode === "resume") {
-        await markTerminalAttentionConsumed(run);
+        await markTerminalAttentionSettled(run);
         return parseToolResult(
           WorkflowResumeToolResultSchema,
           {
@@ -263,11 +263,12 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // refreshed record that reflects the dispatched terminal status; when the refresh failed
       // or lags, skip the marker and the wake settles as consumed from the tool result in
       // history on the next scan (worst case one redundant wake for a kernel-nested resume).
-      if (!isBackgroundDispatch && refreshedRun != null) {
-        const dispatchedStatus = WorkflowRunStatusSchema.safeParse(dispatched.status);
-        if (dispatchedStatus.success && refreshedRun.status === dispatchedStatus.data) {
-          await markTerminalAttentionConsumed(refreshedRun);
-        }
+      if (
+        !isBackgroundDispatch &&
+        refreshedRun != null &&
+        refreshedRun.status === dispatched.status
+      ) {
+        await markTerminalAttentionSettled(refreshedRun);
       }
 
       return parseToolResult(

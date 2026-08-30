@@ -92,9 +92,9 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     const hasBoundary = "afterBoundaryMessageId" in record;
     const boundaryRaw = record.afterBoundaryMessageId;
     // A present-but-invalid snapshot ("" or a non-string) is corruption, not a legacy record:
-    // demoting it to a boundaryless entry would misclassify a recorded boundary as unknowable
-    // provenance (parking its wake as indeterminate). Reject the entry; absence stays reserved
-    // for records that genuinely predate the field.
+    // demoting it to a boundaryless entry would misclassify a recorded boundary as legacy
+    // provenance (silently settling its wake as superseded). Reject the entry; absence stays
+    // reserved for records that genuinely predate the field.
     if (
       hasBoundary &&
       boundaryRaw !== null &&
@@ -157,9 +157,9 @@ export async function readAgentWorkflowRunReferences(
     }
     // For kernel-launched runs this file is the only durable invocation evidence, and callers
     // deciding wake delivery must distinguish "no reference" from "cannot know right now":
-    // flattening a transient read failure into [] would let the terminal drain tombstone the
-    // run's wake. Corrupted contents below stay self-healing because rereading cannot repair
-    // them, while a failed read can succeed later.
+    // flattening a transient read failure into [] would let the terminal drain settle the
+    // run's wake as superseded. Corrupted contents below stay self-healing because rereading
+    // cannot repair them, while a failed read can succeed later.
     throw error;
   }
   try {

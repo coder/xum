@@ -119,7 +119,7 @@ export async function recordBackgroundWorkflowRunReference(
   // failure must not be persisted as a verified-empty boundary (null): record without the
   // field instead, so the run stays rediscoverable (listAgentReferencedWorkflowRunIds) and a
   // later workflow_resume re-record can repair provenance, while the unverifiable boundary
-  // defers wake delivery (indeterminate) instead of guessing from wall-clock order.
+  // fails safe to a not-current wake instead of guessing from wall-clock order.
   let afterBoundaryMessageId: string | null | undefined;
   const taskService = config.taskService;
   if (config.workspaceId != null && taskService?.getWorkflowInvocationBoundaryMessageId != null) {

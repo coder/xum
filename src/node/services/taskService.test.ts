@@ -6867,7 +6867,7 @@ describe("TaskService", () => {
     });
   });
 
-  test("transient run-store read failures defer the wake instead of tombstoning it", async () => {
+  test("transient run-store read failures defer the wake instead of dropping it", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const sendMessage = mock(

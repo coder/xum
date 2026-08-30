@@ -9145,9 +9145,9 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
 
       // The drain's synthetic coalesced prompt carries no workflow-result metadata. After a
-      // crash between durable acceptance and the outbox delivery mark, this row is the only
-      // evidence the result already reached history; it must read as consumption or restart
-      // recovery injects the same terminal result again.
+      // crash between durable acceptance and the settled-marker write, this row is the only
+      // evidence the result already reached history; it must read as consumption or the next
+      // sweep injects the same terminal result again.
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage(
@@ -9337,7 +9337,8 @@ describe("WorkspaceService workflow invocation events", () => {
       );
       try {
         // The drain distinguishes a read failure (retain and retry) from supersession
-        // (tombstone); the boolean view stays fail-safe false for non-destructive callers.
+        // (settle as superseded); the boolean view stays fail-safe false for non-destructive
+        // callers.
         expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
           "indeterminate"
         );
@@ -9405,7 +9406,7 @@ describe("WorkspaceService workflow invocation events", () => {
 
       // The sidecar is the only invocation evidence for kernel-launched runs: an unreadable
       // file must read as "cannot know right now", not "no reference", or the drain would
-      // tombstone the wake on a transient storage fault.
+      // settle the wake as superseded on a transient storage fault.
       const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
       await fsPromises.rm(sidecarPath);
       await fsPromises.mkdir(sidecarPath);

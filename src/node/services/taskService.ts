@@ -7809,16 +7809,10 @@ export class TaskService implements AgentTaskIntegration {
             workspace.id,
             TerminalAttentionStore.notificationId("workflow_run", run.id, run.updatedAt)
           );
-          if (marker != null && marker.status !== "pending") {
+          if (marker != null) {
             continue;
           }
-          let runIds = this.pendingWorkflowRunAttention.get(workspace.id);
-          if (runIds == null) {
-            runIds = new Set();
-            this.pendingWorkflowRunAttention.set(workspace.id, runIds);
-          }
-          if (!runIds.has(run.id)) {
-            runIds.add(run.id);
+          if (this.queueWorkflowRunAttention(workspace.id, run.id)) {
             queuedCount += 1;
           }
           queuedForWorkspace = true;
@@ -7946,13 +7940,22 @@ export class TaskService implements AgentTaskIntegration {
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
-    let runIds = this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId);
+    this.queueWorkflowRunAttention(params.ownerWorkspaceId, params.runId);
+    this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
+  }
+
+  /** Returns true when the run was newly queued for this owner. */
+  private queueWorkflowRunAttention(ownerWorkspaceId: string, runId: string): boolean {
+    let runIds = this.pendingWorkflowRunAttention.get(ownerWorkspaceId);
     if (runIds == null) {
       runIds = new Set();
-      this.pendingWorkflowRunAttention.set(params.ownerWorkspaceId, runIds);
+      this.pendingWorkflowRunAttention.set(ownerWorkspaceId, runIds);
     }
-    runIds.add(params.runId);
-    this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
+    if (runIds.has(runId)) {
+      return false;
+    }
+    runIds.add(runId);
+    return true;
   }
 
   /**
@@ -8317,8 +8320,7 @@ export class TaskService implements AgentTaskIntegration {
       // Currentness can succeed (e.g. a direct invocation row) and this identity read still
       // fail transiently. Delivering without the recorded identity would bind the wake to the
       // newest agent-bearing history row, handing the run's output to an unrelated later
-      // synthetic turn's agent; defer to the bounded retry instead, like an unreadable run
-      // record.
+      // synthetic turn's agent; defer like an unreadable run record.
       return { outcome: "defer" };
     }
     const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
@@ -8704,17 +8706,14 @@ export class TaskService implements AgentTaskIntegration {
     }
     // Deliver one launch-identity group per drain, keyed by agentId AND recorded strict pin:
     // the whole coalesced prompt is handled under the single agentId/pin passed to
-    // sendMessage, so batching runs from different agents (or runs sharing an agentId but
-    // launched under different pins, e.g. an agent definition replaced between synthetic
-    // turns) would hand a restricted launch's (attacker-influenced) output to another
-    // launch's tool grants. The same applies to mixed batches: workspace-turn and sub-agent
-    // attention resumes under the conversation's own (history-walk) identity, so agent-bound
-    // workflow groups never share their send. Deferred groups stay pending and deliver on the
-    // re-armed retry drain; among agent-bound groups the newest launch goes first.
+    // sendMessage, so batching runs from different launch identities would hand a restricted
+    // launch's (attacker-influenced) output to another launch's tool grants. Mixed batches
+    // too: workspace-turn and sub-agent attention resumes under the conversation's own
+    // (history-walk) identity, so agent-bound workflow groups never share their send.
+    // Unselected groups stay queued for a later drain; the newest launch goes first.
     // Suppression revalidation below can only shrink the workspace-turn set, so gating on
     // pre-suppression candidates over-approximates non-workflow deliverables: the safe
-    // direction, deferring agent-bound groups to the retry drain rather than ever mixing
-    // launch identities in one send.
+    // direction, deferring agent-bound groups rather than ever mixing identities in one send.
     const hasNonWorkflowDeliverables =
       deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0;
     let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;

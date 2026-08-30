@@ -158,7 +158,7 @@ export class TerminalAttentionStore {
       notification.generationId
     );
     const existing = await this.get(notification.ownerWorkspaceId, id);
-    if (existing != null && existing.status !== "pending") {
+    if (existing != null) {
       return;
     }
     await this.write({
