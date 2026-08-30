@@ -2004,8 +2004,9 @@ describe("WorkspaceStore", () => {
       expect(clearedState.canInterrupt).toBe(false);
     });
 
-    it("routes live deltas through the keyed channel without bumping workspace state", () => {
+    it("routes live deltas through the keyed channel without bumping workspace state", async () => {
       const workspaceId = "fine-grained-deltas";
+      const flushMicrotasks = () => new Promise<void>((resolve) => queueMicrotask(resolve));
       const messageId = "stream-message";
       createAndAddWorkspace(store, workspaceId);
       const rawStore = getInternal<{
@@ -2013,7 +2014,17 @@ describe("WorkspaceStore", () => {
         streamingStatsStore: { bump: (key: string) => void };
         streamingMessageStore: { has: (key: string) => boolean };
         handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        processStreamEvent: (
+          id: string,
+          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
+          event: WorkspaceChatMessage
+        ) => void;
       }>(store);
+      // Dispatch below the caught-up buffering gate: the mock onChat retry loop
+      // resets transient.caughtUp whenever an await lets it advance, which would
+      // silently buffer later events. Hydration gating is covered elsewhere.
+      const dispatch = (event: WorkspaceChatMessage) =>
+        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
 
       rawStore.handleChatMessage(workspaceId, {
         type: "stream-start",
@@ -2037,7 +2048,6 @@ describe("WorkspaceStore", () => {
 
       const bump = spyOn(rawStore.states, "bump");
       const listener = mock(() => undefined);
-      const unsubscribe = store.subscribeStreamingMessage(workspaceId, messageId, listener);
       // A delta that adds a part creates a new display row, which only a
       // workspace bump can mount; within-part deltas stay row-local.
       const deltas: Array<{ event: WorkspaceChatMessage; createsRow: boolean }> = [
@@ -2101,22 +2111,38 @@ describe("WorkspaceStore", () => {
       ];
 
       const statsBump = spyOn(rawStore.streamingStatsStore, "bump");
+      const trailingRowId = () => {
+        const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const row = rows[i];
+          if ("historyId" in row && row.historyId === messageId) return row.id;
+        }
+        throw new Error("no displayed row for streaming message");
+      };
       bump.mockClear();
       for (const { event, createsRow } of deltas) {
         listener.mockClear();
         bump.mockClear();
         statsBump.mockClear();
-        rawStore.handleChatMessage(workspaceId, event);
         if (createsRow) {
+          dispatch(event);
           expect(bump).toHaveBeenCalledWith(workspaceId);
           expect(statsBump).toHaveBeenCalledWith(workspaceId);
         } else {
+          const unsubscribeRow = store.subscribeStreamingMessage(
+            workspaceId,
+            trailingRowId(),
+            listener
+          );
+          dispatch(event);
+          await flushMicrotasks();
           expect(bump).not.toHaveBeenCalled();
           expect(listener).toHaveBeenCalledTimes(1);
+          unsubscribeRow();
         }
       }
 
-      rawStore.handleChatMessage(workspaceId, {
+      dispatch({
         type: "reasoning-end",
         workspaceId,
         messageId,
@@ -2128,18 +2154,18 @@ describe("WorkspaceStore", () => {
         .getDisplayedMessages()
         .find((message) => message.type === "assistant" && message.historyId === messageId)!;
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).not.toBeNull();
+      const liveRowKey = `${workspaceId}\u0000${trailingRowId()}`;
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(true);
 
-      rawStore.handleChatMessage(
-        workspaceId,
+      dispatch(
         streamEndEvent(workspaceId, messageId, {
           parts: [{ type: "text", text: "hello world" }],
         })
       );
       // Terminal events release the keyed channel and stop overriding prop rows,
       // so transcript-level transforms (e.g. merged stream errors) survive.
-      expect(rawStore.streamingMessageStore.has(`${workspaceId}\u0000${messageId}`)).toBe(false);
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(false);
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).toBeNull();
-      unsubscribe();
     });
 
     it("releases the keyed channel when a background activity stop clears the stream", async () => {
@@ -2182,7 +2208,10 @@ describe("WorkspaceStore", () => {
         timestamp: 3,
       });
       await flush();
-      expect(rawStore.streamingMessageStore.has(`${workspaceId}\u0000msg-a`)).toBe(true);
+      const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
+      const liveRow = rows.find((row) => row.type === "assistant" && row.historyId === "msg-a")!;
+      const liveRowKey = `${workspaceId}\u0000${liveRow.id}`;
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(true);
 
       // Background the workspace, then let activity report the stream stopped:
       // no terminal chat event ever arrives, so the activity path must release
@@ -2196,7 +2225,7 @@ describe("WorkspaceStore", () => {
         workspaceId,
         createActivitySnapshot(11, { streaming: false })
       );
-      expect(rawStore.streamingMessageStore.has(`${workspaceId}\u0000msg-a`)).toBe(false);
+      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(false);
     });
 
     it("publishes the same accumulated text shown by the live channel", () => {

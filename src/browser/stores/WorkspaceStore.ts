@@ -1692,11 +1692,24 @@ export class WorkspaceStore {
   ): void {
     const messageId = aggregator.getActiveStreamMessageId();
     if (!messageId || this.pendingStreamingMessageBump.has(workspaceId)) return;
-    const key = getStreamingMessageKey(workspaceId, messageId);
-    this.pendingStreamingMessageBump.set(workspaceId, key);
+    this.pendingStreamingMessageBump.set(workspaceId, messageId);
     queueMicrotask(() => {
-      if (this.pendingStreamingMessageBump.get(workspaceId) !== key) return;
+      if (this.pendingStreamingMessageBump.get(workspaceId) !== messageId) return;
       this.pendingStreamingMessageBump.delete(workspaceId);
+      // Deltas extend the active message's trailing displayed row; keying the
+      // bump by that row wakes one subscriber instead of every row of the
+      // message. The list is freshly cached here, so leaf reads hit the cache.
+      const rows = aggregator.getDisplayedMessages();
+      let rowId: string | undefined;
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        if ("historyId" in row && row.historyId === messageId) {
+          rowId = row.id;
+          break;
+        }
+      }
+      if (rowId === undefined) return;
+      const key = getStreamingMessageKey(workspaceId, rowId);
       const previousKey = this.streamingMessageKeys.get(workspaceId);
       if (previousKey !== undefined && previousKey !== key) {
         this.streamingMessageStore.delete(previousKey);
@@ -1725,11 +1738,11 @@ export class WorkspaceStore {
 
   subscribeStreamingMessage(
     workspaceId: string,
-    messageId: string,
+    displayedId: string,
     listener: () => void
   ): () => void {
     return this.streamingMessageStore.subscribeKey(
-      getStreamingMessageKey(workspaceId, messageId),
+      getStreamingMessageKey(workspaceId, displayedId),
       listener
     );
   }
@@ -4389,12 +4402,21 @@ export class WorkspaceStore {
       if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {
         // Live tool-call UI is tied to the active stream context; clear it when replay
         // replaces history, reports no active stream, or reports a different stream ID.
+        const clearedAdvisorToolCallIds = new Set([
+          ...transient.liveAdvisorOutput.keys(),
+          ...transient.liveAdvisorReasoning.keys(),
+        ]);
         transient.liveBashOutput.clear();
         transient.liveAdvisorOutput.clear();
         transient.liveAdvisorReasoning.clear();
         transient.liveAdvisorPhase.clear();
         transient.liveWorkflowRuns.clear();
         transient.liveTaskIds.clear();
+        // delete() notifies subscribers, so mounted advisor cards re-read null
+        // instead of keeping pre-reconnect live output.
+        for (const toolCallId of clearedAdvisorToolCallIds) {
+          this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
+        }
       }
 
       if (sinceContext) {
@@ -5255,7 +5277,7 @@ export function useStreamingMessageDelta(
   return useSyncExternalStore(
     (listener) => {
       if (!workspaceId || !messageId) return () => undefined;
-      return store.subscribeStreamingMessage(workspaceId, messageId, listener);
+      return store.subscribeStreamingMessage(workspaceId, message.id, listener);
     },
     () => {
       if (!workspaceId || !messageId) return message;
