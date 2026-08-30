@@ -18,12 +18,8 @@ import {
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
 
-function makeConfig(rootDir: string): {
-  sessionsDir: string;
-  getSessionDir: (id: string) => string;
-} {
-  const sessionsDir = path.join(rootDir, "sessions");
-  return { sessionsDir, getSessionDir: (id: string) => path.join(sessionsDir, id) };
+function makeConfig(rootDir: string): { sessionsDir: string } {
+  return { sessionsDir: path.join(rootDir, "sessions") };
 }
 
 function payload(overrides: Partial<BashMonitorWakePayload> = {}): BashMonitorWakePayload {

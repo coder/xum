@@ -10,12 +10,8 @@ import {
   BashMonitorRegistryStore,
 } from "@/node/services/bashMonitorRegistryStore";
 
-function makeConfig(rootDir: string): {
-  sessionsDir: string;
-  getSessionDir: (id: string) => string;
-} {
-  const sessionsDir = path.join(rootDir, "sessions");
-  return { sessionsDir, getSessionDir: (id: string) => path.join(sessionsDir, id) };
+function makeConfig(rootDir: string): { sessionsDir: string } {
+  return { sessionsDir: path.join(rootDir, "sessions") };
 }
 
 function armedPayload(overrides: Partial<MonitorArmedPayload> = {}): MonitorArmedPayload {

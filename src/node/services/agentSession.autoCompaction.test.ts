@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 
-import type {
-  ProvidersConfigMap,
-  SendMessageOptions,
-  WorkspaceChatMessage,
-} from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
@@ -13,7 +9,7 @@ import {
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -390,8 +386,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
     const compactionModel = "openai:gpt-4o-mini";
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -648,8 +645,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const compactionModel = "openai:gpt-5.5";
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -699,8 +697,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-compact-thinking-default";
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
       loadConfigOrDefault: () => ({
         agentAiDefaults: {
           compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" },
@@ -783,7 +782,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("threads providers config into pre-send and mid-stream compaction checks", async () => {
     const workspaceId = "ws-auto-compaction-providers-config";
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { config, historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const providersConfig = {
@@ -795,7 +794,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
           },
         ],
       },
-    } as unknown as ProvidersConfigMap;
+    };
+    new ProvidersConfigStore(config.rootDir).saveProvidersConfig(providersConfig);
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
@@ -844,12 +844,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         void _queued;
       }),
     } as unknown as BackgroundProcessManager;
-
-    const config = {
-      srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
-      loadProvidersConfig: () => providersConfig,
-    } as unknown as Config;
 
     const session = new AgentSession({
       workspaceId,
@@ -967,8 +961,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -1077,8 +1073,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -1226,8 +1224,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     } as unknown as BackgroundProcessManager;
 
     const config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: (_workspaceId: string) => "/tmp",
+      loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
     const session = new AgentSession({

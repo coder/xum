@@ -12,8 +12,10 @@ import { createStartedTurnHandle, createStreamLifecycleMocks } from "./agentSess
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const config = {
+  rootDir: "/tmp",
+  sessionsDir: "/tmp",
   srcDir: "/tmp",
-  getSessionDir: (_workspaceId: string) => "/tmp",
+  loadConfigOrDefault: () => ({}),
 } as unknown as Config;
 
 // r30: family-message payload rows ride sendMessage as pre-turn rows so they

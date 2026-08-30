@@ -50,7 +50,9 @@ describe("AgentSession post-compaction context retry", () => {
 
   test("retries once without post-compaction injection on context_exceeded", async () => {
     const workspaceId = "ws";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
     const postCompactionPath = path.join(sessionDir, "post-compaction.json");
 
     await createPersistedPostCompactionState({
@@ -146,8 +148,10 @@ describe("AgentSession post-compaction context retry", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: sessionsDir,
+      sessionsDir,
       srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -221,7 +225,9 @@ describe("AgentSession post-compaction context retry", () => {
   // event) leave a child task running until the parent times out.
   test("recovery decision resolves only after the context retry startup outcome is known", async () => {
     const workspaceId = "ws-decision";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
@@ -299,8 +305,10 @@ describe("AgentSession post-compaction context retry", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: sessionsDir,
+      sessionsDir,
       srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -366,7 +374,9 @@ describe("AgentSession post-compaction context retry", () => {
   // settlement convinced the (dead) retry is still carrying the turn.
   test("a retry that starts and then fails terminally records separate per-attempt outcomes", async () => {
     const workspaceId = "ws-overlap";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
@@ -442,8 +452,10 @@ describe("AgentSession post-compaction context retry", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: sessionsDir,
+      sessionsDir,
       srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const session = new AgentSession({
