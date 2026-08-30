@@ -362,10 +362,8 @@ describe("router workflow routes", () => {
         getWorkflowContinuationSendOptions: mock(() => null),
         sendMessage: mock(async () => ({ success: true, data: undefined })),
       },
-      // Nonterminal run status changes reset any stale terminal notification; the stub keeps
-      // that call observable without wiring a full TaskService.
       taskService: {
-        resetWorkflowRunTerminalAttention: mock(async () => undefined),
+        noteWorkflowRunTerminalAttention: mock(() => undefined),
       },
       experimentsService: {
         isExperimentEnabled: mock(() => options.enabled),
@@ -956,7 +954,7 @@ export default function workflow() { return { reportMarkdown: "should not run" }
     await waitForRouterWorkflowStatus(client, "workspace-1", result.runId, "completed");
   });
 
-  test("crash-resumed background runs enqueue terminal attention on settle", async () => {
+  test("crash-resumed background runs note terminal attention on settle", async () => {
     const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
     await runStore.createRun({
       id: "wfr_crash_wake",
@@ -970,64 +968,26 @@ export default function workflow() { return { reportMarkdown: "should not run" }
     // Orphaned by a crash: durable status says running, but no live runner.
     await runStore.appendStatus("wfr_crash_wake", "running", "2026-05-29T00:00:01.000Z");
 
-    const enqueueWorkflowRunTerminalAttention = mock(async () => undefined);
+    const noteWorkflowRunTerminalAttention = mock(() => undefined);
     const context = createContext({ enabled: true });
     (context as unknown as Record<string, unknown>).taskService = {
-      enqueueWorkflowRunTerminalAttention,
-      resetWorkflowRunTerminalAttention: mock(async () => undefined),
+      noteWorkflowRunTerminalAttention,
     };
-    (
-      context.workspaceService as unknown as Record<string, unknown>
-    ).repairWorkflowRunReferenceBoundary = mock(async () => undefined);
     const client = createRouterClient(router(), { context });
 
-    // A read path triggers crash recovery; the resumed run's settle must land in the
-    // terminal-attention outbox instead of waiting for the next restart's sweep.
+    // A read path triggers crash recovery; the resumed run's settle must poke the drain
+    // instead of waiting for the next sweep.
     await client.workflows.listRuns({ workspaceId: "workspace-1" });
     await waitForRouterWorkflowStatus(client, "workspace-1", "wfr_crash_wake", "completed");
     const deadline = Date.now() + 5_000;
-    while (enqueueWorkflowRunTerminalAttention.mock.calls.length === 0 && Date.now() < deadline) {
+    while (noteWorkflowRunTerminalAttention.mock.calls.length === 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    expect(enqueueWorkflowRunTerminalAttention).toHaveBeenCalledWith({
+    expect(noteWorkflowRunTerminalAttention).toHaveBeenCalledWith({
       ownerWorkspaceId: "workspace-1",
       runId: "wfr_crash_wake",
       status: "completed",
     });
-  });
-
-  test("router-managed resume resets a stale terminal notification before restart", async () => {
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
-    await runStore.createRun({
-      id: "wfr_resume_reset",
-      workspaceId: "workspace-1",
-      workflow: { name: "demo", description: "Demo", scope: "built-in", executable: true },
-      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
-      args: {},
-      attentionPolicy: "notify_on_terminal",
-      now: "2026-05-29T00:00:00.000Z",
-    });
-
-    const context = createContext({ enabled: true });
-    const resetWorkflowRunTerminalAttention = (
-      context.taskService as unknown as {
-        resetWorkflowRunTerminalAttention: ReturnType<typeof mock>;
-      }
-    ).resetWorkflowRunTerminalAttention;
-    const client = createRouterClient(router(), { context });
-
-    await client.workflows.interrupt({ workspaceId: "workspace-1", runId: "wfr_resume_reset" });
-    resetWorkflowRunTerminalAttention.mockClear();
-
-    // The prior run's notification survives under the stable workflow_run:<runId> id as
-    // delivered/superseded; without a reset on restart, enqueueIfAbsent preserves that
-    // record and the resumed run's terminal wake is silently dropped.
-    await client.workflows.resume({ workspaceId: "workspace-1", runId: "wfr_resume_reset" });
-    expect(resetWorkflowRunTerminalAttention).toHaveBeenCalledWith({
-      ownerWorkspaceId: "workspace-1",
-      runId: "wfr_resume_reset",
-    });
-    await waitForRouterWorkflowStatus(client, "workspace-1", "wfr_resume_reset", "completed");
   });
 });
 

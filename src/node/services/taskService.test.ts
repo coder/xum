@@ -5965,7 +5965,7 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
@@ -6007,13 +6007,13 @@ describe("TaskService", () => {
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    // History unreadable at drain time: currentness is indeterminate, so the notification must
-    // stay pending for a later drain instead of being tombstoned as superseded.
+    // History unreadable at drain time: currentness is indeterminate, so the run must stay
+    // queued for a later drain or sweep instead of being settled as superseded.
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("indeterminate"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
@@ -6021,10 +6021,16 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+    const run = await runStore.getRun(runId);
+    expect(
+      await terminalAttentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+      )
+    ).toBeNull();
   });
 
-  test("deferred terminal wake-up retries on the bounded timer", async () => {
+  test("a deferred wake delivers on the next drain trigger", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_terminal_defer_retry";
@@ -6056,8 +6062,8 @@ describe("TaskService", () => {
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    // The first drain sees a transient storage fault that clears before the retry fires. An
-    // already-idle owner produces no other drain trigger, so only the bounded retry delivers.
+    // The first drain sees a transient storage fault: the run stays queued with no timer
+    // bookkeeping, and any later drain trigger (stream end, sweep) re-evaluates and delivers.
     let currentnessCalls = 0;
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => {
@@ -6065,158 +6071,30 @@ describe("TaskService", () => {
         return Promise.resolve(currentnessCalls === 1 ? "indeterminate" : "current");
       });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+
     (
-      taskService as unknown as { terminalAttentionDeferRetryDelayMs: number }
-    ).terminalAttentionDeferRetryDelayMs = 10;
-
-    await taskService.enqueueWorkflowRunTerminalAttention({
-      ownerWorkspaceId: parentId,
-      runId,
-      status: "completed",
-    });
+      taskService as unknown as { scheduleTerminalAttentionDrain(id: string): void }
+    ).scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
-    expect(sendMessage).not.toHaveBeenCalled();
-
-    // Real timers: poll until the armed retry fires and the follow-up drain delivers.
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline && sendMessage.mock.calls.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      await flushTerminalAttentionDrains(taskService);
-    }
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+    const run = await runStore.getRun(runId);
+    expect(
+      await terminalAttentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+      )
+    ).toMatchObject({ status: "delivered" });
   });
 
-  test("failed terminal attention enqueue is retained and retried on the bounded timer", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runId = "wfr_terminal_enqueue_retry";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
-    await runStore.createRun({
-      id: runId,
-      workspaceId: parentId,
-      workflow: {
-        name: "research",
-        description: "Research workflow",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
-      args: {},
-      attentionPolicy: "notify_on_terminal",
-      now: "2026-06-19T00:00:00.000Z",
-    });
-    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
-    await runStore.appendNextEvent(runId, {
-      type: "result",
-      at: "2026-06-19T00:00:02.000Z",
-      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
-    });
-    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
-
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const sendMessage = mock(
-      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
-    );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
-      mock(() => Promise.resolve("current"));
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    (
-      taskService as unknown as { terminalAttentionDeferRetryDelayMs: number }
-    ).terminalAttentionDeferRetryDelayMs = 10;
-
-    // The workflow terminal callback driving this enqueue is single-attempt, so when the
-    // first outbox write fails only the retained in-process retry can persist the wake.
-    const internalStore = (
-      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
-    ).terminalAttentionStore;
-    spyOn(internalStore, "enqueueIfAbsent").mockRejectedValueOnce(
-      new Error("EIO: outbox write failed")
-    );
-
-    await taskService.enqueueWorkflowRunTerminalAttention({
-      ownerWorkspaceId: parentId,
-      runId,
-      status: "completed",
-    });
-    await flushTerminalAttentionDrains(taskService);
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
-
-    // Real timers: poll until the armed retry re-enqueues and the follow-up drain delivers.
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline && sendMessage.mock.calls.length === 0) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      await flushTerminalAttentionDrains(taskService);
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
-  });
-
-  test("reset drops a retained terminal attention enqueue", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runId = "wfr_terminal_enqueue_reset";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
-    await runStore.createRun({
-      id: runId,
-      workspaceId: parentId,
-      workflow: {
-        name: "research",
-        description: "Research workflow",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
-      args: {},
-      attentionPolicy: "notify_on_terminal",
-      now: "2026-06-19T00:00:00.000Z",
-    });
-    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
-    await runStore.appendNextEvent(runId, {
-      type: "result",
-      at: "2026-06-19T00:00:02.000Z",
-      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
-    });
-    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
-
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const sendMessage = mock(
-      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
-    );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
-      mock(() => Promise.resolve("current"));
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const internalStore = (
-      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
-    ).terminalAttentionStore;
-    spyOn(internalStore, "enqueueIfAbsent").mockRejectedValueOnce(
-      new Error("EIO: outbox write failed")
-    );
-
-    await taskService.enqueueWorkflowRunTerminalAttention({
-      ownerWorkspaceId: parentId,
-      runId,
-      status: "completed",
-    });
-    // The run was reset (e.g. resumed) before the retry fired; the retained stale wake
-    // must be dropped instead of resurrected by the retry.
-    await taskService.resetWorkflowRunTerminalAttention({ ownerWorkspaceId: parentId, runId });
-
-    // Drive the armed retry directly so the outcome is deterministic under real timers.
-    await (
-      taskService as unknown as {
-        retryRetainedWorkflowTerminalEnqueues(ownerWorkspaceId: string): Promise<void>;
-      }
-    ).retryRetainedWorkflowTerminalEnqueues(parentId);
-    await flushTerminalAttentionDrains(taskService);
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
-  });
-
-  test("workspace removal drops retained terminal enqueues without recreating the outbox", async () => {
+  test("drains for a removed workspace drop queued workflow wakes without touching disk", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_terminal_enqueue_removed_owner";
@@ -6250,21 +6128,9 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const internalStore = (
-      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
-    ).terminalAttentionStore;
-    spyOn(internalStore, "enqueueIfAbsent").mockRejectedValueOnce(
-      new Error("EIO: outbox write failed")
-    );
 
-    await taskService.enqueueWorkflowRunTerminalAttention({
-      ownerWorkspaceId: parentId,
-      runId,
-      status: "completed",
-    });
-
-    // The owner is removed (config entry gone, session directory deleted) before the bounded
-    // retry fires; the retry must not recreate the deleted session directory or leave state
+    // The owner is removed (config entry gone, session directory deleted) before the drain
+    // runs; the drain must not recreate the deleted session directory or leave queued state
     // for a future workspace reusing the ID.
     const cfg = config.loadConfigOrDefault();
     for (const project of cfg.projects.values()) {
@@ -6274,24 +6140,48 @@ describe("TaskService", () => {
     const sessionDir = config.getSessionDir(parentId);
     await fsPromises.rm(sessionDir, { recursive: true, force: true });
 
-    await (
-      taskService as unknown as {
-        retryRetainedWorkflowTerminalEnqueues(ownerWorkspaceId: string): Promise<void>;
-      }
-    ).retryRetainedWorkflowTerminalEnqueues(parentId);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
     await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(existsSync(sessionDir)).toBe(false);
-    const retained = (
+    const queued = (
       taskService as unknown as {
-        retainedWorkflowTerminalEnqueues: Map<string, Map<string, unknown>>;
+        pendingWorkflowRunAttention: Map<string, Set<string>>;
       }
-    ).retainedWorkflowTerminalEnqueues;
-    expect(retained.has(parentId)).toBe(false);
+    ).pendingWorkflowRunAttention;
+    expect(queued.has(parentId)).toBe(false);
   });
 
-  test("startup recovery replaces a stale terminal record from an older run generation", async () => {
+  test("a legacy pending workflow outbox record is deleted by the next drain", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { taskService } = createTaskServiceHarness(config);
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const legacy = await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: "wfr_legacy_outbox",
+    });
+    assert(legacy, "legacy workflow attention must enqueue");
+
+    await (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention(parentId);
+
+    // Deleted outright rather than superseded: workflow wakes are re-derived from run
+    // records now, so a pre-reconciler pending record is dead state that would otherwise
+    // hold the drain hot forever.
+    expect(await terminalAttentionStore.get(parentId, legacy.id)).toBeNull();
+  });
+
+  test("the sweep re-queues a resumed run's new terminal generation past the old delivered marker", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_recovery_stale_generation";
@@ -6320,102 +6210,37 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const recover = () =>
+    const sweep = () =>
       (
         taskService as unknown as {
-          recoverTerminalWorkflowRunAttentionNotifications(): Promise<number>;
+          sweepWorkflowRunTerminalAttention(): Promise<number>;
         }
-      ).recoverTerminalWorkflowRunAttentionNotifications();
+      ).sweepWorkflowRunTerminalAttention();
 
-    // First generation delivers normally, leaving a delivered record newer than the run's
-    // terminal transition; recovery must not duplicate a record representing this outcome.
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    // First generation delivers normally, leaving a delivered marker bound to that terminal
+    // generation; the sweep must not re-queue an already-settled generation.
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "failed",
     });
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(await recover()).toBe(0);
+    expect(await sweep()).toBe(0);
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(1);
 
-    // The resumed run reaches terminal again after the delivered record was written, and the
-    // process crashed before reset-then-enqueue ran (no in-memory reset marker survives the
-    // restart). Recovery must replace the stale delivered record instead of letting
-    // enqueueIfAbsent silently absorb the newer generation's wake.
+    // The resumed run reaches terminal again with a newer updatedAt; the old delivered marker
+    // belongs to the previous generation, so the sweep re-queues the wake without any reset
+    // bookkeeping having run.
     await runStore.appendStatus(runId, "running", new Date(Date.now() + 30_000).toISOString(), {
       allowFailedCheckpointRetry: true,
     });
     await runStore.appendStatus(runId, "failed", new Date(Date.now() + 60_000).toISOString());
 
-    expect(await recover()).toBe(1);
+    expect(await sweep()).toBe(1);
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(2);
-  });
-
-  test("a failed reset is completed by the next terminal enqueue", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runId = "wfr_reset_retained";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
-    await runStore.createRun({
-      id: runId,
-      workspaceId: parentId,
-      workflow: {
-        name: "research",
-        description: "Research workflow",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
-      args: {},
-      attentionPolicy: "notify_on_terminal",
-      now: "2026-06-19T00:00:00.000Z",
-    });
-    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
-    await runStore.appendNextEvent(runId, {
-      type: "result",
-      at: "2026-06-19T00:00:02.000Z",
-      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
-    });
-    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
-
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const sendMessage = mock(
-      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
-    );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
-      mock(() => Promise.resolve("current"));
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // First settle delivers normally, leaving a delivered record under the stable id.
-    await taskService.enqueueWorkflowRunTerminalAttention({
-      ownerWorkspaceId: parentId,
-      runId,
-      status: "completed",
-    });
-    await flushTerminalAttentionDrains(taskService);
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-
-    // The restart's reset fails transiently; callers swallow the rejection, so only the
-    // retained pending reset can stop the delivered record from absorbing the next enqueue.
-    const internalStore = (
-      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
-    ).terminalAttentionStore;
-    spyOn(internalStore, "delete").mockRejectedValueOnce(new Error("EIO: outbox delete failed"));
-    await taskService.resetWorkflowRunTerminalAttention({ ownerWorkspaceId: parentId, runId });
-
-    // The resumed run settles again: the enqueue completes the reset and delivers fresh.
-    await taskService.enqueueWorkflowRunTerminalAttention({
-      ownerWorkspaceId: parentId,
-      runId,
-      status: "completed",
-    });
-    await flushTerminalAttentionDrains(taskService);
-    expect(sendMessage).toHaveBeenCalledTimes(2);
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
   test("workflow wake restriction recovery stops at a context reset boundary", async () => {
@@ -6475,7 +6300,7 @@ describe("TaskService", () => {
       })
     );
 
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
@@ -6541,7 +6366,7 @@ describe("TaskService", () => {
         synthetic: true,
       })
     );
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId: "wfr_policy_restore",
       status: "completed",
@@ -6557,7 +6382,7 @@ describe("TaskService", () => {
       parentId,
       createMuxMessage("manual-unrestricted", "user", "carry on", { timestamp: 1_200 })
     );
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId: "wfr_policy_lifted",
       status: "completed",
@@ -6624,7 +6449,7 @@ describe("TaskService", () => {
         createMuxMessage(`assistant-${i}`, "assistant", `progress ${i}`, { timestamp: 1_001 + i })
       );
     }
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
@@ -6700,7 +6525,7 @@ describe("TaskService", () => {
       agentId: "plan",
     });
 
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
@@ -6769,19 +6594,12 @@ describe("TaskService", () => {
       agentId: "plan",
     });
 
-    // Seed the store directly so ONE drain observes both pending notifications; per-enqueue
-    // drains would deliver them separately without exercising the coalescing path.
+    // Seed the in-memory queue directly so ONE drain observes both runs; per-note drains
+    // would deliver them separately without exercising the coalescing path.
     const terminalAttentionStore = new TerminalAttentionStore(config);
-    await terminalAttentionStore.enqueueIfAbsent({
-      ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: "wfr_split_plan",
-    });
-    await terminalAttentionStore.enqueueIfAbsent({
-      ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: "wfr_split_exec",
-    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set(["wfr_split_plan", "wfr_split_exec"]));
     await drain(parentId);
 
     // The newest launch's group delivers first, alone, under its own agent.
@@ -6866,16 +6684,13 @@ describe("TaskService", () => {
     });
 
     const terminalAttentionStore = new TerminalAttentionStore(config);
-    await terminalAttentionStore.enqueueIfAbsent({
-      ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: "wfr_pin_split_pinned",
-    });
-    await terminalAttentionStore.enqueueIfAbsent({
-      ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: "wfr_pin_split_unpinned",
-    });
+    // Seed the in-memory queue directly so ONE drain observes both runs.
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(
+      parentId,
+      new Set(["wfr_pin_split_pinned", "wfr_pin_split_unpinned"])
+    );
     await drain(parentId);
 
     // The newest launch delivers first, alone, without the other launch's pin.
@@ -6957,11 +6772,9 @@ describe("TaskService", () => {
       sourceKind: "workspace_turn",
       sourceId: "wst_mixed_handle",
     });
-    await terminalAttentionStore.enqueueIfAbsent({
-      ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: runId,
-    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
     await drain(parentId);
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -7040,7 +6853,7 @@ describe("TaskService", () => {
       agentId: "plan",
     });
 
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
@@ -7062,41 +6875,39 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
     const terminalAttentionStore = new TerminalAttentionStore(config);
+    const queued = (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention;
 
     // run.json exists but is unreadable (EISDIR): potentially transient, so the wake must
-    // stay pending for a later drain instead of being durably tombstoned.
+    // stay queued for a later drain or sweep instead of being dropped.
     const unreadableRunId = "wfr_unreadable";
     await fsPromises.mkdir(
       path.join(config.getSessionDir(parentId), "workflows", unreadableRunId, "run.json"),
       { recursive: true }
     );
-    await terminalAttentionStore.enqueueIfAbsent({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: unreadableRunId,
+      runId: unreadableRunId,
+      status: "completed",
     });
-    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+    expect(queued.get(parentId)?.has(unreadableRunId)).toBe(true);
 
-    // A definitively missing run (ENOENT) is still tombstoned, not deferred forever.
-    await terminalAttentionStore.enqueueIfAbsent({
+    // A definitively missing run (ENOENT) is dropped from the queue: the sweep re-derives
+    // owed wakes from run records, so nothing durable is needed to keep it away.
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: "wfr_missing",
+      runId: "wfr_missing",
+      status: "completed",
     });
-    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.get(parentId, "workflow_run:wfr_missing")).toMatchObject({
-      status: "superseded",
-    });
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+    expect(queued.get(parentId)?.has("wfr_missing")).toBe(false);
+    expect(queued.get(parentId)?.has(unreadableRunId)).toBe(true);
+    expect(await terminalAttentionStore.get(parentId, "workflow_run:wfr_missing")).toBeNull();
   });
 
   test("wake defers when the launch-identity read fails after currentness succeeds", async () => {
@@ -7129,27 +6940,35 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
     const terminalAttentionStore = new TerminalAttentionStore(config);
 
     // ...but the launch-identity read fails transiently (EISDIR). Delivering without the
     // recorded identity would bind the wake to the newest agent-bearing history row, so the
-    // wake must stay pending for the retry drain.
+    // wake must stay queued for the retry drain.
     await fsPromises.mkdir(path.join(config.getSessionDir(parentId), "agent-workflow-runs.json"), {
       recursive: true,
     });
-    await terminalAttentionStore.enqueueIfAbsent({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
-      sourceKind: "workflow_run",
-      sourceId: runId,
+      runId,
+      status: "completed",
     });
-    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+    expect(
+      (
+        taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+      ).pendingWorkflowRunAttention
+        .get(parentId)
+        ?.has(runId)
+    ).toBe(true);
+    const run = await runStore.getRun(runId);
+    expect(
+      await terminalAttentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+      )
+    ).toBeNull();
   });
 
   test("wake re-pins the selected group's recorded launch pin, not the newest row's", async () => {
@@ -7211,7 +7030,7 @@ describe("TaskService", () => {
       agentId: "exec",
       strictAgentResolution: null,
     });
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId: "wfr_pin_unpinned",
       status: "completed",
@@ -7232,7 +7051,7 @@ describe("TaskService", () => {
       agentId: "plan",
       strictAgentResolution: { expectedScope: "built-in" },
     });
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId: "wfr_pin_recorded",
       status: "completed",
@@ -7286,7 +7105,7 @@ describe("TaskService", () => {
         disableWorkspaceAgents: true,
       } as unknown as Parameters<typeof createMuxMessage>[3])
     );
-    await taskService.enqueueWorkflowRunTerminalAttention({
+    taskService.noteWorkflowRunTerminalAttention({
       ownerWorkspaceId: parentId,
       runId,
       status: "completed",
