@@ -1411,6 +1411,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 
   it("ignores invalid persisted WebSocket transport values", async () => {
     await withTempConfig(async (config, factory) => {
+      // eslint-disable-next-line local/no-sync-fs-methods -- Test setup writes intentionally invalid config bytes.
       fs.writeFileSync(
         path.join(config.rootDir, "providers.jsonc"),
         JSON.stringify({
