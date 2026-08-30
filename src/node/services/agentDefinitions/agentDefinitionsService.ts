@@ -942,7 +942,7 @@ export async function resolveAgentFrontmatter(
 
 export type AgentDefinitionsContext = Pick<
   ORPCContext,
-  "config" | "aiService" | "experimentsService"
+  "config" | "aiService" | "experimentsService" | "initStateManager"
 >;
 
 export async function resolveAgentDiscoveryContext(
@@ -980,7 +980,7 @@ export async function listAgentDefinitions(
     includeDisabled?: boolean;
   }
 ) {
-  if (input.workspaceId) await context.aiService.waitForInit(input.workspaceId);
+  if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
   const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
     EXPERIMENT_IDS.AGENT_PLUGINS
@@ -1041,7 +1041,7 @@ export async function getAgentDefinition(
     agentId: AgentId;
   }
 ) {
-  if (input.workspaceId) await context.aiService.waitForInit(input.workspaceId);
+  if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
   return readAgentDefinition(runtime, discoveryPath, input.agentId, {
     includeAgentPlugins: context.experimentsService.isExperimentEnabled(

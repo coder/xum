@@ -1054,7 +1054,10 @@ export async function readAgentSkill(
   throw new Error(`Agent skill not found: ${name}`);
 }
 
-export type AgentSkillsContext = Pick<ORPCContext, "config" | "aiService" | "experimentsService">;
+export type AgentSkillsContext = Pick<
+  ORPCContext,
+  "config" | "aiService" | "experimentsService" | "initStateManager"
+>;
 
 async function resolveAgentSkillDiscoveryContext(
   context: AgentSkillsContext,
@@ -1115,7 +1118,7 @@ async function getAgentSkillContext(
   context: AgentSkillsContext,
   input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
 ) {
-  if (input.workspaceId) await context.aiService.waitForInit(input.workspaceId);
+  if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   return resolveAgentSkillDiscoveryContext(context, input);
 }
 

@@ -72,8 +72,8 @@ describe("WorkflowService request orchestration", () => {
     const context = {
       workflowRuntimeFactory: new QuickJSRuntimeFactory(),
       config,
+      initStateManager: { waitForInit },
       aiService: {
-        waitForInit,
         resolveXumToolScopeForWorkspace: mock((_metadata, _runtime, executionPath) => ({
           type: "project",
           xumHome: temp.path,

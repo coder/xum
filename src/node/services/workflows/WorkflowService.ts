@@ -18,6 +18,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import type { TaskService } from "@/node/services/taskService";
@@ -970,6 +971,7 @@ export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are d
 export interface WorkflowServiceContext {
   config: Config;
   aiService: AIService;
+  initStateManager: InitStateManager;
   workspaceService: WorkspaceService;
   taskService: TaskService;
   experimentsService: ExperimentsService;
@@ -998,7 +1000,7 @@ export async function resolveWorkflowContext(
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
     throw new Error(DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE);
   }
-  await context.aiService.waitForInit(workspaceId);
+  await context.initStateManager.waitForInit(workspaceId);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) {
     throw new Error(metadataResult.error);
