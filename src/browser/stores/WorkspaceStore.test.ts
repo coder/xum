@@ -4688,6 +4688,10 @@ describe("WorkspaceStore", () => {
       ]);
 
       createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+      }>(store);
+      const advisorKey = `${workspaceId}\u0000call-advisor-output-delete`;
 
       const hasLiveOutput = await waitUntil(
         () =>
@@ -4695,6 +4699,7 @@ describe("WorkspaceStore", () => {
           "stale partial advice"
       );
       expect(hasLiveOutput).toBe(true);
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(true);
 
       releaseDelete?.();
 
@@ -4702,6 +4707,9 @@ describe("WorkspaceStore", () => {
         () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete") === null
       );
       expect(clearedLiveOutput).toBe(true);
+      // The delete-time sweep must release the keyed channel as well: with the
+      // transient entry gone, no later sweep can rediscover this key.
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
     });
 
     it("replays pre-caught-up advisor output after full replay catches up", async () => {

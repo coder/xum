@@ -2021,12 +2021,16 @@ export class WorkspaceStore {
     for (const toolCallId of Array.from(transient.liveAdvisorReasoning.keys())) {
       if (!activeAdvisorToolCallIds.has(toolCallId)) {
         transient.liveAdvisorReasoning.delete(toolCallId);
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
       }
     }
 
     for (const toolCallId of Array.from(transient.liveAdvisorOutput.keys())) {
       if (!activeAdvisorToolCallIds.has(toolCallId)) {
         transient.liveAdvisorOutput.delete(toolCallId);
+        // Release the keyed channel version too; once the transient entry is
+        // gone, the workspace-removal sweep can no longer discover this key.
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
       }
     }
 
