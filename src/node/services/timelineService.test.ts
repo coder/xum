@@ -60,7 +60,7 @@ describe("TimelineService", () => {
   });
 
   function timelinePath(workspaceId = WORKSPACE_ID): string {
-    return path.join(path.join(config.sessionsDir, workspaceId), TIMELINE_FILE_NAME);
+    return path.join(config.sessionsDir, workspaceId, TIMELINE_FILE_NAME);
   }
 
   test("continues monotonic sequences after service restart", async () => {
@@ -424,12 +424,12 @@ describe("TimelineService", () => {
     });
 
     const archived = await fs.readFile(
-      path.join(path.join(config.sessionsDir, WORKSPACE_ID), "chat-archive.jsonl"),
+      path.join(config.sessionsDir, WORKSPACE_ID, "chat-archive.jsonl"),
       "utf-8"
     );
     expect(archived).toContain('"id":"target"');
     const active = await fs.readFile(
-      path.join(path.join(config.sessionsDir, WORKSPACE_ID), "chat.jsonl"),
+      path.join(config.sessionsDir, WORKSPACE_ID, "chat.jsonl"),
       "utf-8"
     );
     expect(active).not.toContain('"id":"target"');

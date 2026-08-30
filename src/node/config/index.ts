@@ -23,7 +23,6 @@ import type {
   AppConfigOnDisk,
   BaseProviderConfig as ProviderConfig,
   ModelFallbacks,
-  ProvidersConfig as CanonicalProvidersConfig,
 } from "@/common/config/schemas";
 import { DEFAULT_MODEL_FALLBACKS, sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
@@ -85,7 +84,7 @@ import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
-export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig, CanonicalProvidersConfig };
+export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
 export { FileLeaseManager } from "./fileLeaseManager";
 export { ProvidersConfigStore, type ProvidersConfig } from "./providersConfigStore";
 export { SecretsStore } from "./secretsStore";
@@ -162,7 +161,7 @@ function parseOptionalNonEmptyString(value: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-export interface LegacyTaskVariantGroup {
+interface LegacyTaskVariantGroup {
   groupId: string;
   index: number;
   total: number;
@@ -170,7 +169,7 @@ export interface LegacyTaskVariantGroup {
   label?: string;
 }
 
-export interface LegacyTaskVariantWorkspace {
+interface LegacyTaskVariantWorkspace {
   id: string;
   projectPath: string;
   parentWorkspaceId?: string;
@@ -899,7 +898,6 @@ export class Config {
   readonly sessionsDir: string;
   readonly srcDir: string;
   private readonly configFile: string;
-  private readonly sessionLocator: WorkspaceSessionLocator;
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly emitter = new EventEmitter();
   /**
@@ -913,12 +911,8 @@ export class Config {
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
   private migrationPersist: Promise<void> | null = null;
 
-  constructor(
-    rootDir?: string,
-    providersConfigStore?: ProvidersConfigStore,
-    sessionLocator = new WorkspaceSessionLocator(rootDir)
-  ) {
-    this.sessionLocator = sessionLocator;
+  constructor(rootDir?: string, providersConfigStore?: ProvidersConfigStore) {
+    const sessionLocator = new WorkspaceSessionLocator(rootDir);
     this.rootDir = sessionLocator.rootDir;
     this.sessionsDir = sessionLocator.sessionsDir;
     this.srcDir = sessionLocator.srcDir;
@@ -1654,7 +1648,7 @@ export class Config {
                 }
 
                 const usagePath = path.join(
-                  path.join(this.sessionLocator.sessionsDir, sessionEntry.name),
+                  path.join(this.sessionsDir, sessionEntry.name),
                   "session-usage.json"
                 );
                 if (fs.existsSync(usagePath)) {
@@ -2675,7 +2669,7 @@ export class Config {
 
           // Try loading metadata with basename as ID (works for old workspaces)
           const metadataPath = path.join(
-            path.join(this.sessionLocator.sessionsDir, workspaceBasename),
+            path.join(this.sessionsDir, workspaceBasename),
             "metadata.json"
           );
           try {
@@ -2727,7 +2721,7 @@ export class Config {
           // remains registered.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
           const legacyMetadataPath = path.join(
-            path.join(this.sessionLocator.sessionsDir, legacyId),
+            path.join(this.sessionsDir, legacyId),
             "metadata.json"
           );
           try {
@@ -3033,7 +3027,7 @@ export class Config {
             workspaceBasename === legacyId ? [legacyId] : [legacyId, workspaceBasename];
           for (const candidateId of candidateIds) {
             const candidatePath = path.join(
-              path.join(this.sessionLocator.sessionsDir, candidateId),
+              path.join(this.sessionsDir, candidateId),
               "metadata.json"
             );
             let candidateRaw: string | undefined;
@@ -3503,18 +3497,18 @@ export class Config {
 export interface ConfigStores {
   config: Config;
   sessionLocator: WorkspaceSessionLocator;
-  providersConfig: ProvidersConfigStore;
-  secrets: SecretsStore;
-  fileLeases: FileLeaseManager;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: SecretsStore;
+  fileLeaseManager: FileLeaseManager;
 }
 
 export function createConfigStores(rootDir?: string): ConfigStores {
   const sessionLocator = new WorkspaceSessionLocator(rootDir);
-  const providersConfig = new ProvidersConfigStore(sessionLocator.rootDir);
-  const secrets = new SecretsStore(sessionLocator.rootDir);
-  const fileLeases = new FileLeaseManager(sessionLocator.rootDir);
-  const config = new Config(sessionLocator.rootDir, providersConfig, sessionLocator);
-  return { config, sessionLocator, providersConfig, secrets, fileLeases };
+  const providersConfigStore = new ProvidersConfigStore(sessionLocator.rootDir);
+  const secretsStore = new SecretsStore(sessionLocator.rootDir);
+  const fileLeaseManager = new FileLeaseManager(sessionLocator.rootDir);
+  const config = new Config(sessionLocator.rootDir, providersConfigStore);
+  return { config, sessionLocator, providersConfigStore, secretsStore, fileLeaseManager };
 }
 
 const defaultStores = createConfigStores();

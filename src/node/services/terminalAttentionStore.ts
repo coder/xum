@@ -82,7 +82,7 @@ export class TerminalAttentionStore {
 
   private dir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "TerminalAttentionStore requires ownerWorkspaceId");
-    return path.join(path.join(this.config.sessionsDir, ownerWorkspaceId), TERMINAL_ATTENTION_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, TERMINAL_ATTENTION_DIR);
   }
 
   /** Stable id keyed by source and optional execution generation for per-assignment idempotency. */

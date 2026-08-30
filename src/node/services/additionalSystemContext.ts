@@ -26,7 +26,7 @@ export function getAdditionalSystemContextPath(
   config: SessionDirProvider,
   workspaceId: string
 ): string {
-  return path.join(path.join(config.sessionsDir, workspaceId), ADDITIONAL_SYSTEM_CONTEXT_FILENAME);
+  return path.join(config.sessionsDir, workspaceId, ADDITIONAL_SYSTEM_CONTEXT_FILENAME);
 }
 
 export function getAdditionalSystemContextDisabledPath(

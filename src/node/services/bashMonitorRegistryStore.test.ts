@@ -78,7 +78,7 @@ describe("BashMonitorRegistryStore", () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);
     await store.upsert(armedPayload());
-    const dir = path.join(path.join(config.sessionsDir, "owner-1"), BASH_MONITOR_REGISTRY_DIR);
+    const dir = path.join(config.sessionsDir, "owner-1", BASH_MONITOR_REGISTRY_DIR);
     await fsPromises.writeFile(path.join(dir, "bad.json"), "not json", "utf-8");
     await fsPromises.writeFile(
       path.join(dir, "wrong-shape.json"),

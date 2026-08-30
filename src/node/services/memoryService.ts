@@ -678,9 +678,7 @@ export class MemoryService extends EventEmitter {
             "Workspace memory is unavailable: no workspace is associated with this session"
           );
         }
-        return new LocalMemoryStore(
-          path.join(path.join(this.config.sessionsDir, ctx.workspaceId), "memory")
-        );
+        return new LocalMemoryStore(path.join(this.config.sessionsDir, ctx.workspaceId, "memory"));
       }
     }
   }

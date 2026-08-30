@@ -1411,12 +1411,15 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
 
   it("ignores invalid persisted WebSocket transport values", async () => {
     await withTempConfig(async (config, factory) => {
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        openai: {
-          apiKey: "sk-test",
-          webSocketTransportEnabled: "true",
-        },
-      } as unknown as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+      fs.writeFileSync(
+        path.join(config.rootDir, "providers.jsonc"),
+        JSON.stringify({
+          openai: {
+            apiKey: "sk-test",
+            webSocketTransportEnabled: "true",
+          },
+        })
+      );
 
       const result = await factory.createModel("openai:gpt-4.1-mini");
 

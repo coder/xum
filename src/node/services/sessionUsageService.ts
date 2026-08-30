@@ -139,7 +139,7 @@ export class SessionUsageService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), this.SESSION_USAGE_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, this.SESSION_USAGE_FILE);
   }
 
   private createEmptyUsageFile(): SessionUsageFile {

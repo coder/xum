@@ -841,7 +841,7 @@ export class BashMonitorWakeStore {
 
   private dir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "BashMonitorWakeStore requires ownerWorkspaceId");
-    return path.join(path.join(this.config.sessionsDir, ownerWorkspaceId), BASH_MONITOR_WAKE_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, BASH_MONITOR_WAKE_DIR);
   }
 
   /**

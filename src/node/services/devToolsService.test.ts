@@ -23,7 +23,7 @@ describe("DevToolsService removal gate (r64)", () => {
       workspaceId: liveId,
       startedAt: new Date().toISOString(),
     });
-    const liveFile = path.join(path.join(config.sessionsDir, liveId), "devtools.jsonl");
+    const liveFile = path.join(config.sessionsDir, liveId, "devtools.jsonl");
     expect(await fs.readFile(liveFile, "utf8")).toContain("run-1");
 
     // Removal-tombstoned workspace: with XUM_ALLOW_MULTIPLE_INSTANCES=1 a

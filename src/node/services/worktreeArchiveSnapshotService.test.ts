@@ -186,7 +186,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       recursive: true,
     });
     await fs.writeFile(
-      path.join(path.join(fixture.config.sessionsDir, fixture.workspaceName), "metadata.json"),
+      path.join(fixture.config.sessionsDir, fixture.workspaceName, "metadata.json"),
       JSON.stringify({ id: fixture.workspaceId }),
       "utf-8"
     );
@@ -256,9 +256,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       ?.workspaces[0];
     expect(storedWorkspace?.worktreeArchiveSnapshot).toBeUndefined();
     expect(
-      await pathExists(
-        path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), "archive-state")
-      )
+      await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
   });
 
@@ -510,7 +508,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       throw new Error("Expected staged patch path");
     }
     await fs.writeFile(
-      path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), stagedPatchPath),
+      path.join(fixture.config.sessionsDir, fixture.workspaceId, stagedPatchPath),
       "this is not a valid patch\n",
       "utf-8"
     );
@@ -561,9 +559,7 @@ describe("WorktreeArchiveSnapshotService", () => {
         ?.worktreeArchiveSnapshot
     ).toBeUndefined();
     expect(
-      await pathExists(
-        path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), "archive-state")
-      )
+      await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
   });
 
@@ -714,12 +710,9 @@ describe("WorktreeArchiveSnapshotService", () => {
       return cfg;
     });
 
-    await fs.rm(
-      path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), stagedPatchPath),
-      {
-        force: true,
-      }
-    );
+    await fs.rm(path.join(fixture.config.sessionsDir, fixture.workspaceId, stagedPatchPath), {
+      force: true,
+    });
     await fs.writeFile(
       path.join(fixture.workspacePath, "tracked.txt"),
       "base\ncommit one\ncommit two\nstaged change\nunstaged change\nextra drift\n",
@@ -876,12 +869,9 @@ describe("WorktreeArchiveSnapshotService", () => {
       return cfg;
     });
 
-    await fs.rm(
-      path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), stagedPatchPath),
-      {
-        force: true,
-      }
-    );
+    await fs.rm(path.join(fixture.config.sessionsDir, fixture.workspaceId, stagedPatchPath), {
+      force: true,
+    });
     runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
 
     const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
@@ -923,7 +913,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       if (
         typeof targetPath === "string" &&
         targetPath.endsWith(
-          path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), "archive-state")
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
       ) {
         throw new Error("snapshot cleanup failed");
@@ -943,7 +933,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       ).toEqual(captureResult.data);
       expect(
         await pathExists(
-          path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), "archive-state")
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
       ).toBe(true);
     } finally {
@@ -1059,7 +1049,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       ).toEqual(captureResult.data);
       expect(
         await pathExists(
-          path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), "archive-state")
+          path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
       ).toBe(false);
     } finally {
@@ -1116,9 +1106,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       Err({ kind: "confirm-lossy-untracked-files", paths: ["untracked.txt"] })
     );
     expect(
-      await pathExists(
-        path.join(path.join(fixture.config.sessionsDir, fixture.workspaceId), "archive-state")
-      )
+      await pathExists(path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state"))
     ).toBe(false);
   });
 

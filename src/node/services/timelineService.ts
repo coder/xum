@@ -526,7 +526,7 @@ export class TimelineService implements TimelineRecorder {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), TIMELINE_FILE_NAME);
+    return path.join(this.config.sessionsDir, workspaceId, TIMELINE_FILE_NAME);
   }
 
   private hasRecentSourceKey(workspaceId: string, sourceKey: string): boolean {

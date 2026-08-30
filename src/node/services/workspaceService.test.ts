@@ -22107,7 +22107,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
         // session's chat.jsonl was not recreated by a late guarded append.
         expect(await awaitPendingBranchSummary(newWorkspaceId)).toBeNull();
         expect(guardedAppendSpy).not.toHaveBeenCalled();
-        const chatFile = path.join(path.join(config.sessionsDir, newWorkspaceId), "chat.jsonl");
+        const chatFile = path.join(config.sessionsDir, newWorkspaceId, "chat.jsonl");
         const chatExists = await fsPromises.access(chatFile).then(
           () => true,
           () => false

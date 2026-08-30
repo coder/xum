@@ -381,7 +381,7 @@ describe("SessionTimingService", () => {
     emitCompletedStreamWithOneTool({ workspaceId, messageId, model, reasoningTokens: 2 });
     await service.waitForIdle(workspaceId);
 
-    const filePath = path.join(path.join(config.sessionsDir, workspaceId), "session-timing.json");
+    const filePath = path.join(config.sessionsDir, workspaceId, "session-timing.json");
     const raw = await fs.readFile(filePath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
     expect(typeof parsed).toBe("object");

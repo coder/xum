@@ -68,7 +68,7 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   // For integration tests (TEST_INTEGRATION=1), do NOT write dummy keys here (they would override
   // real env-backed credentials used by tests like name generation).
   if (!shouldRunIntegrationTests()) {
-    stores.providersConfig.saveProvidersConfig({
+    stores.providersConfigStore.saveProvidersConfig({
       anthropic: { apiKey: "test-key-for-ui-tests" },
     });
   }

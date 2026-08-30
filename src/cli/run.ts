@@ -519,8 +519,8 @@ async function main(): Promise<number> {
   const config = runStores.config;
 
   // Copy providers and secrets from real config to ephemeral config
-  const realProvidersStore = realStores.providersConfig;
-  const runProvidersStore = runStores.providersConfig;
+  const realProvidersStore = realStores.providersConfigStore;
+  const runProvidersStore = runStores.providersConfigStore;
   const existingProviders = realProvidersStore.loadProvidersConfig();
   const providersFile = path.join(config.rootDir, "providers.jsonc");
   await replacePrivateRunConfigFile(
@@ -531,7 +531,7 @@ async function main(): Promise<number> {
   );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
-  const existingSecrets = realStores.secrets.loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   const secretsFile = path.join(config.rootDir, "secrets.json");
   await replacePrivateRunConfigFile(
     secretsFile,
@@ -659,11 +659,7 @@ async function main(): Promise<number> {
     streamManager,
     turnRequestBuilderBindings,
   } = createCoreServices({
-    config,
-    sessionLocator: runStores.sessionLocator,
-    providersConfigStore: runStores.providersConfig,
-    secretsStore: runStores.secrets,
-    fileLeaseManager: runStores.fileLeases,
+    ...runStores,
     policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
@@ -692,7 +688,7 @@ async function main(): Promise<number> {
   // the refresh token on every use, so persisting rotations only to tempDir
   // would strand ~/.xum/providers.jsonc with a consumed (dead) refresh token
   // once this CLI session exits.
-  const realFileLeaseManager = realStores.fileLeases;
+  const realFileLeaseManager = realStores.fileLeaseManager;
   const realProviderService = new ProviderService(
     realConfig,
     policyService,

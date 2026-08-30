@@ -533,7 +533,7 @@ describe("HistoryService", () => {
         createMuxMessage("foreign-1", "assistant", "foreign row", { historySequence: 7 })
       );
       await fs.appendFile(
-        path.join(path.join(config.sessionsDir, workspaceId), "chat.jsonl"),
+        path.join(config.sessionsDir, workspaceId, "chat.jsonl"),
         foreignLine + "\n"
       );
       // Without the in-lock counter refresh this batch would assign stale
@@ -569,7 +569,7 @@ describe("HistoryService", () => {
         createMuxMessage("foreign-1", "assistant", "foreign row", { historySequence: 7 })
       );
       await fs.appendFile(
-        path.join(path.join(config.sessionsDir, workspaceId), "chat.jsonl"),
+        path.join(config.sessionsDir, workspaceId, "chat.jsonl"),
         foreignLine + "\n"
       );
 
@@ -2040,11 +2040,11 @@ describe("HistoryService", () => {
     }
 
     function chatPath(workspaceId: string): string {
-      return path.join(path.join(config.sessionsDir, workspaceId), "chat.jsonl");
+      return path.join(config.sessionsDir, workspaceId, "chat.jsonl");
     }
 
     function archivePath(workspaceId: string): string {
-      return path.join(path.join(config.sessionsDir, workspaceId), "chat-archive.jsonl");
+      return path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl");
     }
 
     it("rotates the sealed prefix into the archive when a boundary is appended", async () => {

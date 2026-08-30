@@ -166,7 +166,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     historyService,
     extensionMetadata,
     opts.analyticsService,
-    opts.goalServiceOptions
+    opts.goalServiceOptions,
+    providersConfigStore
   );
 
   // Default-construct when the caller (CLI) does not pass one: workspace MCP
@@ -278,7 +279,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.experimentsService,
     opts.sessionTimingService,
     streamManager,
-    secretsStore
+    secretsStore,
+    providersConfigStore
   );
   turnRequestBuilderBindings.workspaceHeartbeatService = workspaceService;
   // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,

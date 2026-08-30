@@ -635,7 +635,7 @@ describe("Config", () => {
       );
       // Basename-backed second candidate is unreadable: a directory at the
       // metadata.json path fails reads with EISDIR (non-ENOENT).
-      fs.mkdirSync(path.join(path.join(config.sessionsDir, "legacy-ws"), "metadata.json"), {
+      fs.mkdirSync(path.join(config.sessionsDir, "legacy-ws", "metadata.json"), {
         recursive: true,
       });
 

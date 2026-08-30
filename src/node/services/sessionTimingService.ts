@@ -331,7 +331,7 @@ export class SessionTimingService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), SESSION_TIMING_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, SESSION_TIMING_FILE);
   }
 
   private async readTimingFile(workspaceId: string): Promise<SessionTimingFile> {

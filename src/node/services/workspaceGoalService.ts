@@ -653,7 +653,8 @@ export class WorkspaceGoalService {
     private readonly historyService: HistoryService,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly analytics?: GoalLifecycleAnalyticsSink,
-    options: WorkspaceGoalServiceOptions = {}
+    options: WorkspaceGoalServiceOptions = {},
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
   ) {
     this.continuationCooldownMs =
       options.continuationCooldownMs ?? DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS;
@@ -1066,7 +1067,7 @@ export class WorkspaceGoalService {
   // doesn't re-assert and re-join the same way.
   private resolveSessionFilePath(workspaceId: string, fileName: string): string {
     assert(workspaceId.trim().length > 0, "WorkspaceGoalService requires non-empty workspaceId");
-    return path.join(path.join(this.config.sessionsDir, workspaceId), fileName);
+    return path.join(this.config.sessionsDir, workspaceId, fileName);
   }
 
   private getFilePath(workspaceId: string): string {
@@ -2642,7 +2643,7 @@ export class WorkspaceGoalService {
   }
 
   private getProvidersConfigForPricing(): ProvidersConfigMap | null {
-    const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
+    const providersConfig = this.providersConfigStore.loadProvidersConfig();
     return providersConfig as ProvidersConfigMap | null;
   }
 

@@ -2378,7 +2378,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly streamManager?: StreamManager,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
   ) {
     super();
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
@@ -8488,7 +8489,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingExternalEditorRecordings = new Map<string, number>();
 
   private externalEditorMarkerPath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), "external-editor-opened");
+    return path.join(this.config.sessionsDir, workspaceId, "external-editor-opened");
   }
 
   /**
@@ -10291,7 +10292,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           hasBudgetedResumableGoal(goal) &&
           !modelHasPricingData(
             normalized.data.model,
-            new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig()
+            this.providersConfigStore.loadProvidersConfig()
           )
         ) {
           return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);

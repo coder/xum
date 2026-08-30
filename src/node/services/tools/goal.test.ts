@@ -598,7 +598,7 @@ describe("goal tools", () => {
       tool.execute!({ summary: "Implemented and verified." }, mockToolCallOptions)
     );
     const storedRaw = await fs.readFile(
-      path.join(path.join(config.sessionsDir, workspaceId), "goal.json"),
+      path.join(config.sessionsDir, workspaceId, "goal.json"),
       "utf-8"
     );
     const storedGoal = JSON.parse(storedRaw) as GoalRecordV1;

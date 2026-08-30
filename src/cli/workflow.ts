@@ -22,8 +22,8 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { ProvidersConfigStore, SecretsStore, createConfigStores } from "@/node/config";
-import type { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
+import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
@@ -208,15 +208,20 @@ function generateWorkspaceId(): string {
   return `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function copyPersistentConfig(realConfig: Config, config: Config): Promise<void> {
-  const realProvidersStore = new ProvidersConfigStore(realConfig.rootDir);
+async function copyPersistentConfig(
+  realStores: ConfigStores,
+  runStores: ConfigStores
+): Promise<void> {
+  const realConfig = realStores.config;
+  const config = runStores.config;
+  const realProvidersStore = realStores.providersConfigStore;
   const existingProviders = realProvidersStore.loadProvidersConfig();
   if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
-    new ProvidersConfigStore(config.rootDir).saveProvidersConfig(existingProviders);
+    runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
-  const existingSecrets = new SecretsStore(realConfig.rootDir).loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
-    await new SecretsStore(config.rootDir).saveSecretsConfig(existingSecrets);
+    await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
   const existingConfig = realConfig.loadConfigOrDefault();
@@ -342,11 +347,11 @@ async function createWorkflowContext(options: {
     const realConfig = realStores.config;
     const runStores = createConfigStores(tempDir.path);
     const config = runStores.config;
-    await copyPersistentConfig(realConfig, config);
+    await copyPersistentConfig(realStores, runStores);
 
-    const realProvidersStore = realStores.providersConfig;
-    const realFileLeaseManager = realStores.fileLeases;
-    const runProvidersStore = runStores.providersConfig;
+    const realProvidersStore = realStores.providersConfigStore;
+    const realFileLeaseManager = realStores.fileLeaseManager;
+    const runProvidersStore = runStores.providersConfigStore;
     const existingProviders = realProvidersStore.loadProvidersConfig();
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
@@ -369,11 +374,7 @@ async function createWorkflowContext(options: {
     await policyService.initialize();
 
     services = createCoreServices({
-      config,
-      sessionLocator: runStores.sessionLocator,
-      providersConfigStore: runStores.providersConfig,
-      secretsStore: runStores.secrets,
-      fileLeaseManager: runStores.fileLeases,
+      ...runStores,
       policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,

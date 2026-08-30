@@ -125,7 +125,7 @@ export class TerminalService {
   private readonly pendingNativeTerminalOpens = new Map<string, number>();
 
   private nativeTerminalMarkerPath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), "native-terminal-opened");
+    return path.join(this.config.sessionsDir, workspaceId, "native-terminal-opened");
   }
 
   /**

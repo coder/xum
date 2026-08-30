@@ -59,7 +59,7 @@ describe("TerminalAttentionStore", () => {
 
   test("loads pending notifications written with legacy derived fields", async () => {
     const config = makeConfig(rootDir);
-    const dir = path.join(path.join(config.sessionsDir, "owner-1"), TERMINAL_ATTENTION_DIR);
+    const dir = path.join(config.sessionsDir, "owner-1", TERMINAL_ATTENTION_DIR);
     await fsPromises.mkdir(dir, { recursive: true });
     await fsPromises.writeFile(
       path.join(dir, `${encodeURIComponent("agent_task:task-1")}.json`),

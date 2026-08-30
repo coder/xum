@@ -8147,7 +8147,7 @@ export class AgentSession {
       return null;
     }
 
-    const todoPath = path.join(path.join(this.config.sessionsDir, this.workspaceId), "todos.json");
+    const todoPath = path.join(this.config.sessionsDir, this.workspaceId, "todos.json");
 
     try {
       const data = await readFile(todoPath, "utf-8");

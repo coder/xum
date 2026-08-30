@@ -411,7 +411,7 @@ export class DevToolsService extends EventEmitter {
   }
 
   private getSessionFilePath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), "devtools.jsonl");
+    return path.join(this.config.sessionsDir, workspaceId, "devtools.jsonl");
   }
 
   private getOrCreateWorkspaceData(workspaceId: string): WorkspaceData {

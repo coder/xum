@@ -67,7 +67,7 @@ function createMockExperimentsService(enabled: boolean): ExperimentsService {
 }
 type BashToolConfig = Parameters<typeof bashToolModule.createBashTool>[0];
 interface WorkspaceServiceTestOptions {
-  config: Partial<Config> & { secretsStore?: Pick<SecretsStore, "getEffectiveSecrets"> };
+  config: Partial<Config>;
   historyService: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;

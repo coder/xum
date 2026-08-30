@@ -598,7 +598,7 @@ describe("MemoryService", () => {
       );
       expect(result).toEqual({ success: true, data: { sha256: sha("fresh") } });
       const onDisk = await fsPromises.readFile(
-        path.join(path.join(fixture.config.sessionsDir, "ws-ui"), "memory", "notes.md"),
+        path.join(fixture.config.sessionsDir, "ws-ui", "memory", "notes.md"),
         "utf-8"
       );
       expect(onDisk).toBe("fresh");

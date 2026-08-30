@@ -160,9 +160,9 @@ export class ServiceContainer {
     const config = stores.config;
     this.config = config;
     this.sessionLocator = stores.sessionLocator;
-    this.providersConfigStore = stores.providersConfig;
-    this.secretsStore = stores.secrets;
-    this.fileLeaseManager = stores.fileLeases;
+    this.providersConfigStore = stores.providersConfigStore;
+    this.secretsStore = stores.secretsStore;
+    this.fileLeaseManager = stores.fileLeaseManager;
 
     // Cross-cutting services: created first so they can be passed to core
     // services via constructor params (no setter injection needed).
@@ -188,11 +188,7 @@ export class ServiceContainer {
     this.workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
 
     const core = createCoreServices({
-      config,
-      sessionLocator: this.sessionLocator,
-      providersConfigStore: this.providersConfigStore,
-      secretsStore: this.secretsStore,
-      fileLeaseManager: this.fileLeaseManager,
+      ...stores,
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
       policyService: this.policyService,

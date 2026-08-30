@@ -149,7 +149,7 @@ function createWorkspaceTurnMetadata(projectPath: string): WorkspaceMetadata {
 
 async function workspaceGoalFileExists(config: Config, workspaceId: string): Promise<boolean> {
   try {
-    await fsPromises.access(path.join(path.join(config.sessionsDir, workspaceId), "goal.json"));
+    await fsPromises.access(path.join(config.sessionsDir, workspaceId, "goal.json"));
     return true;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {

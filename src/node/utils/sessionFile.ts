@@ -36,7 +36,7 @@ export class SessionFileManager<T> {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(path.join(this.config.sessionsDir, workspaceId), this.fileName);
+    return path.join(this.config.sessionsDir, workspaceId, this.fileName);
   }
 
   /**

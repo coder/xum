@@ -754,7 +754,7 @@ describe("SessionUsageService", () => {
       );
 
       // Delete session-usage.json but keep session dir (appendToHistory created it)
-      const usagePath = path.join(path.join(config.sessionsDir, workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);
@@ -1052,7 +1052,7 @@ describe("SessionUsageService", () => {
       await historyService.appendToHistory(workspaceId, postCompactionMsg);
 
       // Delete session-usage.json to trigger rebuild from messages
-      const usagePath = path.join(path.join(config.sessionsDir, workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);
