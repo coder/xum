@@ -15815,7 +15815,10 @@ describe("WorkspaceService metadata listeners", () => {
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = { setStreaming };
+    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
+      isWorkspaceDeleted: mock(() => false),
+      setStreaming,
+    };
 
     new WorkspaceService(
       mockConfig as Config,
@@ -15875,7 +15878,10 @@ describe("WorkspaceService metadata listeners", () => {
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = { setTodoStatus };
+    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
+      isWorkspaceDeleted: mock(() => false),
+      setTodoStatus,
+    };
 
     new WorkspaceService(
       mockConfig as Config,
@@ -15899,7 +15905,9 @@ describe("WorkspaceService metadata listeners", () => {
 
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(readTodosSpy).toHaveBeenCalledWith("/tmp/test/sessions");
+      expect(readTodosSpy).toHaveBeenCalledWith(
+        path.join(mockConfig.sessionsDir ?? "", workspaceId)
+      );
       expect(setTodoStatus).toHaveBeenCalledWith(
         workspaceId,
         { emoji: "🔄", message: "Run typecheck" },
@@ -19100,23 +19108,15 @@ describe("WorkspaceService init cancellation", () => {
     } as unknown as AgentSession;
 
     try {
-      const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+      const workspaceService = createWorkspaceServiceForTest({
+        config: mockConfig,
         historyService,
-        mockAIService,
-        mockInitStateManager as InitStateManager,
-        mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        {
+        aiService: mockAIService,
+        initStateManager: mockInitStateManager as InitStateManager,
+        secretsStore: {
           getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
-        } as unknown as SecretsStore
-      );
+        } as unknown as SecretsStore,
+      });
 
       const metadataEvents: Array<FrontendWorkspaceMetadata | null> = [];
       workspaceService.on("metadata", (event: unknown) => {

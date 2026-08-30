@@ -21,7 +21,7 @@ export function resolveReplaySessionDir(workspaceId: string): {
     return {
       sessionDir: REPLAY_FIXTURE_DIR,
       historyService: new HistoryService({
-        sessionsDir: REPLAY_FIXTURE_DIR,
+        getSessionDir: () => REPLAY_FIXTURE_DIR,
         // Read-only verification: rootDir only locates write locks/tombstones.
         rootDir: path.dirname(REPLAY_FIXTURE_DIR),
       }),
