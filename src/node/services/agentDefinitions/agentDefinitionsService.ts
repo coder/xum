@@ -407,6 +407,26 @@ async function readAgentDescriptorFromFile(
   }
 }
 
+function buildAgentDescriptorFromPackage(
+  pkg: AgentDefinitionPackage,
+  pluginName?: string
+): AgentDefinitionDescriptor {
+  const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
+  return AgentDefinitionDescriptorSchema.parse({
+    id: pkg.id,
+    scope: pkg.scope,
+    name: pkg.frontmatter.name,
+    description: pkg.frontmatter.description,
+    uiSelectable: selectable,
+    uiColor: pkg.frontmatter.ui?.color,
+    subagentRunnable: pkg.frontmatter.subagent?.runnable ?? false,
+    base: pkg.frontmatter.base,
+    aiDefaults: pkg.frontmatter.ai,
+    tools: pkg.frontmatter.tools,
+    ...(pluginName !== undefined ? { pluginName } : {}),
+  });
+}
+
 function buildBuiltInAgentDescriptor(
   pkg: ReturnType<typeof getBuiltInAgentDefinitions>[number]
 ): AgentDefinitionDescriptor {
@@ -433,6 +453,8 @@ export async function discoverAgentDefinitions(
     roots?: AgentDefinitionsRoots;
     /** agent-plugins experiment: also scan Agent Plugins agents (used only when `roots` is absent). */
     includeAgentPlugins?: boolean;
+    /** Request-scoped parsed definitions already loaded during agent resolution. */
+    cache?: AgentDefinitionRequestCache;
     /**
      * When false, return every discovered descriptor in precedence order
      * (shadowed ids included) instead of only the effective one per id.
@@ -494,14 +516,18 @@ export async function discoverAgentDefinitions(
         if (!contained) continue;
       }
 
-      const descriptor = await readAgentDescriptorFromFile(
-        scan.runtime,
-        filePath,
-        agentId,
-        scan.scope,
-        scan.pluginName,
-        scan.pluginRoot
-      );
+      const cachedSource = options?.cache?.getSource(scan.runtime, filePath);
+      const descriptor =
+        cachedSource == null
+          ? await readAgentDescriptorFromFile(
+              scan.runtime,
+              filePath,
+              agentId,
+              scan.scope,
+              scan.pluginName,
+              scan.pluginRoot
+            )
+          : buildAgentDescriptorFromPackage(cachedSource.definition, cachedSource.pluginName);
       if (!descriptor) continue;
 
       if (dedupeById) {
@@ -551,10 +577,110 @@ export async function discoverAgentDefinitions(
   });
 }
 
+interface CachedAgentDefinitionSource {
+  definition: AgentDefinitionPackage;
+  pluginName?: string;
+}
+
+interface AgentDefinitionSource {
+  runtime: Runtime;
+  filePath: string;
+  pluginName?: string;
+}
+
+export interface AgentDefinitionRequestCache {
+  getWinningDefinition(
+    runtime: Runtime,
+    workspacePath: string,
+    agentId: AgentId,
+    options?: ReadAgentDefinitionOptions
+  ): AgentDefinitionPackage | undefined;
+  getSource(runtime: Runtime, filePath: string): CachedAgentDefinitionSource | undefined;
+  rememberWinningDefinition(
+    runtime: Runtime,
+    workspacePath: string,
+    agentId: AgentId,
+    definition: AgentDefinitionPackage,
+    options?: ReadAgentDefinitionOptions,
+    source?: AgentDefinitionSource
+  ): void;
+}
+
+export function createAgentDefinitionRequestCache(): AgentDefinitionRequestCache {
+  const winningByRuntime = new WeakMap<Runtime, Map<string, CachedAgentDefinitionSource>>();
+  const bySource = new Map<string, CachedAgentDefinitionSource>();
+  const remoteRuntimeIds = new WeakMap<Runtime, number>();
+  const rootsIds = new WeakMap<AgentDefinitionsRoots, number>();
+  let nextRemoteRuntimeId = 1;
+  let nextRootsId = 1;
+
+  const keyFor = (
+    workspacePath: string,
+    agentId: AgentId,
+    options?: ReadAgentDefinitionOptions
+  ): string => {
+    let rootsId = "default";
+    if (options?.roots != null) {
+      let id = rootsIds.get(options.roots);
+      if (id == null) {
+        id = nextRootsId++;
+        rootsIds.set(options.roots, id);
+      }
+      rootsId = String(id);
+    }
+    return JSON.stringify([
+      workspacePath,
+      agentId,
+      options?.skipScopesAbove ?? null,
+      options?.includeAgentPlugins === true,
+      rootsId,
+    ]);
+  };
+
+  const sourceKeyFor = (runtime: Runtime, filePath: string): string => {
+    if (!(runtime instanceof RemoteRuntime)) {
+      return JSON.stringify(["host", filePath]);
+    }
+    let runtimeId = remoteRuntimeIds.get(runtime);
+    if (runtimeId == null) {
+      runtimeId = nextRemoteRuntimeId++;
+      remoteRuntimeIds.set(runtime, runtimeId);
+    }
+    return JSON.stringify([runtimeId, filePath]);
+  };
+
+  return {
+    getWinningDefinition(runtime, workspacePath, agentId, options) {
+      return winningByRuntime.get(runtime)?.get(keyFor(workspacePath, agentId, options))
+        ?.definition;
+    },
+    getSource(runtime, filePath) {
+      return bySource.get(sourceKeyFor(runtime, filePath));
+    },
+    rememberWinningDefinition(runtime, workspacePath, agentId, definition, options, source) {
+      const cachedSource = {
+        definition,
+        ...(source?.pluginName !== undefined ? { pluginName: source.pluginName } : {}),
+      };
+      let definitions = winningByRuntime.get(runtime);
+      if (definitions == null) {
+        definitions = new Map();
+        winningByRuntime.set(runtime, definitions);
+      }
+      definitions.set(keyFor(workspacePath, agentId, options), cachedSource);
+      if (source != null) {
+        bySource.set(sourceKeyFor(source.runtime, source.filePath), cachedSource);
+      }
+    },
+  };
+}
+
 export interface ReadAgentDefinitionOptions {
   roots?: AgentDefinitionsRoots;
   /** agent-plugins experiment: also probe Agent Plugins agents (used only when `roots` is absent). */
   includeAgentPlugins?: boolean;
+  /** Request-scoped parsed definition reuse; callers own the cache lifetime. */
+  cache?: AgentDefinitionRequestCache;
   /**
    * Skip scopes at or above this level when resolving.
    * Used for base resolution: when a project-scope agent has `base: exec`,
@@ -573,6 +699,11 @@ export async function readAgentDefinition(
 ): Promise<AgentDefinitionPackage> {
   if (!workspacePath) {
     throw new Error("readAgentDefinition: workspacePath is required");
+  }
+
+  const cached = options?.cache?.getWinningDefinition(runtime, workspacePath, agentId, options);
+  if (cached != null) {
+    return cached;
   }
 
   const roots =
@@ -619,6 +750,23 @@ export async function readAgentDefinition(
         agentId,
       });
       if (!contained) continue;
+    }
+
+    const cachedSource = options?.cache?.getSource(candidate.runtime, filePath);
+    if (cachedSource != null) {
+      options.cache?.rememberWinningDefinition(
+        runtime,
+        workspacePath,
+        agentId,
+        cachedSource.definition,
+        options,
+        {
+          runtime: candidate.runtime,
+          filePath,
+          pluginName: candidate.pluginName,
+        }
+      );
+      return cachedSource.definition;
     }
 
     try {
@@ -671,6 +819,18 @@ export async function readAgentDefinition(
         );
       }
 
+      options?.cache?.rememberWinningDefinition(
+        runtime,
+        workspacePath,
+        agentId,
+        validated.data,
+        options,
+        {
+          runtime: candidate.runtime,
+          filePath,
+          pluginName: candidate.pluginName,
+        }
+      );
       return validated.data;
     } catch {
       continue;
@@ -686,6 +846,13 @@ export async function readAgentDefinition(
           `Invalid built-in agent definition '${agentId}': ${validated.error.message}`
         );
       }
+      options?.cache?.rememberWinningDefinition(
+        runtime,
+        workspacePath,
+        agentId,
+        validated.data,
+        options
+      );
       return validated.data;
     }
   }
@@ -709,6 +876,7 @@ export async function resolveAgentBody(
   agentId: AgentId,
   options?: {
     roots?: AgentDefinitionsRoots;
+    cache?: AgentDefinitionRequestCache;
     includeAgentPlugins?: boolean;
     skipScopesAbove?: AgentDefinitionScope;
   }
@@ -751,6 +919,7 @@ export async function resolveAgentBody(
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
       includeAgentPlugins: options?.includeAgentPlugins,
+      cache: options?.cache,
       skipScopesAbove,
     });
 
@@ -853,6 +1022,7 @@ export async function resolveAgentFrontmatter(
   agentId: AgentId,
   options?: {
     roots?: AgentDefinitionsRoots;
+    cache?: AgentDefinitionRequestCache;
     includeAgentPlugins?: boolean;
     skipScopesAbove?: AgentDefinitionScope;
   }
@@ -900,6 +1070,7 @@ export async function resolveAgentFrontmatter(
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
       includeAgentPlugins: options?.includeAgentPlugins,
+      cache: options?.cache,
       skipScopesAbove,
     });
 

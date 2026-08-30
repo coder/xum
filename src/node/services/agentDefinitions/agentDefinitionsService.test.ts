@@ -9,6 +9,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
+  createAgentDefinitionRequestCache,
   discoverAgentDefinitions,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
@@ -871,6 +872,27 @@ base: a
       expect(shared).toHaveLength(1);
       expect(shared[0]?.name).toBe("Shared (project)");
       expect(shared[0]?.pluginName).toBeUndefined();
+    });
+
+    test("cached plugin packages preserve plugin attribution during discovery", async () => {
+      using project = new DisposableTempDir("agent-defs-plugin-project");
+      using global = new DisposableTempDir("agent-defs-plugin-global");
+
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+      await writePluginWithAgent(pluginContainer, "my-plugin", "helper", "Helper (plugin)");
+
+      const roots = {
+        projectRoots: [path.join(project.path, ".mux", "agents")],
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+      const cache = createAgentDefinitionRequestCache();
+
+      await readAgentDefinition(runtime, project.path, "helper", { roots, cache });
+      const agents = await discoverAgentDefinitions(runtime, project.path, { roots, cache });
+
+      expect(agents.find((agent) => agent.id === "helper")?.pluginName).toBe("my-plugin");
     });
 
     test("dedupeById: false returns shadowed plugin agents in precedence order", async () => {

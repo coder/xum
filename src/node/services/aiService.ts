@@ -1884,6 +1884,7 @@ export class AIService extends EventEmitter {
         return agentResult;
       }
       const {
+        agentDefinitionCache,
         effectiveAgentId,
         agentDefinition,
         agentDiscoveryRuntime,
@@ -2077,6 +2078,7 @@ export class AIService extends EventEmitter {
           metadata,
           workspacePath,
           workspaceId,
+          agentDefinitionCache,
           agentDefinition,
           effectiveMode,
           agentDiscoveryRuntime,
