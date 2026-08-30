@@ -7,6 +7,7 @@ import { MCPConfigService } from "./mcpConfigService";
 import { MCPServerManager } from "./mcpServerManager";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 
 describe("MCPConfigService", () => {
   let tempDir: string;
@@ -21,6 +22,54 @@ describe("MCPConfigService", () => {
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("resolveWorkspaceAgentPluginsContext preserves the off-host null sentinel", async () => {
+    // null suppresses plugin discovery entirely; coercing it to undefined would
+    // fall back to project-level discovery and offer repo-controlled plugins for
+    // workspaces that execute off-host.
+    const cases: Array<{
+      runtimeConfig: WorkspaceMetadata["runtimeConfig"];
+      namedWorkspacePath?: string;
+      expectedNull: boolean;
+    }> = [
+      {
+        runtimeConfig: { type: "ssh", host: "example", srcBaseDir: "/remote/src" },
+        namedWorkspacePath: "/remote/src/proj/ws1",
+        expectedNull: true,
+      },
+      {
+        runtimeConfig: { type: "worktree", srcBaseDir: tempDir },
+        namedWorkspacePath: undefined,
+        expectedNull: false,
+      },
+    ];
+    for (const testCase of cases) {
+      const projectPath = path.join(tempDir, "proj");
+      // namedWorkspacePath is persisted alongside metadata for SSH workspaces (see WorkspaceMetadataForRuntime).
+      const metadata: WorkspaceMetadata & { namedWorkspacePath?: string } = {
+        id: "ws1234567890",
+        name: "ws1",
+        projectName: "proj",
+        projectPath,
+        runtimeConfig: testCase.runtimeConfig,
+        namedWorkspacePath: testCase.namedWorkspacePath,
+      };
+      const service = new MCPConfigService(config, {
+        workspaceMetadataProvider: {
+          getWorkspaceMetadata: () => Promise.resolve({ success: true as const, data: metadata }),
+        },
+      });
+      const resolved = await service.resolveWorkspaceAgentPluginsContext(
+        "ws1234567890",
+        projectPath
+      );
+      if (testCase.expectedNull) {
+        expect(resolved).toBeNull();
+      } else {
+        expect(resolved).toMatchObject({ projectKey: projectPath });
+      }
+    }
   });
 
   test("writes global config to <rootDir>/mcp.jsonc", async () => {

@@ -203,10 +203,11 @@ export class MCPConfigService {
     return result;
   }
 
+  /** Preserves the resolver's null sentinel: null suppresses plugin discovery for off-host workspaces. */
   async resolveWorkspaceAgentPluginsContext(
     workspaceId: string | null | undefined,
     projectPath: string | null | undefined
-  ): Promise<AgentPluginsMcpContext | undefined> {
+  ): Promise<AgentPluginsMcpContext | null | undefined> {
     const trimmed = workspaceId?.trim();
     if (!trimmed || !this.workspaceMetadataProvider) {
       return undefined;
@@ -226,10 +227,7 @@ export class MCPConfigService {
         return undefined;
       }
       const runtime = createRuntimeForWorkspace(metadata);
-      return (
-        resolveAgentPluginsMcpContext(metadata, resolveWorkspaceRootPath(metadata, runtime)) ??
-        undefined
-      );
+      return resolveAgentPluginsMcpContext(metadata, resolveWorkspaceRootPath(metadata, runtime));
     } catch (error) {
       log.debug("Failed to resolve Agent Plugins MCP context for workspace", {
         workspaceId: trimmed,
