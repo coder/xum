@@ -22,6 +22,7 @@ import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
+import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { TaskSettings } from "@/common/types/tasks";
@@ -43,7 +44,7 @@ import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/age
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { buildSystemMessage } from "./systemMessage";
+import { buildSystemMessageFromSources, loadWorkspaceInstructionSources } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
@@ -227,6 +228,8 @@ export async function buildPlanInstructions(
 
 /** Options for building the system message context. */
 export interface BuildStreamSystemContextOptions {
+  /** Reuse a source snapshot across policy/model-driven context rebuilds in one startup. */
+  instructionSources?: InstructionSources;
   runtime: Runtime;
   metadata: WorkspaceMetadata;
   workspacePath: string;
@@ -249,7 +252,7 @@ export interface BuildStreamSystemContextOptions {
   modelString: string;
   cfg: ProjectsConfig;
   providersConfig?: ProvidersConfigMap | null;
-  mcpServers: Parameters<typeof buildSystemMessage>[5];
+  mcpServers: Parameters<typeof buildSystemMessageFromSources>[5];
   xumScope?: XumToolScope;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /** Whether the advisor tool is available for the current agent */
@@ -284,6 +287,8 @@ export interface StreamSystemContextResult {
    * trailing scoped heading in one section swallow the next section's text.
    */
   agentSystemPromptSections: string[];
+  /** Instruction sources loaded once for both prompt and tool-scoped extraction. */
+  instructionSources: InstructionSources;
   /** Full system message string. */
   systemMessage: string;
   /** Token count of the system message. */
@@ -626,10 +631,22 @@ export async function buildStreamSystemContext(
     effectiveAdditionalInstructions
   );
 
+  // Load once so prompt assembly and tool-scoped extraction observe the same
+  // instruction snapshot without reading workspace files twice per startup.
+  const instructionSources =
+    opts.instructionSources ??
+    (await loadWorkspaceInstructionSources(
+      metadata,
+      runtime,
+      workspacePath,
+      cfg.projects,
+      opts.claudeSkillsCompatEnabled
+    ));
+
   // Build system message from workspace metadata
-  let systemMessage = await buildSystemMessage(
+  let systemMessage = buildSystemMessageFromSources(
     metadata,
-    runtime,
+    instructionSources,
     workspacePath,
     mergedAdditionalInstructions,
     modelString,
@@ -642,8 +659,6 @@ export async function buildStreamSystemContext(
     {
       agentSystemPromptSections,
       modes: [effectiveMode, agentDefinition.id],
-      projectConfigs: cfg.projects,
-      claudeSkillsCompatEnabled: opts.claudeSkillsCompatEnabled,
     }
   );
 
@@ -662,6 +677,7 @@ export async function buildStreamSystemContext(
 
   return {
     agentSystemPromptSections,
+    instructionSources,
     systemMessage,
     systemMessageTokens,
     agentDefinitions,
