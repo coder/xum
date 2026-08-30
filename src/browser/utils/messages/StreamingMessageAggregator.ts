@@ -1935,6 +1935,10 @@ export class StreamingMessageAggregator {
    * Get the active main-agent stream id (for interrupt, live usage, and token tracking).
    * Returns undefined when no interruptible stream is active.
    */
+  getMessagePartCount(messageId: string): number {
+    return this.messages.get(messageId)?.parts.length ?? 0;
+  }
+
   getActiveStreamMessageId(): string | undefined {
     return this.getActiveStreamEntry()?.[0];
   }

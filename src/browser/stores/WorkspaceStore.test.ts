@@ -2036,41 +2036,79 @@ describe("WorkspaceStore", () => {
       const bump = spyOn(rawStore.states, "bump");
       const listener = mock(() => undefined);
       const unsubscribe = store.subscribeStreamingMessage(workspaceId, messageId, listener);
-      const deltas: WorkspaceChatMessage[] = [
+      // A delta that adds a part creates a new display row, which only a
+      // workspace bump can mount; within-part deltas stay row-local.
+      const deltas: Array<{ event: WorkspaceChatMessage; createsRow: boolean }> = [
         {
-          type: "stream-delta",
-          workspaceId,
-          messageId,
-          delta: "hello",
-          tokens: 1,
-          timestamp: 2,
+          event: {
+            type: "stream-delta",
+            workspaceId,
+            messageId,
+            delta: "hello",
+            tokens: 1,
+            timestamp: 2,
+          },
+          createsRow: true,
         },
         {
-          type: "reasoning-delta",
-          workspaceId,
-          messageId,
-          delta: "thinking",
-          tokens: 1,
-          timestamp: 3,
+          event: {
+            type: "stream-delta",
+            workspaceId,
+            messageId,
+            delta: " world",
+            tokens: 1,
+            timestamp: 3,
+          },
+          createsRow: false,
         },
         {
-          type: "tool-call-delta",
-          workspaceId,
-          messageId,
-          toolCallId: "tool-1",
-          toolName: "bash",
-          delta: { command: "echo hi" },
-          tokens: 1,
-          timestamp: 4,
+          event: {
+            type: "reasoning-delta",
+            workspaceId,
+            messageId,
+            delta: "thinking",
+            tokens: 1,
+            timestamp: 4,
+          },
+          createsRow: true,
+        },
+        {
+          event: {
+            type: "reasoning-delta",
+            workspaceId,
+            messageId,
+            delta: " harder",
+            tokens: 1,
+            timestamp: 5,
+          },
+          createsRow: false,
+        },
+        {
+          event: {
+            type: "tool-call-delta",
+            workspaceId,
+            messageId,
+            toolCallId: "tool-1",
+            toolName: "bash",
+            delta: { command: "echo hi" },
+            tokens: 1,
+            timestamp: 6,
+          },
+          createsRow: false,
         },
       ];
 
       bump.mockClear();
-      for (const delta of deltas) {
+      for (const { event, createsRow } of deltas) {
         listener.mockClear();
-        rawStore.handleChatMessage(workspaceId, delta);
-        expect(bump).not.toHaveBeenCalled();
-        expect(listener).toHaveBeenCalledTimes(1);
+        bump.mockClear();
+        rawStore.handleChatMessage(workspaceId, event);
+        if (createsRow) {
+          expect(bump).toHaveBeenCalledWith(workspaceId);
+        } else {
+          expect(bump).not.toHaveBeenCalled();
+          expect(listener).toHaveBeenCalledTimes(1);
+        }
       }
 
       rawStore.handleChatMessage(workspaceId, {

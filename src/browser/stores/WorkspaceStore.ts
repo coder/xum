@@ -909,8 +909,7 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
     },
     "stream-delta": (workspaceId, aggregator, data) => {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingMessageBump(workspaceId, aggregator);
+      this.applyStreamingDelta(workspaceId, aggregator, data);
     },
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
@@ -1007,8 +1006,7 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
     },
     "tool-call-delta": (workspaceId, aggregator, data) => {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingMessageBump(workspaceId, aggregator);
+      this.applyStreamingDelta(workspaceId, aggregator, data);
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
@@ -1062,8 +1060,7 @@ export class WorkspaceStore {
       }
     },
     "reasoning-delta": (workspaceId, aggregator, data) => {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingMessageBump(workspaceId, aggregator);
+      this.applyStreamingDelta(workspaceId, aggregator, data);
     },
     "reasoning-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1653,6 +1650,26 @@ export class WorkspaceStore {
     );
 
     this.deltaIdleHandles.set(workspaceId, handle);
+  }
+
+  /**
+   * Deltas normally extend the active message's last part in place and only
+   * need the row-local bump. A delta that adds a part creates a new display
+   * row with no mounted subscriber yet, so only a workspace bump can mount it.
+   */
+  private applyStreamingDelta(
+    workspaceId: string,
+    aggregator: StreamingMessageAggregator,
+    data: WorkspaceChatMessage
+  ): void {
+    const messageId = aggregator.getActiveStreamMessageId();
+    const partsBefore = messageId ? aggregator.getMessagePartCount(messageId) : 0;
+    applyWorkspaceChatEventToAggregator(aggregator, data);
+    if (messageId && aggregator.getMessagePartCount(messageId) !== partsBefore) {
+      this.states.bump(workspaceId);
+    } else {
+      this.scheduleStreamingMessageBump(workspaceId, aggregator);
+    }
   }
 
   private scheduleStreamingMessageBump(
