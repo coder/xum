@@ -8,10 +8,7 @@ import * as path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
-import {
-  discoverAvailableSubagentsForToolContext,
-  prepareProviderRequestMessages,
-} from "./turnContextAssembler";
+import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
   buildAppAttributionHeaders,
