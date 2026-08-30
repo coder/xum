@@ -6853,6 +6853,91 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("a fully suppressed batch re-pokes the drain for unselected workflow groups", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_repoke";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+      agentId: "exec",
+    });
+
+    // A pending workspace-turn notification whose handle already carries an owner-follow-up
+    // supersede: the pre-suppression batch counts it (excluding the agent-bound workflow
+    // group from the send), then the last-moment reread drops it, emptying the batch.
+    const taskHandleStore = new TaskHandleStore(config);
+    await taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_repoke_suppressed",
+      ownerWorkspaceId: parentId,
+      workspaceId: parentId,
+      turnId: "repoke-suppressed",
+      status: "interrupted",
+      error:
+        "Workspace turn superseded by follow-up turn wst_repoke_successor from the same owner workspace",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      updatedAt: "2026-08-11T00:00:01.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workspace_turn",
+      sourceId: "wst_repoke_suppressed",
+    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    // The empty suppressed batch must re-poke the drain, not park the wake on the sweep.
+    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const prompt = String(sendMessage.mock.calls[0]?.[1]);
+    expect(prompt).toContain(runId);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "exec",
+    });
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
   test("wake keeps a synthetic launch row's strict pin without lifting the manual policy", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

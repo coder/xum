@@ -8854,6 +8854,13 @@ export class TaskService implements AgentTaskIntegration {
     });
     if (effectivePending.length === 0 && selectedWorkflowPrompts.length === 0) {
       await markSuppressedSuperseded();
+      // Suppression can empty the very batch that excluded agent-bound workflow groups; with
+      // nothing sent there is no streamEnded drain, so re-poke instead of parking the queued
+      // wake on the sweep. No spin: the suppressed notifications were just durably marked
+      // superseded, so the re-drain sees no non-workflow deliverables and selects a group.
+      if (deliverableWorkflowPrompts.length > 0) {
+        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+      }
       return;
     }
 
