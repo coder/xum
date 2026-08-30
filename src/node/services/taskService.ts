@@ -3201,7 +3201,13 @@ export class TaskService implements AgentTaskIntegration {
       log.error("Startup workflow task archive sweep failed", { error });
     }
 
-    const queuedTerminalWorkflowRunAttentionCount = await this.sweepWorkflowRunTerminalAttention();
+    let queuedTerminalWorkflowRunAttentionCount = 0;
+    try {
+      queuedTerminalWorkflowRunAttentionCount = await this.sweepWorkflowRunTerminalAttention();
+    } catch (error: unknown) {
+      // Startup-time initialization must never crash the app; the interval sweep retries.
+      log.warn("Startup workflow terminal attention sweep failed", { error });
+    }
     if (this.workflowAttentionSweepTimer == null) {
       this.workflowAttentionSweepTimer = setInterval(() => {
         void this.sweepWorkflowRunTerminalAttention().catch((error: unknown) => {
@@ -7805,10 +7811,23 @@ export class TaskService implements AgentTaskIntegration {
           ) {
             continue;
           }
-          const marker = await this.terminalAttentionStore.get(
-            workspace.id,
-            TerminalAttentionStore.notificationId("workflow_run", run.id, run.updatedAt)
-          );
+          let marker: Awaited<ReturnType<TerminalAttentionStore["get"]>>;
+          try {
+            marker = await this.terminalAttentionStore.get(
+              workspace.id,
+              TerminalAttentionStore.notificationId("workflow_run", run.id, run.updatedAt)
+            );
+          } catch (error: unknown) {
+            // Startup awaits this sweep, so one unreadable marker must not abort it (or app
+            // init). Skip the run: an unreadable marker cannot prove the wake is owed, and
+            // the next sweep retries, so delivery is delayed, never crashed or duplicated.
+            log.warn("Failed to read workflow terminal settlement marker; skipping run", {
+              workspaceId: workspace.id,
+              runId: run.id,
+              error: getErrorMessage(error),
+            });
+            continue;
+          }
           if (marker != null) {
             continue;
           }

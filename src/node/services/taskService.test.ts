@@ -6243,6 +6243,64 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  test("an unreadable settlement marker skips only that run and never rejects the sweep", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    for (const runId of ["wfr_sweep_marker_a", "wfr_sweep_marker_b"]) {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    }
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // Keep the queue observable: indeterminate currentness defers every drain delivery.
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("indeterminate"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internal = taskService as unknown as {
+      sweepWorkflowRunTerminalAttention(): Promise<number>;
+      terminalAttentionStore: TerminalAttentionStore;
+      pendingWorkflowRunAttention: Map<string, Set<string>>;
+    };
+    const realGet = internal.terminalAttentionStore.get.bind(internal.terminalAttentionStore);
+    const getSpy = spyOn(internal.terminalAttentionStore, "get")
+      // Lazy rejection: an eager mockRejectedValueOnce promise trips bun's unhandled-rejection
+      // detector on this host before the sweep consumes it.
+      .mockImplementationOnce(() => Promise.reject(new Error("EACCES: marker unreadable")))
+      .mockImplementation(realGet);
+
+    try {
+      // Startup awaits this sweep: one damaged marker must skip its run, not abort the sweep.
+      expect(await internal.sweepWorkflowRunTerminalAttention()).toBe(1);
+      expect(internal.pendingWorkflowRunAttention.get(parentId)?.size).toBe(1);
+
+      // The skipped run is re-derived once the marker read recovers.
+      expect(await internal.sweepWorkflowRunTerminalAttention()).toBe(1);
+      expect(internal.pendingWorkflowRunAttention.get(parentId)?.size).toBe(2);
+    } finally {
+      getSpy.mockRestore();
+    }
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("workflow wake restriction recovery stops at a context reset boundary", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
