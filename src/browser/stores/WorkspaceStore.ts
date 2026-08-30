@@ -844,6 +844,9 @@ export class WorkspaceStore {
   private deltaIdleHandles = new Map<string, number>();
 
   private pendingStreamingMessageBump = new Map<string, string>();
+  // Live keyed-channel key per workspace, so every stream-clearing path can
+  // release it even when no terminal chat event names the message.
+  private streamingMessageKeys = new Map<string, string>();
   private streamingMessageStore = new MapStore<string, void>();
   private advisorLiveStore = new MapStore<string, void>();
   private streamingStatsStore = new MapStore<string, WorkspaceStreamingStats | null>();
@@ -914,9 +917,7 @@ export class WorkspaceStore {
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamEndData);
-      this.streamingMessageStore.delete(
-        getStreamingMessageKey(workspaceId, streamEndData.messageId)
-      );
+      this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream completion telemetry
       this.trackStreamCompletedTelemetry(streamEndData, false);
@@ -975,9 +976,7 @@ export class WorkspaceStore {
     "stream-abort": (workspaceId, aggregator, data) => {
       const streamAbortData = data as StreamAbortEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamAbortData);
-      this.streamingMessageStore.delete(
-        getStreamingMessageKey(workspaceId, streamAbortData.messageId)
-      );
+      this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream interruption telemetry (get model from aggregator)
       const model = aggregator.getCurrentModel();
@@ -1659,6 +1658,13 @@ export class WorkspaceStore {
     this.deltaIdleHandles.set(workspaceId, handle);
   }
 
+  private releaseStreamingMessageChannel(workspaceId: string): void {
+    const key = this.streamingMessageKeys.get(workspaceId);
+    if (key === undefined) return;
+    this.streamingMessageKeys.delete(workspaceId);
+    this.streamingMessageStore.delete(key);
+  }
+
   /**
    * Deltas normally extend the active message's last part in place and only
    * need the row-local bump. A delta that adds a part creates a new display
@@ -1691,6 +1697,11 @@ export class WorkspaceStore {
     queueMicrotask(() => {
       if (this.pendingStreamingMessageBump.get(workspaceId) !== key) return;
       this.pendingStreamingMessageBump.delete(workspaceId);
+      const previousKey = this.streamingMessageKeys.get(workspaceId);
+      if (previousKey !== undefined && previousKey !== key) {
+        this.streamingMessageStore.delete(previousKey);
+      }
+      this.streamingMessageKeys.set(workspaceId, key);
       this.streamingMessageStore.bump(key);
       this.streamingStatsStore.bump(workspaceId);
     });
@@ -3316,6 +3327,7 @@ export class WorkspaceStore {
       this.aggregators.get(workspaceId)?.clearBackgroundHandoffCompletion();
       this.aggregators.get(workspaceId)?.clearActiveStreams();
       this.aggregators.get(workspaceId)?.clearPendingStreamStart();
+      this.releaseStreamingMessageChannel(workspaceId);
     }
 
     if (snapshot?.streaming !== true) {
@@ -3789,16 +3801,21 @@ export class WorkspaceStore {
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
   private async runOnChatSubscription(workspaceId: string, signal: AbortSignal): Promise<void> {
+    // Loop-scoped so the observation survives the generation retry: attaching a
+    // client aborts the change signal the waiting attempt captured, and the
+    // retried attempt would otherwise see the client as always-present.
+    let clientWasMissing = false;
     await runSubscriptionLoop({
       name: "onChat(" + workspaceId + ")",
       signal,
       getClient: async (attemptSignal) => {
-        const hadClientAtLoopStart = this.client !== null;
-        const client = this.client ?? (await this.waitForClient(attemptSignal));
-        return client ? { client, hadClientAtLoopStart } : null;
+        if (this.client === null) clientWasMissing = true;
+        return this.client ?? (await this.waitForClient(attemptSignal));
       },
       getClientChangeSignal: () => this.clientChangeController.signal,
-      subscribe: async ({ client, hadClientAtLoopStart }, attemptSignal, abortAttempt) => {
+      subscribe: async (client, attemptSignal, abortAttempt) => {
+        const hadClientAtLoopStart = !clientWasMissing;
+        clientWasMissing = false;
         const initialTransient = this.chatTransientState.get(workspaceId);
         if (
           !hadClientAtLoopStart &&
@@ -3992,10 +4009,7 @@ export class WorkspaceStore {
     this.cancelPendingIdleBump(workspaceId);
     this.cancelPendingStreamingBump(workspaceId);
     this.streamingStatsStore.delete(workspaceId);
-    const activeStreamMessageId = this.aggregators.get(workspaceId)?.getActiveStreamMessageId();
-    if (activeStreamMessageId) {
-      this.streamingMessageStore.delete(getStreamingMessageKey(workspaceId, activeStreamMessageId));
-    }
+    this.releaseStreamingMessageChannel(workspaceId);
     const transientForRemoval = this.chatTransientState.get(workspaceId);
     if (transientForRemoval) {
       for (const toolCallId of new Set([
@@ -4562,7 +4576,7 @@ export class WorkspaceStore {
       // streamingStatsStore cache so useWorkspaceStreamingStats returns null.
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
-      this.streamingMessageStore.delete(getStreamingMessageKey(workspaceId, data.messageId));
+      this.releaseStreamingMessageChannel(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
       return;

@@ -2142,6 +2142,63 @@ describe("WorkspaceStore", () => {
       unsubscribe();
     });
 
+    it("releases the keyed channel when a background activity stop clears the stream", async () => {
+      const workspaceId = "keyed-channel-background-stop";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        applyWorkspaceActivitySnapshot: (
+          id: string,
+          snapshot: WorkspaceActivitySnapshot | null
+        ) => void;
+      }>(store);
+      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
+      const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
+
+      send({
+        type: "stream-start",
+        workspaceId,
+        messageId: "msg-a",
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      send(caughtUpEvent());
+      send({
+        type: "stream-delta",
+        workspaceId,
+        messageId: "msg-a",
+        delta: "a",
+        tokens: 1,
+        timestamp: 2,
+      });
+      send({
+        type: "stream-delta",
+        workspaceId,
+        messageId: "msg-a",
+        delta: "b",
+        tokens: 1,
+        timestamp: 3,
+      });
+      await flush();
+      expect(rawStore.streamingMessageStore.has(`${workspaceId}\u0000msg-a`)).toBe(true);
+
+      // Background the workspace, then let activity report the stream stopped:
+      // no terminal chat event ever arrives, so the activity path must release
+      // the keyed channel.
+      createAndAddWorkspace(store, "keyed-channel-foreground");
+      rawStore.applyWorkspaceActivitySnapshot(
+        workspaceId,
+        createActivitySnapshot(10, { streaming: true })
+      );
+      rawStore.applyWorkspaceActivitySnapshot(
+        workspaceId,
+        createActivitySnapshot(11, { streaming: false })
+      );
+      expect(rawStore.streamingMessageStore.has(`${workspaceId}\u0000msg-a`)).toBe(false);
+    });
+
     it("publishes the same accumulated text shown by the live channel", () => {
       const workspaceId = "live-final-content";
       const messageId = "stream-message";
