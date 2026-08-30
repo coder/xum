@@ -407,11 +407,13 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     workspaceId,
   ]);
 
+  // Dismissal drops the stored selection so a menu reopened for the same
+  // channel starts back at the first result instead of the pre-Escape row.
   const dismiss = () => {
     setSelection({
-      channelKey: activeChannelKey,
-      index: selectedIndex,
-      selectedId: suggestions[selectedIndex]?.id ?? null,
+      channelKey: "",
+      index: 0,
+      selectedId: null,
       dismissedTokenKey: activeTokenKey,
     });
   };

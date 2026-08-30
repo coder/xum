@@ -481,10 +481,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           el.selectionStart = newCursor;
           el.selectionEnd = newCursor;
         });
-        return;
+        return { text: converted.text, cursor: converted.cursor };
       }
 
       setInput(next);
+      return { text: next, cursor: caret };
     },
     [latestInputValueRef, powerMode, setInput]
   );
@@ -577,8 +578,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
     composerSuggestions;
   const handleComposerInputChange = (next: string, caret?: number) => {
-    handleInputCaretChange(caret, next);
-    handleInputChange(next, caret);
+    // Feed the suggestion seam the applied text/cursor: symbol auto-conversion
+    // can rewrite both, and caret state keyed to the pre-conversion text would
+    // fall back to end-of-input over the converted draft.
+    const applied = handleInputChange(next, caret);
+    handleInputCaretChange(applied.cursor, applied.text);
   };
   const additionalSystemContext = useAdditionalSystemContextSnapshot(
     variant === "workspace" ? props.workspaceId : ""
