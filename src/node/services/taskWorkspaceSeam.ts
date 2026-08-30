@@ -142,94 +142,19 @@ export interface SendMessageInternalOptions {
   yieldToQueuedMessages?: boolean;
 }
 
-export interface WorkspaceHost {
-  acquirePreInterruptionArchiveHold(
+export interface WorkspaceTurnHost {
+  sendMessage(
     workspaceId: string,
-    options: {
-      queuedDelegatedTurnCount: number;
-      expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
-    }
-  ): Result<Disposable>;
-  archive(
+    message: string,
+    options: SendMessageOptions & { fileParts?: FilePart[] },
+    internal?: SendMessageInternalOptions
+  ): Promise<Result<void, SendMessageError>>;
+  resumeStream(
     workspaceId: string,
-    acknowledgedUntrackedPaths?: string[],
-    options?: ArchiveWorkspaceOptions
-  ): Promise<Result<ArchiveWorkspaceResult>>;
-  archiveWhileTaskTreeLocked(
-    workspaceId: string,
-    acknowledgedUntrackedPaths?: string[],
-    options?: ArchiveWorkspaceOptions
-  ): Promise<Result<ArchiveWorkspaceResult>>;
+    options: SendMessageOptions,
+    internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
+  ): Promise<Result<{ started: boolean }, SendMessageError>>;
   clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
-  countQueuedAgentPeerMessages(workspaceId: string): number;
-  create(
-    projectPath: string,
-    branchName: string | undefined,
-    trunkBranch: string | undefined,
-    title?: string,
-    runtimeConfig?: RuntimeConfig,
-    subProjectPath?: string,
-    pendingAutoTitle?: boolean,
-    tags?: Record<string, string>
-  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
-  discardExtensionMetadataEntry(workspaceId: string): Promise<void>;
-  emit(
-    event: "metadata",
-    payload: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }
-  ): boolean;
-  emit(event: "chat", payload: { workspaceId: string; message: WorkspaceChatMessage }): boolean;
-  emitChatEvent(workspaceId: string, message: WorkspaceChatMessage): void;
-  getInfo(workspaceId: string): Promise<FrontendWorkspaceMetadata | null>;
-  getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
-  getWorkflowInvocationBoundaryMessageId(
-    workspaceId: string,
-    runId: string
-  ): Promise<string | null>;
-  getWorkflowInvocationCurrentness(
-    workspaceId: string,
-    runId: string
-  ): Promise<"current" | "not_current" | "indeterminate">;
-  hasPendingAutoRetry(workspaceId: string): boolean;
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
-  hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
-  hasPendingWorkspaceTurnContinuation(
-    workspaceId: string,
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
-  ): boolean;
-  hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
-  hasQueuedWorkspaceTurn(workspaceId: string, handleId: string): boolean;
-  hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean>;
-  hasUntrackableExternalAppOpen(workspaceId: string): Promise<boolean>;
-  isBusyForMessage(workspaceId: string): boolean;
-  isExperimentEnabled(experimentId: ExperimentId): boolean;
-  isSnapshotArchiveEligibilityMutationSensitive(
-    workspaceId: string,
-    worktreeArchiveBehavior?: WorktreeArchiveBehavior,
-    metadata?: WorkspaceMetadata
-  ): boolean;
-  isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
-  listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;
-  preflightArchive(
-    workspaceId: string,
-    options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
-  ): Promise<Result<ArchivePreflightResult>>;
-  registerExternalBackgroundInit(
-    workspaceId: string,
-    abortController: AbortController,
-    settled: Promise<unknown>
-  ): void;
-  remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
-  removeQueuedMessagesByDedupeKeyPrefix(
-    workspaceId: string,
-    prefix: string,
-    options?: { cancelReason?: string }
-  ): Result<number>;
-  removeQueuedWorkspaceTurn(
-    workspaceId: string,
-    handleId: string,
-    options: { cancelReason: string }
-  ): Result<boolean>;
-  removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
@@ -238,25 +163,6 @@ export interface WorkspaceHost {
       deletePlanFile?: boolean;
     }
   ): Promise<Result<void>>;
-  resumeStream(
-    workspaceId: string,
-    options: SendMessageOptions,
-    internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
-  ): Promise<Result<{ started: boolean }, SendMessageError>>;
-  sanitizeMaterializedTaskWorkspace(
-    workspaceId: string,
-    workspacePath: string,
-    runtimeConfig: RuntimeConfig | undefined,
-    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
-  ): Promise<string | undefined>;
-  sendMessage(
-    workspaceId: string,
-    message: string,
-    options: SendMessageOptions & { fileParts?: FilePart[] },
-    internal?: SendMessageInternalOptions
-  ): Promise<Result<void, SendMessageError>>;
-  unarchiveWhileTaskTreeLocked(workspaceId: string): Promise<Result<void>>;
-  updateTitle(workspaceId: string, title: string): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
@@ -267,6 +173,118 @@ export interface WorkspaceHost {
     messageId: string
   ): Promise<StreamErrorRecoveryOutcome | undefined>;
 }
+
+export interface TurnAdmissionHost {
+  isBusyForMessage(workspaceId: string): boolean;
+  hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
+  hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+  hasPendingAutoRetry(workspaceId: string): boolean;
+  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
+  hasPendingWorkspaceTurnContinuation(
+    workspaceId: string,
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): boolean;
+  hasQueuedWorkspaceTurn(workspaceId: string, handleId: string): boolean;
+  removeQueuedWorkspaceTurn(
+    workspaceId: string,
+    handleId: string,
+    options: { cancelReason: string }
+  ): Result<boolean>;
+  removeQueuedMessagesByDedupeKeyPrefix(
+    workspaceId: string,
+    prefix: string,
+    options?: { cancelReason?: string }
+  ): Result<number>;
+  getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
+  countQueuedAgentPeerMessages(workspaceId: string): number;
+}
+
+export interface WorkspaceLifecycleHost {
+  archive(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>>;
+  archiveWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>>;
+  unarchiveWhileTaskTreeLocked(workspaceId: string): Promise<Result<void>>;
+  preflightArchive(
+    workspaceId: string,
+    options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
+  ): Promise<Result<ArchivePreflightResult>>;
+  acquirePreInterruptionArchiveHold(
+    workspaceId: string,
+    options: {
+      queuedDelegatedTurnCount: number;
+      expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
+    }
+  ): Result<Disposable>;
+  listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;
+  hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean>;
+  hasUntrackableExternalAppOpen(workspaceId: string): Promise<boolean>;
+  isSnapshotArchiveEligibilityMutationSensitive(
+    workspaceId: string,
+    worktreeArchiveBehavior?: WorktreeArchiveBehavior,
+    metadata?: WorkspaceMetadata
+  ): boolean;
+  remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
+}
+
+export interface WorkspaceProvisioningHost {
+  create(
+    projectPath: string,
+    branchName: string | undefined,
+    trunkBranch: string | undefined,
+    title?: string,
+    runtimeConfig?: RuntimeConfig,
+    subProjectPath?: string,
+    pendingAutoTitle?: boolean,
+    tags?: Record<string, string>
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
+  sanitizeMaterializedTaskWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    runtimeConfig: RuntimeConfig | undefined,
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined>;
+  discardExtensionMetadataEntry(workspaceId: string): Promise<void>;
+  registerExternalBackgroundInit(
+    workspaceId: string,
+    abortController: AbortController,
+    settled: Promise<unknown>
+  ): void;
+}
+
+export interface WorkspaceMetadataHost {
+  getInfo(workspaceId: string): Promise<FrontendWorkspaceMetadata | null>;
+  updateTitle(workspaceId: string, title: string): Promise<Result<void>>;
+  emit(
+    event: "metadata",
+    payload: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }
+  ): boolean;
+  emit(event: "chat", payload: { workspaceId: string; message: WorkspaceChatMessage }): boolean;
+  emitChatEvent(workspaceId: string, message: WorkspaceChatMessage): void;
+  getWorkflowInvocationBoundaryMessageId(
+    workspaceId: string,
+    runId: string
+  ): Promise<string | null>;
+  getWorkflowInvocationCurrentness(
+    workspaceId: string,
+    runId: string
+  ): Promise<"current" | "not_current" | "indeterminate">;
+  isExperimentEnabled(experimentId: ExperimentId): boolean;
+  isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
+}
+
+export type WorkspaceHost = WorkspaceTurnHost &
+  TurnAdmissionHost &
+  WorkspaceLifecycleHost &
+  WorkspaceProvisioningHost &
+  WorkspaceMetadataHost;
 
 export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;

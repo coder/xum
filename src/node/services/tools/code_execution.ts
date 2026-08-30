@@ -647,7 +647,9 @@ ${xumTypes}
           // Always re-register, even on reused persistent mounts: each request
           // builds a fresh ToolBridge from the CURRENT policy + grants, and a
           // stale bridge would keep exposing tools after permissions narrowed.
-          // Registration just overwrites the guest's `xum`/`mux` globals, so this is
+          // Registration just overwrites the guest's `xum`/`mux` globals and
+          // reuses cached guest function handles (QuickJS host-function ids
+          // are a finite per-context budget; see QuickJSRuntime), so this is
           // cheap and idempotent. Persistent mounts get the kernel extras
           // (xum.task_spawn / xum.events) bound to this mount's event queue.
           activeBridge.register(

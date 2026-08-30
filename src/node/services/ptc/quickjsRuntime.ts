@@ -36,6 +36,15 @@ import { UNAVAILABLE_IDENTIFIERS } from "./staticAnalysis";
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+/** One QuickJS context can mint at most 65,536 host-function ids over its
+ * lifetime (quickjs-emscripten stores them in a signed 16-bit slot). Past
+ * that, ids silently wrap on the C side and guest calls dispatch to whatever
+ * closure minted the aliased id 65,536 allocations earlier. Handle reuse in
+ * registerObject keeps steady-state allocation near zero, so approaching this
+ * limit means an unbounded-registration bug; fail loudly instead of letting
+ * dispatch corrupt. */
+const HOST_FN_ID_LIMIT = 60_000;
+
 /** Generate a short random ID for PTC nested tool calls (10 hex chars). */
 function generateCallId(): string {
   return crypto.randomBytes(5).toString("hex");
@@ -258,6 +267,19 @@ export class QuickJSRuntime implements IJSRuntime {
     string,
     Record<string, (...args: unknown[]) => unknown>
   >();
+  /** Guest host-function handles cached per registerObject name + method.
+   * Re-registration must not mint fresh host-function ids (see
+   * HOST_FN_ID_LIMIT): persistent mounts re-register the tool bridge on
+   * every eval, which exhausted the 16-bit id space in a few hundred calls
+   * and misrouted every later xum.* call to an unrelated tool. Dispatch is
+   * late-bound through the maps above, so a cached guest function stays
+   * correct across re-registrations; only never-seen method names allocate. */
+  private readonly registeredObjectFnHandles = new Map<
+    string,
+    Map<string, { kind: "async" | "sync"; handle: QuickJSHandle }>
+  >();
+  /** Host-function ids minted on this context; see HOST_FN_ID_LIMIT. */
+  private hostFnAllocations = 0;
 
   // Execution state (reset per eval)
   private toolCalls: PTCToolCallRecord[] = [];
@@ -317,7 +339,7 @@ export class QuickJSRuntime implements IJSRuntime {
   registerFunction(name: string, fn: (...args: unknown[]) => Promise<unknown>): void {
     this.assertNotDisposed("registerFunction");
 
-    const handle = this.ctx.newAsyncifiedFunction(name, async (...argHandles) => {
+    const handle = this.newAsyncifiedHostFunction(name, async (...argHandles) => {
       if (this.abortController?.signal.aborted) {
         throw new Error("Execution aborted");
       }
@@ -415,7 +437,7 @@ export class QuickJSRuntime implements IJSRuntime {
     // it hands the guest a deferred VM promise and settles it when the host
     // promise settles. This is the async capability bridge: the guest can
     // fire-and-forget or await the returned Promise.
-    const fnHandle = this.ctx.newFunction(name, (...argHandles) => {
+    const fnHandle = this.newHostFunction(name, (...argHandles) => {
       const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
       const startTime = Date.now();
       const callId = generateCallId();
@@ -816,7 +838,7 @@ export class QuickJSRuntime implements IJSRuntime {
   registerSyncFunction(name: string, fn: (...args: unknown[]) => unknown): void {
     this.assertNotDisposed("registerSyncFunction");
 
-    const fnHandle = this.ctx.newFunction(name, (...argHandles) => {
+    const fnHandle = this.newHostFunction(name, (...argHandles) => {
       const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
       // Host exceptions propagate to the guest as thrown errors.
       const result = fn(...args);
@@ -950,11 +972,30 @@ export class QuickJSRuntime implements IJSRuntime {
     this.registeredObjects.set(name, obj);
     this.registeredObjectSyncMethods.set(name, syncMethods ?? {});
 
+    // Reuse cached guest functions across re-registrations; see
+    // registeredObjectFnHandles for why minting fresh ids per registration
+    // corrupts dispatch on long-lived runtimes.
+    let fnCache = this.registeredObjectFnHandles.get(name);
+    if (fnCache === undefined) {
+      fnCache = new Map();
+      this.registeredObjectFnHandles.set(name, fnCache);
+    }
+
     // Create object in QuickJS
     const objHandle = this.ctx.newObject();
 
     for (const methodName of Object.keys(obj)) {
-      const fnHandle = this.ctx.newAsyncifiedFunction(methodName, async (...argHandles) => {
+      const cachedAsync = fnCache.get(methodName);
+      if (cachedAsync?.kind === "async") {
+        this.ctx.setProp(objHandle, methodName, cachedAsync.handle);
+        continue;
+      }
+      if (cachedAsync !== undefined) {
+        // The method flipped kinds since the last registration; the cached
+        // guest function would route through the wrong wrapper. Replace it.
+        cachedAsync.handle.dispose();
+      }
+      const fnHandle = this.newAsyncifiedHostFunction(methodName, async (...argHandles) => {
         if (this.abortController?.signal.aborted) {
           throw new Error("Execution aborted");
         }
@@ -1037,8 +1078,8 @@ export class QuickJSRuntime implements IJSRuntime {
         }
       });
 
+      fnCache.set(methodName, { kind: "async", handle: fnHandle });
       this.ctx.setProp(objHandle, methodName, fnHandle);
-      fnHandle.dispose();
     }
 
     // Sync methods: plain (non-asyncified) host functions. Asyncified methods
@@ -1047,7 +1088,15 @@ export class QuickJSRuntime implements IJSRuntime {
     // call them — asyncify replays the call and returns garbage. Sync methods
     // never suspend, so they stay safe post-await (see registerSyncFunction).
     for (const methodName of Object.keys(syncMethods ?? {})) {
-      const fnHandle = this.ctx.newFunction(methodName, (...argHandles) => {
+      const cachedSync = fnCache.get(methodName);
+      if (cachedSync?.kind === "sync") {
+        this.ctx.setProp(objHandle, methodName, cachedSync.handle);
+        continue;
+      }
+      if (cachedSync !== undefined) {
+        cachedSync.handle.dispose();
+      }
+      const fnHandle = this.newHostFunction(methodName, (...argHandles) => {
         // Late-bound dispatch (see registeredObjects note above).
         const fn = this.registeredObjectSyncMethods.get(name)?.[methodName];
         if (fn === undefined) {
@@ -1057,8 +1106,20 @@ export class QuickJSRuntime implements IJSRuntime {
         // Host exceptions propagate to the guest as thrown errors.
         return this.marshal(fn(...args));
       });
+      fnCache.set(methodName, { kind: "sync", handle: fnHandle });
       this.ctx.setProp(objHandle, methodName, fnHandle);
-      fnHandle.dispose();
+    }
+
+    // Methods absent from this registration: drop their cached handles so a
+    // later re-add mints a fresh function of the right kind. Guest-saved
+    // references to a removed method stay callable in the VM but fail closed
+    // through the late-bound lookup.
+    const currentSyncMethods = syncMethods ?? {};
+    for (const [methodName, cached] of fnCache) {
+      if (!(methodName in obj) && !(methodName in currentSyncMethods)) {
+        cached.handle.dispose();
+        fnCache.delete(methodName);
+      }
     }
 
     this.ctx.setProp(this.ctx.global, name, objHandle);
@@ -1247,6 +1308,14 @@ export class QuickJSRuntime implements IJSRuntime {
 
   dispose(): void {
     if (!this.disposed) {
+      // The registerObject handle cache owns live guest values; release them
+      // before the context goes down.
+      for (const fnCache of this.registeredObjectFnHandles.values()) {
+        for (const cached of fnCache.values()) {
+          cached.handle.dispose();
+        }
+      }
+      this.registeredObjectFnHandles.clear();
       this.ctx.dispose();
       this.disposed = true;
       // Queued late settlements would no-op anyway (guarded checks disposed);
@@ -1260,6 +1329,36 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   // --- Private helpers ---
+
+  /** Mint one host-function id, failing loudly at the budget: exceeding the
+   * real 16-bit space silently misroutes guest calls to unrelated closures
+   * (see HOST_FN_ID_LIMIT). All host-function creation must flow through this
+   * and newAsyncifiedHostFunction. */
+  private newHostFunction(
+    name: string,
+    fn: Parameters<QuickJSAsyncContext["newFunction"]>[1]
+  ): QuickJSHandle {
+    this.trackHostFnAllocation(name);
+    return this.ctx.newFunction(name, fn);
+  }
+
+  /** Asyncified variant of newHostFunction; same id budget. */
+  private newAsyncifiedHostFunction(
+    name: string,
+    fn: Parameters<QuickJSAsyncContext["newAsyncifiedFunction"]>[1]
+  ): QuickJSHandle {
+    this.trackHostFnAllocation(name);
+    return this.ctx.newAsyncifiedFunction(name, fn);
+  }
+
+  private trackHostFnAllocation(name: string): void {
+    this.hostFnAllocations += 1;
+    if (this.hostFnAllocations > HOST_FN_ID_LIMIT) {
+      throw new Error(
+        `QuickJS host-function id budget exhausted registering "${name}"; dispose and recreate this runtime`
+      );
+    }
+  }
 
   private assertNotDisposed(method: string): void {
     if (this.disposed) {
@@ -1443,7 +1542,7 @@ export class QuickJSRuntime implements IJSRuntime {
     const consoleObj = this.ctx.newObject();
 
     for (const level of ["log", "warn", "error"] as const) {
-      const fn = this.ctx.newFunction(level, (...argHandles) => {
+      const fn = this.newHostFunction(level, (...argHandles) => {
         const timestamp = Date.now();
         // Route to the eval that registered the enclosing reaction (falls
         // back to the current drain context for untagged code).
@@ -1549,7 +1648,7 @@ export class QuickJSRuntime implements IJSRuntime {
   /** Install the promise-reaction tagging patch; see REACTION_TAGGING_SCRIPT. */
   private setupReactionTagging(): void {
     // Host refcount endpoints must exist before the script captures them.
-    const retainFn = this.ctx.newFunction(RETAIN_GENERATION_FN, (genHandle) => {
+    const retainFn = this.newHostFunction(RETAIN_GENERATION_FN, (genHandle) => {
       const gen: unknown = this.ctx.dump(genHandle) as unknown;
       if (typeof gen !== "number") return;
       const entry = this.generationContexts.get(gen);
@@ -1557,7 +1656,7 @@ export class QuickJSRuntime implements IJSRuntime {
     });
     this.ctx.setProp(this.ctx.global, RETAIN_GENERATION_FN, retainFn);
     retainFn.dispose();
-    const releaseFn = this.ctx.newFunction(RELEASE_GENERATION_FN, (genHandle) => {
+    const releaseFn = this.newHostFunction(RELEASE_GENERATION_FN, (genHandle) => {
       const gen: unknown = this.ctx.dump(genHandle) as unknown;
       if (typeof gen !== "number") return;
       const entry = this.generationContexts.get(gen);

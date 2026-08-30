@@ -1,6 +1,5 @@
 import * as path from "node:path";
 import assert from "node:assert/strict";
-import * as fsPromises from "fs/promises";
 
 import type { Config } from "@/node/config";
 import type {
@@ -33,7 +32,6 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { shellQuote } from "@/common/utils/shell";
-import { streamToString } from "@/node/runtime/streamUtils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import {
@@ -41,6 +39,7 @@ import {
   getWorkspaceProjectStorageKeys,
 } from "@/node/services/workspaceProjectRepos";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
 
 /** Callback invoked after patch generation completes (success or failure). */
 export type OnPatchGenerationComplete = (childWorkspaceId: string) => Promise<void>;
@@ -52,33 +51,6 @@ function isPathInsideDir(dirPath: string, filePath: string): boolean {
   return (
     relativePath.length > 0 && !relativePath.startsWith("..") && !path.isAbsolute(relativePath)
   );
-}
-
-async function writeReadableStreamToLocalFile(
-  stream: ReadableStream<Uint8Array>,
-  filePath: string
-): Promise<void> {
-  assert(filePath.length > 0, "writeReadableStreamToLocalFile: filePath must be non-empty");
-
-  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-
-  const fileHandle = await fsPromises.open(filePath, "w");
-  try {
-    const reader = stream.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          await fileHandle.write(value);
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  } finally {
-    await fileHandle.close();
-  }
 }
 
 function getPrimaryProjectName(projectPath: string, projects?: ProjectRef[]): string {
@@ -866,23 +838,14 @@ export class GitPatchArtifactService {
             continue;
           }
 
-          const formatPatchStream = await runtime.exec(
-            `git format-patch --stdout --binary ${baseCommitSha}..${headCommitSha}`,
-            { cwd: projectRepo.repoCwd, timeout: 120 }
-          );
-          await formatPatchStream.stdin.close();
-
-          const stderrPromise = streamToString(formatPatchStream.stderr);
-          const writePromise = writeReadableStreamToLocalFile(formatPatchStream.stdout, patchPath);
-
-          const [exitCode, stderr] = await Promise.all([
-            formatPatchStream.exitCode,
-            stderrPromise,
-            writePromise,
-          ]);
-
-          if (exitCode !== 0) {
-            await fsPromises.rm(patchPath, { force: true });
+          const generation = await taskGitPatchEngine.generatePatch({
+            runtime,
+            repoCwd: projectRepo.repoCwd,
+            baseCommitSha,
+            headCommitSha,
+            patchPath,
+          });
+          if (!generation.success) {
             await ensureProjectArtifact({
               projectPath: projectRepo.projectPath,
               projectName: projectRepo.projectName,
@@ -891,7 +854,7 @@ export class GitPatchArtifactService {
               baseCommitSha,
               headCommitSha,
               commitCount,
-              error: `git format-patch failed (exitCode=${exitCode}): ${stderr.trim() || "unknown error"}`,
+              error: generation.error,
             });
             continue;
           }
