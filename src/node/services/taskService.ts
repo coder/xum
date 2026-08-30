@@ -7806,11 +7806,31 @@ export class TaskService implements AgentTaskIntegration {
           if (!(await this.workspaceService.isWorkflowInvocationCurrent(workspace.id, run.id))) {
             continue;
           }
+          const outcome = terminalAttentionOutcome(run.status);
+          const notificationId = TerminalAttentionStore.notificationId("workflow_run", run.id);
+          const existing = await this.terminalAttentionStore.get(workspace.id, notificationId);
+          const existingCreatedAt = existing != null ? Date.parse(existing.createdAt) : Number.NaN;
+          const runUpdatedAt = Date.parse(run.updatedAt);
+          const existingRepresentsCurrentOutcome =
+            existing?.terminalOutcome === outcome &&
+            Number.isFinite(existingCreatedAt) &&
+            Number.isFinite(runUpdatedAt) &&
+            existingCreatedAt >= runUpdatedAt;
+          if (existing != null && !existingRepresentsCurrentOutcome) {
+            // A crash can lose the retained in-memory reset (resetWorkflowRunTerminalAttention
+            // failure path), leaving a stale delivered/superseded record from an older run
+            // generation that would absorb this terminal's wake via enqueueIfAbsent. The record
+            // predates the run's latest terminal transition and the currentness gate above
+            // verified the wake is owed, so replace it; worst case is one redundant wake (fail
+            // toward notify, never a lost wake).
+            await this.terminalAttentionStore.delete(workspace.id, notificationId);
+            this.pendingWorkflowNotificationResets.get(workspace.id)?.delete(run.id);
+          }
           const created = await this.terminalAttentionStore.enqueueIfAbsent({
             ownerWorkspaceId: workspace.id,
             sourceKind: "workflow_run",
             sourceId: run.id,
-            terminalOutcome: terminalAttentionOutcome(run.status),
+            terminalOutcome: outcome,
           });
           if (created != null) {
             this.scheduleTerminalAttentionDrain(workspace.id);
@@ -7933,6 +7953,15 @@ export class TaskService implements AgentTaskIntegration {
     );
     assert(params.runId.length > 0, "enqueueWorkflowRunTerminalAttention requires runId");
     if (!isTerminalWorkflowRunStatus(params.status)) {
+      return;
+    }
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), params.ownerWorkspaceId) == null) {
+      // Owner workspace was removed: an outbox write would recreate the deleted session
+      // directory and leak a stale record to a future workspace reusing the ID. Applies to
+      // live terminal callbacks and to the bounded retry timer, whose retained state is
+      // dropped here so nothing re-arms the write.
+      this.retainedWorkflowTerminalEnqueues.delete(params.ownerWorkspaceId);
+      this.pendingWorkflowNotificationResets.delete(params.ownerWorkspaceId);
       return;
     }
     try {

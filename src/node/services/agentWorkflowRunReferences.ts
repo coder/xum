@@ -236,7 +236,9 @@ export async function recordAgentWorkflowRunReference(input: {
 
 /**
  * Compare-and-set boundary repair for a surviving boundaryless reference. The reference is
- * re-validated under the sidecar file lock: a concurrent full-history clear deletes the file
+ * re-validated under the process-local sidecar mutex (single-instance backends are the
+ * supported deployment; see requestSingleInstanceLock in desktop/main.ts): a concurrent
+ * full-history clear deletes the file
  * (retiring every reference), and an unconditional write would recreate it with a
  * verified-empty boundary, resurrecting the retired pre-clear result as "current" in the
  * freshly cleared conversation. A reference that concurrently gained a boundary (explicit

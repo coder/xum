@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
+import { existsSync } from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
@@ -6213,6 +6214,144 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
+  test("workspace removal drops retained terminal enqueues without recreating the outbox", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_terminal_enqueue_removed_owner";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendNextEvent(runId, {
+      type: "result",
+      at: "2026-06-19T00:00:02.000Z",
+      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
+    });
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internalStore = (
+      taskService as unknown as { terminalAttentionStore: TerminalAttentionStore }
+    ).terminalAttentionStore;
+    spyOn(internalStore, "enqueueIfAbsent").mockRejectedValueOnce(
+      new Error("EIO: outbox write failed")
+    );
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+
+    // The owner is removed (config entry gone, session directory deleted) before the bounded
+    // retry fires; the retry must not recreate the deleted session directory or leave state
+    // for a future workspace reusing the ID.
+    const cfg = config.loadConfigOrDefault();
+    for (const project of cfg.projects.values()) {
+      project.workspaces = project.workspaces.filter((workspace) => workspace.id !== parentId);
+    }
+    await config.editConfig(() => cfg);
+    const sessionDir = config.getSessionDir(parentId);
+    await fsPromises.rm(sessionDir, { recursive: true, force: true });
+
+    await (
+      taskService as unknown as {
+        retryRetainedWorkflowTerminalEnqueues(ownerWorkspaceId: string): Promise<void>;
+      }
+    ).retryRetainedWorkflowTerminalEnqueues(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(existsSync(sessionDir)).toBe(false);
+    const retained = (
+      taskService as unknown as {
+        retainedWorkflowTerminalEnqueues: Map<string, Map<string, unknown>>;
+      }
+    ).retainedWorkflowTerminalEnqueues;
+    expect(retained.has(parentId)).toBe(false);
+  });
+
+  test("startup recovery replaces a stale terminal record from an older run generation", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_recovery_stale_generation";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: new Date(Date.now() - 120_000).toISOString(),
+    });
+    await runStore.appendStatus(runId, "running", new Date(Date.now() - 90_000).toISOString());
+    await runStore.appendStatus(runId, "failed", new Date(Date.now() - 60_000).toISOString());
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const recover = () =>
+      (
+        taskService as unknown as {
+          recoverTerminalWorkflowRunAttentionNotifications(): Promise<number>;
+        }
+      ).recoverTerminalWorkflowRunAttentionNotifications();
+
+    // First generation delivers normally, leaving a delivered record newer than the run's
+    // terminal transition; recovery must not duplicate a record representing this outcome.
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "failed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(await recover()).toBe(0);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    // The resumed run reaches terminal again after the delivered record was written, and the
+    // process crashed before reset-then-enqueue ran (no in-memory reset marker survives the
+    // restart). Recovery must replace the stale delivered record instead of letting
+    // enqueueIfAbsent silently absorb the newer generation's wake.
+    await runStore.appendStatus(runId, "running", new Date(Date.now() + 30_000).toISOString(), {
+      allowFailedCheckpointRetry: true,
+    });
+    await runStore.appendStatus(runId, "failed", new Date(Date.now() + 60_000).toISOString());
+
+    expect(await recover()).toBe(1);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
   test("a failed reset is completed by the next terminal enqueue", async () => {
