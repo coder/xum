@@ -1,0 +1,253 @@
+/**
+ * Chaos tests for StreamManager stream consumption.
+ *
+ * A faulty upstream provider (or gateway) can deliver arbitrary chunk
+ * sequences: malformed deltas, unknown chunk types, garbage usage payloads,
+ * mid-stream thrown errors, or empty streams. The agent loop must never wedge:
+ * every started stream's completion promise must settle with a terminal event,
+ * no unhandled rejections may escape, and the workspace must accept a new
+ * stream afterwards.
+ */
+import { describe, test, expect, afterEach, beforeEach } from "bun:test";
+import { StreamManager, type TurnEngineEvent } from "./streamManager";
+import type { HistoryService } from "./historyService";
+import { createTestHistoryService } from "./testHistoryService";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+import type { LanguageModel } from "ai";
+import {
+  mulberry32,
+  randomHostileValue,
+  randomFragmentString,
+  randInt,
+  pick,
+  type Rng,
+} from "@/common/utils/testing/fuzzHelpers";
+
+const SEED = 0x5eed5;
+const ITERATIONS = 40;
+const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+
+let historyService: HistoryService;
+let historyCleanup: () => Promise<void>;
+
+beforeEach(async () => {
+  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+});
+
+afterEach(async () => {
+  await historyCleanup();
+});
+
+function createTestLanguageModel(): LanguageModel {
+  return {
+    specificationVersion: "v3",
+    provider: "test",
+    modelId: "chaos-model",
+    supportedUrls: {},
+    doGenerate: () => Promise.reject(new Error("doGenerate unused in chaos tests")),
+    doStream: () => Promise.reject(new Error("doStream unused in chaos tests")),
+  };
+}
+
+/** One random provider chunk. Mirrors the shapes a broken upstream can emit. */
+function randomChunk(rng: Rng): unknown {
+  const kind = rng();
+  if (kind < 0.25) {
+    // text-delta with string or junk payloads under all known field aliases.
+    return {
+      type: "text-delta",
+      [pick(rng, ["text", "delta", "textDelta"])]:
+        rng() < 0.6 ? randomFragmentString(rng) : randomHostileValue(rng),
+    };
+  }
+  if (kind < 0.4) {
+    return {
+      type: pick(rng, ["reasoning-start", "reasoning-delta", "reasoning-end"]),
+      id: rng() < 0.5 ? `r${randInt(rng, 3)}` : randomHostileValue(rng),
+      [pick(rng, ["text", "delta"])]: rng() < 0.5 ? randomFragmentString(rng) : undefined,
+      providerMetadata: rng() < 0.3 ? randomHostileValue(rng) : undefined,
+    };
+  }
+  if (kind < 0.5) {
+    return { type: "start-step" };
+  }
+  if (kind < 0.6) {
+    return {
+      type: "finish-step",
+      usage: randomHostileValue(rng),
+      finishReason: rng() < 0.5 ? randomFragmentString(rng) : randomHostileValue(rng),
+      providerMetadata: rng() < 0.5 ? randomHostileValue(rng) : undefined,
+      response: rng() < 0.5 ? randomHostileValue(rng) : undefined,
+    };
+  }
+  if (kind < 0.7) {
+    return {
+      type: "finish",
+      finishReason:
+        rng() < 0.5 ? pick(rng, ["stop", "length", "content-filter"]) : randomHostileValue(rng),
+      totalUsage: randomHostileValue(rng),
+    };
+  }
+  if (kind < 0.8) {
+    return { type: "error", error: randomHostileValue(rng) };
+  }
+  // Unknown chunk type / total garbage.
+  return rng() < 0.5
+    ? { type: randomFragmentString(rng, 2), payload: randomHostileValue(rng) }
+    : randomHostileValue(rng);
+}
+
+function randomFullStream(rng: Rng): AsyncGenerator<unknown, void, unknown> {
+  const chunkCount = randInt(rng, 12);
+  const chunks = Array.from({ length: chunkCount }, () => randomChunk(rng));
+  const throwMidStream = rng() < 0.3;
+  const throwValue = randomHostileValue(rng);
+  return (async function* () {
+    await Promise.resolve();
+    for (const chunk of chunks) {
+      yield chunk;
+    }
+    if (throwMidStream) {
+      throw throwValue instanceof Error ? throwValue : new Error(String(chunkCount));
+    }
+    // Otherwise close without a finish event (truncated stream).
+  })();
+}
+
+describe("StreamManager chaos", () => {
+  test(`hostile chunk streams always settle with a terminal event and never wedge the workspace (seed=${SEED})`, async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const rng = mulberry32(SEED);
+      for (let iter = 0; iter < ITERATIONS; iter++) {
+        const workspaceId = `chaos-ws-${iter}`;
+        const events: TurnEngineEvent[] = [];
+        const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+          events.push(event);
+        });
+        Reflect.set(streamManager, "tokenTracker", {
+          setModel: () => Promise.resolve(),
+          countTokens: () => Promise.resolve(0),
+        });
+        Reflect.set(streamManager, "createStreamResult", () => ({
+          fullStream: randomFullStream(rng),
+          totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
+          usage: Promise.resolve(undefined),
+          providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
+          steps: Promise.resolve([]),
+        }));
+
+        const messageId = `chaos-msg-${iter}`;
+        const appendResult = await historyService.appendToHistory(workspaceId, {
+          id: messageId,
+          role: "assistant",
+          metadata: { historySequence: 1, partial: true },
+          parts: [],
+        });
+        expect(appendResult.success).toBe(true);
+
+        const result = await streamManager.startStream({
+          workspaceId,
+          messageId,
+          model: createTestLanguageModel(),
+          messages: [{ role: "user", content: "hello" }],
+          modelString: "openai:gpt-4.1-mini",
+          historySequence: 1,
+          system: "system",
+          runtime: LOCAL_TEST_RUNTIME,
+          providedRuntimeTempDir: "",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) continue;
+
+        // The completion promise must settle without external intervention.
+        const completion = await Promise.race([
+          result.data.completion,
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error(`iteration ${iter}: stream wedged (no settlement)`)),
+              15_000
+            )
+          ),
+        ]);
+        expect(["completed", "failed", "aborted"]).toContain(completion.status);
+
+        // A terminal event must have been emitted to the sink.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const terminalTypes = events.filter((event) =>
+          ["stream-end", "error", "stream-abort"].includes(event.type)
+        );
+        expect(terminalTypes.length).toBeGreaterThan(0);
+
+        // The workspace must not be wedged: interruption/cleanup must allow
+        // reuse. stopStream must be a no-op that does not throw.
+        await streamManager.stopStream(workspaceId);
+      }
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  }, 120_000);
+
+  test("cyclic error-chunk payloads surface the provider message, not a JSON serialization TypeError", async () => {
+    // Regression: the error-part fallback used bare JSON.stringify, so a
+    // cyclic/BigInt error payload threw "Converting circular structure to
+    // JSON" and masked the provider's actual error.
+    const cyclic: Record<string, unknown> = { code: "upstream_broke" };
+    cyclic.self = cyclic;
+
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      events.push(event);
+    });
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createStreamResult", () => ({
+      fullStream: (async function* () {
+        await Promise.resolve();
+        yield { type: "error", error: cyclic };
+      })(),
+      totalUsage: Promise.resolve(undefined),
+      usage: Promise.resolve(undefined),
+      providerMetadata: Promise.resolve(undefined),
+      steps: Promise.resolve([]),
+    }));
+
+    const appendResult = await historyService.appendToHistory("cyclic-error-ws", {
+      id: "cyclic-error-msg",
+      role: "assistant",
+      metadata: { historySequence: 1, partial: true },
+      parts: [],
+    });
+    expect(appendResult.success).toBe(true);
+
+    const result = await streamManager.startStream({
+      workspaceId: "cyclic-error-ws",
+      messageId: "cyclic-error-msg",
+      model: createTestLanguageModel(),
+      messages: [{ role: "user", content: "hello" }],
+      modelString: "openai:gpt-4.1-mini",
+      historySequence: 1,
+      system: "system",
+      runtime: LOCAL_TEST_RUNTIME,
+      providedRuntimeTempDir: "",
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected stream to start");
+
+    const completion = await result.data.completion;
+    expect(completion.status).toBe("failed");
+    const errorEvent = events.find((event) => event.type === "error") as
+      | { type: "error"; message?: string; error?: string }
+      | undefined;
+    expect(errorEvent).toBeDefined();
+    const message = errorEvent?.message ?? errorEvent?.error ?? "";
+    expect(message).not.toContain("circular");
+    expect(message).toContain("upstream_broke");
+  });
+});

@@ -3629,8 +3629,11 @@ export class StreamManager {
                   errorMessage ??=
                     typeof errorObj.message === "string" ? errorObj.message : undefined;
 
-                  // Last resort: stringify the error
-                  errorMessage ??= JSON.stringify(errorObj);
+                  // Last resort: stringify the error. getErrorMessage guards
+                  // against cyclic/BigInt payloads and undefined-returning
+                  // toJSON, where a bare JSON.stringify would throw and
+                  // replace the provider error with a serialization TypeError.
+                  errorMessage ??= getErrorMessage(errorObj);
 
                   const error = new Error(errorMessage);
                   // Preserve original error as cause for debugging

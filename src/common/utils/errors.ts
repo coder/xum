@@ -17,7 +17,18 @@ export function getErrorMessage(error: unknown): string {
           return message;
         }
 
-        const serializedError = JSON.stringify(error);
+        // Cycle/BigInt-safe: provider error payloads can carry circular
+        // references (which make bare JSON.stringify throw) — degrading to
+        // String(error)'s useless "[object Object]".
+        const serializedSeen = new WeakSet<object>();
+        const serializedError = JSON.stringify(error, (_key, value: unknown) => {
+          if (typeof value === "bigint") return value.toString();
+          if (typeof value === "object" && value !== null) {
+            if (serializedSeen.has(value)) return "[Circular]";
+            serializedSeen.add(value);
+          }
+          return value;
+        });
         if (typeof serializedError === "string") {
           return serializedError;
         }
@@ -30,7 +41,14 @@ export function getErrorMessage(error: unknown): string {
       }
     }
 
-    return String(error);
+    try {
+      return String(error);
+    } catch {
+      // String(error) invokes toString/Symbol.toPrimitive, which a hostile
+      // Proxy or throwing getter can make throw. This helper must never throw
+      // (it runs in stream-failure paths where a crash would mask the error).
+      return "[unrepresentable thrown value]";
+    }
   }
 
   let msg = error.message;

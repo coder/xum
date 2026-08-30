@@ -45,10 +45,10 @@ describe("getErrorMessage", () => {
     expect(getErrorMessage(obj)).toBe("[object Object]");
   });
 
-  it("falls back to String() for circular plain objects", () => {
+  it("serializes circular plain objects with a [Circular] marker instead of degrading", () => {
     const obj: Record<string, unknown> = { code: 500 };
     obj.self = obj;
-    expect(getErrorMessage(obj)).toBe("[object Object]");
+    expect(getErrorMessage(obj)).toBe('{"code":500,"self":"[Circular]"}');
   });
 
   it("returns .message for a plain Error", () => {
