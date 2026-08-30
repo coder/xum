@@ -46,6 +46,17 @@ const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
  * dispatch corrupt. */
 const HOST_FN_ID_LIMIT = 60_000;
 
+/** A guest function minted for one registerObject method, tagged with the
+ * wrapper kind it was created through so a later registration can tell a
+ * reusable handle from one that must be replaced. */
+interface CachedMethodHandle {
+  kind: "async" | "sync";
+  handle: QuickJSHandle;
+}
+
+/** Cached guest functions for one registerObject name, keyed by method name. */
+type MethodHandleCache = Map<string, CachedMethodHandle>;
+
 /** Generate a short random ID for PTC nested tool calls (10 hex chars). */
 function generateCallId(): string {
   return crypto.randomBytes(5).toString("hex");
@@ -275,10 +286,7 @@ export class QuickJSRuntime implements IJSRuntime {
    * and misrouted every later xum.* call to an unrelated tool. Dispatch is
    * late-bound through the maps above, so a cached guest function stays
    * correct across re-registrations; only never-seen method names allocate. */
-  private readonly registeredObjectFnHandles = new Map<
-    string,
-    Map<string, { kind: "async" | "sync"; handle: QuickJSHandle }>
-  >();
+  private readonly registeredObjectFnHandles = new Map<string, MethodHandleCache>();
   /** Host-function ids minted on this context; see HOST_FN_ID_LIMIT. */
   private hostFnAllocations = 0;
 
@@ -977,16 +985,7 @@ export class QuickJSRuntime implements IJSRuntime {
     const objHandle = this.ctx.newObject();
 
     for (const methodName of Object.keys(obj)) {
-      const cachedAsync = fnCache.get(methodName);
-      if (cachedAsync?.kind === "async") {
-        this.ctx.setProp(objHandle, methodName, cachedAsync.handle);
-        continue;
-      }
-      if (cachedAsync !== undefined) {
-        // The method flipped kinds since the last registration; the cached
-        // guest function would route through the wrong wrapper. Replace it.
-        cachedAsync.handle.dispose();
-      }
+      if (this.reuseCachedMethodHandle(fnCache, objHandle, methodName, "async")) continue;
       const fnHandle = this.newAsyncifiedHostFunction(methodName, async (...argHandles) => {
         if (this.abortController?.signal.aborted) {
           throw new Error("Execution aborted");
@@ -1080,14 +1079,7 @@ export class QuickJSRuntime implements IJSRuntime {
     // call them — asyncify replays the call and returns garbage. Sync methods
     // never suspend, so they stay safe post-await (see registerSyncFunction).
     for (const methodName of Object.keys(syncMethods ?? {})) {
-      const cachedSync = fnCache.get(methodName);
-      if (cachedSync?.kind === "sync") {
-        this.ctx.setProp(objHandle, methodName, cachedSync.handle);
-        continue;
-      }
-      if (cachedSync !== undefined) {
-        cachedSync.handle.dispose();
-      }
+      if (this.reuseCachedMethodHandle(fnCache, objHandle, methodName, "sync")) continue;
       const fnHandle = this.newHostFunction(methodName, (...argHandles) => {
         // Late-bound dispatch (see registeredObjects note above).
         const fn = this.registeredObjectSyncMethods.get(name)?.[methodName];
@@ -1341,6 +1333,28 @@ export class QuickJSRuntime implements IJSRuntime {
   ): QuickJSHandle {
     this.trackHostFnAllocation(name);
     return this.ctx.newAsyncifiedFunction(name, fn);
+  }
+
+  /** Bind the cached guest function for `methodName` onto `objHandle` when it
+   * was minted through the same wrapper, returning true so the caller skips
+   * minting a fresh host-function id (see HOST_FN_ID_LIMIT). A handle of the
+   * other kind would route through the wrong wrapper, so it is disposed and
+   * the caller mints a replacement. */
+  private reuseCachedMethodHandle(
+    fnCache: MethodHandleCache,
+    objHandle: QuickJSHandle,
+    methodName: string,
+    kind: CachedMethodHandle["kind"]
+  ): boolean {
+    const cached = fnCache.get(methodName);
+    if (cached === undefined) return false;
+    if (cached.kind === kind) {
+      this.ctx.setProp(objHandle, methodName, cached.handle);
+      return true;
+    }
+    // The method flipped kinds since the last registration.
+    cached.handle.dispose();
+    return false;
   }
 
   private trackHostFnAllocation(name: string): void {
