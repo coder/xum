@@ -159,15 +159,17 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // that this turn already received the terminal result. Persist consumption durably so the
       // terminal-attention drain never re-delivers it.
       const markTerminalAttentionConsumed = async (
-        terminalRun: Pick<WorkflowRunRecord, "id" | "status">
+        terminalRun: Pick<WorkflowRunRecord, "id" | "status" | "updatedAt">
       ) => {
         if (!isTerminalWorkflowRunStatus(terminalRun.status)) {
           return;
         }
-        await config.taskService?.markWorkflowRunTerminalAttentionConsumed?.({
+        await config.taskService?.markWorkflowRunTerminalAttentionSettled?.({
           ownerWorkspaceId: workspaceId,
           runId: terminalRun.id,
           status: terminalRun.status,
+          runUpdatedAt: terminalRun.updatedAt,
+          settledAs: "delivered",
         });
       };
 
@@ -255,15 +257,16 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       const refreshedRunIsStale =
         isBackgroundDispatch && refreshedRun != null && refreshedRun.status === run.status;
 
-      // Foreground only: a background dispatch can still observe the stale pre-dispatch terminal
-      // status, and consuming it would tombstone the retried run's future terminal wake.
-      // Consumption derives from the dispatch result itself, not the refreshed record: the
-      // terminal result is returned to the model below even when the refresh read fails, and
-      // skipping the tombstone would let the pending terminal attention re-inject it later.
-      if (!isBackgroundDispatch) {
+      // Foreground only: a background dispatch can still observe the stale pre-dispatch
+      // terminal status, and settling it would absorb the retried run's future terminal wake.
+      // The settled marker binds to the run's terminal generation (updatedAt), so it needs a
+      // refreshed record that reflects the dispatched terminal status; when the refresh failed
+      // or lags, skip the marker and the wake settles as consumed from the tool result in
+      // history on the next scan (worst case one redundant wake for a kernel-nested resume).
+      if (!isBackgroundDispatch && refreshedRun != null) {
         const dispatchedStatus = WorkflowRunStatusSchema.safeParse(dispatched.status);
-        if (dispatchedStatus.success) {
-          await markTerminalAttentionConsumed({ id: runId, status: dispatchedStatus.data });
+        if (dispatchedStatus.success && refreshedRun.status === dispatchedStatus.data) {
+          await markTerminalAttentionConsumed(refreshedRun);
         }
       }
 

@@ -6,7 +6,6 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
   clearAgentWorkflowRunReferences,
   readAgentWorkflowRunReferences,
-  repairAgentWorkflowRunReferenceBoundary,
   type AgentWorkflowRunReference,
 } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
@@ -11065,9 +11064,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // identity cannot be verified, and wall-clock ordering is the exact hole the identity
       // path exists to close (a backward clock correction would let a pre-supersession
       // reference outrank a newer manual turn and deliver its output under that turn's tool
-      // policy). Defer like an unreadable history: the wake stays pending, a workflow_resume
-      // re-record repairs provenance, and an explicit resume/await still consumes the run.
-      return "indeterminate";
+      // policy). Fail quiet rather than deliver or defer forever: this is a deliberately
+      // accepted narrow window (downgrade-stripped or snapshot-failed launches), and the
+      // run's result stays retrievable via an explicit workflow_resume, which re-records the
+      // reference with a fresh boundary.
+      return "not_current";
     }
     if (reference.afterBoundaryMessageId === null) {
       // Verified-empty snapshot: a decision row now exists, so it appeared after the record.
@@ -11159,50 +11160,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       throw new Error("workflow invocation boundary unavailable: history read failed");
     }
     return decision.status === "found" ? decision.messageId : null;
-  }
-
-  /**
-   * Re-snapshot the boundary for a run reference that lost it: a pre-boundary build rewrites
-   * the sidecar with only runId/createdAtMs on any record (upgrade -> downgrade -> upgrade
-   * strips the field), and a boundaryless reference defers its terminal wake as indeterminate
-   * until provenance is re-established. Crash recovery calls this before restarting an
-   * orphaned run, but the repair proceeds only on supersession-free evidence: a decision-free
-   * history (recorded as a verified-empty boundary) or a newest decision row that belongs to
-   * this run. A newest manual/reset row is refused: the stripped launch cannot be ordered
-   * against it by identity, and snapshotting it would resurrect a possibly pre-supersession
-   * result into the newer conversation (the same reference with a surviving boundary would
-   * stay not_current). Those wakes stay deferred until an explicit workflow_resume, which
-   * carries current-context intent. References that still carry a boundary (including
-   * verified-empty null) are left untouched: refreshing them would forgive manual
-   * supersessions on every restart.
-   */
-  async repairWorkflowRunReferenceBoundary(workspaceId: string, runId: string): Promise<void> {
-    assert(workspaceId.length > 0, "repairWorkflowRunReferenceBoundary requires workspaceId");
-    assert(runId.length > 0, "repairWorkflowRunReferenceBoundary requires runId");
-    const sessionDir = this.config.getSessionDir(workspaceId);
-    const references = await readAgentWorkflowRunReferences(sessionDir);
-    const reference = references.find((candidate) => candidate.runId === runId);
-    if (reference == null || reference.afterBoundaryMessageId !== undefined) {
-      return;
-    }
-    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
-    if (decision.status === "error") {
-      throw new Error("workflow invocation boundary unavailable: history read failed");
-    }
-    if (decision.status === "found" && decision.outcome === "superseded") {
-      return;
-    }
-    // Supersession-free evidence only: no decision row at all (verified-empty null), or the
-    // newest decision row is this run's own invocation/consumed row, which no manual row can
-    // postdate (the backward walk would have found that manual row first). The write is a
-    // compare-and-set under the sidecar lock: a full clear landing after the reads above
-    // deletes the sidecar, and an unconditional record would recreate it with a
-    // verified-empty boundary, resurrecting the retired pre-clear result as "current".
-    await repairAgentWorkflowRunReferenceBoundary({
-      workspaceSessionDir: sessionDir,
-      runId,
-      afterBoundaryMessageId: decision.status === "found" ? decision.messageId : null,
-    });
   }
 
   /**

@@ -116,7 +116,6 @@ import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
-import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
@@ -584,34 +583,21 @@ export async function resolveWorkflowContext(
           includeAgentPlugins,
           skillStorageContext,
         }),
-      onRunStatusChanged: async (event) => {
-        // Router-managed restarts (resume / retry / crash recovery) must clear a prior
-        // delivered or superseded notification when the run leaves terminal state, or
-        // enqueueIfAbsent would preserve the stale record and silently drop the resumed
-        // run's next terminal wake (mirrors the AIService-owned service).
-        if (!isTerminalWorkflowRunStatus(event.status)) {
-          await context.taskService.resetWorkflowRunTerminalAttention({
-            ownerWorkspaceId: event.workspaceId,
-            runId: event.runId,
-          });
-        }
-        await context.workspaceService.emitWorkflowRunActivity(event);
-      },
-      onRunCrashResumed: (event) =>
-        context.workspaceService.repairWorkflowRunReferenceBoundary(event.workspaceId, event.runId),
+      // No reset bookkeeping on restarts: settled markers are keyed by the run's terminal
+      // generation, so a resumed run's next terminal transition re-arms attention by itself.
+      onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
       // Read paths (listRuns / stream subscribe) create services purely to observe runs, but
       // crash recovery can resume an orphaned background run on them: without a terminal
-      // callback the settled run would enqueue no terminal attention until the next restart's
-      // sweep. Default to the standard outbox enqueue (idempotent via enqueueIfAbsent);
-      // explicit callbacks (slash-command continuations, retry) keep their custom behavior.
+      // callback the settled run would owe its wake to the next sweep. Explicit callbacks
+      // (slash-command continuations, retry) keep their custom behavior.
       onBackgroundRunTerminal:
         options.onBackgroundRunTerminal ??
-        (async (event) => {
+        ((event) => {
           // Nested runs surface through their parent workflow, not their own wake.
           if (event.run.parentWorkflow != null) {
             return;
           }
-          await context.taskService.enqueueWorkflowRunTerminalAttention({
+          context.taskService.noteWorkflowRunTerminalAttention({
             ownerWorkspaceId: workspaceId,
             runId: event.runId,
             status: event.status,

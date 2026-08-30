@@ -157,6 +157,7 @@ import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/type
 import {
   isActiveWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
+  type WorkflowRunRecord,
   type WorkflowRunStatus,
 } from "@/common/types/workflow";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
@@ -874,10 +875,11 @@ function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
 const REMOVED_AGENT_TASKS_DIR = "removed-agent-tasks";
 const COMPLETED_REPORT_CACHE_MAX_ENTRIES = 128;
 
-// Retry cadence for terminal-attention drains deferred by indeterminate workflow currentness
-// (unreadable history/sidecar). There is no deterministic "storage recovered" signal, so a
-// bounded timer is the re-trigger; each retry that defers again arms the next one.
-const TERMINAL_ATTENTION_DEFER_RETRY_DELAY_MS = 30_000;
+// Level-triggered backstop for workflow terminal wakes: the sweep re-derives owed wakes from
+// durable state (run records + settled markers), so lost terminal callbacks, deferred
+// (transiently unreadable) evaluations, and crashes all recover here without any per-failure
+// retry bookkeeping.
+const WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS = 5 * 60_000;
 
 /** Maximum consecutive auto-resumes before stopping. Prevents infinite loops when descendants are stuck. */
 // Task-recovery paths must stay deterministic and editing-capable even when
@@ -1675,32 +1677,12 @@ export class TaskService implements AgentTaskIntegration {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
-  // One armed defer-retry timer per owner (see scheduleTerminalAttentionDeferRetry). The delay
-  // is a field, not a constant, so tests can shrink it without waiting out the real backoff.
-  private readonly terminalAttentionDeferRetryTimers = new Map<
-    string,
-    ReturnType<typeof setTimeout>
-  >();
-  private terminalAttentionDeferRetryDelayMs = TERMINAL_ATTENTION_DEFER_RETRY_DELAY_MS;
-  // Workflow terminal callbacks are single-attempt (WorkflowService swallows callback
-  // rejections), so a transient outbox write failure would otherwise silence the wake for
-  // the life of the process. Retain failed enqueue params (owner -> runId -> status) and
-  // retry on the defer-retry cadence; reset drops the entry so a resumed run cannot
-  // resurrect its stale terminal wake.
-  private readonly retainedWorkflowTerminalEnqueues = new Map<
-    string,
-    Map<string, WorkflowRunStatus>
-  >();
-  private readonly workflowTerminalEnqueueRetryTimers = new Map<
-    string,
-    ReturnType<typeof setTimeout>
-  >();
-  // A reset whose store delete fails is retained here (owner -> runIds) instead of being
-  // swallowed: the stale delivered/superseded record only matters when the run settles
-  // again, so the next terminal enqueue completes the reset (delete before enqueue) and a
-  // failure there flows into the retained-enqueue retry above. No timer needed: with no
-  // later terminal transition the stale record is inert.
-  private readonly pendingWorkflowNotificationResets = new Map<string, Set<string>>();
+  // Owed workflow terminal wakes (owner -> runIds believed terminal and not yet settled). An
+  // in-memory work queue over durable state, not a delivery record: entries are (re)derived
+  // from run records + settled markers at startup and on the periodic sweep and added by live
+  // terminal callbacks, so losing the map merely delays a wake until the next sweep.
+  private readonly pendingWorkflowRunAttention = new Map<string, Set<string>>();
+  private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
@@ -3219,8 +3201,15 @@ export class TaskService implements AgentTaskIntegration {
       log.error("Startup workflow task archive sweep failed", { error });
     }
 
-    const recoveredTerminalWorkflowRunNotificationCount =
-      await this.recoverTerminalWorkflowRunAttentionNotifications();
+    const queuedTerminalWorkflowRunAttentionCount = await this.sweepWorkflowRunTerminalAttention();
+    if (this.workflowAttentionSweepTimer == null) {
+      this.workflowAttentionSweepTimer = setInterval(() => {
+        void this.sweepWorkflowRunTerminalAttention().catch((error: unknown) => {
+          log.warn("Workflow terminal attention sweep failed", { error });
+        });
+      }, WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS);
+      this.workflowAttentionSweepTimer.unref?.();
+    }
     const recoveredTerminalWorkspaceTurnNotificationCount =
       await this.recoverTerminalWorkspaceTurnAttentionNotifications();
     const terminalAttentionDrainStartedAt = Date.now();
@@ -3246,7 +3235,7 @@ export class TaskService implements AgentTaskIntegration {
       patchGenerationRecoveryMs,
       bestOfParentRecoveryCount: bestOfParentWorkspaceIds.size,
       bestOfRecoveryMs,
-      recoveredTerminalWorkflowRunNotificationCount,
+      queuedTerminalWorkflowRunAttentionCount,
       recoveredTerminalWorkspaceTurnNotificationCount,
       pendingTerminalAttentionOwnerWorkspaceCount: pendingTerminalAttentionOwnerWorkspaceIds.length,
       terminalAttentionDrainMs,
@@ -7773,12 +7762,24 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
-  private async recoverTerminalWorkflowRunAttentionNotifications(): Promise<number> {
+  /**
+   * Level-triggered reconciliation scan: re-derive owed workflow terminal wakes from durable
+   * state (top-level notify_on_terminal run records in a terminal status, minus
+   * generation-scoped settled markers) into the in-memory queue and poke the drain. Runs at
+   * startup and on a fixed sweep interval, so missed terminal callbacks, crashes, and
+   * deferred (transiently unreadable) evaluations always get re-evaluated without any
+   * per-failure retry bookkeeping. Archived workspaces are skipped, which parks their wakes
+   * unsettled: unarchiving re-queues them on the next sweep instead of dropping them.
+   */
+  private async sweepWorkflowRunTerminalAttention(): Promise<number> {
     const cfg = this.config.loadConfigOrDefault();
-    let recoveredCount = 0;
+    let queuedCount = 0;
     for (const project of cfg.projects.values()) {
       for (const workspace of project.workspaces) {
-        if (workspace.id == null) {
+        if (
+          workspace.id == null ||
+          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+        ) {
           continue;
         }
         const runStore = new WorkflowRunStore({
@@ -7788,12 +7789,13 @@ export class TaskService implements AgentTaskIntegration {
         try {
           runs = await runStore.listRuns();
         } catch (error: unknown) {
-          log.warn("Failed to recover workflow terminal notifications", {
+          log.warn("Failed to sweep workflow terminal attention", {
             workspaceId: workspace.id,
             error: getErrorMessage(error),
           });
           continue;
         }
+        let queuedForWorkspace = false;
         for (const run of runs) {
           if (
             run.workspaceId !== workspace.id ||
@@ -7803,43 +7805,30 @@ export class TaskService implements AgentTaskIntegration {
           ) {
             continue;
           }
-          if (!(await this.workspaceService.isWorkflowInvocationCurrent(workspace.id, run.id))) {
+          const marker = await this.terminalAttentionStore.get(
+            workspace.id,
+            TerminalAttentionStore.notificationId("workflow_run", run.id, run.updatedAt)
+          );
+          if (marker != null && marker.status !== "pending") {
             continue;
           }
-          const outcome = terminalAttentionOutcome(run.status);
-          const notificationId = TerminalAttentionStore.notificationId("workflow_run", run.id);
-          const existing = await this.terminalAttentionStore.get(workspace.id, notificationId);
-          const existingCreatedAt = existing != null ? Date.parse(existing.createdAt) : Number.NaN;
-          const runUpdatedAt = Date.parse(run.updatedAt);
-          const existingRepresentsCurrentOutcome =
-            existing?.terminalOutcome === outcome &&
-            Number.isFinite(existingCreatedAt) &&
-            Number.isFinite(runUpdatedAt) &&
-            existingCreatedAt >= runUpdatedAt;
-          if (existing != null && !existingRepresentsCurrentOutcome) {
-            // A crash can lose the retained in-memory reset (resetWorkflowRunTerminalAttention
-            // failure path), leaving a stale delivered/superseded record from an older run
-            // generation that would absorb this terminal's wake via enqueueIfAbsent. The record
-            // predates the run's latest terminal transition and the currentness gate above
-            // verified the wake is owed, so replace it; worst case is one redundant wake (fail
-            // toward notify, never a lost wake).
-            await this.terminalAttentionStore.delete(workspace.id, notificationId);
-            this.pendingWorkflowNotificationResets.get(workspace.id)?.delete(run.id);
+          let runIds = this.pendingWorkflowRunAttention.get(workspace.id);
+          if (runIds == null) {
+            runIds = new Set();
+            this.pendingWorkflowRunAttention.set(workspace.id, runIds);
           }
-          const created = await this.terminalAttentionStore.enqueueIfAbsent({
-            ownerWorkspaceId: workspace.id,
-            sourceKind: "workflow_run",
-            sourceId: run.id,
-            terminalOutcome: outcome,
-          });
-          if (created != null) {
-            this.scheduleTerminalAttentionDrain(workspace.id);
-            recoveredCount += 1;
+          if (!runIds.has(run.id)) {
+            runIds.add(run.id);
+            queuedCount += 1;
           }
+          queuedForWorkspace = true;
+        }
+        if (queuedForWorkspace) {
+          this.scheduleTerminalAttentionDrain(workspace.id);
         }
       }
     }
-    return recoveredCount;
+    return queuedCount;
   }
 
   private async recoverTerminalWorkspaceTurnAttentionNotifications(): Promise<number> {
@@ -7932,131 +7921,38 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   // ---- Terminal attention notifier ------------------------------------------------------------
-  // Deep module for delivering terminal wake-ups for notify_on_terminal work. Settlement paths
-  // enqueue a persisted notification (outside any settlement lock); the notifier drains pending
-  // notifications when the owner is idle, sends one coalesced synthetic wake-up, and marks each
-  // delivered only after an accepted send. Crash/restart safe via the persisted store.
+  // Deep module for delivering terminal wake-ups for notify_on_terminal work. Sub-agent and
+  // workspace-turn settlements enqueue a persisted outbox notification (outside any settlement
+  // lock); workflow wakes are level-triggered instead, re-derived from run records + settled
+  // markers (see sweepWorkflowRunTerminalAttention). The drain fires when the owner is idle,
+  // sends one coalesced synthetic wake-up, and records delivery only after an accepted send.
 
   /**
-   * Persist a pending terminal wake-up for the owner workspace and schedule an async drain.
-   * Idempotent by source kind/id. Must NOT be called while holding settlement/event locks; only
-   * the persisted enqueue happens synchronously inside callers, the drain is deferred.
+   * Note a top-level background workflow run's terminal transition and poke the drain. Purely
+   * an accelerator over the durable state the sweep re-derives (run records + settled
+   * markers): a lost poke, a removed workspace, or a later resume needs no compensation here,
+   * so this writes nothing to disk.
    */
-  async enqueueWorkflowRunTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    runId: string;
-    status: WorkflowRunStatus;
-  }): Promise<void> {
-    assert(
-      params.ownerWorkspaceId.length > 0,
-      "enqueueWorkflowRunTerminalAttention requires ownerWorkspaceId"
-    );
-    assert(params.runId.length > 0, "enqueueWorkflowRunTerminalAttention requires runId");
-    if (!isTerminalWorkflowRunStatus(params.status)) {
-      return;
-    }
-    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), params.ownerWorkspaceId) == null) {
-      // Owner workspace was removed: an outbox write would recreate the deleted session
-      // directory and leak a stale record to a future workspace reusing the ID. Applies to
-      // live terminal callbacks and to the bounded retry timer, whose retained state is
-      // dropped here so nothing re-arms the write.
-      this.retainedWorkflowTerminalEnqueues.delete(params.ownerWorkspaceId);
-      this.pendingWorkflowNotificationResets.delete(params.ownerWorkspaceId);
-      return;
-    }
-    try {
-      const pendingResets = this.pendingWorkflowNotificationResets.get(params.ownerWorkspaceId);
-      if (pendingResets?.has(params.runId)) {
-        // Marker cleared only after the delete succeeds so a failure retries the full
-        // reset-then-enqueue sequence instead of preserving the stale record.
-        await this.terminalAttentionStore.delete(
-          params.ownerWorkspaceId,
-          TerminalAttentionStore.notificationId("workflow_run", params.runId)
-        );
-        pendingResets.delete(params.runId);
-      }
-      await this.enqueueTerminalAttention({
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        sourceKind: "workflow_run",
-        terminalOutcome: terminalAttentionOutcome(params.status),
-        sourceId: params.runId,
-      });
-    } catch (error) {
-      log.error("Workflow terminal attention enqueue failed; retrying on bounded timer", {
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-        error,
-      });
-      this.retainWorkflowTerminalEnqueue(params);
-    }
-  }
-
-  private retainWorkflowTerminalEnqueue(params: {
+  noteWorkflowRunTerminalAttention(params: {
     ownerWorkspaceId: string;
     runId: string;
     status: WorkflowRunStatus;
   }): void {
-    let byRun = this.retainedWorkflowTerminalEnqueues.get(params.ownerWorkspaceId);
-    if (byRun == null) {
-      byRun = new Map();
-      this.retainedWorkflowTerminalEnqueues.set(params.ownerWorkspaceId, byRun);
-    }
-    byRun.set(params.runId, params.status);
-    if (this.workflowTerminalEnqueueRetryTimers.has(params.ownerWorkspaceId)) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      this.workflowTerminalEnqueueRetryTimers.delete(params.ownerWorkspaceId);
-      void this.retryRetainedWorkflowTerminalEnqueues(params.ownerWorkspaceId);
-    }, this.terminalAttentionDeferRetryDelayMs);
-    timer.unref?.();
-    this.workflowTerminalEnqueueRetryTimers.set(params.ownerWorkspaceId, timer);
-  }
-
-  private async retryRetainedWorkflowTerminalEnqueues(ownerWorkspaceId: string): Promise<void> {
-    const byRun = this.retainedWorkflowTerminalEnqueues.get(ownerWorkspaceId);
-    if (byRun == null) {
-      return;
-    }
-    this.retainedWorkflowTerminalEnqueues.delete(ownerWorkspaceId);
-    for (const [runId, status] of byRun) {
-      // A re-attempt that fails again re-retains the entry and re-arms the timer.
-      await this.enqueueWorkflowRunTerminalAttention({ ownerWorkspaceId, runId, status });
-    }
-  }
-
-  async resetWorkflowRunTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    runId: string;
-  }): Promise<void> {
     assert(
       params.ownerWorkspaceId.length > 0,
-      "resetWorkflowRunTerminalAttention requires ownerWorkspaceId"
+      "noteWorkflowRunTerminalAttention requires ownerWorkspaceId"
     );
-    assert(params.runId.length > 0, "resetWorkflowRunTerminalAttention requires runId");
-    this.retainedWorkflowTerminalEnqueues.get(params.ownerWorkspaceId)?.delete(params.runId);
-    try {
-      await this.terminalAttentionStore.delete(
-        params.ownerWorkspaceId,
-        TerminalAttentionStore.notificationId("workflow_run", params.runId)
-      );
-      this.pendingWorkflowNotificationResets.get(params.ownerWorkspaceId)?.delete(params.runId);
-    } catch (error) {
-      // Restart callers swallow this rejection, so a transiently failed delete would leave
-      // the stale delivered/superseded record absorbing the resumed run's next terminal
-      // enqueue. Retain the reset; the next enqueue completes it before enqueuing fresh.
-      log.error("Workflow terminal attention reset failed; retained for the next enqueue", {
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-        error,
-      });
-      let pendingResets = this.pendingWorkflowNotificationResets.get(params.ownerWorkspaceId);
-      if (pendingResets == null) {
-        pendingResets = new Set();
-        this.pendingWorkflowNotificationResets.set(params.ownerWorkspaceId, pendingResets);
-      }
-      pendingResets.add(params.runId);
+    assert(params.runId.length > 0, "noteWorkflowRunTerminalAttention requires runId");
+    if (!isTerminalWorkflowRunStatus(params.status)) {
+      return;
     }
+    let runIds = this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId);
+    if (runIds == null) {
+      runIds = new Set();
+      this.pendingWorkflowRunAttention.set(params.ownerWorkspaceId, runIds);
+    }
+    runIds.add(params.runId);
+    this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
   /**
@@ -8070,29 +7966,37 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceService.getWorkflowInvocationBoundaryMessageId(workspaceId, runId);
   }
 
-  async markWorkflowRunTerminalAttentionConsumed(params: {
+  /**
+   * Durable "this terminal generation needs no further wake" marker, keyed by the run's
+   * terminal updatedAt: a later resume produces a new generation and thereby re-arms
+   * attention without any reset bookkeeping. Write-once and best-effort by design: if the
+   * write fails or never happens, the next drain evaluation re-derives the same answer from
+   * run + history evidence and merely re-attempts the marker.
+   */
+  async markWorkflowRunTerminalAttentionSettled(params: {
     ownerWorkspaceId: string;
     runId: string;
     status: WorkflowRunStatus;
+    runUpdatedAt: string;
+    settledAs: "delivered" | "superseded";
   }): Promise<void> {
     assert(
       params.ownerWorkspaceId.length > 0,
-      "markWorkflowRunTerminalAttentionConsumed requires ownerWorkspaceId"
+      "markWorkflowRunTerminalAttentionSettled requires ownerWorkspaceId"
     );
-    assert(params.runId.length > 0, "markWorkflowRunTerminalAttentionConsumed requires runId");
+    assert(params.runId.length > 0, "markWorkflowRunTerminalAttentionSettled requires runId");
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
-    await this.terminalAttentionStore.enqueueIfAbsent({
+    await this.terminalAttentionStore.recordSettled({
       ownerWorkspaceId: params.ownerWorkspaceId,
       sourceKind: "workflow_run",
-      terminalOutcome: terminalAttentionOutcome(params.status),
       sourceId: params.runId,
+      generationId: params.runUpdatedAt,
+      terminalOutcome: terminalAttentionOutcome(params.status),
+      status: params.settledAs,
     });
-    await this.terminalAttentionStore.markDelivered(
-      params.ownerWorkspaceId,
-      TerminalAttentionStore.notificationId("workflow_run", params.runId)
-    );
+    this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId)?.delete(params.runId);
   }
 
   async markWorkspaceTurnTerminalAttentionConsumed(params: {
@@ -8199,24 +8103,6 @@ export class TaskService implements AgentTaskIntegration {
       });
     this.pendingTerminalAttentionDrainsByOwner.set(ownerWorkspaceId, promise);
     this.pendingTerminalAttentionDrains.add(promise);
-  }
-
-  /**
-   * A deferred (indeterminate) terminal wake has no deterministic "storage recovered" signal
-   * to re-trigger the drain, and an idle-wait would resolve immediately on an already-idle
-   * owner and busy-loop while the fault persists. Retry on a bounded timer instead, one armed
-   * timer per owner; each retry that defers again arms the next one.
-   */
-  private scheduleTerminalAttentionDeferRetry(ownerWorkspaceId: string): void {
-    if (this.terminalAttentionDeferRetryTimers.has(ownerWorkspaceId)) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      this.terminalAttentionDeferRetryTimers.delete(ownerWorkspaceId);
-      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-    }, this.terminalAttentionDeferRetryDelayMs);
-    timer.unref?.();
-    this.terminalAttentionDeferRetryTimers.set(ownerWorkspaceId, timer);
   }
 
   /**
@@ -8343,8 +8229,17 @@ export class TaskService implements AgentTaskIntegration {
     ownerWorkspaceId: string,
     runId: string
   ): Promise<
-    | { outcome: "deliver"; prompt: string; initiatingAgent?: WorkflowWakeInitiatingAgent }
-    | { outcome: "superseded" }
+    | {
+        outcome: "deliver";
+        prompt: string;
+        run: WorkflowRunRecord;
+        initiatingAgent?: WorkflowWakeInitiatingAgent;
+      }
+    // settle: superseded or already consumed; record the generation marker so scans stop here.
+    | { outcome: "settle"; run: WorkflowRunRecord }
+    // drop: not (or no longer) a wake candidate; just dequeue, nothing durable to mark.
+    | { outcome: "drop" }
+    // defer: state transiently unreadable; keep queued for the next drain trigger or sweep.
     | { outcome: "defer" }
   > {
     assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
@@ -8358,8 +8253,8 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error: unknown) {
       // A missing run (ENOENT) or an unparseable record (no fs code; rereading cannot repair
       // it) is definitively ineligible. Every other fs failure (EIO, EACCES, EISDIR...) is
-      // potentially transient, and tombstoning on it would permanently drop the wake over a
-      // recoverable fault: defer those like indeterminate currentness below.
+      // potentially transient, and dropping on it would delay the wake to the next sweep's
+      // re-derivation for no reason: defer those like indeterminate currentness below.
       const code =
         error != null && typeof error === "object" && "code" in error
           ? (error as { code?: unknown }).code
@@ -8377,26 +8272,27 @@ export class TaskService implements AgentTaskIntegration {
         runId,
         error: getErrorMessage(error),
       });
-      return { outcome: "superseded" };
+      return { outcome: "drop" };
     }
     if (
       run.workspaceId !== ownerWorkspaceId ||
       run.parentWorkflow != null ||
+      // A resumed run left terminal state; its next terminal transition re-queues it.
       !isTerminalWorkflowRunStatus(run.status)
     ) {
-      return { outcome: "superseded" };
+      return { outcome: "drop" };
     }
     const currentness = await this.workspaceService.getWorkflowInvocationCurrentness(
       ownerWorkspaceId,
       run.id
     );
-    // Indeterminate means history was unreadable, not that the run was superseded: tombstoning
+    // Indeterminate means history was unreadable, not that the run was superseded: settling
     // now would permanently drop the wake over a transient fault, so defer and retry instead.
     if (currentness === "indeterminate") {
       return { outcome: "defer" };
     }
     if (currentness === "not_current") {
-      return { outcome: "superseded" };
+      return { outcome: "settle", run };
     }
     // Bind the wake to the agent recorded at launch: the newest agent-bearing assistant row
     // can belong to an unrelated later synthetic turn (a heartbeat is not a supersession
@@ -8428,6 +8324,7 @@ export class TaskService implements AgentTaskIntegration {
     const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
     return {
       outcome: "deliver",
+      run,
       ...(initiatingAgent != null ? { initiatingAgent } : {}),
       prompt: buildWorkflowResultContextMessage({
         rawCommand: `workflow_run ${scriptPath}`,
@@ -8649,8 +8546,20 @@ export class TaskService implements AgentTaskIntegration {
    * drained notifications delivered. Stale (deleted-workspace) notifications are marked superseded.
    */
   private async drainTerminalAttention(ownerWorkspaceId: string): Promise<void> {
-    const pending = await this.terminalAttentionStore.listPending(ownerWorkspaceId);
-    if (pending.length === 0) {
+    const allPending = await this.terminalAttentionStore.listPending(ownerWorkspaceId);
+    // Legacy pre-reconciler outbox records for workflow runs (no generation suffix) are dead
+    // state now that workflow wakes are re-derived from run records + settled markers: delete
+    // them so they cannot hold the drain hot forever.
+    for (const notification of allPending) {
+      if (notification.sourceKind === "workflow_run") {
+        await this.terminalAttentionStore.delete(ownerWorkspaceId, notification.id);
+      }
+    }
+    const pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
+    const queuedWorkflowRunIds = Array.from(
+      this.pendingWorkflowRunAttention.get(ownerWorkspaceId) ?? []
+    );
+    if (pending.length === 0 && queuedWorkflowRunIds.length === 0) {
       return;
     }
 
@@ -8658,6 +8567,8 @@ export class TaskService implements AgentTaskIntegration {
     const entry = findWorkspaceEntry(cfg, ownerWorkspaceId);
     if (entry == null) {
       // Owner workspace no longer exists: the terminal artifacts remain retrievable elsewhere.
+      // Queue only, no markers: a settled-marker write would recreate the deleted session dir.
+      this.pendingWorkflowRunAttention.delete(ownerWorkspaceId);
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -8665,6 +8576,9 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
+      // Workflow wakes stay unsettled while archived: the sweep skips archived workspaces, so
+      // dropping the queue parks them until an unarchive-time sweep re-derives the entries.
+      this.pendingWorkflowRunAttention.delete(ownerWorkspaceId);
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -8741,44 +8655,47 @@ export class TaskService implements AgentTaskIntegration {
         publicAwaitId: isPersistentChildContinuation ? record.workspaceId : notification.sourceId,
       });
     }
-    const workflowNotifications = pending.filter(
-      (notification) => notification.sourceKind === "workflow_run"
-    );
-    const deliverableWorkflowNotificationIds = new Set<string>();
     const deliverableWorkflowPrompts: Array<{
-      notificationId: string;
+      runId: string;
+      run: WorkflowRunRecord;
       prompt: string;
       initiatingAgent?: WorkflowWakeInitiatingAgent;
     }> = [];
 
     const workflowPromptSections: string[] = [];
-    for (const notification of workflowNotifications) {
-      const workflowPrompt = await this.buildWorkflowTerminalPrompt(
-        ownerWorkspaceId,
-        notification.sourceId
-      );
+    for (const runId of queuedWorkflowRunIds) {
+      const workflowPrompt = await this.buildWorkflowTerminalPrompt(ownerWorkspaceId, runId);
       if (workflowPrompt.outcome === "defer") {
-        // Currentness was indeterminate (history or sidecar unreadable): keep the notification
-        // pending rather than permanently dropping the wake, and arm a bounded retry, because an
-        // already-idle owner produces no further drain trigger on its own.
-        log.warn("Deferring workflow terminal attention; history unavailable", {
+        // History, sidecar, or the run record was transiently unreadable: the run stays
+        // queued and the next drain trigger or sweep re-evaluates it.
+        log.warn("Deferring workflow terminal attention; state unavailable", {
           ownerWorkspaceId,
-          runId: notification.sourceId,
+          runId,
         });
-        this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
         continue;
       }
-      if (workflowPrompt.outcome === "superseded") {
+      if (workflowPrompt.outcome === "drop") {
+        this.pendingWorkflowRunAttention.get(ownerWorkspaceId)?.delete(runId);
+        continue;
+      }
+      if (workflowPrompt.outcome === "settle") {
         // Dropping a notify_on_terminal wake strands the run's owner; keep the drop diagnosable.
-        log.warn("Dropping superseded workflow terminal attention", {
+        log.warn("Settling superseded workflow terminal attention", {
           ownerWorkspaceId,
-          runId: notification.sourceId,
+          runId,
         });
-        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
+        await this.markWorkflowRunTerminalAttentionSettled({
+          ownerWorkspaceId,
+          runId,
+          status: workflowPrompt.run.status,
+          runUpdatedAt: workflowPrompt.run.updatedAt,
+          settledAs: "superseded",
+        });
         continue;
       }
       deliverableWorkflowPrompts.push({
-        notificationId: notification.id,
+        runId,
+        run: workflowPrompt.run,
         prompt: workflowPrompt.prompt,
         ...(workflowPrompt.initiatingAgent != null
           ? { initiatingAgent: workflowPrompt.initiatingAgent }
@@ -8822,11 +8739,9 @@ export class TaskService implements AgentTaskIntegration {
           (candidate.initiatingAgent != null &&
             workflowWakeGroupKey(candidate.initiatingAgent) === selectedGroupKey)
     );
-    if (selectedWorkflowPrompts.length < deliverableWorkflowPrompts.length) {
-      this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
-    }
+    // Unselected groups stay queued: the selected group's wake turn ends with a streamEnded
+    // drain (and the sweep backstops an aborted one), which delivers the next group.
     for (const candidate of selectedWorkflowPrompts) {
-      deliverableWorkflowNotificationIds.add(candidate.notificationId);
       workflowPromptSections.push(candidate.prompt);
     }
 
@@ -8852,12 +8767,12 @@ export class TaskService implements AgentTaskIntegration {
     try {
       wakeRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
     } catch (error: unknown) {
-      // Fail closed: an unknown policy must not fall back to unrestricted tools.
+      // Fail closed: an unknown policy must not fall back to unrestricted tools. Everything
+      // stays pending/queued for the next drain trigger or sweep.
       log.warn("Deferring terminal wake; caller tool policy unavailable", {
         ownerWorkspaceId,
         error,
       });
-      this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
       return;
     }
 
@@ -8917,12 +8832,9 @@ export class TaskService implements AgentTaskIntegration {
       if (notification.sourceKind === "agent_task") {
         return deliverableAgentNotificationIds.has(notification.id);
       }
-      if (notification.sourceKind === "workflow_run") {
-        return deliverableWorkflowNotificationIds.has(notification.id);
-      }
       return deliverableWorkspaceTurnNotificationIds.has(notification.id);
     });
-    if (effectivePending.length === 0) {
+    if (effectivePending.length === 0 && selectedWorkflowPrompts.length === 0) {
       await markSuppressedSuperseded();
       return;
     }
@@ -8930,6 +8842,26 @@ export class TaskService implements AgentTaskIntegration {
     const markPendingDelivered = async () => {
       for (const notification of effectivePending) {
         await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
+      }
+      for (const candidate of selectedWorkflowPrompts) {
+        try {
+          await this.markWorkflowRunTerminalAttentionSettled({
+            ownerWorkspaceId,
+            runId: candidate.runId,
+            status: candidate.run.status,
+            runUpdatedAt: candidate.run.updatedAt,
+            settledAs: "delivered",
+          });
+        } catch (error: unknown) {
+          // Best-effort: the delivered wake itself is durable history evidence, so the next
+          // evaluation settles this run as consumed and re-attempts the marker.
+          log.warn("Failed to record delivered workflow wake marker", {
+            ownerWorkspaceId,
+            runId: candidate.runId,
+            error,
+          });
+          this.pendingWorkflowRunAttention.get(ownerWorkspaceId)?.delete(candidate.runId);
+        }
       }
     };
 

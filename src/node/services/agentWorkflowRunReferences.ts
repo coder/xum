@@ -233,39 +233,3 @@ export async function recordAgentWorkflowRunReference(input: {
     );
   });
 }
-
-/**
- * Compare-and-set boundary repair for a surviving boundaryless reference. The reference is
- * re-validated under the process-local sidecar mutex (single-instance backends are the
- * supported deployment; see requestSingleInstanceLock in desktop/main.ts): a concurrent
- * full-history clear deletes the file
- * (retiring every reference), and an unconditional write would recreate it with a
- * verified-empty boundary, resurrecting the retired pre-clear result as "current" in the
- * freshly cleared conversation. A reference that concurrently gained a boundary (explicit
- * workflow_resume re-record) is also left untouched. Returns false without writing when the
- * reference is gone or already carries a boundary.
- */
-export async function repairAgentWorkflowRunReferenceBoundary(input: {
-  workspaceSessionDir: string;
-  runId: string;
-  afterBoundaryMessageId: string | null;
-}): Promise<boolean> {
-  assert(input.runId.length > 0, "agent workflow reference repair requires runId");
-  const filePath = referencesPath(input.workspaceSessionDir);
-
-  return referenceFileLocks.withLock(filePath, async () => {
-    const existing = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
-    const reference = existing.find((candidate) => candidate.runId === input.runId);
-    if (reference == null || reference.afterBoundaryMessageId !== undefined) {
-      return false;
-    }
-    const references = existing.map((candidate) =>
-      candidate.runId === input.runId
-        ? { ...candidate, afterBoundaryMessageId: input.afterBoundaryMessageId }
-        : candidate
-    );
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await writeFileAtomic(filePath, JSON.stringify({ references }, null, 2));
-    return true;
-  });
-}

@@ -138,6 +138,43 @@ export class TerminalAttentionStore {
     return record;
   }
 
+  /**
+   * Write-once settlement marker: records a notification directly in a terminal status with a
+   * single write (no pending intermediate a concurrent reader could misread as an owed wake).
+   * An existing record for the same id is left untouched.
+   */
+  async recordSettled(
+    notification: Omit<
+      TerminalAttentionNotification,
+      "id" | "status" | "createdAt" | "outputDelivery"
+    > & {
+      generationId: string;
+      status: "delivered" | "superseded";
+    }
+  ): Promise<void> {
+    const id = TerminalAttentionStore.notificationId(
+      notification.sourceKind,
+      notification.sourceId,
+      notification.generationId
+    );
+    const existing = await this.get(notification.ownerWorkspaceId, id);
+    if (existing != null && existing.status !== "pending") {
+      return;
+    }
+    await this.write({
+      id,
+      ownerWorkspaceId: notification.ownerWorkspaceId,
+      sourceKind: notification.sourceKind,
+      sourceId: notification.sourceId,
+      generationId: notification.generationId,
+      outputDelivery: outputDeliveryForSource(notification.sourceKind),
+      terminalOutcome: notification.terminalOutcome,
+      status: notification.status,
+      createdAt: new Date().toISOString(),
+      ...(notification.status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+    });
+  }
+
   async get(ownerWorkspaceId: string, id: string): Promise<TerminalAttentionNotification | null> {
     let raw: string;
     try {

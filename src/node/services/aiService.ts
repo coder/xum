@@ -200,7 +200,6 @@ import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
-import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
   buildWorkflowResultContextMessage,
@@ -2329,13 +2328,9 @@ export class AIService extends EventEmitter {
               runStore: new WorkflowRunStore({
                 sessionDir: this.config.getSessionDir(workspaceId),
               }),
+              // No reset bookkeeping on restarts: settled markers are keyed by the run's
+              // terminal generation, so a resumed run re-arms attention by itself.
               onRunStatusChanged: async (event) => {
-                if (!isTerminalWorkflowRunStatus(event.status)) {
-                  await this.taskService?.resetWorkflowRunTerminalAttention({
-                    ownerWorkspaceId: event.workspaceId,
-                    runId: event.runId,
-                  });
-                }
                 await this.onWorkflowRunStatusChanged?.(event);
               },
               runtimeFactory: new QuickJSRuntimeFactory(),
@@ -2379,7 +2374,7 @@ export class AIService extends EventEmitter {
                   return;
                 }
                 if (this.taskService != null) {
-                  await this.taskService.enqueueWorkflowRunTerminalAttention({
+                  this.taskService.noteWorkflowRunTerminalAttention({
                     ownerWorkspaceId: workspaceId,
                     runId,
                     status,
