@@ -245,9 +245,7 @@ export class HistoryService {
       workspaceId: string;
       entry: SubagentTranscriptArtifactIndexEntry;
     } | null> => {
-      const artifacts = await readSubagentTranscriptArtifactsFile(
-        this.getSessionDir(workspaceId)
-      );
+      const artifacts = await readSubagentTranscriptArtifactsFile(this.getSessionDir(workspaceId));
       const entry = artifacts.artifactsByChildTaskId[taskId] ?? null;
       return entry ? { workspaceId, entry } : null;
     };

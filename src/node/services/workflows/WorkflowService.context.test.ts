@@ -157,7 +157,9 @@ describe("WorkflowService request orchestration", () => {
     workspaceService.waitForWorkspaceIdle = mock(
       () => new Promise<void>((resolve) => (releaseIdle = resolve))
     );
-    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, "workspace-1") });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
 
     const start = startWorkflowRun(context, {
       workspaceId: "workspace-1",

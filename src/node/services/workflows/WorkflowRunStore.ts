@@ -68,7 +68,9 @@ export async function getWorkflowRunStatusesForOwners(
       try {
         let store = stores.get(ref.workspaceId);
         if (store == null) {
-          store = new WorkflowRunStore({ sessionDir: path.join(context.sessionsDir, ref.workspaceId) });
+          store = new WorkflowRunStore({
+            sessionDir: path.join(context.sessionsDir, ref.workspaceId),
+          });
           stores.set(ref.workspaceId, store);
         }
         const status = await store.getRunStatusForLiveness(ref);
@@ -87,7 +89,9 @@ export async function listActiveWorkflowRunsForOwners(
 ) {
   const results = await Promise.all(
     workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
-      const store = new WorkflowRunStore({ sessionDir: path.join(context.sessionsDir, workspaceId) });
+      const store = new WorkflowRunStore({
+        sessionDir: path.join(context.sessionsDir, workspaceId),
+      });
       const summaries = await store.listActiveRunSummaries({ workspaceId });
       return summaries.map((summary) => ({ workspaceId, ...summary }));
     })
