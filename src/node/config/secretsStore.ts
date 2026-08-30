@@ -148,10 +148,6 @@ export class SecretsStore {
     return normalized;
   }
 
-  /**
-   * Load secrets configuration from JSON file
-   * Returns empty config if file doesn't exist
-   */
   loadSecretsConfig(): SecretsConfig {
     try {
       if (fs.existsSync(this.secretsFile)) {
@@ -218,10 +214,6 @@ export class SecretsStore {
     await this.saveSecretsConfig(raw);
   }
 
-  /**
-   * Save secrets configuration to JSON file
-   * @param config The secrets configuration to save
-   */
   async saveSecretsConfig(config: SecretsConfig | Record<string, unknown>): Promise<void> {
     try {
       if (!fs.existsSync(this.rootDir)) {
@@ -402,11 +394,6 @@ export class SecretsStore {
     return config[normalizedProjectPath] ?? [];
   }
 
-  /**
-   * Update secrets for a specific project
-   * @param projectPath The path to the project
-   * @param secrets The secrets to save for the project
-   */
   async updateProjectSecrets(projectPath: string, secrets: Secret[]): Promise<void> {
     const normalizedProjectPath =
       SecretsStore.normalizeSecretsProjectPath(projectPath) || projectPath;

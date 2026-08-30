@@ -22,10 +22,6 @@ export class ProvidersConfigStore {
     this.providersFile = path.join(this.rootDir, "providers.jsonc");
   }
 
-  /**
-   * Load providers configuration from JSONC file
-   * Supports comments in JSONC format
-   */
   loadProvidersConfig(): ProvidersConfig | null {
     try {
       if (fs.existsSync(this.providersFile)) {
@@ -102,9 +98,8 @@ export class ProvidersConfigStore {
       watcher = fs.watch(this.rootDir, { persistent: false }, (_eventType, changedFilename) => {
         // changedFilename can be null on some platforms/kernels (notably
         // older macOS FSEvents). When we can't tell which file changed,
-        // assume providers.jsonc might have and let the consumer re-fetch
-        // — better an extra refresh than a missed one, since this is the
-        // exact scenario the feature is meant to fix.
+        // assume providers.jsonc might have changed. An extra refresh is safer
+        // than missing the external edit this watcher exists to detect.
         if (changedFilename != null && changedFilename !== filename) return;
         fire();
       });
@@ -128,7 +123,7 @@ export class ProvidersConfigStore {
         try {
           watcher.close();
         } catch {
-          // Watcher may already be torn down by the OS — nothing to do.
+          // Watcher may already be torn down by the OS; nothing to do.
         }
       });
     } catch (error) {
@@ -137,7 +132,7 @@ export class ProvidersConfigStore {
         error
       );
       const noop = (): void => {
-        // Nothing to clean up — watcher setup never completed.
+        // Nothing to clean up; watcher setup never completed.
       };
       return noop;
     }
@@ -148,20 +143,14 @@ export class ProvidersConfigStore {
     };
   }
 
-  /**
-   * Save providers configuration to JSONC file
-   * @param config The providers configuration to save
-   */
   saveProvidersConfig(config: ProvidersConfig): void {
     try {
       if (!fs.existsSync(this.rootDir)) {
         ensurePrivateDirSync(this.rootDir);
       }
 
-      // Format with 2-space indentation for readability
       const jsonString = JSON.stringify(config, null, 2);
 
-      // Add a comment header to the file
       const contentWithComments = `// Providers configuration for xum
 // Configure your AI providers here
 // Example:

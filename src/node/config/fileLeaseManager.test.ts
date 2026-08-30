@@ -82,7 +82,7 @@ describe("FileLeaseManager", () => {
       const release = manager.tryAcquireCoderOauthClientLease(TTL_MS);
       expect(release).not.toBeNull();
 
-      // The holder outlives the TTL but its process (this one) is alive —
+      // The holder outlives the TTL but its process (this one) is alive.
       // e.g. a suspended laptop or a stalled event loop. Breaking it would
       // let a second flow enter the same critical section and race the
       // resumed original; contenders must fail acquisition instead.
@@ -112,13 +112,12 @@ describe("FileLeaseManager", () => {
       expect(otherRelease).not.toBeNull();
 
       // The original holder's late release must NOT remove the new owner's
-      // lease — otherwise a third flow could acquire it concurrently and two
+      // lease; otherwise a third flow could acquire it concurrently and two
       // flows would clobber the stored client's single redirect slot.
       originalRelease!();
       expect(fs.existsSync(leasePath)).toBe(true);
       expect(manager.tryAcquireCoderOauthClientLease(TTL_MS)).toBeNull();
 
-      // The rightful owner can still release it.
       otherRelease!();
       expect(fs.existsSync(leasePath)).toBe(false);
     });
@@ -131,7 +130,6 @@ describe("FileLeaseManager", () => {
       // being provably gone.
       const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
       fs.mkdirSync(leasePath, { recursive: true });
-      // Fresh mtime (NOT backdated) + dead owner PID.
       fs.writeFileSync(path.join(leasePath, "owner-crashed"), "999999999");
 
       const release = manager.tryAcquireCoderOauthClientLease(TTL_MS);
@@ -142,7 +140,7 @@ describe("FileLeaseManager", () => {
     it("reclaims an EMPTY orphaned lease directory immediately, before the TTL elapses", () => {
       // Regression: acquisition installs the owner marker atomically with the
       // lock directory (staged rename), so an empty directory can only be a
-      // crash remnant — never a live acquisition. A fresh-mtime empty orphan
+      // crash remnant; never a live acquisition. A fresh-mtime empty orphan
       // previously read as live until the TTL, and every acquisition timeout
       // is shorter than its TTL, so the first operation after such a crash
       // always failed.
@@ -198,7 +196,7 @@ describe("FileLeaseManager", () => {
     it("acquires over an EMPTY orphaned lock directory immediately, before the TTL elapses", async () => {
       // Regression: acquisition installs the owner marker atomically with the
       // lock directory (staged rename), so an empty directory can only be a
-      // crash remnant — never a live acquisition. Previously a fresh-mtime
+      // crash remnant; never a live acquisition. Previously a fresh-mtime
       // empty orphan read as live until the 10s TTL, and the 5s acquisition
       // timeout always fired first, so the first config write after such a
       // crash always timed out.
@@ -235,7 +233,6 @@ describe("FileLeaseManager", () => {
       const second = otherProcess.withCoderOauthRefreshLock(() => {
         events.push("second:enter");
       });
-      // The second section must not start while the first holds the lock.
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(events).toEqual(["first:enter"]);
 
@@ -247,7 +244,7 @@ describe("FileLeaseManager", () => {
     it("does not release a successor's lock after being stale-broken mid-section", async () => {
       // A holder that outlives staleLockMs (suspended process, stalled event
       // loop) can be stale-broken and the lock reacquired before its release
-      // runs. That release must only remove its OWN generation — deleting the
+      // runs. That release must only remove its OWN generation; deleting the
       // successor's lock would let a third process into the critical section
       // (for the refresh lock, the concurrent rotating-refresh-token race).
       const lockPath = path.join(tempDir, "providers.jsonc.coder-refresh.lock");
@@ -282,7 +279,6 @@ describe("FileLeaseManager", () => {
       releaseFirst();
       expect(fs.existsSync(lockPath)).toBe(true);
 
-      // The second holder's critical section completes and cleans up cleanly.
       releaseSecond();
       await Promise.all([first, second]);
       expect(fs.existsSync(lockPath)).toBe(false);
