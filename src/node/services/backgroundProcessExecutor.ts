@@ -65,6 +65,7 @@ export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
  * NOTE: Local runtimes validate that cwd exists before spawning, so this must be a real directory.
  */
 const FALLBACK_CWD = process.platform === "win32" ? (process.env.TEMP ?? "C:\\") : "/tmp";
+const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
 
 /** Helper to extract error message for logging */
 function errorMsg(error: unknown): string {
@@ -127,6 +128,8 @@ export interface SpawnOptions {
   processId: string;
   /** Environment variables to inject */
   env?: Record<string, string>;
+  /** Host-namespace paths to translate before injecting as environment variables. */
+  pathEnv?: Record<string, string>;
 }
 
 /**
@@ -160,17 +163,22 @@ export async function spawnProcess(
   // Get temp directory from runtime (absolute path, runtime-agnostic)
   const tempDir = await runtime.tempDir();
   const bgOutputDir = `${tempDir}/${BG_OUTPUT_SUBDIR}`;
-  const execCwd = runtime.mapPathForExec?.(options.cwd) ?? options.cwd;
 
   // Use shell-safe quoting for paths (handles spaces, special chars)
   const quotePath = quotePathForShell;
 
   // Verify working directory exists
-  const cwdCheck = await execBuffered(runtime, `cd ${quotePath(execCwd)}`, {
-    cwd: FALLBACK_CWD,
-    timeout: 10,
-  });
+  const cwdCheck = await execBuffered(
+    runtime,
+    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+    {
+      cwd: FALLBACK_CWD,
+      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+      timeout: 10,
+    }
+  );
   if (cwdCheck.exitCode !== 0) {
+    const execCwd = cwdCheck.stdout.trim() || options.cwd;
     return { success: false, error: `Working directory does not exist: ${execCwd}` };
   }
 
@@ -222,12 +230,19 @@ export async function spawnProcess(
     };
   }
 
-  // Build wrapper script (same for all runtimes now that paths are absolute)
-  // Note: buildWrapperScript handles quoting internally via shellQuote
+  // The outer spawn shell exports the translated pathEnv (and cwd var) before
+  // the wrapper runs; wrapper-level env exports would overwrite those
+  // translations, so pathEnv-owned keys are stripped from the wrapper env.
+  const wrapperEnv: Record<string, string> = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+  for (const key of [...Object.keys(options.pathEnv ?? {}), BACKGROUND_CWD_ENV]) {
+    delete wrapperEnv[key];
+  }
+
   const wrapperScript = buildWrapperScript({
     exitCodePath,
-    cwd: execCwd,
-    env: { ...options.env, ...NON_INTERACTIVE_ENV_VARS },
+    cwd: options.cwd,
+    cwdEnvVar: BACKGROUND_CWD_ENV,
+    env: wrapperEnv,
     script,
   });
 
@@ -241,6 +256,7 @@ export async function spawnProcess(
     // No timeout - the spawn command backgrounds the process and returns immediately
     const result = await execBuffered(runtime, spawnCommand, {
       cwd: FALLBACK_CWD,
+      pathEnv: { ...options.pathEnv, [BACKGROUND_CWD_ENV]: options.cwd },
     });
 
     if (result.exitCode !== 0) {

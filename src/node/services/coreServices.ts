@@ -98,6 +98,45 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     providerService.getConfig()
   );
   const extensionMetadata = new ExtensionMetadataService(extensionMetadataPath);
+  // Write tombstones are process-local removal knowledge; the shared config
+  // is the authority (with XUM_ALLOW_MULTIPLE_INSTANCES a downgraded backend
+  // can legitimately re-register a deterministic legacy id this process
+  // pruned). Without this probe, a tombstoned id that becomes active again
+  // would have every metadata write and broadcast suppressed until an
+  // activity bootstrap happens to run. Raw view first (cheap; complete when
+  // every persisted entry carries an inline id); only id-less legacy entries
+  // require the authoritative enumeration. Throws propagate: unknowable
+  // registration keeps the tombstone.
+  extensionMetadata.setRegistrationProbe(async (workspaceId) => {
+    const evidence = config.readPersistedWorkspaceIdEvidence();
+    if (evidence.ids.has(workspaceId)) {
+      return true;
+    }
+    if (!evidence.hasWorkspaceEntriesWithoutIds) {
+      return false;
+    }
+    // Targeted lenient positive first: a POSITIVE identity match needs no
+    // completeness, so a re-registered workspace whose own compatibility
+    // metadata is healthy must not stay write-suppressed because an
+    // UNRELATED legacy entry's metadata is malformed (the strict
+    // enumeration below throws on the first such entry, and the tombstone
+    // would then pin every one of the target's writes as transient
+    // indefinitely). A lenient scan only skips unreadable entries — it
+    // never fabricates a match.
+    if (config.findWorkspace(workspaceId) != null) {
+      return true;
+    }
+    // Negatives keep requiring the complete strict view: a lenient miss is
+    // indistinguishable from an identity hidden by a read failure. Alias
+    // ids: a second resolvable compatibility file's identity stays
+    // registered for findWorkspace even though it is not any entry's
+    // primary id — refusing its writes/deletions requires knowing it here.
+    const legacyAliasIds = new Set<string>();
+    const registered = (
+      await config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })
+    ).some((metadata) => metadata.id === workspaceId);
+    return registered || legacyAliasIds.has(workspaceId);
+  });
   const workspaceGoalService = new WorkspaceGoalService(
     config,
     historyService,
@@ -250,7 +289,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceGoalService
   );
   aiService.setTaskService(taskService);
-  workspaceService.setTaskService(taskService);
+  workspaceService.setAgentTaskIntegration(taskService);
 
   // Goal continuation bridge lives at the core scope so every codepath that
   // uses createCoreServices (xum run, xum server via ServiceContainer, tests)

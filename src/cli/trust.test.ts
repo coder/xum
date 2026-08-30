@@ -227,7 +227,14 @@ describe("xum trust CLI", () => {
       .quiet();
 
     expect(result.exitCode).not.toBe(0);
-    expect(result.stderr.toString()).toContain("Failed to persist trust change");
+    // Either failure surface is acceptable: the corrupt-config write gate
+    // (config.json exists but cannot be read, so editConfig refuses to write
+    // defaults over it) or the post-write trust verification (the write was
+    // silently swallowed). Both must fail loudly instead of reporting
+    // success.
+    expect(result.stderr.toString()).toMatch(
+      /Failed to persist trust change|Skipping config write/
+    );
     expect(result.stdout.toString()).toBe("");
   }, 15_000);
 

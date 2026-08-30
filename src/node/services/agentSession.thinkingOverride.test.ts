@@ -3,7 +3,7 @@ import { describe, expect, it, mock } from "bun:test";
 import type { MuxMessage } from "@/common/types/message";
 import { Ok, Err } from "@/common/types/result";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 
 const MODEL = "anthropic:claude-sonnet-4-5";
@@ -38,7 +38,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(first).toEqual({ accepted: true });
       expect(second).toEqual({ accepted: true });
       expect(opts.activeTurnThinkingOverride?.pending).toBe("low");
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
@@ -76,7 +76,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     let pendingSeenByStream: string | undefined;
     const streamMessage = mock((opts: StreamMessageOptions) => {
       pendingSeenByStream = opts.activeTurnThinkingOverride?.pending;
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
@@ -133,7 +133,9 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
   });
 
   it("clears the holder when an onAccepted failure aborts the turn before streaming", async () => {
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock((_history: MuxMessage[]) =>
+      Promise.resolve(Ok(createStartedTurnHandle()))
+    );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-onaccepted-failure",
       aiServiceOverrides: {

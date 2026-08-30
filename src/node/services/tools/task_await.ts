@@ -32,9 +32,9 @@ import {
   type WorkspaceTurnTaskStatus,
 } from "@/node/services/taskHandleStore";
 import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import {
   ForegroundWaitBackgroundedError,
-  type AgentTaskStatus,
   type AgentTaskStatusLookup,
   type AgentTaskTimestamps,
 } from "@/node/services/taskService";

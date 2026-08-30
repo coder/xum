@@ -35,6 +35,15 @@ export interface ExtensionMetadata {
   // a restart so unchanged chats are not regenerated. Never exposed on
   // WorkspaceActivitySnapshot (IPC shape).
   sidebarStatusInputHash?: string | null;
+  // Backend-only monotonic write counter, advanced by every persisted
+  // mutation of this entry. Recovery merges cannot order metadata copies by
+  // `recency` — that is a USER-INTERACTION timestamp which status/goal/
+  // streaming writers deliberately preserve — so cross-copy ordering uses
+  // this generation instead (see recoverStrandedRecreatedLeftover). Never
+  // exposed on WorkspaceActivitySnapshot (IPC shape). Builds without this
+  // field drop it on their writes; ordering then degrades to the recency
+  // tiebreak, never resurrecting against a generation-less newer write.
+  writeGeneration?: number;
   goal?: GoalSnapshot | null;
 }
 
@@ -128,6 +137,9 @@ export function coerceExtensionMetadata(value: unknown): ExtensionMetadata | nul
     lastStatusUrl: coerceStatusUrl(record.lastStatusUrl),
     ...(typeof record.sidebarStatusInputHash === "string"
       ? { sidebarStatusInputHash: record.sidebarStatusInputHash }
+      : {}),
+    ...(typeof record.writeGeneration === "number" && Number.isFinite(record.writeGeneration)
+      ? { writeGeneration: record.writeGeneration }
       : {}),
     ...(goal !== undefined ? { goal } : {}),
   };

@@ -3883,6 +3883,14 @@ describe("CoderOauthService", () => {
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
           return Promise.resolve(aiProvidersResponse());
         }
+        // Earlier tests can finish their OAuth flow before post-login catalog discovery settles.
+        // Keep those stale requests from participating in this flow's concurrency gate.
+        if (
+          url.includes("/api/v2/aibridge/") &&
+          new Headers(init?.headers).get("Authorization") !== "Bearer at_concurrent"
+        ) {
+          return new Response("stale test flow", { status: 404 });
+        }
         if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
           catalogSignals.push(init?.signal);
           await anthropicGate; // Stalled until openai is queried.

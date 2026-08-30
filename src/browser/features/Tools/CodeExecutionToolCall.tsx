@@ -27,6 +27,8 @@ interface CodeExecutionToolCallProps {
   status?: ToolStatus;
   /** Nested tool calls from streaming (takes precedence over result.toolCalls) */
   nestedCalls?: NestedToolCall[];
+  workspaceId?: string;
+  toolCallTimestamp?: number;
 }
 
 interface ViewToggleProps {
@@ -70,6 +72,8 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   result,
   status = "pending",
   nestedCalls,
+  workspaceId,
+  toolCallTimestamp,
 }) => {
   // Use streaming nested calls if available, otherwise fall back to result
   const toolCalls = nestedCalls ?? [];
@@ -192,7 +196,12 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
 
       {/* Content based on view mode */}
       {effectiveViewMode === "tools" && hasToolCalls && (
-        <NestedToolsContainer calls={toolCalls} parentInterrupted={isInterrupted} />
+        <NestedToolsContainer
+          calls={toolCalls}
+          parentInterrupted={isInterrupted}
+          workspaceId={workspaceId}
+          toolCallTimestamp={toolCallTimestamp}
+        />
       )}
 
       {effectiveViewMode === "code" && (

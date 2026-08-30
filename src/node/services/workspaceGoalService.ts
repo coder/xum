@@ -1280,24 +1280,41 @@ export class WorkspaceGoalService {
   private async pushTransientGoalSnapshot(
     workspaceId: string,
     snapshot: GoalSnapshot
-  ): Promise<boolean> {
-    const activity = await this.extensionMetadata.getSnapshot(workspaceId);
+  ): Promise<"delivered" | "no_baseline" | "unavailable"> {
+    let activity: WorkspaceActivitySnapshot | null;
+    try {
+      activity = await this.extensionMetadata.getSnapshot(workspaceId, { throwOnError: true });
+    } catch (error) {
+      // A suspect baseline (failed sidecar reconcile / unreadable main)
+      // must not feed an emitted overlay: partial-main fields would clear
+      // status in the renderer. "unavailable" is deliberately DISTINCT from
+      // the authoritative "no_baseline": the durable pushSnapshot fallback
+      // writes through the lenient load (accepting the same suspect partial
+      // main this strict read refused) and emits the result — converting
+      // this failure into that fallback would clear exactly the renderer
+      // state the strict read preserves.
+      log.debug("Skipping transient goal emit after failed snapshot read", {
+        workspaceId,
+        error,
+      });
+      return "unavailable";
+    }
     if (!activity) {
       // No baseline activity snapshot to overlay the transient goal on
       // (extensionMetadata has no entry for this workspace yet). Callers
       // that must guarantee delivery — e.g. live cost previews — should
-      // observe this `false` return and fall back to `pushSnapshot`, which
+      // observe "no_baseline" and fall back to `pushSnapshot`, which
       // creates the entry and emits via the durable path. Pending-goal
       // publication does not retry here because it only fires after a
       // `setGoal` that already created the entry.
-      return false;
+      return "no_baseline";
     }
     this.onActivityChange?.(workspaceId, {
       ...activity,
       goal: snapshot,
       transientGoalOnly: true,
     });
-    return true;
+    return "delivered";
   }
 
   private async pushLiveGoalPreviewOverlay(
@@ -4114,13 +4131,17 @@ export class WorkspaceGoalService {
       });
       const snapshot = toGoalSnapshot(preview);
       this.liveGoalPreviewSnapshots.set(input.workspaceId, snapshot);
-      const didEmitTransient = await this.pushTransientGoalSnapshot(input.workspaceId, snapshot);
-      if (!didEmitTransient) {
+      const transientResult = await this.pushTransientGoalSnapshot(input.workspaceId, snapshot);
+      if (transientResult === "no_baseline") {
         // If the baseline activity snapshot does not exist yet (for
         // example, extensionMetadata was reset or stream-start's
         // fire-and-forget metadata write has not finished), fall back to
         // the durable path so this preview is still delivered to Goals UI
-        // subscribers instead of being dropped.
+        // subscribers instead of being dropped. "unavailable" must NOT take
+        // this path: the durable write's lenient load would accept the
+        // suspect partial main the strict read refused and emit it,
+        // clearing renderer goal/status state — return the computed preview
+        // without delivery instead (renderer keeps last-known state).
         return this.pushSnapshot(input.workspaceId, preview);
       }
       return snapshot;

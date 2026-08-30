@@ -903,6 +903,287 @@ describe("Config", () => {
     });
   });
 
+  describe("strict structural validation (throwOnError)", () => {
+    // Destructive callers (extension-metadata pruning, orphan session-dir
+    // cleanup) must never receive a lenient-normalized empty/partial workspace
+    // view for a parseable but structurally invalid config: they would treat
+    // the omitted live workspaces as removed and delete their data.
+    const invalidShapes: Array<[string, unknown]> = [
+      ["non-array projects", { projects: {} }],
+      ["non-pair projects entry", { projects: ["not-a-pair"] }],
+      ["non-object project config", { projects: [["/repo", null]] }],
+      ["non-array workspaces", { projects: [["/repo", { workspaces: "bogus" }]] }],
+      // ProjectConfigSchema always persists `workspaces`; a present project
+      // entry without the key is mangled state that raw evidence flags as
+      // incomplete — strict mode must not vouch "authoritatively empty" for
+      // it (the prune would delete every snapshot of that project).
+      ["missing workspaces key", { projects: [["/repo", {}]] }],
+      // The lenient path-filter silently drops the WHOLE project for empty
+      // or non-string keys, and an id-less legacy workspace inside it is
+      // raw-invisible too (its stable id lives only in session
+      // metadata.json) — strict mode must fail closed rather than hand the
+      // prune an id set missing that workspace.
+      ["null project key", { projects: [[null, { workspaces: [] }]] }],
+      ["empty-string project key", { projects: [["", { workspaces: [] }]] }],
+      // A truthy non-string workspace id would ride getAllWorkspaceMetadata's
+      // modern-entry branch as the authoritative id, omitting the workspace's
+      // REAL string identity from the prune's known set; non-object entries
+      // have no establishable identity at all.
+      ["non-object workspace entry", { projects: [["/repo", { workspaces: ["bogus"] }]] }],
+      [
+        "numeric workspace id",
+        { projects: [["/repo", { workspaces: [{ id: 42, path: "/repo/ws" }] }]] },
+      ],
+      [
+        "empty-string workspace id",
+        { projects: [["/repo", { workspaces: [{ id: "", path: "/repo/ws" }] }]] },
+      ],
+    ];
+
+    for (const [label, shape] of invalidShapes) {
+      it(`rejects ${label} in strict mode while lenient mode still loads`, async () => {
+        fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(shape));
+        const strictConfig = new Config(tempDir);
+        expect(() => strictConfig.loadConfigOrDefault({ throwOnError: true })).toThrow();
+        // try/catch instead of rejects.toThrow: the node-side type-aware lint
+        // flags awaiting bun's expect() chain as await-thenable.
+        let strictMetadataRejected = false;
+        try {
+          await new Config(tempDir).getAllWorkspaceMetadata({ throwOnError: true });
+        } catch {
+          strictMetadataRejected = true;
+        }
+        expect(strictMetadataRejected).toBe(true);
+        // Ordinary loads keep the historical self-healing behavior: they
+        // never throw for these shapes (normalized stubs may survive).
+        expect(() => new Config(tempDir).loadConfigOrDefault()).not.toThrow();
+      });
+    }
+
+    it("accepts an absent projects key in strict mode (healthy empty config)", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ defaultProjectDir: "/tmp" })
+      );
+      const loaded = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+      expect(loaded.projects.size).toBe(0);
+    });
+
+    it("keeps the canonical legacy identity when a secondary alias file is unreadable in lenient loads", async () => {
+      // An id-less legacy entry with a HEALTHY canonical (generated-legacy)
+      // metadata file and an unreadable basename-backed second candidate:
+      // lenient loads must keep the canonical identity instead of
+      // discarding it for skeletal path-id fallback metadata (which would
+      // surface the workspace under the WRONG id with its session history
+      // apparently missing). Strict enumeration still fails closed — the
+      // unreadable alias may hide a registered identity.
+      const projectPath = "/repo";
+      const workspacePath = "/repo/legacy-ws";
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+          // Migration flags pre-seeded so the first load never schedules the
+          // async settings-migration persist mid-test.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
+        })
+      );
+      const config = new Config(tempDir);
+      const canonicalId = (
+        config as unknown as {
+          generateLegacyId(projectPath: string, workspacePath: string): string;
+        }
+      ).generateLegacyId(projectPath, workspacePath);
+      const canonicalDir = config.getSessionDir(canonicalId);
+      fs.mkdirSync(canonicalDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(canonicalDir, "metadata.json"),
+        JSON.stringify({ id: "stable-canonical-id", name: "legacy-ws" })
+      );
+      // Basename-backed second candidate is unreadable: a directory at the
+      // metadata.json path fails reads with EISDIR (non-ENOENT).
+      fs.mkdirSync(path.join(config.getSessionDir("legacy-ws"), "metadata.json"), {
+        recursive: true,
+      });
+
+      let strictRejected = false;
+      try {
+        await config.getAllWorkspaceMetadata({ throwOnError: true });
+      } catch {
+        strictRejected = true;
+      }
+      expect(strictRejected).toBe(true);
+
+      const lenient = await config.getAllWorkspaceMetadata();
+      const lenientIds = lenient.map((metadata) => metadata.id);
+      expect(lenientIds).toContain("stable-canonical-id");
+      expect(lenientIds).not.toContain(canonicalId);
+    });
+  });
+
+  describe("readPersistedWorkspaceIdSuperset", () => {
+    it("ignores nested workspaces arrays inside workspace entries", () => {
+      // Workspace entries (and unknown newer-build extension objects) can
+      // carry nested `workspaces`-keyed fields whose ids reference OTHER —
+      // including removed — workspaces. Treating them as registered would
+      // lift removed ids' tombstones and recreate stale metadata
+      // indefinitely; only `projects[*][1].workspaces` direct entries are
+      // registration evidence.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "real-ws",
+                    path: "/repo/ws",
+                    workspaces: [{ id: "phantom-ws", path: "/x" }],
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
+      expect([...evidence.ids]).toEqual(["real-ws"]);
+      expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(false);
+    });
+
+    it("collects ids from entries that lenient normalization discards", () => {
+      // `[null, ...]` fails the project-path filter and vanishes from the
+      // normalized view; the raw superset must still surface its workspace id
+      // so destructive callers never treat that live workspace as removed.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [null, { workspaces: [{ id: "live-discarded", path: "/tmp/x" }] }],
+            ["/repo", { workspaces: [{ id: "live-normal", path: "/repo/ws", name: "ws" }] }],
+          ],
+        })
+      );
+      const superset = new Config(tempDir).readPersistedWorkspaceIdSuperset();
+      expect(superset.has("live-discarded")).toBe(true);
+      expect(superset.has("live-normal")).toBe(true);
+    });
+
+    it("resolves empty for a missing file and throws on unparseable content", () => {
+      expect(new Config(tempDir).readPersistedWorkspaceIdSuperset().size).toBe(0);
+      fs.writeFileSync(path.join(tempDir, "config.json"), "{not json");
+      expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(["array-root"]));
+      expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
+    });
+
+    it("collects only workspace-entry ids, not nested id-bearing objects", () => {
+      // Workspace entries carry nested id-bearing objects (e.g.
+      // taskPendingGuidance items) whose ids can reference OTHER — including
+      // removed — workspaces. Treating those as registered would corrupt
+      // registration evidence (aborted deletions, lifted tombstones) and
+      // unbound the activity scope.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "ws-live",
+                    path: "/repo/ws",
+                    taskPendingGuidance: [{ id: "removed-workspace-id", message: "hi" }],
+                    parentWorkspaceId: "some-parent",
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(["ws-live"]),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+    });
+
+    it("reports whether any workspace entry lacks an inline id", () => {
+      // Completeness signal for registration evidence: with inline ids
+      // everywhere, the raw view is complete and callers may skip the
+      // per-workspace authoritative enumeration; a single id-less (legacy)
+      // entry means a raw-invisible stable id may exist.
+      const configPath = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          projects: [["/repo", { workspaces: [{ id: "modern", path: "/repo/ws" }] }]],
+        })
+      );
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(["modern"]),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          projects: [
+            ["/repo", { workspaces: [{ id: "modern", path: "/repo/ws" }, { path: "/repo/old" }] }],
+          ],
+        })
+      );
+      const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
+      expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(true);
+      expect(evidence.ids.has("modern")).toBe(true);
+      // A PRESENT but malformed (non-array) container is uninterpretable:
+      // the original entries may have been mangled, so the id set must not
+      // be treated as complete evidence for destructive decisions.
+      for (const malformed of [null, "mangled", 7]) {
+        fs.writeFileSync(
+          configPath,
+          JSON.stringify({ projects: [["/repo", { workspaces: malformed }]] })
+        );
+        expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+          ids: new Set(),
+          hasWorkspaceEntriesWithoutIds: true,
+        });
+      }
+      // Missing file: healthy empty evidence (fresh install).
+      fs.rmSync(configPath);
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+      // Malformed OUTER structure is incomplete evidence too: a mangled
+      // projects container / pair / project config may be the remnant of
+      // real registrations. Only an absent projects key is healthy empty.
+      for (const projects of [
+        null,
+        {},
+        "mangled",
+        [null],
+        ["not-a-pair"],
+        [["/repo", null]],
+        [["/repo", ["array-config"]]],
+        [["/repo", {}]], // project config with no workspaces key at all
+      ]) {
+        fs.writeFileSync(configPath, JSON.stringify({ projects }));
+        expect(
+          new Config(tempDir).readPersistedWorkspaceIdEvidence().hasWorkspaceEntriesWithoutIds
+        ).toBe(true);
+      }
+      fs.writeFileSync(configPath, JSON.stringify({ defaultProjectDir: "/tmp" }));
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+    });
+  });
+
   describe("legacy task variant compatibility", () => {
     it("loads variant children as ordinary sub-agents without destroying downgrade metadata", async () => {
       const configFile = path.join(tempDir, "config.json");
@@ -3036,6 +3317,94 @@ describe("Config", () => {
       expect(workspace.id).toBe(legacyId);
       expect(workspace.name).toBe(workspaceName);
       expect(workspace.createdAt).toBe("2025-01-01T00:00:00.000Z");
+    });
+
+    it("enumerates basename-backed legacy stable ids like findWorkspace", async () => {
+      // Oldest layout: an id-less config entry whose stable id lives in
+      // sessions/<workspace-basename>/metadata.json. findWorkspace resolves
+      // it (basename candidate first), so the enumeration must report the
+      // same identity — destructive callers (the extension-metadata prune)
+      // classify ids as stale against the enumeration, and a mismatch would
+      // delete the live workspace's activity data.
+      const projectPath = "/fake/project";
+      const workspaceName = "old-feature";
+      const workspacePath = path.join(config.srcDir, "project", workspaceName);
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      const sessionDir = config.getSessionDir(workspaceName);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({
+          id: "stable-basename-id",
+          name: workspaceName,
+          projectName: "project",
+          projectPath,
+          createdAt: "2025-01-01T00:00:00.000Z",
+        })
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: workspacePath }],
+        });
+        return cfg;
+      });
+
+      const allMetadata = await config.getAllWorkspaceMetadata({ throwOnError: true });
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("stable-basename-id");
+    });
+
+    it("surfaces the second resolvable compatibility file's id as a legacy alias", async () => {
+      // Both supported layouts exist with DIFFERENT ids (e.g. a stale
+      // basename-side file next to the live generated-legacy metadata).
+      // findWorkspace resolves either id, so destructive known-id sets must
+      // retain both — the GENERATED-LEGACY record stays canonical (its id
+      // feeds the read-time config migration; a stale basename-side primary
+      // would rewrite the persisted stable id on upgrade and orphan session
+      // history) while the basename id is reported through the
+      // legacyAliasIds out-parameter.
+      const projectPath = "/fake/project";
+      const workspaceName = "aliased-feature";
+      const workspacePath = path.join(config.srcDir, "project", workspaceName);
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      const basenameSessionDir = config.getSessionDir(workspaceName);
+      fs.mkdirSync(basenameSessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(basenameSessionDir, "metadata.json"),
+        JSON.stringify({ id: "stale-basename-id", name: workspaceName })
+      );
+      const legacyId = config.generateLegacyId(projectPath, workspacePath);
+      const legacySessionDir = config.getSessionDir(legacyId);
+      fs.mkdirSync(legacySessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: "live-generated-id", name: workspaceName })
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: workspacePath }],
+        });
+        return cfg;
+      });
+
+      const legacyAliasIds = new Set<string>();
+      const allMetadata = await config.getAllWorkspaceMetadata({
+        throwOnError: true,
+        legacyAliasIds,
+      });
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("live-generated-id");
+      expect(legacyAliasIds.has("stale-basename-id")).toBe(true);
+      // The read-time migration must persist the CANONICAL id — a stale
+      // basename-side id here would change the workspace's stable identity
+      // on upgrade and make its session history appear missing.
+      const persisted = config
+        .loadConfigOrDefault()
+        .projects.get(projectPath)
+        ?.workspaces.find((workspace) => workspace.path === workspacePath);
+      expect(persisted?.id).toBe("live-generated-id");
     });
   });
 

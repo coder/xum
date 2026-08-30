@@ -21,6 +21,7 @@ export type ProviderName =
   | "xai"
   | "deepseek"
   | "moonshotai"
+  | "zai"
   | "openrouter"
   | "github-copilot"
   | "coder"
@@ -158,12 +159,20 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  zai: {
+    displayName: "Z.ai",
+    import: () => import("@ai-sdk/zai"),
+    factoryName: "createZai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
   openrouter: {
     displayName: "OpenRouter",
     import: () => import("@openrouter/ai-sdk-provider"),
     factoryName: "createOpenRouter",
     requiresApiKey: true,
     kind: "gateway",
+    // OpenRouter uses the hyphenated vendor slug "z-ai", so direct "zai" routing is not inferred.
     routes: ["anthropic", "openai", "google", "xai", "deepseek", "moonshotai"],
     passthrough: false,
     toGatewayModelId: toSlashSeparatedGatewayModelId,

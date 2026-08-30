@@ -14,7 +14,6 @@ import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
-import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
@@ -43,6 +42,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
+import type { QueueCutCutter } from "@/node/services/messageQueue";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -311,7 +311,15 @@ import {
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
-import type { TaskService } from "@/node/services/taskService";
+import {
+  areArchiveUntrackedPathListsEqual,
+  normalizeArchiveUntrackedPaths,
+  type AgentTaskIntegration,
+  type ArchiveWorkspaceOptions,
+  type SendMessageInternalOptions,
+  type WorkspaceHost,
+  type WorkspaceLiveActivity,
+} from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 
@@ -630,53 +638,6 @@ const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
-export interface ArchiveWorkspaceOptions {
-  /**
-   * Refuse to archive when the effective worktree archive behavior would delete the checkout
-   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
-   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
-   * behavior read that drives the snapshot/deletion decisions.
-   */
-  forbidWorktreeCheckoutDeletion?: boolean;
-  /**
-   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
-   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
-   * session). Model-facing callers set this so an agent-driven archive fails closed instead
-   * of silently terminating user work that started after the caller's earlier activity check.
-   * Checked synchronously in the same block that marks the workspace as archiving, pairing
-   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
-   * other. Also holds the session's turn admission for the rest of the archive so a queued
-   * entry cannot dispatch through AgentSession's internal send path (which bypasses
-   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
-   * path intentionally omits this and keeps its stop-activity semantics.
-   */
-  refuseLiveUserActivity?: boolean;
-  /**
-   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
-   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
-   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
-   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
-   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
-   */
-  worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
-  /**
-   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
-   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
-   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
-   * fail closed instead; route that policy through user-mediated archive.
-   */
-  forbidCoderWorkspaceDeletion?: boolean;
-  /**
-   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
-   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
-   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
-   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
-   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
-   * otherwise strand already-interrupted turns behind a failed archive.
-   */
-  coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
-}
-
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
@@ -688,18 +649,6 @@ function normalizeRepoRootProjectPath(projectPath: string | null | undefined): s
   }
 
   return stripTrailingSlashes(path.posix.normalize(normalizedPath));
-}
-
-function normalizeArchiveUntrackedPaths(paths: readonly string[]): string[] {
-  const normalizedPaths = paths.map((untrackedPath) => {
-    const trimmedPath = untrackedPath.trim();
-    assert(
-      trimmedPath.length > 0,
-      "normalizeArchiveUntrackedPaths: untracked paths must be non-empty"
-    );
-    return trimmedPath;
-  });
-  return [...new Set(normalizedPaths)].sort();
 }
 
 function buildArchiveLossyUntrackedFilesConfirmation(
@@ -714,23 +663,6 @@ function buildArchiveLossyUntrackedFilesConfirmation(
     kind: "confirm-lossy-untracked-files",
     paths: normalizedPaths,
   };
-}
-
-// Exported so TaskService's pre-interruption archive preflight applies the exact
-// acknowledgement semantics enforced at the archive sink (getArchiveUntrackedFilesConfirmation):
-// a drifted acknowledged set — extra OR missing paths — must re-confirm before any
-// destructive interruption, not after.
-export function areArchiveUntrackedPathListsEqual(
-  leftPaths: readonly string[],
-  rightPaths: readonly string[]
-): boolean {
-  const normalizedLeftPaths = normalizeArchiveUntrackedPaths(leftPaths);
-  const normalizedRightPaths = normalizeArchiveUntrackedPaths(rightPaths);
-  if (normalizedLeftPaths.length !== normalizedRightPaths.length) {
-    return false;
-  }
-
-  return normalizedLeftPaths.every((path, index) => path === normalizedRightPaths[index]);
 }
 
 function isArchiveLossyUntrackedFilesConfirmation(
@@ -1909,7 +1841,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 });
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-export class WorkspaceService extends EventEmitter {
+export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
@@ -2237,7 +2169,10 @@ export class WorkspaceService extends EventEmitter {
     // the clear. Cost: an occasional duplicate emit, which renderers apply idempotently.
     this.lastEmittedBashMonitorCounts.delete(workspaceId);
     void this.extensionMetadata
-      .getSnapshot(workspaceId)
+      // Strict: emitting a suspect (partial-main) snapshot after a failed
+      // sidecar reconcile would clear goal/status in the renderer; the
+      // catch below already retains "unknown" and re-emits on next change.
+      .getSnapshot(workspaceId, { throwOnError: true })
       .then((snapshot) => {
         this.emitWorkspaceActivity(workspaceId, snapshot);
         // Record only after a successful emit. Re-read the count because the emit merges
@@ -2262,6 +2197,13 @@ export class WorkspaceService extends EventEmitter {
     Promise<Set<string>>
   >();
   private readonly activeWorkflowRunIdsByWorkspace = new Map<string, Set<string>>();
+  // Workspaces where NONZERO workflow-run activity was actually observed
+  // (bootstrap probe, run-status event, or list read). This — not cache
+  // presence — is the zero-count tombstone signal: the activity list's own
+  // probe installs an (empty) cache for every scoped id, so cache existence
+  // would fabricate recency:0 entries for every idle config-known workspace
+  // from the second list on, re-bloating the payload this scoping trims.
+  private readonly workflowRunSeenWorkspaces = new Set<string>();
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -2396,7 +2338,7 @@ export class WorkspaceService extends EventEmitter {
   private readonly initSettlementPromises = new Map<string, Promise<void>>();
 
   /**
-   * Registers a fire-and-forget background init started outside this service (TaskService
+   * Registers a fire-and-forget background init started outside this service (task orchestration
    * starts inits for task workspaces after materializing their checkouts) with the same
    * abort-and-settlement mechanism archive uses: archiveUnlocked aborts the registered
    * controller when init state is still running, and always awaits the retained settlement
@@ -2503,6 +2445,19 @@ export class WorkspaceService extends EventEmitter {
     });
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
+    // A cleared tombstone means a removed id was re-registered (downgraded
+    // concurrent backend re-creating a deterministic legacy id): evict the
+    // process-local activity caches bootstrapped for the REMOVED incarnation
+    // so the revived workspace re-probes disk instead of showing ghost
+    // workflow-run counts from session state that removal deleted.
+    // Guarded like the backgroundProcessManager subscriptions above: tests
+    // may construct WorkspaceService with a partial ExtensionMetadataService
+    // stub.
+    if (typeof this.extensionMetadata.setTombstoneClearedListener === "function") {
+      this.extensionMetadata.setTombstoneClearedListener((workspaceId) => {
+        this.evictWorkspaceActivityCaches(workspaceId);
+      });
+    }
     // r63 startup self-heal: reclaim removal tombstones left behind by a
     // removal whose config deregistration AND tombstone rollback both failed
     // — otherwise that workspace stays registered but refused every mutation
@@ -3410,7 +3365,7 @@ export class WorkspaceService extends EventEmitter {
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
-  private taskService?: TaskService;
+  private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
@@ -3474,7 +3429,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * TaskService entry point: task worktrees are REGISTERED before their
+   * Task orchestration entry point: task worktrees are REGISTERED before their
    * checkout exists (queued/reserved launches persist the entry with a future
    * path), so creation-time sanitization cannot cover them and an uninstall's
    * override pruning enumerates a path with nothing to prune — the later
@@ -3756,12 +3711,8 @@ export class WorkspaceService extends EventEmitter {
     this.worktreeArchiveSnapshotService = service;
   }
 
-  /**
-   * Set the task service for auto-resume counter resets.
-   * Called after construction due to circular dependency.
-   */
-  setTaskService(taskService: TaskService): void {
-    this.taskService = taskService;
+  setAgentTaskIntegration(integration: AgentTaskIntegration): void {
+    this.agentTaskIntegration = integration;
   }
 
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
@@ -4223,29 +4174,66 @@ export class WorkspaceService extends EventEmitter {
   }
 
   private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
-    assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
-    const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-    if (cached != null) {
-      const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
-      if (bootstrap != null) {
-        await bootstrap;
-      }
-      return cached;
+    const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId);
+    if (
+      activeRunIds.size > 0 &&
+      // Installation re-check in THIS continuation: an eviction (removal, or
+      // a tombstone lifted for revival) can land in the microtask gap after
+      // resolve's own final check. A detached set must not repopulate the
+      // seen marker — the evicted id's caches are empty, so a stale marker
+      // would fabricate zero-count entries for the idle revived workspace.
+      this.activeWorkflowRunIdsByWorkspace.get(workspaceId) === activeRunIds
+    ) {
+      // A list- or event-delivered nonzero count is what makes a later zero
+      // meaningful as a tombstone (see workflowRunSeenWorkspaces).
+      this.workflowRunSeenWorkspaces.add(workspaceId);
     }
+    return activeRunIds;
+  }
 
-    // Install the shared Set before awaiting disk so parallel workflow status events
-    // mutate the same cache instead of racing to replace each other after bootstrap.
-    const activeRunIds = new Set<string>();
-    this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-    const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
-    this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
-    try {
-      return await bootstrap;
-    } finally {
-      if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
-        this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+  private async resolveActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
+    assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
+    // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
+    // lifted for re-registration) can race an in-flight bootstrap. A waiter
+    // that captured the pre-eviction Set would otherwise return the removed
+    // incarnation's runs — ghost counts with no future terminal event to
+    // clear them — so after every await the Set is re-verified as still the
+    // installed cache and the read restarts when it was evicted.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+      if (cached != null) {
+        const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
+        if (bootstrap != null) {
+          await bootstrap;
+        }
+        if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== cached) {
+          continue;
+        }
+        return cached;
       }
+
+      // Install the shared Set before awaiting disk so parallel workflow status events
+      // mutate the same cache instead of racing to replace each other after bootstrap.
+      const activeRunIds = new Set<string>();
+      this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+      const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
+      this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
+      try {
+        await bootstrap;
+      } finally {
+        if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
+          this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+        }
+      }
+      if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== activeRunIds) {
+        continue;
+      }
+      return activeRunIds;
     }
+    // Eviction churn exhausted the retries (pathological): probe disk once
+    // more DETACHED so the caller still gets current durable state without
+    // installing a cache that may itself be mid-eviction.
+    return this.populateActiveWorkflowRunIds(workspaceId, new Set<string>());
   }
 
   private async updateActiveWorkflowRunCount(event: {
@@ -4253,13 +4241,32 @@ export class WorkspaceService extends EventEmitter {
     runId: string;
     status: WorkflowRunStatus;
   }): Promise<number> {
-    const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
-    if (isActiveWorkflowRunStatus(event.status)) {
-      activeRunIds.add(event.runId);
-    } else {
-      activeRunIds.delete(event.runId);
+    // Bounded retry (same reason as resolveActiveWorkflowRunIds): an
+    // eviction can land in the microtask gap after the cache read resolves,
+    // so the mutation below would hit a detached incarnation — and must not
+    // mark the seen set for an id whose caches were just evicted, or the
+    // idle revived workspace emits fabricated zero-count entries forever.
+    let detachedSize = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
+      if (isActiveWorkflowRunStatus(event.status)) {
+        activeRunIds.add(event.runId);
+      } else {
+        activeRunIds.delete(event.runId);
+      }
+      detachedSize = activeRunIds.size;
+      if (this.activeWorkflowRunIdsByWorkspace.get(event.workspaceId) !== activeRunIds) {
+        continue;
+      }
+      if (isActiveWorkflowRunStatus(event.status)) {
+        this.workflowRunSeenWorkspaces.add(event.workspaceId);
+      }
+      return activeRunIds.size;
     }
-    return activeRunIds.size;
+    // Eviction churn exhausted the retries (pathological): report the last
+    // detached mutation's size without seen-marking, mirroring the detached
+    // disk-probe fallback in resolveActiveWorkflowRunIds.
+    return detachedSize;
   }
 
   private mergeCachedActiveWorkflowRuns(
@@ -4347,10 +4354,23 @@ export class WorkspaceService extends EventEmitter {
     assert(event.workspaceId.length > 0, "emitWorkflowRunActivity requires workspaceId");
     assert(event.runId.length > 0, "emitWorkflowRunActivity requires runId");
     await this.updateActiveWorkflowRunCount(event);
-    this.emitWorkspaceActivity(
-      event.workspaceId,
-      await this.extensionMetadata.getSnapshot(event.workspaceId)
-    );
+    let snapshot: WorkspaceActivitySnapshot | null;
+    try {
+      snapshot = await this.extensionMetadata.getSnapshot(event.workspaceId, {
+        throwOnError: true,
+      });
+    } catch (error) {
+      // Emitting a suspect (partial-main) snapshot after a failed sidecar
+      // reconcile would clear goal/status in the renderer with no repair
+      // event. Retention is recoverable: the run count is already cached,
+      // so the next emit or list read delivers it.
+      log.debug("Skipping workflow-run activity emit after failed snapshot read", {
+        workspaceId: event.workspaceId,
+        error,
+      });
+      return;
+    }
+    this.emitWorkspaceActivity(event.workspaceId, snapshot);
   }
 
   /**
@@ -4362,16 +4382,27 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
-    this.emit("activity", {
+    const activity = this.mergeCurrentActiveBashMonitorCount(
       workspaceId,
-      activity: this.mergeCurrentActiveBashMonitorCount(
+      this.mergeCachedActiveWorkflowRuns(
         workspaceId,
-        this.mergeCachedActiveWorkflowRuns(
-          workspaceId,
-          this.overlayPendingGoal(workspaceId, snapshot)
-        )
-      ),
-    });
+        this.overlayPendingGoal(workspaceId, snapshot)
+      )
+    );
+    // A late in-flight producer (e.g. a stream-abort stop-status handler mid
+    // todo read) can complete after removal deleted this workspace's
+    // metadata entry. Its disk write is already blocked by the write
+    // tombstone; suppress the broadcast too, or the renderer re-inserts the
+    // removed id into its activity map after having processed the
+    // metadata-removal event. Null (clearing) emissions stay allowed — the
+    // check runs on the MERGED payload (not the raw snapshot) because the
+    // workflow/bash-monitor cache overlays above can turn a null snapshot
+    // into a non-null activity from still-populated caches, which would
+    // re-insert the deleted id just the same.
+    if (activity !== null && this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+      return;
+    }
+    this.emit("activity", { workspaceId, activity });
   }
 
   /**
@@ -5142,6 +5173,13 @@ export class WorkspaceService extends EventEmitter {
     const config = this.config.loadConfigOrDefault({ throwOnError: true });
 
     const knownIds = new Set<string>(allMetadata.map((metadata) => metadata.id));
+    // Same rationale as the extension-metadata prune: normalization is lossy,
+    // and a live workspace whose config entry gets filtered (e.g. invalid
+    // project path) must not have its session data reaped as an orphan.
+    // Throws on unreadable/unparseable config, aborting this cleanup.
+    for (const persistedId of this.config.readPersistedWorkspaceIdSuperset()) {
+      knownIds.add(persistedId);
+    }
     // The config load-time migration (removeLegacyXumChatEntries) drops the
     // removed Chat with Xum workspace from config, which would make its
     // session dir look orphaned here. Preserve the transcript: a downgraded
@@ -6128,9 +6166,10 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
-    const taskService = this.taskService;
-    const withLock = taskService?.withTaskTreeLifecycleLock?.bind(taskService);
-    return withLock == null ? await operation() : await withLock(workspaceId, operation);
+    const integration = this.agentTaskIntegration;
+    return integration == null
+      ? await operation()
+      : await integration.withTaskTreeLifecycleLock(workspaceId, operation);
   }
 
   async remove(workspaceId: string, force = false): Promise<Result<void>> {
@@ -6140,9 +6179,9 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle lock,
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle lock,
    * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
-   * under TaskService's creation mutex, which the tree lock is ordered before).
+   * under the task creation mutex, which the tree lock is ordered before).
    */
   async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
     return await this.removeUnlocked(workspaceId, force);
@@ -6178,7 +6217,7 @@ export class WorkspaceService extends EventEmitter {
 
     // Try to remove from runtime (filesystem)
     try {
-      if (this.taskService?.hasDescendantAgentTasks?.(workspaceId) === true) {
+      if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
@@ -6829,6 +6868,11 @@ export class WorkspaceService extends EventEmitter {
       }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+
+      // Deregistration succeeded: drop the workspace's activity/status entry
+      // so extensionMetadata.json stays bounded (stale entries were
+      // historically never pruned and grew monotonically, issue #3959).
+      await this.discardExtensionMetadataEntry(workspaceId);
 
       if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
@@ -8320,7 +8364,9 @@ export class WorkspaceService extends EventEmitter {
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
   ): Promise<Result<ArchivePreflightResult>> {
     try {
-      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
 
@@ -8796,19 +8842,7 @@ export class WorkspaceService extends EventEmitter {
    * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
    * archiving instead of killing activity that has no delegated workspace-turn handle.
    */
-  listLiveWorkspaceActivity(workspaceId: string): {
-    streaming: boolean;
-    /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
-    queuedMessages: boolean;
-    /**
-     * Detached background bash processes still running (sync snapshot; may briefly read
-     * stale-running until the next lazy refresh — callers wanting freshness should await
-     * hasRunningBackgroundBashProcesses first).
-     */
-    backgroundBashProcesses: boolean;
-    terminalSessions: boolean;
-    desktopSession: boolean;
-  } {
+  listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity {
     return {
       streaming: this.aiService.isStreaming(workspaceId),
       queuedMessages:
@@ -8969,7 +9003,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
    * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
    * workspace lifecycle), so the sink must not re-acquire it.
@@ -9062,7 +9096,9 @@ export class WorkspaceService extends EventEmitter {
         // entering later observe the armed guard and refuse. This closes the window between
         // the caller's earlier active-run snapshot and this sink.
         if (
-          (await this.taskService?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) === true
+          (await this.agentTaskIntegration?.hasActiveTopLevelWorkflowRunsForWorkspace(
+            workspaceId
+          )) === true
         ) {
           return Err(
             "Workspace has active workflow runs that archiving would orphan. Wait for them to finish or ask the user to archive manually."
@@ -9087,7 +9123,9 @@ export class WorkspaceService extends EventEmitter {
       if (!workspace) {
         return Err("Workspace not found");
       }
-      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
       const initState = this.initStateManager.getInitState(workspaceId);
@@ -9435,7 +9473,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock (the model-facing unarchive path pre-acquires it for lock ordering; agent-task
    * ancestry unarchive runs under the send path's tree lock).
    */
@@ -11269,60 +11307,7 @@ export class WorkspaceService extends EventEmitter {
     options: SendMessageOptions & {
       fileParts?: FilePart[];
     },
-    internal?: {
-      allowQueuedAgentTask?: boolean;
-      skipAutoResumeReset?: boolean;
-      synthetic?: boolean;
-      /** Marks a synthetic send as an active-goal continuation turn. */
-      goalContinuation?: boolean;
-      /** Specific active-goal synthetic turn kind to persist on the user message. */
-      goalKind?: GoalSyntheticMessageKind;
-      /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
-      goalId?: string;
-      /** Force Copilot billing classification to "agent" for internal sends. */
-      agentInitiated?: boolean;
-      onAccepted?: () => Promise<void> | void;
-      onCanceled?: (reason: string) => Promise<void> | void;
-      onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
-      /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
-      cancelSignal?: AbortSignal;
-      /**
-       * Synchronous staleness probe from the caller, re-evaluated at the real admission points
-       * (the enqueue block and the session's turn-admission gates) in addition to the
-       * context-mutation epoch. Peer agent sends use it so a user Stop or task_stop landing
-       * during this method's awaits refuses the send instead of queueing a wake or resurrecting
-       * the stopped task via markInterruptedTaskRunning.
-       */
-      admissionStale?: () => boolean;
-      /**
-       * Synthetic assistant rows persisted just before the turn's user row
-       * (family-message payloads). Delivered atomically with the message —
-       * queued alongside it when the workspace is busy — so they never land
-       * inside another turn's PREPARING window (see AgentSession.sendMessage).
-       */
-      preTurnMessages?: MuxMessage[];
-      /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
-      onPreTurnRowsPersisted?: () => void;
-      /** Return once the user message is accepted; stream startup continues asynchronously. */
-      startStreamInBackground?: boolean;
-      /** When true, reject instead of queueing if the workspace is busy. */
-      requireIdle?: boolean;
-      /** Preserve workspace-turn correlation only when this send is the next continuation. */
-      workspaceTurnContinuation?: boolean;
-      /** Coalescing for queued sends: drop the message when the same key is already queued. */
-      queueDedupeKey?: string;
-      /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
-      removableQueueDedupeKey?: boolean;
-      /**
-       * For queued sends: quietly drop the message (success) when other messages are already
-       * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
-       * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
-       * options, so merging a heartbeat in would run the user's queued turn with the
-       * heartbeat's model/agent.
-       */
-      yieldToQueuedMessages?: boolean;
-    }
+    internal?: SendMessageInternalOptions
   ): Promise<Result<void, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
       workspaceId,
@@ -11436,7 +11421,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Guard: queued agent tasks must not start streaming via generic sendMessage calls.
-      // They should only be started by TaskService once a parallel slot is available.
+      // They should only be started by task orchestration once a parallel slot is available.
       if (!internal?.allowQueuedAgentTask) {
         const config = this.config.loadConfigOrDefault();
         for (const [_projectPath, project] of config.projects) {
@@ -11611,7 +11596,7 @@ export class WorkspaceService extends EventEmitter {
         if (internal?.admissionStale?.() === true) {
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
-        const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+        const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
         if (taskStatus === "interrupted") {
           return Err({
             type: "unknown",
@@ -11715,18 +11700,18 @@ export class WorkspaceService extends EventEmitter {
         }
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
-          this.taskService?.resetAutoResumeCount?.(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         }
 
         if (effectiveQueueDispatchMode === "tool-end") {
-          this.taskService?.backgroundForegroundWaitsForWorkspace?.(workspaceId);
+          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
         return Ok(undefined);
       }
 
       if (!internal?.skipAutoResumeReset) {
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       }
 
       // A stale caller probe must refuse BEFORE the interrupted-task rescue below: a peer send
@@ -11737,7 +11722,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
-      // taskStatus=interrupted. Transition before starting a new stream so TaskService
+      // taskStatus=interrupted. Transition before starting a new stream so task orchestration
       // stream-end handling does not early-return on interrupted status.
       //
       // Guarded sends (peer messages) skip this rescue entirely: it exists for user-driven
@@ -11748,7 +11733,7 @@ export class WorkspaceService extends EventEmitter {
       if (internal?.admissionStale == null) {
         try {
           resumedInterruptedTask =
-            (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+            (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
         } catch (error: unknown) {
           log.error("Failed to restore interrupted task status before sendMessage", {
             workspaceId,
@@ -11761,7 +11746,7 @@ export class WorkspaceService extends EventEmitter {
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (restoreError: unknown) {
             log.error(
               "Failed to restore interrupted task status after accepted edit startup failure",
@@ -11830,7 +11815,7 @@ export class WorkspaceService extends EventEmitter {
 
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
               workspaceId,
@@ -11865,7 +11850,7 @@ export class WorkspaceService extends EventEmitter {
 
       if (resumedInterruptedTask) {
         try {
-          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
             workspaceId,
@@ -11975,7 +11960,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Guard: queued agent tasks must not be resumed by generic UI/API calls.
-      // TaskService is responsible for dequeuing and starting them.
+      // Task orchestration is responsible for dequeuing and starting them.
       if (!internal?.allowQueuedAgentTask) {
         const config = this.config.loadConfigOrDefault();
         for (const [_projectPath, project] of config.projects) {
@@ -12005,7 +11990,7 @@ export class WorkspaceService extends EventEmitter {
 
       const session = this.getOrCreateSession(workspaceId);
 
-      const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+      const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
       if (taskStatus === "interrupted" && session.isBusy()) {
         return Err({
           type: "unknown",
@@ -12029,11 +12014,11 @@ export class WorkspaceService extends EventEmitter {
       await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "resume");
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
-      // taskStatus=interrupted. Transition before stream start so TaskService stream-end
+      // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
       // handling does not early-return on interrupted status.
       try {
         resumedInterruptedTask =
-          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       } catch (error: unknown) {
         log.error("Failed to restore interrupted task status before resumeStream", {
           workspaceId,
@@ -12060,7 +12045,7 @@ export class WorkspaceService extends EventEmitter {
         });
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
               workspaceId,
@@ -12076,7 +12061,7 @@ export class WorkspaceService extends EventEmitter {
       if (!result.data.started) {
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
               workspaceId,
@@ -12091,7 +12076,7 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       if (resumedInterruptedTask) {
         try {
-          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
             workspaceId,
@@ -12166,11 +12151,11 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
     try {
-      this.taskService?.resetAutoResumeCount(workspaceId);
+      this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
         // Mark before attempting the session interrupt to close races where a child
         // could report between stop initiation and descendant cascade termination.
-        this.taskService?.markParentWorkspaceInterrupted(workspaceId);
+        this.agentTaskIntegration?.markParentWorkspaceInterrupted(workspaceId);
         // Latch synchronously at the request boundary, BEFORE the session-interrupt await
         // below: the suppression mark above is level-triggered (a user resume clears it), so
         // a peer send from a still-running descendant entering during that await — or during
@@ -12178,8 +12163,7 @@ export class WorkspaceService extends EventEmitter {
         // ancestor epoch as its clean baseline and wake workspaces outside the stopped
         // subtree. Released in the finally, after the descendant cascade persisted terminal
         // statuses.
-        // Optional call: test harnesses mock TaskService with a narrow method surface.
-        releaseHardStopLatch = this.taskService?.latchHardInterruptCascade?.(workspaceId);
+        releaseHardStopLatch = this.agentTaskIntegration?.latchHardInterruptCascade(workspaceId);
       }
 
       const session = this.getOrCreateSession(workspaceId);
@@ -12187,7 +12171,7 @@ export class WorkspaceService extends EventEmitter {
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
-          this.taskService?.resetAutoResumeCount(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         }
         log.error("Failed to stop stream:", stopResult.error);
         return Err(stopResult.error);
@@ -12205,7 +12189,7 @@ export class WorkspaceService extends EventEmitter {
       if (!options?.soft) {
         try {
           const interruptedTaskIds =
-            await this.taskService?.terminateAllDescendantAgentTasks?.(workspaceId);
+            await this.agentTaskIntegration?.terminateAllDescendantAgentTasks(workspaceId);
           if (interruptedTaskIds && interruptedTaskIds.length > 0) {
             log.debug("Cascade-interrupted descendant tasks on interrupt", {
               workspaceId,
@@ -12224,7 +12208,7 @@ export class WorkspaceService extends EventEmitter {
       if (options?.sendQueuedImmediately) {
         // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
         // clear hard-interrupt suppression first (it won't flow through sendMessage()).
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         // The card represents only user-authored queue content. Prioritize that
         // entry over hidden synthetic/background work before dispatching.
         session.sendNextUserQueuedMessage();
@@ -12237,7 +12221,7 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       if (!options?.soft) {
         // Keep suppression state consistent if interrupt setup/stop throws.
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       }
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in interruptStream handler:", error);
@@ -12621,6 +12605,15 @@ export class WorkspaceService extends EventEmitter {
   ): boolean {
     const session = this.sessions.get(workspaceId.trim());
     return session?.hasPendingWorkspaceTurnContinuation(metadata) ?? false;
+  }
+
+  /**
+   * Input poised to take over the session at a queue cut, for cut attribution.
+   * See AgentSession.getQueueCutCutter for stage semantics.
+   */
+  getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
+    const session = this.sessions.get(workspaceId.trim());
+    return session?.getQueueCutCutter();
   }
 
   /**
@@ -13499,30 +13492,322 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * Best-effort removal of a deregistered workspace's activity/status entry
+   * from extensionMetadata.json. Used by remove() and by rollback paths that
+   * deregister via config.removeWorkspace directly (e.g. TaskService's failed
+   * task-create rollback, where a send that failed mid-create may already
+   * have scheduled metadata writes that would recreate the entry after
+   * deregistration). A missed delete is reclaimed by the one-time
+   * pruneStaleExtensionMetadataOnce pass on a later process start.
+   */
+  async discardExtensionMetadataEntry(workspaceId: string): Promise<void> {
+    try {
+      // Deleting also write-tombstones the id for the rest of this process,
+      // so verify deregistration actually landed before publishing it:
+      // saveConfig swallows write failures, meaning config.removeWorkspace
+      // can resolve while the workspace is still persisted in config.json —
+      // tombstoning a still-live id would suppress all of its future
+      // activity writes. A failed verification (unreadable config) skips the
+      // delete too; like a missed delete, the entry is reclaimed by a later
+      // process start's prune, which re-checks against config.
+      //
+      // Deliberately NOT getAllWorkspaceMetadata here: that walks every
+      // configured workspace with per-workspace fs probes — an O(n)
+      // traversal just to check one id. The raw persisted superset (which
+      // throws on an unreadable config, also making findWorkspace's lenient
+      // internal load safe below) covers entries normalization would drop,
+      // and the targeted findWorkspace lookup covers normalized/legacy ids
+      // (metadata.json / generated legacy ids) the raw scan cannot see.
+      const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+      // throwOnError: a lenient findWorkspace swallows unreadable legacy
+      // metadata.json files, and "identity unknowable" must fail closed here
+      // (skip the delete) rather than read as "not registered".
+      if (
+        knownIds.has(workspaceId) ||
+        this.config.findWorkspace(workspaceId, { throwOnError: true }) != null
+      ) {
+        log.debug("Skipping extension metadata discard: workspace still persisted in config", {
+          workspaceId,
+        });
+        return;
+      }
+      await this.extensionMetadata.deleteWorkspace(workspaceId);
+      // Removal-side counterpart of the tombstone-cleared eviction: drop the
+      // process-local workflow/bash-monitor caches for the removed id so a
+      // later re-registration never inherits activity bootstrapped from
+      // session state that removal deleted.
+      this.evictWorkspaceActivityCaches(workspaceId);
+    } catch (error) {
+      log.debug("Failed to prune extension metadata after workspace deregistration", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Strict authoritative enumeration for destructive/identity decisions:
+   * every primary workspace id PLUS legacy alias identities (a second
+   * resolvable compatibility file findWorkspace still vouches for — see
+   * Config.getAllWorkspaceMetadata's legacyAliasIds). Known-id sets built
+   * without the aliases would prune or drop live alias-keyed activity.
+   */
+  private async enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>> {
+    const legacyAliasIds = new Set<string>();
+    const ids = new Set(
+      (await this.config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })).map(
+        (metadata) => metadata.id
+      )
+    );
+    for (const aliasId of legacyAliasIds) {
+      ids.add(aliasId);
+    }
+    return ids;
+  }
+
+  /**
+   * Evict process-local activity caches for a removed (or removed-then-
+   * revived) workspace id. The caches re-bootstrap from disk on next access;
+   * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
+   */
+  private evictWorkspaceActivityCaches(workspaceId: string): void {
+    this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
+    this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+    this.bashMonitorSeenWorkspaces.delete(workspaceId);
+    this.workflowRunSeenWorkspaces.delete(workspaceId);
+  }
+
+  /**
+   * One-time lazy cleanup for pre-existing deployments: drop
+   * extensionMetadata.json entries whose workspace no longer exists in
+   * config. remove() prunes going forward, but entries that leaked before
+   * that hook existed (issue #3959) would otherwise bloat the file — and
+   * every serialized rewrite of it — forever. Runs at most once per process
+   * from the activity bootstrap path; never a per-read scan.
+   */
+  private prunedStaleExtensionMetadata = false;
+  /**
+   * Returns the config-known workspace ids captured during the prune so the
+   * first activity bootstrap can reuse them for scoping —
+   * getAllWorkspaceMetadata walks every workspace with per-workspace disk
+   * probes, which large deployments should not pay twice in the
+   * latency-sensitive bootstrap. `knownIds` is the FULL raw-plus-normalized
+   * union the prune spared from deletion: scoping to anything narrower (the
+   * normalized view alone) would drop raw-registered ids the normalized
+   * view cannot see (e.g. a project pair shadowed by a duplicate path key),
+   * and if the bootstrap's later raw refreshes then failed transiently, the
+   * authoritative response would omit a live workspace whose id this READ
+   * already loaded successfully — clearing its renderer state with no event
+   * to correct it. `enumeratedIds` is what the strict enumeration itself
+   * vouched for (see scopeEnumerationIds: only those ids may treat
+   * enumeration absence as removal evidence). Null when the prune was
+   * skipped or failed.
+   */
+  private async pruneStaleExtensionMetadataOnce(): Promise<{
+    knownIds: Set<string>;
+    enumeratedIds: ReadonlySet<string>;
+  } | null> {
+    if (this.prunedStaleExtensionMetadata) {
+      return null;
+    }
+    // Latch before awaiting so concurrent bootstraps don't queue redundant
+    // prunes; a failed attempt is retried on the next process start rather
+    // than on every read.
+    this.prunedStaleExtensionMetadata = true;
+    try {
+      let prunedScope: { knownIds: Set<string>; enumeratedIds: ReadonlySet<string> } | null = null;
+      const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(
+        async () => {
+          // Invoked inside the file's serialized mutation AFTER the file load,
+          // reading config fresh from disk (see pruneMissingWorkspaces), so a
+          // concurrently created workspace — even in another backend process —
+          // cannot lose its just-written entry.
+          //
+          // Union of two views, both of which throw (aborting the prune, caught
+          // below) rather than resolving with a silently lossy id set:
+          // - the raw persisted superset covers entries loadConfigOrDefault's
+          //   validation/normalization would filter or discard (see
+          //   readPersistedWorkspaceIdSuperset), so a live workspace with a
+          //   malformed config entry is never treated as removed;
+          // - the strict normalized view covers ids produced by in-memory
+          //   config migrations that are not yet persisted verbatim.
+          // A missing config file resolves as a healthy empty set in both.
+          const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+          const enumeratedIds = await this.enumerateAuthoritativeWorkspaceIds();
+          for (const workspaceId of enumeratedIds) {
+            knownIds.add(workspaceId);
+          }
+          prunedScope = { knownIds, enumeratedIds };
+          return knownIds;
+        },
+        async () => {
+          // Mid-prune re-registration recheck. The first callback's strict
+          // enumeration walks a session lookup per configured workspace;
+          // rerunning it doubles that cost on exactly the stale-heavy
+          // deployments this prune exists to fix, while the serialized
+          // metadata queue blocks live recency/status writes. The raw id view
+          // is complete registration evidence whenever every persisted
+          // workspace entry carries its id inline — only id-less legacy
+          // entries (whose stable id lives in session metadata.json) can be
+          // registered raw-invisibly, so the enumeration is repeated only
+          // when such entries exist. Both reads throw on failure, aborting
+          // the prune rather than deleting on lossy evidence.
+          const evidence = this.config.readPersistedWorkspaceIdEvidence();
+          if (!evidence.hasWorkspaceEntriesWithoutIds) {
+            return evidence.ids;
+          }
+          for (const workspaceId of await this.enumerateAuthoritativeWorkspaceIds()) {
+            evidence.ids.add(workspaceId);
+          }
+          return evidence.ids;
+        }
+      );
+      if (prunedCount > 0) {
+        log.info(`Pruned ${prunedCount} stale extension metadata entries`);
+      }
+      return prunedScope;
+    } catch (error) {
+      log.debug("Failed to prune stale extension metadata entries", { error });
+      return null;
+    }
+  }
+
   async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot> | null> {
     try {
-      const snapshots = await this.extensionMetadata.getAllSnapshots();
-      const workspaceIds = new Set(snapshots.keys());
-      for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
-        workspaceIds.add(workspaceId);
-      }
-      for (const workspaceId of this.bashMonitorSeenWorkspaces) {
-        workspaceIds.add(workspaceId);
-      }
+      // On the first bootstrap the prune already enumerated the config; reuse
+      // that id set instead of paying the per-workspace disk walk twice.
+      // Baseline for the post-await cross-process removal revalidation at
+      // the end of this method: captured before ANY await (including the
+      // first-bootstrap prune, whose enumeration another backend's removal
+      // could otherwise outdate before this baseline is read) so ids
+      // deregistered from the shared config while this list computes can be
+      // told apart from ids the raw scan can never see.
+      let initialConfigIds: ReadonlySet<string> | null = null;
       try {
-        for (const metadata of await this.config.getAllWorkspaceMetadata()) {
-          workspaceIds.add(metadata.id);
+        initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+      } catch {
+        initialConfigIds = null;
+      }
+      const prefetchedScope = await this.pruneStaleExtensionMetadataOnce();
+      // throwOnError: the default load self-heals an unreadable/malformed
+      // metadata file into an empty one, which this list would then present
+      // as an authoritative "no activity anywhere" answer — the renderer
+      // applies that by wiping every cached streaming/status/goal snapshot
+      // with no retry (the subscription stays connected). Throwing to the
+      // null-returning catch below instead keeps last-known renderer state
+      // and lets the bootstrap retry read the real list later.
+      const snapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+      // Scope the list to config-known workspaces. extensionMetadata.json was
+      // historically never pruned, so long-lived deployments accumulate stale
+      // entries for removed workspaces/sub-agents by the thousands (issue
+      // #3959: 13,901 entries / 2.89 MB / ~59 s per bootstrap while the
+      // sidebar needed ~246). Stale ids must neither inflate the payload nor
+      // trigger the per-id workflow-run bootstrap disk probe below. Known ids
+      // WITHOUT a snapshot still flow through the tombstone logic below —
+      // scoping only drops ids that are not in config at all.
+      let workspaceIds: Set<string>;
+      // Whether scoping ended up on the fail-open legacy union (config
+      // unreadable): only that availability path may serve a response with
+      // the cross-process removal guards disabled.
+      let scopedFailOpen = false;
+      // Ids the SCOPE's strict enumeration itself vouched for, captured
+      // before raw-view additions: the authoritative-removal fallback below
+      // may treat mid-list enumeration absence as removal evidence only for
+      // these ids — raw-registered ids the normalized view cannot see
+      // (invalid project path) are legitimately absent from every
+      // enumeration and must not read that absence as removal.
+      let scopeEnumerationIds: ReadonlySet<string> | null = null;
+      if (prefetchedScope != null) {
+        scopeEnumerationIds = prefetchedScope.enumeratedIds;
+        // Scope to the FULL known-id union the prune spared (raw +
+        // normalized), not the enumeration alone: a raw-registered id the
+        // normalized view cannot see was already loaded successfully by the
+        // prune's raw read, and relying solely on the refresh below to
+        // re-admit it would let a transient refresh failure turn into an
+        // authoritative response that omits the live workspace.
+        workspaceIds = prefetchedScope.knownIds;
+        // The prune enumerated config BEFORE the snapshot read above, so a
+        // workspace registered in between would be missing here — and an
+        // authoritative list omitting it would clear its live-arrived
+        // renderer state with no retry. Admit every id a fresh raw config
+        // view now knows, NOT just ids with a persisted snapshot: a
+        // concurrently registered workspace with workflow- or bash-monitor-
+        // only activity has no extensionMetadata entry, and its on-disk
+        // workflow runs are only discovered by the per-id probe below.
+        // (Cheap sync read; on failure the prefetched view stands and the
+        // miss is a transient one.)
+        try {
+          const refreshedConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+          for (const workspaceId of refreshedConfigIds) {
+            workspaceIds.add(workspaceId);
+          }
+        } catch (error) {
+          log.debug("Failed to refresh config ids for first-bootstrap scoping", { error });
         }
-      } catch (error) {
-        log.debug("Failed to include all workspaces while listing activity", { error });
+      } else {
+        try {
+          // throwOnError so a corrupted config.json actually reaches the
+          // fail-open fallback below instead of silently resolving as the
+          // empty default and dropping every live entry from the list.
+          workspaceIds = await this.enumerateAuthoritativeWorkspaceIds();
+          scopeEnumerationIds = workspaceIds;
+        } catch (error) {
+          // Fail open: without the config view, stale ids cannot be told apart
+          // from live ones, and dropping live entries would strand renderer
+          // activity state. Fall back to the legacy unscoped union.
+          log.debug("Failed to scope activity list to known workspaces", { error });
+          scopedFailOpen = true;
+          workspaceIds = new Set(snapshots.keys());
+          for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
+            workspaceIds.add(workspaceId);
+          }
+          for (const workspaceId of this.bashMonitorSeenWorkspaces) {
+            workspaceIds.add(workspaceId);
+          }
+          for (const workspaceId of this.workflowRunSeenWorkspaces) {
+            workspaceIds.add(workspaceId);
+          }
+        }
       }
 
+      // Re-establish the raw baseline when the pre-await read failed: with a
+      // null baseline BOTH cross-process removal guards stay disabled while
+      // the response is still authoritative — a workspace another backend
+      // removes during the probes below would ride back into the renderer
+      // with no event to correct it. This retry still precedes every per-id
+      // probe await, so it remains a valid "registered at list start"
+      // baseline; ids it cannot see flow through the authoritative-identity
+      // path instead. If it fails again the config is genuinely unreadable
+      // and the fail-open scoping above already chose availability.
+      if (initialConfigIds == null) {
+        try {
+          initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+        } catch (error) {
+          // Authoritative scope but NO raw baseline even on retry: both
+          // cross-process removal guards would silently stay disabled on a
+          // response the renderer applies as authoritative — a workspace
+          // another backend deregisters during the probes below would ride
+          // back with no event to correct it. Fail the list instead (null →
+          // renderer keeps last-known state and retries). The fail-open
+          // scope keeps its availability contract: config is unreadable
+          // there by definition, and no baseline exists by design.
+          if (!scopedFailOpen) {
+            throw error;
+          }
+          initialConfigIds = null;
+        }
+      }
       const entries = await Promise.all(
         Array.from(
           workspaceIds,
           async (workspaceId): Promise<readonly [string, WorkspaceActivitySnapshot] | null> => {
             const snapshot = snapshots.get(workspaceId) ?? null;
-            const hadWorkflowActivityCache = this.activeWorkflowRunIdsByWorkspace.has(workspaceId);
+            // Nonzero-observation signal, NOT cache presence: the probe below
+            // installs an empty cache for every scoped id, which would turn
+            // every idle config-known workspace into a fabricated recency:0
+            // entry on the next list.
+            const hadWorkflowActivity = this.workflowRunSeenWorkspaces.has(workspaceId);
             // Bash-monitor counterpart of the workflow tombstone: a monitor that stopped
             // while the renderer was disconnected (or whose stop emit failed) must still
             // surface a zero-count entry here, otherwise the renderer's last-known
@@ -13542,7 +13827,7 @@ export class WorkspaceService extends EventEmitter {
             if (
               snapshot == null &&
               activeWorkflowRunCount === 0 &&
-              !hadWorkflowActivityCache &&
+              !hadWorkflowActivity &&
               activeBashMonitorCount === 0 &&
               !hadBashMonitorActivityCache
             ) {
@@ -13568,15 +13853,651 @@ export class WorkspaceService extends EventEmitter {
           }
         )
       );
-      return Object.fromEntries(
-        entries.filter(
-          (entry): entry is readonly [string, WorkspaceActivitySnapshot] => entry != null
-        )
+      // Cross-process counterparts of the in-process tombstone check below:
+      // with XUM_ALLOW_MULTIPLE_INSTANCES another backend can remove a
+      // workspace while this list computes, invisible to this process's
+      // deletedWorkspaceIds. Re-read the (post-prune bounded) metadata file
+      // and the raw persisted config id superset once. Best-effort: an
+      // unreadable re-read skips its revalidation instead of failing an
+      // otherwise complete response.
+      let freshSnapshots: ReadonlyMap<string, WorkspaceActivitySnapshot> | null = null;
+      try {
+        freshSnapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+      } catch {
+        freshSnapshots = null;
+      }
+      const freshPersistedIds: ReadonlySet<string> | null =
+        freshSnapshots != null ? new Set(freshSnapshots.keys()) : null;
+      // Tombstones the registration evidence below may legitimately clear:
+      // only ones that already exist HERE, before the evidence is captured
+      // (the raw superset read is synchronous with this snapshot, and the
+      // authoritative enumeration runs later still). A same-process removal
+      // landing during the enumeration await publishes its tombstone after
+      // the evidence reads began — stale evidence still showing the id
+      // registered must not clear that fresh tombstone, or the pre-removal
+      // snapshot rides back into the renderer and late producers persist the
+      // entry again. Such a tombstone stays clearable by the NEXT list's
+      // fresh evidence if the id really is re-registered.
+      const clearableTombstoneIds = this.extensionMetadata.getTombstonedIds();
+      let freshConfigIds: ReadonlySet<string> | null = null;
+      // Whether the fresh raw view is COMPLETE registration evidence: id-less
+      // legacy entries register raw-invisibly (their stable id lives in
+      // session metadata.json), so their presence — or an unreadable raw
+      // view — forces the authoritative enumeration below for admission and
+      // removal decisions the raw comparison cannot make.
+      let freshConfigHasRawInvisibleEntries = false;
+      try {
+        const evidence = this.config.readPersistedWorkspaceIdEvidence();
+        freshConfigIds = evidence.ids;
+        freshConfigHasRawInvisibleEntries = evidence.hasWorkspaceEntriesWithoutIds;
+      } catch {
+        freshConfigIds = null;
+        freshConfigHasRawInvisibleEntries = true;
+      }
+      // Like-for-like raw-superset comparison only: an id that WAS persisted
+      // in config before the awaits and is gone from the fresh raw view was
+      // verifiably deregistered. Ids the raw scan cannot see (legacy entries
+      // whose stable id lives in a session metadata.json, in-memory migration
+      // ids) never appear in either view — dropping them on a cheap fresh
+      // view would misclassify identity-lookup gaps as removals, so they are
+      // revalidated through the authoritative identity path below instead.
+      // Skipped when either superset read fails.
+      const isRemovedFromConfig = (workspaceId: string): boolean =>
+        initialConfigIds != null &&
+        freshConfigIds != null &&
+        initialConfigIds.has(workspaceId) &&
+        !freshConfigIds.has(workspaceId);
+      // Raw-invisible ids (legacy stable ids resolved from session
+      // metadata.json during enumeration) need their own removal
+      // revalidation: the raw baseline can never contain them, so the
+      // comparison above is blind to their cross-process removal — a
+      // snapshotless (workflow/bash-monitor-only) legacy entry removed
+      // mid-list would otherwise ride the delayed authoritative response
+      // back into the renderer. Revalidate against ONE fresh authoritative
+      // enumeration (per-id findWorkspace lookups would re-read and scan the
+      // whole config per entry — O(n²) on legacy-heavy first bootstraps,
+      // recreating the very stall this scoping removes): a verified "not
+      // registered" drops the entry, while an unknowable identity anywhere
+      // (unreadable/id-less metadata.json throws in strict mode) skips the
+      // recheck and conservatively retains every raw-invisible id. Computed
+      // only when a retained entry is actually missing from the raw
+      // baseline (or a raw-invisible late snapshot needs admission below),
+      // so modern deployments (every workspace id persisted in config)
+      // never pay the extra walk.
+      // Second trigger: a fresh-snapshot id outside the per-id scope that
+      // the raw view cannot vouch for. It is either a raw-invisible legacy
+      // id a downgraded backend registered mid-list — which the merge below
+      // must ADMIT, and only the authoritative enumeration can prove
+      // registered — or noise the merge must keep excluding; either way the
+      // enumeration is the only view that can tell.
+      const hasRawInvisibleLateSnapshotId =
+        freshSnapshots != null &&
+        Array.from(freshSnapshots.keys()).some(
+          (workspaceId) =>
+            !workspaceIds.has(workspaceId) && !(freshConfigIds?.has(workspaceId) ?? false)
+        );
+      let authoritativeIds: ReadonlySet<string> | null = null;
+      if (
+        initialConfigIds != null &&
+        (entries.some((entry) => entry != null && !initialConfigIds.has(entry[0])) ||
+          hasRawInvisibleLateSnapshotId ||
+          // Third trigger: id-less legacy entries exist, so a downgraded
+          // backend may have registered a raw-invisible workspace with
+          // workflow-only activity (no snapshot) mid-list — only the
+          // enumeration can discover it for the merge admission below.
+          // Modern deployments (every id inline) never pay this walk.
+          freshConfigHasRawInvisibleEntries)
+      ) {
+        try {
+          authoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+        } catch (error) {
+          log.debug("Failed to enumerate authoritative ids for removal revalidation", { error });
+          authoritativeIds = null;
+        }
+        // The enumeration awaited disk: refresh the raw view so the
+        // like-for-like removal comparison below never compares two
+        // pre-removal reads. An inline-id workspace removed by another
+        // backend DURING the enumeration is invisible to the pre-await
+        // freshConfigIds (and deliberately exempt from the authoritative
+        // check, which skips ids present in the initial baseline), so its
+        // stale entry would otherwise pass the retained-entry filter with no
+        // cross-process event to correct it. Fresher raw evidence is
+        // strictly better for every downstream consumer; the tombstone-clear
+        // eligibility snapshot was captured before ALL evidence reads, so
+        // ordering stays sound.
+        try {
+          const refreshedEvidence = this.config.readPersistedWorkspaceIdEvidence();
+          freshConfigIds = refreshedEvidence.ids;
+          freshConfigHasRawInvisibleEntries = refreshedEvidence.hasWorkspaceEntriesWithoutIds;
+        } catch {
+          freshConfigIds = null;
+          freshConfigHasRawInvisibleEntries = true;
+        }
+        if (freshConfigHasRawInvisibleEntries) {
+          // The refresh postdates the enumeration and reveals id-less
+          // entries, so the enumeration's DENIALS may already be stale: an
+          // id removed before the enumeration can have been re-registered
+          // id-less (with fresh cross-process activity) in the gap, and
+          // trusting the stale denial would drop the revived workspace and
+          // tombstone it. Re-enumerate ONCE so the enumeration-backed
+          // removal arms use the freshest capable view; a revival landing
+          // after this last read is the contract's out-of-scope window
+          // (the next list's evidence clears any republished tombstone).
+          // The raw view deliberately stays at its pre-re-enumeration
+          // read: staleness there errs toward retention (an id present in
+          // the older view is kept), never toward a wrong drop. On failure
+          // fall back to retention, not the stale denial set.
+          try {
+            authoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+          } catch (error) {
+            log.debug("Failed to re-enumerate authoritative ids after raw refresh", { error });
+            authoritativeIds = null;
+          }
+        }
+      }
+      const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>
+        (initialConfigIds != null &&
+          !initialConfigIds.has(workspaceId) &&
+          // An id visible in the FRESH raw view is verifiably registered
+          // regardless of what the (possibly earlier) authoritative
+          // enumeration saw — e.g. a workspace registered after that
+          // enumeration ran must not read as removed.
+          !(freshConfigIds?.has(workspaceId) ?? false) &&
+          authoritativeIds != null &&
+          !authoritativeIds.has(workspaceId)) ||
+        // Raw view unavailable (initial evidence read or post-enumeration
+        // refresh failed): the mid-list authoritative enumeration is the
+        // only usable post-removal view — without this arm an inline-id
+        // workspace removed during that enumeration would ride the
+        // authoritative response with every raw guard disabled and no
+        // cross-process event to repair the renderer. Confined to ids the
+        // scope enumeration itself vouched for (see scopeEnumerationIds).
+        (freshConfigIds == null &&
+          authoritativeIds != null &&
+          (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+          !authoritativeIds.has(workspaceId));
+      // Raw-visible→raw-invisible is verifiable removal only while the
+      // fresh raw view is COMPLETE registration evidence. With id-less
+      // legacy entries present, the id may have been removed and
+      // RE-REGISTERED by a downgraded backend as an id-less entry during
+      // the awaits (raw-invisible from then on) — the raw comparison alone
+      // would drop the revived workspace and republish the very tombstone
+      // the authoritative evidence just cleared, suppressing its activity
+      // again. In that case the authoritative enumeration (which resolves
+      // id-less identities, and is attempted whenever id-less entries
+      // exist — see the third trigger above) must DENY the id before the
+      // transition counts as removal; an affirmation or a failed
+      // enumeration retains the entry (keeping a stale entry briefly is
+      // recoverable, wrongly suppressing a live workspace is not). The
+      // enumeration consulted here postdates the raw refresh whenever that
+      // refresh reports id-less entries (see the re-enumeration above), so
+      // a stale pre-refresh denial can never veto a revived id; a revival
+      // landing after that last enumeration is the contract's out-of-scope
+      // window — the next list's initial baseline no longer contains the
+      // id, so the raw arm cannot re-fire and its fresh evidence clears
+      // the republished tombstone.
+      const isVerifiablyRemovedFromRawConfig = (workspaceId: string): boolean =>
+        isRemovedFromConfig(workspaceId) &&
+        (!freshConfigHasRawInvisibleEntries ||
+          (authoritativeIds != null && !authoritativeIds.has(workspaceId)));
+      // Tombstones are process-local removal knowledge; the shared config is
+      // the authority. A downgraded concurrent backend can legitimately
+      // re-register a deterministic legacy id this process pruned earlier —
+      // observing the id in a FRESH config-derived view (raw superset or the
+      // strict authoritative enumeration above; never snapshot/cache keys,
+      // which do not prove registration) makes the tombstone stale, so its
+      // write suppression and list filtering must end. Cleared before the
+      // revalidation filter below so a re-registered id's entry survives.
+      if (freshConfigIds != null || authoritativeIds != null) {
+        const registeredIds = new Set<string>();
+        for (const workspaceId of freshConfigIds ?? []) {
+          registeredIds.add(workspaceId);
+        }
+        for (const workspaceId of authoritativeIds ?? []) {
+          registeredIds.add(workspaceId);
+        }
+        this.extensionMetadata.clearTombstonesForRegisteredIds(
+          registeredIds,
+          clearableTombstoneIds
+        );
+      }
+      const activityById = Object.fromEntries(
+        entries.filter((entry): entry is readonly [string, WorkspaceActivitySnapshot] => {
+          if (entry == null) {
+            return false;
+          }
+          const workspaceId = entry[0];
+          // Revalidate after the per-workspace awaits above: a workspace
+          // removed while this list was computing would otherwise ride the
+          // delayed response past emitWorkspaceActivity's tombstone
+          // suppression — a renderer that already processed the removal
+          // event would re-insert the deleted id until the next reconnect.
+          if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+            return false;
+          }
+          const foreignRemoved =
+            // Persisted snapshot vanished from the shared file mid-list.
+            // Metadata keys normally only disappear through removal, but
+            // NOT always: a deterministically corrupt file self-heals into
+            // a valid (possibly EMPTY) one on the strict re-read, so a
+            // mid-list quarantine makes every earlier key vanish while the
+            // workspaces stay registered. Disappearance therefore counts as
+            // removal evidence only when a fresh config-derived view
+            // CAPABLE of seeing the id corroborates the deregistration:
+            // raw-visible ids need the fresh raw view to deny them,
+            // raw-invisible (legacy) ids the authoritative enumeration.
+            // With neither view available the entry is retained — keeping a
+            // stale entry briefly is recoverable, wiping live renderer
+            // state on a corruption reset is not. Entries that never had a
+            // persisted snapshot are covered by the config check.
+            (freshPersistedIds != null &&
+              snapshots.has(workspaceId) &&
+              !freshPersistedIds.has(workspaceId) &&
+              !(authoritativeIds?.has(workspaceId) ?? false) &&
+              ((initialConfigIds?.has(workspaceId) ?? false) ||
+              (freshConfigIds?.has(workspaceId) ?? false)
+                ? freshConfigIds != null && !freshConfigIds.has(workspaceId)
+                : authoritativeIds != null)) ||
+            // Deregistered from the shared config mid-list — also covers
+            // workflow/bash-monitor-only entries with no persisted snapshot.
+            isVerifiablyRemovedFromRawConfig(workspaceId) ||
+            // Raw-invisible (legacy stable) ids: authoritative-lookup
+            // counterpart of the raw-superset comparison above.
+            isRemovedPerAuthoritativeIdentity(workspaceId);
+          if (foreignRemoved) {
+            // A cross-process removal publishes no local tombstone, so the
+            // tombstone-cleared eviction listener never fires for it. Stale
+            // workflow-run/monitor caches would then survive the removal —
+            // and if a downgraded backend re-registers the same
+            // deterministic legacy id later, getActiveWorkflowRunIds would
+            // serve the REMOVED incarnation's cached runs as ghost activity
+            // instead of probing the recreated session.
+            this.evictWorkspaceActivityCaches(workspaceId);
+            // Eviction alone cannot stop a LATE local producer (workflow-run
+            // or bash-monitor completion) from repopulating the caches and
+            // re-emitting the removed incarnation's activity right after
+            // this authoritative response dropped it — publish a local
+            // tombstone so emits and writes stay suppressed until fresh
+            // config evidence proves a revival.
+            this.extensionMetadata.suppressForeignRemoval(workspaceId);
+            return false;
+          }
+          return true;
+        })
       );
+      // Addition-side counterpart of the fresh re-read: another backend can
+      // register a workspace AND persist its first activity after this
+      // process's initial snapshot read. The refreshed config admits the id
+      // into scope, but its per-id computation saw a null snapshot (and no
+      // local workflow/monitor caches, which are process-local), so the
+      // entry was omitted — and the activity subscription cannot heal that
+      // (it is backed by this process's EventEmitter, so cross-process
+      // writes produce no delta). Merge in-scope additions from the fresh
+      // re-read, subject to the same removal guards as retained entries.
+      // NOT gated on the snapshot re-read succeeding: config-proven late ids
+      // (workflow-only registrations) must be probed even when the metadata
+      // re-read transiently failed — the method still returns an
+      // authoritative (non-null) response in that case, and the
+      // process-local subscription can never supply the foreign workflow
+      // event, so skipping the probe would hide that activity until
+      // reconnect. Snapshot-derived candidates and snapshot guards simply
+      // degrade to the views that ARE available.
+      {
+        // Merge scope: the (possibly stale) per-id scope PLUS fresh-snapshot
+        // ids a fresh config-derived view proves registered — a workspace
+        // registered and written between the scope reads and the fresh
+        // re-read is in both fresh views but in neither stale one. Raw-
+        // invisible ids (legacy stable ids resolved from session
+        // metadata.json) can never appear in the raw view, so they are
+        // admitted through the authoritative enumeration instead — without
+        // that, a legacy workspace registered by a downgraded backend
+        // mid-list would stay absent until reconnect (the process-local
+        // subscription cannot deliver the cross-process snapshot).
+        const mergeCandidateIds = new Set(workspaceIds);
+        for (const workspaceId of freshSnapshots?.keys() ?? []) {
+          if (
+            (freshConfigIds?.has(workspaceId) ?? false) ||
+            (authoritativeIds?.has(workspaceId) ?? false)
+          ) {
+            mergeCandidateIds.add(workspaceId);
+          }
+        }
+        // Workflow-only late registrations: a workspace registered after the
+        // scope reads can have active workflow runs but no metadata snapshot
+        // at all, so admission cannot come from fresh-snapshot keys alone —
+        // every fresh config-derived id outside the stale per-id scope is a
+        // candidate. The authoritative enumeration contributes the ids the
+        // raw view can never carry (id-less legacy registrations by a
+        // downgraded backend). Ids with neither a snapshot nor live activity
+        // cost one workflow probe and are dropped by the emptiness check
+        // below.
+        for (const lateIdSource of [freshConfigIds, authoritativeIds]) {
+          for (const workspaceId of lateIdSource ?? []) {
+            if (!workspaceIds.has(workspaceId)) {
+              mergeCandidateIds.add(workspaceId);
+            }
+          }
+        }
+        // Workflow-run bootstrap for candidates the per-id loop never saw:
+        // their on-disk active runs are not in the process-local cache, and
+        // a cached-only merge would omit activeWorkflowRunCount for exactly
+        // the cross-process registrations this merge exists to bootstrap.
+        // Probed BEFORE the final guard views below so no await separates
+        // guard evaluation from insertion (ids the per-id loop already
+        // probed resolve synchronously from the shared cached Set).
+        const probedWorkflowRunIds = new Map<string, ReadonlySet<string>>();
+        for (const workspaceId of mergeCandidateIds) {
+          if (
+            workspaceId in activityById ||
+            // In-scope ids without a late snapshot were fully decided by the
+            // per-id loop (probe + zero-tombstone logic); re-probing them
+            // would only trigger the final re-reads below on every list.
+            (workspaceIds.has(workspaceId) && !(freshSnapshots?.has(workspaceId) ?? false))
+          ) {
+            continue;
+          }
+          probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
+        }
+        const isRawInvisible = (workspaceId: string): boolean =>
+          !(initialConfigIds?.has(workspaceId) ?? false) &&
+          !(freshConfigIds?.has(workspaceId) ?? false);
+        // The final revalidation must ALSO run when a retained entry is
+        // raw-invisible even with zero late candidates: the mid-list
+        // authoritative enumeration can observe a legacy stable id right
+        // before another backend deregisters it and deletes its metadata
+        // later in the same await. Every view the retained filter used
+        // (pre-enumeration freshSnapshots, raw scans blind to stable ids,
+        // the stale enumeration itself) then still shows the workspace, and
+        // with no candidates to probe nothing else would re-read — the
+        // deleted workspace would ride every authoritative response
+        // indefinitely because cross-process removals emit no local event.
+        // Modern deployments (all ids raw-visible) never pay this path.
+        if (probedWorkflowRunIds.size > 0 || Object.keys(activityById).some(isRawInvisible)) {
+          // Final post-probe views: the probes awaited disk, so a removal
+          // landing during them is invisible to every view captured above —
+          // inserting on those alone would ride the deleted id back into the
+          // renderer. Re-read the (post-prune bounded) metadata file and the
+          // raw config superset once more, then evaluate every guard with no
+          // awaits before insertion. A removed workspace's metadata key is
+          // deleted on removal, so the snapshot re-read also covers legacy
+          // ids the raw view cannot see; same-process removals are covered
+          // by the tombstone check. Best-effort like the other fresh
+          // re-reads: an unreadable view falls back to the pre-probe one.
+          let finalSnapshots: ReadonlyMap<string, WorkspaceActivitySnapshot> | null = null;
+          try {
+            finalSnapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+          } catch {
+            finalSnapshots = null;
+          }
+          // Post-probe authoritative recheck, only when a probed candidate is
+          // raw-invisible (in no raw view): the raw deregistration guard
+          // below is blind to a legacy workspace removed during the probes,
+          // and in the normal gap between config deregistration and metadata
+          // cleanup its snapshot still exists — the pre-probe authoritative
+          // set is the view that ADMITTED it, so only a fresh enumeration
+          // can prove the removal. Modern deployments never pay this walk.
+          let finalAuthoritativeIds: ReadonlySet<string> | null = null;
+          let finalConfigIds: ReadonlySet<string> | null = null;
+          // Completeness of the final raw view, mirroring the mid-list
+          // fresh read: id-less legacy entries make raw denial insufficient
+          // removal evidence (see isVerifiablyRemovedFromRawConfig).
+          let finalConfigHasRawInvisibleEntries = false;
+          try {
+            const finalEvidence = this.config.readPersistedWorkspaceIdEvidence();
+            finalConfigIds = finalEvidence.ids;
+            finalConfigHasRawInvisibleEntries = finalEvidence.hasWorkspaceEntriesWithoutIds;
+          } catch {
+            finalConfigIds = null;
+            finalConfigHasRawInvisibleEntries = true;
+          }
+          if (
+            Array.from(probedWorkflowRunIds.keys()).some(isRawInvisible) ||
+            // Retained entries are re-filtered with the final views below
+            // (they were admitted before the probes awaited), and a
+            // raw-invisible retained id's removal is provable only through
+            // the same fresh enumeration.
+            Object.keys(activityById).some(isRawInvisible) ||
+            // A transiently unreadable post-probe raw view would otherwise
+            // disable the raw deregistration guards below entirely: an
+            // inline-id workspace deregistered during the probes (its
+            // metadata key not yet cleaned up) would ride the response with
+            // no cross-process event to repair it. The enumeration
+            // substitutes as removal evidence for ids the scope enumeration
+            // vouched for.
+            finalConfigIds == null ||
+            // Id-less legacy entries in the final raw view: a raw-visible
+            // id deregistered during the probes is indistinguishable from
+            // one removed-and-revived as an id-less entry by a downgraded
+            // backend, so the raw deregistration guards below need the
+            // enumeration to tell them apart (same rule as the mid-list
+            // isVerifiablyRemovedFromRawConfig). Modern deployments (every
+            // id inline) never pay this walk.
+            finalConfigHasRawInvisibleEntries
+          ) {
+            try {
+              finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+            } catch (error) {
+              log.debug("Failed to re-enumerate authoritative ids after workflow probes", {
+                error,
+              });
+              finalAuthoritativeIds = null;
+            }
+            // The enumeration is itself an await: a raw-invisible legacy
+            // workspace can be admitted by it and then removed (metadata
+            // key deleted) before it finishes — invisible to the snapshot
+            // view captured before it and to every raw view. Re-read the
+            // snapshot evidence after the enumeration so the vanish guard
+            // sees the removal; on failure keep the pre-enumeration view
+            // (still a post-probe view).
+            try {
+              finalSnapshots = await this.extensionMetadata.getAllSnapshots({
+                throwOnError: true,
+              });
+            } catch {
+              // Keep the pre-enumeration re-read (possibly null).
+            }
+            // Re-read the raw view after the awaits above so the raw
+            // deregistration guards see the freshest possible view; on a
+            // repeat failure keep the earlier successful read (still a
+            // valid post-probe view) rather than degrading to null.
+            try {
+              const refreshedFinalEvidence = this.config.readPersistedWorkspaceIdEvidence();
+              finalConfigIds = refreshedFinalEvidence.ids;
+              finalConfigHasRawInvisibleEntries =
+                refreshedFinalEvidence.hasWorkspaceEntriesWithoutIds;
+            } catch {
+              // Keep the pre-enumeration read (possibly null).
+            }
+            if (finalConfigHasRawInvisibleEntries) {
+              // Same staleness rule as the mid-list re-enumeration: the
+              // refresh revealed id-less entries, so the enumeration's
+              // denials may predate an id-less re-registration — the
+              // enumeration-backed drops below must use the freshest
+              // capable view (a revival after this last read is the
+              // contract's out-of-scope window). The raw and snapshot
+              // views deliberately stay at their earlier reads: their
+              // staleness errs toward retention, never a wrong drop. On
+              // failure retain rather than trust the stale denial set.
+              try {
+                finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+              } catch (error) {
+                log.debug("Failed to re-enumerate authoritative ids after final raw refresh", {
+                  error,
+                });
+                finalAuthoritativeIds = null;
+              }
+            }
+          }
+          // The retained-entry filter above ran BEFORE the workflow probes,
+          // so a removal landing during those awaits is invisible to every
+          // view it used — the removed workspace would ride the response
+          // back into the renderer with no cross-process event to correct
+          // it. Re-apply the removal guards to retained entries with the
+          // post-probe views (final filtering must follow the last await).
+          // Removal guards only: zero-count tombstone entries legitimately
+          // have no snapshot and no live counts, so the probed candidates'
+          // emptiness check must not run here.
+          for (const workspaceId of Object.keys(activityById)) {
+            const foreignRemoved =
+              // Persisted snapshot vanished during the probes — also covers
+              // legacy ids the raw views cannot see. Corroborated like the
+              // mid-list filter's vanish arm: a strict re-read self-heals
+              // deterministic corruption into a valid (possibly EMPTY)
+              // file, so disappearance alone is not removal evidence — a
+              // post-probe config-derived view capable of seeing the id
+              // must also deny it.
+              (finalSnapshots != null &&
+                (snapshots.has(workspaceId) || (freshSnapshots?.has(workspaceId) ?? false)) &&
+                !finalSnapshots.has(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                !(finalAuthoritativeIds?.has(workspaceId) ?? false) &&
+                (isRawInvisible(workspaceId)
+                  ? finalAuthoritativeIds != null
+                  : finalConfigIds != null)) ||
+              // Verifiably deregistered from the raw config during the
+              // probes: visible in an earlier raw view, gone from the
+              // post-probe one. With id-less entries in the final raw view
+              // the id may instead have been removed-and-revived id-less,
+              // so the final enumeration must deny it (same completeness
+              // rule as isVerifiablyRemovedFromRawConfig).
+              (finalConfigIds != null &&
+                !finalConfigIds.has(workspaceId) &&
+                ((initialConfigIds?.has(workspaceId) ?? false) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)) &&
+                (!finalConfigHasRawInvisibleEntries ||
+                  (finalAuthoritativeIds != null && !finalAuthoritativeIds.has(workspaceId)))) ||
+              // Raw-invisible retained ids: post-probe authoritative
+              // counterpart of the raw guard above.
+              (isRawInvisible(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId)) ||
+              // Raw view unreadable post-probe: the fallback enumeration
+              // substitutes as removal evidence, but only for ids the scope
+              // enumeration itself vouched for — raw-only ids are
+              // enumeration-invisible by design and stay retained on
+              // transient read failures.
+              (finalConfigIds == null &&
+                finalAuthoritativeIds != null &&
+                (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+                !finalAuthoritativeIds.has(workspaceId));
+            if (foreignRemoved) {
+              // Cross-process removals publish no local tombstone, so the
+              // tombstone-cleared eviction listener never fires — see the
+              // mid-list filter above (including the late-producer
+              // suppression rationale).
+              this.evictWorkspaceActivityCaches(workspaceId);
+              this.extensionMetadata.suppressForeignRemoval(workspaceId);
+              delete activityById[workspaceId];
+            } else if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+              delete activityById[workspaceId];
+            }
+          }
+          for (const [workspaceId, activeWorkflowRunIds] of probedWorkflowRunIds) {
+            // Freshest available view, degrading to the INITIAL read: a raw-
+            // registered id outside the normalized scope (e.g. invalid
+            // project path) is admitted here, and when both re-reads failed
+            // transiently its already-loaded initial snapshot must still
+            // supply goal/status/recency — omitting it from an authoritative
+            // response would clear that renderer state with no repair event.
+            const lateSnapshot =
+              finalSnapshots != null
+                ? (finalSnapshots.get(workspaceId) ?? null)
+                : freshSnapshots != null
+                  ? (freshSnapshots.get(workspaceId) ?? null)
+                  : (snapshots.get(workspaceId) ?? null);
+            const lateForeignRemoved =
+              isVerifiablyRemovedFromRawConfig(workspaceId) ||
+              isRemovedPerAuthoritativeIdentity(workspaceId) ||
+              // Persisted snapshot vanished during the probes — also covers
+              // legacy ids the raw views cannot see. Same corruption-reset
+              // corroboration as the retained-entry vanish arms: a
+              // self-healed (possibly empty) re-read is not removal
+              // evidence on its own.
+              (finalSnapshots != null &&
+                (freshSnapshots?.has(workspaceId) ?? false) &&
+                !finalSnapshots.has(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                !(finalAuthoritativeIds?.has(workspaceId) ?? false) &&
+                (isRawInvisible(workspaceId)
+                  ? finalAuthoritativeIds != null
+                  : finalConfigIds != null)) ||
+              // Verifiably deregistered from the raw config during the
+              // probes: the id was visible in an EARLIER raw view — the
+              // initial baseline or the fresh re-read that admitted it (a
+              // late registration is absent from the initial baseline by
+              // definition) — and is gone from the post-probe view. During
+              // the normal gap between config deregistration and metadata
+              // cleanup the snapshot still exists, so the vanish check
+              // above cannot catch this. Same raw-view completeness rule as
+              // the retained-entry arm: with id-less entries present the
+              // final enumeration must deny a possibly-revived id.
+              (finalConfigIds != null &&
+                !finalConfigIds.has(workspaceId) &&
+                ((initialConfigIds?.has(workspaceId) ?? false) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)) &&
+                (!finalConfigHasRawInvisibleEntries ||
+                  (finalAuthoritativeIds != null && !finalAuthoritativeIds.has(workspaceId)))) ||
+              // Raw-invisible candidates: post-probe authoritative
+              // counterpart of the raw guard above — a legacy workspace
+              // deregistered during the probes is invisible to every raw
+              // view, and its snapshot may outlive the deregistration.
+              (!(initialConfigIds?.has(workspaceId) ?? false) &&
+                !(freshConfigIds?.has(workspaceId) ?? false) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId)) ||
+              // Raw view unreadable post-probe: same enumeration fallback
+              // as the retained-entry filter, scoped to ids the scope
+              // enumeration vouched for (raw-only ids stay admitted on
+              // transient read failures — see lateSnapshot above).
+              (finalConfigIds == null &&
+                finalAuthoritativeIds != null &&
+                (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+                !finalAuthoritativeIds.has(workspaceId));
+            if (lateForeignRemoved) {
+              // Same cross-process eviction + late-producer suppression
+              // rationale as the mid-list filter: no local tombstone means
+              // no listener-driven eviction, and the probes above may have
+              // installed caches for the removed incarnation.
+              this.evictWorkspaceActivityCaches(workspaceId);
+              this.extensionMetadata.suppressForeignRemoval(workspaceId);
+              continue;
+            }
+            if (
+              // Nothing to contribute: no persisted snapshot and no live
+              // counts (a workflow-only candidate legitimately has no
+              // snapshot, so its absence alone is not removal evidence) —
+              // never removal proof, so no cache eviction.
+              (lateSnapshot == null &&
+                activeWorkflowRunIds.size === 0 &&
+                this.getActiveBashMonitorCount(workspaceId) === 0) ||
+              this.extensionMetadata.isWorkspaceDeleted(workspaceId)
+            ) {
+              continue;
+            }
+            // Same overlay path emitWorkspaceActivity uses.
+            const merged = this.mergeCurrentActiveBashMonitorCount(
+              workspaceId,
+              mergeActiveWorkflowRuns(
+                this.overlayPendingGoal(workspaceId, lateSnapshot),
+                activeWorkflowRunIds
+              )
+            );
+            if (merged != null) {
+              activityById[workspaceId] = merged;
+            }
+          }
+        }
+      }
+      return activityById;
     } catch (error) {
       log.error("Failed to list activity:", error);
       // null (not {}) so the renderer can tell a read failure from a legitimately
-      // idle deployment — {} is a valid successful result when nothing is active.
+      // idle deployment — with scoping, {} is a valid authoritative answer (no
+      // known workspace has activity) that the renderer must apply to clear
+      // stale entries after a disconnected removal. On null the renderer keeps
+      // last-known state and retries in the background.
       return null;
     }
   }

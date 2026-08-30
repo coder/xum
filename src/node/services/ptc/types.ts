@@ -11,6 +11,7 @@ import type {
   CodeExecutionToolCallRecord,
 } from "@/common/types/codeExecution";
 import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
+import { WorkflowRunStatusSchema } from "@/common/orpc/schemas/workflow";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
@@ -646,6 +647,19 @@ export function retainPersistenceCriticalArgsFields(
   toolName: string,
   args: unknown
 ): Record<string, unknown> | undefined {
+  if (toolName === "workflow_run") {
+    // A workflow_run whose args exceed the kernel args cap (large inline
+    // script_source or invocation args) would otherwise lose script_path,
+    // leaving the transcript workflow card without a display name until the
+    // durable run loads. Same serialized-byte bound as file paths below.
+    const scriptPath = (args as { script_path?: unknown } | null | undefined)?.script_path;
+    if (typeof scriptPath !== "string" || scriptPath.length === 0) return undefined;
+    const scriptPathBytes = serializedJsonByteLength(scriptPath);
+    if (scriptPathBytes === undefined || scriptPathBytes > KERNEL_RETAINED_PATH_MAX_BYTES) {
+      return undefined;
+    }
+    return { script_path: scriptPath };
+  }
   if (!isPersistenceCriticalRecordToolName(toolName)) return undefined;
   const path = extractToolFilePath(args);
   if (path === undefined) return undefined;
@@ -658,6 +672,30 @@ export function retainPersistenceCriticalArgsFields(
     return undefined;
   }
   return { path };
+}
+
+/**
+ * Run-identity fields merged onto a __kernelBounded RESULT marker (see
+ * KernelRecordBounds.captureResultRetained): a workflow_run/workflow_resume
+ * result embedding a large run record or workflow output exceeds the kernel
+ * result cap, and a bare marker would strip the runId/status the transcript
+ * card needs to re-fetch the durable run after reload. Only the validated
+ * identity fields are preserved; the run record and workflow output stay
+ * bounded (never exempt workflow results from bounding: they can carry
+ * megabytes of delegated-agent output).
+ */
+export function retainWorkflowResultIdentityFields(
+  toolName: string,
+  result: unknown
+): Record<string, unknown> | undefined {
+  if (toolName !== "workflow_run" && toolName !== "workflow_resume") return undefined;
+  if (typeof result !== "object" || result === null) return undefined;
+  const { runId, status } = result as { runId?: unknown; status?: unknown };
+  if (typeof runId !== "string" || runId.length === 0) return undefined;
+  const runIdBytes = serializedJsonByteLength(runId);
+  if (runIdBytes === undefined || runIdBytes > KERNEL_RETAINED_PATH_MAX_BYTES) return undefined;
+  const parsedStatus = WorkflowRunStatusSchema.safeParse(status);
+  return { runId, ...(parsedStatus.success ? { status: parsedStatus.data } : {}) };
 }
 
 /** See isKernelRecordResultExempt (persistence-critical branch). */

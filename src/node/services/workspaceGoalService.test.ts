@@ -2298,6 +2298,32 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("previewStreamAccounting skips the durable fallback when the strict baseline read is unavailable", async () => {
+    // "unavailable" (failed sidecar reconcile) must stay distinct from the
+    // authoritative "no baseline": the durable pushSnapshot fallback writes
+    // through the lenient load — accepting the suspect partial main the
+    // strict read refused — and emits it, clearing renderer goal/status
+    // state. The preview must resolve without delivering or writing.
+    await setGoalOk(service, { workspaceId, objective: "Preview goal" });
+    const metadataFilePath = path.join(config.rootDir, "extensionMetadata.json");
+    const before = await fs.readFile(metadataFilePath, "utf-8");
+    // A directory at the sidecar path yields a deterministic errno (EISDIR)
+    // standing in for EACCES/EIO-class reconcile failures.
+    await fs.mkdir(`${metadataFilePath}.corrupt`);
+    try {
+      const activityUpdates = captureGoalActivity(service);
+
+      const preview = await service.previewStreamAccounting({ workspaceId, costUsd: 1 });
+
+      expect(preview).toMatchObject({ objective: "Preview goal" });
+      // No emit (renderer keeps last-known state) and no durable write.
+      expect(activityUpdates).toHaveLength(0);
+      expect(await fs.readFile(metadataFilePath, "utf-8")).toBe(before);
+    } finally {
+      await fs.rm(`${metadataFilePath}.corrupt`, { recursive: true });
+    }
+  });
+
   test("successful no-op queued drains clear the pending snapshot", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Existing goal" });
     await extensionMetadata.setStreaming(workspaceId, true);
@@ -5470,7 +5496,14 @@ describe("WorkspaceGoalService", () => {
       objective: "Preview without metadata",
       budgetCents: 1_000,
     });
-    await extensionMetadata.deleteWorkspace(workspaceId);
+    // Clear the snapshot by rewriting the file directly: deleteWorkspace now
+    // write-tombstones removed workspaces for the rest of the process, which
+    // would (correctly) block the preview persistence below. This test
+    // simulates a LIVE workspace that merely has no activity snapshot yet.
+    await fs.writeFile(
+      path.join(config.rootDir, "extensionMetadata.json"),
+      JSON.stringify({ version: 1, workspaces: {} })
+    );
     const activityUpdates = captureGoalActivity(service);
 
     const preview = await service.previewStreamAccounting({

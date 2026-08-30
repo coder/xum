@@ -52,11 +52,16 @@ import type {
   RuntimeStatusEvent,
   StreamAbortEvent,
   StreamEndEvent,
-  WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
 import { log } from "./log";
 import type { SessionUsageService } from "./sessionUsageService";
-import type { ModelFallbackOptions, StreamManager } from "./streamManager";
+import type {
+  StreamManager,
+  TurnCompletion,
+  TurnEngineEvent,
+  TurnExecutionOptions,
+  TurnStreamHandle,
+} from "./streamManager";
 import type {
   ActiveTurnThinkingOverride,
   RebuildProviderOptionsForThinkingLevel,
@@ -293,7 +298,7 @@ function stubCommonStreamMessageDependencies(args: {
   historyService: HistoryService;
   initStateManager: InitStateManager;
   metadata: WorkspaceMetadata;
-  startStreamCalls?: unknown[][];
+  startStreamCalls?: TurnExecutionOptions[];
   routeProvider?: ProviderName;
   allTools?: Record<string, Tool>;
   workspacePathOverride?: string;
@@ -399,13 +404,17 @@ function stubCommonStreamMessageDependencies(args: {
   // the stream is registered (durable turn-envelope emission hangs on it), so
   // a success stub must call it too or envelope tests assert an empty journal.
   const stubStartStream = async (
-    ...startArgs: Parameters<StreamManager["startStream"]>
-  ): Promise<{ success: true; data: typeof streamToken }> => {
-    args.startStreamCalls?.push(startArgs);
-    // Positional parameter 31 of startStream (typed via Parameters above).
-    const onStreamConstructed = startArgs[30];
-    await onStreamConstructed?.();
-    return { success: true, data: streamToken };
+    options: TurnExecutionOptions
+  ): Promise<{ success: true; data: TurnStreamHandle }> => {
+    args.startStreamCalls?.push(options);
+    await options.onStreamConstructed?.();
+    return {
+      success: true,
+      data: {
+        messageId: options.messageId,
+        completion: new Promise<TurnCompletion>(() => undefined),
+      },
+    };
   };
   spyOn(streamManager, "startStream").mockImplementation(stubStartStream);
 
@@ -618,9 +627,9 @@ describe("resolveMuxProjectRootForHostFs", () => {
   });
 });
 
-describe("AIService.setupStreamEventForwarding", () => {
+describe("AIService turn engine events", () => {
   interface ForwardingInternals {
-    streamManager: StreamManager;
+    emitEngineEvent: (event: TurnEngineEvent) => void | Promise<void>;
     pendingDevToolsRunMetadataByMessageId: Map<string, { workspaceId: string; metadataId: string }>;
   }
 
@@ -674,7 +683,7 @@ describe("AIService.setupStreamEventForwarding", () => {
     const forwardedAbortPromise = new Promise<StreamAbortEvent>((resolve) => {
       service.once("stream-abort", (event) => resolve(event as StreamAbortEvent));
     });
-    internals.streamManager.emit("stream-abort", abortEvent);
+    await internals.emitEngineEvent(abortEvent);
 
     expect(await forwardedAbortPromise).toEqual(abortEvent);
     expect(deletePartialSpy).toHaveBeenCalledWith(abortEvent.workspaceId);
@@ -682,55 +691,9 @@ describe("AIService.setupStreamEventForwarding", () => {
     expect(internals.pendingDevToolsRunMetadataByMessageId.has(abortEvent.messageId)).toBe(false);
   });
 
-  it("forwards stream-abort with empty messageId without throwing", async () => {
-    using harness = createForwardingHarness("ai-service-stream-abort-empty-message-id");
-    const { service, internals, clearPendingRunMetadataSpy } = harness;
-    internals.pendingDevToolsRunMetadataByMessageId.set("message-1", {
-      workspaceId: "workspace-1",
-      metadataId: "metadata-1",
-    });
-    const abortEvent: StreamAbortEvent = {
-      type: "stream-abort",
-      workspaceId: "workspace-1",
-      messageId: "",
-      abandonPartial: true,
-    };
-
-    const forwardedAbortPromise = new Promise<StreamAbortEvent>((resolve) => {
-      service.once("stream-abort", (event) => resolve(event as StreamAbortEvent));
-    });
-    internals.streamManager.emit("stream-abort", abortEvent);
-
-    expect(await forwardedAbortPromise).toEqual(abortEvent);
-    expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
-    expect(internals.pendingDevToolsRunMetadataByMessageId.has("message-1")).toBe(true);
-  });
-
-  it("forwards workflow-run-attached events", async () => {
-    using harness = createForwardingHarness("ai-service-workflow-run-attached-forwarding");
-    const { service, internals } = harness;
-    const event: WorkflowRunAttachedEvent = {
-      type: "workflow-run-attached",
-      workspaceId: "workspace-1",
-      messageId: "message-1",
-      toolCallId: "workflow-call-1",
-      runId: "wfr_forwarded",
-      timestamp: Date.now(),
-    };
-
-    const forwardedPromise = new Promise<WorkflowRunAttachedEvent>((resolve) => {
-      service.once("workflow-run-attached", (forwarded) =>
-        resolve(forwarded as WorkflowRunAttachedEvent)
-      );
-    });
-    internals.streamManager.emit("workflow-run-attached", event);
-
-    expect(await forwardedPromise).toEqual(event);
-  });
-
   it.each([
     {
-      name: "stream error",
+      name: "stream error clears tracked metadata",
       eventName: "error" as const,
       event: {
         type: "error" as const,
@@ -739,9 +702,10 @@ describe("AIService.setupStreamEventForwarding", () => {
         error: "request failed",
         errorType: "rate_limit" as const,
       } satisfies ErrorEvent,
+      expectCleared: true,
     },
     {
-      name: "stream-end",
+      name: "stream-end clears tracked metadata",
       eventName: "stream-end" as const,
       event: {
         type: "stream-end" as const,
@@ -750,11 +714,24 @@ describe("AIService.setupStreamEventForwarding", () => {
         metadata: { model: "anthropic:claude-opus-4-1" },
         parts: [],
       } satisfies StreamEndEvent,
+      expectCleared: true,
     },
-  ])("clears tracked devtools run metadata on $name", async ({ eventName, event }) => {
+    {
+      name: "stream-abort with empty messageId leaves unrelated metadata",
+      eventName: "stream-abort" as const,
+      event: {
+        type: "stream-abort" as const,
+        workspaceId: "workspace-1",
+        messageId: "",
+        abandonPartial: true,
+      } satisfies StreamAbortEvent,
+      expectCleared: false,
+    },
+  ])("devtools run metadata: $name", async ({ eventName, event, expectCleared }) => {
     using harness = createForwardingHarness(`ai-service-${eventName}-devtools-cleanup`);
     const { service, internals, clearPendingRunMetadataSpy } = harness;
-    internals.pendingDevToolsRunMetadataByMessageId.set(event.messageId, {
+    const trackedMessageId = event.messageId || "message-1";
+    internals.pendingDevToolsRunMetadataByMessageId.set(trackedMessageId, {
       workspaceId: event.workspaceId,
       metadataId: "metadata-1",
     });
@@ -762,11 +739,17 @@ describe("AIService.setupStreamEventForwarding", () => {
     const forwardedPromise = new Promise<typeof event>((resolve) => {
       service.once(eventName, (forwarded) => resolve(forwarded as typeof event));
     });
-    internals.streamManager.emit(eventName, event);
+    await internals.emitEngineEvent(event);
 
     expect(await forwardedPromise).toEqual(event);
-    expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(event.workspaceId, "metadata-1");
-    expect(internals.pendingDevToolsRunMetadataByMessageId.has(event.messageId)).toBe(false);
+    if (expectCleared) {
+      expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(event.workspaceId, "metadata-1");
+    } else {
+      expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
+    }
+    expect(internals.pendingDevToolsRunMetadataByMessageId.has(trackedMessageId)).toBe(
+      !expectCleared
+    );
   });
 });
 
@@ -1205,7 +1188,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     streamSystemContextAdvisorFlags: Array<boolean | undefined>;
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
     streamSystemContextHotMemoriesBlocks: Array<string | undefined>;
-    startStreamCalls: unknown[][];
+    startStreamCalls: TurnExecutionOptions[];
     getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
   }
 
@@ -1228,10 +1211,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   }
 
-  function openAIOptionsFromStartStreamCall(startStreamArgs: unknown[]): Record<string, unknown> {
-    const providerOptions = startStreamArgs[11];
+  function openAIOptionsFromStartStreamCall(
+    startStreamOptions: TurnExecutionOptions
+  ): Record<string, unknown> {
+    const providerOptions = startStreamOptions.providerOptions;
     if (!providerOptions || typeof providerOptions !== "object") {
-      throw new Error("Expected provider options object at startStream arg index 11");
+      throw new Error("Expected provider options object in startStream options");
     }
 
     const openai = (providerOptions as { openai?: unknown }).openai;
@@ -1242,10 +1227,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     return openai as Record<string, unknown>;
   }
 
-  function initialMetadataFromStartStreamCall(startStreamArgs: unknown[]): Record<string, unknown> {
-    const initialMetadata = startStreamArgs[10];
+  function initialMetadataFromStartStreamCall(
+    startStreamOptions: TurnExecutionOptions
+  ): Record<string, unknown> {
+    const initialMetadata = startStreamOptions.initialMetadata;
     if (!initialMetadata || typeof initialMetadata !== "object" || Array.isArray(initialMetadata)) {
-      throw new Error("Expected initial metadata object at startStream arg index 10");
+      throw new Error("Expected initial metadata object in startStream options");
     }
 
     return initialMetadata as Record<string, unknown>;
@@ -1280,7 +1267,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const streamSystemContextAdvisorFlags: Array<boolean | undefined> = [];
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
     const streamSystemContextHotMemoriesBlocks: Array<string | undefined> = [];
-    const startStreamCalls: unknown[][] = [];
+    const startStreamCalls: TurnExecutionOptions[] = [];
 
     const getToolsForModelSpy = stubCommonStreamMessageDependencies({
       service,
@@ -1332,12 +1319,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       getToolsForModelSpy,
     };
   }
-
-  const START_STREAM_ON_CHUNK_INDEX = 21;
-  const START_STREAM_ON_STEP_MESSAGES_INDEX = 22;
-  const START_STREAM_RUNTIME_TEMP_DIR_INDEX = 23;
-
-  const START_STREAM_MODEL_FALLBACK_INDEX = 24;
 
   interface AdvisorRuntimeForTests {
     createModel: (modelString: string) => Promise<LanguageModel>;
@@ -1424,8 +1405,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       throw new Error("Expected streamManager.startStream call arguments");
     }
 
-    const onChunk = startStreamCall[START_STREAM_ON_CHUNK_INDEX];
-    const onStepMessages = startStreamCall[START_STREAM_ON_STEP_MESSAGES_INDEX];
+    const onChunk = startStreamCall.onChunk;
+    const onStepMessages = startStreamCall.onStepMessages;
     expect(typeof onChunk).toBe("function");
     expect(typeof onStepMessages).toBe("function");
     if (typeof onChunk !== "function" || typeof onStepMessages !== "function") {
@@ -1553,9 +1534,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(result.success).toBe(true);
     expect(harness.startStreamCalls).toHaveLength(1);
 
-    const modelFallback = harness.startStreamCalls[0]?.[START_STREAM_MODEL_FALLBACK_INDEX] as
-      | ModelFallbackOptions
-      | undefined;
+    const modelFallback = harness.startStreamCalls[0]?.modelFallback;
     expect(modelFallback).toBeDefined();
     if (!modelFallback) {
       throw new Error("Expected modelFallback options on startStream");
@@ -1652,9 +1631,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
     expect(result.success).toBe(true);
 
-    const modelFallback = harness.startStreamCalls[0]?.[START_STREAM_MODEL_FALLBACK_INDEX] as
-      | ModelFallbackOptions
-      | undefined;
+    const modelFallback = harness.startStreamCalls[0]?.modelFallback;
     expect(modelFallback).toBeDefined();
     if (!modelFallback) {
       throw new Error("Expected modelFallback options on startStream");
@@ -1746,9 +1723,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(harness.startStreamCalls).toHaveLength(1);
 
     const startStreamArgs = harness.startStreamCalls[0];
-    const modelFallback = startStreamArgs[START_STREAM_MODEL_FALLBACK_INDEX] as
-      | ModelFallbackOptions
-      | undefined;
+    const modelFallback = startStreamArgs.modelFallback;
     if (!modelFallback) {
       throw new Error("Expected modelFallback options on startStream");
     }
@@ -1903,9 +1878,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
     expect(result.success).toBe(true);
 
-    const modelFallback = harness.startStreamCalls[0]?.[START_STREAM_MODEL_FALLBACK_INDEX] as
-      | ModelFallbackOptions
-      | undefined;
+    const modelFallback = harness.startStreamCalls[0]?.modelFallback;
     if (!modelFallback) {
       throw new Error("Expected modelFallback options on startStream");
     }
@@ -2417,7 +2390,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(harness.streamSystemContextAdvisorFlags).toEqual([false]);
-    expect(harness.startStreamCalls[0]?.[START_STREAM_RUNTIME_TEMP_DIR_INDEX]).toBe(
+    expect(harness.startStreamCalls[0]?.providedRuntimeTempDir).toBe(
       path.join(metadata.projectPath, ".tmp-stream")
     );
   });
@@ -2798,7 +2771,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       throw new Error("Expected streamManager.startStream call arguments");
     }
 
-    const startStreamMessageIds = messageIdsFromUnknownArray(startStreamCall[1]);
+    const startStreamMessageIds = messageIdsFromUnknownArray(startStreamCall.messages);
     expect(startStreamMessageIds).toEqual(["boundary-2", "latest-user"]);
     expect(initialMetadataFromStartStreamCall(startStreamCall).requestHistorySequence).toBe(42);
 
@@ -2991,7 +2964,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       throw new Error("Expected streamManager.startStream call arguments");
     }
 
-    const startStreamMessageIds = messageIdsFromUnknownArray(startStreamCall[1]);
+    const startStreamMessageIds = messageIdsFromUnknownArray(startStreamCall.messages);
     expect(startStreamMessageIds).toEqual([
       "assistant-before-malformed",
       "malformed-boundary",
@@ -3475,9 +3448,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   });
 
   describe("mid-turn thinking override rebuild closure", () => {
-    const START_STREAM_THINKING_OVERRIDE_STATE_INDEX = 26;
-    const START_STREAM_THINKING_REBUILD_INDEX = 27;
-
     function getThinkingOverrideStartStreamArgs(harness: StreamMessageHarness): {
       holder: unknown;
       rebuild: RebuildProviderOptionsForThinkingLevel;
@@ -3487,10 +3457,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       if (!call) {
         throw new Error("Expected streamManager.startStream call arguments");
       }
-      const holder = call[START_STREAM_THINKING_OVERRIDE_STATE_INDEX];
-      const rebuild = call[START_STREAM_THINKING_REBUILD_INDEX];
+      const holder = call.thinkingOverrideState;
+      const rebuild = call.rebuildProviderOptionsForThinkingLevel;
       expect(typeof rebuild).toBe("function");
-      return { holder, rebuild: rebuild as RebuildProviderOptionsForThinkingLevel };
+      return { holder, rebuild: rebuild! };
     }
 
     it("threads the session holder by reference and rebuilds options through the same pipeline", async () => {
@@ -3815,22 +3785,24 @@ describe("AIService.streamMessage model parameter overrides", () => {
   interface ModelParameterOverridesHarness {
     service: AIService;
     config: Config;
-    startStreamCalls: unknown[][];
+    startStreamCalls: TurnExecutionOptions[];
   }
 
-  function providerOptionsFromStartStreamCall(startStreamArgs: unknown[]): Record<string, unknown> {
-    const providerOptions = startStreamArgs[11];
+  function providerOptionsFromStartStreamCall(
+    startStreamArgs: TurnExecutionOptions
+  ): Record<string, unknown> {
+    const providerOptions = startStreamArgs.providerOptions;
     if (!providerOptions || typeof providerOptions !== "object" || Array.isArray(providerOptions)) {
       throw new Error("Expected provider options object at startStream arg index 11");
     }
 
-    return providerOptions as Record<string, unknown>;
+    return providerOptions;
   }
 
   function callSettingsOverridesFromStartStreamCall(
-    startStreamArgs: unknown[]
+    startStreamArgs: TurnExecutionOptions
   ): Record<string, unknown> {
-    const callSettingsOverrides = startStreamArgs[20];
+    const callSettingsOverrides = startStreamArgs.callSettingsOverrides;
     if (
       !callSettingsOverrides ||
       typeof callSettingsOverrides !== "object" ||
@@ -3848,7 +3820,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
     options?: { routeProvider?: ProviderName }
   ): ModelParameterOverridesHarness {
     const { config, historyService, initStateManager, service } = createBasicAIService(xumHomePath);
-    const startStreamCalls: unknown[][] = [];
+    const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,
       config,
@@ -3869,7 +3841,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
     harness: ModelParameterOverridesHarness,
     workspaceId: string,
     modelString = ANTHROPIC_MODEL
-  ): Promise<unknown[]> {
+  ): Promise<TurnExecutionOptions> {
     const result = await harness.service.streamMessage({
       messages: [createMuxMessage("user-message", "user", "hello")],
       workspaceId,
@@ -4101,7 +4073,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
     spyOn(harness.config, "loadProvidersConfig").mockReturnValue({});
 
     const startStreamArgs = await streamAndGetStartStreamArgs(harness, workspaceId);
-    expect(startStreamArgs[20]).toEqual({});
+    expect(startStreamArgs.callSettingsOverrides).toEqual({});
   });
 
   it("preserves Xum-built provider options when provider extras conflict", async () => {
@@ -4281,7 +4253,7 @@ describe("AIService.streamMessage model parameter overrides", () => {
     const { config, historyService, initStateManager, service } = createBasicAIService(
       xumHome.path
     );
-    const startStreamCalls: unknown[][] = [];
+    const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,
       config,
@@ -4347,7 +4319,7 @@ describe("AIService.streamMessage turn envelope", () => {
   interface TurnEnvelopeHarness {
     service: AIService;
     config: Config;
-    startStreamCalls: unknown[][];
+    startStreamCalls: TurnExecutionOptions[];
   }
 
   function createHarness(
@@ -4356,7 +4328,7 @@ describe("AIService.streamMessage turn envelope", () => {
     options?: { allTools?: Record<string, Tool> }
   ): TurnEnvelopeHarness {
     const { config, historyService, initStateManager, service } = createBasicAIService(xumHomePath);
-    const startStreamCalls: unknown[][] = [];
+    const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,
       config,

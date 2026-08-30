@@ -47,6 +47,7 @@ interface WorkflowTimelineProps {
   view: WorkflowRunView;
   workspaceId?: string;
   nestedDepth?: number;
+  showFinalReport?: boolean;
 }
 
 interface WorkflowPhaseSectionProps {
@@ -581,7 +582,7 @@ export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
           <WorkflowLongText className="flex-1" text={view.errorMessage} title="Workflow error" />
         </div>
       )}
-      <WorkflowFinalReport view={view} />
+      {props.showFinalReport !== false && <WorkflowFinalReport view={view} />}
       <div className="flex flex-col gap-1">
         <div className="text-muted flex items-center gap-1.5 text-[11px] font-semibold tracking-wide uppercase">
           <ListTree className="h-3 w-3" /> Step stream

@@ -14,7 +14,8 @@ import { TaskListToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
 import { isNestedWorkflowRun } from "@/common/types/workflow";
-import type { AgentTaskStatus, TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";

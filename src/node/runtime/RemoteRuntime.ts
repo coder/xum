@@ -14,6 +14,7 @@
  */
 
 import type { ChildProcess } from "child_process";
+import * as path from "node:path";
 import { Readable } from "stream";
 import type {
   Runtime,
@@ -35,10 +36,17 @@ import { log } from "@/node/services/log";
 import { attachStreamErrorHandler } from "@/node/utils/streamErrors";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { DisposableProcess } from "@/node/utils/disposableExec";
-import { streamToString, shescape } from "./streamUtils";
-import { getErrorMessage } from "@/common/utils/errors";
+import { shescape } from "./streamUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
-import { buildShellExport } from "./shellEnv";
+import { buildShellExport, buildShellPathExport } from "./shellEnv";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import {
+  ensureDirViaExec,
+  readFileViaExec,
+  statViaExec,
+  writeFileViaExec,
+  STAT_VIA_EXEC_COMMAND,
+} from "./execFileIO";
 
 // Cap for the stderr side-buffer kept purely for error reporting on process
 // failure. 16KB comfortably covers SSH/launch diagnostics while bounding memory
@@ -121,6 +129,9 @@ export abstract class RemoteRuntime implements Runtime {
     const envVars = { ...options.env, ...NON_INTERACTIVE_ENV_VARS };
     for (const [key, value] of Object.entries(envVars)) {
       parts.push(buildShellExport(key, value, (envValue) => shescape.quote(envValue)));
+    }
+    for (const [key, value] of Object.entries(options.pathEnv ?? {})) {
+      parts.push(buildShellPathExport(key, value, (envValue) => shescape.quote(envValue)));
     }
 
     // Add the actual command
@@ -356,74 +367,51 @@ export abstract class RemoteRuntime implements Runtime {
     return { stdout, stderr, stdin, exitCode, duration };
   }
 
+  private async resolveFilePath(filePath: string, abortSignal?: AbortSignal): Promise<string> {
+    if (filePath === "~" || filePath.startsWith("~/")) {
+      return this.resolveWithAbort(this.resolvePath(filePath), abortSignal);
+    }
+    if (path.posix.isAbsolute(filePath)) {
+      return path.posix.normalize(filePath);
+    }
+    const basePath = await this.resolveWithAbort(this.resolvePath(this.getBasePath()), abortSignal);
+    return path.posix.resolve(basePath, filePath);
+  }
+
+  /**
+   * resolvePath has no signal path into its exec, so a canceled file operation
+   * must not wait out the resolver (up to its 10s timeout): settle the caller
+   * immediately and let the orphaned resolver finish in the background.
+   */
+  private async resolveWithAbort(
+    resolution: Promise<string>,
+    abortSignal?: AbortSignal
+  ): Promise<string> {
+    const result = await raceWithAbortAndTimeout(resolution, { signal: abortSignal });
+    if (result.kind !== "ok") {
+      resolution.catch(() => undefined);
+      abortSignal?.throwIfAborted();
+      throw new RuntimeError("Path resolution aborted", "file_io");
+    }
+    return result.value;
+  }
+
   /**
    * Read file contents as a stream via exec.
    */
   readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    // Internal controller so CANCELLING the returned stream kills the remote
-    // cat: the eager pump below has no other path to the exec, and without
-    // it a cancelled wrapper (e.g. mux.load's byte ceiling) left cat blocked
-    // until its 300s timeout, accumulating remote processes (r18). The
-    // caller's abortSignal forwards into the same controller.
-    const readAbort = new AbortController();
-    const forwardAbort = () => readAbort.abort();
-    if (abortSignal?.aborted) {
-      readAbort.abort();
-    } else {
-      abortSignal?.addEventListener("abort", forwardAbort, { once: true });
-    }
-    const cleanupAbortForwarder = () => {
-      abortSignal?.removeEventListener("abort", forwardAbort);
-    };
-
-    return new ReadableStream<Uint8Array>({
-      cancel: () => {
-        readAbort.abort();
-        cleanupAbortForwarder();
+    return readFileViaExec(
+      filePath,
+      async (signal) => {
+        const resolvedPath = await this.resolveFilePath(filePath, signal);
+        return this.exec(`cat ${this.quoteForRemote(resolvedPath)}`, {
+          cwd: this.getBasePath(),
+          timeout: 300,
+          abortSignal: signal,
+        });
       },
-      start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
-        try {
-          const stream = await this.exec(`cat ${this.quoteForRemote(filePath)}`, {
-            cwd: this.getBasePath(),
-            timeout: 300,
-            abortSignal: readAbort.signal,
-          });
-
-          const reader = stream.stdout.getReader();
-          const exitCodePromise = stream.exitCode;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-
-          const code = await exitCodePromise;
-          if (code !== 0) {
-            const stderr = await streamToString(stream.stderr);
-            throw new RuntimeError(`Failed to read file ${filePath}: ${stderr}`, "file_io");
-          }
-
-          controller.close();
-        } catch (err) {
-          if (err instanceof RuntimeError) {
-            controller.error(err);
-          } else {
-            controller.error(
-              new RuntimeError(
-                `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
-                "file_io",
-                err instanceof Error ? err : undefined
-              )
-            );
-          }
-        } finally {
-          // Natural completion/error: stop listening on the caller's signal
-          // so long-lived signals don't accumulate forwarders.
-          cleanupAbortForwarder();
-        }
-      },
-    });
+      abortSignal
+    );
   }
 
   /**
@@ -431,74 +419,20 @@ export abstract class RemoteRuntime implements Runtime {
    * Uses temp file + mv for atomic write.
    */
   writeFile(filePath: string, abortSignal?: AbortSignal): WritableStream<Uint8Array> {
-    const quotedPath = this.quoteForRemote(filePath);
-    const tempPath = getAtomicWriteTempPath(filePath);
-    const quotedTempPath = this.quoteForRemote(tempPath);
-
-    // Build write command - subclasses can override buildWriteCommand for special handling
-    const writeCommand = this.buildWriteCommand(quotedPath, quotedTempPath);
-
-    let execPromise: Promise<ExecStream> | null = null;
-    const writeAbortController = new AbortController();
-    const abortWrite = () => writeAbortController.abort();
-    if (abortSignal?.aborted) {
-      writeAbortController.abort();
-    } else {
-      abortSignal?.addEventListener("abort", abortWrite, { once: true });
-    }
-    const cleanupAbortForwarder = () => {
-      abortSignal?.removeEventListener("abort", abortWrite);
-    };
-
-    const getExecStream = () => {
-      execPromise ??= this.exec(writeCommand, {
-        cwd: this.getBasePath(),
-        timeout: 300,
-        abortSignal: writeAbortController.signal,
-      });
-      return execPromise;
-    };
-
-    return new WritableStream<Uint8Array>({
-      write: async (chunk: Uint8Array) => {
-        const stream = await getExecStream();
-        const writer = stream.stdin.getWriter();
-        try {
-          await writer.write(chunk);
-        } finally {
-          writer.releaseLock();
-        }
+    return writeFileViaExec(
+      filePath,
+      async (signal) => {
+        const resolvedPath = await this.resolveFilePath(filePath, signal);
+        const quotedPath = this.quoteForRemote(resolvedPath);
+        const quotedTempPath = this.quoteForRemote(getAtomicWriteTempPath(resolvedPath));
+        return this.exec(this.buildWriteCommand(quotedPath, quotedTempPath), {
+          cwd: this.getBasePath(),
+          timeout: 300,
+          abortSignal: signal,
+        });
       },
-      close: async () => {
-        try {
-          const stream = await getExecStream();
-          await stream.stdin.close();
-          const exitCode = await stream.exitCode;
-
-          if (exitCode !== 0) {
-            const stderr = await streamToString(stream.stderr);
-            throw new RuntimeError(`Failed to write file ${filePath}: ${stderr}`, "file_io");
-          }
-        } finally {
-          cleanupAbortForwarder();
-        }
-      },
-      abort: async (reason?: unknown) => {
-        writeAbortController.abort();
-        if (execPromise) {
-          try {
-            const stream = await execPromise;
-            await stream.stdin.abort(reason).catch(() => undefined);
-            await stream.exitCode.catch(() => undefined);
-          } finally {
-            cleanupAbortForwarder();
-          }
-        } else {
-          cleanupAbortForwarder();
-        }
-        throw new RuntimeError(`Failed to write file ${filePath}: ${String(reason)}`, "file_io");
-      },
-    });
+      abortSignal
+    );
   }
 
   /**
@@ -512,65 +446,29 @@ export abstract class RemoteRuntime implements Runtime {
   /**
    * Ensure a directory exists (mkdir -p semantics).
    */
-  async ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
-    const stream = await this.exec(`mkdir -p ${this.quoteForRemote(dirPath)}`, {
-      cwd: "/",
-      timeout: 10,
-      abortSignal,
+  ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
+    return ensureDirViaExec(dirPath, async () => {
+      const resolvedPath = await this.resolveFilePath(dirPath, abortSignal);
+      return this.exec(`mkdir -p ${this.quoteForRemote(resolvedPath)}`, {
+        cwd: "/",
+        timeout: 10,
+        abortSignal,
+      });
     });
-
-    await stream.stdin.close();
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(stream.stdout),
-      streamToString(stream.stderr),
-      stream.exitCode,
-    ]);
-
-    if (exitCode !== 0) {
-      const extra = stderr.trim() || stdout.trim();
-      throw new RuntimeError(
-        `Failed to create directory ${dirPath}: exit code ${exitCode}${extra ? `: ${extra}` : ""}`,
-        "file_io"
-      );
-    }
   }
 
   /**
    * Get file statistics via exec.
-   * Uses stat -L to follow symlinks (report target's type, not "symbolic link").
    */
-  async stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
-    const stream = await this.exec(`stat -L -c '%s %Y %F' ${this.quoteForRemote(filePath)}`, {
-      cwd: this.getBasePath(),
-      timeout: 10,
-      abortSignal,
+  stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
+    return statViaExec(filePath, async () => {
+      const resolvedPath = await this.resolveFilePath(filePath, abortSignal);
+      return this.exec(`${STAT_VIA_EXEC_COMMAND} ${this.quoteForRemote(resolvedPath)}`, {
+        cwd: this.getBasePath(),
+        timeout: 10,
+        abortSignal,
+      });
     });
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(stream.stdout),
-      streamToString(stream.stderr),
-      stream.exitCode,
-    ]);
-
-    if (exitCode !== 0) {
-      throw new RuntimeError(`Failed to stat ${filePath}: ${stderr}`, "file_io");
-    }
-
-    const parts = stdout.trim().split(" ");
-    if (parts.length < 3) {
-      throw new RuntimeError(`Failed to parse stat output for ${filePath}: ${stdout}`, "file_io");
-    }
-
-    const size = parseInt(parts[0], 10);
-    const mtime = parseInt(parts[1], 10);
-    const fileType = parts.slice(2).join(" ");
-
-    return {
-      size,
-      modifiedTime: new Date(mtime * 1000),
-      isDirectory: fileType === "directory",
-    };
   }
 
   /**

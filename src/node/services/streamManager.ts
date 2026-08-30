@@ -1,4 +1,3 @@
-import { EventEmitter } from "events";
 import * as path from "path";
 import { PlatformPaths } from "@/common/utils/paths";
 import { eventSpine } from "@/node/services/events/eventSpine";
@@ -22,11 +21,18 @@ import { Ok, Err } from "@/common/types/result";
 import { log, type Logger } from "./log";
 import type {
   StreamStartEvent,
+  StreamDeltaEvent,
   StreamEndEvent,
+  StreamAbortEvent,
   StreamAbortReason,
+  ErrorEvent,
   UsageDeltaEvent,
+  ToolCallStartEvent,
+  ToolCallDeltaEvent,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
+  ReasoningDeltaEvent,
+  ReasoningEndEvent,
   CompletedMessagePart,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
@@ -181,7 +187,102 @@ type ToolCallMap = Map<string, ToolCallState>;
 type WorkspaceId = string & { __brand: "WorkspaceId" };
 type StreamToken = string & { __brand: "StreamToken" };
 
-// Stream request config for start/retry
+export type TurnEngineEvent =
+  | StreamStartEvent
+  | StreamDeltaEvent
+  | StreamEndEvent
+  | StreamAbortEvent
+  | ErrorEvent
+  | UsageDeltaEvent
+  | ToolCallStartEvent
+  | ToolCallExecutionStartEvent
+  | ToolCallDeltaEvent
+  | ToolCallEndEvent
+  | ReasoningDeltaEvent
+  | ReasoningEndEvent
+  | WorkflowRunAttachedEvent;
+
+export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<void>;
+
+// Turn identity lives on TurnStreamHandle.messageId; completions cannot diverge from it.
+export type TurnCompletion =
+  | { status: "completed" }
+  | { status: "aborted"; abortReason: StreamAbortReason }
+  | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
+
+export interface TurnStreamHandle {
+  messageId: string;
+  completion: Promise<TurnCompletion>;
+}
+
+export interface TurnCompletionController {
+  promise: Promise<TurnCompletion>;
+  settle: (completion: TurnCompletion) => void;
+}
+
+export function createTurnCompletionController(): TurnCompletionController {
+  let settled = false;
+  let resolveCompletion!: (completion: TurnCompletion) => void;
+  const promise = new Promise<TurnCompletion>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  return {
+    promise,
+    settle: (completion) => {
+      if (settled) return;
+      settled = true;
+      resolveCompletion(completion);
+    },
+  };
+}
+
+// Request-construction options shared by the primary turn and model-fallback
+// hops (fallbacks rebuild these from the prepared fallback request).
+interface StreamRequestOptions {
+  model: LanguageModel;
+  modelString: string;
+  messages: ModelMessage[];
+  system: string;
+  tools?: Record<string, Tool>;
+  providerOptions?: Record<string, unknown>;
+  maxOutputTokens?: number;
+  callSettingsOverrides?: ResolvedCallSettingsOverrides;
+  toolPolicy?: ToolPolicy;
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  headers?: Record<string, string | undefined>;
+  anthropicCacheTtlOverride?: AnthropicCacheTtl;
+  onChunk?: StreamTextOnChunk;
+  onStepMessages?: (messages: ModelMessage[]) => void;
+  toolSearchState?: ToolSearchStreamState;
+  thinkingOverrideState?: ActiveTurnThinkingOverride;
+  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+  forcedFirstStepToolNames?: string[];
+  providersConfigSnapshot?: ProvidersConfigMap;
+  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
+}
+
+export interface TurnExecutionOptions extends StreamRequestOptions {
+  workspaceId: string;
+  historySequence: number;
+  runtime: Runtime;
+  messageId: string;
+  abortSignal?: AbortSignal;
+  initialMetadata?: Partial<MuxMetadata>;
+  providedStreamToken?: StreamToken;
+  workspaceName?: string;
+  thinkingLevel?: string;
+  providedRuntimeTempDir?: string;
+  modelFallback?: ModelFallbackOptions;
+  onStreamConstructed?: () => Promise<void>;
+}
+
+// routeProvider is the backend-resolved route (initialMetadata.routeProvider
+// for the primary request, initialMetadataPatch.routeProvider for fallbacks);
+// missing route metadata fails closed for OpenAI explicit prompt caching.
+type StreamRequestInput = StreamRequestOptions & {
+  routeProvider?: string;
+  onToolExecutionStart?: (toolCallId: string) => void;
+};
 
 interface StepMessageTracker {
   latestMessages?: ModelMessage[];
@@ -570,6 +671,12 @@ interface WorkspaceStreamInfo {
   // attachment and apply it as soon as the matching dynamic-tool part lands.
   pendingWorkflowRunAttachments: Map<string, WorkflowRunToolAttachment>;
 
+  // Kernel-nested tool events can arrive before the fullStream consumer stores the parent
+  // code_execution part (same race as pendingToolExecutionStarts). Buffer the nested records
+  // by parent toolCallId and merge them when the parent part lands, so an interrupt in that
+  // window doesn't lose the nested calls (or their workflow run identity) from partial.json.
+  pendingNestedCalls: Map<string, NestedToolCall[]>;
+
   // execute() can begin (lock acquired in withSequentialExecution) before the fullStream
   // consumer has stored the matching dynamic-tool part. Keep the execution-start timestamp
   // and apply it as soon as the part lands.
@@ -651,6 +758,8 @@ interface WorkspaceStreamInfo {
   lastStepUsage?: LanguageModelV2Usage;
   // Last step's provider metadata (for context window cache display)
   lastStepProviderMetadata?: Record<string, unknown>;
+  completionController: TurnCompletionController;
+  terminalCompletion?: TurnCompletion;
 }
 
 // Ensure per-stream part timestamps are strictly monotonic.
@@ -673,7 +782,7 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
  * - Atomic stream creation/cancellation operations
  * - Guaranteed resource cleanup in all code paths
  */
-export class StreamManager extends EventEmitter {
+export class StreamManager {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
   private streamLocks = new Map<WorkspaceId, AsyncMutex>();
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
@@ -681,6 +790,7 @@ export class StreamManager extends EventEmitter {
   private mcpServerManager?: MCPServerManager;
   private readonly sessionUsageService?: SessionUsageService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
+  private readonly eventSink: TurnEngineEventSink;
   // Token tracker for live streaming statistics
   private tokenTracker = new StreamingTokenTracker();
   // Track OpenAI previousResponseIds that have been invalidated
@@ -690,12 +800,23 @@ export class StreamManager extends EventEmitter {
   constructor(
     historyService: HistoryService,
     sessionUsageService?: SessionUsageService,
-    getProvidersConfig?: () => ProvidersConfigMap | null
+    getProvidersConfig?: () => ProvidersConfigMap | null,
+    eventSink: TurnEngineEventSink = () => undefined
   ) {
-    super();
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
+    this.eventSink = eventSink;
+  }
+
+  private emitTurnEvent(event: TurnEngineEvent): void {
+    // TurnEngineEventSink may return a promise; non-abort delivery stays
+    // fire-and-forget, so contain rejections here or a failing async sink
+    // becomes an unhandled rejection. Abort delivery is sequenced separately
+    // via emitStreamAbort.
+    void Promise.resolve(this.eventSink(event)).catch((error) => {
+      log.error("Turn event sink failed", { eventType: event.type, error: getErrorMessage(error) });
+    });
   }
 
   private getWorkspaceLogger(
@@ -769,7 +890,7 @@ export class StreamManager extends EventEmitter {
     toolCallId: string;
     attachment: WorkflowRunToolAttachment;
   }): void {
-    this.emit("workflow-run-attached", {
+    this.emitTurnEvent({
       type: "workflow-run-attached",
       workspaceId: input.workspaceId as string,
       messageId: input.messageId,
@@ -795,6 +916,18 @@ export class StreamManager extends EventEmitter {
       (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
     );
     if (partIndex === -1) {
+      // Kernel-launched workflows target a NESTED call persisted on a
+      // code_execution part (see emitNestedToolEvent), not a top-level part.
+      if (
+        await this.attachWorkflowRunToNestedCall(
+          workspaceId,
+          streamInfo,
+          event.toolCallId,
+          attachment
+        )
+      ) {
+        return true;
+      }
       (streamInfo.pendingWorkflowRunAttachments ??= new Map()).set(event.toolCallId, attachment);
       return true;
     }
@@ -812,6 +945,60 @@ export class StreamManager extends EventEmitter {
 
     await this.flushPartialWrite(workspaceId, streamInfo);
     return true;
+  }
+
+  /**
+   * A nested call's persisted attachment keeps only the run identity: the full
+   * WorkflowRunRecord carries the workflow source and invocation args, which
+   * would ride into partial.json unbounded and defeat the kernel record caps
+   * that already replaced the nested args/result with markers. The frontend
+   * re-fetches the durable run by runId. (The live workflow-run-attached event
+   * still carries the full run snapshot.)
+   */
+  private static toNestedWorkflowRunAttachment(
+    attachment: WorkflowRunToolAttachment
+  ): WorkflowRunToolAttachment {
+    return { runId: attachment.runId, timestamp: attachment.timestamp };
+  }
+
+  /**
+   * Persist a workflow run attachment onto the nested call record it targets,
+   * so a kernel-launched run's identity survives reload even when kernel
+   * bounding replaced the nested args/result with a marker. The live event
+   * still reaches the frontend through the normal emit path.
+   */
+  private async attachWorkflowRunToNestedCall(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    toolCallId: string,
+    attachment: WorkflowRunToolAttachment
+  ): Promise<boolean> {
+    const nestedAttachment = StreamManager.toNestedWorkflowRunAttachment(attachment);
+    for (const part of streamInfo.parts) {
+      if (part.type !== "dynamic-tool") {
+        continue;
+      }
+      const parentPart = part as { nestedCalls?: NestedToolCall[] };
+      const nestedCalls = parentPart.nestedCalls;
+      const nestedIndex =
+        nestedCalls?.findIndex((nested) => nested.toolCallId === toolCallId) ?? -1;
+      if (nestedCalls == null || nestedIndex === -1) {
+        continue;
+      }
+      nestedCalls[nestedIndex] = { ...nestedCalls[nestedIndex], workflowRun: nestedAttachment };
+      await this.flushPartialWrite(workspaceId, streamInfo);
+      return true;
+    }
+    // The nested record may still be buffered because its parent part has not
+    // landed yet; attach there so the merge in appendPartAndEmit persists it.
+    for (const buffered of streamInfo.pendingNestedCalls?.values() ?? []) {
+      const nestedIndex = buffered.findIndex((nested) => nested.toolCallId === toolCallId);
+      if (nestedIndex !== -1) {
+        buffered[nestedIndex] = { ...buffered[nestedIndex], workflowRun: nestedAttachment };
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -835,7 +1022,7 @@ export class StreamManager extends EventEmitter {
     assert(part.type === "dynamic-tool", "applyToolExecutionStart matched a non-tool part");
     streamInfo.parts[partIndex] = { ...part, executionStartedAt: timestamp };
 
-    this.emit("tool-call-execution-start", {
+    this.emitTurnEvent({
       type: "tool-call-execution-start",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -982,11 +1169,9 @@ export class StreamManager extends EventEmitter {
   public async createTempDirForStream(streamToken: StreamToken, runtime: Runtime): Promise<string> {
     const tempDir = `~/.xum-tmp/${streamToken}`;
 
-    // Resolve ~ in the runtime's context.
-    //
-    // IMPORTANT: On Windows local runtime, Git Bash may use a customized $HOME,
-    // while runtime.resolvePath expands ~ via Node (USERPROFILE). To avoid drift,
-    // create the directory using the resolved absolute path.
+    // Resolve ~ in the runtime's context: callers need the canonical absolute
+    // path as a value, and reusing it for ensureDir avoids a second remote
+    // resolution round trip per stream on SSH runtimes.
     let resolvedPath = (await runtime.resolvePath(tempDir)).trim();
 
     // In the main process, PlatformPaths defaults to POSIX behavior (no navigator),
@@ -1057,7 +1242,7 @@ export class StreamManager extends EventEmitter {
     const tokens = await this.tokenTracker.countTokens(deltaText);
     const timestamp = Date.now();
 
-    this.emit("tool-call-delta", {
+    this.emitTurnEvent({
       type: "tool-call-delta",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -1272,7 +1457,7 @@ export class StreamManager extends EventEmitter {
 
     if (part.type === "text") {
       const tokens = await this.tokenTracker.countTokens(part.text);
-      this.emit("stream-delta", {
+      this.emitTurnEvent({
         type: "stream-delta",
         workspaceId: workspaceId as string,
         messageId,
@@ -1283,7 +1468,7 @@ export class StreamManager extends EventEmitter {
       });
     } else if (part.type === "reasoning") {
       const tokens = await this.tokenTracker.countTokens(part.text);
-      this.emit("reasoning-delta", {
+      this.emitTurnEvent({
         type: "reasoning-delta",
         workspaceId: workspaceId as string,
         messageId,
@@ -1296,7 +1481,7 @@ export class StreamManager extends EventEmitter {
     } else if (part.type === "dynamic-tool") {
       const inputText = JSON.stringify(part.input);
       const tokens = await this.tokenTracker.countTokens(inputText);
-      this.emit("tool-call-start", {
+      this.emitTurnEvent({
         type: "tool-call-start",
         workspaceId: workspaceId as string,
         messageId,
@@ -1314,7 +1499,7 @@ export class StreamManager extends EventEmitter {
       });
 
       if (part.workflowRun != null) {
-        this.emit("workflow-run-attached", {
+        this.emitTurnEvent({
           type: "workflow-run-attached",
           workspaceId: workspaceId as string,
           messageId,
@@ -1326,9 +1511,21 @@ export class StreamManager extends EventEmitter {
         } satisfies WorkflowRunAttachedEvent);
       }
 
+      // Replays rebuild renderer state from persisted parts, but nested kernel
+      // calls (and their workflow run identities) live on the parent part and
+      // are only ever live-emitted by emitNestedToolEvent; without re-emitting
+      // them here a reconnect rebuilds the code_execution card without its
+      // nested rows. Live appends never carry nestedCalls (buffered nested
+      // records merge after this emit), so this only fires on replay in practice.
+      const nestedCalls = (part as { nestedCalls?: NestedToolCall[] }).nestedCalls ?? [];
+      this.emitNestedCallEvents(workspaceId, messageId, part.toolCallId, nestedCalls, {
+        replay: isReplay,
+        fallbackTimestamp: timestamp,
+      });
+
       // If tool has output, emit completion
       if (part.state === "output-available") {
-        this.emit("tool-call-end", {
+        this.emitTurnEvent({
           type: "tool-call-end",
           workspaceId: workspaceId as string,
           messageId,
@@ -1337,6 +1534,62 @@ export class StreamManager extends EventEmitter {
           toolName: part.toolName,
           result: part.output,
           timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Emit a nested call's full event sequence (start, workflow attachment, end)
+   * on behalf of its parent part. Used when the renderer could not have applied
+   * the original live events: reconnect replays, and the buffered-merge path in
+   * appendPartAndEmit where the original events raced ahead of the parent part.
+   * The aggregator dedupes re-delivered nested starts by toolCallId.
+   */
+  private emitNestedCallEvents(
+    workspaceId: WorkspaceId,
+    messageId: string,
+    parentToolCallId: string,
+    nestedCalls: NestedToolCall[],
+    options: { replay?: boolean; fallbackTimestamp: number }
+  ): void {
+    const isReplay = options.replay === true;
+    for (const nested of nestedCalls) {
+      this.emitTurnEvent({
+        type: "tool-call-start",
+        workspaceId: workspaceId as string,
+        messageId,
+        ...(isReplay ? { replay: true } : {}),
+        toolCallId: nested.toolCallId,
+        toolName: nested.toolName,
+        args: nested.input ?? {},
+        tokens: 0,
+        timestamp: nested.timestamp ?? options.fallbackTimestamp,
+        parentToolCallId,
+      });
+      if (nested.workflowRun != null) {
+        this.emitTurnEvent({
+          type: "workflow-run-attached",
+          workspaceId: workspaceId as string,
+          messageId,
+          ...(isReplay ? { replay: true } : {}),
+          toolCallId: nested.toolCallId,
+          runId: nested.workflowRun.runId,
+          ...(nested.workflowRun.run != null ? { run: nested.workflowRun.run } : {}),
+          timestamp: nested.workflowRun.timestamp,
+        } satisfies WorkflowRunAttachedEvent);
+      }
+      if (nested.state === "output-available") {
+        this.emitTurnEvent({
+          type: "tool-call-end",
+          workspaceId: workspaceId as string,
+          messageId,
+          ...(isReplay ? { replay: true } : {}),
+          toolCallId: nested.toolCallId,
+          toolName: nested.toolName,
+          result: nested.output,
+          timestamp: Date.now(),
+          parentToolCallId,
         });
       }
     }
@@ -1360,6 +1613,7 @@ export class StreamManager extends EventEmitter {
       let partToPersist = part;
       let pendingAttachment: WorkflowRunToolAttachment | undefined;
       let pendingExecutionStart: number | undefined;
+      let bufferedNestedCalls: NestedToolCall[] | undefined;
       if (part.type === "dynamic-tool") {
         pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, part.toolCallId);
         // execute() may have started (lock acquired) before the fullStream consumer
@@ -1368,25 +1622,54 @@ export class StreamManager extends EventEmitter {
         if (pendingExecutionStart !== undefined) {
           streamInfo.pendingToolExecutionStarts.delete(part.toolCallId);
         }
-        if (pendingAttachment != null || pendingExecutionStart !== undefined) {
+        // Nested kernel events may have arrived (and been buffered) in the same
+        // race window; merge them so they persist with the parent part. Their
+        // live events already reached the frontend at emission time.
+        bufferedNestedCalls = streamInfo.pendingNestedCalls?.get(part.toolCallId);
+        if (bufferedNestedCalls !== undefined) {
+          streamInfo.pendingNestedCalls.delete(part.toolCallId);
+        }
+        if (
+          pendingAttachment != null ||
+          pendingExecutionStart !== undefined ||
+          bufferedNestedCalls !== undefined
+        ) {
           partToPersist = {
             ...part,
             ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
             ...(pendingExecutionStart !== undefined
               ? { executionStartedAt: pendingExecutionStart }
               : {}),
+            ...(bufferedNestedCalls !== undefined ? { nestedCalls: bufferedNestedCalls } : {}),
           };
         }
       }
       streamInfo.parts.push(partToPersist);
       if (pendingExecutionStart !== undefined && part.type === "dynamic-tool") {
-        this.emit("tool-call-execution-start", {
+        this.emitTurnEvent({
           type: "tool-call-execution-start",
           workspaceId: workspaceId as string,
           messageId: streamInfo.messageId,
           toolCallId: part.toolCallId,
           timestamp: pendingExecutionStart,
         } satisfies ToolCallExecutionStartEvent);
+      }
+      if (bufferedNestedCalls !== undefined && part.type === "dynamic-tool") {
+        if (pendingAttachment == null) {
+          // Buffered nested calls can carry a workflow run identity that must
+          // survive an interrupt; don't wait for the debounced write.
+          await this.flushPartialWrite(workspaceId, streamInfo);
+        }
+        // The original nested events raced ahead of the parent part, so the
+        // renderer dropped them (it refuses parented events with no parent
+        // row); re-deliver them now that the parent start has been emitted.
+        this.emitNestedCallEvents(
+          workspaceId,
+          streamInfo.messageId,
+          part.toolCallId,
+          bufferedNestedCalls,
+          { fallbackTimestamp: part.timestamp ?? Date.now() }
+        );
       }
       if (pendingAttachment != null && part.type === "dynamic-tool") {
         await this.flushPartialWrite(workspaceId, streamInfo);
@@ -1565,8 +1848,9 @@ export class StreamManager extends EventEmitter {
       }
     }
 
-    // Emit abort event with usage if available
-    this.emitStreamAbort(
+    // Emit abort asynchronously as before; completion settles only after the facade's
+    // partial cleanup and external stream-abort emission have finished.
+    const abortDelivery = this.emitStreamAbort(
       workspaceId,
       streamInfo.messageId,
       { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
@@ -1577,6 +1861,15 @@ export class StreamManager extends EventEmitter {
 
     // Clean up immediately
     this.workspaceStreams.delete(workspaceId);
+    void abortDelivery
+      .catch((error) => {
+        // Contain sink rejections: .finally alone would re-propagate them as
+        // an unhandled rejection after completion settles.
+        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+      })
+      .finally(() => {
+        streamInfo.completionController?.settle({ status: "aborted", abortReason });
+      });
   }
 
   /**
@@ -1686,33 +1979,31 @@ export class StreamManager extends EventEmitter {
       : normalizeUsageModelKey(model, this.getProvidersConfig());
   }
 
-  private buildStreamRequestConfig(
-    model: LanguageModel,
-    modelString: string,
-    messages: ModelMessage[],
-    system: string,
-    // Backend-resolved route provider (initialMetadata.routeProvider for the
-    // primary request, initialMetadataPatch.routeProvider for fallbacks).
-    // Missing route metadata fails closed for OpenAI explicit prompt caching.
-    routeProvider?: string,
-    tools?: Record<string, Tool>,
-    providerOptions?: Record<string, unknown>,
-    maxOutputTokens?: number,
-    callSettingsOverrides?: ResolvedCallSettingsOverrides,
-    toolPolicy?: ToolPolicy,
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean,
-    headers?: Record<string, string | undefined>,
-    anthropicCacheTtlOverride?: AnthropicCacheTtl,
-    onChunk?: StreamTextOnChunk,
-    onStepMessages?: (messages: ModelMessage[]) => void,
-    toolSearchState?: ToolSearchStreamState,
-    onToolExecutionStart?: (toolCallId: string) => void,
-    thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[],
-    providersConfigSnapshot?: ProvidersConfigMap,
-    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
-  ): StreamRequestConfig {
+  private buildStreamRequestConfig(input: StreamRequestInput): StreamRequestConfig {
+    const {
+      model,
+      modelString,
+      messages,
+      system,
+      routeProvider,
+      tools,
+      providerOptions,
+      maxOutputTokens,
+      callSettingsOverrides,
+      toolPolicy,
+      hasQueuedMessages,
+      headers,
+      anthropicCacheTtlOverride,
+      onChunk,
+      onStepMessages,
+      toolSearchState,
+      onToolExecutionStart,
+      thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel,
+      forcedFirstStepToolNames,
+      providersConfigSnapshot,
+      rebuildFirstStepForThinkingLevel,
+    } = input;
     // The request's pinned providers-config snapshot (when the caller has
     // one): cache wrappers and type-derived output limits below must resolve
     // Coder instance metadata against the SAME config that created the SDK
@@ -2046,74 +2337,43 @@ export class StreamManager extends EventEmitter {
    * Atomically creates a new stream with all necessary setup
    */
   private createStreamAtomically(
-    workspaceId: WorkspaceId,
-    streamToken: StreamToken,
-    runtimeTempDir: string,
-    runtime: Runtime,
-    messages: ModelMessage[],
-    model: LanguageModel,
-    modelString: string,
-    abortController: AbortController,
-    system: string,
-    historySequence: number,
-    messageId: string,
-    tools?: Record<string, Tool>,
-    initialMetadata?: Partial<MuxMetadata>,
-    providerOptions?: Record<string, unknown>,
-    maxOutputTokens?: number,
-    toolPolicy?: ToolPolicy,
-    callSettingsOverrides?: ResolvedCallSettingsOverrides,
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean,
-    workspaceName?: string,
-    thinkingLevel?: string,
-    headers?: Record<string, string | undefined>,
-    anthropicCacheTtlOverride?: AnthropicCacheTtl,
-    onChunk?: StreamTextOnChunk,
-    onStepMessages?: (messages: ModelMessage[]) => void,
-    modelFallback?: ModelFallbackOptions,
-    toolSearchState?: ToolSearchStreamState,
-    thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[],
-    providersConfigSnapshot?: ProvidersConfigMap,
-    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
+    options: TurnExecutionOptions,
+    ctx: {
+      streamToken: StreamToken;
+      runtimeTempDir: string;
+      abortController: AbortController;
+      completionController: TurnCompletionController;
+    }
   ): WorkspaceStreamInfo {
-    // abortController is created and linked to the caller-provided abortSignal in startStream().
-
-    const stepTracker: StepMessageTracker = {};
-    const metadataModel = this.resolveMetadataModel(modelString, providersConfigSnapshot);
-    const request = this.buildStreamRequestConfig(
-      model,
+    // ctx.abortController is created and linked to the caller-provided abortSignal in startStream().
+    const workspaceId = options.workspaceId as WorkspaceId;
+    const {
+      messageId,
       modelString,
-      messages,
-      system,
-      initialMetadata?.routeProvider,
-      tools,
-      providerOptions,
+      historySequence,
+      workspaceName,
+      thinkingLevel,
+      initialMetadata,
+      modelFallback,
       maxOutputTokens,
-      callSettingsOverrides,
-      toolPolicy,
-      hasQueuedMessages,
-      headers,
-      anthropicCacheTtlOverride,
-      onChunk,
-      onStepMessages,
-      toolSearchState,
-      (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
-      thinkingOverrideState,
-      rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames,
-      providersConfigSnapshot,
-      rebuildFirstStepForThinkingLevel
-    );
+      runtime,
+    } = options;
+    const stepTracker: StepMessageTracker = {};
+    const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
+    const request = this.buildStreamRequestConfig({
+      ...options,
+      routeProvider: initialMetadata?.routeProvider,
+      onToolExecutionStart: (toolCallId) =>
+        this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
+    });
 
     // Start streaming - this can throw immediately if API key is missing
     let streamResult;
     try {
-      streamResult = this.createStreamResult(request, abortController, stepTracker);
+      streamResult = this.createStreamResult(request, ctx.abortController, stepTracker);
     } catch (error) {
       // Clean up abort controller if stream creation fails
-      abortController.abort();
+      ctx.abortController.abort();
       // Re-throw the error to be caught by startStream
       throw error;
     }
@@ -2123,13 +2383,14 @@ export class StreamManager extends EventEmitter {
       state: StreamState.STARTING,
       streamResult,
       workspaceName,
-      abortController,
+      abortController: ctx.abortController,
       messageId,
-      token: streamToken,
+      token: ctx.streamToken,
       startTime,
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
       pendingWorkflowRunAttachments: new Map(),
+      pendingNestedCalls: new Map(),
       pendingToolExecutionStarts: new Map(),
       model: modelString,
       metadataModel,
@@ -2160,7 +2421,8 @@ export class StreamManager extends EventEmitter {
       partialWritePromise: undefined, // No write in flight initially
       processingPromise: Promise.resolve(), // Placeholder, overwritten in startStream
       softInterrupt: { pending: false },
-      runtimeTempDir, // Stream-scoped temp directory for tool outputs
+      completionController: ctx.completionController,
+      runtimeTempDir: ctx.runtimeTempDir, // Stream-scoped temp directory for tool outputs
       runtime, // Runtime for temp directory cleanup
       // Initialize cumulative tracking for multi-step streams
       cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -2250,7 +2512,7 @@ export class StreamManager extends EventEmitter {
     const completionTimestamp = nextPartTimestamp(streamInfo);
     streamInfo.toolCompletionTimestamps ??= new Map();
     streamInfo.toolCompletionTimestamps.set(toolCallId, completionTimestamp);
-    this.emit("tool-call-end", {
+    this.emitTurnEvent({
       type: "tool-call-end",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -2353,6 +2615,12 @@ export class StreamManager extends EventEmitter {
     // Persist nested calls to streamInfo.parts for crash/interrupt resilience
     const streamInfo = this.workspaceStreams.get(workspaceId as WorkspaceId);
     if (streamInfo) {
+      if (event.type === "tool-call-end") {
+        // Nested records never store an end time, so incremental replay needs
+        // this to notice a nested call that completed while the renderer was
+        // disconnected (same mechanism as top-level tool completions).
+        streamInfo.toolCompletionTimestamps.set(event.callId, event.endTime ?? Date.now());
+      }
       const parentPartIndex = streamInfo.parts.findIndex(
         (p): p is CompletedMessagePart & { type: "dynamic-tool"; toolCallId: string } =>
           p.type === "dynamic-tool" && "toolCallId" in p && p.toolCallId === event.parentToolCallId
@@ -2385,12 +2653,37 @@ export class StreamManager extends EventEmitter {
 
         // Schedule partial write so nested calls survive crashes
         void this.schedulePartialWrite(workspaceId as WorkspaceId, streamInfo);
+      } else {
+        // execute() can win the race against the fullStream consumer (same window as
+        // pendingToolExecutionStarts): buffer the nested record and merge it when the
+        // parent part lands, instead of silently dropping it from persistence.
+        const pendingNestedCalls = (streamInfo.pendingNestedCalls ??= new Map());
+        const buffered = pendingNestedCalls.get(event.parentToolCallId) ?? [];
+        if (event.type === "tool-call-start") {
+          buffered.push({
+            toolCallId: event.callId,
+            toolName: event.toolName,
+            input: args,
+            state: "input-available",
+            timestamp: event.startTime,
+          });
+        } else if (event.type === "tool-call-end") {
+          const idx = buffered.findIndex((n) => n.toolCallId === event.callId);
+          if (idx !== -1) {
+            buffered[idx] = {
+              ...buffered[idx],
+              output: event.result ?? (event.error ? { error: event.error } : undefined),
+              state: "output-available",
+            };
+          }
+        }
+        pendingNestedCalls.set(event.parentToolCallId, buffered);
       }
     }
 
     // Emit to frontend
     if (event.type === "tool-call-start") {
-      this.emit("tool-call-start", {
+      this.emitTurnEvent({
         type: "tool-call-start",
         workspaceId,
         messageId,
@@ -2402,7 +2695,7 @@ export class StreamManager extends EventEmitter {
         parentToolCallId: event.parentToolCallId,
       });
     } else if (event.type === "tool-call-end") {
-      this.emit("tool-call-end", {
+      this.emitTurnEvent({
         type: "tool-call-end",
         workspaceId,
         messageId,
@@ -2436,7 +2729,7 @@ export class StreamManager extends EventEmitter {
       streamInfo.model.startsWith("mux-gateway:");
     const routeProvider = streamInfo.initialMetadata?.routeProvider;
 
-    this.emit("stream-start", {
+    this.emitTurnEvent({
       type: "stream-start",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -2476,16 +2769,18 @@ export class StreamManager extends EventEmitter {
     abortReason: StreamAbortReason,
     abandonPartial?: boolean,
     acpPromptId?: string
-  ): void {
-    this.emit("stream-abort", {
-      type: "stream-abort",
-      workspaceId: workspaceId as string,
-      messageId,
-      abortReason,
-      metadata,
-      abandonPartial,
-      acpPromptId,
-    });
+  ): Promise<void> {
+    return Promise.resolve(
+      this.eventSink({
+        type: "stream-abort",
+        workspaceId: workspaceId as string,
+        messageId,
+        abortReason,
+        metadata,
+        abandonPartial,
+        acpPromptId,
+      })
+    );
   }
 
   private async handleEmptyStreamCompletion(
@@ -2833,38 +3128,39 @@ export class StreamManager extends EventEmitter {
     // Build the swapped request/stream into locals first so a failure here
     // leaves streamInfo unmodified (the terminal error then names the model
     // that actually refused, not a half-applied fallback).
-    const nextRequest = this.buildStreamRequestConfig(
-      prepared.data.model,
-      prepared.data.modelString,
-      prepared.data.messages,
-      prepared.data.system,
+    const nextRequest = this.buildStreamRequestConfig({
+      model: prepared.data.model,
+      modelString: prepared.data.modelString,
+      messages: prepared.data.messages,
+      system: prepared.data.system,
       // Use the fallback's freshly-resolved route (not stale source metadata,
       // which streamInfo.initialMetadata still holds at this point) so the
       // OpenAI cached-system transform evaluates the fallback route.
-      prepared.data.initialMetadataPatch?.routeProvider,
-      prepared.data.tools,
-      prepared.data.providerOptions,
-      fallbackState.original.maxOutputTokens,
-      prepared.data.callSettingsOverrides,
-      streamInfo.request.toolPolicy,
-      streamInfo.request.hasQueuedMessages,
-      prepared.data.headers,
-      prepared.data.anthropicCacheTtl,
-      streamInfo.request.onChunk,
-      streamInfo.request.onStepMessages,
+      routeProvider: prepared.data.initialMetadataPatch?.routeProvider,
+      tools: prepared.data.tools,
+      providerOptions: prepared.data.providerOptions,
+      maxOutputTokens: fallbackState.original.maxOutputTokens,
+      callSettingsOverrides: prepared.data.callSettingsOverrides,
+      toolPolicy: streamInfo.request.toolPolicy,
+      hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      headers: prepared.data.headers,
+      anthropicCacheTtlOverride: prepared.data.anthropicCacheTtl,
+      onChunk: streamInfo.request.onChunk,
+      onStepMessages: streamInfo.request.onStepMessages,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
-      streamInfo.request.toolSearchState,
-      (toolCallId) => this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
+      toolSearchState: streamInfo.request.toolSearchState,
+      onToolExecutionStart: (toolCallId) =>
+        this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
       // Same holder object (the session's setter keeps working across the
       // hop) with a closure bound to the FALLBACK model. Attached before
       // createStreamResult below in case the SDK eagerly prepares step 1.
-      streamInfo.request.thinkingOverrideState,
-      prepared.data.rebuildProviderOptionsForThinkingLevel,
-      prepared.data.forcedFirstStepToolNames,
-      prepared.data.providersConfig,
-      prepared.data.rebuildFirstStepForThinkingLevel
-    );
+      thinkingOverrideState: streamInfo.request.thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel: prepared.data.rebuildProviderOptionsForThinkingLevel,
+      forcedFirstStepToolNames: prepared.data.forcedFirstStepToolNames,
+      providersConfigSnapshot: prepared.data.providersConfig,
+      rebuildFirstStepForThinkingLevel: prepared.data.rebuildFirstStepForThinkingLevel,
+    });
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
     // later disk-reset await cannot wipe freshly prepared fallback messages.
@@ -3166,7 +3462,7 @@ export class StreamManager extends EventEmitter {
                     );
                     // Emit signature update event for Anthropic UI consumers.
                     if (signature) {
-                      this.emit("reasoning-delta", {
+                      this.emitTurnEvent({
                         type: "reasoning-delta",
                         workspaceId: workspaceId as string,
                         messageId: streamInfo.messageId,
@@ -3220,7 +3516,7 @@ export class StreamManager extends EventEmitter {
                   }
                 }
 
-                this.emit("reasoning-end", {
+                this.emitTurnEvent({
                   type: "reasoning-end",
                   workspaceId: workspaceId as string,
                   messageId: streamInfo.messageId,
@@ -3501,7 +3797,7 @@ export class StreamManager extends EventEmitter {
                   costsIncluded: streamInfo.initialMetadata?.costsIncluded,
                 });
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
-                this.emit("usage-delta", usageEvent);
+                this.emitTurnEvent(usageEvent);
                 await this.checkSoftCancelStream(workspaceId, streamInfo);
                 break;
               }
@@ -3697,7 +3993,8 @@ export class StreamManager extends EventEmitter {
             // Compaction handler listens to this event and clears history - if we emit
             // before updateHistory completes, compaction can clear the file and then
             // updateHistory writes stale data back.
-            this.emit("stream-end", streamEndEvent);
+            this.emitTurnEvent(streamEndEvent);
+            streamInfo.terminalCompletion = { status: "completed" };
           }
           break;
         } catch (error) {
@@ -3757,6 +4054,11 @@ export class StreamManager extends EventEmitter {
         workspaceId: workspaceId as string,
         messageId: streamInfo.messageId,
       });
+
+      if (streamInfo.terminalCompletion != null) {
+        // Optional-chained: whitebox test fixtures register stream infos without a controller.
+        streamInfo.completionController?.settle(streamInfo.terminalCompletion);
+      }
     }
   }
 
@@ -3779,7 +4081,8 @@ export class StreamManager extends EventEmitter {
     this.recordLostResponseIdIfApplicable(workspaceId, error, streamInfo, workspaceLog);
 
     const errorPayload = this.buildStreamErrorPayload(streamInfo, error);
-    await this.persistStreamError(workspaceId, streamInfo, errorPayload);
+    const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
+    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
   }
 
   private buildStreamErrorPayload(
@@ -3914,7 +4217,7 @@ export class StreamManager extends EventEmitter {
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     payload: StreamErrorPayload & { errorType: StreamErrorType }
-  ): Promise<void> {
+  ): Promise<StreamErrorPayload & { errorType: StreamErrorType }> {
     // Clamp at the single choke point every stream error payload passes
     // through before persist/emit, including buildStreamErrorPayload's
     // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
@@ -4008,8 +4311,9 @@ export class StreamManager extends EventEmitter {
       log.error("Failed to record errored-stream usage in headless sidecar", { error });
     }
 
-    // Emit error event.
-    this.emit("error", createErrorEvent(workspaceId as string, payload));
+    // Emit error event before completion settles so recovery bookkeeping is ready for waiters.
+    this.emitTurnEvent(createErrorEvent(workspaceId as string, payload));
+    return payload;
   }
 
   private getOpenAIPreviousResponseId(
@@ -4395,48 +4699,28 @@ export class StreamManager extends EventEmitter {
    * 3. No race conditions in stream registration or cleanup
    */
   async startStream(
-    workspaceId: string,
-    messages: ModelMessage[],
-    model: LanguageModel,
-    modelString: string,
-    historySequence: number,
-    system: string,
-    runtime: Runtime,
-    messageId: string,
-    abortSignal?: AbortSignal,
-    tools?: Record<string, Tool>,
-    initialMetadata?: Partial<MuxMetadata>,
-    providerOptions?: Record<string, unknown>,
-    maxOutputTokens?: number,
-    toolPolicy?: ToolPolicy,
-    providedStreamToken?: StreamToken,
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean,
-    workspaceName?: string,
-    thinkingLevel?: string,
-    headers?: Record<string, string | undefined>,
-    anthropicCacheTtlOverride?: AnthropicCacheTtl,
-    callSettingsOverrides?: ResolvedCallSettingsOverrides,
-    onChunk?: StreamTextOnChunk,
-    onStepMessages?: (messages: ModelMessage[]) => void,
-    providedRuntimeTempDir?: string,
-    modelFallback?: ModelFallbackOptions,
-    toolSearchState?: ToolSearchStreamState,
-    thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[],
-    // Pinned providers-config snapshot the request was assembled from (see
-    // AIService's pinCoderWireProvidersConfig): request-config building and
-    // metadata resolution must not re-read live config after model creation.
-    providersConfigSnapshot?: ProvidersConfigMap,
-    // Invoked once the stream is constructed and registered (before
-    // processing). Durable side effects describing this request — the turn
-    // envelope — belong here: earlier emission persists phantom rows when
-    // setup aborts or fails before any provider request exists. Must not throw.
-    onStreamConstructed?: () => Promise<void>,
-    // Step-0 message rebuild for thinking overrides that race stream setup
-    // (see RebuildFirstStepForThinkingLevel).
-    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel
-  ): Promise<Result<StreamToken, SendMessageError>> {
+    options: TurnExecutionOptions
+  ): Promise<Result<TurnStreamHandle, SendMessageError>> {
+    const {
+      workspaceId,
+      messages,
+      model,
+      modelString,
+      historySequence,
+      runtime,
+      messageId,
+      abortSignal,
+      providedStreamToken,
+      providedRuntimeTempDir,
+      onStreamConstructed,
+    } = options;
+    const completionController = createTurnCompletionController();
+    const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
+    const settleStartupAbort = (): Result<TurnStreamHandle, SendMessageError> => {
+      completionController.settle({ status: "aborted", abortReason: "startup" });
+      return Ok(handle);
+    };
+
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
     if (messages.length === 0) {
@@ -4479,7 +4763,7 @@ export class StreamManager extends EventEmitter {
         // If the stream was interrupted while we were waiting on async setup (mutex,
         // temp dir creation, etc), avoid starting the stream entirely.
         if (streamAbortController.signal.aborted) {
-          return Ok(streamToken);
+          return settleStartupAbort();
         }
 
         // Step 3: Create temp directory for this stream using runtime.
@@ -4489,43 +4773,16 @@ export class StreamManager extends EventEmitter {
           providedRuntimeTempDir ?? (await this.createTempDirForStream(streamToken, runtime));
 
         if (streamAbortController.signal.aborted) {
-          return Ok(streamToken);
+          return settleStartupAbort();
         }
 
         // Step 4: Atomic stream creation and registration
-        const streamInfo = this.createStreamAtomically(
-          typedWorkspaceId,
+        const streamInfo = this.createStreamAtomically(options, {
           streamToken,
           runtimeTempDir,
-          runtime,
-          messages,
-          model,
-          modelString,
-          streamAbortController,
-          system,
-          historySequence,
-          messageId,
-          tools,
-          initialMetadata,
-          providerOptions,
-          maxOutputTokens,
-          toolPolicy,
-          callSettingsOverrides,
-          hasQueuedMessages,
-          workspaceName,
-          thinkingLevel,
-          headers,
-          anthropicCacheTtlOverride,
-          onChunk,
-          onStepMessages,
-          modelFallback,
-          toolSearchState,
-          thinkingOverrideState,
-          rebuildProviderOptionsForThinkingLevel,
-          forcedFirstStepToolNames,
-          providersConfigSnapshot,
-          rebuildFirstStepForThinkingLevel
-        );
+          abortController: streamAbortController,
+          completionController,
+        });
 
         // Guard against a narrow race:
         // - stopStream() may abort while we're between the last aborted-check and stream registration.
@@ -4534,7 +4791,7 @@ export class StreamManager extends EventEmitter {
         // In that case, immediately drop the registered stream and rely on the caller to handle UI.
         if (streamAbortController.signal.aborted) {
           this.workspaceStreams.delete(typedWorkspaceId);
-          return Ok(streamToken);
+          return settleStartupAbort();
         }
 
         streamInfo.unlinkAbortSignal = unlinkAbortSignal;
@@ -4559,7 +4816,7 @@ export class StreamManager extends EventEmitter {
             this.workspaceStreams.delete(typedWorkspaceId);
           }
           streamRegistered = false;
-          return Ok(streamToken);
+          return settleStartupAbort();
         }
 
         // Step 5: Track the processing promise for guaranteed cleanup
@@ -4572,7 +4829,7 @@ export class StreamManager extends EventEmitter {
           log.error("Unexpected error in stream processing:", error);
         });
 
-        return Ok(streamToken);
+        return Ok(handle);
       } finally {
         if (!streamRegistered) {
           runLanguageModelCleanup(model);
@@ -4743,7 +5000,15 @@ export class StreamManager extends EventEmitter {
         // Emit abort event so frontend clears pending stream state.
         // This handles the case where user interrupts before stream-start arrives.
         // Use empty messageId - frontend handles gracefully (just clears pendingStreamStartTime).
-        this.emitStreamAbort(typedWorkspaceId, "", {}, abortReason, options?.abandonPartial);
+        void this.emitStreamAbort(
+          typedWorkspaceId,
+          "",
+          {},
+          abortReason,
+          options?.abandonPartial
+        ).catch((error) => {
+          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+        });
         return Ok(undefined);
       }
 
@@ -4898,6 +5163,31 @@ export class StreamManager extends EventEmitter {
                 return true;
               }
 
+              // Nested kernel calls carry their own activity (start or workflow
+              // attach) after the cursor even while the parent part's own
+              // timestamps are older; replay the parent so emitPartAsEvent can
+              // rebuild the nested rows.
+              const nestedCalls = (part as { nestedCalls?: NestedToolCall[] }).nestedCalls ?? [];
+              if (
+                nestedCalls.some(
+                  (nested) =>
+                    // Legacy rows can miss the timestamp; replay defensively.
+                    nested.timestamp === undefined ||
+                    nested.timestamp > afterTimestamp ||
+                    (nested.workflowRun != null && nested.workflowRun.timestamp > afterTimestamp) ||
+                    // The nested record stores no end time, so a call that
+                    // completed while the renderer was disconnected is only
+                    // visible through the recorded completion timestamp.
+                    // Missing entry => replay defensively; re-delivered nested
+                    // events are deduped by the aggregator.
+                    (nested.state === "output-available" &&
+                      (streamInfo.toolCompletionTimestamps.get(nested.toolCallId) ??
+                        Number.POSITIVE_INFINITY) > afterTimestamp)
+                )
+              ) {
+                return true;
+              }
+
               if (part.state === "output-available") {
                 const completionTimestamp = streamInfo.toolCompletionTimestamps.get(
                   part.toolCallId
@@ -4954,7 +5244,7 @@ export class StreamManager extends EventEmitter {
         // Replays must preserve gateway-billed zero-cost behavior from the original stream.
         costsIncluded: streamInfo.initialMetadata?.costsIncluded,
       });
-      this.emit("usage-delta", usageEvent);
+      this.emitTurnEvent(usageEvent);
     }
   }
 
@@ -4992,11 +5282,14 @@ export class StreamManager extends EventEmitter {
     };
 
     // Write error state to partial.json (same as real error handling)
-    await this.persistStreamError(typedWorkspaceId, streamInfo, {
+    const persistedPayload = await this.persistStreamError(typedWorkspaceId, streamInfo, {
       messageId: streamInfo.messageId,
       error: errorMessage,
       errorType: "network",
     });
+    // Debug-injected failures bypass handleStreamFailure, so record the failed
+    // completion here or cleanup would never settle the turn handle.
+    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
 
     // Wait for the stream processing to complete (cleanup)
     await streamInfo.processingPromise;

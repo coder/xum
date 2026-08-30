@@ -80,6 +80,11 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig, CanonicalProvidersConfig };
 export type ProvidersConfig = CanonicalProvidersConfig | Record<string, ProviderConfig>;
 
+/** True only for fs errors whose errno code is ENOENT (genuinely missing path). */
+function isEnoentError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
 function isValidHeartbeatIntervalMs(intervalMs: unknown): intervalMs is number {
   return (
     typeof intervalMs === "number" &&
@@ -1107,14 +1112,144 @@ export class Config {
     );
   }
 
+  /**
+   * Maximal superset of workspace ids present in the RAW persisted config,
+   * for destructive "id is not in config" decisions (extension-metadata
+   * pruning, orphan session-dir cleanup).
+   *
+   * loadConfigOrDefault's validation/normalization is LOSSY: entries it
+   * filters or discards (invalid project paths, malformed pairs, entries a
+   * migration rewrites) simply vanish from the normalized view, so a pruner
+   * keyed on that view would treat their live workspaces as removed and
+   * delete their data. This scan instead walks the raw `projects` subtree
+   * and collects every string `id` it can find, without judging validity —
+   * over-collection merely retains a stale entry a little longer, while
+   * under-collection destroys live data. Callers should union this with the
+   * normalized view (which contains ids created by in-memory migrations).
+   *
+   * Throws when the file exists but cannot be read/parsed or the root is not
+   * a plain object; a missing file resolves as an empty set (fresh install).
+   */
+  readPersistedWorkspaceIdSuperset(): Set<string> {
+    return this.readPersistedWorkspaceIdEvidence().ids;
+  }
+
+  /**
+   * readPersistedWorkspaceIdSuperset plus a completeness signal: whether any
+   * persisted workspace entry lacks an inline string id. Only such id-less
+   * (legacy) entries can be registered "raw-invisibly" — their stable id
+   * lives in the session metadata.json, which only the authoritative
+   * enumeration resolves. When this reports false, the raw id set is
+   * complete registration evidence and callers can skip that per-workspace
+   * enumeration. Detection is conservative in the destructive direction:
+   * any workspaces container whose entries cannot be verified to carry ids
+   * reports true (over-reporting merely costs an extra enumeration, while
+   * under-reporting could let a pruner delete a live legacy workspace).
+   */
+  readPersistedWorkspaceIdEvidence(): {
+    ids: Set<string>;
+    hasWorkspaceEntriesWithoutIds: boolean;
+  } {
+    const ids = new Set<string>();
+    let hasWorkspaceEntriesWithoutIds = false;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.configFile, "utf-8");
+    } catch (error) {
+      // No existsSync probe: it also returns false for EACCES/ENOTDIR/EIO,
+      // which would report a transiently unreadable config as an empty id
+      // set and let destructive callers treat every workspace as removed.
+      // Only a genuinely missing file is a healthy empty set (fresh install).
+      if (isEnoentError(error)) {
+        return { ids, hasWorkspaceEntriesWithoutIds };
+      }
+      throw error;
+    }
+    const parsedValue: unknown = JSON.parse(raw);
+    if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
+      throw new Error("Config root must be a JSON object");
+    }
+    const hasInlineStringId = (value: unknown): boolean => {
+      if (value === null || typeof value !== "object") {
+        return false;
+      }
+      const id = (value as { id?: unknown }).id;
+      return typeof id === "string" && id.length > 0;
+    };
+    // Collect ids ONLY from the direct entries of `projects[*][1].workspaces`
+    // — never from arbitrary nested objects. Workspace entries carry nested
+    // id-bearing objects (e.g. taskPendingGuidance items) and can even carry
+    // nested `workspaces`-keyed fields written by other builds; ids found
+    // there can reference OTHER (including removed) workspaces, and treating
+    // them as registered corrupts registration evidence (aborted deletions,
+    // lifted tombstones, ghost activity probes) and unbounds the activity
+    // scope. Under-collection stays safe: any workspaces container whose
+    // entries cannot be verified (id-less entry, non-array container) flips
+    // the incompleteness flag, routing callers to the strict enumeration.
+    //
+    // The OUTER structure must be interpretable too, or the id set cannot be
+    // proven complete: a present non-array `projects`, a non-pair element, a
+    // non-object project config, or a project config with no workspaces key
+    // at all may be a mangled remnant of real registrations. Only an absent
+    // projects key is healthy emptiness (the strict loader accepts it).
+    // A malformed sibling project only flips the flag — ids from the
+    // remaining well-formed projects are still collected.
+    const projects = (parsedValue as { projects?: unknown }).projects;
+    if (projects !== undefined) {
+      if (!Array.isArray(projects)) {
+        hasWorkspaceEntriesWithoutIds = true;
+      } else {
+        for (const pair of projects) {
+          const projectConfig: unknown = Array.isArray(pair) ? pair[1] : undefined;
+          if (
+            projectConfig === null ||
+            typeof projectConfig !== "object" ||
+            Array.isArray(projectConfig)
+          ) {
+            hasWorkspaceEntriesWithoutIds = true;
+            continue;
+          }
+          const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
+          if (!Array.isArray(workspaces)) {
+            // A missing key or a PRESENT container in any non-array shape is
+            // uninterpretable evidence — the original entries may have been
+            // mangled, so the raw id set cannot be proven complete.
+            hasWorkspaceEntriesWithoutIds = true;
+            continue;
+          }
+          for (const entry of workspaces) {
+            if (hasInlineStringId(entry)) {
+              ids.add((entry as { id: string }).id);
+            } else {
+              hasWorkspaceEntriesWithoutIds = true;
+            }
+          }
+        }
+      }
+    }
+    return { ids, hasWorkspaceEntriesWithoutIds };
+  }
+
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
     try {
-      if (fs.existsSync(this.configFile)) {
+      try {
         rawBytes = fs.readFileSync(this.configFile);
+      } catch (readError) {
+        // No existsSync probe: it also returns false for EACCES/ENOTDIR/EIO,
+        // which would silently select the fresh-install default while the
+        // config is merely transiently unreadable — in strict mode that
+        // empty view feeds destructive "not in config" decisions. Route
+        // non-ENOENT failures through the shared failure path below
+        // (throwOnError callers rethrow); only ENOENT means missing.
+        if (!isEnoentError(readError)) {
+          throw readError;
+        }
+      }
+      if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
         if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
           throw new Error("Config root must be a JSON object");
@@ -1266,6 +1401,84 @@ export class Config {
         // Config is stored as array of [path, config] pairs.
         // Older/newer files may omit `projects`; treat missing/invalid values as an empty map
         // so top-level settings (provider/runtime/server preferences) still load.
+        //
+        // Strict mode must NOT accept that lenient normalization: callers that
+        // make destructive "id is not in config" decisions (extension-metadata
+        // pruning, orphan session-dir cleanup) would interpret a structurally
+        // invalid-but-parseable file (e.g. `projects: {}` or a non-array
+        // `workspaces`) as an empty/partial workspace set and delete live
+        // data. A genuinely ABSENT `projects` key stays valid in strict mode:
+        // it is how older/newer builds persist a config with no projects.
+        if (options?.throwOnError && parsed.projects !== undefined) {
+          if (!Array.isArray(parsed.projects)) {
+            throw new Error("Config projects must be an array of [path, config] pairs");
+          }
+          for (const pair of parsed.projects) {
+            if (!Array.isArray(pair)) {
+              throw new Error("Config projects entries must be [path, config] pairs");
+            }
+            const projectKey: unknown = pair[0];
+            // The lenient normalization below silently drops the WHOLE
+            // project when its key is empty or non-string ("Filtering out
+            // project with invalid path"), and an id-less legacy workspace
+            // inside it is raw-invisible too (its stable id lives only in
+            // session metadata.json, which only the normalized enumeration
+            // resolves). Accepting the pair here would hand destructive
+            // strict callers an authoritative id set missing every one of
+            // that project's workspaces — the startup prune would then
+            // permanently delete their recency/goal/status snapshots.
+            if (typeof projectKey !== "string" || projectKey.length === 0) {
+              throw new Error("Config project entries must have a non-empty string path");
+            }
+            const projectConfig: unknown = pair[1];
+            // Arrays pass typeof "object": lenient normalization would turn
+            // an array-valued project config into a project with no
+            // workspaces, and destructive strict callers would then classify
+            // every one of its workspaces as removed.
+            if (
+              projectConfig === null ||
+              typeof projectConfig !== "object" ||
+              Array.isArray(projectConfig)
+            ) {
+              throw new Error("Config project entries must be objects");
+            }
+            const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
+            // ProjectConfigSchema persists `workspaces` as a REQUIRED array,
+            // so a present project entry without the key is mangled state
+            // (readPersistedWorkspaceIdEvidence flags it incomplete too).
+            // Accepting it here would hand destructive callers an
+            // authoritatively-empty workspace set for that project.
+            if (!Array.isArray(workspaces)) {
+              throw new Error("Config project workspaces must be an array");
+            }
+            for (const workspaceEntry of workspaces) {
+              // WorkspaceSchema persists workspace entries as objects; a
+              // non-object entry is mangled state whose identity cannot be
+              // established.
+              if (
+                workspaceEntry === null ||
+                typeof workspaceEntry !== "object" ||
+                Array.isArray(workspaceEntry)
+              ) {
+                throw new Error("Config workspace entries must be objects");
+              }
+              const workspaceId = (workspaceEntry as { id?: unknown }).id;
+              // A truthy non-string id (42, {}) would ride the modern-entry
+              // branch of getAllWorkspaceMetadata as the authoritative id,
+              // so the prune's known set would omit the workspace's REAL
+              // string identity and delete its activity snapshot. Nullish
+              // ids stay valid: legacy entries resolve their stable id
+              // through session metadata.json, and the strict guard there
+              // fails closed when that resolution yields no usable id.
+              if (
+                workspaceId != null &&
+                !(typeof workspaceId === "string" && workspaceId.length > 0)
+              ) {
+                throw new Error("Config workspace ids must be non-empty strings");
+              }
+            }
+          }
+        }
         const rawPairs = Array.isArray(parsed.projects) ? parsed.projects : [];
         // Migrate: normalize project paths by stripping trailing slashes
         // This fixes configs created with paths like "/home/user/project/"
@@ -2105,7 +2318,19 @@ export class Config {
    * Find a workspace by ID.
    * @returns Stored config project key plus a separate attribution project path, or null
    */
-  findWorkspace(workspaceId: string): {
+  findWorkspace(
+    workspaceId: string,
+    options?: {
+      /**
+       * Propagate failures that hide a workspace's identity (unreadable or
+       * unparseable config / legacy session metadata.json) instead of
+       * skipping the entry. Callers making destructive "id is not
+       * registered" decisions must use this: a lenient miss is
+       * indistinguishable from a genuine absence.
+       */
+      throwOnError?: boolean;
+    }
+  ): {
     workspacePath: string;
     projectPath: string;
     attributionProjectPath?: string;
@@ -2114,7 +2339,7 @@ export class Config {
     parentWorkspaceId?: string;
     pendingAutoTitle?: boolean;
   } | null {
-    const config = this.loadConfigOrDefault();
+    const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
 
     for (const [projectPath, project] of config.projects) {
       for (const workspace of project.workspaces) {
@@ -2143,28 +2368,90 @@ export class Config {
 
           // Try loading metadata with basename as ID (works for old workspaces)
           const metadataPath = path.join(this.getSessionDir(workspaceBasename), "metadata.json");
-          if (fs.existsSync(metadataPath)) {
-            try {
-              const data = fs.readFileSync(metadataPath, "utf-8");
-              const metadata = JSON.parse(data) as WorkspaceMetadata;
-              this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
-              if (metadata.id === workspaceId) {
-                return {
-                  workspacePath: workspace.path,
-                  projectPath,
-                  attributionProjectPath,
-                  projects: metadata.projects ?? workspace.projects,
-                  workspaceName: undefined,
-                  parentWorkspaceId: undefined,
-                };
-              }
-            } catch {
-              // Ignore parse errors, try legacy ID
+          try {
+            const data = fs.readFileSync(metadataPath, "utf-8");
+            const metadata = JSON.parse(data) as WorkspaceMetadata;
+            this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
+            // Parseable-but-id-less metadata (e.g. `{}`) leaves this entry's
+            // identity unknowable: strict callers (the extension-metadata
+            // discard) must not conclude "not registered" from it, or a live
+            // workspace whose stable id lived only here gets its activity
+            // deleted and write-tombstoned. Mirrors the strict enumeration
+            // guard in getAllWorkspaceMetadata. The catch below rethrows this
+            // for strict callers and keeps ignoring it for lenient ones.
+            if (
+              options?.throwOnError &&
+              !(typeof metadata.id === "string" && metadata.id.length > 0)
+            ) {
+              throw new Error(
+                `Legacy workspace metadata at ${metadataPath} resolved without a usable id`
+              );
             }
+            if (metadata.id === workspaceId) {
+              return {
+                workspacePath: workspace.path,
+                projectPath,
+                attributionProjectPath,
+                projects: metadata.projects ?? workspace.projects,
+                workspaceName: undefined,
+                parentWorkspaceId: undefined,
+              };
+            }
+          } catch (error) {
+            // A genuinely missing file is the common case (most entries have
+            // no legacy metadata.json). The entry's identity may live in an
+            // unreadable/unparseable one though, so strict callers must not
+            // conclude "absent" from a failed lookup.
+            if (!isEnoentError(error) && options?.throwOnError) {
+              throw error;
+            }
+            // Ignore errors, try legacy ID
+          }
+
+          // Authoritative legacy path: getAllWorkspaceMetadata resolves an
+          // id-less entry's stable id from sessions/<generated-legacy-id>/
+          // metadata.json (NOT the basename path above). Callers verifying
+          // "is this id still registered" (e.g. the extension-metadata
+          // discard) must see the same identity, or a stable id that lives
+          // only in that file would be reported absent while its workspace
+          // remains registered.
+          const legacyId = this.generateLegacyId(projectPath, workspace.path);
+          const legacyMetadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
+          try {
+            const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
+            const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
+            this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
+            // Same unknowable-identity guard as the basename lookup above:
+            // this is the authoritative file getAllWorkspaceMetadata resolves
+            // stable ids from, so an id-less parse here must fail closed in
+            // strict mode rather than fall through to "not registered".
+            if (
+              options?.throwOnError &&
+              !(typeof legacyMetadata.id === "string" && legacyMetadata.id.length > 0)
+            ) {
+              throw new Error(
+                `Legacy workspace metadata at ${legacyMetadataPath} resolved without a usable id`
+              );
+            }
+            if (legacyMetadata.id === workspaceId) {
+              return {
+                workspacePath: workspace.path,
+                projectPath,
+                attributionProjectPath,
+                projects: legacyMetadata.projects ?? workspace.projects,
+                workspaceName: undefined,
+                parentWorkspaceId: undefined,
+              };
+            }
+          } catch (error) {
+            // Same strict-mode contract as the basename lookup above.
+            if (!isEnoentError(error) && options?.throwOnError) {
+              throw error;
+            }
+            // Ignore errors, try legacy ID
           }
 
           // Try legacy ID format as last resort
-          const legacyId = this.generateLegacyId(projectPath, workspace.path);
           if (legacyId === workspaceId) {
             return {
               workspacePath: workspace.path,
@@ -2224,8 +2511,30 @@ export class Config {
    * If missing from config or legacy metadata, a new timestamp is assigned and
    * saved to config for subsequent loads.
    */
-  async getAllWorkspaceMetadata(): Promise<FrontendWorkspaceMetadata[]> {
-    const config = this.loadConfigOrDefault();
+  async getAllWorkspaceMetadata(options?: {
+    /**
+     * Throw on config read/parse failure instead of silently resolving with
+     * the empty default. Callers that make destructive decisions based on
+     * "workspace is not in config" (e.g. extension-metadata pruning) must use
+     * this: the swallowed-failure default is indistinguishable from a truly
+     * empty config. A missing config file still resolves as empty (healthy
+     * fresh install), matching loadConfigOrDefault.
+     */
+    throwOnError?: boolean;
+    /**
+     * Out-parameter collecting ADDITIONAL stable ids that findWorkspace()
+     * can resolve for id-less legacy entries but that are not the returned
+     * entry's primary id: when both compatibility files
+     * (sessions/<basename>/metadata.json and
+     * sessions/<generated-legacy-id>/metadata.json) exist with different
+     * ids, only the first becomes the metadata entry, yet the second
+     * identity remains registered for targeted lookups. Destructive callers
+     * building "known id" sets must include these aliases or they would
+     * delete activity data findWorkspace still vouches for.
+     */
+    legacyAliasIds?: Set<string>;
+  }): Promise<FrontendWorkspaceMetadata[]> {
+    const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
@@ -2394,15 +2703,90 @@ export class Config {
             continue; // Skip metadata file lookup
           }
 
-          // LEGACY FORMAT: Fall back to reading metadata.json
-          // Try legacy ID format first (project-workspace) - used by E2E tests and old workspaces
+          // LEGACY FORMAT: Fall back to reading metadata.json.
+          // findWorkspace resolves an id-less entry's stable id from EITHER
+          // sessions/<generated-legacy-id>/metadata.json or
+          // sessions/<workspace-basename>/metadata.json (old layout).
+          // Enumerate BOTH candidates: destructive callers (the
+          // extension-metadata prune) classify ids as stale against this
+          // enumeration, so a stable id that findWorkspace can resolve but
+          // this walk cannot would be deleted as unknown.
+          // The generated-legacy record stays CANONICAL when both exist:
+          // this walk's primary id feeds the read-time config migration, and
+          // it historically consulted only the generated-legacy file — making
+          // a (potentially stale) basename-side file primary would rewrite
+          // the workspace's persisted stable id on upgrade and orphan its
+          // session history. The basename id is surfaced as an alias below;
+          // it becomes primary only when it is the sole surviving record.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
-          const metadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
           let metadataFound = false;
 
-          if (fs.existsSync(metadataPath)) {
-            const data = fs.readFileSync(metadataPath, "utf-8");
-            const metadata = JSON.parse(data) as WorkspaceMetadata;
+          let metadataPath = "";
+          let legacyMetadataRaw: string | undefined;
+          const candidateIds =
+            workspaceBasename === legacyId ? [legacyId] : [legacyId, workspaceBasename];
+          for (const candidateId of candidateIds) {
+            const candidatePath = path.join(this.getSessionDir(candidateId), "metadata.json");
+            let candidateRaw: string | undefined;
+            try {
+              candidateRaw = fs.readFileSync(candidatePath, "utf-8");
+            } catch (readError) {
+              // Missing is normal (most entries never had a legacy
+              // metadata.json). Any other failure means the workspace's
+              // authoritative stable id is unknowable right now — surface it
+              // to the catch below instead of silently substituting the
+              // generated legacy path id via the !metadataFound branch.
+              if (!isEnoentError(readError)) {
+                // Secondary-candidate failure with a usable canonical
+                // record already in hand: lenient loads keep the canonical
+                // identity instead of discarding it for skeletal path-id
+                // fallback metadata (which would surface the workspace
+                // under the WRONG id with its session history apparently
+                // missing). Destructive strict enumeration still fails
+                // closed — the unreadable alias file may hide a registered
+                // identity.
+                if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
+                  continue;
+                }
+                throw readError;
+              }
+              continue;
+            }
+            if (legacyMetadataRaw === undefined) {
+              legacyMetadataRaw = candidateRaw;
+              metadataPath = candidatePath;
+              continue;
+            }
+            // A SECOND resolvable compatibility file: findWorkspace() tries
+            // every candidate, so its id stays registered for targeted
+            // lookups even though only the first file becomes the metadata
+            // entry. Surface it through the legacyAliasIds out-parameter so
+            // destructive known-id sets retain it. findWorkspace consults
+            // candidate files only for id-less entries; for a partially
+            // migrated entry (inline id, no name) the alias is
+            // over-inclusive, which errs toward retention, never deletion.
+            // A corrupt or id-less second file leaves the alias identity
+            // unknowable — fail closed in strict mode, mirroring the
+            // primary lookup guards.
+            let aliasMetadata: WorkspaceMetadata | undefined;
+            try {
+              aliasMetadata = JSON.parse(candidateRaw) as WorkspaceMetadata;
+            } catch (parseError) {
+              if (options?.throwOnError) {
+                throw parseError;
+              }
+            }
+            const aliasId = aliasMetadata?.id;
+            if (typeof aliasId === "string" && aliasId.length > 0) {
+              options?.legacyAliasIds?.add(aliasId);
+            } else if (aliasMetadata !== undefined && options?.throwOnError) {
+              throw new Error(
+                `Legacy workspace metadata at ${candidatePath} resolved without a usable id`
+              );
+            }
+          }
+          if (legacyMetadataRaw !== undefined) {
+            const metadata = JSON.parse(legacyMetadataRaw) as WorkspaceMetadata;
             this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
 
             // Ensure required fields are present
@@ -2461,6 +2845,21 @@ export class Config {
             // different value here would hand the UI an ID that findWorkspace cannot
             // resolve until the next reload.
             metadata.id = workspace.id ?? metadata.id;
+            // Strict callers make destructive "id is not known" decisions (the
+            // extension-metadata prune): metadata.json that parses but carries
+            // no usable id (e.g. `{}`, or a non-object like an array) resolves
+            // to an id-less entry here, and the workspace's REAL stable id —
+            // recorded nowhere else — would be classified as stale and its
+            // activity data permanently deleted. Successful JSON parsing does
+            // not establish identity; fail closed instead.
+            if (
+              options?.throwOnError &&
+              !(typeof metadata.id === "string" && metadata.id.length > 0)
+            ) {
+              throw new Error(
+                `Legacy workspace metadata at ${metadataPath} resolved without a usable id`
+              );
+            }
             metadata.name = workspace.name ?? metadata.name;
             metadata.createdAt = workspace.createdAt ?? metadata.createdAt;
             metadata.runtimeConfig = workspace.runtimeConfig ?? metadata.runtimeConfig;
@@ -2576,6 +2975,14 @@ export class Config {
             );
           }
         } catch (error) {
+          // Strict callers make destructive "id is not known" decisions (the
+          // extension-metadata prune): for a legacy entry whose stable id
+          // lives only in its unreadable/unparseable metadata.json, the
+          // generated-path-id fallback below would classify the real id's
+          // entries as stale. Propagate the identity-lookup failure instead.
+          if (options?.throwOnError) {
+            throw error;
+          }
           log.error(`Failed to load/migrate workspace metadata:`, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);

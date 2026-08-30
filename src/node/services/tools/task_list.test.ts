@@ -6,7 +6,8 @@ import type { ToolExecutionOptions } from "ai";
 import { createTaskListTool } from "./task_list";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import { Config, type Workspace } from "@/node/config";
-import type { AgentTaskStatus, TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type {
   WorkspaceTurnTaskHandleRecord,

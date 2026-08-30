@@ -81,6 +81,12 @@ export function formatModelDisplayName(modelName: string): string {
     }
   }
 
+  // GLM models
+  if (lower.startsWith("glm-")) {
+    const parts = lower.slice("glm-".length).split("-");
+    return `GLM ${parts.map(capitalize).join(" ")}`;
+  }
+
   // GPT models
   if (lower.startsWith("gpt-")) {
     const parts = lower.split("-");

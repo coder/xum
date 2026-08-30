@@ -66,7 +66,11 @@ import {
 } from "@/browser/features/ChatInput/draftAttachmentsStorage";
 import type { MuxMessageMetadata } from "@/common/types/message";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
-import { processSlashCommand, type SlashCommandContext } from "@/browser/utils/chatCommands";
+import {
+  processSlashCommand,
+  type CommandAction,
+  type SlashCommandEnv,
+} from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   useWorkspaceName,
@@ -741,7 +745,7 @@ export function useCreationWorkspace({
 
         if (initialSlashCommand) {
           await initialAiSettingsPersisted;
-          const commandContext: SlashCommandContext = {
+          const commandEnv: SlashCommandEnv = {
             api,
             workspaceId: metadata.id,
             variant: "workspace",
@@ -749,18 +753,25 @@ export function useCreationWorkspace({
             rawInput: messageText,
             dynamicWorkflowsEnabled,
             sendMessageOptions,
-            setInput: () => undefined,
-            setAttachments: () => undefined,
-            setSendingState: () => undefined,
-            setToast,
-            setPreferredModel: () => undefined,
-            setVimEnabled: () => undefined,
-            resetInputHeight: () => undefined,
           };
-          const commandResult = await processSlashCommand(initialSlashCommand, commandContext);
+          // Creation owns only toast state; composer actions intentionally remain local to ChatInput.
+          const applyCommandActions = (actions: CommandAction[]) => {
+            for (const action of actions) {
+              if (action.type === "show-toast") setToast(action.toast);
+            }
+          };
+          let commandResult = await processSlashCommand(initialSlashCommand, commandEnv);
+          while (commandResult.kind === "phase") {
+            applyCommandActions(commandResult.actions);
+            commandResult = await commandResult.continue();
+          }
+          applyCommandActions(commandResult.actions);
+          if (commandResult.backgroundTask) {
+            void commandResult.backgroundTask().then(applyCommandActions);
+          }
           setIsSending(false);
 
-          if (!commandResult.clearInput) {
+          if (commandResult.inputDisposition !== "consume") {
             workspaceStore.clearPendingInitialSendState(metadata.id);
             return { success: false };
           }

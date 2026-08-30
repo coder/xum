@@ -59,6 +59,8 @@ describe("MockAiStreamPlayer", () => {
 
   test("appends assistant placeholder even when router turn ends with stream error", async () => {
     const aiServiceStub = new EventEmitter();
+    // Bare EventEmitters throw on unobserved "error" emits (production always subscribes).
+    aiServiceStub.on("error", () => undefined);
 
     const player = new MockAiStreamPlayer({
       historyService,
@@ -98,6 +100,8 @@ describe("MockAiStreamPlayer", () => {
       workspaceId
     );
     expect(secondResult.success).toBe(true);
+    if (!secondResult.success || !secondResult.data) throw new Error("expected a stream handle");
+    expect(await secondResult.data.completion).toMatchObject({ status: "failed" });
 
     // Read back all messages and check the assistant placeholders
     const allResult = await historyService.getLastMessages(workspaceId, 100);
@@ -684,6 +688,8 @@ describe("MockAiStreamPlayer", () => {
     expect(playResult.success).toBe(true);
 
     await waitForCondition(() => !player.isStreaming(workspaceId), 2000);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    expect(await playResult.data.completion).toMatchObject({ status: "completed" });
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial).toBeNull();
@@ -800,5 +806,7 @@ describe("MockAiStreamPlayer", () => {
 
     expect(deltaCount).toBe(deltasAtStop);
     expect(abortCount).toBe(1);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    expect(await playResult.data.completion).toMatchObject({ status: "aborted" });
   });
 });

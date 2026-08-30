@@ -285,6 +285,93 @@ describe("task tool", () => {
     });
   });
 
+  it("announces the possibly superseded handle only when createWorkspaceTurn reports one", async () => {
+    using tempDir = new TestTempDir("test-task-tool-workspace-turn-supersede-note");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const executeFollowUp = async (maySupersedeTaskId?: string): Promise<{ note?: string }> => {
+      const createWorkspaceTurn = mock(() =>
+        Ok({
+          taskId: "wst_follow_up",
+          kind: "workspace_turn" as const,
+          status: "queued" as const,
+          workspaceId: "child-workspace",
+          ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
+        })
+      );
+      const taskService = { createWorkspaceTurn } as unknown as TaskService;
+      const tool = createTaskTool({ ...baseConfig, taskService });
+      return (await Promise.resolve(
+        tool.execute!(
+          {
+            kind: "workspace",
+            prompt: "follow up",
+            title: "Follow-up",
+            run_in_background: true,
+            workspace: { mode: "existing", workspaceId: "child-workspace" },
+          },
+          mockToolCallOptions
+        )
+      )) as { note?: string };
+    };
+
+    // Assert on the superseded handle id, not the note prose.
+    const announced = await executeFollowUp("wst_previous_turn");
+    expect(announced.note).toContain("wst_previous_turn");
+
+    const silent = await executeFollowUp();
+    expect(silent.note ?? "").not.toContain("wst_previous_turn");
+  });
+
+  it("carries the superseded handle id into foreground completed results", async () => {
+    // The old handle's wake is suppressed, so a foreground completion is the
+    // owner's only notification that its previously tracked handle settled.
+    using tempDir = new TestTempDir("test-task-tool-workspace-turn-supersede-completed");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const executeForegroundFollowUp = async (
+      maySupersedeTaskId?: string
+    ): Promise<{ status?: string; note?: string }> => {
+      const createWorkspaceTurn = mock(() =>
+        Ok({
+          taskId: "wst_follow_up",
+          kind: "workspace_turn" as const,
+          status: "queued" as const,
+          workspaceId: "child-workspace",
+          ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
+        })
+      );
+      const waitForWorkspaceTurn = mock(() =>
+        Promise.resolve({
+          taskId: "wst_follow_up",
+          workspaceId: "child-workspace",
+          updatedAt: "2026-08-11T00:00:00.000Z",
+          reportMarkdown: "done",
+        })
+      );
+      const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
+      const tool = createTaskTool({ ...baseConfig, taskService });
+      return (await Promise.resolve(
+        tool.execute!(
+          {
+            kind: "workspace",
+            prompt: "follow up",
+            title: "Follow-up",
+            run_in_background: false,
+            workspace: { mode: "existing", workspaceId: "child-workspace" },
+          },
+          mockToolCallOptions
+        )
+      )) as { status?: string; note?: string };
+    };
+
+    const announced = await executeForegroundFollowUp("wst_previous_turn");
+    expect(announced.status).toBe("completed");
+    expect(announced.note).toContain("wst_previous_turn");
+
+    const silent = await executeForegroundFollowUp();
+    expect(silent.status).toBe("completed");
+    expect(silent.note ?? "").not.toContain("wst_previous_turn");
+  });
+
   it("forwards isolation to taskService.create", async () => {
     using tempDir = new TestTempDir("test-task-tool-isolation-passthrough");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

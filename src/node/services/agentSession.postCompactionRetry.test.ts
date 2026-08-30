@@ -13,6 +13,17 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
+import { createFailedTurnHandle, createStartedTurnHandle } from "./agentSession.testHarness";
+
+function contextExceededResult(messageId: string) {
+  return {
+    success: true as const,
+    data: createFailedTurnHandle(messageId, {
+      error: "Context length exceeded",
+      errorType: "context_exceeded",
+    }),
+  };
+}
 
 function createPersistedPostCompactionState(options: {
   filePath: string;
@@ -91,11 +102,14 @@ describe("AgentSession post-compaction context retry", () => {
           errorType: "context_exceeded",
         });
 
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
       }
 
       resolveSecondCall?.();
-      return Promise.resolve({ success: true as const, data: undefined });
+      return Promise.resolve({
+        success: true as const,
+        data: createStartedTurnHandle("assistant-retry"),
+      });
     });
 
     const aiService: AIService = {
@@ -237,7 +251,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return { success: true as const, data: undefined };
+        return contextExceededResult("assistant-ctx-exceeded");
       }
       // Retry startup in flight: hold it until the test releases, then fail
       // pre-stream (e.g. commitPartial / history read failure).
@@ -372,7 +386,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve(contextExceededResult("assistant-attempt-1"));
       }
       // The retry's startup succeeds, but the stream dies immediately with a
       // terminal error — emitted before the original retry path resumes.
@@ -382,7 +396,13 @@ describe("AgentSession post-compaction context retry", () => {
         error: "The model refused to continue",
         errorType: "model_refusal",
       });
-      return Promise.resolve({ success: true as const, data: undefined });
+      return Promise.resolve({
+        success: true as const,
+        data: createFailedTurnHandle("assistant-attempt-2", {
+          error: "The model refused to continue",
+          errorType: "model_refusal",
+        }),
+      });
     });
 
     const aiService: AIService = {

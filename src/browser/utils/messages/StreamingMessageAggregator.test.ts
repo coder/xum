@@ -3795,6 +3795,46 @@ describe("StreamingMessageAggregator", () => {
       }
     });
 
+    test("drops nested starts whose parent part has not streamed in (no ghost top-level row)", () => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator, { messageId: "msg-1" });
+      // No parent tool part exists yet; streamManager re-emits the nested
+      // events after the parent lands, so the early event must be dropped.
+      startToolCall(aggregator, {
+        toolCallId: "nested-early-1",
+        toolName: "workflow_run",
+        args: {},
+        timestamp: 1100,
+        parentToolCallId: "parent-tool-1",
+      });
+
+      expect(
+        aggregator
+          .getDisplayedMessages()
+          .some((m) => m.type === "tool" && m.toolCallId === "nested-early-1")
+      ).toBe(false);
+    });
+
+    test("skips duplicate nested starts (reconnect replays re-emit them with the parent part)", () => {
+      const aggregator = createTestAggregator();
+      startParentTool(aggregator);
+      for (let i = 0; i < 2; i++) {
+        startToolCall(aggregator, {
+          toolCallId: "nested-tool-1",
+          toolName: "workflow_run",
+          args: { script_path: "wf.js" },
+          timestamp: 1100,
+          parentToolCallId: "parent-tool-1",
+        });
+      }
+
+      const toolMsg = parentToolMessage(aggregator);
+      if (toolMsg?.type !== "tool") {
+        throw new Error("Expected parent tool message");
+      }
+      expect(toolMsg.nestedCalls).toHaveLength(1);
+    });
+
     test("updates nested call with output on tool-call-end with parentToolCallId", () => {
       const aggregator = createTestAggregator();
       startParentTool(aggregator);
@@ -3870,23 +3910,6 @@ describe("StreamingMessageAggregator", () => {
         expect(toolMsg.nestedCalls![1].toolName).toBe("bash");
         expect(toolMsg.nestedCalls![1].state).toBe("output-available");
       }
-    });
-
-    test("falls through to create regular tool if parent not found", () => {
-      // Defensive behavior: out-of-order nested calls should become regular tool parts.
-      const aggregator = createTestAggregator();
-      startTestStream(aggregator, { messageId: "msg-1" });
-      startToolCall(aggregator, {
-        toolCallId: "nested-orphan",
-        toolName: "file_read",
-        args: { filePath: "test.txt" },
-        timestamp: 1000,
-        parentToolCallId: "non-existent-parent",
-      });
-
-      const toolParts = aggregator.getDisplayedMessages().filter((m) => m.type === "tool");
-      expect(toolParts).toHaveLength(1);
-      expect(toolParts[0].toolCallId).toBe("nested-orphan");
     });
 
     test("nested call end is ignored if nested call not found in parent", () => {

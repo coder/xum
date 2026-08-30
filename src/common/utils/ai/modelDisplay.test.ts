@@ -31,6 +31,12 @@ describe("formatModelDisplayName", () => {
     });
   });
 
+  describe("GLM models", () => {
+    test("preserves uppercase GLM branding", () => {
+      expect(formatModelDisplayName("glm-5.3-flash")).toBe("GLM 5.3 Flash");
+    });
+  });
+
   describe("GPT models", () => {
     test("formats GPT models", () => {
       expect(formatModelDisplayName("gpt-5-pro")).toBe("GPT-5 Pro");

@@ -180,6 +180,10 @@ export class QuickJSRuntime implements IJSRuntime {
   private disposed = false;
   private eventHandler?: (event: PTCEvent) => void;
   private abortController?: AbortController;
+  /** See IJSRuntime.takeActiveHostCallId: set synchronously right before a
+   * registered host function is invoked, consumed by the tool bridge inside
+   * that same synchronous window. */
+  private activeHostCallId?: string;
   private abortRequested = false; // Track abort requests before eval() starts
   private limits: RuntimeLimits = {};
   private consoleSetup = false;
@@ -341,6 +345,9 @@ export class QuickJSRuntime implements IJSRuntime {
       });
 
       try {
+        // Hand the record callId to the dispatched function (tool bridge)
+        // through the synchronous window contract; see takeActiveHostCallId.
+        this.activeHostCallId = callId;
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
@@ -723,15 +730,39 @@ export class QuickJSRuntime implements IJSRuntime {
       }
       // Budget exhausted: fall back to normal bounding — oversized results
       // become honest-size markers, small results still pass inline.
-      return QuickJSRuntime.preserveSuccessBit(
-        this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
-        retained
+      return this.applyRetainedResultFields(
+        QuickJSRuntime.preserveSuccessBit(
+          this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+          retained
+        ),
+        toolName,
+        sanitized
       );
     }
-    return QuickJSRuntime.preserveSuccessBit(
-      this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+    return this.applyRetainedResultFields(
+      QuickJSRuntime.preserveSuccessBit(
+        this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+        sanitized
+      ),
+      toolName,
       sanitized
     );
+  }
+
+  /** Merge captureResultRetained identity fields under a __kernelBounded
+   * result marker (marker fields win on collisions, mirroring the
+   * captureArgsRetained merge in boundCaptureArgs). No-op for results that
+   * survived bounding inline. */
+  private applyRetainedResultFields(bounded: unknown, toolName: string, source: unknown): unknown {
+    if (
+      typeof bounded !== "object" ||
+      bounded === null ||
+      (bounded as { __kernelBounded?: boolean }).__kernelBounded !== true
+    ) {
+      return bounded;
+    }
+    const retained = this.kernelRecordBounds?.captureResultRetained?.(toolName, source);
+    return retained !== undefined ? { ...retained, ...bounded } : bounded;
   }
 
   /** A boolean success bit is preserved onto EVERY __kernelBounded result
@@ -952,6 +983,8 @@ export class QuickJSRuntime implements IJSRuntime {
         });
 
         try {
+          // Same synchronous-window handoff as registerFunction.
+          this.activeHostCallId = callId;
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
@@ -1200,6 +1233,12 @@ export class QuickJSRuntime implements IJSRuntime {
   abort(): void {
     this.abortRequested = true;
     this.abortController?.abort();
+  }
+
+  takeActiveHostCallId(): string | undefined {
+    const callId = this.activeHostCallId;
+    this.activeHostCallId = undefined;
+    return callId;
   }
 
   getAbortSignal(): AbortSignal | undefined {

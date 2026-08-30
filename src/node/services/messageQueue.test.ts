@@ -585,6 +585,40 @@ describe("MessageQueue", () => {
       ).toBe(false);
     });
 
+    it("exposes the head entry's metadata and dispatch mode as the queue-cut candidate", () => {
+      expect(queue.getNextQueueCutCandidate()).toBeUndefined();
+
+      queue.add("Follow up", {
+        model: "gpt-4",
+        agentId: "exec",
+        muxMetadata: metadata,
+        queueDispatchMode: "turn-end",
+      });
+
+      const candidate = queue.getNextQueueCutCandidate();
+      expect(candidate?.dispatchMode).toBe("turn-end");
+      expect((candidate?.muxMetadata as MuxMessageMetadata).type).toBe("workspace-turn-task");
+    });
+
+    it("never batches a user message into a sealed workspace-turn entry", () => {
+      // Cut attribution reads the head entry's muxMetadata; the sealing
+      // invariant guarantees a manual user message queued after a
+      // workspace-turn follow-up lands in a SEPARATE entry, so workspace-turn
+      // metadata can never mask user-authored text.
+      queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+      queue.add("Manual user message");
+
+      expect(queue.getMessages()).toEqual(["Follow up", "Manual user message"]);
+      expect((queue.getNextQueueCutCandidate()?.muxMetadata as MuxMessageMetadata).type).toBe(
+        "workspace-turn-task"
+      );
+
+      queue.dequeueNext();
+      const next = queue.getNextQueueCutCandidate();
+      expect(next).toBeDefined();
+      expect(next?.muxMetadata).toBeUndefined();
+    });
+
     it("should strip correlation when queue reordering moves user input ahead", () => {
       const onCanceled = () => undefined;
       const onAcceptedPreStreamFailure = () => undefined;

@@ -5,15 +5,15 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
-import type { SendMessageError } from "@/common/types/errors";
-import type { Result } from "@/common/types/result";
 import { Ok } from "@/common/types/result";
 import { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
+import { createStartedTurnHandle } from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
+
 const config = {
   srcDir: "/tmp",
   getSessionDir: (_workspaceId: string) => "/tmp",
@@ -35,7 +35,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
   async function createSessionHarness(
     workspaceId: string,
-    streamHandler: StreamMessageHandler = () => Promise.resolve(Ok(undefined))
+    streamHandler: StreamMessageHandler = () => Promise.resolve(Ok(createStartedTurnHandle()))
   ) {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -282,8 +282,8 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const workspaceId = "ws-edit-preparing";
     const streamResolves: Array<() => void> = [];
     const streamHandler: StreamMessageHandler = (opts) => {
-      return new Promise<Result<void, SendMessageError>>((resolve) => {
-        const resolveOk = () => resolve(Ok(undefined));
+      return new Promise<Awaited<ReturnType<StreamMessageHandler>>>((resolve) => {
+        const resolveOk = () => resolve(Ok(createStartedTurnHandle()));
         if (opts.abortSignal?.aborted === true) {
           resolveOk();
           return;

@@ -139,6 +139,16 @@ describe("hasAnyConfiguredProvider", () => {
   });
 });
 
+describe("resolveProviderCredentials - Z.ai", () => {
+  it("resolves ZAI_API_KEY from the environment", () => {
+    const result = resolveProviderCredentials("zai", {}, { ZAI_API_KEY: "zai-test-key" });
+
+    expect(result.isConfigured).toBe(true);
+    expect(result.apiKey).toBe("zai-test-key");
+    expect(result.apiKeySource).toBe("env");
+  });
+});
+
 describe("resolveProviderCredentials - legacy op:// references", () => {
   it("falls back to the env key when config holds a legacy op:// reference", () => {
     const result = resolveProviderCredentials(
