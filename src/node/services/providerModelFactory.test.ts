@@ -100,17 +100,26 @@ async function withTempConfig(
   run: (
     config: Config,
     factory: ProviderModelFactory,
-    oauth: OauthServiceBindings
+    oauth: OauthServiceBindings,
+    providersConfigStore: ProvidersConfigStore
   ) => Promise<void> | void
 ): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
 
   try {
     const config = new Config(tmpDir);
-    const providerService = new ProviderService(config);
+    const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+    const providerService = new ProviderService(config, undefined, providersConfigStore);
     const oauth: OauthServiceBindings = {};
-    const factory = new ProviderModelFactory(config, providerService, undefined, oauth);
-    await run(config, factory, oauth);
+    const factory = new ProviderModelFactory(
+      config,
+      providerService,
+      undefined,
+      oauth,
+      undefined,
+      providersConfigStore
+    );
+    await run(config, factory, oauth, providersConfigStore);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -1055,7 +1064,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   });
 
   it("normalizes Request bodies for the Codex OAuth responses endpoint", async () => {
-    await withTempConfig(async (_config, factory, oauth) => {
+    await withTempConfig(async (_config, factory, oauth, providersConfigStore) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
       const requests: Array<{
         input: Parameters<typeof fetch>[0];
@@ -1104,7 +1113,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         );
       };
 
-      spyOn(ProvidersConfigStore.prototype, "loadProvidersConfig").mockReturnValue({
+      spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
         openai: {
           codexOauth: auth,
           fetch: baseFetch,

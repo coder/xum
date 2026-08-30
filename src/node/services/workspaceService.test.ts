@@ -16306,6 +16306,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   const workspaceId = "ws-archive";
   const projectPath = "/tmp/project";
   const workspacePath = "/tmp/project/ws-archive";
+  const sessionsDir = "/tmp/test/sessions";
+  const externalEditorMarkerPath = path.join(sessionsDir, workspaceId, "external-editor-opened");
 
   let workspaceService: WorkspaceService;
   let mockAIService: AIService;
@@ -16349,7 +16351,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
+      sessionsDir,
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -16655,7 +16657,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("acquirePreInterruptionArchiveHold validates and arms the gate before turn interruption", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // In-flight user activity must refuse BEFORE the caller destroys delegated turns: the
     // sink's own gate runs only after interruption, when the turns are already lost.
@@ -16713,7 +16715,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // Released (e.g. the archive failed): admissions flow again.
     const allowed = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold-2");
     expect(allowed.success).toBe(true);
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("acquirePreInterruptionArchiveHold binds the stream exemption to the delegated turns", () => {
@@ -16855,7 +16857,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("recordExternalEditorOpen refuses while the workspace is being archived", async () => {
     // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
     addToArchivingWorkspaces(workspaceService, workspaceId);
 
     const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-refused");
@@ -16870,7 +16872,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("recordExternalEditorOpen rejects workspace IDs without a config entry", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Unknown IDs never reach the marker path (which joins the raw ID beneath the sessions
     // directory), closing both stale-ID requests and traversal-crafted IDs.
@@ -16882,7 +16884,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     }
     let markerExists = true;
     try {
-      await fsPromises.access("/tmp/test/sessions/external-editor-opened");
+      await fsPromises.access(externalEditorMarkerPath);
     } catch {
       markerExists = false;
     }
@@ -16893,7 +16895,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("recordExternalEditorOpen marks the workspace as having an untrackable app open", async () => {
     // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
 
     const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-marks");
@@ -16902,11 +16904,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     // The durable marker outlives this test run; remove it so "not yet opened" assertions in
     // future runs (this fixture shares one session dir) stay deterministic.
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("recordExternalEditorOpenForLaunch rolls back a freshly created marker after a failed launch", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     expect(admitted.success).toBe(true);
@@ -16921,7 +16923,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("rollbackAfterFailedLaunch removes the marker when every open in a concurrent batch fails", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Two first-time recordings overlap in flight: the second sees the marker written by the
     // first, but that in-flight marker must not masquerade as evidence of a real prior
@@ -16942,7 +16944,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("rollbackRecordedEditorOpen redeems a renderer launch token", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Client-generated token: the renderer knows it even when the recording response is
     // lost, so an ambiguous outcome can still be reconciled.
@@ -16968,7 +16970,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("rollbackRecordedEditorOpen tombstones a token whose recording is still in flight", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // The renderer saw its recording RPC reject at the transport while the backend handler
     // was still persisting the marker, and rolled back immediately. The not-yet-registered
@@ -16990,7 +16992,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("a failed marker persistence does not leave stale ancestry for the next attempt", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Same filesystem hiccup hits both the probe (EACCES -> fail-closed "unknown", so the
     // batch records markerPreexisted: true) and the write. The failed attempt must discard
@@ -17018,7 +17020,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("archive gating stays closed while an editor recording is in flight", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Freeze the recording at its marker write: the pending-recording count must keep the
     // untrackable-app probe true for the whole in-flight window even though no durable
@@ -17051,7 +17053,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // An earlier session's editor may still be running behind a pre-existing marker; a later
     // failed launch must not delete the evidence protecting it.
     await fsPromises.mkdir("/tmp/test/sessions", { recursive: true });
-    await fsPromises.writeFile("/tmp/test/sessions/external-editor-opened", "earlier session");
+    await fsPromises.writeFile(externalEditorMarkerPath, "earlier session");
 
     const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     expect(admitted.success).toBe(true);
@@ -17059,11 +17061,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await admitted.data.rollbackAfterFailedLaunch();
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("rollbackAfterFailedLaunch preserves the marker while another open holds launch evidence", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     const failing = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     expect(failing.success).toBe(true);
@@ -17076,7 +17078,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await failing.data.rollbackAfterFailedLaunch();
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("archive waits for a retained background-init settlement before proceeding", async () => {

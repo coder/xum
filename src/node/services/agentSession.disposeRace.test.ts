@@ -80,7 +80,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -290,7 +290,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -377,7 +377,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -471,7 +471,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -616,7 +616,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({

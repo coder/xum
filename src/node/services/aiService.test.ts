@@ -190,11 +190,11 @@ function createRecordingOpenAIFetch(
 
 function configureOpenAICodexOAuth(
   service: AIService,
-  config: Config,
+  providersConfigStore: ProvidersConfigStore,
   requests: RecordedFetchRequest[],
   options?: { defaultAuth?: "apiKey"; responseModel?: string; setOauthService?: boolean }
 ): void {
-  new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+  spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
     openai: {
       apiKey: "test-openai-api-key",
       codexOauth: TEST_CODEX_OAUTH,
@@ -874,9 +874,9 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     },
   ])("$name", async ({ tempDirName, defaultAuth, endpointMatcher }) => {
     using xumHome = new DisposableTempDir(tempDirName);
-    const { config, service } = createBasicAIService(xumHome.path);
+    const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
-    configureOpenAICodexOAuth(service, config, requests, { defaultAuth });
+    configureOpenAICodexOAuth(service, providersConfigStore, requests, { defaultAuth });
 
     await createGeneratedModel(service, KNOWN_MODELS.GPT.id, [
       { role: "user", content: [{ type: "text", text: "Hello" }] },
@@ -889,9 +889,11 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
 
   it("ensures Codex OAuth routed Responses requests include non-empty instructions", async () => {
     using xumHome = new DisposableTempDir("codex-oauth-instructions");
-    const { config, service } = createBasicAIService(xumHome.path);
+    const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
-    configureOpenAICodexOAuth(service, config, requests, { responseModel: "gpt-5.3-codex" });
+    configureOpenAICodexOAuth(service, providersConfigStore, requests, {
+      responseModel: "gpt-5.3-codex",
+    });
     const systemPrompt = "Test system prompt";
 
     await createGeneratedModel(service, KNOWN_MODELS.GPT_53_CODEX.id, [
@@ -950,9 +952,11 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
 
   it("filters out item_reference entries and preserves inline items when routing through Codex OAuth", async () => {
     using xumHome = new DisposableTempDir("codex-oauth-filter-refs");
-    const { config, service } = createBasicAIService(xumHome.path);
+    const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
-    configureOpenAICodexOAuth(service, config, requests, { responseModel: "gpt-5.3-codex" });
+    configureOpenAICodexOAuth(service, providersConfigStore, requests, {
+      responseModel: "gpt-5.3-codex",
+    });
 
     await createGeneratedModel(service, KNOWN_MODELS.GPT_53_CODEX.id, [
       { role: "system", content: "You are a helpful assistant" },

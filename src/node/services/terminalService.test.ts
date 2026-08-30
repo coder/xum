@@ -34,6 +34,7 @@ const mockConfig = {
     projects: new Map(),
     terminalDefaultShell: undefined,
   })),
+  sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
   srcDir: "/tmp",
 } as unknown as Config;
 
@@ -50,7 +51,7 @@ function createConfigWithMetadata(metadata: {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
-    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 }
@@ -990,7 +991,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
-    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1016,7 +1017,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
-    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1039,7 +1040,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
-    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1062,7 +1063,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
-    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
+    sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1218,7 +1219,7 @@ describe("TerminalService.openNative", () => {
       // Session dir rooted under /dev/null: marker persistence (mkdir/writeFile) must fail.
       const configWithUnwritableSessions = {
         ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
-        getSessionDir: mock((id: string) => `/dev/null/sessions/${id}`),
+        sessionsDir: "/dev/null/sessions",
       } as unknown as Config;
       service = new TerminalService(configWithUnwritableSessions, mockPTYService, mockSecretsStore);
 
