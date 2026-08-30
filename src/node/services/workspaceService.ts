@@ -11141,6 +11141,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       : { status: "none" };
   }
 
+  /** Testable seam for the pre-truncation retirement in truncateHistory. */
+  private async retireKernelWorkflowRunReferences(workspaceId: string): Promise<void> {
+    await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+  }
+
   /**
    * Boundary snapshot for the agent-workflow-runs sidecar: the message ID of the newest
    * invocation-decision row for this run, or null when history has none. Recorded at
@@ -12888,6 +12893,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       }
     }
+    // Kernel workflow run references belong to the cleared conversation: a verified-empty
+    // (null) boundary snapshot recorded before the clear is indistinguishable from one
+    // recorded after it, so a surviving reference could inject a pre-clear workflow result
+    // into the fresh conversation. Retire them BEFORE the truncation commits so both fault
+    // directions fail safe: a failed retirement aborts with the conversation intact, and a
+    // failed truncation leaves reference-less runs settling superseded (dropped wake, still
+    // retrievable via resume) rather than a committed clear racing a live null-boundary
+    // reference it could no longer delete. A post-clear resume re-records provenance.
+    if (isFullClear) {
+      try {
+        await this.retireKernelWorkflowRunReferences(workspaceId);
+      } catch (error) {
+        return Err(
+          `Cannot clear history: stale workflow run references could not be retired ` +
+            `(${getErrorMessage(error)}). Retry once the session storage is writable.`
+        );
+      }
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
@@ -12906,22 +12929,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
-      // Kernel workflow run references belong to the cleared conversation: a verified-empty
-      // (null) boundary snapshot recorded before the clear is indistinguishable from one
-      // recorded after it, so a surviving reference could inject a pre-clear workflow result
-      // into the fresh conversation. Retire them immediately after the truncation commits,
-      // before any later post-clear step that can fail and return early (goal acknowledgment,
-      // carryover discard), or the stale reference would survive the committed clear. A
-      // post-clear resume re-records provenance.
-      try {
-        await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
-      } catch (error) {
-        return Err(
-          `History was cleared, but stale workflow run references could not be retired ` +
-            `(${getErrorMessage(error)}). A finished background workflow may re-inject its ` +
-            `result into the cleared conversation; retry once the session storage is writable.`
-        );
-      }
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the

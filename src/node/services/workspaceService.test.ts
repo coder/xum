@@ -9089,6 +9089,82 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("a failed reference retirement aborts the clear before truncation", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-retire-abort";
+    const runId = "wfr_currentness_retire_abort";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-retire-abort",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+
+      // Retirement failing after a committed truncation would leave the null-snapshot
+      // reference reading current against the emptied history (pre-clear output injected
+      // into the fresh conversation), so the clear must abort with the transcript intact.
+      const truncateSpy = spyOn(historyService, "truncateHistory");
+      const internal = workspaceService as unknown as {
+        retireKernelWorkflowRunReferences(id: string): Promise<void>;
+      };
+      const retireSpy = spyOn(internal, "retireKernelWorkflowRunReferences")
+        // Lazy rejection: an eager mockRejectedValueOnce promise trips bun's
+        // unhandled-rejection detector on this host before the clear consumes it.
+        .mockImplementationOnce(() => Promise.reject(new Error("read-only session storage")));
+      try {
+        const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
+        expect(clearResult.success).toBe(false);
+        if (!clearResult.success) {
+          expect(clearResult.error).toContain("could not be retired");
+        }
+        expect(truncateSpy).not.toHaveBeenCalled();
+      } finally {
+        retireSpy.mockRestore();
+        truncateSpy.mockRestore();
+      }
+
+      // A retry once storage recovers clears normally and retires the sidecar.
+      const retryResult = await workspaceService.truncateHistory(workspaceId, 1.0);
+      expect(retryResult.success).toBe(true);
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a delivered coalesced workflow result consumes the kernel run's currentness", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-coalesced";
