@@ -215,6 +215,39 @@ describe("runSubscriptionLoop", () => {
     expect(attached).toEqual(["first", "second"]);
   });
 
+  test("a client swap during getClient retries instead of binding the stale client", async () => {
+    const controller = new AbortController();
+    const subscribedClients: string[] = [];
+    let generation = 0;
+    const changeControllers = [new AbortController(), new AbortController()];
+
+    await runSubscriptionLoop<string, number, undefined>({
+      name: "test",
+      signal: controller.signal,
+      getClient: () => {
+        if (generation === 0) {
+          // Swap generations while the first attempt is awaiting the client.
+          generation = 1;
+          changeControllers[0].abort();
+          return Promise.resolve("stale-client");
+        }
+        return Promise.resolve("fresh-client");
+      },
+      getClientChangeSignal: () => changeControllers[generation === 0 ? 0 : 1].signal,
+      subscribe: (client, signal) => {
+        subscribedClients.push(client);
+        const stream = closeOnAbort<number>(signal);
+        stream.push(1);
+        return Promise.resolve({ events: stream.iterable, context: undefined });
+      },
+      onEvent: () => controller.abort(),
+      watchdog: false,
+      sleep: noSleep,
+    });
+
+    expect(subscribedClients).toEqual(["fresh-client"]);
+  });
+
   test("clean teardown aborts the active attempt without retrying", async () => {
     const controller = new AbortController();
     const clientChange = new AbortController();

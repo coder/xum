@@ -2010,6 +2010,8 @@ describe("WorkspaceStore", () => {
       createAndAddWorkspace(store, workspaceId);
       const rawStore = getInternal<{
         states: { bump: (key: string) => void };
+        streamingStatsStore: { bump: (key: string) => void };
+        streamingMessageStore: { has: (key: string) => boolean };
         handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
       }>(store);
 
@@ -2098,13 +2100,16 @@ describe("WorkspaceStore", () => {
         },
       ];
 
+      const statsBump = spyOn(rawStore.streamingStatsStore, "bump");
       bump.mockClear();
       for (const { event, createsRow } of deltas) {
         listener.mockClear();
         bump.mockClear();
+        statsBump.mockClear();
         rawStore.handleChatMessage(workspaceId, event);
         if (createsRow) {
           expect(bump).toHaveBeenCalledWith(workspaceId);
+          expect(statsBump).toHaveBeenCalledWith(workspaceId);
         } else {
           expect(bump).not.toHaveBeenCalled();
           expect(listener).toHaveBeenCalledTimes(1);
@@ -2117,6 +2122,23 @@ describe("WorkspaceStore", () => {
         messageId,
       });
       expect(bump).toHaveBeenCalledWith(workspaceId);
+
+      const streamingRow = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .find((message) => message.type === "assistant" && message.historyId === messageId)!;
+      expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).not.toBeNull();
+
+      rawStore.handleChatMessage(
+        workspaceId,
+        streamEndEvent(workspaceId, messageId, {
+          parts: [{ type: "text", text: "hello world" }],
+        })
+      );
+      // Terminal events release the keyed channel and stop overriding prop rows,
+      // so transcript-level transforms (e.g. merged stream errors) survive.
+      expect(rawStore.streamingMessageStore.has(`${workspaceId}\u0000${messageId}`)).toBe(false);
+      expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).toBeNull();
       unsubscribe();
     });
 
@@ -2149,7 +2171,7 @@ describe("WorkspaceStore", () => {
       const displayed = aggregator
         .getDisplayedMessages()
         .find((message) => message.type === "assistant" && message.historyId === messageId)!;
-      const live = store.getStreamingMessage(workspaceId, displayed.id);
+      const live = store.getStreamingMessage(workspaceId, displayed.id, messageId);
       expect(live?.type === "assistant" ? live.content : null).toBe("hello world");
 
       send(
@@ -2218,8 +2240,8 @@ describe("WorkspaceStore", () => {
       const tool = displayed.find((message) => message.type === "tool")!;
       const text = displayed.find((message) => message.type === "assistant")!;
 
-      expect(store.getStreamingMessage(workspaceId, tool.id)?.type).toBe("tool");
-      const liveText = store.getStreamingMessage(workspaceId, text.id);
+      expect(store.getStreamingMessage(workspaceId, tool.id, messageId)?.type).toBe("tool");
+      const liveText = store.getStreamingMessage(workspaceId, text.id, messageId);
       expect(liveText?.type === "assistant" ? liveText.content : null).toBe("summary");
     });
 

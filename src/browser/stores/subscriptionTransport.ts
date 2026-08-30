@@ -68,13 +68,16 @@ export async function runSubscriptionLoop<TClient, TEvent, TContext>(
   let attempt = 0;
 
   while (!options.signal.aborted) {
+    // Capture before awaiting the client: a swap during the await would
+    // otherwise bind the old client to the new generation's change signal.
+    const clientChangeSignal = options.getClientChangeSignal();
     const client = await options.getClient(options.signal);
     if (!client || options.signal.aborted) return;
+    if (clientChangeSignal.aborted) continue;
 
     const attemptController = new AbortController();
     const abortAttempt = () => attemptController.abort();
     options.signal.addEventListener("abort", abortAttempt, { once: true });
-    const clientChangeSignal = options.getClientChangeSignal();
     clientChangeSignal.addEventListener("abort", abortAttempt, { once: true });
 
     let lastEventAt = Date.now();

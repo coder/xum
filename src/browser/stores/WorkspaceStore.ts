@@ -914,6 +914,9 @@ export class WorkspaceStore {
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamEndData);
+      this.streamingMessageStore.delete(
+        getStreamingMessageKey(workspaceId, streamEndData.messageId)
+      );
 
       // Track stream completion telemetry
       this.trackStreamCompletedTelemetry(streamEndData, false);
@@ -972,6 +975,9 @@ export class WorkspaceStore {
     "stream-abort": (workspaceId, aggregator, data) => {
       const streamAbortData = data as StreamAbortEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamAbortData);
+      this.streamingMessageStore.delete(
+        getStreamingMessageKey(workspaceId, streamAbortData.messageId)
+      );
 
       // Track stream interruption telemetry (get model from aggregator)
       const model = aggregator.getCurrentModel();
@@ -1026,6 +1032,7 @@ export class WorkspaceStore {
         transient?.liveAdvisorOutput.delete(toolCallEnd.toolCallId);
         transient?.liveAdvisorReasoning.delete(toolCallEnd.toolCallId);
         transient?.liveAdvisorPhase.delete(toolCallEnd.toolCallId);
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallEnd.toolCallId));
       }
       if (toolCallEnd.toolName === "task") {
         transient?.liveTaskIds.delete(toolCallEnd.toolCallId);
@@ -1667,6 +1674,7 @@ export class WorkspaceStore {
     applyWorkspaceChatEventToAggregator(aggregator, data);
     if (messageId && aggregator.getMessagePartCount(messageId) !== partsBefore) {
       this.states.bump(workspaceId);
+      this.streamingStatsStore.bump(workspaceId);
     } else {
       this.scheduleStreamingMessageBump(workspaceId, aggregator);
     }
@@ -1692,13 +1700,16 @@ export class WorkspaceStore {
     this.pendingStreamingMessageBump.delete(workspaceId);
   }
 
-  getStreamingMessage(workspaceId: string, displayedId: string): DisplayedMessage | null {
-    return (
-      this.aggregators
-        .get(workspaceId)
-        ?.getDisplayedMessages()
-        .find((message) => message.id === displayedId) ?? null
-    );
+  getStreamingMessage(
+    workspaceId: string,
+    displayedId: string,
+    messageId: string
+  ): DisplayedMessage | null {
+    const aggregator = this.aggregators.get(workspaceId);
+    // Completed rows may be transformed by the transcript (e.g. merged stream
+    // errors); only the actively streaming message overrides its prop row.
+    if (!aggregator || aggregator.getActiveStreamMessageId() !== messageId) return null;
+    return aggregator.getDisplayedMessages().find((message) => message.id === displayedId) ?? null;
   }
 
   subscribeStreamingMessage(
@@ -3981,6 +3992,19 @@ export class WorkspaceStore {
     this.cancelPendingIdleBump(workspaceId);
     this.cancelPendingStreamingBump(workspaceId);
     this.streamingStatsStore.delete(workspaceId);
+    const activeStreamMessageId = this.aggregators.get(workspaceId)?.getActiveStreamMessageId();
+    if (activeStreamMessageId) {
+      this.streamingMessageStore.delete(getStreamingMessageKey(workspaceId, activeStreamMessageId));
+    }
+    const transientForRemoval = this.chatTransientState.get(workspaceId);
+    if (transientForRemoval) {
+      for (const toolCallId of new Set([
+        ...transientForRemoval.liveAdvisorOutput.keys(),
+        ...transientForRemoval.liveAdvisorReasoning.keys(),
+      ])) {
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
+      }
+    }
     this.lastUserPromptStore.bump(workspaceId);
     this.lastUserPromptStore.delete(workspaceId);
 
@@ -4538,6 +4562,7 @@ export class WorkspaceStore {
       // streamingStatsStore cache so useWorkspaceStreamingStats returns null.
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
+      this.streamingMessageStore.delete(getStreamingMessageKey(workspaceId, data.messageId));
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
       return;
@@ -5220,7 +5245,7 @@ export function useStreamingMessageDelta(
     },
     () => {
       if (!workspaceId || !messageId) return message;
-      return store.getStreamingMessage(workspaceId, message.id) ?? message;
+      return store.getStreamingMessage(workspaceId, message.id, messageId) ?? message;
     }
   );
 }
