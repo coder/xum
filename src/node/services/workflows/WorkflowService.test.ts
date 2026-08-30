@@ -1109,7 +1109,10 @@ describe("WorkflowService crash recovery", () => {
       projectTrusted: true,
     });
     expect(resumed).toEqual(["wfr_crash_repair_retry"]);
-    expect(repairCalls).toEqual(["workspace-1:wfr_crash_repair_retry"]);
+    // The shrunk retry timer can fire while resumeCrashedRuns is still awaiting the runner
+    // restart on a slow machine, so only the initial attempt's ordering is asserted here;
+    // the exact two-attempt sequence is asserted after the poll below.
+    expect(repairCalls[0]).toBe("workspace-1:wfr_crash_repair_retry");
 
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline && repairCalls.length < 2) {
