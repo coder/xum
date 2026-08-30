@@ -2475,6 +2475,14 @@ export class TurnRequestBuilder {
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
     const finalMessages = primaryRequest.messages;
+    // Debug sinks pair systemMessage with the message list, so when the
+    // assembler embedded the system prompt as a leading cached row
+    // (engineSystem undefined), drop that row to keep the system prompt
+    // single-sourced in captures.
+    const debugViewMessages =
+      primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
+        ? finalMessages.slice(1)
+        : finalMessages;
 
     captureMcpToolTelemetry({
       telemetryService: this.dependencies.telemetryService,
@@ -2585,7 +2593,7 @@ export class TurnRequestBuilder {
             workspaceId,
             model: modelString,
             systemMessage,
-            messages: finalMessages,
+            messages: debugViewMessages,
             tools: Object.fromEntries(
               Object.entries(tools).map(([n, t]) => [
                 n,
@@ -2631,7 +2639,7 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
       maxOutputTokens,
       systemMessage,
-      messages: finalMessages,
+      messages: debugViewMessages,
     };
 
     try {
