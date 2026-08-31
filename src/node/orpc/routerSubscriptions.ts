@@ -1,0 +1,548 @@
+import type {
+  FrontendWorkspaceMetadataSchemaType,
+  OnChatMode,
+  UpdateStatus,
+  WorkspaceActivitySnapshot,
+  WorkspaceChatMessage,
+  WorkspaceStatsSnapshot,
+} from "@/common/orpc/types";
+import type {
+  MemoryChangeEventPayload,
+  MemoryConsolidationStatusChangeEventPayload,
+} from "@/common/orpc/schemas/memory";
+import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
+import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
+import type { DevToolsEvent } from "@/common/types/devtools";
+import {
+  asyncIterableFromSubscription,
+  createAsyncEventQueue,
+  createLatestValueQueue,
+} from "@/common/utils/asyncEventIterator";
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import { createCoalescedReader } from "@/common/utils/coalescedReader";
+import { getErrorMessage } from "@/common/utils/errors";
+import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
+import type { ORPCContext } from "./context";
+import { createReplayBufferedStreamMessageRelay } from "@/node/services/replayBufferedStreamMessageRelay";
+import { TIMELINE_DEFAULT_PAGE_LIMIT } from "@/node/services/timelineService";
+import type { LogEntry } from "@/node/services/logBuffer";
+import { subscribeLogFeed } from "@/node/services/logBuffer";
+import {
+  resolveMemoryProjectIdentity,
+  type MemoryChangeEvent,
+} from "@/node/services/memoryService";
+
+type LogSubscriptionEvent =
+  | { type: "snapshot"; epoch: number; entries: LogEntry[] }
+  | { type: "append"; epoch: number; entries: LogEntry[] }
+  | { type: "reset"; epoch: number };
+
+interface MetadataEvent {
+  workspaceId: string;
+  metadata: FrontendWorkspaceMetadataSchemaType | null;
+}
+
+interface WorkspaceChatSubscriptionInput {
+  workspaceId: string;
+  mode?: OnChatMode;
+  legacyAutoRetryEnabled?: boolean;
+}
+
+type WorkspaceActivityEvent =
+  | { type: "activity"; workspaceId: string; activity: WorkspaceActivitySnapshot | null }
+  | { type: "heartbeat" };
+
+type TerminalAttachMessage =
+  | { type: "screenState"; data: string }
+  | { type: "output"; data: string };
+
+type TerminalActivitySnapshot = ReturnType<
+  ORPCContext["terminalService"]["getAllWorkspaceActivity"]
+>;
+
+type TerminalActivityEvent =
+  | {
+      type: "update";
+      workspaceId: string;
+      activity: { activeCount: number; totalSessions: number };
+    }
+  | { type: "snapshot"; workspaces: TerminalActivitySnapshot }
+  | { type: "heartbeat" };
+
+const LOG_LEVEL_PRIORITY: Record<LogEntry["level"], number> = {
+  error: 0,
+  warn: 1,
+  info: 2,
+  debug: 3,
+};
+
+function shouldIncludeLogEntry(
+  entryLevel: LogEntry["level"],
+  minLevel: LogEntry["level"]
+): boolean {
+  return (
+    (LOG_LEVEL_PRIORITY[entryLevel] ?? LOG_LEVEL_PRIORITY.debug) <=
+    (LOG_LEVEL_PRIORITY[minLevel] ?? LOG_LEVEL_PRIORITY.info)
+  );
+}
+
+export function subscribeConfigChanges(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return asyncIterableFromSubscription<undefined>({
+    signal,
+    queue: createLatestValueQueue<undefined>(),
+    subscribe: (push) => context.config.onConfigChanged(() => push(undefined)),
+  });
+}
+
+export function subscribeDevTools(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<DevToolsEvent> {
+  const service = context.devToolsService;
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => {
+      const eventName = "update:" + workspaceId;
+      service.on(eventName, push);
+      return () => service.off(eventName, push);
+    },
+    initial: async () => ({ type: "snapshot" as const, runs: await service.getRuns(workspaceId) }),
+  });
+}
+
+export function subscribeProviderConfig(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return asyncIterableFromSubscription<undefined>({
+    signal,
+    queue: createLatestValueQueue<undefined>(),
+    subscribe: (push) => context.providerService.onConfigChanged(() => push(undefined)),
+  });
+}
+
+export function subscribePolicyChanges(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return asyncIterableFromSubscription<undefined>({
+    signal,
+    queue: createLatestValueQueue<undefined>(),
+    subscribe: (push) => context.policyService.onPolicyChanged(() => push(undefined)),
+  });
+}
+
+export function createTickIterable(
+  count: number,
+  intervalMs: number
+): AsyncGenerator<{ tick: number; timestamp: number }> {
+  return (async function* () {
+    for (let tick = 1; tick <= count; tick++) {
+      yield { tick, timestamp: Date.now() };
+      if (tick < count) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  })();
+}
+
+export function subscribeLogs(
+  minLevel: LogEntry["level"],
+  signal?: AbortSignal
+): AsyncGenerator<LogSubscriptionEvent> {
+  let snapshot: ReturnType<typeof subscribeLogFeed>["snapshot"];
+  return asyncIterableFromSubscription<LogSubscriptionEvent>({
+    signal,
+    subscribe: (push) => {
+      const subscription = subscribeLogFeed((event) => {
+        if (event.type === "append") {
+          if (shouldIncludeLogEntry(event.entry.level, minLevel)) {
+            push({ type: "append", epoch: event.epoch, entries: [event.entry] });
+          }
+          return;
+        }
+        push({ type: "reset", epoch: event.epoch });
+      }, minLevel);
+      snapshot = subscription.snapshot;
+      return subscription.unsubscribe;
+    },
+    initial: () => ({
+      type: "snapshot" as const,
+      epoch: snapshot.epoch,
+      entries: snapshot.entries.filter((entry) => shouldIncludeLogEntry(entry.level, minLevel)),
+    }),
+  });
+}
+
+export function subscribeMemoryChanges(
+  context: ORPCContext,
+  workspaceId: string | null,
+  signal?: AbortSignal,
+  validate?: () => void
+): AsyncGenerator<MemoryChangeEventPayload> {
+  return (async function* () {
+    validate?.();
+    const metadata = workspaceId ? await context.workspaceService.getInfo(workspaceId) : null;
+    const projectPath = metadata ? resolveMemoryProjectIdentity(metadata) : null;
+    yield* asyncIterableFromSubscription({
+      signal,
+      subscribe: (push) => {
+        const onChange = (event: MemoryChangeEvent) => {
+          if (event.scope === "workspace" && event.workspaceId !== workspaceId) return;
+          if (event.scope === "project" && event.projectPath !== projectPath) return;
+          push(event);
+        };
+        const onStatusChange = (event: MemoryConsolidationStatusChangeEventPayload) => push(event);
+        context.memoryService.on("change", onChange);
+        context.memoryConsolidationService.on("statusChange", onStatusChange);
+        return () => {
+          context.memoryService.off("change", onChange);
+          context.memoryConsolidationService.off("statusChange", onStatusChange);
+        };
+      },
+    });
+  })();
+}
+
+export function subscribeTimeline(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<TimelineSubscriptionEvent> {
+  const pendingEvents: TimelineSubscriptionEvent["events"] = [];
+  let snapshotSequence: number | undefined;
+  let pushEvent: ((event: TimelineSubscriptionEvent) => void) | undefined;
+  return asyncIterableFromSubscription<TimelineSubscriptionEvent>({
+    signal,
+    subscribe: (push) => {
+      pushEvent = push;
+      const onAppended = (event: {
+        workspaceId: string;
+        events: TimelineSubscriptionEvent["events"];
+      }) => {
+        if (event.workspaceId !== workspaceId) return;
+        const sequence = snapshotSequence;
+        if (sequence == null) {
+          // Buffer until the snapshot boundary is known so reconnect cannot duplicate events.
+          pendingEvents.push(...event.events);
+          return;
+        }
+        const events = event.events.filter((item) => item.seq > sequence);
+        if (events.length > 0) push({ type: "appended", events });
+      };
+      context.timelineService.on("appended", onAppended);
+      return () => context.timelineService.off("appended", onAppended);
+    },
+    initial: async () => {
+      const maxSequence = await context.timelineService.getLastSequence(workspaceId);
+      snapshotSequence = maxSequence;
+      const snapshot = await context.timelineService.list(workspaceId, {
+        cursor: maxSequence + 1,
+        limit: TIMELINE_DEFAULT_PAGE_LIMIT,
+      });
+      const appended = pendingEvents.filter((event) => event.seq > maxSequence);
+      if (appended.length > 0) pushEvent?.({ type: "appended", events: appended });
+      pendingEvents.length = 0;
+      return {
+        type: "snapshot" as const,
+        events: snapshot.events,
+        nextCursor: snapshot.nextCursor,
+        hasOlder: snapshot.hasOlder,
+      };
+    },
+  });
+}
+
+export function subscribeWorkspaceChat(
+  context: ORPCContext,
+  input: WorkspaceChatSubscriptionInput,
+  signal?: AbortSignal
+): AsyncGenerator<WorkspaceChatMessage> {
+  const session = context.workspaceService.getOrCreateSession(input.workspaceId);
+  if (typeof input.legacyAutoRetryEnabled === "boolean") {
+    session.setLegacyAutoRetryEnabledHint(input.legacyAutoRetryEnabled);
+  }
+  const queue = withQueueHeartbeat(createAsyncMessageQueue<WorkspaceChatMessage>(), {
+    type: "heartbeat" as const,
+  });
+  let replayRelay: ReturnType<typeof createReplayBufferedStreamMessageRelay>;
+  // Subscribe before replay so the relay can buffer overlapping live deltas.
+  return asyncIterableFromSubscription({
+    signal,
+    queue,
+    subscribe: (push) => {
+      replayRelay = createReplayBufferedStreamMessageRelay(push);
+      return session.onChatEvent(({ message }) => replayRelay.handleSessionMessage(message));
+    },
+    initialize: async (push) => {
+      await session.replayHistory(({ message }) => push(message), input.mode);
+      replayRelay.finishReplay();
+      session.scheduleStartupRecovery();
+    },
+  });
+}
+
+export function subscribeMetadata(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<MetadataEvent> {
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => {
+      context.workspaceService.on("metadata", push);
+      return () => context.workspaceService.off("metadata", push);
+    },
+  });
+}
+
+export function subscribeWorkspaceActivity(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<WorkspaceActivityEvent> {
+  const queue = withQueueHeartbeat(createAsyncEventQueue<WorkspaceActivityEvent>(), {
+    type: "heartbeat",
+  });
+  return asyncIterableFromSubscription({
+    signal,
+    queue,
+    subscribe: (push) => {
+      const onActivity = (event: {
+        workspaceId: string;
+        activity: WorkspaceActivitySnapshot | null;
+      }) => push({ type: "activity", ...event });
+      context.workspaceService.on("activity", onActivity);
+      return () => context.workspaceService.off("activity", onActivity);
+    },
+  });
+}
+
+export function subscribeBackgroundBashes(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+) {
+  const service = context.workspaceService;
+  const getState = async () => ({
+    processes: await service.listBackgroundProcesses(workspaceId),
+    foregroundToolCallIds: service.getForegroundToolCallIds(workspaceId),
+  });
+  // Full snapshots coalesce because replaying stale intermediate state only grows memory.
+  const queue = createLatestValueQueue<Awaited<ReturnType<typeof getState>>>();
+  const bootstrap = { delivered: false, error: null as Error | null };
+  const reader = createCoalescedReader({
+    read: async () => {
+      try {
+        queue.push(await getState());
+        bootstrap.delivered = true;
+      } catch (error) {
+        if (!bootstrap.delivered) {
+          bootstrap.error = error instanceof Error ? error : new Error(getErrorMessage(error));
+          queue.end();
+          return;
+        }
+        throw error;
+      }
+    },
+    retryDelayMs: 1_000,
+  });
+  return asyncIterableFromSubscription({
+    signal,
+    queue,
+    subscribe: () => {
+      const onChange = (changedWorkspaceId: string) => {
+        if (changedWorkspaceId === workspaceId) reader.trigger();
+      };
+      service.onBackgroundBashChange(onChange);
+      return () => {
+        reader.stop();
+        service.offBackgroundBashChange(onChange);
+      };
+    },
+    initialize: () => reader.trigger(),
+    onEnd: () => {
+      if (bootstrap.error != null) throw bootstrap.error;
+    },
+  });
+}
+
+export function subscribeWorkspaceStats(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<WorkspaceStatsSnapshot> {
+  const queue = createLatestValueQueue<WorkspaceStatsSnapshot>();
+  const throttleMs = 100;
+  let lastPushedAtMs = 0;
+  let inFlight = true;
+  let pendingTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingSnapshot = false;
+  let closed = false;
+  // Snapshot reads are serialized and throttled so token deltas cannot build a backlog.
+  const pushSnapshot = async () => {
+    if (closed || inFlight || !pendingSnapshot) return;
+    pendingSnapshot = false;
+    inFlight = true;
+    try {
+      const snapshot = await context.sessionTimingService.getSnapshot(workspaceId);
+      if (closed) return;
+      lastPushedAtMs = snapshot.generatedAt;
+      queue.push(snapshot);
+    } finally {
+      inFlight = false;
+      if (!closed && pendingSnapshot) scheduleSnapshot();
+    }
+  };
+  const runPushSnapshot = () => {
+    void pushSnapshot().catch(() => undefined);
+  };
+  const scheduleSnapshot = () => {
+    pendingSnapshot = true;
+    if (closed || inFlight || pendingTimer) return;
+    const remaining = throttleMs - (Date.now() - lastPushedAtMs);
+    if (remaining <= 0) {
+      runPushSnapshot();
+      return;
+    }
+    pendingTimer = setTimeout(() => {
+      pendingTimer = undefined;
+      runPushSnapshot();
+    }, remaining);
+    pendingTimer.unref?.();
+  };
+  return asyncIterableFromSubscription({
+    signal,
+    queue,
+    subscribe: () => {
+      const onChange = (changedWorkspaceId: string) => {
+        if (changedWorkspaceId === workspaceId) scheduleSnapshot();
+      };
+      context.sessionTimingService.addSubscriber(workspaceId);
+      context.sessionTimingService.onStatsChange(onChange);
+      return () => {
+        closed = true;
+        if (pendingTimer) clearTimeout(pendingTimer);
+        context.sessionTimingService.offStatsChange(onChange);
+        context.sessionTimingService.removeSubscriber(workspaceId);
+      };
+    },
+    initialize: async () => {
+      try {
+        const initial = await context.sessionTimingService.getSnapshot(workspaceId);
+        lastPushedAtMs = initial.generatedAt;
+        queue.push(initial);
+      } finally {
+        inFlight = false;
+        if (!closed && pendingSnapshot) scheduleSnapshot();
+      }
+    },
+  });
+}
+
+export function subscribeTerminalOutput(
+  context: ORPCContext,
+  sessionId: string,
+  signal?: AbortSignal
+): AsyncGenerator<string> {
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => context.terminalService.onOutput(sessionId, push),
+  });
+}
+
+export function attachTerminal(
+  context: ORPCContext,
+  sessionId: string,
+  signal?: AbortSignal
+): AsyncGenerator<TerminalAttachMessage> {
+  // Output subscribes before screen capture so attach cannot lose bytes in the handshake.
+  return asyncIterableFromSubscription<TerminalAttachMessage>({
+    signal,
+    subscribe: (push) =>
+      context.terminalService.onOutput(sessionId, (data) => push({ type: "output", data })),
+    initial: () => ({
+      type: "screenState" as const,
+      data: context.terminalService.getScreenState(sessionId),
+    }),
+  });
+}
+
+export function subscribeTerminalExit(
+  context: ORPCContext,
+  sessionId: string,
+  signal?: AbortSignal
+): AsyncGenerator<number> {
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => context.terminalService.onExit(sessionId, push),
+    take: 1,
+  });
+}
+
+export function subscribeTerminalActivity(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<TerminalActivityEvent> {
+  const queue = withQueueHeartbeat(createAsyncEventQueue<TerminalActivityEvent>(), {
+    type: "heartbeat",
+  });
+  return asyncIterableFromSubscription({
+    signal,
+    queue,
+    subscribe: (push) =>
+      context.terminalService.onActivityChange((workspaceId) =>
+        push({
+          type: "update",
+          workspaceId,
+          activity: context.terminalService.getWorkspaceActivity(workspaceId),
+        })
+      ),
+    initial: () => ({
+      type: "snapshot",
+      workspaces: context.terminalService.getAllWorkspaceActivity(),
+    }),
+  });
+}
+
+export function subscribeUpdateStatus(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<UpdateStatus> {
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => context.updateService.onStatus(push),
+  });
+}
+
+export function subscribeOpenSettings(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => context.menuEventService.onOpenSettings(() => push(undefined)),
+  });
+}
+
+export function subscribeSshPrompts(
+  context: ORPCContext,
+  signal?: AbortSignal
+): AsyncGenerator<SshPromptEvent> {
+  return asyncIterableFromSubscription({
+    signal,
+    subscribe: (push) => {
+      const releaseResponder = context.sshPromptService.registerInteractiveResponder();
+      // The service returns snapshot plus listeners atomically, preventing a request gap.
+      const { snapshot, unsubscribe } = context.sshPromptService.subscribeRequests(
+        (request: SshPromptRequest) => push({ type: "request", ...request }),
+        (requestId: string) => push({ type: "removed", requestId })
+      );
+      for (const request of snapshot) push({ type: "request", ...request });
+      return () => {
+        releaseResponder();
+        unsubscribe();
+      };
+    },
+  });
+}

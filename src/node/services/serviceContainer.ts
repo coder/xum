@@ -244,6 +244,8 @@ export class ServiceContainer {
 
     this.projectService = new ProjectService(config, this.sshPromptService);
     this.projectService.setWorkspaceService(this.workspaceService);
+    this.projectService.setWorkspaceMetadataRefresher(this.workspaceService);
+    this.projectService.setMcpServerManager(this.mcpServerManager);
     this.desktopSessionManager = new DesktopSessionManager({
       config,
       experimentsService: this.experimentsService,
@@ -329,6 +331,7 @@ export class ServiceContainer {
     this.mcpServerManager.setMcpOauthService(this.mcpOauthService);
 
     this.muxGatewayOauthService = new MuxGatewayOauthService(
+      config,
       this.providerService,
       this.windowService
     );
@@ -362,9 +365,13 @@ export class ServiceContainer {
     // Plugin-override pruning is wired inside createCoreServices (shared with
     // headless CLI registration), using this.workspaceMcpOverridesService.
     // Editor service for opening workspaces in code editors
-    this.editorService = new EditorService(config);
+    this.editorService = new EditorService(config, this.workspaceService);
     this.updateService = new UpdateService(this.config);
-    this.tokenizerService = new TokenizerService(this.sessionUsageService);
+    this.tokenizerService = new TokenizerService(
+      this.sessionUsageService,
+      this.aiService,
+      this.providerService
+    );
     this.instructionsService = new InstructionsService(
       config,
       this.aiService,
@@ -621,6 +628,7 @@ export class ServiceContainer {
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
       aiService: this.aiService,
+      historyService: this.historyService,
       projectService: this.projectService,
       workspaceService: this.workspaceService,
       taskService: this.taskService,

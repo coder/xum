@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import {
   CODER_ARCHIVE_BEHAVIORS,
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -1497,6 +1498,99 @@ describe("Config", () => {
         appearance: { theme: "light" },
         notifications: { notifyOnResponseByWorkspace: { "ws-1": true } },
       });
+    });
+  });
+
+  describe("API config mutations", () => {
+    it("normalizes saves while preserving omitted settings", async () => {
+      await config.editConfig((current) => ({
+        ...current,
+        userPreferences: { appearance: { theme: "flexoki-light" } },
+        taskSettings: {
+          ...DEFAULT_TASK_SETTINGS,
+          preserveSubagentsUntilArchive: true,
+          proposePlanImplementReplacesChatHistory: true,
+        },
+      }));
+
+      await config.saveUserConfig({
+        taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 5 },
+        agentAiDefaults: {
+          foo: {
+            modelString: "anthropic:claude-3-5-sonnet",
+            thinkingLevel: "high",
+            enabled: true,
+            subagent: {
+              modelString: "openai:gpt-5.6-sol",
+              thinkingLevel: "xhigh",
+              reasoningMode: "pro",
+            },
+          },
+        },
+      });
+
+      const saved = config.loadConfigOrDefault();
+      expect(saved.userPreferences).toEqual({ appearance: { theme: "flexoki-light" } });
+      expect(saved.taskSettings).toMatchObject({
+        maxParallelAgentTasks: 4,
+        maxTaskNestingDepth: 5,
+        preserveSubagentsUntilArchive: true,
+        proposePlanImplementReplacesChatHistory: true,
+      });
+      expect(saved.agentAiDefaults?.foo?.subagent?.reasoningMode).toBe("pro");
+
+      await config.saveUserConfig({ userPreferences: null });
+      const cleared = config.loadConfigOrDefault();
+      expect(cleared.userPreferences).toBeUndefined();
+      expect(cleared.migrations?.userPreferencesInitialized).toBe(true);
+    });
+
+    it("preserves advisor validation errors", async () => {
+      for (const [value, message] of [
+        [1.5, "Advisor max uses per turn must be an integer"],
+        [0, "Advisor max uses per turn must be positive"],
+      ] as const) {
+        let thrown: unknown;
+        try {
+          await config.saveUserConfig({ advisorMaxUsesPerTurn: value });
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(Error);
+        expect((thrown as Error).message).toBe(message);
+      }
+    });
+
+    it("normalizes model and runtime mutations", async () => {
+      await config.updateModelPreferences({
+        defaultModel: " openai:gpt-5.6-sol ",
+        hiddenModels: ["anthropic:claude-sonnet-4-5", "anthropic:claude-sonnet-4-5", ""],
+      });
+      await config.updateRuntimeEnablement({
+        runtimeEnablement: { local: true, worktree: false },
+        defaultRuntime: "worktree",
+      });
+
+      const saved = config.loadConfigOrDefault();
+      expect(saved.defaultModel).toBe("openai:gpt-5.6-sol");
+      expect(saved.hiddenModels).toEqual(["anthropic:claude-sonnet-4-5"]);
+      expect(saved.runtimeEnablement).toEqual({ worktree: false });
+      expect(saved.defaultRuntime).toBe("worktree");
+    });
+
+    it("rejects invalid route overrides before saving", async () => {
+      let thrown: unknown;
+      try {
+        await config.updateRoutePreferences({
+          routePriority: ["openai"],
+          routeOverrides: { "openai:gpt-5.6-sol": "missing" },
+          validateRouteOverrides: () => ({ success: false, error: "invalid route" }),
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect((thrown as Error).message).toBe("invalid route");
+      expect(config.loadConfigOrDefault().routePriority).toBeUndefined();
     });
   });
 

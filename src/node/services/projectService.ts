@@ -47,6 +47,14 @@ import {
 } from "@/common/utils/projectRemoval";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { z } from "zod";
+import { ORPCError } from "@orpc/server";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -138,6 +146,10 @@ type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
 
 interface WorkspaceRemover {
   remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
+}
+
+interface WorkspaceMetadataRefresher {
+  refreshAndEmitMetadata(workspaceId: string): Promise<void>;
 }
 
 function isTildePrefixedPath(value: string): boolean {
@@ -383,6 +395,8 @@ export class ProjectService {
   private directoryPicker?: (initialPath?: string | null) => Promise<string | null>;
   private readonly sshPromptService: SshPromptService | undefined;
   private workspaceService?: WorkspaceRemover;
+  private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
+  private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
 
   constructor(
     private readonly config: Config,
@@ -393,6 +407,16 @@ export class ProjectService {
 
   setWorkspaceService(workspaceService: WorkspaceRemover): void {
     this.workspaceService = workspaceService;
+  }
+
+  setWorkspaceMetadataRefresher(workspaceService: WorkspaceMetadataRefresher): void {
+    this.workspaceMetadataRefresher = workspaceService;
+  }
+
+  setMcpServerManager(
+    mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
+  ): void {
+    this.mcpServerManager = mcpServerManager;
   }
 
   setDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>) {
@@ -1193,11 +1217,7 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
-  /** Success carries every removed path (cascade included) so callers can drop per-path state. */
-  async remove(
-    projectPath: string,
-    force = false
-  ): Promise<Result<{ removedProjectPaths: string[] }, ProjectRemoveError>> {
+  async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();
@@ -1230,7 +1250,8 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
-        return Ok({ removedProjectPaths: [normalizedPath] });
+        this.mcpServerManager?.forgetProjectTrust(normalizedPath);
+        return Ok(undefined);
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
@@ -1395,7 +1416,10 @@ export class ProjectService {
         log.error(`Failed to clean up secrets for project ${normalizedPath}:`, error);
       }
 
-      return Ok({ removedProjectPaths: [normalizedPath, ...removedSubProjectPaths] });
+      for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
+        this.mcpServerManager?.forgetProjectTrust(removedPath);
+      }
+      return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
       return Err({ type: "unknown" as const, message: `Failed to remove project: ${message}` });
@@ -1789,6 +1813,113 @@ export class ProjectService {
     }
   }
 
+  async setTrust(projectPath: string, trusted: boolean): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      let project = config.projects.get(normalizedPath);
+      if (!project) {
+        project = { workspaces: [] };
+        config.projects.set(normalizedPath, project);
+      }
+      project.trusted = trusted;
+      return config;
+    });
+
+    const affectedPaths = [normalizedPath];
+    for (const [candidatePath, project] of this.config.loadConfigOrDefault().projects) {
+      if (
+        project.parentProjectPath !== undefined &&
+        stripTrailingSlashes(project.parentProjectPath) === normalizedPath
+      ) {
+        affectedPaths.push(candidatePath);
+      }
+    }
+    this.mcpServerManager?.applyProjectTrust(
+      affectedPaths.map((candidatePath) => ({
+        projectPath: candidatePath,
+        trusted: isProjectTrusted(this.config, candidatePath),
+      }))
+    );
+  }
+
+  async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.displayName = displayName ?? undefined;
+      return config;
+    });
+  }
+
+  async setColor(projectPath: string, color: string | null | undefined): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.color = color ?? undefined;
+      return config;
+    });
+  }
+
+  async setCustomInstructions(
+    projectPath: string,
+    customInstructions: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      project.customInstructions = customInstructions?.trim() ? customInstructions : undefined;
+      return config;
+    });
+  }
+
+  async setCodeWorkspaceSyncPath(
+    projectPath: string,
+    codeWorkspaceSyncPath: string | null | undefined
+  ): Promise<void> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    const trimmed = codeWorkspaceSyncPath?.trim() ?? "";
+    if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+      throw new ORPCError("BAD_REQUEST", {
+        message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+      });
+    }
+
+    let previousValue: string | undefined;
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (!project) {
+        throw new Error(`Project not found: ${normalizedPath}`);
+      }
+      previousValue = project.codeWorkspaceSyncPath;
+      project.codeWorkspaceSyncPath = trimmed || undefined;
+      return config;
+    });
+
+    if (!trimmed) {
+      return;
+    }
+    const result = await syncProjectCodeWorkspace(this.config, normalizedPath);
+    if (result.ok) {
+      return;
+    }
+    await this.config.editConfig((config) => {
+      const project = config.projects.get(normalizedPath);
+      if (project?.codeWorkspaceSyncPath === trimmed) {
+        project.codeWorkspaceSyncPath = previousValue;
+      }
+      return config;
+    });
+    throw new ORPCError("BAD_REQUEST", { message: result.error });
+  }
   // ─────────────────────────────────────────────────────────────────────────────
   // Section Management
   // ─────────────────────────────────────────────────────────────────────────────
@@ -1859,5 +1990,39 @@ export class ProjectService {
       const message = getErrorMessage(error);
       return Err(`Failed to assign workspace to sub-project: ${message}`);
     }
+  }
+
+  async assignWorkspaceToSubProjectAndSync(
+    projectPath: string,
+    workspaceId: string,
+    subProjectPath: string | null
+  ): Promise<Result<void>> {
+    const previousMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+      (metadata) => metadata.id === workspaceId
+    );
+    const result = await this.assignWorkspaceToSubProject(projectPath, workspaceId, subProjectPath);
+    if (!result.success) {
+      return result;
+    }
+
+    await this.workspaceMetadataRefresher?.refreshAndEmitMetadata(workspaceId);
+    if (subProjectPath !== null) {
+      await syncProjectCodeWorkspace(this.config, subProjectPath);
+    }
+    const previousSubProjectPath =
+      previousMetadata?.subProjectPath != null
+        ? stripTrailingSlashes(previousMetadata.subProjectPath)
+        : null;
+    const newSubProjectPath = subProjectPath !== null ? stripTrailingSlashes(subProjectPath) : null;
+    if (
+      previousMetadata &&
+      previousSubProjectPath !== null &&
+      previousSubProjectPath !== newSubProjectPath
+    ) {
+      await syncProjectCodeWorkspace(this.config, previousSubProjectPath, {
+        extraManagedRootDirs: managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+      });
+    }
+    return result;
   }
 }

@@ -33,6 +33,7 @@ import { createDeltaStorage, type DeltaRecordStorage } from "@/common/utils/toke
 import { log } from "./log";
 import type { TelemetryService } from "./telemetryService";
 import { roundToBase2 } from "@/common/telemetry/utils";
+import { getErrorMessage } from "@/common/utils/errors";
 
 const SESSION_TIMING_FILE = "session-timing.json";
 const SESSION_TIMING_VERSION = 2 as const;
@@ -496,6 +497,15 @@ export class SessionTimingService {
     });
     this.timingFileCache.set(workspaceId, loaded);
     return loaded;
+  }
+
+  async clearTimingFileForApi(workspaceId: string) {
+    try {
+      await this.clearTimingFile(workspaceId);
+      return { success: true as const, data: undefined };
+    } catch (error) {
+      return { success: false as const, error: getErrorMessage(error) };
+    }
   }
 
   async clearTimingFile(workspaceId: string): Promise<void> {

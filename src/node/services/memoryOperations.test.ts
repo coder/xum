@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/require-await */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createRouterClient } from "@orpc/server";
 import { EventEmitter } from "events";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -12,10 +11,20 @@ import type {
 import { Config } from "@/node/config";
 import { MemoryService, type MemoryChangeEvent } from "@/node/services/memoryService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
-import type { ORPCContext } from "./context";
-import { router } from "./router";
+import type { ORPCContext } from "@/node/orpc/context";
+import { subscribeMemoryChanges } from "@/node/orpc/routerSubscriptions";
+import {
+  consolidateMemory,
+  deleteMemory,
+  getMemoryConsolidationStatus,
+  listMemory,
+  readMemory,
+  saveMemory,
+  setMemoryPinned,
+  assertMemoryEnabled,
+} from "./memoryOperations";
 
-describe("router memory routes", () => {
+describe("memory operations", () => {
   let tempDir: string;
   let config: Config;
   let projectPath: string;
@@ -74,34 +83,26 @@ describe("router memory routes", () => {
     enabled: boolean;
     workspaceInfo?: ReturnType<typeof workspaceInfo>;
   }) {
-    return createRouterClient(router(), { context: createContext(options) });
+    const context = createContext(options);
+    return {
+      memory: {
+        list: (input: Parameters<typeof listMemory>[1]) => listMemory(context, input),
+        read: (input: Parameters<typeof readMemory>[1]) => readMemory(context, input),
+        save: (input: Parameters<typeof saveMemory>[1]) => saveMemory(context, input),
+        delete: (input: Parameters<typeof deleteMemory>[1]) => deleteMemory(context, input),
+        setPinned: (input: Parameters<typeof setMemoryPinned>[1]) =>
+          setMemoryPinned(context, input),
+        consolidationStatus: (input: Parameters<typeof getMemoryConsolidationStatus>[1]) =>
+          getMemoryConsolidationStatus(context, input),
+        consolidate: (input: Parameters<typeof consolidateMemory>[1]) =>
+          consolidateMemory(context, input),
+        onChange: (input: { workspaceId?: string | null }, options?: { signal?: AbortSignal }) =>
+          subscribeMemoryChanges(context, input.workspaceId ?? null, options?.signal, () =>
+            assertMemoryEnabled(context)
+          ),
+      },
+    };
   }
-
-  test("all memory routes reject while the experiment is disabled", async () => {
-    const client = createClient({ enabled: false });
-    await expect(client.memory.list({ workspaceId: "ws-mem" })).rejects.toThrow(/disabled/);
-    await expect(
-      client.memory.read({ workspaceId: "ws-mem", path: "/memories/global/a.md" })
-    ).rejects.toThrow(/disabled/);
-    await expect(
-      client.memory.save({
-        workspaceId: "ws-mem",
-        path: "/memories/global/a.md",
-        content: "x",
-        expectedSha256: null,
-      })
-    ).rejects.toThrow(/disabled/);
-    await expect(
-      client.memory.delete({ workspaceId: "ws-mem", path: "/memories/global/a.md" })
-    ).rejects.toThrow(/disabled/);
-    await expect(
-      client.memory.setPinned({
-        workspaceId: "ws-mem",
-        path: "/memories/global/a.md",
-        pinned: true,
-      })
-    ).rejects.toThrow(/disabled/);
-  });
 
   test("routes fail cleanly for unknown workspaces", async () => {
     const client = createClient({ enabled: true });

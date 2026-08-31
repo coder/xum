@@ -329,6 +329,18 @@ export class BackupService {
     });
   }
 
+  pushWithApproval(input: SettingsBackupInput & { approvedSecretDigest?: string | null }) {
+    const { approvedSecretDigest, ...settings } = input;
+    return this.push(settings, { approvedSecretDigest: approvedSecretDigest ?? undefined });
+  }
+
+  restoreWithApproval(
+    input: SettingsBackupInput & { approvedCommandTokens?: readonly string[] | null }
+  ) {
+    const { approvedCommandTokens, ...settings } = input;
+    return this.restore(settings, { approvedCommandTokens: approvedCommandTokens ?? undefined });
+  }
+
   async push(
     settings: SettingsBackupInput,
     options: { approvedSecretDigest?: string } = {}

@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { WorkflowRunStore } from "./WorkflowRunStore";
+import { isPathSafeWorkspaceId, WorkflowRunStore } from "./WorkflowRunStore";
 
 const definition = {
   name: "deep-research",
@@ -627,5 +627,24 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
+  });
+});
+
+describe("isPathSafeWorkspaceId", () => {
+  test("accepts single-segment ids and rejects traversal attempts", () => {
+    expect(isPathSafeWorkspaceId("workspace-1")).toBe(true);
+    for (const unsafe of [
+      "",
+      ".",
+      "..",
+      "../evil",
+      "..\\evil",
+      "a/../b",
+      "nested/dir",
+      "/absolute",
+      "C:\\sessions",
+    ]) {
+      expect(isPathSafeWorkspaceId(unsafe)).toBe(false);
+    }
   });
 });

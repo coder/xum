@@ -194,6 +194,9 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
       isEnabled: () =>
         opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true,
     }),
+    policyService: opts.policyService,
+    telemetryService: opts.telemetryService,
+    workspaceMetadataProvider: aiService,
   });
   const mcpServerManager = new MCPServerManager(
     mcpConfigService,
@@ -203,6 +206,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
       // cached plugin instances before serving them again. The sibling's
       // uninstall also pruned plugin keys from workspace override files, so
       // the sweep refreshes cached override snapshots from disk.
+      config,
+      telemetryService: opts.telemetryService,
       pluginInvalidation: {
         keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
         readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),

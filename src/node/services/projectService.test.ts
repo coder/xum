@@ -6,6 +6,7 @@ import { execSync } from "child_process";
 import { createHash } from "crypto";
 import { Config } from "@/node/config";
 import { Ok } from "@/common/types/result";
+import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -2263,7 +2264,148 @@ exit 1
     });
   });
 
+  describe("project settings mutations", () => {
+    it("propagates parent trust to MCP state", async () => {
+      const parentPath = path.join(tempDir, "project");
+      const childPath = path.join(parentPath, "packages", "api");
+      await config.editConfig((current) => {
+        current.projects.set(parentPath, { workspaces: [] });
+        current.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        return current;
+      });
+      const updates: Array<Array<{ projectPath: string; trusted: boolean }>> = [];
+      service.setMcpServerManager({
+        applyProjectTrust: (value) => updates.push(value),
+        forgetProjectTrust: () => undefined,
+      });
+
+      await service.setTrust(`${parentPath}/`, true);
+
+      expect(config.loadConfigOrDefault().projects.get(parentPath)?.trusted).toBe(true);
+      expect(updates).toEqual([
+        [
+          { projectPath: parentPath, trusted: true },
+          { projectPath: childPath, trusted: true },
+        ],
+      ]);
+    });
+
+    it("validates, writes, and clears code workspace sync paths", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      let invalid: unknown;
+      try {
+        await service.setCodeWorkspaceSyncPath(projectPath, "notes.txt");
+      } catch (error) {
+        invalid = error;
+      }
+      expect(invalid).toBeInstanceOf(ORPCError);
+      expect((invalid as Error).message).toContain(".code-workspace");
+
+      await service.setCodeWorkspaceSyncPath(projectPath, "  proj.code-workspace  ");
+      const workspaceFile = path.join(projectPath, "proj.code-workspace");
+      expect(config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath).toBe(
+        "proj.code-workspace"
+      );
+      expect(JSON.parse(await fs.readFile(workspaceFile, "utf-8"))).toEqual({
+        folders: [{ path: projectPath }],
+      });
+
+      await service.setCodeWorkspaceSyncPath(projectPath, null);
+      expect(
+        config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+      ).toBeUndefined();
+      expect((await fs.stat(workspaceFile)).isFile()).toBe(true);
+    });
+
+    it("rolls back code workspace paths when explicit sync fails", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.writeFile(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      let thrown: unknown;
+      try {
+        await service.setCodeWorkspaceSyncPath(projectPath, "broken.code-workspace");
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ORPCError);
+      expect((thrown as Error).message).toContain("not valid JSONC");
+      expect(
+        config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+      ).toBeUndefined();
+    });
+  });
+
   describe("assignWorkspaceToSubProject", () => {
+    it("syncs both code workspace files after reassignment", async () => {
+      const parentPath = path.join(tempDir, "project");
+      const subProjectA = path.join(parentPath, "packages", "a");
+      const subProjectB = path.join(parentPath, "packages", "b");
+      const worktreePath = path.join(config.srcDir, "project", "feat-1");
+      await Promise.all([
+        fs.mkdir(subProjectA, { recursive: true }),
+        fs.mkdir(subProjectB, { recursive: true }),
+        fs.mkdir(worktreePath, { recursive: true }),
+      ]);
+      await config.editConfig((current) => {
+        current.projects.set(parentPath, {
+          workspaces: [
+            {
+              path: worktreePath,
+              id: "aaaaaaaaaa",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+              subProjectPath: subProjectA,
+            },
+          ],
+        });
+        current.projects.set(subProjectA, {
+          workspaces: [],
+          parentProjectPath: parentPath,
+          codeWorkspaceSyncPath: "a.code-workspace",
+        });
+        current.projects.set(subProjectB, {
+          workspaces: [],
+          parentProjectPath: parentPath,
+          codeWorkspaceSyncPath: "b.code-workspace",
+        });
+        return current;
+      });
+      const fileA = path.join(subProjectA, "a.code-workspace");
+      const fileB = path.join(subProjectB, "b.code-workspace");
+      await fs.writeFile(fileA, JSON.stringify({ folders: [{ path: worktreePath }] }));
+      let refreshed = "";
+      service.setWorkspaceMetadataRefresher({
+        refreshAndEmitMetadata: (workspaceId) => {
+          refreshed = workspaceId;
+          return Promise.resolve();
+        },
+      });
+
+      const result = await service.assignWorkspaceToSubProjectAndSync(
+        parentPath,
+        "aaaaaaaaaa",
+        subProjectB
+      );
+
+      const foldersOf = async (file: string) =>
+        (JSON.parse(await fs.readFile(file, "utf-8")) as { folders: Array<{ path: string }> })
+          .folders;
+      expect(result.success).toBe(true);
+      expect(refreshed).toBe("aaaaaaaaaa");
+      expect((await foldersOf(fileA)).map((folder) => folder.path)).not.toContain(worktreePath);
+      expect((await foldersOf(fileB)).map((folder) => folder.path)).toContain(worktreePath);
+    });
+
     it("accepts either parent or sub-project path as the owner selector", async () => {
       const parentPath = "/fake/project";
       const subProjectPath = "/fake/project/packages/api";
@@ -2567,21 +2709,21 @@ exit 1
       expect(result.error.type).toBe("project_not_found");
     });
 
-    it("reports cascade-removed sub-project paths so callers can drop per-path state", async () => {
-      // Retained MCP trust is keyed by path; omitting a cascaded child here
-      // would let a re-registered path inherit the removed project's grant.
+    it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/api";
+      const forgottenPaths: string[] = [];
+      service.setMcpServerManager({
+        applyProjectTrust: () => undefined,
+        forgetProjectTrust: (projectPath) => forgottenPaths.push(projectPath),
+      });
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(parentPath, { workspaces: [] });
       cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
       await config.editConfig(() => cfg);
 
-      const result = await service.remove(parentPath);
-
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error("Expected success");
-      expect(result.data.removedProjectPaths.sort()).toEqual([parentPath, childPath]);
+      expect((await service.remove(parentPath)).success).toBe(true);
+      expect(forgottenPaths.sort()).toEqual([parentPath, childPath]);
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(parentPath)).toBe(false);
       expect(after.projects.has(childPath)).toBe(false);

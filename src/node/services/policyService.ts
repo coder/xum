@@ -206,6 +206,11 @@ export class PolicyService {
   async refreshNow(): Promise<Result<void, string>> {
     return await this.refreshPolicy({ isStartup: false });
   }
+
+  async refreshNowForApi(): Promise<Result<PolicyGetResponse, string>> {
+    const result = await this.refreshNow();
+    return result.success ? Ok(this.getPolicyGetResponse()) : result;
+  }
   onPolicyChanged(callback: () => void): () => void {
     this.emitter.on("policyChanged", callback);
     return () => this.emitter.off("policyChanged", callback);

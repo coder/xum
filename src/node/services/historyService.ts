@@ -12,7 +12,10 @@ import {
   type MuxMetadata,
 } from "@/common/types/message";
 import type { Config } from "@/node/config";
-import { ensurePrivateDir } from "@/node/utils/fs";
+import type { AIService } from "@/node/services/aiService";
+import type { TaskService } from "@/node/services/taskService";
+import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
+import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -29,6 +32,11 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
 import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  readSubagentTranscriptArtifactsFile,
+  type SubagentTranscriptArtifactIndexEntry,
+} from "@/node/services/subagentTranscriptArtifacts";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
@@ -190,6 +198,11 @@ export function hasCommitWorthyParts(parts: MuxMessage["parts"] | undefined): bo
  * reads and full-file rewrites (updateHistory on every stream end) scale with
  * the active epoch instead of lifetime history.
  */
+interface SubagentTranscriptDependencies {
+  taskService: Pick<TaskService, "isDescendantAgentTask" | "listDescendantAgentTasks">;
+  aiService: Pick<AIService, "getWorkspaceMetadata">;
+}
+
 export class HistoryService {
   private readonly CHAT_FILE = CHAT_FILE_NAME;
   private readonly CHAT_ARCHIVE_FILE = CHAT_ARCHIVE_FILE_NAME;
@@ -207,6 +220,268 @@ export class HistoryService {
 
   constructor(config: Pick<Config, "getSessionDir" | "rootDir">) {
     this.config = config;
+  }
+
+  async getSubagentTranscript(
+    input: { taskId: string; requestingWorkspaceId?: string | null },
+    dependencies: SubagentTranscriptDependencies
+  ): Promise<{ messages: MuxMessage[]; model?: string; thinkingLevel?: ThinkingLevel }> {
+    const taskId = input.taskId.trim();
+    assert(taskId.length > 0, "workspace.getSubagentTranscript: taskId must be non-empty");
+    const trimmedRequestingId = input.requestingWorkspaceId?.trim() ?? "";
+    const requestingWorkspaceId = trimmedRequestingId.length > 0 ? trimmedRequestingId : null;
+    const tryLoadFromWorkspace = async (
+      workspaceId: string
+    ): Promise<{
+      workspaceId: string;
+      entry: SubagentTranscriptArtifactIndexEntry;
+    } | null> => {
+      const artifacts = await readSubagentTranscriptArtifactsFile(
+        this.config.getSessionDir(workspaceId)
+      );
+      const entry = artifacts.artifactsByChildTaskId[taskId] ?? null;
+      return entry ? { workspaceId, entry } : null;
+    };
+
+    let isDescendant = false;
+    if (requestingWorkspaceId) {
+      try {
+        isDescendant = await dependencies.taskService.isDescendantAgentTask(
+          requestingWorkspaceId,
+          taskId
+        );
+      } catch (error: unknown) {
+        log.warn("workspace.getSubagentTranscript: descendant check failed", {
+          requestingWorkspaceId,
+          taskId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+
+    let resolved: {
+      workspaceId: string;
+      entry: SubagentTranscriptArtifactIndexEntry;
+    } | null = null;
+    let hasArtifactInRequestingTree = false;
+
+    if (requestingWorkspaceId !== null) {
+      resolved = await tryLoadFromWorkspace(requestingWorkspaceId);
+      if (!resolved) {
+        // Grandchild transcripts may still live in the immediate parent session until cleanup
+        // rolls them into the requesting workspace. Prefer shallower owners first.
+        const descendants = dependencies.taskService
+          .listDescendantAgentTasks(requestingWorkspaceId)
+          .sort((a, b) => a.depth - b.depth);
+        for (const descendant of descendants) {
+          resolved = await tryLoadFromWorkspace(descendant.taskId);
+          if (resolved) break;
+        }
+      }
+      hasArtifactInRequestingTree = resolved !== null;
+    } else {
+      resolved = await this.findSubagentTranscriptByScanningSessions(taskId);
+    }
+
+    // Pending artifacts still have a live task session, so read it directly while it exists.
+    if (!resolved) {
+      if (requestingWorkspaceId && isDescendant) {
+        const taskSessionDir = this.config.getSessionDir(taskId);
+        const messages = await this.readTranscriptFromPaths({
+          workspaceId: taskId,
+          chatPath: path.join(taskSessionDir, CHAT_FILE_NAME),
+          chatArchivePath: path.join(taskSessionDir, CHAT_ARCHIVE_FILE_NAME),
+          partialPath: path.join(taskSessionDir, this.PARTIAL_FILE),
+          logLabel: taskId + "/chat.jsonl",
+        });
+        const metaResult = await dependencies.aiService.getWorkspaceMetadata(taskId);
+        const model =
+          metaResult.success &&
+          typeof metaResult.data.taskModelString === "string" &&
+          metaResult.data.taskModelString.trim().length > 0
+            ? metaResult.data.taskModelString.trim()
+            : undefined;
+        const thinkingLevel = metaResult.success
+          ? coerceThinkingLevel(metaResult.data.taskThinkingLevel)
+          : undefined;
+        return { messages, model, thinkingLevel };
+      }
+
+      throw new Error(
+        requestingWorkspaceId
+          ? "No transcript found for task " + taskId + " in workspace " + requestingWorkspaceId
+          : "No transcript found for task " + taskId
+      );
+    }
+
+    if (requestingWorkspaceId && !isDescendant && !hasArtifactInRequestingTree) {
+      throw new Error("Task is not a descendant of this workspace");
+    }
+
+    const messages = await this.readTranscriptFromPaths({
+      workspaceId: resolved.workspaceId,
+      chatPath: resolved.entry.chatPath,
+      partialPath: resolved.entry.partialPath,
+      logLabel: resolved.workspaceId + "/subagent-transcripts/" + taskId + "/chat.jsonl",
+    });
+    const model =
+      typeof resolved.entry.model === "string" && resolved.entry.model.trim().length > 0
+        ? resolved.entry.model.trim()
+        : undefined;
+    const thinkingLevel = coerceThinkingLevel(resolved.entry.thinkingLevel);
+    return { messages, model, thinkingLevel };
+  }
+
+  private normalizeTranscriptMessage(value: unknown): MuxMessage | null {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const obj = value as { createdAt?: unknown };
+    if (typeof obj.createdAt === "string") {
+      const parsed = new Date(obj.createdAt);
+      if (Number.isFinite(parsed.getTime())) {
+        obj.createdAt = parsed;
+      } else {
+        delete obj.createdAt;
+      }
+    }
+
+    return normalizeLegacyMuxMetadata(value as MuxMessage);
+  }
+
+  private parseMessages(
+    data: string,
+    logLabel: string,
+    normalize: (value: unknown) => MuxMessage | null
+  ): MuxMessage[] {
+    const lines = data.split("\n").filter((line) => line.trim());
+    const messages: MuxMessage[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      try {
+        const message = normalize(JSON.parse(lines[i]) as unknown);
+        if (message) messages.push(message);
+      } catch (parseError) {
+        log.warn(
+          "Skipping malformed JSON at line " + (i + 1) + " in " + logLabel + ":",
+          getErrorMessage(parseError),
+          "\nLine content:",
+          lines[i].substring(0, 100) + (lines[i].length > 100 ? "..." : "")
+        );
+      }
+    }
+    return messages;
+  }
+
+  private async readTranscriptMessages(
+    chatPath: string,
+    logLabel: string
+  ): Promise<MuxMessage[] | null> {
+    const data = await this.readExistingFile(chatPath);
+    return data === null
+      ? null
+      : this.parseMessages(data, logLabel, (value) => this.normalizeTranscriptMessage(value));
+  }
+
+  private async readTranscriptPartial(partialPath: string): Promise<MuxMessage | null> {
+    try {
+      const raw = await fs.readFile(partialPath, "utf-8");
+      return this.normalizeTranscriptMessage(JSON.parse(raw) as unknown);
+    } catch (error: unknown) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      log.warn("Failed to read partial.json for transcript", {
+        partialPath,
+        error: getErrorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  private mergeTranscriptPartial(messages: MuxMessage[], partial: MuxMessage | null): MuxMessage[] {
+    if (!partial) return messages;
+
+    const partialSeq = partial.metadata?.historySequence;
+    if (partialSeq === undefined) return [...messages, partial];
+
+    const existingIndex = messages.findIndex(
+      (message) => message.metadata?.historySequence === partialSeq
+    );
+    if (existingIndex >= 0) {
+      const existing = messages[existingIndex];
+      if ((partial.parts?.length ?? 0) <= (existing.parts?.length ?? 0)) return messages;
+      const next = [...messages];
+      next[existingIndex] = partial;
+      return next;
+    }
+
+    const insertIndex = messages.findIndex((message) => {
+      const sequence = message.metadata?.historySequence;
+      return typeof sequence === "number" && sequence > partialSeq;
+    });
+    if (insertIndex < 0) return [...messages, partial];
+
+    const next = [...messages];
+    next.splice(insertIndex, 0, partial);
+    return next;
+  }
+
+  private async readTranscriptFromPaths(params: {
+    workspaceId: string;
+    chatPath?: string;
+    chatArchivePath?: string;
+    partialPath?: string;
+    logLabel: string;
+  }): Promise<MuxMessage[]> {
+    const workspaceSessionDir = this.config.getSessionDir(params.workspaceId);
+    // Refuse path traversal from a corrupted transcript index.
+    if (params.chatPath && !isPathInsideDir(workspaceSessionDir, params.chatPath)) {
+      throw new Error("Refusing to read transcript outside workspace session dir");
+    }
+    if (params.chatArchivePath && !isPathInsideDir(workspaceSessionDir, params.chatArchivePath)) {
+      throw new Error("Refusing to read transcript archive outside workspace session dir");
+    }
+    if (params.partialPath && !isPathInsideDir(workspaceSessionDir, params.partialPath)) {
+      throw new Error("Refusing to read partial outside workspace session dir");
+    }
+
+    const [archivedMessages, messages, partial] = await Promise.all([
+      params.chatArchivePath
+        ? this.readTranscriptMessages(params.chatArchivePath, params.logLabel + " (archive)")
+        : null,
+      params.chatPath ? this.readTranscriptMessages(params.chatPath, params.logLabel) : null,
+      params.partialPath ? this.readTranscriptPartial(params.partialPath) : null,
+    ]);
+    if (!messages && !archivedMessages && !partial) {
+      throw new Error("Transcript not found (missing " + params.logLabel + ")");
+    }
+    return this.mergeTranscriptPartial([...(archivedMessages ?? []), ...(messages ?? [])], partial);
+  }
+
+  private async findSubagentTranscriptByScanningSessions(taskId: string): Promise<{
+    workspaceId: string;
+    entry: SubagentTranscriptArtifactIndexEntry;
+  } | null> {
+    const sessionsDir = path.join(this.config.rootDir, "sessions");
+    let dirents: Array<{ name: string; isDirectory: () => boolean }>;
+    try {
+      dirents = await fs.readdir(sessionsDir, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+
+    let best: { workspaceId: string; entry: SubagentTranscriptArtifactIndexEntry } | null = null;
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory() || !dirent.name) continue;
+      const artifacts = await readSubagentTranscriptArtifactsFile(
+        path.join(sessionsDir, dirent.name)
+      );
+      const entry = artifacts.artifactsByChildTaskId[taskId];
+      if (entry && (!best || entry.updatedAtMs > best.entry.updatedAtMs)) {
+        best = { workspaceId: dirent.name, entry };
+      }
+    }
+    return best;
   }
 
   private getChatHistoryPath(workspaceId: string): string {
@@ -735,33 +1010,12 @@ export class HistoryService {
    * Skips malformed JSON lines to prevent data loss from corruption.
    */
   private async readMessagesFromFile(filePath: string, logLabel: string): Promise<MuxMessage[]> {
-    try {
-      const data = await fs.readFile(filePath, "utf-8");
-      const lines = data.split("\n").filter((line) => line.trim());
-      const messages: MuxMessage[] = [];
-
-      for (let i = 0; i < lines.length; i++) {
-        try {
-          const message = JSON.parse(lines[i]) as MuxMessage;
-          messages.push(normalizeLegacyMuxMetadata(message));
-        } catch (parseError) {
-          // Skip malformed lines but log error for debugging
-          log.warn(
-            `Skipping malformed JSON at line ${i + 1} in ${logLabel}:`,
-            getErrorMessage(parseError),
-            "\nLine content:",
-            lines[i].substring(0, 100) + (lines[i].length > 100 ? "..." : "")
-          );
-        }
-      }
-
-      return messages;
-    } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return []; // No history yet
-      }
-      throw error; // Re-throw non-ENOENT errors
-    }
+    const data = await this.readExistingFile(filePath);
+    return data === null
+      ? []
+      : this.parseMessages(data, logLabel, (value) =>
+          normalizeLegacyMuxMetadata(value as MuxMessage)
+        );
   }
 
   /**
