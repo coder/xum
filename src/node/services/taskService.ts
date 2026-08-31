@@ -7996,6 +7996,39 @@ export class TaskService implements AgentTaskIntegration {
       });
       return;
     }
+    // Post-write revalidation: a wake-turn workflow_resume can restart the run while this
+    // settlement's snapshot was in flight, so the restart-time stable clear can land BEFORE
+    // the stable write above re-creates the marker. That marker postdates the newer
+    // generation's updatedAt, so the sweep's upgrade fallback (and a downgraded build's
+    // whole-run dedupe) would permanently suppress the newer result, and the by-run-id queue
+    // delete below would drop its owed wake. Reading the run AFTER the writes closes the
+    // write-side race: any restart after this read re-clears the stable marker itself and
+    // its terminal callback re-queues behind this deletion.
+    let currentRunUpdatedAt: string | null;
+    try {
+      const runStore = new WorkflowRunStore({
+        sessionDir: this.config.getSessionDir(params.ownerWorkspaceId),
+      });
+      currentRunUpdatedAt = (await runStore.getRun(params.runId)).updatedAt;
+    } catch {
+      currentRunUpdatedAt = null;
+    }
+    if (currentRunUpdatedAt !== params.runUpdatedAt) {
+      // The settled snapshot is no longer the run's newest generation (or the run is
+      // unreadable): the stable whole-run marker must not outlive the snapshot. The
+      // generation marker stays; it truthfully settles only this snapshot.
+      await this.clearWorkflowRunDowngradeSettlement({
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        runId: params.runId,
+      });
+      if (currentRunUpdatedAt != null) {
+        // The queue entry now represents the newer generation's owed wake: leave it for the
+        // drain the terminal callback scheduled (the sweep backstops a lost poke).
+        return;
+      }
+      // Unreadable run: fall through to the delete. With no stable marker surviving, the
+      // sweep re-derives any owed newer generation from durable state.
+    }
     this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId)?.delete(params.runId);
   }
 

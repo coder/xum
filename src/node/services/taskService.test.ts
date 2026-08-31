@@ -6267,6 +6267,91 @@ describe("TaskService", () => {
     expect(String(sendMessage.mock.calls[0]?.[1])).toContain(runId);
   });
 
+  test("settling a stale generation snapshot does not suppress a newer resumed result", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_mid_settlement_resume";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: new Date(Date.now() - 120_000).toISOString(),
+    });
+    await runStore.appendStatus(runId, "running", new Date(Date.now() - 90_000).toISOString());
+    await runStore.appendStatus(runId, "failed", new Date(Date.now() - 60_000).toISOString());
+
+    // The first wake turn resumes the run in the background and the newer generation reaches
+    // terminal before the outer drain settles its stale first-generation snapshot. The owner
+    // stays busy (streaming the wake turn) until that settlement completes, so the callback's
+    // interim drain defers instead of delivering the newer generation early.
+    let ownerBusy = false;
+    let simulateResumeDuringWake: (() => Promise<void>) | undefined;
+    const sendMessage = mock(async (..._args: unknown[]): Promise<Result<void>> => {
+      const simulate = simulateResumeDuringWake;
+      simulateResumeDuringWake = undefined;
+      await simulate?.();
+      return Ok(undefined);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    (workspaceService as unknown as Record<string, unknown>).hasPendingQueuedOrPreparingTurn = mock(
+      () => ownerBusy
+    );
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    simulateResumeDuringWake = async () => {
+      ownerBusy = true;
+      await runStore.appendStatus(runId, "running", new Date(Date.now() + 30_000).toISOString(), {
+        allowFailedCheckpointRetry: true,
+      });
+      await runStore.appendStatus(runId, "failed", new Date(Date.now() + 60_000).toISOString());
+      taskService.noteWorkflowRunTerminalAttention({
+        ownerWorkspaceId: parentId,
+        runId,
+        status: "failed",
+      });
+    };
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+    const sweep = () =>
+      (
+        taskService as unknown as {
+          sweepWorkflowRunTerminalAttention(): Promise<number>;
+        }
+      ).sweepWorkflowRunTerminalAttention();
+
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    await drain(parentId);
+    ownerBusy = false;
+    await flushTerminalAttentionDrains(taskService);
+    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // The stale snapshot's settlement must neither drop the newer generation's queue entry
+    // nor leave a stable marker that postdates it (which the sweep's upgrade fallback would
+    // migrate as delivered, permanently suppressing the result).
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(String(sendMessage.mock.calls[1]?.[1])).toContain(runId);
+    expect(await sweep()).toBe(0);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
   test("an unreadable settlement marker skips only that run and never rejects the sweep", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
