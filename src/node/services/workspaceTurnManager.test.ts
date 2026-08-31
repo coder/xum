@@ -16,8 +16,8 @@ import {
   readSubagentGitPatchArtifact,
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
-import { SessionUsageService } from "@/node/services/sessionUsageService";
-import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import {
   TerminalAttentionStore,
   type TerminalAttentionOutcome,
