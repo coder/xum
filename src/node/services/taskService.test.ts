@@ -565,6 +565,27 @@ function createTaskServiceHarness(
     streamManager
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);
+  const managerInternals = workspaceTurnManager as unknown as {
+    taskHandleStore: TaskHandleStore;
+    activeWorkspaceTurnHandleByWorkspaceId: Map<
+      string,
+      { handleId: string; ownerWorkspaceId: string; accepted: boolean }
+    >;
+  };
+  Object.defineProperties(taskService, {
+    taskHandleStore: { value: managerInternals.taskHandleStore },
+    activeWorkspaceTurnHandleByWorkspaceId: {
+      value: managerInternals.activeWorkspaceTurnHandleByWorkspaceId,
+    },
+  });
+  const managerRecord = workspaceTurnManager as unknown as Record<string, unknown>;
+  for (const name of Object.getOwnPropertyNames(WorkspaceTurnManager.prototype)) {
+    if (name === "constructor" || name in taskService) continue;
+    const method = managerRecord[name];
+    if (typeof method === "function") {
+      Object.defineProperty(taskService, name, { value: method.bind(workspaceTurnManager) });
+    }
+  }
 
   return {
     historyService,
