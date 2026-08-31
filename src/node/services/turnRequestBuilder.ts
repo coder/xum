@@ -2364,6 +2364,7 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
+        const prepareMessagesForProviderStartedAt = Date.now();
         const finalMessages = await prepareMessagesForProvider({
           messagesWithSentinel: addInterruptedSentinel(attemptProviderRequestMessages),
           effectiveAgentId,
@@ -2378,6 +2379,12 @@ export class TurnRequestBuilder {
           anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
           workspaceId,
         });
+        if (options.recordTimings) {
+          recordStartupPhaseTiming(
+            "prepareMessagesForProviderMs",
+            prepareMessagesForProviderStartedAt
+          );
+        }
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2497,7 +2504,6 @@ export class TurnRequestBuilder {
       -1
     );
     emitStartupBreadcrumb("preparing_request");
-    const prepareMessagesForProviderStartedAt = Date.now();
     const primaryRequest = await prepareModelRequest({
       seed: modelResult.data,
       sourceMessages: messages,
@@ -2507,7 +2513,6 @@ export class TurnRequestBuilder {
       requestHistorySequence,
       recordTimings: true,
     });
-    recordStartupPhaseTiming("prepareMessagesForProviderMs", prepareMessagesForProviderStartedAt);
     const tools = primaryRequest.tools;
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
