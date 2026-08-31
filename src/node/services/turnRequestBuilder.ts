@@ -453,6 +453,7 @@ type TurnRequestBuildOutcome =
 export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   mcpServerManager?: MCPServerManager;
   taskService?: TaskService;
+  workspaceTurnManager?: ToolConfiguration["workspaceTurnManager"];
   memoryService?: MemoryService;
   timelineService?: ToolConfiguration["timelineService"];
   extraTools?: Record<string, Tool>;
@@ -2130,6 +2131,7 @@ export class TurnRequestBuilder {
       },
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
+      workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
       analyticsService: this.dependencies.bindings.analyticsService,
       desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
       // Agent memory (memory experiment): per-scope write policy derived from

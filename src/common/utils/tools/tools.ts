@@ -80,6 +80,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
 import type { MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
@@ -203,6 +204,8 @@ export interface ToolConfiguration {
   reportModelUsage?: (event: ToolModelUsageEvent) => void;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
+  /** Workspace-turn lifecycle orchestration for wst_ handles. */
+  workspaceTurnManager?: WorkspaceTurnManager;
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {
     getRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;

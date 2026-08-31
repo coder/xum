@@ -629,7 +629,6 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
 
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
-  private readonly workspaceLifecycleLocks = new MutexMap<string>();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
   private readonly activeWorkspaceTurnHandleByWorkspaceId = new Map<
     string,
@@ -646,6 +645,7 @@ export class WorkspaceTurnManager {
     private readonly initStateManager: InitStateManager,
     private readonly taskService: TaskService,
     private readonly terminalAttentionStore: TerminalAttentionStore,
+    private readonly workspaceLifecycleLocks: MutexMap<string>,
     private readonly streamManager?: StreamManager
   ) {
     this.taskHandleStore = new TaskHandleStore(config);
@@ -659,6 +659,109 @@ export class WorkspaceTurnManager {
    * when two follow-ups are created within the same millisecond — an equal
    * ISO timestamp would otherwise fall back to filesystem readdir order.
    */
+
+  getLiveWorkspaceTurnRegistration(
+    workspaceId: string
+  ): { handleId: string; ownerWorkspaceId: string; accepted: boolean } | undefined {
+    return this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+  }
+
+  async markBackgroundWorkNotifyOnTerminal(
+    taskId: string,
+    ownerWorkspaceId: string
+  ): Promise<void> {
+    if (ownerWorkspaceId == null) return;
+    const pendingNotification = await this.workspaceTurnSettlementLocks.withLock(
+      taskId,
+      async (): Promise<{
+        handleId: string;
+        generationId: string;
+        terminalOutcome: TerminalAttentionOutcome;
+      } | null> => {
+        const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, taskId);
+        if (current == null) return null;
+
+        const updatedRecord: WorkspaceTurnTaskHandleRecord =
+          current.attentionPolicy === "notify_on_terminal"
+            ? current
+            : {
+                ...current,
+                attentionPolicy: "notify_on_terminal",
+                // Policy-only writes after settlement must not mint a new terminal outcome
+                // generation or invalidate direct-parent delivery keyed by status + updatedAt.
+                ...(this.isTerminalWorkspaceTurnStatus(current.status)
+                  ? {}
+                  : { updatedAt: getIsoNow() }),
+              };
+        if (updatedRecord !== current) {
+          await this.taskHandleStore.upsertWorkspaceTurn(updatedRecord);
+        }
+
+        // A queued-message/timeout detach can race with child stream-end settlement: the waiter is
+        // gone before notify_on_terminal is durably persisted, so settleWorkspaceTurn may have seen a
+        // blocking policy and skipped the terminal wake-up. If the handle is already terminal here,
+        // enqueue the missing wake-up after releasing the settlement lock.
+        if (
+          this.isTerminalWorkspaceTurnStatus(updatedRecord.status) &&
+          updatedRecord.terminalAttentionNotifiedAt == null
+        ) {
+          return {
+            handleId: updatedRecord.handleId,
+            generationId: this.workspaceTurnTerminalAttentionGenerationId(updatedRecord),
+            terminalOutcome: terminalAttentionOutcome(updatedRecord.status),
+          };
+        }
+        return null;
+      }
+    );
+    if (pendingNotification != null) {
+      await this.taskService.enqueueTerminalAttention({
+        ownerWorkspaceId,
+        sourceKind: "workspace_turn",
+        sourceId: pendingNotification.handleId,
+        generationId: pendingNotification.generationId,
+        terminalOutcome: pendingNotification.terminalOutcome,
+      });
+      await this.workspaceTurnSettlementLocks.withLock(taskId, async () => {
+        const terminal = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, taskId);
+        if (terminal != null && terminal.terminalAttentionNotifiedAt == null) {
+          await this.taskHandleStore.upsertWorkspaceTurn({
+            ...terminal,
+            terminalAttentionNotifiedAt: getIsoNow(),
+          });
+        }
+      });
+    }
+  }
+
+  async listAllWorkspaceTurns(options?: {
+    statuses?: WorkspaceTurnTaskStatus[];
+  }): Promise<WorkspaceTurnTaskHandleRecord[]> {
+    return await this.taskHandleStore.listAllWorkspaceTurns(options);
+  }
+
+  async getWorkspaceTurnRecord(
+    ownerWorkspaceId: string,
+    handleId: string
+  ): Promise<WorkspaceTurnTaskHandleRecord | null> {
+    return await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+  }
+
+  async getWorkspaceTurnForExecution(
+    workspaceId: string,
+    executionId: string
+  ): Promise<WorkspaceTurnTaskHandleRecord | null> {
+    const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+    if (live?.handleId === executionId) {
+      return await this.taskHandleStore.getWorkspaceTurn(live.ownerWorkspaceId, executionId);
+    }
+    return (
+      (await this.taskHandleStore.listAllWorkspaceTurns()).find(
+        (record) => record.handleId === executionId
+      ) ?? null
+    );
+  }
+
   private nextWorkspaceTurnCreatedAt(): string {
     const nowMs = Math.max(Date.now(), this.lastWorkspaceTurnCreatedAtMs + 1);
     this.lastWorkspaceTurnCreatedAtMs = nowMs;
@@ -1452,11 +1555,7 @@ export class WorkspaceTurnManager {
       return Err("Task.createWorkspaceTurn: owner workspace was archived during turn creation");
     }
     if (targetIsAgentWorkspace) {
-      await this.taskService.updateAgentTaskExecutionState(
-        targetWorkspaceId,
-        handleId,
-        record.status
-      );
+      await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, record.status);
     }
 
     if (agentValidationError != null) {
@@ -1499,11 +1598,7 @@ export class WorkspaceTurnManager {
           });
         }
         if (targetIsAgentWorkspace) {
-          await this.taskService.updateAgentTaskExecutionState(
-            targetWorkspaceId,
-            handleId,
-            "running"
-          );
+          await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, "running");
           // A stopped queued child keeps its only copy of the initial brief in taskPrompt. Once the
           // continuation accepts the replayed prompt, history owns that brief and the config copy can go.
           await this.taskService.editWorkspaceEntry(
@@ -1926,7 +2021,7 @@ export class WorkspaceTurnManager {
     }
   }
 
-  private isTerminalWorkspaceTurnStatus(status: WorkspaceTurnTaskStatus): boolean {
+  isTerminalWorkspaceTurnStatus(status: WorkspaceTurnTaskStatus): boolean {
     return status === "completed" || status === "interrupted" || status === "error";
   }
 
@@ -1952,7 +2047,7 @@ export class WorkspaceTurnManager {
     );
   }
 
-  private workspaceTurnTerminalAttentionGenerationId(
+  workspaceTurnTerminalAttentionGenerationId(
     record: Pick<WorkspaceTurnTaskHandleRecord, "handleId" | "status" | "updatedAt">
   ): string {
     // A handle can self-heal from an error into a corrected completion. Include the exact terminal
@@ -2280,7 +2375,7 @@ export class WorkspaceTurnManager {
                   ),
                 }
           );
-          await this.taskService.updateAgentTaskExecutionState(
+          await this.updateAgentTaskExecutionState(
             current.workspaceId,
             current.handleId,
             current.status
@@ -2366,7 +2461,7 @@ export class WorkspaceTurnManager {
           });
         }
         await this.taskHandleStore.upsertWorkspaceTurn(nextRecord);
-        await this.taskService.updateAgentTaskExecutionState(
+        await this.updateAgentTaskExecutionState(
           nextRecord.workspaceId,
           nextRecord.handleId,
           nextRecord.status
@@ -2635,7 +2730,7 @@ export class WorkspaceTurnManager {
     });
   }
 
-  private async normalizeWorkspaceTurnRecord(
+  async normalizeWorkspaceTurnRecord(
     record: WorkspaceTurnTaskHandleRecord,
     options: {
       /**
@@ -3107,7 +3202,7 @@ export class WorkspaceTurnManager {
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
-        await this.taskService.updateAgentTaskExecutionState(
+        await this.updateAgentTaskExecutionState(
           record.workspaceId,
           record.handleId,
           "interrupted"
@@ -3976,7 +4071,7 @@ export class WorkspaceTurnManager {
     });
   }
 
-  private async countActiveWorkspaceTurns(
+  async countActiveWorkspaceTurns(
     records?: readonly WorkspaceTurnTaskHandleRecord[]
   ): Promise<number> {
     const candidateWorkspaceTurns =
@@ -4012,9 +4107,7 @@ export class WorkspaceTurnManager {
     return count;
   }
 
-  private async listActiveWorkspaceTurnTaskIdsForOwner(
-    ownerWorkspaceId: string
-  ): Promise<string[]> {
+  async listActiveWorkspaceTurnTaskIdsForOwner(ownerWorkspaceId: string): Promise<string[]> {
     const records = await this.taskHandleStore.listWorkspaceTurns(ownerWorkspaceId);
     const taskIds: string[] = [];
     for (const record of records) {
@@ -4078,7 +4171,7 @@ export class WorkspaceTurnManager {
     };
   }
 
-  private getWorkspaceTurnMetadataFromValue(
+  getWorkspaceTurnMetadataFromValue(
     muxMetadata: unknown
   ): { taskHandleId: string; ownerWorkspaceId: string; turnId: string } | null {
     return parseWorkspaceTurnTaskCorrelation(muxMetadata);
@@ -4285,7 +4378,7 @@ export class WorkspaceTurnManager {
     return null;
   }
 
-  private async markWorkspaceTurnStreamEndDeferred(event: StreamEndEvent): Promise<void> {
+  async markWorkspaceTurnStreamEndDeferred(event: StreamEndEvent): Promise<void> {
     const metadata = this.getWorkspaceTurnMetadata(event);
     if (metadata == null) {
       return;
@@ -4847,5 +4940,182 @@ export class WorkspaceTurnManager {
       waiterSettlement: { status: "error", error: new Error(event.error) },
     });
     return true;
+  }
+
+  async reconcileAgentTaskExecutionIds(): Promise<void> {
+    const config = this.config.loadConfigOrDefault();
+    let records: WorkspaceTurnTaskHandleRecord[];
+    try {
+      records = await this.taskHandleStore.listAllWorkspaceTurns();
+    } catch (error: unknown) {
+      // Startup initialization must be self-healing: inability to scan task handles should disable
+      // this recovery pass, not prevent the application from starting.
+      log.warn("Skipping persistent sub-agent execution reconciliation", { error });
+      return;
+    }
+
+    interface TimestampedWorkspaceTurn {
+      record: WorkspaceTurnTaskHandleRecord;
+      updatedAtMs: number;
+    }
+    const timestampedRecords: TimestampedWorkspaceTurn[] = [];
+    for (const record of records) {
+      const updatedAtMs = Date.parse(record.updatedAt);
+      const canonicalUpdatedAt = Number.isFinite(updatedAtMs)
+        ? new Date(updatedAtMs).toISOString()
+        : null;
+      if (canonicalUpdatedAt !== record.updatedAt) {
+        log.warn("Ignoring persistent sub-agent execution with invalid updatedAt", {
+          handleId: record.handleId,
+          workspaceId: record.workspaceId,
+          updatedAt: record.updatedAt,
+        });
+        continue;
+      }
+      timestampedRecords.push({ record, updatedAtMs });
+    }
+    const recordsByHandleId = new Map(
+      timestampedRecords.map((candidate) => [candidate.record.handleId, candidate])
+    );
+    const recordsByWorkspaceId = new Map<string, TimestampedWorkspaceTurn[]>();
+    for (const candidate of timestampedRecords) {
+      const workspaceRecords = recordsByWorkspaceId.get(candidate.record.workspaceId) ?? [];
+      workspaceRecords.push(candidate);
+      recordsByWorkspaceId.set(candidate.record.workspaceId, workspaceRecords);
+    }
+
+    for (const task of this.taskService.listAgentTaskWorkspaces(config)) {
+      if (task.id == null) continue;
+      try {
+        const candidates = recordsByWorkspaceId.get(task.id) ?? [];
+        const referenced =
+          task.taskExecutionId != null ? recordsByHandleId.get(task.taskExecutionId) : undefined;
+        // Recover the crash window where the handle record became durable before the stable child
+        // pointer. Invalid timestamps are ignored so corrupt records cannot outrank active work.
+        const latestCandidate = candidates.reduce<TimestampedWorkspaceTurn | undefined>(
+          (latest, candidate) => {
+            if (latest == null) return candidate;
+            return candidate.updatedAtMs > latest.updatedAtMs ? candidate : latest;
+          },
+          undefined
+        );
+        const selected =
+          referenced == null
+            ? latestCandidate
+            : latestCandidate != null && latestCandidate.updatedAtMs > referenced.updatedAtMs
+              ? latestCandidate
+              : referenced;
+        const record = selected?.record;
+        if (record == null) {
+          if (task.taskExecutionId != null) {
+            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
+          }
+          continue;
+        }
+
+        let normalized: WorkspaceTurnTaskHandleRecord | null;
+        try {
+          normalized = await this.normalizeWorkspaceTurnRecord(record);
+        } catch (error: unknown) {
+          log.warn("Failed to reconcile persistent sub-agent execution", {
+            taskId: task.id,
+            handleId: record.handleId,
+            error,
+          });
+          continue;
+        }
+        if (normalized?.workspaceId !== task.id) {
+          if (task.taskExecutionId != null) {
+            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
+          }
+          continue;
+        }
+
+        await this.taskService.editWorkspaceEntry(
+          task.id,
+          (workspace) => {
+            workspace.taskExecutionId = normalized.handleId;
+            workspace.taskExecutionStatus = normalized.status;
+          },
+          { allowMissing: true }
+        );
+        await this.taskService.emitWorkspaceMetadata(task.id);
+        if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
+          this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
+            handleId: normalized.handleId,
+            ownerWorkspaceId: normalized.ownerWorkspaceId,
+            // Fail closed: the restart killed any live stream, so this recovered registration
+            // exists for settlement ownership, not peer admission. A revival or a fresh
+            // acceptance re-marks the entry accepted.
+            accepted: false,
+          });
+        }
+      } catch (error: unknown) {
+        // Startup recovery is best-effort: one read-only/corrupt child must not prevent Xum startup
+        // or block reconciliation of the remaining persistent children.
+        log.warn("Failed to persist persistent sub-agent execution reconciliation", {
+          taskId: task.id,
+          handleId: task.taskExecutionId,
+          error,
+        });
+      }
+    }
+  }
+
+  async updateAgentTaskExecutionState(
+    workspaceId: string,
+    handleId: string,
+    status: WorkspaceTurnTaskStatus | null
+  ): Promise<void> {
+    // editWorkspaceEntry reports `updated` for a mere existing workspace, so a queued/stale
+    // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
+    // points at — track whether the matching mirror was actually mutated.
+    let settledMatchingMirror = false;
+    const updated = await this.taskService.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (status == null) {
+          if (workspace.taskExecutionId === handleId) {
+            delete workspace.taskExecutionId;
+            delete workspace.taskExecutionStatus;
+            settledMatchingMirror = true;
+          }
+          return;
+        }
+        if (isActiveWorkspaceTurnTaskStatus(status)) {
+          workspace.taskExecutionId = handleId;
+          workspace.taskExecutionStatus = status;
+          return;
+        }
+        if (workspace.taskExecutionId === handleId) {
+          workspace.taskExecutionStatus = status;
+          settledMatchingMirror = true;
+        }
+      },
+      { allowMissing: true }
+    );
+    if (updated) {
+      // A settled MATCHING execution mirror is authoritative settlement: any stop latch
+      // retained for an unconfirmed stop of this workspace has been superseded and must be
+      // released — holding it past settlement would bar the workspace from peer messaging
+      // until restart. A non-matching handle settling leaves the live execution unrefuted, so
+      // its latch must stay.
+      //
+      // Remove the matching live registration BEFORE releasing (synchronously, in the same
+      // tick): Config.saveConfig swallows write failures, so `updated` does not prove the
+      // terminal mirror reached disk — a peer admission probe reading a stale running mirror
+      // between this release and the caller's own guarded registration delete would otherwise
+      // still find an accepted live handle and escape the stop. Without the registration,
+      // hasLiveRunningExecution refuses regardless of what the on-disk mirror claims. Callers'
+      // later guarded deletes simply no-op.
+      if (settledMatchingMirror) {
+        const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+        if (live?.handleId === handleId) {
+          this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
+        }
+        this.taskService.releaseRetainedStopLatches(workspaceId);
+      }
+      await this.taskService.emitWorkspaceMetadata(workspaceId);
+    }
   }
 }

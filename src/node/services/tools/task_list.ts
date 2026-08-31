@@ -26,7 +26,12 @@ import {
 
 import { buildWorkflowProgressSummary } from "./workflowProgress";
 import { toBashTaskId } from "./taskId";
-import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
+import {
+  parseToolResult,
+  requireTaskService,
+  requireWorkspaceId,
+  requireWorkspaceTurnManager,
+} from "./toolUtils";
 
 // "pending" and "backgrounded" are workflow-run statuses; agent/bash tasks never carry them.
 const DEFAULT_STATUSES = [
@@ -316,6 +321,7 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
     execute: async (args): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_list");
       const taskService = requireTaskService(config, "task_list");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_list");
 
       if ((args.scope ?? "descendants") === "tree") {
         return executeTreeScope(taskService, workspaceId, args.statuses ?? null);
@@ -371,7 +377,10 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
           const execution =
             resolvedExecution?.record ??
             (resolveAgentExecution == null
-              ? await taskService.getWorkspaceTurnSnapshot(workspaceId, task.executionTaskId)
+              ? await workspaceTurnManager.getWorkspaceTurnSnapshot(
+                  workspaceId,
+                  task.executionTaskId
+                )
               : null);
           executionStatus = execution?.status ?? executionStatus;
         }
@@ -419,11 +428,11 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
         }
       }
 
-      if (workspaceTurnStatuses.length > 0 && taskService.listWorkspaceTurnTasks != null) {
+      if (workspaceTurnStatuses.length > 0 && workspaceTurnManager.listWorkspaceTurnTasks != null) {
         const storeStatuses = workspaceTurnStatuses.map((status) =>
           status === "failed" ? "error" : status
         );
-        const workspaceTurns = await taskService.listWorkspaceTurnTasks(workspaceId, {
+        const workspaceTurns = await workspaceTurnManager.listWorkspaceTurnTasks(workspaceId, {
           statuses: storeStatuses,
         });
         for (const turn of workspaceTurns) {

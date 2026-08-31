@@ -24,6 +24,7 @@ import {
   emitChatEventBestEffort,
   parseToolResult,
   requireTaskService,
+  requireWorkspaceTurnManager,
   requireWorkspaceId,
 } from "./toolUtils";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -409,6 +410,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       const workspaceId = requireWorkspaceId(config, "task");
       const taskService = requireTaskService(config, "task");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task");
 
       const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
 
@@ -417,7 +419,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
       }
 
       if (kind === "workspace") {
-        const created = await taskService.createWorkspaceTurn({
+        const created = await workspaceTurnManager.createWorkspaceTurn({
           ownerWorkspaceId: workspaceId,
           prompt,
           title,
@@ -472,7 +474,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         }
 
         try {
-          const report = await taskService.waitForWorkspaceTurn(created.data.taskId, {
+          const report = await workspaceTurnManager.waitForWorkspaceTurn(created.data.taskId, {
             abortSignal,
             requestingWorkspaceId: workspaceId,
             backgroundOnMessageQueued: true,
