@@ -160,6 +160,7 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
@@ -2329,35 +2330,6 @@ export class TurnRequestBuilder {
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
-        // Shared by the initial build and thinking rebuilds so their assembly
-        // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
-          assemblePromptPayload({
-            history: options.sourceMessages,
-            systemMessage: attemptSystem,
-            tools: attemptTools,
-            modelString: seed.rawModelString,
-            routeProvider: seed.routeProvider,
-            providerForMessages: seed.wireProviderName,
-            effectiveThinkingLevel: level,
-            effectiveAgentId,
-            toolNamesForSentinel,
-            planContentForTransition,
-            planFilePath,
-            postCompactionAttachments,
-            providersConfig: seed.providersConfig,
-            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-            workspaceId,
-          });
-        const prepareMessagesForProviderStartedAt = Date.now();
-        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
-        if (options.recordTimings) {
-          recordStartupPhaseTiming(
-            "prepareMessagesForProviderMs",
-            prepareMessagesForProviderStartedAt
-          );
-        }
-        const finalMessages = attemptPayload.messages;
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2378,6 +2350,41 @@ export class TurnRequestBuilder {
           reasoningMode,
           ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
         });
+        // Manual cache markers must honor a TTL set through per-model
+        // providerOptions extras when the dedicated mux-level setting is
+        // unset, matching the pre-assembler request-config behavior.
+        const effectiveAnthropicCacheTtl =
+          effectiveMuxProviderOptions.anthropic?.cacheTtl ??
+          getAnthropicCacheTtl(preparedAttempt.providerOptions);
+        // Shared by the initial build and thinking rebuilds so their assembly
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
+          assemblePromptPayload({
+            history: options.sourceMessages,
+            systemMessage: attemptSystem,
+            tools: attemptTools,
+            modelString: seed.rawModelString,
+            routeProvider: seed.routeProvider,
+            providerForMessages: seed.wireProviderName,
+            effectiveThinkingLevel: level,
+            effectiveAgentId,
+            toolNamesForSentinel,
+            planContentForTransition,
+            planFilePath,
+            postCompactionAttachments,
+            providersConfig: seed.providersConfig,
+            anthropicCacheTtl: effectiveAnthropicCacheTtl,
+            workspaceId,
+          });
+        const prepareMessagesForProviderStartedAt = Date.now();
+        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+        if (options.recordTimings) {
+          recordStartupPhaseTiming(
+            "prepareMessagesForProviderMs",
+            prepareMessagesForProviderStartedAt
+          );
+        }
+        const finalMessages = attemptPayload.messages;
         const forcedFirstStepToolNames =
           seed.routeProvider === "xai"
             ? getForcedXaiSearchToolNames(
@@ -2405,7 +2412,7 @@ export class TurnRequestBuilder {
             requestHistorySequence: options.requestHistorySequence,
             sentinelToolNames: toolNamesForSentinel,
             wireProviderName: seed.wireProviderName,
-            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+            anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,
             planFilePath,
             postCompactionAttachments,
