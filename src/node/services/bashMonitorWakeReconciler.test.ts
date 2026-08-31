@@ -89,7 +89,11 @@ describe("BashMonitorWakeReconciler", () => {
         listAll: () => Promise.resolve(rows),
         remove: (_ownerWorkspaceId, processId, createdAt) => {
           removed.push(processId);
-          rows = rows.filter((row) => row.processId !== processId || row.createdAt !== createdAt);
+          rows = rows.filter((row) =>
+            createdAt == null
+              ? row.processId !== processId
+              : row.processId !== processId || row.createdAt !== createdAt
+          );
         },
         recordTerminal: () => undefined,
       },
