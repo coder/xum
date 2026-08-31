@@ -9373,6 +9373,84 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("a full-clear-classified truncation that would leave rows is refused under the history lock", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-all-drift-refuse";
+    const runId = "wfr_currentness_all_drift_refuse";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-all-drift-refuse",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      for (let i = 0; i < 6; i++) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`manual-user-${i}`, "user", `padding message ${i}`, {
+            timestamp: 1_200 + i,
+          })
+        );
+      }
+
+      // Simulate rows appended during the unserialized preflight (e.g. a turn completing
+      // before the admission guard is acquired): it classified this request as emptying, but
+      // the locked rewrite's recomputation removes only a prefix. The serialized revalidation
+      // must refuse rather than apply full-clear side effects (context epoch advance,
+      // goal/plan/retry discards) while rows remain.
+      const preflightSpy = spyOn(
+        historyService,
+        "classifyTruncationRemoval"
+      ).mockImplementationOnce(() => Promise.resolve("all" as const));
+      try {
+        const result = await workspaceService.truncateHistory(workspaceId, 0.5);
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("leave messages");
+        }
+      } finally {
+        preflightSpy.mockRestore();
+      }
+      // The transcript is intact; the reference was already retired before the refused
+      // rewrite (retirement precedes every row-removing truncation), which is the fail-safe
+      // direction: a dropped wake, with the result still retrievable via resume.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data).toHaveLength(6);
+      }
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a partial prefix truncation retires kernel workflow references", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-prefix-retire";

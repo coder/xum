@@ -12857,7 +12857,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // turn's restriction rows without a supersession decision), and a no-op must retire
     // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
     // Decide up front; historyService revalidates the dangerous drift directions under the
-    // history write lock (refuseFullDelete / refuseRowRemoval below).
+    // history write lock (refuseFullDelete / refuseRowRemoval / requireFullDelete below).
     const truncationScope =
       effectivePercentage >= 1.0
         ? ("all" as const)
@@ -12971,13 +12971,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       session?.clearUsageState();
     }
     // historyService revalidates the scope preflight under the history write lock: an
-    // overlapping truncation can shift this one across a scope boundary in either dangerous
+    // overlapping mutation can shift this one across a scope boundary in any dangerous
     // direction (a partial cut becoming a full delete skips the full-clear guards; a no-op
-    // becoming a real cut skips reference retirement).
+    // becoming a real cut skips reference retirement; a full clear leaving survivors would
+    // apply full-clear-only discards while rows remain).
     const truncate = () =>
       this.historyService.truncateHistory(workspaceId, effectivePercentage, {
         refuseFullDelete: truncationScope === "partial",
         refuseRowRemoval: truncationScope === "none",
+        requireFullDelete: truncationScope === "all",
       });
     const truncateResult =
       effectivePercentage > 0

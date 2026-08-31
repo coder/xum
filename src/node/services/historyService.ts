@@ -3002,7 +3002,11 @@ export class HistoryService {
   async truncateHistory(
     workspaceId: string,
     percentage: number,
-    options?: { refuseFullDelete?: boolean; refuseRowRemoval?: boolean }
+    options?: {
+      refuseFullDelete?: boolean;
+      refuseRowRemoval?: boolean;
+      requireFullDelete?: boolean;
+    }
   ): Promise<Result<number[], string>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -3039,6 +3043,17 @@ export class HistoryService {
           if (options?.refuseRowRemoval === true && removeCount > 0) {
             return Err(
               "Truncation classified as a no-op would remove messages; retry to re-run it."
+            );
+          }
+
+          // Third drift direction: the caller classified this request as emptying (and will
+          // apply full-clear-only side effects after the rewrite: context epoch advance,
+          // goal/plan/retry discards), but history grew between that unserialized read and
+          // this locked rewrite so rows would survive. Refuse instead of leaving survivors
+          // behind a "full clear"; a retry re-classifies.
+          if (options?.requireFullDelete === true && removeCount < messages.length) {
+            return Err(
+              "Truncation classified as a full clear would leave messages; retry to re-run it."
             );
           }
 
