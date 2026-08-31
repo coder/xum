@@ -282,13 +282,27 @@ export class MemoryMetaService {
           if (isEmptyEntry(entry)) delete entries[key];
         }
         const next: MemoryMetaFile = { entries };
-        yield* Effect.tryPromise({
-          try: () =>
-            writeFileAtomic(self.metaPath, JSON.stringify(next, null, 2), { encoding: "utf-8" }),
-          catch: (cause) =>
-            new MemoryMetaWriteError({ metaPath: self.metaPath, reason: getErrorMessage(cause) }),
-        });
-        self.cache = next;
+        // The atomic write cannot be cancelled once started, so the write and
+        // the cache update form one uninterruptible unit: a fiber interrupted
+        // mid-write (e.g. client abort) must still reconcile the in-memory
+        // cache with what landed on disk. Otherwise the next mutation would
+        // rebuild disk state from a stale cache and silently lose this write.
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            yield* Effect.tryPromise({
+              try: () =>
+                writeFileAtomic(self.metaPath, JSON.stringify(next, null, 2), {
+                  encoding: "utf-8",
+                }),
+              catch: (cause) =>
+                new MemoryMetaWriteError({
+                  metaPath: self.metaPath,
+                  reason: getErrorMessage(cause),
+                }),
+            });
+            self.cache = next;
+          })
+        );
       })
     );
   }
