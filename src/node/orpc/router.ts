@@ -485,27 +485,44 @@ export const router = (authToken?: string) => {
         .input(schemas.providers.getConfig.input)
         .output(schemas.providers.getConfig.output)
         .handler(({ context }) => context.providerService.getConfig()),
+      // Provider mutations run Effect generators via handlerGen (client aborts
+      // interrupt the fiber); the wire contracts are unchanged. Sync reads
+      // (list/getConfig) and subscriptions stay plain handlers.
       addCustomProvider: t
         .input(schemas.providers.addCustomProvider.input)
         .output(schemas.providers.addCustomProvider.output)
-        .handler(({ context, input }) => context.providerService.addCustomProvider(input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.providerService.addCustomProviderEffect(input);
+          })
+        ),
       removeCustomProvider: t
         .input(schemas.providers.removeCustomProvider.input)
         .output(schemas.providers.removeCustomProvider.output)
-        .handler(({ context, input }) =>
-          context.providerService.removeCustomProvider(input.provider)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.providerService.removeCustomProviderEffect(input.provider);
+          })
         ),
       setProviderConfig: t
         .input(schemas.providers.setProviderConfig.input)
         .output(schemas.providers.setProviderConfig.output)
-        .handler(({ context, input }) =>
-          context.providerService.setConfig(input.provider, input.keyPath, input.value)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.providerService.setConfigEffect(
+              input.provider,
+              input.keyPath,
+              input.value
+            );
+          })
         ),
       setModels: t
         .input(schemas.providers.setModels.input)
         .output(schemas.providers.setModels.output)
-        .handler(({ context, input }) =>
-          context.providerService.setModels(input.provider, input.models)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.providerService.setModelsEffect(input.provider, input.models);
+          })
         ),
       onConfigChanged: t
         .input(schemas.providers.onConfigChanged.input)
