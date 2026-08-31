@@ -294,6 +294,74 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("runtime failure recreates missing registry evidence from arm metadata", async () => {
+    const { service, events, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      bashMonitorRegistryStore: {
+        listAll(workspaceId: string): Promise<
+          Array<{
+            processId: string;
+            lost?: {
+              reason: "runtime-failure";
+              failureMessage?: string;
+              failedOperations?: string[];
+              failedMatch?: { lines: string[] };
+            };
+          }>
+        >;
+      };
+    };
+    try {
+      await internal.bashMonitorRecoveryPromise;
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      const armMetadata = {
+        processId: "failed-proc",
+        taskId: "bash:failed-proc",
+        workspaceId: "owner",
+        filter: "READY",
+        filterExclude: false,
+        script: "run",
+        createdAt: "2026-08-31T12:00:00.000Z",
+      };
+
+      events.emit("monitor:stopped", "owner", {
+        processId: "failed-proc",
+        reason: "failed",
+        armMetadata,
+        failureMessage: "transport unavailable",
+        failedOperations: ["readOutput"],
+        failedMatch: {
+          lines: ["READY before failure"],
+          totalMatches: 1,
+          droppedLines: 0,
+          matchedThroughOffset: 12,
+        },
+      });
+
+      let rows = await internal.bashMonitorRegistryStore.listAll("owner");
+      for (let attempt = 0; attempt < 20 && rows.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        rows = await internal.bashMonitorRegistryStore.listAll("owner");
+      }
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        processId: "failed-proc",
+        lost: {
+          reason: "runtime-failure",
+          failureMessage: "transport unavailable",
+          failedOperations: ["readOutput"],
+          failedMatch: { lines: ["READY before failure"] },
+        },
+      });
+      expect(scheduleReconcile).toHaveBeenCalledWith("owner");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("full clears preconsume and postconsume wakes while truncations leave them alone", async () => {
     const { service, cleanup } = await createWakeWiringService();
     const order: string[] = [];

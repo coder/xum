@@ -137,6 +137,38 @@ describe("BashMonitorRegistryStore", () => {
     });
   });
 
+  test("persists bounded runtime failure evidence until delivery", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    await store.upsert(armedPayload());
+    await store.recordLost("owner-1", "proc-1", {
+      reason: "runtime-failure",
+      failureMessage: "\u001b[31mtransport unavailable\u001b[0m",
+      failedOperations: ["readOutput", "getExitCode"],
+      failedMatch: {
+        lines: Array.from({ length: 60 }, (_, index) => `line-${index}`),
+        totalMatches: 60,
+        droppedLines: 2,
+        matchedThroughOffset: 120,
+      },
+      failedAt: "2026-01-01T00:00:02.000Z",
+    });
+
+    const lost = (await store.listAll("owner-1"))[0].lost;
+    expect(lost).toMatchObject({
+      reason: "runtime-failure",
+      failureMessage: "transport unavailable",
+      failedOperations: ["readOutput", "getExitCode"],
+      failedAt: "2026-01-01T00:00:02.000Z",
+      failedMatch: {
+        totalMatches: 60,
+        droppedLines: 12,
+        matchedThroughOffset: 120,
+      },
+    });
+    expect(lost?.failedMatch?.lines).toHaveLength(50);
+    expect(lost?.failedMatch?.lines[0]).toBe("line-10");
+  });
+
   test("bounds persisted script length", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     await store.upsert(armedPayload({ script: "x".repeat(10_000) }));

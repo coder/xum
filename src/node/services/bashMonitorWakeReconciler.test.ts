@@ -376,6 +376,76 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].prompt).toContain("[monitor] process settled: killed");
   });
 
+  test("runtime monitor failure remains actionable and deduplicates after reconstruction", async () => {
+    const runtimeFailure: BashMonitorRegistryRecord = {
+      processId: "proc",
+      taskId: "bash:proc",
+      ownerWorkspaceId: OWNER,
+      displayName: "CI watcher",
+      filter: "READY",
+      filterExclude: false,
+      script: "run-ci",
+      createdAt: CREATED_AT,
+      lost: {
+        reason: "runtime-failure",
+        failureMessage: "transport failed",
+        failedOperations: ["getExitCode"],
+        failedMatch: {
+          lines: ["READY before failure"],
+          totalMatches: 1,
+          droppedLines: 0,
+          matchedThroughOffset: 12,
+        },
+        failedAt: "2026-08-31T12:06:00.000Z",
+      },
+    };
+    live = [liveSnapshot({ match: undefined, retired: true })];
+    rows = [runtimeFailure];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records[0]).toMatchObject({
+      processId: "proc",
+      kind: "monitor-lost",
+      lostReason: "runtime-failure",
+    });
+    expect(dispatches[0].prompt).toContain("monitor failed at runtime");
+    expect(dispatches[0].prompt).toContain("process may still be running");
+    expect(dispatches[0].prompt).toContain("transport failed");
+    expect(dispatches[0].prompt).toContain("Failed operations: getExitCode");
+    expect(dispatches[0].prompt).toContain("Matched output before failure");
+    expect(dispatches[0].prompt).toContain("READY before failure");
+    expect(dispatches[0].prompt).not.toContain("process was terminated");
+    await dispatches[0].onAccepted();
+
+    live = [];
+    rows = [runtimeFailure];
+    const afterRestart: BashMonitorWakeDispatch[] = [];
+    const restarted = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: async () => live,
+        getMonitorWakeDeliveryState: async () => undefined,
+        acknowledgeMonitorWake: async () => undefined,
+        dropRetiredMonitor: async () => undefined,
+      },
+      registry: {
+        listAll: async () => rows,
+        remove: async (_ownerWorkspaceId, processId) => {
+          rows = rows.filter((row) => row.processId !== processId);
+        },
+        recordTerminal: async () => undefined,
+      },
+      onWake: async (dispatch) => {
+        afterRestart.push(dispatch);
+      },
+    });
+
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toEqual([]);
+  });
+
   test("snapshot supplies pending kinds without dispatching and removes the legacy outbox", async () => {
     rows = [
       registryRecord({
