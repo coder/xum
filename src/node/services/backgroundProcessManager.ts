@@ -1856,7 +1856,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
                 settledAt: monitor.settlementDisposition.settledAt,
                 wakeOnExit: monitor.settlementDisposition.wakeOnExit,
                 terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
-                tailLines: [...monitor.settlementDisposition.tailLines],
+                tailLines: monitor.settlementDisposition.tailLines.map((entry) => ({ ...entry })),
               },
             }
           : {}),
@@ -1942,7 +1942,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const disposition = proc.monitor?.settlementDisposition;
     return disposition == null
       ? undefined
-      : { ...disposition, tailLines: [...disposition.tailLines] };
+      : { ...disposition, tailLines: disposition.tailLines.map((entry) => ({ ...entry })) };
   }
 
   dropMonitorSettlementDisposition(processId: string, originNotAfterMs: number): void {

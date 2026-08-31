@@ -1604,14 +1604,20 @@ describe("BackgroundProcessManager", () => {
         // Terminal-only settlement: no undelivered matched output, so no offset signal that
         // could ever falsely suppress the wake (EOF == shown offset for unread output is fine).
         expect(payload.matchedThroughOffset).toBeUndefined();
-        // Synthetic settle line (downgrade fallback) in lines; the actionable failure travels in
-        // the separate tail so the store can dedupe it against persisted matches.
-        expect(
-          payload.lines.some((line) => line.includes("process settled: exited (code 1)"))
-        ).toBe(true);
+        expect(payload.lines).toEqual([]);
         expect(
           (payload.tailLines ?? []).some((line) =>
             line.includes("Unresolved review comments found")
+          )
+        ).toBe(true);
+        const wakeSignal = manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId);
+        expect(wakeSignal?.match).toBeUndefined();
+        expect(
+          wakeSignal?.terminal?.tailLines?.some(
+            (entry) =>
+              entry.line.includes("Unresolved review comments found") && entry.endOffset > 0
           )
         ).toBe(true);
         // Durability ordering: the wake emit precedes registry deletion.
@@ -1636,7 +1642,7 @@ describe("BackgroundProcessManager", () => {
         const event = await eventPromise;
         expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 3 });
         expect(event.payload.matchedThroughOffset).toBeUndefined();
-        expect(event.payload.lines).toEqual(["[monitor] process settled: exited (code 3)"]);
+        expect(event.payload.lines).toEqual([]);
       });
 
       it("timeout auto-termination settles with a deterministic killed payload", async () => {
@@ -1652,9 +1658,7 @@ describe("BackgroundProcessManager", () => {
 
         const event = await eventPromise;
         expect(event.payload.terminal?.status).toBe("killed");
-        expect(event.payload.lines.some((line) => line.includes("process settled: killed"))).toBe(
-          true
-        );
+        expect(event.payload.lines).toEqual([]);
       });
 
       it("emits ONE coalesced payload for pending matched lines plus exit", async () => {
@@ -1686,9 +1690,14 @@ describe("BackgroundProcessManager", () => {
         expect(payload.lines[0]).toBe("ERR boom");
         expect(payload.matchedThroughOffset).toBeDefined();
         expect(payload.terminal).toEqual({ status: "exited", exitCode: 2 });
-        expect(
-          payload.lines.some((line) => line.includes("process settled: exited (code 2)"))
-        ).toBe(true);
+        expect(payload.lines).toEqual(["ERR boom"]);
+        const wakeSignal = manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId);
+        expect(wakeSignal?.match?.lines).toEqual(["ERR boom"]);
+        expect(wakeSignal?.match?.lines.some((line) => line.includes("process settled:"))).toBe(
+          false
+        );
       });
 
       it("emits no settlement wake on discard-mode termination (task_stop)", async () => {
@@ -2109,8 +2118,7 @@ describe("BackgroundProcessManager", () => {
 
         const event = await eventPromise;
         expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 1 });
-        // Tail unavailable: the synthetic settle line alone still delivers.
-        expect(event.payload.lines).toEqual(["[monitor] process settled: exited (code 1)"]);
+        expect(event.payload.lines).toEqual([]);
       });
 
       it("cancellation during the claimed settlement window wins (no terminal wake, one canceled stop)", async () => {

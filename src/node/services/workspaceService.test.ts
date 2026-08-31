@@ -467,6 +467,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     });
     const afterIdle = mock(() => undefined);
     const onAccepted = mock(() => Promise.resolve());
+    const onDeferred = mock(() => Promise.resolve());
     const internal = service as unknown as {
       hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
       scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
@@ -477,19 +478,22 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         dedupeKey: string;
         cancelSignal: AbortSignal;
         onAccepted(): Promise<void>;
-      }): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
     };
     try {
       internal.hasPendingQueuedOrPreparingTurn = () => true;
       internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
-      await internal.dispatchBashMonitorWake({
+      const outcome = await internal.dispatchBashMonitorWake({
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
         dedupeKey: "wake",
         cancelSignal: new AbortController().signal,
         onAccepted,
+        onDeferred,
       });
+      expect(outcome).toBe("deferred");
       expect(afterIdle).toHaveBeenCalledWith(workspaceId);
       expect(onAccepted).not.toHaveBeenCalled();
     } finally {
