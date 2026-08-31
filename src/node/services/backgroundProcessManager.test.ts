@@ -2415,6 +2415,7 @@ describe("BackgroundProcessManager", () => {
       const proc = await manager.getProcess(result.processId);
       expect(proc).not.toBeNull();
       if (proc == null) return;
+      if (proc.monitor != null) proc.monitor.stopped = true;
       const exitSpy = spyOn(proc.handle, "getExitCode").mockRejectedValue(
         new Error("persistent transport failure")
       );
