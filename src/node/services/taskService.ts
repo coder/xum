@@ -1922,6 +1922,18 @@ export class TaskService implements AgentTaskIntegration {
     return Array.from(runIds);
   }
 
+  /**
+   * Workflow-run reads here all open a per-workspace store over that workspace's session
+   * directory, so the sessionDir join lives in exactly one place. The store constructor is
+   * pure bookkeeping (no I/O), so a fresh instance per call matches the previous inline
+   * construction exactly.
+   */
+  private workflowRunStoreFor(workspaceId: string): WorkflowRunStore {
+    return new WorkflowRunStore({
+      sessionDir: path.join(this.config.sessionsDir, workspaceId),
+    });
+  }
+
   private async listActiveBackgroundWorkflowRunIds(
     workspaceId: string,
     referencedWorkflowRunIds: readonly string[]
@@ -1933,9 +1945,7 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const referencedRunIdSet = new Set(referencedWorkflowRunIds);
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(workspaceId);
       const runs = await runStore.listRuns();
       return runs
         .filter(
@@ -1968,9 +1978,7 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const referencedRunIdSet = new Set(referencedWorkflowRunIds);
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(workspaceId);
       const runs = await runStore.listRuns();
       const blockingRunIds: string[] = [];
       for (const run of runs) {
@@ -2064,9 +2072,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(parentWorkspaceId);
       const run = await runStore.getRun(workflowTask.runId);
       if (run.workspaceId !== parentWorkspaceId) {
         return {
@@ -7733,9 +7739,7 @@ export class TaskService implements AgentTaskIntegration {
         ) {
           continue;
         }
-        const runStore = new WorkflowRunStore({
-          sessionDir: path.join(this.config.sessionsDir, workspace.id),
-        });
+        const runStore = this.workflowRunStoreFor(workspace.id);
         let runs: Awaited<ReturnType<WorkflowRunStore["listRuns"]>>;
         try {
           runs = await runStore.listRuns();
@@ -8112,9 +8116,7 @@ export class TaskService implements AgentTaskIntegration {
     // its terminal callback re-queues behind this deletion.
     let currentRunUpdatedAt: string | null;
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, params.ownerWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(params.ownerWorkspaceId);
       currentRunUpdatedAt = (await runStore.getRun(params.runId)).updatedAt;
     } catch {
       currentRunUpdatedAt = null;
@@ -8417,9 +8419,7 @@ export class TaskService implements AgentTaskIntegration {
     candidate: { runId: string; run: WorkflowRunRecord }
   ): Promise<"deliverable" | "superseded" | "defer"> {
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(ownerWorkspaceId);
       const currentRun = await runStore.getRun(candidate.runId);
       if (
         currentRun.status !== candidate.run.status ||
@@ -8469,9 +8469,7 @@ export class TaskService implements AgentTaskIntegration {
   > {
     assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
     assert(runId.length > 0, "buildWorkflowTerminalPrompt requires runId");
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
-    });
+    const runStore = this.workflowRunStoreFor(ownerWorkspaceId);
     let run: Awaited<ReturnType<WorkflowRunStore["getRun"]>>;
     try {
       run = await runStore.getRun(runId);
@@ -13687,9 +13685,7 @@ export class TaskService implements AgentTaskIntegration {
     if (runIds.length === 0) {
       return [];
     }
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(this.config.sessionsDir, workspaceId),
-    });
+    const runStore = this.workflowRunStoreFor(workspaceId);
     const blocking: string[] = [];
     for (const runId of runIds) {
       const run = await runStore.getRun(runId).catch(() => null);
@@ -13739,9 +13735,7 @@ export class TaskService implements AgentTaskIntegration {
       workspaceId.length > 0,
       "listActiveWorkflowRunIdsForWorkspaceStrict requires workspaceId"
     );
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(this.config.sessionsDir, workspaceId),
-    });
+    const runStore = this.workflowRunStoreFor(workspaceId);
     const runs = await runStore.listRunsForActivityScan();
     return runs
       .filter(
@@ -16873,9 +16867,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(parentWorkspaceId);
       const run = await runStore.getRun(workflowTask.runId);
       return run.agentOutputSchemaRequired !== true;
     } catch (error) {
