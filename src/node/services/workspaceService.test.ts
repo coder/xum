@@ -490,6 +490,12 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         armMetadata.processId,
         armMetadata.createdAt
       );
+      // The invalidated chain must also release its tracking entry so the
+      // per-process failure-persist map stays bounded by in-flight chains.
+      const tracking = (
+        service as unknown as { activeBashMonitorFailurePersists: Map<string, unknown> }
+      ).activeBashMonitorFailurePersists;
+      expect(tracking.size).toBe(0);
     } finally {
       await cleanup();
     }

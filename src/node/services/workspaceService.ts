@@ -1841,7 +1841,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
-  private readonly canceledBashMonitorGenerationByProcess = new Map<string, string>();
+  // Failed-persistence chains active per process, so a later cancellation (task_stop after a
+  // runtime failure) can invalidate in-flight persists and scheduled retries by generation.
+  // "failed" can never follow "canceled" for one generation (stopMonitor guards on
+  // monitor.stopped), so tracking only live failed chains suffices; the owning chain removes
+  // its entry on termination, keeping the map bounded by in-flight failure persists.
+  private readonly activeBashMonitorFailurePersists = new Map<
+    string,
+    { createdAt: string; canceled: boolean }
+  >();
   private readonly bashOutputShownListener = (
     workspaceId: string,
     _payload: OutputShownPayload
@@ -1875,11 +1883,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const processKey = workspaceId + "\u0000" + payload.processId;
     const createdAt = payload.armMetadata?.createdAt;
     if (payload.reason === "canceled" && createdAt != null) {
-      this.canceledBashMonitorGenerationByProcess.set(processKey, createdAt);
+      const active = this.activeBashMonitorFailurePersists.get(processKey);
+      if (active?.createdAt === createdAt) active.canceled = true;
     }
-    const wasCanceled = (): boolean =>
-      createdAt != null &&
-      this.canceledBashMonitorGenerationByProcess.get(processKey) === createdAt;
+    const failurePersist =
+      payload.reason === "failed" && createdAt != null ? { createdAt, canceled: false } : undefined;
+    if (failurePersist != null) {
+      this.activeBashMonitorFailurePersists.set(processKey, failurePersist);
+    }
+    const wasCanceled = (): boolean => failurePersist?.canceled === true;
+    const settleFailurePersist = (): void => {
+      if (
+        failurePersist != null &&
+        this.activeBashMonitorFailurePersists.get(processKey) === failurePersist
+      ) {
+        this.activeBashMonitorFailurePersists.delete(processKey);
+      }
+    };
     const persist = async (): Promise<boolean> => {
       if (payload.reason === "canceled") {
         if (createdAt == null) return false;
@@ -1927,22 +1947,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     };
     let retryIndex = 0;
     const run = (): void => {
-      if (
-        this.removingWorkspaces.has(workspaceId) ||
-        (payload.reason === "failed" && wasCanceled())
-      ) {
+      if (this.removingWorkspaces.has(workspaceId) || wasCanceled()) {
+        settleFailurePersist();
         return;
       }
       void persist()
         .then((persisted) => {
-          if (persisted && !(payload.reason === "failed" && wasCanceled())) {
+          settleFailurePersist();
+          if (persisted && !wasCanceled()) {
             this.scheduleBashMonitorWakeReconcile(workspaceId);
           }
         })
         .catch((error: unknown) => {
-          if (payload.reason === "failed" && wasCanceled()) return;
+          if (wasCanceled()) {
+            settleFailurePersist();
+            return;
+          }
           const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
           if (delay == null) {
+            settleFailurePersist();
             log.error("Failed to retire bash monitor state", { workspaceId, error });
             return;
           }
