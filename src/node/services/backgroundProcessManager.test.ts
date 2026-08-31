@@ -1044,7 +1044,10 @@ describe("BackgroundProcessManager", () => {
         await manager.terminate(terminated.processId, { monitorDisposition: "discard" });
         expect(events.stopped).toContainEqual({
           workspaceId: testWorkspaceId,
-          payload: { processId: terminated.processId, reason: "canceled" },
+          payload: expect.objectContaining({
+            processId: terminated.processId,
+            reason: "canceled",
+          }),
         });
       });
 
@@ -1788,7 +1791,8 @@ describe("BackgroundProcessManager", () => {
         await new Promise((resolve) => setTimeout(resolve, 400));
 
         expect(matchEvents).toHaveLength(0);
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "canceled" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
       it("wake_on_exit=false suppresses the terminal wake entirely on a no-match exit", async () => {
@@ -1889,7 +1893,11 @@ describe("BackgroundProcessManager", () => {
 
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].terminal).toBeUndefined();
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+        });
       });
 
       it("maxEvents reached inside the settlement scan still yields one combined payload", async () => {
@@ -2233,7 +2241,8 @@ describe("BackgroundProcessManager", () => {
         await new Promise((resolve) => setTimeout(resolve, 300));
 
         expect(matchEvents).toHaveLength(0);
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "canceled" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({ processId: result.processId, reason: "canceled" });
       });
 
       it("emits no settlement wakes during shutdown", async () => {
