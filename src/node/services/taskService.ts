@@ -1663,6 +1663,11 @@ export class TaskService implements AgentTaskIntegration {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  // Terminal settlements of the same run must not overlap: settlement is multi-step (stable
+  // refresh, generation marker, post-write mismatch delete), so an older generation reaching
+  // its mismatch delete after a newer settlement's stable refresh would remove the newer
+  // generation's valid marker and let a downgraded build re-deliver a consumed result.
+  private readonly workflowRunSettlementByRun = new Map<string, Promise<void>>();
   // Owed workflow terminal wakes (owner -> runIds believed terminal and not yet settled). An
   // in-memory work queue over durable state, not a delivery record: entries are (re)derived
   // from run records + settled markers at startup and on the periodic sweep and added by live
@@ -7981,6 +7986,32 @@ export class TaskService implements AgentTaskIntegration {
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
+    const key = `${params.ownerWorkspaceId}\u0000${params.runId}`;
+    const previous = this.workflowRunSettlementByRun.get(key) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(() => this.settleWorkflowRunTerminalAttention(params));
+    const tracked = run
+      .then(
+        () => undefined,
+        () => undefined
+      )
+      .finally(() => {
+        if (this.workflowRunSettlementByRun.get(key) === tracked) {
+          this.workflowRunSettlementByRun.delete(key);
+        }
+      });
+    this.workflowRunSettlementByRun.set(key, tracked);
+    return await run;
+  }
+
+  private async settleWorkflowRunTerminalAttention(params: {
+    ownerWorkspaceId: string;
+    runId: string;
+    status: WorkflowRunStatus;
+    runUpdatedAt: string;
+    settledAs: "delivered" | "superseded";
+  }): Promise<void> {
     try {
       // Downgrade compatibility: the previous build dedupes its startup re-derivation on the
       // stable un-suffixed workflow_run id, so settling only the generation marker would let
@@ -8329,17 +8360,14 @@ export class TaskService implements AgentTaskIntegration {
    *   marker, so resending would replay output the conversation already handled.
    * "superseded" settles the candidate; "defer" leaves its queue entry pending so a later
    * drain re-derives from the then-current run record and markers.
+   * Currentness is deliberately the LAST await: it is the read that observes a destructive
+   * history mutation (clear/truncation) retiring the run's invocation, and any awaited read
+   * after it would reopen the stale-injection window this reread exists to close.
    */
   private async revalidateWorkflowPromptForDispatch(
     ownerWorkspaceId: string,
     candidate: { runId: string; run: WorkflowRunRecord }
   ): Promise<"deliverable" | "superseded" | "defer"> {
-    const currentness = await this.workspaceService
-      .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
-      .catch(() => "indeterminate" as const);
-    if (currentness !== "current") {
-      return currentness === "not_current" ? "superseded" : "defer";
-    }
     try {
       const runStore = new WorkflowRunStore({
         sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
@@ -8364,6 +8392,12 @@ export class TaskService implements AgentTaskIntegration {
       }
     } catch {
       return "defer";
+    }
+    const currentness = await this.workspaceService
+      .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
+      .catch(() => "indeterminate" as const);
+    if (currentness !== "current") {
+      return currentness === "not_current" ? "superseded" : "defer";
     }
     return "deliverable";
   }

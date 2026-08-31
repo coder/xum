@@ -6570,6 +6570,194 @@ describe("TaskService", () => {
     expect(pending.get(parentId)?.has(runId) ?? false).toBe(false);
   });
 
+  test("a history mutation during the revalidation reads supersedes the wake instead of delivering", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_dispatch_mutation_during_reads";
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    const run = await runStore.getRun(runId);
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void, SendMessageError>> =>
+        Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // A history clear retires the run's invocation DURING the revalidation's own run/marker
+    // reads: model it on the second generation-marker read (the first is derivation's), so
+    // only a currentness read taken AFTER those reads can observe it.
+    let cleared = false;
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve(cleared ? ("not_current" as const) : ("current" as const)));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const internal = taskService as unknown as {
+      terminalAttentionStore: TerminalAttentionStore;
+      pendingWorkflowRunAttention: Map<string, Set<string>>;
+      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+    };
+    const generationMarkerId = TerminalAttentionStore.notificationId(
+      "workflow_run",
+      runId,
+      run.updatedAt
+    );
+    const realGet = internal.terminalAttentionStore.get.bind(internal.terminalAttentionStore);
+    let generationMarkerReads = 0;
+    const getSpy = spyOn(internal.terminalAttentionStore, "get").mockImplementation(
+      (ownerWorkspaceId, notificationId) => {
+        if (notificationId === generationMarkerId) {
+          generationMarkerReads += 1;
+          if (generationMarkerReads === 2) {
+            cleared = true;
+          }
+        }
+        return realGet(ownerWorkspaceId, notificationId);
+      }
+    );
+
+    try {
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+      );
+      internal.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+      await internal.drainTerminalAttention(parentId);
+      await flushTerminalAttentionDrains(taskService);
+    } finally {
+      getSpy.mockRestore();
+    }
+
+    // Currentness is the final await before dispatch: it postdates the run/marker reads, so
+    // the clear is observed and the retained prompt is settled superseded, never sent.
+    expect(sendMessage).not.toHaveBeenCalled();
+    const probeStore = new TerminalAttentionStore(config);
+    const marker = await probeStore.get(parentId, generationMarkerId);
+    expect(marker?.status).toBe("superseded");
+    expect(internal.pendingWorkflowRunAttention.get(parentId)?.has(runId) ?? false).toBe(false);
+  });
+
+  test("overlapping settlements preserve the newer generation's stable marker", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_overlapping_settlements";
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "failed", "2026-06-19T00:00:03.000Z");
+    const oldGeneration = (await runStore.getRun(runId)).updatedAt;
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:05.000Z", {
+      allowFailedCheckpointRetry: true,
+    });
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:07.000Z");
+    const newGeneration = (await runStore.getRun(runId)).updatedAt;
+
+    const { taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      terminalAttentionStore: TerminalAttentionStore;
+      pendingWorkflowRunAttention: Map<string, Set<string>>;
+    };
+    internal.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    // Park the older generation's settlement inside its first marker write: the newer
+    // generation's settlement (started while the older one is parked) can then only
+    // interleave with the older one's post-write mismatch delete if settlements overlap.
+    let releaseOldSettlement: () => void = () => undefined;
+    const oldSettlementParked = new Promise<void>((resolve) => {
+      releaseOldSettlement = resolve;
+    });
+    let parkedReached: () => void = () => undefined;
+    const oldSettlementReached = new Promise<void>((resolve) => {
+      parkedReached = resolve;
+    });
+    const realRecordSettled = internal.terminalAttentionStore.recordSettled.bind(
+      internal.terminalAttentionStore
+    );
+    let parkedOnce = false;
+    const settleSpy = spyOn(internal.terminalAttentionStore, "recordSettled").mockImplementation(
+      async (record, options) => {
+        if (record.generationId === oldGeneration && !parkedOnce) {
+          parkedOnce = true;
+          parkedReached();
+          await oldSettlementParked;
+        }
+        return realRecordSettled(record, options);
+      }
+    );
+
+    try {
+      const oldSettlement = taskService.markWorkflowRunTerminalAttentionSettled({
+        ownerWorkspaceId: parentId,
+        runId,
+        status: "failed",
+        runUpdatedAt: oldGeneration,
+        settledAs: "superseded",
+      });
+      await oldSettlementReached;
+      const newSettlement = taskService.markWorkflowRunTerminalAttentionSettled({
+        ownerWorkspaceId: parentId,
+        runId,
+        status: "completed",
+        runUpdatedAt: newGeneration,
+        settledAs: "delivered",
+      });
+      // The newer settlement must queue behind the parked older one instead of interleaving.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const midProbeStore = new TerminalAttentionStore(config);
+      expect(
+        await midProbeStore.get(
+          parentId,
+          TerminalAttentionStore.notificationId("workflow_run", runId, newGeneration)
+        )
+      ).toBeNull();
+      releaseOldSettlement();
+      await Promise.all([oldSettlement, newSettlement]);
+    } finally {
+      settleSpy.mockRestore();
+    }
+
+    // The older settlement's mismatch delete ran before the newer settlement's stable
+    // refresh, so the newer generation's markers survive and the queue entry is consumed.
+    const probeStore = new TerminalAttentionStore(config);
+    const stable = await probeStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId)
+    );
+    expect(stable?.generationId).toBe(newGeneration);
+    const generationMarker = await probeStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId, newGeneration)
+    );
+    expect(generationMarker?.status).toBe("delivered");
+    expect(internal.pendingWorkflowRunAttention.get(parentId)?.has(runId) ?? false).toBe(false);
+  });
+
   test("a newer generation's settlement refreshes a surviving stale stable marker", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
