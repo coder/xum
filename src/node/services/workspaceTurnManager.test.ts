@@ -496,9 +496,10 @@ function createWorkspaceTurnManagerHost(
     return signaled;
   };
   return {
-    acquireTaskCreationLock: async () => ({
-      [Symbol.asyncDispose]: async () => undefined,
-    }),
+    acquireTaskCreationLock: () =>
+      Promise.resolve({
+        [Symbol.asyncDispose]: () => Promise.resolve(),
+      }),
     backgroundForegroundWaitIfQueued: (enabled, workspaceId) => {
       if (
         !enabled ||
@@ -544,7 +545,7 @@ function createWorkspaceTurnManagerHost(
         throw new Error("Workspace not found: " + workspaceId);
       return found;
     },
-    emitWorkspaceMetadata: async () => undefined,
+    emitWorkspaceMetadata: () => Promise.resolve(),
     enqueueTerminalAttention: async (params) => {
       await terminalAttentionStore.enqueueIfAbsent(params);
     },
@@ -586,10 +587,10 @@ function createWorkspaceTurnManagerHost(
         )
         .map((run) => run.id);
     },
-    listAgentReferencedWorkflowRunIds: async () => [],
+    listAgentReferencedWorkflowRunIds: () => Promise.resolve([]),
     listAgentTaskExecutionEntries: agentTasks,
     markTaskForegroundRelevant: () => undefined,
-    maybeStartPatchGenerationForReportedTask: async () => undefined,
+    maybeStartPatchGenerationForReportedTask: () => Promise.resolve(),
     registerBackgroundableForegroundWaiter: (workspaceId, waiter) => {
       const waiters = foregroundWaiters.get(workspaceId) ?? new Set();
       waiters.add(waiter);
@@ -654,15 +655,16 @@ function createWorkspaceTurnManagerHarness(
     aiService,
     terminalAttentionStore
   );
-  let taskService: WorkspaceTurnManager | undefined;
+  const taskServiceHolder: { current?: WorkspaceTurnManager } = {};
   const taskHost = new Proxy(taskHostTarget, {
-    get: (target, key, receiver) => {
-      const override =
-        taskService == null ? undefined : Object.getOwnPropertyDescriptor(taskService, key)?.value;
-      return override ?? Reflect.get(target, key, receiver);
+    get: (target, key, receiver): unknown => {
+      const record = taskServiceHolder.current as unknown as Record<PropertyKey, unknown>;
+      return taskServiceHolder.current != null && Object.hasOwn(record, key)
+        ? record[key]
+        : Reflect.get(target, key, receiver);
     },
   });
-  taskService = new WorkspaceTurnManager(
+  const taskService = new WorkspaceTurnManager(
     config,
     historyService,
     aiService,
@@ -673,6 +675,7 @@ function createWorkspaceTurnManagerHarness(
     new MutexMap<string>(),
     streamManager
   );
+  taskServiceHolder.current = taskService;
   for (const key of Object.keys(taskHostTarget) as Array<keyof WorkspaceTurnManagerHostFake>) {
     if (key in taskService) continue;
     Object.defineProperty(taskService, key, {
