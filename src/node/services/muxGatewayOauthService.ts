@@ -1,4 +1,22 @@
+/**
+ * Xum Gateway OAuth + balance service.
+ *
+ * Internals are Effect-native: each fallible pipeline is an `Effect.gen`
+ * program whose error channel carries typed domain errors, and the public
+ * Promise methods are thin `Effect.runPromise` facades that fold those errors
+ * back into the wire `Result<_, string>` shape, so pre-Effect callers (oRPC
+ * routes, tests) keep working unchanged. Only `MuxGatewaySessionExpiredError`
+ * gets its own tag because a caller genuinely branches on it (clearing stored
+ * credentials); every other failure is a `MuxGatewayOAuthError` whose `reason`
+ * is already the exact user-facing string.
+ *
+ * Desktop flow bookkeeping (deferreds, loopback server lifetime, timeouts)
+ * stays promise-based in `OAuthFlowManager`, which is shared with the other
+ * OAuth services — converting that lifecycle to Effect `Scope` is deferred
+ * until the shared manager itself migrates.
+ */
 import * as crypto from "crypto";
+import { Effect, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import {
@@ -26,6 +44,38 @@ interface ServerFlow {
   expiresAtMs: number;
 }
 
+/**
+ * Typed failure: the gateway rejected the stored credential (HTTP 401).
+ * `getAccountStatus` branches on this tag to clear the stored credentials
+ * before surfacing the fixed session-expired message.
+ */
+export class MuxGatewaySessionExpiredError extends Schema.TaggedError<MuxGatewaySessionExpiredError>()(
+  "MuxGatewaySessionExpiredError",
+  {}
+) {}
+
+/**
+ * Typed failure for every other gateway/OAuth error. `reason` carries the
+ * exact user-facing string the wire `Result` contract expects, so facades map
+ * it 1:1 onto `Err(reason)` without reformatting.
+ */
+export class MuxGatewayOAuthError extends Schema.TaggedError<MuxGatewayOAuthError>()(
+  "MuxGatewayOAuthError",
+  { reason: Schema.String }
+) {}
+
+/** Fold the typed failure channel back into the wire `Result` shape. */
+function toWireResult<A>(
+  effect: Effect.Effect<A, MuxGatewayOAuthError>
+): Effect.Effect<Result<A, string>> {
+  return effect.pipe(
+    Effect.map((value): Result<A, string> => Ok(value)),
+    Effect.catchTag("MuxGatewayOAuthError", (error) =>
+      Effect.succeed<Result<A, string>>(Err(error.reason))
+    )
+  );
+}
+
 export class MuxGatewayOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
   private readonly serverFlows = new Map<string, ServerFlow>();
@@ -45,135 +95,212 @@ export class MuxGatewayOauthService {
       string
     >
   > {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
-    const muxConfig = (providersConfig["mux-gateway"] ?? {}) as Record<string, unknown>;
-    const creds = resolveProviderCredentials("mux-gateway", {
-      couponCode: typeof muxConfig.couponCode === "string" ? muxConfig.couponCode : undefined,
-      voucher: typeof muxConfig.voucher === "string" ? muxConfig.voucher : undefined,
-    });
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.runPromise(
+      toWireResult(
+        this.getAccountStatusEffect().pipe(
+          Effect.catchTag("MuxGatewaySessionExpiredError", () =>
+            Effect.gen(function* () {
+              yield* self.clearStoredCredentials();
+              return yield* Effect.fail(
+                new MuxGatewayOAuthError({ reason: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE })
+              );
+            })
+          )
+        )
+      )
+    );
+  }
 
-    if (!creds.isConfigured || !creds.couponCode) {
-      return Err("Xum Gateway is not logged in");
-    }
-
-    let response: Awaited<ReturnType<typeof fetch>>;
-    try {
-      response = await fetch(`${MUX_GATEWAY_ORIGIN}/api/v1/balance`, {
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${creds.couponCode}`,
-        },
+  private getAccountStatusEffect(): Effect.Effect<
+    { remaining_microdollars: number; ai_gateway_concurrent_requests_per_user: number },
+    MuxGatewaySessionExpiredError | MuxGatewayOAuthError
+  > {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
+      const muxConfig = (providersConfig["mux-gateway"] ?? {}) as Record<string, unknown>;
+      const creds = resolveProviderCredentials("mux-gateway", {
+        couponCode: typeof muxConfig.couponCode === "string" ? muxConfig.couponCode : undefined,
+        voucher: typeof muxConfig.voucher === "string" ? muxConfig.voucher : undefined,
       });
-    } catch (error) {
-      return Err(`Xum Gateway balance request failed: ${getErrorMessage(error)}`);
-    }
 
-    if (response.status === 401) {
+      if (!creds.isConfigured || !creds.couponCode) {
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({ reason: "Xum Gateway is not logged in" })
+        );
+      }
+      // Captured after the guard: the narrowing does not survive into the thunk closure.
+      const couponCode = creds.couponCode;
+
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)`, which coerces
+        // non-Promise returns (e.g. a test's synchronous fetch mock).
+        try: async () =>
+          fetch(`${MUX_GATEWAY_ORIGIN}/api/v1/balance`, {
+            headers: {
+              Accept: "application/json",
+              Authorization: `Bearer ${couponCode}`,
+            },
+          }),
+        catch: (error) =>
+          new MuxGatewayOAuthError({
+            reason: `Xum Gateway balance request failed: ${getErrorMessage(error)}`,
+          }),
+      });
+
+      if (response.status === 401) {
+        return yield* Effect.fail(new MuxGatewaySessionExpiredError());
+      }
+
+      if (!response.ok) {
+        // Preserve the HTTP status fallback when the response body is unreadable.
+        const body = yield* Effect.promise(() => response.text().catch(() => ""));
+        const prefix = body.trim().slice(0, 200);
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({
+            reason: `Xum Gateway balance request failed (HTTP ${response.status}): ${
+              prefix || response.statusText
+            }`,
+          })
+        );
+      }
+
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new MuxGatewayOAuthError({
+            reason: `Xum Gateway balance response was not valid JSON: ${getErrorMessage(error)}`,
+          }),
+      });
+
+      const payload = json as {
+        remaining_microdollars?: unknown;
+        ai_gateway_concurrent_requests_per_user?: unknown;
+      };
+      const remaining = payload.remaining_microdollars;
+      const concurrency = payload.ai_gateway_concurrent_requests_per_user;
+
+      if (
+        typeof remaining !== "number" ||
+        !Number.isFinite(remaining) ||
+        !Number.isInteger(remaining) ||
+        remaining < 0 ||
+        typeof concurrency !== "number" ||
+        !Number.isFinite(concurrency) ||
+        !Number.isInteger(concurrency) ||
+        concurrency < 0
+      ) {
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({ reason: "Xum Gateway returned an invalid balance payload" })
+        );
+      }
+
+      return {
+        remaining_microdollars: remaining,
+        ai_gateway_concurrent_requests_per_user: concurrency,
+      };
+    });
+  }
+
+  /**
+   * Best-effort credential clearing on session expiry: failures are swallowed
+   * so the session-expired message still reaches the caller. Mirrors the
+   * pre-Effect behavior exactly (sequential awaits under a single catch, so a
+   * couponCode rejection also skips the voucher clear).
+   */
+  private clearStoredCredentials(): Effect.Effect<void> {
+    return Effect.promise(async () => {
       try {
         await this.providerService.setConfig("mux-gateway", ["couponCode"], "");
         await this.providerService.setConfig("mux-gateway", ["voucher"], "");
       } catch {
         // Credential clearing is best-effort; session expiry still reaches the caller.
       }
-
-      return Err(MUX_GATEWAY_SESSION_EXPIRED_MESSAGE);
-    }
-
-    if (!response.ok) {
-      let body = "";
-      try {
-        body = await response.text();
-      } catch {
-        // Preserve the HTTP status fallback when the response body is unreadable.
-      }
-      const prefix = body.trim().slice(0, 200);
-      return Err(
-        `Xum Gateway balance request failed (HTTP ${response.status}): ${
-          prefix || response.statusText
-        }`
-      );
-    }
-
-    let json: unknown;
-    try {
-      json = await response.json();
-    } catch (error) {
-      return Err(`Xum Gateway balance response was not valid JSON: ${getErrorMessage(error)}`);
-    }
-
-    const payload = json as {
-      remaining_microdollars?: unknown;
-      ai_gateway_concurrent_requests_per_user?: unknown;
-    };
-    const remaining = payload.remaining_microdollars;
-    const concurrency = payload.ai_gateway_concurrent_requests_per_user;
-
-    if (
-      typeof remaining !== "number" ||
-      !Number.isFinite(remaining) ||
-      !Number.isInteger(remaining) ||
-      remaining < 0 ||
-      typeof concurrency !== "number" ||
-      !Number.isFinite(concurrency) ||
-      !Number.isInteger(concurrency) ||
-      concurrency < 0
-    ) {
-      return Err("Xum Gateway returned an invalid balance payload");
-    }
-
-    return Ok({
-      remaining_microdollars: remaining,
-      ai_gateway_concurrent_requests_per_user: concurrency,
     });
   }
 
   async startDesktopFlow(): Promise<
     Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>
   > {
-    const flowId = crypto.randomUUID();
-    const resultDeferred = createDeferred<Result<void, string>>();
+    return Effect.runPromise(toWireResult(this.startDesktopFlowEffect()));
+  }
 
-    let loopback;
-    try {
-      loopback = await startLoopbackServer({
-        expectedState: flowId,
-        deferSuccessResponse: true,
-        renderHtml: (r) =>
-          renderOAuthCallbackHtml({
-            title: r.success ? "Login complete" : "Login failed",
-            message: r.success
-              ? "You can return to Xum. You may now close this tab."
-              : (r.error ?? "Unknown error"),
-            success: r.success,
-            extraHead:
-              '<meta name="theme-color" content="#0e0e0e" />\n    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />',
+  private startDesktopFlowEffect(): Effect.Effect<
+    { flowId: string; authorizeUrl: string; redirectUri: string },
+    MuxGatewayOAuthError
+  > {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const flowId = crypto.randomUUID();
+      const resultDeferred = createDeferred<Result<void, string>>();
+
+      const loopback = yield* Effect.tryPromise({
+        try: () =>
+          startLoopbackServer({
+            expectedState: flowId,
+            deferSuccessResponse: true,
+            renderHtml: (r) =>
+              renderOAuthCallbackHtml({
+                title: r.success ? "Login complete" : "Login failed",
+                message: r.success
+                  ? "You can return to Xum. You may now close this tab."
+                  : (r.error ?? "Unknown error"),
+                success: r.success,
+                extraHead:
+                  '<meta name="theme-color" content="#0e0e0e" />\n    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />',
+              }),
+          }),
+        catch: (error) =>
+          new MuxGatewayOAuthError({
+            reason: `Failed to start OAuth callback listener: ${getErrorMessage(error)}`,
           }),
       });
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Failed to start OAuth callback listener: ${message}`);
-    }
 
-    const authorizeUrl = buildAuthorizeUrl({ redirectUri: loopback.redirectUri, state: flowId });
+      const authorizeUrl = buildAuthorizeUrl({ redirectUri: loopback.redirectUri, state: flowId });
 
-    this.desktopFlows.register(flowId, {
-      server: loopback.server,
-      resultDeferred,
-      // Keep server-side timeout tied to flow lifetime so abandoned flows
-      // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
-      timeoutHandle: setTimeout(() => {
-        void this.desktopFlows.finish(flowId, Err("Timed out waiting for OAuth callback"));
-      }, DEFAULT_DESKTOP_TIMEOUT_MS),
+      self.desktopFlows.register(flowId, {
+        server: loopback.server,
+        resultDeferred,
+        // Keep server-side timeout tied to flow lifetime so abandoned flows
+        // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
+        timeoutHandle: setTimeout(() => {
+          void self.desktopFlows.finish(flowId, Err("Timed out waiting for OAuth callback"));
+        }, DEFAULT_DESKTOP_TIMEOUT_MS),
+      });
+
+      // Background fiber: await loopback callback, do token exchange, finish
+      // flow. Cancellation/timeout still flow through resultDeferred (the
+      // promise-native OAuthFlowManager lifecycle), so the fiber exits via the
+      // race below rather than interruption.
+      Effect.runFork(self.desktopCallbackPipeline(flowId, loopback, resultDeferred));
+
+      log.debug(`Xum Gateway OAuth desktop flow started (flowId=${flowId})`);
+
+      return { flowId, authorizeUrl, redirectUri: loopback.redirectUri };
     });
+  }
 
-    // Background task: await loopback callback, do token exchange, finish flow.
-    // Race against resultDeferred so that if the flow is cancelled/timed out
-    // externally, this task exits cleanly instead of dangling on loopback.result.
-    void (async () => {
-      const callbackOrDone = await Promise.race([
-        loopback.result,
-        resultDeferred.promise.then((): null => null),
-      ]);
+  /**
+   * Desktop-flow completion pipeline, forked from `startDesktopFlowEffect`.
+   * Races the loopback callback against resultDeferred so that if the flow is
+   * cancelled/timed out externally, this fiber exits cleanly instead of
+   * dangling on loopback.result.
+   */
+  private desktopCallbackPipeline(
+    flowId: string,
+    loopback: Awaited<ReturnType<typeof startLoopbackServer>>,
+    resultDeferred: ReturnType<typeof createDeferred<Result<void, string>>>
+  ): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const callbackOrDone = yield* Effect.promise(() =>
+        Promise.race([loopback.result, resultDeferred.promise.then((): null => null)])
+      );
 
       // Flow was already finished externally (timeout or cancel).
       if (callbackOrDone === null) return;
@@ -182,11 +309,13 @@ export class MuxGatewayOauthService {
 
       let result: Result<void, string>;
       if (callbackOrDone.success) {
-        result = await this.handleCallbackAndExchange({
-          state: callbackOrDone.data.state,
-          code: callbackOrDone.data.code,
-          error: null,
-        });
+        result = yield* toWireResult(
+          self.handleCallbackAndExchange({
+            state: callbackOrDone.data.state,
+            code: callbackOrDone.data.code,
+            error: null,
+          })
+        );
 
         if (result.success) {
           loopback.sendSuccessResponse();
@@ -197,12 +326,8 @@ export class MuxGatewayOauthService {
         result = Err(`Xum Gateway OAuth error: ${callbackOrDone.error}`);
       }
 
-      await this.desktopFlows.finish(flowId, result);
-    })();
-
-    log.debug(`Xum Gateway OAuth desktop flow started (flowId=${flowId})`);
-
-    return Ok({ flowId, authorizeUrl, redirectUri: loopback.redirectUri });
+      yield* Effect.promise(() => self.desktopFlows.finish(flowId, result));
+    });
   }
 
   async waitForDesktopFlow(
@@ -246,30 +371,38 @@ export class MuxGatewayOauthService {
     error: string | null;
     errorDescription?: string;
   }): Promise<Result<void, string>> {
-    const state = input.state;
-    if (!state) {
-      return Err("Missing OAuth state");
-    }
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.runPromise(
+      toWireResult(
+        Effect.gen(function* () {
+          const state = input.state;
+          if (!state) {
+            return yield* Effect.fail(new MuxGatewayOAuthError({ reason: "Missing OAuth state" }));
+          }
 
-    const flow = this.serverFlows.get(state);
-    if (!flow) {
-      return Err("Unknown OAuth state");
-    }
+          const flow = self.serverFlows.get(state);
+          if (!flow) {
+            return yield* Effect.fail(new MuxGatewayOAuthError({ reason: "Unknown OAuth state" }));
+          }
 
-    if (Date.now() > flow.expiresAtMs) {
-      this.serverFlows.delete(state);
-      return Err("OAuth flow expired");
-    }
+          if (Date.now() > flow.expiresAtMs) {
+            self.serverFlows.delete(state);
+            return yield* Effect.fail(new MuxGatewayOAuthError({ reason: "OAuth flow expired" }));
+          }
 
-    // Regardless of outcome, this flow should not be reused.
-    this.serverFlows.delete(state);
+          // Regardless of outcome, this flow should not be reused.
+          self.serverFlows.delete(state);
 
-    return this.handleCallbackAndExchange({
-      state,
-      code: input.code,
-      error: input.error,
-      errorDescription: input.errorDescription,
-    });
+          yield* self.handleCallbackAndExchange({
+            state,
+            code: input.code,
+            error: input.error,
+            errorDescription: input.errorDescription,
+          });
+        })
+      )
+    );
   }
 
   async dispose(): Promise<void> {
@@ -277,70 +410,86 @@ export class MuxGatewayOauthService {
     this.serverFlows.clear();
   }
 
-  private async handleCallbackAndExchange(input: {
+  private handleCallbackAndExchange(input: {
     state: string;
     code: string | null;
     error: string | null;
     errorDescription?: string;
-  }): Promise<Result<void, string>> {
-    if (input.error) {
-      const message = input.errorDescription
-        ? `${input.error}: ${input.errorDescription}`
-        : input.error;
-      return Err(`Xum Gateway OAuth error: ${message}`);
-    }
+  }): Effect.Effect<void, MuxGatewayOAuthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (input.error) {
+        const message = input.errorDescription
+          ? `${input.error}: ${input.errorDescription}`
+          : input.error;
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({ reason: `Xum Gateway OAuth error: ${message}` })
+        );
+      }
 
-    if (!input.code) {
-      return Err("Missing OAuth code");
-    }
+      if (!input.code) {
+        return yield* Effect.fail(new MuxGatewayOAuthError({ reason: "Missing OAuth code" }));
+      }
 
-    const tokenResult = await this.exchangeCodeForToken(input.code);
-    if (!tokenResult.success) {
-      return Err(tokenResult.error);
-    }
+      const token = yield* self.exchangeCodeForToken(input.code);
 
-    const persistResult = await this.providerService.setConfig(
-      "mux-gateway",
-      ["couponCode"],
-      tokenResult.data
-    );
-    if (!persistResult.success) {
-      return Err(persistResult.error);
-    }
+      // setConfig resolves with a wire Result; a rejection stays a defect,
+      // matching the previously un-caught await.
+      const persistResult = yield* Effect.promise(() =>
+        self.providerService.setConfig("mux-gateway", ["couponCode"], token)
+      );
+      if (!persistResult.success) {
+        return yield* Effect.fail(new MuxGatewayOAuthError({ reason: persistResult.error }));
+      }
 
-    log.debug(`Xum Gateway OAuth exchange completed (state=${input.state})`);
+      log.debug(`Xum Gateway OAuth exchange completed (state=${input.state})`);
 
-    this.windowService?.focusMainWindow();
-
-    return Ok(undefined);
+      self.windowService?.focusMainWindow();
+    });
   }
 
-  private async exchangeCodeForToken(code: string): Promise<Result<string, string>> {
-    try {
-      const response = await fetch(MUX_GATEWAY_EXCHANGE_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: buildExchangeBody({ code }),
+  private exchangeCodeForToken(code: string): Effect.Effect<string, MuxGatewayOAuthError> {
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)` coercion (see above).
+        try: async () =>
+          fetch(MUX_GATEWAY_EXCHANGE_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: buildExchangeBody({ code }),
+          }),
+        catch: (error) =>
+          new MuxGatewayOAuthError({
+            reason: `Xum Gateway exchange failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Xum Gateway exchange failed (${response.status})`;
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
-      const json = (await response.json()) as { access_token?: unknown };
+      const json = yield* Effect.tryPromise({
+        try: async () => (await response.json()) as { access_token?: unknown },
+        catch: (error) =>
+          new MuxGatewayOAuthError({
+            reason: `Xum Gateway exchange failed: ${getErrorMessage(error)}`,
+          }),
+      });
       const token = typeof json.access_token === "string" ? json.access_token : null;
       if (!token) {
-        return Err("Xum Gateway exchange response missing access_token");
+        return yield* Effect.fail(
+          new MuxGatewayOAuthError({ reason: "Xum Gateway exchange response missing access_token" })
+        );
       }
 
-      return Ok(token);
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return Err(`Xum Gateway exchange failed: ${message}`);
-    }
+      return token;
+    });
   }
 }
