@@ -18,7 +18,6 @@ import {
   type WorkspaceLifecycleResult,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
-export type { TaskCreateArgs, TaskKind } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
@@ -135,7 +134,7 @@ function parseTerminalSubagentExecutionVersion(content: string): string | null {
   return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
 }
 
-export type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
+type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
 
 /**
  * Project-relative paths that contribute agent definitions to discovery
@@ -294,7 +293,7 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
  * envelope when the parent IS the owner): an agent should not be woken merely
  * to learn the expected consequence of a follow-up it just initiated.
  */
-export const WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX =
+const WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX =
   "Workspace turn superseded by follow-up turn ";
 
 function buildOwnerFollowUpSupersededError(successorHandleId: string): string {
@@ -310,7 +309,7 @@ function buildOwnerFollowUpSupersededError(successorHandleId: string): string {
  * matching keeps old records parseable on downgrade while letting suppression
  * decisions derive purely from the persisted record.
  */
-export function isOwnerFollowUpSupersededWorkspaceTurnInterrupt(
+function isOwnerFollowUpSupersededWorkspaceTurnInterrupt(
   record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
 ): boolean {
   return (
@@ -437,6 +436,7 @@ async function runtimePathExists(runtime: Runtime, path: string): Promise<boolea
 
 export class WorkspaceTurnManager {
   private readonly workspaceTurnSettlementLocks = new MutexMap<string>();
+  private readonly workspaceLifecycleLocks = new MutexMap<string>();
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
   private readonly activeWorkspaceTurnHandleByWorkspaceId = new Map<
     string,
@@ -453,7 +453,6 @@ export class WorkspaceTurnManager {
     private readonly initStateManager: InitStateManager,
     private readonly taskHost: WorkspaceTurnManagerHost,
     private readonly terminalAttentionStore: TerminalAttentionStore,
-    private readonly workspaceLifecycleLocks: MutexMap<string>,
     private readonly streamManager?: StreamManager
   ) {
     this.taskHandleStore = new TaskHandleStore(config);

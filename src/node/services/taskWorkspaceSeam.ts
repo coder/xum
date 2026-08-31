@@ -15,7 +15,11 @@ import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import type {
+  OpenAIReasoningMode,
+  ParsedThinkingInput,
+  ThinkingLevel,
+} from "@/common/types/thinking";
 import type {
   TerminalAttentionNotification,
   TerminalAttentionOutcome,
@@ -31,7 +35,6 @@ import {
   formatSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
 import { resolvePersistedAgentId } from "@/common/utils/agentIds";
-import type { ParsedThinkingInput } from "@/common/types/thinking";
 import type { WorkflowRunStatus } from "@/common/types/workflow";
 import type {
   TaskIsolation,

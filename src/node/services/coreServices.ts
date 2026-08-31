@@ -42,7 +42,6 @@ import { WorkspaceService } from "@/node/services/workspaceService";
 import { TaskService } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
-import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -326,7 +325,6 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   });
 
   const terminalAttentionStore = new TerminalAttentionStore(config);
-  const workspaceLifecycleLocks = new MutexMap<string>();
   const taskService = new TaskService(
     config,
     historyService,
@@ -335,7 +333,6 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     initStateManager,
     sessionUsageService,
     workspaceGoalService,
-    streamManager,
     secretsStore,
     terminalAttentionStore
   );
@@ -347,7 +344,6 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     initStateManager,
     taskService,
     terminalAttentionStore,
-    workspaceLifecycleLocks,
     streamManager
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);

@@ -22,6 +22,7 @@ import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { MuxMessageMetadata } from "@/common/types/message";
+
 export function initGitRepo(projectPath: string): void {
   execSync("git init -b main", { cwd: projectPath, stdio: "ignore" });
   execSync('git config user.email "test@example.com"', { cwd: projectPath, stdio: "ignore" });
@@ -69,11 +70,11 @@ export async function createTestProject(
   return projectPath;
 }
 
-export type TestConfigOverrides = Omit<ProjectsConfig, "projects">;
+type TestConfigOverrides = Omit<ProjectsConfig, "projects">;
 
-export type TestTaskSettings = NonNullable<ProjectsConfig["taskSettings"]>;
+type TestTaskSettings = NonNullable<ProjectsConfig["taskSettings"]>;
 
-export type SaveProjectWorkspacesOptions = TestConfigOverrides & {
+type SaveProjectWorkspacesOptions = TestConfigOverrides & {
   extraProjects?: Array<[string, ProjectConfig]>;
 };
 
@@ -189,8 +190,8 @@ export async function saveLocalParentWorkspace(
   return { parentId, projectPath };
 }
 
-export /** Write a runnable exec-derived custom agent definition into the project's .mux/agents. */
-async function writeCustomAgentDefinition(
+/** Write a runnable exec-derived custom agent definition into the project's .mux/agents. */
+export async function writeCustomAgentDefinition(
   projectPath: string,
   extraFrontmatterLines: string[] = []
 ): Promise<void> {
@@ -288,7 +289,7 @@ export function createAIServiceMocks(
   };
 }
 
-export type WorkspaceHostMockOverrides = Partial<{
+type WorkspaceHostMockOverrides = Partial<{
   [K in keyof WorkspaceHost]: ReturnType<typeof mock>;
 }> & { unarchive?: ReturnType<typeof mock> };
 
@@ -408,12 +409,7 @@ export function workspaceTurnStreamEndEvent(
       model: "anthropic:claude-opus-4-6",
       agentId: "exec",
       finishReason: options.finishReason ?? "stop",
-      muxMetadata: {
-        type: "workspace-turn-task",
-        taskHandleId: options.taskHandleId ?? "wst_handle",
-        ownerWorkspaceId,
-        turnId: options.turnId ?? "turn",
-      },
+      muxMetadata: workspaceTurnMuxMetadata(ownerWorkspaceId, options.taskHandleId, options.turnId),
     },
     parts: [{ type: "text", text }],
   };

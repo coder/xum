@@ -204,7 +204,6 @@ export interface ToolConfiguration {
   reportModelUsage?: (event: ToolModelUsageEvent) => void;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
-  /** Workspace-turn lifecycle orchestration for wst_ handles. */
   workspaceTurnManager?: WorkspaceTurnManager;
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {

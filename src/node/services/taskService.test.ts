@@ -11,7 +11,6 @@ import {
 } from "@/constants/terminationTimeouts";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
-import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import {
   getSubagentGitPatchMboxPath,
@@ -217,7 +216,9 @@ function createTaskServiceHarness(
     overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
   const initStateManager = overrides?.initStateManager ?? createMockInitStateManager();
 
-  const streamManager = aiService as unknown as ConstructorParameters<typeof TaskService>[7];
+  const streamManager = aiService as unknown as ConstructorParameters<
+    typeof WorkspaceTurnManager
+  >[7];
   const terminalAttentionStore = new TerminalAttentionStore(config);
   const taskService = new TaskService(
     config,
@@ -227,7 +228,6 @@ function createTaskServiceHarness(
     initStateManager,
     overrides?.sessionUsageService,
     overrides?.workspaceGoalService,
-    streamManager,
     new SecretsStore(config.rootDir),
     terminalAttentionStore
   );
@@ -239,7 +239,6 @@ function createTaskServiceHarness(
     initStateManager,
     taskService,
     terminalAttentionStore,
-    new MutexMap<string>(),
     streamManager
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);

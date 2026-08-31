@@ -43,7 +43,6 @@ import {
   saveWorkspaces,
   stubStableIds,
   testTaskSettings,
-  workspaceTurnManagerFor,
   workspaceTurnMuxMetadata,
   workspaceTurnRecord,
   workspaceTurnSnapshot,
@@ -74,7 +73,6 @@ function makeCreateMockReturning(result: Result<{ metadata: WorkspaceMetadata }>
 }
 
 type WorkspaceTurnManagerHostFake = WorkspaceTurnManagerHost & {
-  manager?: WorkspaceTurnManager;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
 };
 
@@ -128,7 +126,6 @@ function createWorkspaceTurnManagerHost(
     return signaled;
   };
   return {
-    manager: undefined,
     acquireTaskCreationLock: () =>
       Promise.resolve({
         [Symbol.asyncDispose]: () => Promise.resolve(),
@@ -262,7 +259,6 @@ function createWorkspaceTurnManagerHarness(
   }
 ): {
   historyService: HistoryService;
-  partialService: HistoryService;
   taskService: WorkspaceTurnManager;
   taskHost: WorkspaceTurnManagerHostFake;
   aiService: AIService;
@@ -274,9 +270,6 @@ function createWorkspaceTurnManagerHarness(
   const workspaceService =
     overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
   const initStateManager = overrides?.initStateManager ?? createMockInitStateManager();
-  const streamManager = aiService as unknown as ConstructorParameters<
-    typeof WorkspaceTurnManager
-  >[8];
   const terminalAttentionStore = new TerminalAttentionStore(config);
   const taskHost = createWorkspaceTurnManagerHost(
     config,
@@ -291,15 +284,11 @@ function createWorkspaceTurnManagerHarness(
     workspaceService,
     initStateManager,
     taskHost,
-    terminalAttentionStore,
-    new MutexMap<string>(),
-    streamManager
+    terminalAttentionStore
   );
-  taskHost.manager = taskService;
 
   return {
     historyService,
-    partialService: historyService,
     taskService,
     taskHost,
     aiService,
@@ -614,9 +603,7 @@ describe("WorkspaceTurnManager", () => {
     const { config, parentId, projectPath, taskService, taskHandleStore } =
       await createWorkspaceLifecycleHarness({ archive: confirmationArchive });
 
-    const confirmation = await workspaceTurnManagerFor(
-      taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const confirmation = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
       { workspaceId: "childworkspace" },
       { acknowledgedUntrackedPaths: ["scratch.txt"] }
@@ -639,9 +626,7 @@ describe("WorkspaceTurnManager", () => {
       coderWorkspaceArchiveBehaviorOverride: "stop",
     });
 
-    const confirmationByTaskId = await workspaceTurnManagerFor(
-      taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const confirmationByTaskId = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
       { taskId: "wst_created" },
       { acknowledgedUntrackedPathsByWorkspaceId: { childworkspace: ["task-scratch.txt"] } }
@@ -681,9 +666,7 @@ describe("WorkspaceTurnManager", () => {
       })
     );
 
-    const alreadyArchived = await workspaceTurnManagerFor(
-      taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const alreadyArchived = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -729,9 +712,7 @@ describe("WorkspaceTurnManager", () => {
     );
     expect(archive).not.toHaveBeenCalled();
 
-    const interrupted = await workspaceTurnManagerFor(
-      taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const interrupted = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -777,9 +758,10 @@ describe("WorkspaceTurnManager", () => {
     harnessRefs.config = harness.config;
     harnessRefs.projectPath = harness.projectPath;
 
-    const unarchived = await workspaceTurnManagerFor(
-      harness.taskService
-    ).unarchiveOwnedWorkspaceTurnWorkspace(harness.parentId, { taskId: "wst_created" });
+    const unarchived = await harness.taskService.unarchiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { taskId: "wst_created" }
+    );
 
     expect(unarchived).toEqual(
       Ok({
@@ -792,9 +774,10 @@ describe("WorkspaceTurnManager", () => {
     );
     expect(unarchive).toHaveBeenCalledWith("childworkspace");
 
-    const alreadyUnarchived = await workspaceTurnManagerFor(
-      harness.taskService
-    ).unarchiveOwnedWorkspaceTurnWorkspace(harness.parentId, { workspaceId: "childworkspace" });
+    const alreadyUnarchived = await harness.taskService.unarchiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" }
+    );
 
     expect(alreadyUnarchived).toEqual(
       Ok({
@@ -806,9 +789,10 @@ describe("WorkspaceTurnManager", () => {
     );
     expect(unarchive).toHaveBeenCalledTimes(1);
 
-    const unowned = await workspaceTurnManagerFor(
-      harness.taskService
-    ).unarchiveOwnedWorkspaceTurnWorkspace(harness.parentId, { workspaceId: "unownedworkspace" });
+    const unowned = await harness.taskService.unarchiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "unownedworkspace" }
+    );
 
     expect(unowned).toEqual(
       Ok({ status: "invalid_scope", action: "unarchive", workspaceId: "unownedworkspace" })
@@ -879,9 +863,11 @@ describe("WorkspaceTurnManager", () => {
     harnessRefs.config = harness.config;
     harnessRefs.projectPath = harness.projectPath;
 
-    const archived = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, { workspaceId: "childworkspace" }, {});
+    const archived = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      {}
+    );
     expect(archived.success && archived.data.status === "archived").toBe(true);
 
     const refused = await harness.taskService.createWorkspaceTurn({
@@ -892,9 +878,10 @@ describe("WorkspaceTurnManager", () => {
     });
     expect(refused).toEqual(Err("Task.createWorkspaceTurn: existing workspace is archived"));
 
-    const unarchived = await workspaceTurnManagerFor(
-      harness.taskService
-    ).unarchiveOwnedWorkspaceTurnWorkspace(harness.parentId, { workspaceId: "childworkspace" });
+    const unarchived = await harness.taskService.unarchiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" }
+    );
     expect(unarchived.success && unarchived.data.status === "unarchived").toBe(true);
 
     const followUp = await harness.taskService.createWorkspaceTurn({
@@ -932,9 +919,11 @@ describe("WorkspaceTurnManager", () => {
     harnessRefs.config = harness.config;
     harnessRefs.projectPath = harness.projectPath;
 
-    const archivePromise = workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, { workspaceId: "childworkspace" }, {});
+    const archivePromise = harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      {}
+    );
     // Wait until the archive operation holds the lifecycle lock (it is inside
     // workspaceService.archive, gated on archiveGate).
     const waitStart = Date.now();
@@ -1019,9 +1008,7 @@ describe("WorkspaceTurnManager", () => {
     // interrupt_active does not cascade into turns running in OTHER workspaces: the nested
     // workspace never gets the activity checks and admission holds the target does, so
     // interruption (and any disposable cleanup) there could destroy user work unseen.
-    const refusedNested = await workspaceTurnManagerFor(
-      taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const refusedNested = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1057,9 +1044,7 @@ describe("WorkspaceTurnManager", () => {
 
     // Unacknowledged lossy confirmation must surface BEFORE any interruption so a refused
     // confirmation leaves the in-flight work running.
-    const confirmation = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const confirmation = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1083,9 +1068,7 @@ describe("WorkspaceTurnManager", () => {
 
     // With acknowledged paths the preflight is skipped (archive re-validates at capture time)
     // and interruption proceeds.
-    const archived = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const archived = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt"] }
@@ -1152,9 +1135,7 @@ describe("WorkspaceTurnManager", () => {
       hasUntrackableExternalAppOpen: mock(() => true),
     });
 
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
       workspaceId: "childworkspace",
     });
 
@@ -1261,9 +1242,11 @@ describe("WorkspaceTurnManager", () => {
     harnessRefs.config = harness.config;
     harnessRefs.projectPath = harness.projectPath;
 
-    const archivePromise = workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, { workspaceId: "childworkspace" }, {});
+    const archivePromise = harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      {}
+    );
     const waitStart = Date.now();
     while (archive.mock.calls.length === 0) {
       if (Date.now() - waitStart > 5000) throw new Error("archive mock was never invoked");
@@ -1350,9 +1333,7 @@ describe("WorkspaceTurnManager", () => {
 
     // The acknowledged set predates a new untracked file: surface a fresh confirmation
     // BEFORE interrupting instead of destroying the turn and then failing the archive.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt"] }
@@ -1397,9 +1378,7 @@ describe("WorkspaceTurnManager", () => {
     // sink requires exact list equality, so a subset check here would interrupt the turn and
     // then still bounce with requires_confirmation — the acknowledgement must be re-confirmed
     // BEFORE anything is interrupted.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt", "stale.txt"] }
@@ -1439,9 +1418,7 @@ describe("WorkspaceTurnManager", () => {
     // Snapshot archives require an exact untracked-file acknowledgement that running turns can
     // invalidate mid-interruption, so honoring interrupt_active could destroy in-flight work and
     // still bounce with requires_confirmation. Refuse instead and leave the turn running.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1483,9 +1460,7 @@ describe("WorkspaceTurnManager", () => {
     // Interrupting a disposable workspace-turn normally auto-removes its workspace; when the
     // interruption serves an archive (retain), that cleanup would delete the checkout out from
     // under the subsequent archive call, which would then fail with "Workspace not found".
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1521,9 +1496,7 @@ describe("WorkspaceTurnManager", () => {
       { recursive: true }
     );
 
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
       workspaceId: "childworkspace",
     });
 
@@ -1563,9 +1536,7 @@ describe("WorkspaceTurnManager", () => {
 
     // Workflows idle between steps own no descendant agent or turn at that instant, but
     // archiving would break the next step; interrupt_active must not apply to workflow runs.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1590,9 +1561,7 @@ describe("WorkspaceTurnManager", () => {
 
     // No delegated queued turn explains the queue entry, so it is user work: a queued message
     // would dispatch through AgentSession's internal send path after archive and stream hidden.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1625,9 +1594,7 @@ describe("WorkspaceTurnManager", () => {
 
     // The before-archive hook would permanently delete the dedicated remote Coder workspace
     // and unarchive cannot recreate it — the reversible model-facing verb must fail closed.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
       workspaceId: "childworkspace",
     });
 
@@ -1663,9 +1630,7 @@ describe("WorkspaceTurnManager", () => {
       return cfg;
     });
 
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
       workspaceId: "childworkspace",
     });
 
@@ -1717,9 +1682,7 @@ describe("WorkspaceTurnManager", () => {
       "childworkspace"
     );
 
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1747,9 +1710,7 @@ describe("WorkspaceTurnManager", () => {
 
     // Detached background bash outlives its spawning turn: interruption cannot stop it, and a
     // snapshot archive could remove the worktree under a process still writing.
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1791,9 +1752,7 @@ describe("WorkspaceTurnManager", () => {
     );
     markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
 
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
@@ -1868,9 +1827,7 @@ describe("WorkspaceTurnManager", () => {
       harness.parentId
     );
 
-    const result = await workspaceTurnManagerFor(
-      harness.taskService
-    ).archiveOwnedWorkspaceTurnWorkspace(
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }

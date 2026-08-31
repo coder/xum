@@ -29,7 +29,6 @@ export type {
   WorkspaceTurnCreateResult,
   WorkspaceTurnWaitResult,
 } from "@/node/services/workspaceTurnManager";
-import type { StreamManager } from "@/node/services/streamManager";
 import {
   TASK_RECOVERY_FALLBACK_AGENT_ID,
   formatSubagentFailureUserMessage,
@@ -1790,7 +1789,6 @@ export class TaskService implements AgentTaskIntegration {
     private readonly initStateManager: InitStateManager,
     private readonly sessionUsageService?: SessionUsageService,
     private readonly workspaceGoalService?: WorkspaceGoalService,
-    _streamManager?: StreamManager,
     private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir),
     terminalAttentionStore?: TerminalAttentionStore
   ) {
