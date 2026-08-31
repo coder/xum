@@ -6,7 +6,15 @@ import { z } from "zod";
 
 import assert from "@/common/utils/assert";
 import type { WorkspaceSessionLocator } from "@/node/config";
-import type { MonitorArmedPayload } from "@/node/services/backgroundProcessManager";
+import type { BashMonitorFailedOperation } from "@/common/types/message";
+import type {
+  MonitorArmedPayload,
+  MonitorFailedMatchPayload,
+} from "@/node/services/backgroundProcessManager";
+import {
+  boundBashMonitorWakeLines,
+  sanitizeBashMonitorWakeLine,
+} from "@/node/services/bashMonitorWakeReconciler";
 import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -25,6 +33,14 @@ export interface BashMonitorTerminalSummary {
   terminalStatusShown: boolean;
 }
 
+export interface BashMonitorLostSummary {
+  reason: "runtime-failure";
+  failureMessage?: string;
+  failedOperations?: BashMonitorFailedOperation[];
+  failedMatch?: MonitorFailedMatchPayload;
+  failedAt: string;
+}
+
 export interface BashMonitorRegistryRecord {
   processId: string;
   taskId: string;
@@ -35,6 +51,7 @@ export interface BashMonitorRegistryRecord {
   script: string;
   createdAt: string;
   terminal?: BashMonitorTerminalSummary;
+  lost?: BashMonitorLostSummary;
 }
 
 const BashMonitorRegistryRecordSchema = z
@@ -54,6 +71,22 @@ const BashMonitorRegistryRecordSchema = z
         settledAt: z.string().min(1),
         wakeOnExit: z.boolean(),
         terminalStatusShown: z.boolean(),
+      })
+      .optional(),
+    lost: z
+      .object({
+        reason: z.literal("runtime-failure"),
+        failureMessage: z.string().optional(),
+        failedOperations: z.array(z.enum(["readOutput", "getExitCode"])).optional(),
+        failedMatch: z
+          .object({
+            lines: z.array(z.string()),
+            totalMatches: z.number().int().nonnegative(),
+            droppedLines: z.number().int().nonnegative(),
+            matchedThroughOffset: z.number().nonnegative().optional(),
+          })
+          .optional(),
+        failedAt: z.string().min(1),
       })
       .optional(),
   })
@@ -145,6 +178,52 @@ export class BashMonitorRegistryStore {
       const record = this.parse(raw);
       if (record == null) return;
       await fsPromises.writeFile(file, JSON.stringify({ ...record, terminal }, null, 2), "utf-8");
+    });
+  }
+  async recordLost(
+    ownerWorkspaceId: string,
+    processId: string,
+    lost: BashMonitorLostSummary
+  ): Promise<void> {
+    const key = ownerWorkspaceId + ":" + processId;
+    return this.locks.withLock(key, async () => {
+      const file = this.file(ownerWorkspaceId, processId);
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(file, "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) return;
+        throw error;
+      }
+      const record = this.parse(raw);
+      if (record == null) return;
+      const boundedMatch =
+        lost.failedMatch != null ? boundBashMonitorWakeLines(lost.failedMatch.lines) : undefined;
+      const normalized: BashMonitorLostSummary = {
+        reason: "runtime-failure",
+        ...(lost.failureMessage != null
+          ? { failureMessage: sanitizeBashMonitorWakeLine(lost.failureMessage) }
+          : {}),
+        ...(lost.failedOperations != null ? { failedOperations: [...lost.failedOperations] } : {}),
+        ...(lost.failedMatch != null && boundedMatch != null
+          ? {
+              failedMatch: {
+                lines: boundedMatch.lines,
+                totalMatches: lost.failedMatch.totalMatches,
+                droppedLines: lost.failedMatch.droppedLines + boundedMatch.droppedLines,
+                ...(lost.failedMatch.matchedThroughOffset != null
+                  ? { matchedThroughOffset: lost.failedMatch.matchedThroughOffset }
+                  : {}),
+              },
+            }
+          : {}),
+        failedAt: lost.failedAt,
+      };
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({ ...record, lost: normalized }, null, 2),
+        "utf-8"
+      );
     });
   }
 

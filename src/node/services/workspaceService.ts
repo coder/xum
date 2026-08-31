@@ -1870,17 +1870,42 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     workspaceId: string,
     payload: MonitorStoppedPayload
   ): void => {
-    const persist =
-      payload.reason === "canceled"
-        ? this.bashMonitorRegistryStore.remove(workspaceId, payload.processId)
-        : payload.terminal != null
-          ? this.bashMonitorRegistryStore.recordTerminal(
-              workspaceId,
-              payload.processId,
-              payload.terminal
-            )
-          : Promise.resolve();
-    void persist
+    const persist = async (): Promise<void> => {
+      if (payload.reason === "canceled") {
+        await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId);
+        return;
+      }
+      if (payload.reason === "failed") {
+        if (payload.armMetadata != null) {
+          await this.bashMonitorRegistryStore.upsert(payload.armMetadata);
+        }
+        if (payload.terminal != null) {
+          await this.bashMonitorRegistryStore.recordTerminal(
+            workspaceId,
+            payload.processId,
+            payload.terminal
+          );
+        }
+        await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, {
+          reason: "runtime-failure",
+          ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
+          ...(payload.failedOperations != null
+            ? { failedOperations: payload.failedOperations }
+            : {}),
+          ...(payload.failedMatch != null ? { failedMatch: payload.failedMatch } : {}),
+          failedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      if (payload.terminal != null) {
+        await this.bashMonitorRegistryStore.recordTerminal(
+          workspaceId,
+          payload.processId,
+          payload.terminal
+        );
+      }
+    };
+    void persist()
       .then(() => this.scheduleBashMonitorWakeReconcile(workspaceId))
       .catch((error: unknown) => {
         log.error("Failed to retire bash monitor state", { workspaceId, error });
