@@ -54,6 +54,7 @@ describe("BashMonitorWakeReconciler", () => {
   let rows: BashMonitorRegistryRecord[];
   let deliveryState: BashMonitorWakeDeliveryState | undefined;
   let dispatches: BashMonitorWakeDispatch[];
+  let acknowledged: Array<{ processId: string; matchedThroughOffset?: number }>;
   let removed: string[];
   let dropped: string[];
   let reconciler: BashMonitorWakeReconciler;
@@ -64,6 +65,7 @@ describe("BashMonitorWakeReconciler", () => {
     rows = [];
     deliveryState = { status: "settled", shownThroughOffset: 0, terminalStatusShown: false };
     dispatches = [];
+    acknowledged = [];
     removed = [];
     dropped = [];
     reconciler = new BashMonitorWakeReconciler({
@@ -71,6 +73,12 @@ describe("BashMonitorWakeReconciler", () => {
       processManager: {
         pullMonitorWakeSignals: async () => live,
         getMonitorWakeDeliveryState: async () => deliveryState,
+        acknowledgeMonitorWake: async (processId, _generation, matchedThroughOffset) => {
+          acknowledged.push({
+            processId,
+            ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          });
+        },
         dropRetiredMonitor: async (processId) => {
           dropped.push(processId);
         },
@@ -176,6 +184,196 @@ describe("BashMonitorWakeReconciler", () => {
     ];
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(1);
+  });
+
+  test("delivers wake-on-exit settlements and terminal summaries recovered after restart", async () => {
+    live = [
+      liveSnapshot({
+        match: undefined,
+        terminal: {
+          status: "exited",
+          exitCode: 0,
+          settledAt: "2026-08-31T12:01:00.000Z",
+          wakeOnExit: true,
+          terminalStatusShown: false,
+          tailLines: ["complete"],
+        },
+        retired: true,
+      }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].prompt).toContain("Process output before settlement");
+    expect(dispatches[0].prompt).toContain("[monitor] process settled: exited (code 0)");
+    expect(dispatches[0].prompt).toContain("> complete");
+    await dispatches[0].onAccepted();
+    expect(removed).toEqual(["proc"]);
+    expect(dropped).toEqual(["proc"]);
+
+    live = [];
+    rows = [
+      registryRecord({
+        status: "timed_out",
+        settledAt: "2026-08-31T12:02:00.000Z",
+        wakeOnExit: true,
+        terminalStatusShown: false,
+      }),
+    ];
+    const restartedDispatches: BashMonitorWakeDispatch[] = [];
+    const restarted = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: async () => live,
+        getMonitorWakeDeliveryState: async () => undefined,
+        acknowledgeMonitorWake: async () => undefined,
+        dropRetiredMonitor: async () => undefined,
+      },
+      registry: {
+        listAll: async () => rows,
+        remove: async (_ownerWorkspaceId, processId) => {
+          rows = rows.filter((row) => row.processId !== processId);
+        },
+        recordTerminal: async () => undefined,
+      },
+      onWake: async (dispatch) => {
+        restartedDispatches.push(dispatch);
+      },
+    });
+
+    await restarted.reconcile(OWNER);
+
+    expect(restartedDispatches).toHaveLength(1);
+    expect(restartedDispatches[0].prompt).toContain("killed (timeout or terminate)");
+    expect(restartedDispatches[0].prompt).toContain("no longer awaitable");
+    await restartedDispatches[0].onAccepted();
+    await restarted.reconcile(OWNER);
+    expect(restartedDispatches).toHaveLength(1);
+  });
+
+  test("explicit cancellation retracts a queued wake without consuming a later generation", async () => {
+    live = [liveSnapshot()];
+    rows = [registryRecord()];
+    await reconciler.reconcile(OWNER);
+    const queued = dispatches[0];
+
+    live = [];
+    rows = [];
+    await reconciler.reconcile(OWNER);
+
+    expect(queued.cancelSignal.aborted).toBe(true);
+    await queued.onAccepted();
+    live = [
+      liveSnapshot({
+        createdAt: "2026-08-31T12:03:00.000Z",
+        match: { throughOffset: 4, lines: ["new generation"], totalMatches: 1 },
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].prompt).toContain("new generation");
+  });
+
+  test("max-events retirement keeps matched lines but never invents a settlement or lost wake", async () => {
+    live = [liveSnapshot({ retired: true })];
+    rows = [
+      {
+        ...registryRecord(),
+        processId: "proc",
+        taskId: "bash:proc",
+        filter: "READY",
+        script: "run-ci",
+      },
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records[0]).not.toHaveProperty("terminal");
+    await dispatches[0].onAccepted();
+    live = [];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(removed).toEqual(["proc"]);
+    expect(dropped).toEqual(["proc"]);
+  });
+
+  test("watermarks suppress delivered signals across reconstruction and reset for re-arm", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    await dispatches[0].onAccepted();
+
+    const afterRestart: BashMonitorWakeDispatch[] = [];
+    const restarted = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: async () => live,
+        getMonitorWakeDeliveryState: async () => deliveryState,
+        acknowledgeMonitorWake: async () => undefined,
+        dropRetiredMonitor: async () => undefined,
+      },
+      registry: {
+        listAll: async () => rows,
+        remove: async () => undefined,
+        recordTerminal: async () => undefined,
+      },
+      onWake: async (dispatch) => {
+        afterRestart.push(dispatch);
+      },
+    });
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toEqual([]);
+
+    live = [
+      liveSnapshot({
+        createdAt: "2026-08-31T12:04:00.000Z",
+        match: { throughOffset: 3, lines: ["fresh"], totalMatches: 1 },
+      }),
+    ];
+    await restarted.reconcile(OWNER);
+    expect(afterRestart).toHaveLength(1);
+    expect(afterRestart[0].prompt).toContain("fresh");
+  });
+
+  test("a blocking output read defers without consuming the wake", async () => {
+    let settleRead: (() => void) | undefined;
+    const readSettled = new Promise<void>((resolve) => {
+      settleRead = resolve;
+    });
+    live = [liveSnapshot()];
+    deliveryState = { status: "blocked", readSettled };
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toEqual([]);
+
+    deliveryState = { status: "settled", shownThroughOffset: 0, terminalStatusShown: false };
+    settleRead?.();
+    await readSettled;
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].prompt).toContain("READY");
+  });
+
+  test("shown matched output is suppressed while a new settlement still wakes with context", async () => {
+    live = [
+      liveSnapshot({
+        terminal: {
+          status: "killed",
+          settledAt: "2026-08-31T12:05:00.000Z",
+          wakeOnExit: true,
+          terminalStatusShown: false,
+        },
+        retired: true,
+      }),
+    ];
+    deliveryState = { status: "settled", shownThroughOffset: 12, terminalStatusShown: false };
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].prompt).toContain("were already returned to you by an earlier read");
+    expect(dispatches[0].prompt).toContain("[monitor] process settled: killed");
   });
 
   test("snapshot supplies pending kinds without dispatching and removes the legacy outbox", async () => {

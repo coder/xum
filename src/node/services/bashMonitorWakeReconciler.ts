@@ -60,6 +60,12 @@ export interface BashMonitorWakeReconcilerProcessManager {
     processId: string,
     originNotAfterMs: number
   ): Promise<BashMonitorWakeDeliveryState | undefined>;
+  acknowledgeMonitorWake(
+    processId: string,
+    originNotAfterMs: number,
+    matchedThroughOffset?: number,
+    terminalSettledAt?: string
+  ): Promise<void> | void;
   dropRetiredMonitor(processId: string): Promise<void> | void;
 }
 
@@ -667,6 +673,14 @@ export class BashMonitorWakeReconciler {
 
   private async cleanup(signals: readonly DerivedSignal[]): Promise<void> {
     for (const signal of signals) {
+      if (!signal.deadRegistryRow) {
+        await this.args.processManager.acknowledgeMonitorWake(
+          signal.processId,
+          Date.parse(signal.createdAt),
+          signal.matchOffset,
+          signal.terminal?.settledAt
+        );
+      }
       if (signal.deadRegistryRow || signal.retired) {
         await this.args.registry.remove(signal.ownerWorkspaceId, signal.processId);
       }

@@ -1884,6 +1884,27 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     return snapshots;
   }
 
+  acknowledgeMonitorWake(
+    processId: string,
+    originNotAfterMs: number,
+    matchedThroughOffset?: number,
+    terminalSettledAt?: string
+  ): void {
+    if (matchedThroughOffset != null) {
+      this.dropMonitorMatchedLineBatchesThrough(processId, originNotAfterMs, matchedThroughOffset);
+    }
+    if (terminalSettledAt != null) {
+      const proc = this.processes.get(processId);
+      if (
+        proc != null &&
+        proc.startTime <= originNotAfterMs &&
+        proc.monitor?.settlementDisposition?.settledAt === terminalSettledAt
+      ) {
+        proc.monitor.settlementDisposition = undefined;
+      }
+    }
+  }
+
   dropRetiredMonitor(processId: string): void {
     const proc = this.processes.get(processId);
     if (proc?.monitor?.stopped) proc.monitor = undefined;

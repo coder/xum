@@ -1531,6 +1531,34 @@ describe("BackgroundProcessManager", () => {
       expect(incompleteLineBytes).toBeLessThanOrEqual(1_000_000);
     });
 
+    it("retains matched lines until the reconciler acknowledges their offset", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY\n'; sleep 30", {
+        cwd: process.cwd(),
+        displayName: "retained-monitor-match",
+        monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      await eventPromise;
+
+      const before = await manager.pullMonitorWakeSignals(testWorkspaceId);
+      const snapshot = before.find((candidate) => candidate.processId === result.processId);
+      expect(snapshot?.match?.lines).toEqual(["READY"]);
+      expect(snapshot?.match?.throughOffset).toBeGreaterThan(0);
+
+      manager.acknowledgeMonitorWake(
+        result.processId,
+        Date.parse(snapshot?.createdAt ?? ""),
+        snapshot?.match?.throughOffset
+      );
+      const after = await manager.pullMonitorWakeSignals(testWorkspaceId);
+      expect(
+        after.find((candidate) => candidate.processId === result.processId)?.match
+      ).toBeUndefined();
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
+
     describe("settlement wakes", () => {
       it("wakes with a terminal payload when the process exits without any match, before monitor:stopped", async () => {
         // Incident regression (workspace 31d3dfd254): a watcher script exits printing a failure
@@ -1588,7 +1616,11 @@ describe("BackgroundProcessManager", () => {
         ).toBe(true);
         // Durability ordering: the wake emit precedes registry deletion.
         expect(order).toEqual(["match", "stopped"]);
-        expect(stoppedEvents[0]).toEqual({ processId: result.processId, reason: "completed" });
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+          terminal: { status: "exited", exitCode: 1, wakeOnExit: true },
+        });
       });
 
       it("wakes for a zero-output process (never suppressed by the offset gate)", async () => {
@@ -1704,7 +1736,12 @@ describe("BackgroundProcessManager", () => {
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
 
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+          terminal: { status: "exited", exitCode: 1, wakeOnExit: false },
+        });
         expect(matchEvents).toHaveLength(0);
       });
 
@@ -1808,7 +1845,12 @@ describe("BackgroundProcessManager", () => {
         // and is deduped by the wake store before persistence.
         expect(matchEvents[0].lines.filter((line) => line === "ERR final")).toHaveLength(1);
         expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
-        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0]).toMatchObject({
+          processId: result.processId,
+          reason: "completed",
+          terminal: { status: "exited", exitCode: 0, wakeOnExit: true },
+        });
       });
 
       it("honors max_events while accumulating settlement matches", async () => {
