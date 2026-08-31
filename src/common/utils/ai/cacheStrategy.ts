@@ -20,6 +20,34 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "./models";
  */
 export type AnthropicCacheTtl = "5m" | "1h";
 
+function isAnthropicCacheTtl(value: unknown): value is AnthropicCacheTtl {
+  return value === "5m" || value === "1h";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Recover the Anthropic cache TTL from merged provider options. Users can set
+ * cacheControl.ttl through per-model providerOptions extras (modelParameters),
+ * so manual cache markers must honor it when the dedicated mux-level
+ * anthropic.cacheTtl setting is unset.
+ */
+export function getAnthropicCacheTtl(
+  providerOptions?: Record<string, unknown>
+): AnthropicCacheTtl | undefined {
+  const anthropicOptions = providerOptions?.anthropic;
+  if (!isRecord(anthropicOptions)) {
+    return undefined;
+  }
+  const cacheControl = anthropicOptions.cacheControl;
+  if (!isRecord(cacheControl)) {
+    return undefined;
+  }
+  return isAnthropicCacheTtl(cacheControl.ttl) ? cacheControl.ttl : undefined;
+}
+
 /**
  * Check if a model supports Anthropic cache control.
  *

@@ -1,3 +1,4 @@
+import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
@@ -14,7 +15,6 @@ import { createTestHistoryService } from "./testHistoryService";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { existsSync } from "fs";
 import * as fs from "fs/promises";
-import * as path from "path";
 
 function createUsage(input: number, output: number): ChatUsageDisplay {
   return {
@@ -329,7 +329,10 @@ describe("SessionUsageService", () => {
         runtimeConfig: { type: "local" },
       });
 
-      const usagePath = path.join(config.getSessionDir(parentWorkspaceId), "session-usage.json");
+      const usagePath = path.join(
+        path.join(config.sessionsDir, parentWorkspaceId),
+        "session-usage.json"
+      );
       await fs.mkdir(path.dirname(usagePath), { recursive: true });
       await fs.writeFile(
         usagePath,
@@ -451,7 +454,7 @@ describe("SessionUsageService", () => {
         { analyticsSource: "memory_consolidation" }
       );
       expect(recorded).toBeUndefined();
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       expect(
         await fs.access(sessionDir).then(
           () => true,
@@ -503,7 +506,10 @@ describe("SessionUsageService", () => {
     it("appends to the headless-usage sidecar only when an analyticsSource is given", async () => {
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
 
       // No analytics source means no sidecar entry.
       await service.recordHeadlessUsage(workspaceId, model, {
@@ -531,7 +537,7 @@ describe("SessionUsageService", () => {
     it("still appends the analytics sidecar when the usage ledger is corrupt", async () => {
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(sessionDir, { recursive: true });
       // Corrupt ledger: readFile throws on bad JSON (non-ENOENT), which must
       // not block the sidecar — headless spend has no chat-row fallback.
@@ -570,7 +576,7 @@ describe("SessionUsageService", () => {
       // (directory at the path) must abort BEFORE the ledger update.
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(path.join(sessionDir, "headless-usage.jsonl"), { recursive: true });
 
       const recorded = await service.recordHeadlessUsage(
@@ -609,7 +615,10 @@ describe("SessionUsageService", () => {
       // and would leave cost_usd undefined.
       expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -643,7 +652,10 @@ describe("SessionUsageService", () => {
       expect(recorded?.model).toBe("anthropic:claude-sonnet-4-20250514");
       expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -742,7 +754,7 @@ describe("SessionUsageService", () => {
       );
 
       // Delete session-usage.json but keep session dir (appendToHistory created it)
-      const usagePath = path.join(config.getSessionDir(workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);
@@ -766,7 +778,7 @@ describe("SessionUsageService", () => {
       );
 
       // Overwrite session-usage.json with corrupted JSON
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{ invalid json");
 
       const result = await service.getSessionUsage(workspaceId);
@@ -1040,7 +1052,7 @@ describe("SessionUsageService", () => {
       await historyService.appendToHistory(workspaceId, postCompactionMsg);
 
       // Delete session-usage.json to trigger rebuild from messages
-      const usagePath = path.join(config.getSessionDir(workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);

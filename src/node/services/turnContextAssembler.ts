@@ -1,16 +1,6 @@
 /**
- * Stream context builder: assembles plan instructions and system prompt for a stream.
- *
- * Extracted from `streamMessage()` to make these purely functional
- * preparation steps explicit and testable. Contains:
- * - Plan file reading, mode instructions, task nesting warnings
- * - Plan→exec handoff transition content
- * - Agent body resolution with inheritance + subagent prompt append
- * - Subagent discovery for tool descriptions
- * - Skill discovery for tool descriptions
- * - System message construction and token counting
- *
- * All functions are pure — no service dependencies (`this.*`).
+ * Owns provider prompt synthesis plus the plan and system context it consumes.
+ * All functions are independent of mutable service state.
  */
 
 import * as path from "node:path";
@@ -18,6 +8,16 @@ import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { ADVISOR_USAGE_GUIDANCE } from "@/common/constants/advisor";
 import type { MuxMessage } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import type { PostCompactionAttachment } from "@/common/types/attachment";
+import {
+  addInterruptedSentinel,
+  filterEmptyAssistantMessages,
+} from "@/browser/utils/messages/modelMessageTransform";
+import type { ModelMessage, SystemModelMessage, Tool } from "ai";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -48,6 +48,135 @@ import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  applyCacheControlToTools,
+  createCachedSystemMessage,
+  createOpenAICachedSystemMessage,
+  type AnthropicCacheTtl,
+} from "@/common/utils/ai/cacheStrategy";
+import { prepareMessagesForProvider } from "./messagePipeline";
+
+export function prepareProviderRequestMessages(
+  messages: MuxMessage[],
+  canonicalProviderName: string,
+  effectiveThinkingLevel: ThinkingLevel
+): {
+  activeContextMessages: MuxMessage[];
+  providerRequestMessages: MuxMessage[];
+  contextBoundarySlicedCount: number;
+} {
+  // Workflow display rows are durable UI history, not main-agent context.
+  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
+  // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
+  const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
+    sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
+  );
+  const contextBoundarySlicedCount =
+    messagesWithoutWorkflowDisplay.length - activeContextMessages.length;
+  const preserveReasoningOnly =
+    canonicalProviderName === "anthropic" && effectiveThinkingLevel !== "off";
+  return {
+    activeContextMessages,
+    providerRequestMessages: filterEmptyAssistantMessages(
+      activeContextMessages,
+      preserveReasoningOnly
+    ),
+    contextBoundarySlicedCount,
+  };
+}
+
+export function formatMcpWarningPrefix(
+  failedServerCount: number,
+  failedServerNames: string[]
+): string | undefined {
+  if (failedServerCount === 0) {
+    return undefined;
+  }
+  return `[Warning: ${failedServerCount} MCP server(s) failed to start: ${failedServerNames.join(", ")}. Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n`;
+}
+
+export interface PromptPayload {
+  providerRequestMessages: MuxMessage[];
+  messages: ModelMessage[];
+  system: string | SystemModelMessage | undefined;
+  tools: Record<string, Tool> | undefined;
+}
+
+export interface AssemblePromptPayloadOptions {
+  history: MuxMessage[];
+  systemMessage: string;
+  tools?: Record<string, Tool>;
+  modelString: string;
+  routeProvider?: string;
+  providerForMessages: string;
+  effectiveThinkingLevel: ThinkingLevel;
+  effectiveAgentId: string;
+  toolNamesForSentinel: string[];
+  planContentForTransition?: string;
+  planFilePath?: string;
+  postCompactionAttachments?: PostCompactionAttachment[] | null;
+  providersConfig?: ProvidersConfigMap | null;
+  anthropicCacheTtl?: AnthropicCacheTtl | null;
+  workspaceId: string;
+}
+
+export async function assemblePromptPayload(
+  options: AssemblePromptPayloadOptions
+): Promise<PromptPayload> {
+  const prepared = prepareProviderRequestMessages(
+    options.history,
+    options.providerForMessages,
+    options.effectiveThinkingLevel
+  );
+  let messages = await prepareMessagesForProvider({
+    messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+    effectiveAgentId: options.effectiveAgentId,
+    toolNamesForSentinel: options.toolNamesForSentinel,
+    planContentForTransition: options.planContentForTransition,
+    planFilePath: options.planFilePath,
+    postCompactionAttachments: options.postCompactionAttachments,
+    providerForMessages: options.providerForMessages,
+    effectiveThinkingLevel: options.effectiveThinkingLevel,
+    modelString: options.modelString,
+    providersConfig: options.providersConfig,
+    anthropicCacheTtl: options.anthropicCacheTtl,
+    workspaceId: options.workspaceId,
+  });
+  let system: string | SystemModelMessage | undefined = options.systemMessage;
+  const cachedSystemMessage = createCachedSystemMessage(
+    options.systemMessage,
+    options.modelString,
+    options.anthropicCacheTtl,
+    options.providersConfig
+  );
+  if (cachedSystemMessage) {
+    // Anthropic requires the cached system row in messages and no separate system parameter.
+    messages = [cachedSystemMessage, ...messages];
+    system = undefined;
+  } else {
+    system =
+      createOpenAICachedSystemMessage(
+        options.systemMessage,
+        options.modelString,
+        options.routeProvider,
+        options.providersConfig ?? null
+      ) ?? options.systemMessage;
+  }
+
+  return {
+    providerRequestMessages: prepared.providerRequestMessages,
+    messages,
+    system,
+    tools: options.tools
+      ? applyCacheControlToTools(
+          options.tools,
+          options.modelString,
+          options.anthropicCacheTtl,
+          options.providersConfig
+        )
+      : undefined,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Plan & Instructions Assembly

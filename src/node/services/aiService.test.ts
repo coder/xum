@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
-import { discoverAvailableSubagentsForToolContext } from "./streamContextBuilder";
+import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
   buildAppAttributionHeaders,
@@ -18,7 +18,7 @@ import { HistoryService } from "./historyService";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { Config } from "@/node/config";
+import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -58,7 +58,7 @@ import type { DevToolsService } from "./devToolsService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import * as agentResolution from "./agentResolution";
-import * as streamContextBuilder from "./streamContextBuilder";
+import * as turnContextAssembler from "./turnContextAssembler";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -75,6 +75,7 @@ interface BasicAIServiceParts {
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
+  providersConfigStore: ProvidersConfigStore;
   service: AIService;
 }
 
@@ -112,7 +113,8 @@ function createBasicAIService(
   const config = new Config(root);
   const historyService = new HistoryService(config);
   const initStateManager = new InitStateManager(config);
-  const providerService = new ProviderService(config);
+  const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+  const providerService = new ProviderService(config, undefined, providersConfigStore);
   const service = new AIService(
     config,
     historyService,
@@ -124,9 +126,19 @@ function createBasicAIService(
     undefined,
     undefined,
     options?.devToolsService,
-    options?.experimentsService
+    options?.experimentsService,
+    undefined,
+    undefined,
+    providersConfigStore
   );
-  return { config, historyService, initStateManager, providerService, service };
+  return {
+    config,
+    historyService,
+    initStateManager,
+    providerService,
+    providersConfigStore,
+    service,
+  };
 }
 
 async function writeMainConfig(root: string, config: object): Promise<void> {
@@ -178,11 +190,11 @@ function createRecordingOpenAIFetch(
 
 function configureOpenAICodexOAuth(
   service: AIService,
-  config: Config,
+  providersConfigStore: ProvidersConfigStore,
   requests: RecordedFetchRequest[],
   options?: { defaultAuth?: "apiKey"; responseModel?: string; setOauthService?: boolean }
 ): void {
-  config.loadProvidersConfig = () => ({
+  spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
     openai: {
       apiKey: "test-openai-api-key",
       codexOauth: TEST_CODEX_OAUTH,
@@ -297,7 +309,7 @@ function stubCommonStreamMessageDependencies(args: {
   useRequestedModelString?: boolean;
   onPlanPayloadMessageIds?: (messageIds: string[]) => void;
   onBuildStreamSystemContext?: (
-    args: Parameters<typeof streamContextBuilder.buildStreamSystemContext>[0]
+    args: Parameters<typeof turnContextAssembler.buildStreamSystemContext>[0]
   ) => void;
   onPrepareMessagesForProvider?: (
     args: Parameters<typeof messagePipeline.prepareMessagesForProvider>[0]
@@ -306,7 +318,7 @@ function stubCommonStreamMessageDependencies(args: {
   spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(
     resolvedAgentResultFor(args.metadata)
   );
-  spyOn(streamContextBuilder, "buildPlanInstructions").mockImplementation((planArgs) => {
+  spyOn(turnContextAssembler, "buildPlanInstructions").mockImplementation((planArgs) => {
     args.onPlanPayloadMessageIds?.(planArgs.requestPayloadMessages.map((message) => message.id));
     return Promise.resolve({
       effectiveAdditionalInstructions: undefined,
@@ -314,7 +326,7 @@ function stubCommonStreamMessageDependencies(args: {
       planContentForTransition: undefined,
     });
   });
-  spyOn(streamContextBuilder, "buildStreamSystemContext").mockImplementation((contextArgs) => {
+  spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
     args.onBuildStreamSystemContext?.(contextArgs);
     return Promise.resolve({
       agentSystemPromptSections: ["test-agent-prompt"],
@@ -862,9 +874,9 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
     },
   ])("$name", async ({ tempDirName, defaultAuth, endpointMatcher }) => {
     using xumHome = new DisposableTempDir(tempDirName);
-    const { config, service } = createBasicAIService(xumHome.path);
+    const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
-    configureOpenAICodexOAuth(service, config, requests, { defaultAuth });
+    configureOpenAICodexOAuth(service, providersConfigStore, requests, { defaultAuth });
 
     await createGeneratedModel(service, KNOWN_MODELS.GPT.id, [
       { role: "user", content: [{ type: "text", text: "Hello" }] },
@@ -877,9 +889,11 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
 
   it("ensures Codex OAuth routed Responses requests include non-empty instructions", async () => {
     using xumHome = new DisposableTempDir("codex-oauth-instructions");
-    const { config, service } = createBasicAIService(xumHome.path);
+    const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
-    configureOpenAICodexOAuth(service, config, requests, { responseModel: "gpt-5.3-codex" });
+    configureOpenAICodexOAuth(service, providersConfigStore, requests, {
+      responseModel: "gpt-5.3-codex",
+    });
     const systemPrompt = "Test system prompt";
 
     await createGeneratedModel(service, KNOWN_MODELS.GPT_53_CODEX.id, [
@@ -938,9 +952,11 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
 
   it("filters out item_reference entries and preserves inline items when routing through Codex OAuth", async () => {
     using xumHome = new DisposableTempDir("codex-oauth-filter-refs");
-    const { config, service } = createBasicAIService(xumHome.path);
+    const { providersConfigStore, service } = createBasicAIService(xumHome.path);
     const requests: RecordedFetchRequest[] = [];
-    configureOpenAICodexOAuth(service, config, requests, { responseModel: "gpt-5.3-codex" });
+    configureOpenAICodexOAuth(service, providersConfigStore, requests, {
+      responseModel: "gpt-5.3-codex",
+    });
 
     await createGeneratedModel(service, KNOWN_MODELS.GPT_53_CODEX.id, [
       { role: "system", content: "You are a helpful assistant" },
@@ -2048,7 +2064,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } as unknown as SessionUsageService;
     const harness = createHarness(xumHome.path, metadata, { sessionUsageService });
     const metadataModel = KNOWN_MODELS.SONNET.id;
-    harness.config.saveProvidersConfig({
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
       anthropic: {
         models: [{ id: "custom-sonnet", mappedToModel: metadataModel }],
       },
@@ -2166,7 +2182,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } as unknown as SessionUsageService;
     const harness = createHarness(xumHome.path, metadata, { sessionUsageService });
 
-    harness.config.saveProvidersConfig({
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
       openai: {
         codexOauth: {
           type: "oauth",
@@ -2518,6 +2534,7 @@ describe("AIService.streamMessage turn envelope", () => {
   interface TurnEnvelopeHarness {
     service: AIService;
     config: Config;
+    providersConfigStore: ProvidersConfigStore;
     startStreamCalls: TurnExecutionOptions[];
   }
 
@@ -2526,7 +2543,8 @@ describe("AIService.streamMessage turn envelope", () => {
     metadata: WorkspaceMetadata,
     options?: { allTools?: Record<string, Tool> }
   ): TurnEnvelopeHarness {
-    const { config, historyService, initStateManager, service } = createBasicAIService(xumHomePath);
+    const { config, historyService, initStateManager, providersConfigStore, service } =
+      createBasicAIService(xumHomePath);
     const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,
@@ -2537,7 +2555,7 @@ describe("AIService.streamMessage turn envelope", () => {
       startStreamCalls,
       allTools: options?.allTools,
     });
-    return { service, config, startStreamCalls };
+    return { service, config, providersConfigStore, startStreamCalls };
   }
 
   async function streamTurn(harness: TurnEnvelopeHarness, workspaceId: string): Promise<void> {
@@ -2579,7 +2597,7 @@ describe("AIService.streamMessage turn envelope", () => {
     await streamTurn(harness, workspaceId);
     expect(harness.startStreamCalls).toHaveLength(2);
 
-    const journal = new DurableEventJournal(harness.config.getSessionDir(workspaceId));
+    const journal = new DurableEventJournal(path.join(harness.config.sessionsDir, workspaceId));
     const events = await journal.read();
     expect(events).toHaveLength(2);
     expect(new Set(events.map((event) => event.id)).size).toBe(2);
@@ -2612,7 +2630,7 @@ describe("AIService.streamMessage turn envelope", () => {
 
     // A regular file where the session dir should be makes every journal write
     // fail (ENOTDIR); the turn must still stream.
-    const sessionDir = harness.config.getSessionDir(workspaceId);
+    const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
     await fs.mkdir(path.dirname(sessionDir), { recursive: true });
     await fs.writeFile(sessionDir, "not a directory", "utf-8");
 

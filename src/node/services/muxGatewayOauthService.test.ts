@@ -8,7 +8,7 @@ import {
   MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
 } from "@/common/constants/muxGatewayOAuth";
 import { Err, Ok } from "@/common/types/result";
-import type { Config } from "@/node/config";
+import type { ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import { createDeferred } from "@/node/utils/oauthUtils";
@@ -47,13 +47,13 @@ function requestUrl(input: RequestInfo | URL): string {
 }
 
 interface MockDeps {
-  providersConfig: ReturnType<Config["loadProvidersConfig"]>;
+  providersConfig: ReturnType<ProvidersConfigStore["loadProvidersConfig"]>;
   setConfigCalls: Array<{ provider: string; keyPath: string[]; value: string }>;
   focusCalls: number;
 }
 
 function createService(deps: MockDeps): MuxGatewayOauthService {
-  const config: Pick<Config, "loadProvidersConfig"> = {
+  const providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig"> = {
     loadProvidersConfig: () => deps.providersConfig,
   };
   const providerService: Pick<ProviderService, "setConfig"> = {
@@ -68,7 +68,7 @@ function createService(deps: MockDeps): MuxGatewayOauthService {
     },
   };
   return new MuxGatewayOauthService(
-    config,
+    providersConfigStore,
     providerService as ProviderService,
     windowService as WindowService
   );

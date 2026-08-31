@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import {
@@ -37,7 +37,7 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import type { SendMessageError } from "@/common/types/errors";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
@@ -653,7 +653,8 @@ export class WorkspaceGoalService {
     private readonly historyService: HistoryService,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly analytics?: GoalLifecycleAnalyticsSink,
-    options: WorkspaceGoalServiceOptions = {}
+    options: WorkspaceGoalServiceOptions = {},
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
   ) {
     this.continuationCooldownMs =
       options.continuationCooldownMs ?? DEFAULT_GOAL_CONTINUATION_COOLDOWN_MS;
@@ -1066,7 +1067,7 @@ export class WorkspaceGoalService {
   // doesn't re-assert and re-join the same way.
   private resolveSessionFilePath(workspaceId: string, fileName: string): string {
     assert(workspaceId.trim().length > 0, "WorkspaceGoalService requires non-empty workspaceId");
-    return path.join(this.config.getSessionDir(workspaceId), fileName);
+    return path.join(this.config.sessionsDir, workspaceId, fileName);
   }
 
   private getFilePath(workspaceId: string): string {
@@ -2642,14 +2643,8 @@ export class WorkspaceGoalService {
   }
 
   private getProvidersConfigForPricing(): ProvidersConfigMap | null {
-    const maybeConfig = this.config as Config & {
-      loadProvidersConfig?: () => ProvidersConfigMap | null;
-    };
-    if (typeof maybeConfig.loadProvidersConfig !== "function") {
-      return null;
-    }
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    return maybeConfig.loadProvidersConfig() as unknown as ProvidersConfigMap | null;
+    const providersConfig = this.providersConfigStore.loadProvidersConfig();
+    return providersConfig as ProvidersConfigMap | null;
   }
 
   async requestPendingGoalContinuationDispatch(workspaceId: string): Promise<void> {

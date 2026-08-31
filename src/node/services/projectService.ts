@@ -1,4 +1,4 @@
-import type { Config, ProjectConfig } from "@/node/config";
+import { SecretsStore, type Config, type ProjectConfig } from "@/node/config";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
@@ -400,7 +400,8 @@ export class ProjectService {
 
   constructor(
     private readonly config: Config,
-    sshPromptService?: SshPromptService
+    sshPromptService?: SshPromptService,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     this.sshPromptService = sshPromptService;
   }
@@ -1229,7 +1230,7 @@ export class ProjectService {
 
       if (projectConfig.parentProjectPath) {
         try {
-          await this.config.updateProjectSecrets(normalizedPath, []);
+          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
         }
@@ -1404,14 +1405,14 @@ export class ProjectService {
 
       for (const subProjectPath of removedSubProjectPaths) {
         try {
-          await this.config.updateProjectSecrets(subProjectPath, []);
+          await this.secretsStore.updateProjectSecrets(subProjectPath, []);
         } catch (error) {
           log.error(`Failed to clean up secrets for sub-project ${subProjectPath}:`, error);
         }
       }
 
       try {
-        await this.config.updateProjectSecrets(normalizedPath, []);
+        await this.secretsStore.updateProjectSecrets(normalizedPath, []);
       } catch (error) {
         log.error(`Failed to clean up secrets for project ${normalizedPath}:`, error);
       }
@@ -1726,7 +1727,7 @@ export class ProjectService {
 
   getSecrets(projectPath: string): Secret[] {
     try {
-      return this.config.getProjectSecrets(projectPath);
+      return this.secretsStore.getProjectSecrets(projectPath);
     } catch (error) {
       log.error("Failed to get project secrets:", error);
       return [];
@@ -1766,7 +1767,7 @@ export class ProjectService {
 
   async updateSecrets(projectPath: string, secrets: Secret[]): Promise<Result<void>> {
     try {
-      await this.config.updateProjectSecrets(projectPath, secrets);
+      await this.secretsStore.updateProjectSecrets(projectPath, secrets);
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);

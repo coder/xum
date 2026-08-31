@@ -34,8 +34,9 @@ export function createFailedTurnHandle(
 
 function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
   return {
+    rootDir: sessionDir,
+    sessionsDir: sessionDir,
     srcDir: sessionDir,
-    getSessionDir: mock((_workspaceId: string) => sessionDir),
     loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 }

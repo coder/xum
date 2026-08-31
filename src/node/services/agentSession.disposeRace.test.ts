@@ -1,3 +1,4 @@
+import * as path from "path";
 import { describe, expect, test, mock, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -79,7 +80,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -170,7 +171,7 @@ describe("AgentSession disposal race conditions", () => {
     } as unknown as BackgroundProcessManager;
 
     const workspaceId = "ws-branch-summary-dispose";
-    const sessionDir = config.getSessionDir(workspaceId);
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
     try {
       const session = new AgentSession({
         workspaceId,
@@ -289,7 +290,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -376,7 +377,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -470,7 +471,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({
@@ -615,7 +616,7 @@ describe("AgentSession disposal race conditions", () => {
 
     const config: Config = {
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      sessionsDir: "/tmp",
     } as unknown as Config;
 
     const session = new AgentSession({

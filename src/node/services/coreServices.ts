@@ -5,6 +5,12 @@
 import * as os from "os";
 import * as path from "path";
 import type { Config } from "@/node/config";
+import {
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+} from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
@@ -46,6 +52,10 @@ import type { DevToolsService } from "@/node/services/devToolsService";
 
 export interface CoreServicesOptions {
   config: Config;
+  sessionLocator?: WorkspaceSessionLocator;
+  providersConfigStore?: ProvidersConfigStore;
+  secretsStore?: SecretsStore;
+  fileLeaseManager?: FileLeaseManager;
   extensionMetadataPath: string;
   /** Overrides config for MCPConfigService; CLI passes its persistent realConfig. */
   mcpConfig?: Config;
@@ -90,9 +100,19 @@ export interface CoreServices {
 export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   const { config, extensionMetadataPath } = opts;
 
-  const historyService = new HistoryService(config);
+  const sessionLocator = opts.sessionLocator ?? new WorkspaceSessionLocator(config.rootDir);
+  const historyService = new HistoryService(sessionLocator);
   const initStateManager = new InitStateManager(config);
-  const providerService = new ProviderService(config, opts.policyService);
+  const providersConfigStore =
+    opts.providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  const secretsStore = opts.secretsStore ?? new SecretsStore(config.rootDir);
+  const fileLeaseManager = opts.fileLeaseManager ?? new FileLeaseManager(config.rootDir);
+  const providerService = new ProviderService(
+    config,
+    opts.policyService,
+    providersConfigStore,
+    fileLeaseManager
+  );
   const backgroundProcessManager = new BackgroundProcessManager(
     path.join(os.tmpdir(), "mux-bashes")
   );
@@ -146,7 +166,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     historyService,
     extensionMetadata,
     opts.analyticsService,
-    opts.goalServiceOptions
+    opts.goalServiceOptions,
+    providersConfigStore
   );
 
   // Default-construct when the caller (CLI) does not pass one: workspace MCP
@@ -173,7 +194,9 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.devToolsService,
     opts.experimentsService,
     streamManager,
-    turnRequestBuilderBindings
+    turnRequestBuilderBindings,
+    providersConfigStore,
+    secretsStore
   );
 
   // Agent memory (memory experiment): scope roots derive from Config (xum home
@@ -238,8 +261,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     const metadata = metadataResult.success ? metadataResult.data : null;
     const secrets =
       metadata && isMultiProject(metadata)
-        ? mergeMultiProjectSecrets(metadata, config)
-        : config.getEffectiveSecrets(projectPath);
+        ? mergeMultiProjectSecrets(metadata, secretsStore)
+        : secretsStore.getEffectiveSecrets(projectPath);
     return secretsToRecord(secrets);
   });
 
@@ -255,7 +278,9 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.telemetryService,
     opts.experimentsService,
     opts.sessionTimingService,
-    streamManager
+    streamManager,
+    secretsStore,
+    providersConfigStore
   );
   turnRequestBuilderBindings.workspaceHeartbeatService = workspaceService;
   // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
@@ -304,7 +329,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     initStateManager,
     sessionUsageService,
     workspaceGoalService,
-    streamManager
+    streamManager,
+    secretsStore
   );
   turnRequestBuilderBindings.taskService = taskService;
   workspaceService.setAgentTaskIntegration(taskService);

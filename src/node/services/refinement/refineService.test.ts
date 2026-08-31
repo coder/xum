@@ -261,7 +261,7 @@ async function createFixture(options?: {
   return {
     muxHome,
     workspacePath,
-    sessionDir: config.getSessionDir(WORKSPACE_ID),
+    sessionDir: path.join(config.sessionsDir, WORKSPACE_ID),
     config,
     service,
     historyService,

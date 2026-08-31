@@ -1,13 +1,13 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs";
-import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { spawn } from "child_process";
 import { secretsToRecord } from "@/common/types/secrets";
-import type { Config } from "@/node/config";
+import { SecretsStore, type Config } from "@/node/config";
 import { getXumEnv, getRuntimeType } from "@/node/runtime/initHook";
 import type { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -125,7 +125,7 @@ export class TerminalService {
   private readonly pendingNativeTerminalOpens = new Map<string, number>();
 
   private nativeTerminalMarkerPath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "native-terminal-opened");
+    return path.join(this.config.sessionsDir, workspaceId, "native-terminal-opened");
   }
 
   /**
@@ -192,7 +192,13 @@ export class TerminalService {
   private readonly noOscIdleFallbacks = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly activityChangeEmitter = new EventEmitter();
 
-  constructor(config: Config, ptyService: PTYService) {
+  constructor(
+    config: Config,
+    ptyService: PTYService,
+    private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
+      config.rootDir
+    )
+  ) {
     this.config = config;
     this.ptyService = ptyService;
   }
@@ -309,7 +315,9 @@ export class TerminalService {
       // Secrets are local/worktree only. Remote/docker-style transports would expose env via command args
       // unless we add a dedicated secure propagation path.
       const secrets = shouldInjectLocalEnv
-        ? await secretsToRecord(this.config.getEffectiveSecrets(workspaceMetadata.projectPath))
+        ? await secretsToRecord(
+            this.secretsStore.getEffectiveSecrets(workspaceMetadata.projectPath)
+          )
         : {};
 
       // Any process launched from this terminal inherits these variables.

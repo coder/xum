@@ -7,7 +7,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import * as providerOptionsModule from "@/common/utils/ai/providerOptions";
-import type { ProvidersConfig } from "@/node/config";
+import { ProvidersConfigStore, SecretsStore, type ProvidersConfig } from "@/node/config";
 import { InitStateManager } from "./initStateManager";
 import { ProviderModelFactory } from "./providerModelFactory";
 import { ProviderService } from "./providerService";
@@ -25,6 +25,7 @@ async function createPreparationHarness() {
   const testHistory = await createTestHistoryService();
   const { config, historyService } = testHistory;
   const providerService = new ProviderService(config);
+  const providersConfigStore = new ProvidersConfigStore(config.rootDir);
   const streamManager = new StreamManager(
     historyService,
     undefined,
@@ -33,6 +34,8 @@ async function createPreparationHarness() {
   );
   const builder = new TurnRequestBuilder({
     config,
+    providersConfigStore,
+    secretsStore: new SecretsStore(config.rootDir),
     historyService,
     initStateManager: new InitStateManager(config),
     providerService,
@@ -65,7 +68,7 @@ async function createPreparationHarness() {
     isStreaming: () => false,
     trackPendingDevToolsRunMetadata: () => undefined,
   });
-  return { ...testHistory, builder, providerService };
+  return { ...testHistory, builder, providerService, providersConfigStore };
 }
 
 function preparationOptions(
@@ -251,7 +254,7 @@ describe("TurnRequestBuilder model attempt preparation", () => {
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {
-      harness.config.saveProvidersConfig({
+      harness.providersConfigStore.saveProvidersConfig({
         openai: {
           modelParameters: {
             "*": { temperature: 0.7, reasoning: { max_tokens: 4096 } },
@@ -395,7 +398,9 @@ describe("TurnRequestBuilder model attempt preparation", () => {
   ])("$name", async (testCase) => {
     const harness = await createPreparationHarness();
     try {
-      harness.config.saveProvidersConfig(testCase.rawConfig as unknown as ProvidersConfig);
+      harness.providersConfigStore.saveProvidersConfig(
+        testCase.rawConfig as unknown as ProvidersConfig
+      );
       const prepared = harness.builder.prepareModelAttempt(
         preparationOptions(
           testCase.snapshot as unknown as ProvidersConfigMap,

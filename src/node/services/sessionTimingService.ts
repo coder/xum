@@ -1,6 +1,6 @@
+import * as path from "path";
 import assert from "@/common/utils/assert";
 import * as fs from "fs/promises";
-import * as path from "path";
 import { EventEmitter } from "events";
 import writeFileAtomic from "write-file-atomic";
 import type { Config } from "@/node/config";
@@ -331,7 +331,7 @@ export class SessionTimingService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), SESSION_TIMING_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, SESSION_TIMING_FILE);
   }
 
   private async readTimingFile(workspaceId: string): Promise<SessionTimingFile> {

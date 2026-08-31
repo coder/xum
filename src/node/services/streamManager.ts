@@ -80,12 +80,6 @@ import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { Runtime } from "@/node/runtime/Runtime";
-import {
-  createCachedSystemMessage,
-  createOpenAICachedSystemMessage,
-  applyCacheControlToTools,
-  type AnthropicCacheTtl,
-} from "@/common/utils/ai/cacheStrategy";
 import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
@@ -242,7 +236,7 @@ interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
-  system: string;
+  system: string | SystemModelMessage | undefined;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
   maxOutputTokens?: number;
@@ -250,7 +244,6 @@ interface StreamRequestOptions {
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   headers?: Record<string, string | undefined>;
-  anthropicCacheTtlOverride?: AnthropicCacheTtl;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
   toolSearchState?: ToolSearchStreamState;
@@ -276,11 +269,7 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   onStreamConstructed?: () => Promise<void>;
 }
 
-// routeProvider is the backend-resolved route (initialMetadata.routeProvider
-// for the primary request, initialMetadataPatch.routeProvider for fallbacks);
-// missing route metadata fails closed for OpenAI explicit prompt caching.
 type StreamRequestInput = StreamRequestOptions & {
-  routeProvider?: string;
   onToolExecutionStart?: (toolCallId: string) => void;
 };
 
@@ -290,12 +279,7 @@ interface StepMessageTracker {
 interface StreamRequestConfig {
   model: LanguageModel;
   messages: ModelMessage[];
-  /**
-   * System instructions for streamText. Direct official OpenAI GPT-5.6
-   * requests carry a structured SystemModelMessage with an explicit prompt
-   * cache breakpoint (createOpenAICachedSystemMessage); everything else keeps
-   * the plain string.
-   */
+  /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
   tools?: Record<string, Tool>;
   providerOptions?: Record<string, unknown>;
@@ -349,8 +333,8 @@ interface PreparedModelFallback {
   modelString: string;
   /** Messages re-prepared for the fallback model's provider. */
   messages: ModelMessage[];
-  /** System prompt rebuilt for the fallback model (model-keyed instruction sections). */
-  system: string;
+  /** Provider-ready system prompt rebuilt for the fallback model. */
+  system: string | SystemModelMessage | undefined;
   /**
    * Tools rebuilt for the fallback model. Required (even if undefined for a
    * tool-less stream) so callers cannot silently reuse the source model's
@@ -361,7 +345,6 @@ interface PreparedModelFallback {
   providerOptions?: Record<string, unknown>;
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
-  anthropicCacheTtl?: AnthropicCacheTtl;
   thinkingLevel?: string;
   /** Route attribution corrections (routedThroughGateway, routeProvider, costsIncluded). */
   initialMetadataPatch?: Partial<MuxMetadata>;
@@ -388,8 +371,8 @@ interface PreparedModelFallback {
    * (see TurnRequestBuilder's pinCoderInstanceProvidersConfig). The swap's request-config
    * rebuild and metadata resolution must read THIS snapshot, not the live
    * config: a catalog refresh between prepare() and the swap could retag the
-   * instance and hand the prepared SDK model another wire's cache wrappers,
-   * output limits, or usage identity.
+   * instance and hand the prepared SDK model another wire's output limits or
+   * usage identity.
    */
   providersConfig?: ProvidersConfigMap;
 }
@@ -462,35 +445,6 @@ function isStreamTruncatedMessage(message: string): boolean {
     lowerMessage.includes("stream closed before terminal event") ||
     lowerMessage.includes("stream closed unexpectedly before the response completed")
   );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isAnthropicCacheTtl(value: unknown): value is AnthropicCacheTtl {
-  return value === "5m" || value === "1h";
-}
-
-function getAnthropicCacheTtl(
-  providerOptions?: Record<string, unknown>
-): AnthropicCacheTtl | undefined {
-  if (!providerOptions) {
-    return undefined;
-  }
-
-  const anthropicOptions = providerOptions.anthropic;
-  if (!isRecord(anthropicOptions)) {
-    return undefined;
-  }
-
-  const cacheControl = anthropicOptions.cacheControl;
-  if (!isRecord(cacheControl)) {
-    return undefined;
-  }
-
-  const ttl = cacheControl.ttl;
-  return isAnthropicCacheTtl(ttl) ? ttl : undefined;
 }
 
 // Stream state enum for exhaustive checking
@@ -701,11 +655,10 @@ interface WorkspaceStreamInfo {
   didRetryAfterEmptyOutput?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
   // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
-  // be rebuilt for a different model — buildStreamRequestConfig re-applies
-  // provider-specific wrapping (e.g. Anthropic cached system message / tool
-  // cache_control), which must not be applied twice or leak across providers.
-  // System and tools are rebuilt per fallback model by prepare() because both
-  // are model-keyed (provider web tools, MCP sanitization, model sections).
+  // be rebuilt for a different model. System, tools, and messages are rebuilt
+  // per fallback model by prepare() via the prompt assembler because they are
+  // model-keyed (cache wrapping, provider web tools, MCP sanitization, model
+  // sections) and must not leak across providers.
   modelFallback?: {
     options: ModelFallbackOptions;
     /** Canonical model originally requested for this turn (the chain source). */
@@ -2049,7 +2002,6 @@ export class StreamManager {
       modelString,
       messages,
       system,
-      routeProvider,
       tools,
       providerOptions,
       maxOutputTokens,
@@ -2057,7 +2009,6 @@ export class StreamManager {
       toolPolicy,
       hasQueuedMessages,
       headers,
-      anthropicCacheTtlOverride,
       onChunk,
       onStepMessages,
       toolSearchState,
@@ -2068,10 +2019,8 @@ export class StreamManager {
       providersConfigSnapshot,
       rebuildFirstStepForThinkingLevel,
     } = input;
-    // The request's pinned providers-config snapshot (when the caller has
-    // one): cache wrappers and type-derived output limits below must resolve
-    // Coder instance metadata against the SAME config that created the SDK
-    // model, or a mid-turn catalog retag applies another wire's treatment.
+    // The request's pinned providers-config snapshot keeps type-derived output limits
+    // aligned with the config that created the SDK model.
     const requestProvidersConfig = providersConfigSnapshot ?? this.getProvidersConfig();
     // Mid-turn thinking overrides mutate providerOptions IN PLACE (the SDK's
     // per-step deep-merge reads the object passed at streamText() time, so
@@ -2079,54 +2028,6 @@ export class StreamManager {
     // mutation unobservable — normalize to a guaranteed mutable object.
     const finalProviderOptions =
       rebuildProviderOptionsForThinkingLevel != null ? (providerOptions ?? {}) : providerOptions;
-
-    // Apply cache control for Anthropic models
-    let finalMessages = messages;
-    let finalTools = tools;
-    let finalSystem: string | SystemModelMessage | undefined = system;
-    const anthropicCacheTtl =
-      anthropicCacheTtlOverride ?? getAnthropicCacheTtl(finalProviderOptions);
-
-    // For Anthropic models, convert system message to a cached message at the start
-    const cachedSystemMessage = createCachedSystemMessage(
-      system,
-      modelString,
-      anthropicCacheTtl,
-      requestProvidersConfig
-    );
-    if (cachedSystemMessage) {
-      // Prepend cached system message and set system parameter to undefined
-      // Note: Must be undefined, not empty string, to avoid Anthropic API error
-      finalMessages = [cachedSystemMessage, ...messages];
-      finalSystem = undefined;
-    } else {
-      // Direct official OpenAI GPT-5.6: put one explicit prompt cache
-      // breakpoint at the end of the stable system instructions. The system
-      // stays in streamText's `system` argument (as a structured message);
-      // request-wide caching remains implicit so OpenAI keeps placing its
-      // automatic latest-message breakpoint. Ineligible routes (gateways,
-      // Codex OAuth, custom base URLs, missing route metadata) keep the
-      // original string.
-      const openaiCachedSystem = createOpenAICachedSystemMessage(
-        system,
-        modelString,
-        routeProvider,
-        requestProvidersConfig
-      );
-      if (openaiCachedSystem) {
-        finalSystem = openaiCachedSystem;
-      }
-    }
-
-    // Apply cache control to tools for Anthropic models
-    if (tools) {
-      finalTools = applyCacheControlToTools(
-        tools,
-        modelString,
-        anthropicCacheTtl,
-        requestProvidersConfig
-      );
-    }
 
     // Use the runtime model's max_output_tokens if available and caller didn't
     // specify. This must be the runtime model (not the mapped metadata model)
@@ -2146,11 +2047,11 @@ export class StreamManager {
 
     return {
       model,
-      messages: finalMessages,
-      system: finalSystem,
+      messages,
+      system,
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
-      tools: withSequentialExecution(finalTools, onToolExecutionStart),
+      tools: withSequentialExecution(tools, onToolExecutionStart),
       providerOptions: finalProviderOptions,
       headers,
       maxOutputTokens: effectiveMaxOutputTokens,
@@ -2283,8 +2184,7 @@ export class StreamManager {
       model: request.model,
       messages: request.messages,
       system: request.system,
-      // For Anthropic prompt caching, the system prompt is prepended to
-      // `messages` as a { role: "system" } message (createCachedSystemMessage).
+      // The assembler prepends Anthropic cached system prompts to `messages`.
       // AI SDK 7 rejects system messages inside `messages` unless opted in.
       // Trusted: mux builds these messages server-side.
       allowSystemInMessages: true,
@@ -2335,18 +2235,9 @@ export class StreamManager {
               appliedLevel,
               thinkingOverride
             );
-            // buildStreamRequestConfig may have moved the system prompt into
-            // messages[0] as a cached system row (Anthropic prompt caching
-            // sets request.system to undefined). The rebuild closure returns
-            // history messages only — re-prepend that row or the replacement
-            // would drop the entire system prompt from the first request.
-            const cachedSystemRow =
-              request.system === undefined && request.messages[0]?.role === "system"
-                ? [request.messages[0]]
-                : [];
             // Same per-step transforms the construction-time messages receive.
             rebuiltFirstStepMessages = await extractToolMediaAsUserMessagesFromModelMessages(
-              stripWorkflowRunRecordsFromModelMessages([...cachedSystemRow, ...rebuilt])
+              stripWorkflowRunRecordsFromModelMessages(rebuilt)
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
@@ -2426,7 +2317,6 @@ export class StreamManager {
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
-      routeProvider: initialMetadata?.routeProvider,
       onToolExecutionStart: (toolCallId) =>
         this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
     });
@@ -3197,10 +3087,6 @@ export class StreamManager {
       modelString: prepared.data.modelString,
       messages: prepared.data.messages,
       system: prepared.data.system,
-      // Use the fallback's freshly-resolved route (not stale source metadata,
-      // which streamInfo.initialMetadata still holds at this point) so the
-      // OpenAI cached-system transform evaluates the fallback route.
-      routeProvider: prepared.data.initialMetadataPatch?.routeProvider,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
       maxOutputTokens: fallbackState.original.maxOutputTokens,
@@ -3208,7 +3094,6 @@ export class StreamManager {
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
       headers: prepared.data.headers,
-      anthropicCacheTtlOverride: prepared.data.anthropicCacheTtl,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
       // Same state object: aiService's fallback prepare() rebuilt it in place

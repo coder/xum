@@ -202,8 +202,10 @@ describe("AgentSession post-compaction refresh trigger", () => {
     } as unknown as BackgroundProcessManager;
 
     const config: Config = {
+      rootDir: "/tmp",
+      sessionsDir: "/tmp",
       srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
+      loadConfigOrDefault: mock(() => ({})),
     } as unknown as Config;
 
     const onPostCompactionStateChange = mock(() => undefined);

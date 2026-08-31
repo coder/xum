@@ -1,6 +1,6 @@
+import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
-import * as path from "path";
 import * as os from "os";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
@@ -2858,7 +2858,10 @@ exit 1
       await config.editConfig(() => cfg);
 
       const legacyWorkspaceId = config.generateLegacyId(projectPath, archivedWorkspaceDir);
-      const metadataPath = path.join(config.getSessionDir(legacyWorkspaceId), "metadata.json");
+      const metadataPath = path.join(
+        path.join(config.sessionsDir, legacyWorkspaceId),
+        "metadata.json"
+      );
       await fs.mkdir(path.dirname(metadataPath), { recursive: true });
       await fs.writeFile(
         metadataPath,

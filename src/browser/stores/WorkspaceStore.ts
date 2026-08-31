@@ -29,6 +29,12 @@ import {
 } from "@/browser/utils/messages/responseCompletionMetadata";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
+  SUBSCRIPTION_RETRY_BASE_MS,
+  calculateSubscriptionBackoffMs,
+  runSubscriptionLoop,
+  sleepWithAbort,
+} from "@/browser/stores/subscriptionTransport";
+import {
   ADVISOR_LIVE_OUTPUT_MAX_CHARS,
   BASH_TRUNCATE_MAX_TOTAL_BYTES,
 } from "@/common/constants/toolLimits";
@@ -58,7 +64,10 @@ import {
   type AdvisorPhaseEvent,
   type StreamAbortEvent,
   type StreamAbortReasonSnapshot,
+  type StreamDeltaEvent,
   type StreamEndEvent,
+  type ToolCallDeltaEvent,
+  type ReasoningDeltaEvent,
   type StreamStartEvent,
   type RuntimeStatusEvent,
 } from "@/common/types/stream";
@@ -477,15 +486,6 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
   };
 }
 
-const SUBSCRIPTION_RETRY_BASE_MS = 250;
-const SUBSCRIPTION_RETRY_MAX_MS = 5000;
-
-// Stall detection: server sends heartbeats every 5s, so if we don't receive any events
-// (including heartbeats) for 10s, the connection is likely dead. This handles half-open
-// WebSocket paths (e.g., some WSL localhost forwarding setups).
-const SUBSCRIPTION_STALL_TIMEOUT_MS = 10_000;
-const SUBSCRIPTION_STALL_CHECK_INTERVAL_MS = 2_000;
-
 interface ValidationIssue {
   path?: Array<string | number>;
   message?: string;
@@ -583,10 +583,6 @@ function areAgentStatusesEqual(
   }
 
   return a.emoji === b.emoji && a.message === b.message && (a.url ?? null) === (b.url ?? null);
-}
-
-function calculateSubscriptionBackoffMs(attempt: number): number {
-  return Math.min(SUBSCRIPTION_RETRY_BASE_MS * 2 ** attempt, SUBSCRIPTION_RETRY_MAX_MS);
 }
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
@@ -702,6 +698,14 @@ function repriceSessionUsage(
  * specific workspaces via useSyncExternalStore, ensuring only relevant
  * components re-render when workspace state changes.
  */
+function getStreamingMessageKey(workspaceId: string, messageId: string): string {
+  return workspaceId + "\0" + messageId;
+}
+
+function getAdvisorLiveKey(workspaceId: string, toolCallId: string): string {
+  return workspaceId + "\0" + toolCallId;
+}
+
 export class WorkspaceStore {
   // Per-workspace state (lazy computed on get)
   private states = new MapStore<string, WorkspaceState>();
@@ -839,23 +843,15 @@ export class WorkspaceStore {
   private fileModifyingToolMs = new Map<string, number>();
   private fileModifyingToolSubs = new MapStore<string, void>();
 
-  // Idle callback handles for high-frequency, terminal-style output (init logs).
-  // Data is always updated immediately in the aggregator; only UI notification is scheduled.
-  // Using requestIdleCallback adapts to actual CPU availability rather than a fixed timer.
-  // NOTE: Streaming text/reasoning/tool deltas do NOT use this — they use
-  // scheduleStreamingStateBump() (microtask coalescing) so the smoothing engine's
-  // RAF presentation clock isn't competing with a 100ms ingestion clock.
+  // Idle callbacks keep high-frequency init logs from blocking the renderer.
   private deltaIdleHandles = new Map<string, number>();
 
-  // Microtask coalescing for streaming deltas. Many deltas can arrive in the same
-  // task pump (ORPC iterator drain); we collapse them into a single states.bump()
-  // at the microtask tail so React reconciles once per pump instead of once per chunk.
-  private pendingStreamingBump = new Set<string>();
-
-  // Live streaming stats (tokens/sec) — exposed via useWorkspaceStreamingStats() as a
-  // leaf subscription. Updated on every stream-delta in the same coalesced microtask
-  // as states.bump(), but separate so changes only re-render the StreamingBarrier
-  // pill and not the entire ChatPane subtree.
+  private pendingStreamingMessageBump = new Map<string, string>();
+  // Live keyed-channel key per workspace, so every stream-clearing path can
+  // release it even when no terminal chat event names the message.
+  private streamingMessageKeys = new Map<string, string>();
+  private streamingMessageStore = new MapStore<string, void>();
+  private advisorLiveStore = new MapStore<string, void>();
   private streamingStatsStore = new MapStore<string, WorkspaceStreamingStats | null>();
 
   /**
@@ -919,12 +915,12 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
     },
     "stream-delta": (workspaceId, aggregator, data) => {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingStateBump(workspaceId);
+      this.applyStreamingDelta(workspaceId, aggregator, data as StreamDeltaEvent);
     },
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamEndData);
+      this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream completion telemetry
       this.trackStreamCompletedTelemetry(streamEndData, false);
@@ -983,6 +979,7 @@ export class WorkspaceStore {
     "stream-abort": (workspaceId, aggregator, data) => {
       const streamAbortData = data as StreamAbortEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamAbortData);
+      this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream interruption telemetry (get model from aggregator)
       const model = aggregator.getCurrentModel();
@@ -1017,8 +1014,7 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
     },
     "tool-call-delta": (workspaceId, aggregator, data) => {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingStateBump(workspaceId);
+      this.applyStreamingDelta(workspaceId, aggregator, data as ToolCallDeltaEvent);
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
@@ -1038,6 +1034,7 @@ export class WorkspaceStore {
         transient?.liveAdvisorOutput.delete(toolCallEnd.toolCallId);
         transient?.liveAdvisorReasoning.delete(toolCallEnd.toolCallId);
         transient?.liveAdvisorPhase.delete(toolCallEnd.toolCallId);
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallEnd.toolCallId));
       }
       if (toolCallEnd.toolName === "task") {
         transient?.liveTaskIds.delete(toolCallEnd.toolCallId);
@@ -1072,8 +1069,7 @@ export class WorkspaceStore {
       }
     },
     "reasoning-delta": (workspaceId, aggregator, data) => {
-      applyWorkspaceChatEventToAggregator(aggregator, data);
-      this.scheduleStreamingStateBump(workspaceId);
+      this.applyStreamingDelta(workspaceId, aggregator, data as ReasoningDeltaEvent);
     },
     "reasoning-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1665,36 +1661,107 @@ export class WorkspaceStore {
     this.deltaIdleHandles.set(workspaceId, handle);
   }
 
+  private releaseStreamingMessageChannel(workspaceId: string): void {
+    const key = this.streamingMessageKeys.get(workspaceId);
+    if (key === undefined) return;
+    this.streamingMessageKeys.delete(workspaceId);
+    this.streamingMessageStore.delete(key);
+  }
+
   /**
-   * Coalesce streaming state bumps to a single microtask per workspace.
-   *
-   * Streaming text/reasoning/tool deltas land in the aggregator immediately, but
-   * the React notification is deferred to the microtask tail of the current
-   * task pump. Many deltas can arrive in the same pump (the ORPC iterator
-   * drains a queue) — we want React to reconcile once per pump, not once per
-   * chunk.
-   *
-   * Why microtask and not requestIdleCallback? The smoothing engine
-   * ({@link useSmoothStreamingText}) is the presentation clock — pacing the
-   * visible reveal at RAF frequency. The ingestion clock should be deterministic
-   * and prompt; an idle-callback ingestion delay (~100ms) just means the
-   * smoothing engine has to absorb burstier inputs and is more likely to hit
-   * its visual-lag safety net.
+   * Deltas normally extend the active message's last part in place and only
+   * need the row-local bump. A delta that adds a part creates a new display
+   * row with no mounted subscriber yet, so only a workspace bump can mount it.
    */
-  private scheduleStreamingStateBump(workspaceId: string): void {
-    if (this.pendingStreamingBump.has(workspaceId)) return;
-    this.pendingStreamingBump.add(workspaceId);
-    queueMicrotask(() => {
-      // Cleared by cancelPendingStreamingBump (e.g. on stream-end) — skip the bump
-      // so we don't double-notify after the terminal event already bumped state.
-      if (!this.pendingStreamingBump.delete(workspaceId)) return;
+  private applyStreamingDelta(
+    workspaceId: string,
+    aggregator: StreamingMessageAggregator,
+    data: StreamDeltaEvent | ToolCallDeltaEvent | ReasoningDeltaEvent
+  ): void {
+    // Route by the delta's own message ID: a second stream can start before the
+    // previous stream context is removed, and the "first active entry" would
+    // then attribute this delta's part-count change to the wrong message.
+    const messageId = data.messageId;
+    const partsBefore = aggregator.getMessagePartCount(messageId);
+    applyWorkspaceChatEventToAggregator(aggregator, data);
+    if (aggregator.getMessagePartCount(messageId) !== partsBefore) {
       this.states.bump(workspaceId);
+      this.streamingStatsStore.bump(workspaceId);
+    } else {
+      this.scheduleStreamingMessageBump(workspaceId, aggregator, messageId);
+    }
+  }
+
+  private scheduleStreamingMessageBump(
+    workspaceId: string,
+    aggregator: StreamingMessageAggregator,
+    messageId: string
+  ): void {
+    const pendingId = this.pendingStreamingMessageBump.get(workspaceId);
+    if (pendingId === messageId) return;
+    if (pendingId !== undefined) {
+      // Deltas from two concurrent streams are interleaved in this pump. The
+      // per-row channel tracks one row, so refresh the whole workspace rather
+      // than waking only the other stream's row.
+      this.states.bump(workspaceId);
+      this.streamingStatsStore.bump(workspaceId);
+      return;
+    }
+    this.pendingStreamingMessageBump.set(workspaceId, messageId);
+    queueMicrotask(() => {
+      if (this.pendingStreamingMessageBump.get(workspaceId) !== messageId) return;
+      this.pendingStreamingMessageBump.delete(workspaceId);
+      // Deltas extend the active message's trailing displayed row; keying the
+      // bump by that row wakes one subscriber instead of every row of the
+      // message. The list is freshly cached here, so leaf reads hit the cache.
+      const rows = aggregator.getDisplayedMessages();
+      let rowId: string | undefined;
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        if ("historyId" in row && row.historyId === messageId) {
+          rowId = row.id;
+          break;
+        }
+      }
+      if (rowId === undefined) return;
+      const key = getStreamingMessageKey(workspaceId, rowId);
+      const previousKey = this.streamingMessageKeys.get(workspaceId);
+      if (previousKey !== undefined && previousKey !== key) {
+        this.streamingMessageStore.delete(previousKey);
+      }
+      this.streamingMessageKeys.set(workspaceId, key);
+      this.streamingMessageStore.bump(key);
       this.streamingStatsStore.bump(workspaceId);
     });
   }
 
   private cancelPendingStreamingBump(workspaceId: string): void {
-    this.pendingStreamingBump.delete(workspaceId);
+    this.pendingStreamingMessageBump.delete(workspaceId);
+  }
+
+  getStreamingMessage(
+    workspaceId: string,
+    displayedId: string,
+    messageId: string
+  ): DisplayedMessage | null {
+    const aggregator = this.aggregators.get(workspaceId);
+    // Completed rows may be transformed by the transcript (e.g. merged stream
+    // errors); only an actively streaming message overrides its prop row. Check
+    // membership rather than the first active entry so a second concurrent
+    // stream's rows keep receiving live overrides.
+    if (!aggregator?.isStreamActive(messageId)) return null;
+    return aggregator.getDisplayedMessages().find((message) => message.id === displayedId) ?? null;
+  }
+
+  subscribeStreamingMessage(
+    workspaceId: string,
+    displayedId: string,
+    listener: () => void
+  ): () => void {
+    return this.streamingMessageStore.subscribeKey(
+      getStreamingMessageKey(workspaceId, displayedId),
+      listener
+    );
   }
 
   /**
@@ -1971,12 +2038,16 @@ export class WorkspaceStore {
     for (const toolCallId of Array.from(transient.liveAdvisorReasoning.keys())) {
       if (!activeAdvisorToolCallIds.has(toolCallId)) {
         transient.liveAdvisorReasoning.delete(toolCallId);
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
       }
     }
 
     for (const toolCallId of Array.from(transient.liveAdvisorOutput.keys())) {
       if (!activeAdvisorToolCallIds.has(toolCallId)) {
         transient.liveAdvisorOutput.delete(toolCallId);
+        // Release the keyed channel version too; once the transient entry is
+        // gone, the workspace-removal sweep can no longer discover this key.
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
       }
     }
 
@@ -2006,6 +2077,10 @@ export class WorkspaceStore {
   subscribeKey = (workspaceId: string, listener: () => void) => {
     return this.states.subscribeKey(workspaceId, listener);
   };
+
+  subscribeAdvisorLive(workspaceId: string, toolCallId: string, listener: () => void): () => void {
+    return this.advisorLiveStore.subscribeKey(getAdvisorLiveKey(workspaceId, toolCallId), listener);
+  }
 
   getBashToolLiveOutput(workspaceId: string, toolCallId: string): LiveBashOutputView | null {
     const state = this.chatTransientState.get(workspaceId)?.liveBashOutput.get(toolCallId);
@@ -3144,32 +3219,6 @@ export class WorkspaceStore {
     }
   }
 
-  private sleepWithAbort(timeoutMs: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve) => {
-      if (signal.aborted) {
-        resolve();
-        return;
-      }
-
-      const onAbort = () => {
-        cleanup();
-        resolve();
-      };
-
-      const timeout = setTimeout(() => {
-        cleanup();
-        resolve();
-      }, timeoutMs);
-
-      const cleanup = () => {
-        clearTimeout(timeout);
-        signal.removeEventListener("abort", onAbort);
-      };
-
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
-
   private isWorkspaceRegistered(workspaceId: string): boolean {
     return this.workspaceMetadata.has(workspaceId);
   }
@@ -3312,6 +3361,7 @@ export class WorkspaceStore {
       this.aggregators.get(workspaceId)?.clearBackgroundHandoffCompletion();
       this.aggregators.get(workspaceId)?.clearActiveStreams();
       this.aggregators.get(workspaceId)?.clearPendingStreamStart();
+      this.releaseStreamingMessageChannel(workspaceId);
     }
 
     if (snapshot?.streaming !== true) {
@@ -3405,190 +3455,61 @@ export class WorkspaceStore {
     }
   }
 
-  /**
-   * Wire an attempt-scoped {@link AbortController} to the two signals every
-   * subscription retry loop reacts to:
-   *  - the caller's outer cancellation signal (workspace lifecycle teardown)
-   *  - the current client-change signal (so client swaps abort in-flight attempts)
-   *
-   * Returns a release callback that detaches both listeners. Pair with
-   * {@link createStallWatchdog} inside a try/finally so the listeners and the
-   * watchdog tear down together regardless of how the attempt ends.
-   */
-  private linkAttemptToClientChange(
-    attemptController: AbortController,
-    signal: AbortSignal
-  ): () => void {
-    const onAbort = () => attemptController.abort();
-    signal.addEventListener("abort", onAbort);
-
-    const clientChangeSignal = this.clientChangeController.signal;
-    const onClientChange = () => attemptController.abort();
-    clientChangeSignal.addEventListener("abort", onClientChange, { once: true });
-
-    return () => {
-      signal.removeEventListener("abort", onAbort);
-      clientChangeSignal.removeEventListener("abort", onClientChange);
-    };
-  }
-
-  /**
-   * Creates a stall watchdog that aborts the attempt when no events arrive
-   * within the configured timeout. Call start() only after the subscription
-   * connection is established so handshake latency isn't misclassified as
-   * stream silence.
-   */
-  private createStallWatchdog(
-    attemptController: AbortController,
-    label: string
-  ): { markEvent: () => void; start: () => void; stop: () => void } {
-    let lastEventAt = Date.now();
-    let interval: ReturnType<typeof setInterval> | null = null;
-
-    return {
-      markEvent: () => {
-        lastEventAt = Date.now();
-      },
-      start: () => {
-        if (interval != null) {
-          return;
-        }
-
-        lastEventAt = Date.now();
-        interval = setInterval(() => {
-          if (attemptController.signal.aborted) {
-            return;
-          }
-
-          const elapsedMs = Date.now() - lastEventAt;
-          if (elapsedMs < SUBSCRIPTION_STALL_TIMEOUT_MS) {
-            return;
-          }
-
-          console.warn(
-            `[WorkspaceStore] ${label} stalled (no events for ${elapsedMs}ms); retrying...`
-          );
-          attemptController.abort();
-        }, SUBSCRIPTION_STALL_CHECK_INTERVAL_MS);
-      },
-      stop: () => {
-        if (interval != null) {
-          clearInterval(interval);
-          interval = null;
-        }
-      },
-    };
-  }
-
   private async runTerminalActivitySubscription(controller: AbortController): Promise<void> {
     const signal = controller.signal;
-    let attempt = 0;
-
     try {
-      while (!signal.aborted) {
-        const client = this.client ?? (await this.waitForClient(signal));
-        if (!client || signal.aborted) {
-          return;
-        }
-
-        const subscribe = this.resolveTerminalActivitySubscribe(client);
-        if (!subscribe) {
-          // Client doesn't support terminal activity — clear stale state and exit
-          // without entering the retry loop (this is not an error condition).
-          this.clearAllTerminalActivitySnapshots();
-          return;
-        }
-
-        const attemptController = new AbortController();
-        const releaseAttemptListeners = this.linkAttemptToClientChange(attemptController, signal);
-        const watchdog = this.createStallWatchdog(
-          attemptController,
-          "terminal activity subscription"
-        );
-
-        try {
-          const iterator = await subscribe(undefined, {
-            signal: attemptController.signal,
-          });
-
-          // Start watchdog after subscribe connects so timeout measures
-          // post-connect silence, not handshake latency.
-          watchdog.start();
-
-          for await (const event of iterator) {
-            if (signal.aborted) {
+      await runSubscriptionLoop({
+        name: "terminal activity subscription",
+        signal,
+        getClient: async (attemptSignal) =>
+          this.client ?? (await this.waitForClient(attemptSignal)),
+        getClientChangeSignal: () => this.clientChangeController.signal,
+        subscribe: async (client, attemptSignal) => {
+          const subscribe = this.resolveTerminalActivitySubscribe(client);
+          if (!subscribe) {
+            this.clearAllTerminalActivitySnapshots();
+            return null;
+          }
+          return {
+            events: await subscribe(undefined, { signal: attemptSignal }),
+            context: undefined,
+          };
+        },
+        onEvent: (event, _context, attemptSignal) => {
+          if (event.type === "heartbeat") return;
+          queueMicrotask(() => {
+            if (signal.aborted || attemptSignal.aborted) return;
+            if (event.type === "snapshot") {
+              const seen = new Set<string>();
+              for (const [workspaceId, activity] of Object.entries(event.workspaces)) {
+                seen.add(workspaceId);
+                this.applyTerminalActivity(workspaceId, activity);
+              }
+              for (const workspaceId of Array.from(this.workspaceTerminalActivity.keys())) {
+                if (!seen.has(workspaceId))
+                  this.applyTerminalActivity(workspaceId, { activeCount: 0, totalSessions: 0 });
+              }
               return;
             }
-
-            watchdog.markEvent();
-
-            // Connection is alive again - don't carry old backoff into the next failure.
-            attempt = 0;
-
-            if (event.type === "heartbeat") {
-              continue;
-            }
-
-            queueMicrotask(() => {
-              if (signal.aborted || attemptController.signal.aborted) {
-                return;
-              }
-
-              if (event.type === "snapshot") {
-                const seenWorkspaceIds = new Set<string>();
-                for (const [workspaceId, activity] of Object.entries(event.workspaces)) {
-                  seenWorkspaceIds.add(workspaceId);
-                  this.applyTerminalActivity(workspaceId, activity);
-                }
-
-                for (const workspaceId of Array.from(this.workspaceTerminalActivity.keys())) {
-                  if (seenWorkspaceIds.has(workspaceId)) {
-                    continue;
-                  }
-                  this.applyTerminalActivity(workspaceId, { activeCount: 0, totalSessions: 0 });
-                }
-
-                return;
-              }
-
-              this.applyTerminalActivity(event.workspaceId, event.activity);
-            });
-          }
-
-          if (signal.aborted) {
-            return;
-          }
-
-          if (!attemptController.signal.aborted) {
+            this.applyTerminalActivity(event.workspaceId, event.activity);
+          });
+        },
+        onUnexpectedEnd: ({ attemptAborted }) => {
+          if (!attemptAborted)
             console.warn(
               "[WorkspaceStore] terminal activity subscription ended unexpectedly; retrying..."
             );
-          }
-        } catch (error) {
-          if (signal.aborted) {
-            return;
-          }
-
+        },
+        onError: (error, { attemptAborted }) => {
           const abortError = isAbortError(error);
-          if (attemptController.signal.aborted) {
-            if (!abortError) {
+          if (attemptAborted) {
+            if (!abortError)
               console.warn("[WorkspaceStore] terminal activity subscription aborted; retrying...");
-            }
-          } else if (!abortError) {
+          } else if (!abortError)
             console.warn("[WorkspaceStore] Error in terminal activity subscription:", error);
-          }
-        } finally {
-          releaseAttemptListeners();
-          watchdog.stop();
-        }
-
-        if (!signal.aborted && !attemptController.signal.aborted) {
-          const delayMs = calculateSubscriptionBackoffMs(attempt);
-          attempt++;
-
-          await this.sleepWithAbort(delayMs, signal);
-        }
-      }
+        },
+        backoffAfterAbort: false,
+      });
     } finally {
       this.releaseTerminalActivityController(controller);
     }
@@ -3642,124 +3563,47 @@ export class WorkspaceStore {
   }
 
   private async runActivitySubscription(signal: AbortSignal): Promise<void> {
-    let attempt = 0;
-
-    while (!signal.aborted) {
-      const client = this.client ?? (await this.waitForClient(signal));
-      if (!client || signal.aborted) {
-        return;
-      }
-
-      const attemptController = new AbortController();
-      const releaseAttemptListeners = this.linkAttemptToClientChange(attemptController, signal);
-      const watchdog = this.createStallWatchdog(attemptController, "activity subscription");
-
-      try {
-        // Open the live delta stream first so no state transition can be lost
-        // between the list snapshot fetch and subscribe registration.
+    await runSubscriptionLoop({
+      name: "activity subscription",
+      signal,
+      getClient: async (attemptSignal) => this.client ?? (await this.waitForClient(attemptSignal)),
+      getClientChangeSignal: () => this.clientChangeController.signal,
+      subscribe: async (client, attemptSignal) => {
         const iterator = await client.workspace.activity.subscribe(undefined, {
-          signal: attemptController.signal,
+          signal: attemptSignal,
         });
-
         const snapshots = await client.workspace.activity.list();
-        if (signal.aborted) {
-          return;
-        }
-        // Client changed while list() was in flight — retry with the new client
-        // instead of exiting permanently. The outer while loop will pick up the
-        // replacement client on the next iteration.
-        if (attemptController.signal.aborted) {
-          continue;
-        }
-
+        if (signal.aborted) return null;
+        if (attemptSignal.aborted) return { retryImmediately: true };
         queueMicrotask(() => {
-          if (signal.aborted || attemptController.signal.aborted) {
-            return;
-          }
-          // null is the backend's read-failure signal: keep last-known snapshots and
-          // stay non-authoritative (the background retry below delivers the real
-          // list later). A non-null list — including {} on an all-idle deployment —
-          // is authoritative.
-          if (snapshots != null) {
-            this.applyWorkspaceActivityList(snapshots);
-          }
+          if (signal.aborted || attemptSignal.aborted) return;
+          if (snapshots != null) this.applyWorkspaceActivityList(snapshots);
           this.markActivityHydrated(snapshots != null);
         });
-
-        // A transiently-null bootstrap must not stay non-authoritative for the
-        // life of an otherwise healthy subscription: heartbeats keep the iterator
-        // alive indefinitely and events never confer authority, so another list
-        // read may never happen. Retry in the background (attempt-scoped) instead
-        // of blocking here, so live events keep flowing while the read heals.
-        if (snapshots == null) {
-          void this.retryActivityBootstrapList(client, signal, attemptController.signal);
-        }
-
-        // Start watchdog after bootstrap so slow list() doesn't trigger
-        // false-positive reconnects.
-        watchdog.start();
-
-        for await (const event of iterator) {
-          if (signal.aborted) {
-            return;
-          }
-
-          watchdog.markEvent();
-
-          // Connection is alive again - don't carry old backoff into the next failure.
-          attempt = 0;
-
-          if (event.type === "heartbeat") {
-            continue;
-          }
-
-          queueMicrotask(() => {
-            if (signal.aborted || attemptController.signal.aborted) {
-              return;
-            }
-            this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
-            this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
-          });
-        }
-
-        if (signal.aborted) {
-          return;
-        }
-
-        if (!attemptController.signal.aborted) {
-          console.warn("[WorkspaceStore] activity subscription ended unexpectedly; retrying...");
-        }
-      } catch (error) {
-        if (signal.aborted) {
-          return;
-        }
-
+        if (snapshots == null) void this.retryActivityBootstrapList(client, signal, attemptSignal);
+        return { events: iterator, context: undefined };
+      },
+      onEvent: (event, _context, attemptSignal) => {
+        if (event.type === "heartbeat") return;
+        queueMicrotask(() => {
+          if (signal.aborted || attemptSignal.aborted) return;
+          this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
+          this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
+        });
+      },
+      onUnexpectedEnd: () =>
+        console.warn("[WorkspaceStore] activity subscription ended unexpectedly; retrying..."),
+      onError: (error, { attemptAborted }) => {
         const abortError = isAbortError(error);
-        if (attemptController.signal.aborted) {
-          if (!abortError) {
+        if (attemptAborted) {
+          if (!abortError)
             console.warn("[WorkspaceStore] activity subscription aborted; retrying...");
-          }
         } else if (!abortError) {
           console.warn("[WorkspaceStore] Error in activity subscription:", error);
-          // Self-heal: a failing activity subscription must not hold the chat
-          // view's first-paint barrier. Treat the (empty) activity map as
-          // known; the retry loop will deliver real data when it recovers.
-          // Not authoritative: baseline consumers must not read this as "no activity".
           this.markActivityHydrated(false);
         }
-      } finally {
-        releaseAttemptListeners();
-        watchdog.stop();
-      }
-
-      const delayMs = calculateSubscriptionBackoffMs(attempt);
-      attempt++;
-
-      await this.sleepWithAbort(delayMs, signal);
-      if (signal.aborted) {
-        return;
-      }
-    }
+      },
+    });
   }
 
   /**
@@ -3781,7 +3625,7 @@ export class WorkspaceStore {
   ): Promise<void> {
     let attempt = 0;
     while (!signal.aborted && !attemptSignal.aborted) {
-      await this.sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
+      await sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
       attempt++;
       if (signal.aborted || attemptSignal.aborted) {
         return;
@@ -3900,6 +3744,17 @@ export class WorkspaceStore {
 
     // Reset per-workspace transient state so the next replay rebuilds from the backend source of truth.
     const previousTransient = this.chatTransientState.get(workspaceId);
+    // Release keyed advisor channels before the transient maps are replaced:
+    // they are the only record of these tool-call IDs, so the caught-up and
+    // workspace-removal sweeps can never rediscover the keys afterwards.
+    if (previousTransient) {
+      for (const toolCallId of new Set([
+        ...previousTransient.liveAdvisorOutput.keys(),
+        ...previousTransient.liveAdvisorReasoning.keys(),
+      ])) {
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
+      }
+    }
     const nextTransient = createInitialChatTransientState();
 
     // Preserve active hydration across full replay resets so workspace-switch catch-up
@@ -3991,228 +3846,111 @@ export class WorkspaceStore {
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
   private async runOnChatSubscription(workspaceId: string, signal: AbortSignal): Promise<void> {
-    let attempt = 0;
-
-    while (!signal.aborted) {
-      const hadClientAtLoopStart = this.client !== null;
-      const client = this.client ?? (await this.waitForClient(signal));
-      if (!client || signal.aborted) {
-        return;
-      }
-
-      // If activation happened while the client was offline, begin hydration now
-      // that we can actually start the subscription loop.
-      const initialTransient = this.chatTransientState.get(workspaceId);
-      if (
-        !hadClientAtLoopStart &&
-        initialTransient &&
-        !initialTransient.caughtUp &&
-        !initialTransient.isHydratingTranscript
-      ) {
-        initialTransient.isHydratingTranscript = true;
-        this.states.bump(workspaceId);
-      }
-
-      // Allow us to abort only this subscription attempt (without unsubscribing the workspace).
-      const attemptController = new AbortController();
-      const releaseAttemptListeners = this.linkAttemptToClientChange(attemptController, signal);
-      const watchdog = this.createStallWatchdog(attemptController, `onChat(${workspaceId})`);
-
-      try {
-        // Always reset caughtUp at subscription start so historical events are
-        // buffered until the caught-up marker arrives, regardless of replay mode.
-        const transient = this.chatTransientState.get(workspaceId);
-        if (transient) {
-          transient.caughtUp = false;
+    // Loop-scoped so the observation survives the generation retry: attaching a
+    // client aborts the change signal the waiting attempt captured, and the
+    // retried attempt would otherwise see the client as always-present.
+    let clientWasMissing = false;
+    await runSubscriptionLoop({
+      name: "onChat(" + workspaceId + ")",
+      signal,
+      getClient: async (attemptSignal) => {
+        if (this.client === null) clientWasMissing = true;
+        return this.client ?? (await this.waitForClient(attemptSignal));
+      },
+      getClientChangeSignal: () => this.clientChangeController.signal,
+      subscribe: async (client, attemptSignal, abortAttempt) => {
+        const hadClientAtLoopStart = !clientWasMissing;
+        clientWasMissing = false;
+        const initialTransient = this.chatTransientState.get(workspaceId);
+        if (
+          !hadClientAtLoopStart &&
+          initialTransient &&
+          !initialTransient.caughtUp &&
+          !initialTransient.isHydratingTranscript
+        ) {
+          initialTransient.isHydratingTranscript = true;
+          this.states.bump(workspaceId);
         }
-
-        // Reconnect incrementally whenever we can build a valid cursor.
-        // Do not gate on transient.caughtUp here: retry paths may optimistically
-        // set caughtUp=false to re-enable buffering, but the cursor can still
-        // represent the latest rendered state for an incremental reconnect.
+        const transient = this.chatTransientState.get(workspaceId);
+        if (transient) transient.caughtUp = false;
         const aggregator = this.aggregators.get(workspaceId);
         let mode: OnChatMode | undefined;
-
-        // Attempt-scoped reconnect context: since-replay reconciliation must only ever
-        // see the anchor from its own attempt's cursor. Routed through the same
-        // attempt-guarded event path as chat events (the abort checks below drop
-        // events from stale attempts), so a caught-up from a previous attempt can
-        // never consume a newer attempt's anchor.
-        const attemptContext: OnChatAttemptContext = {
-          abort: () => attemptController.abort(),
-        };
-
+        const attemptContext: OnChatAttemptContext = { abort: abortAttempt };
         if (aggregator) {
           const cursor = aggregator.getOnChatCursor();
           if (cursor?.history) {
-            mode = {
-              type: "since",
-              cursor: {
-                history: cursor.history,
-                stream: cursor.stream,
-              },
-            };
+            mode = { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
             attemptContext.since = {
               requestedAnchorSequence: cursor.history.historySequence,
               localActiveStreamMessageId: cursor.stream?.messageId,
             };
           }
         }
-
         await this.syncAutoCompactionThresholdAtStartup(client, workspaceId);
-
         const autoRetryKey = getAutoRetryKey(workspaceId);
-        const legacyAutoRetryEnabledRaw = readPersistedState<unknown>(autoRetryKey, undefined);
-        const legacyAutoRetryEnabled =
-          typeof legacyAutoRetryEnabledRaw === "boolean" ? legacyAutoRetryEnabledRaw : undefined;
-
-        if (legacyAutoRetryEnabledRaw !== undefined && legacyAutoRetryEnabled === undefined) {
-          // Self-heal malformed legacy values so onChat subscription retries do not
-          // keep failing schema validation on every reconnect attempt.
+        const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
+        const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
+        if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        }
-
-        const onChatInput =
+        const input =
           legacyAutoRetryEnabled === undefined
             ? { workspaceId, mode }
             : { workspaceId, mode, legacyAutoRetryEnabled };
-
-        const iterator = await client.workspace.onChat(onChatInput, {
-          signal: attemptController.signal,
-        });
-
-        if (legacyAutoRetryEnabled !== undefined) {
-          // One-way migration: once we have successfully forwarded the legacy value
-          // to the backend, clear the renderer key so future sessions rely solely
-          // on backend persistence.
+        const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
+        if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        }
-
-        // Full replay: clear stale derived/transient state now that the subscription
-        // is active. Deferred to after the iterator is established so the UI continues
-        // displaying previous state until replay data actually starts arriving.
-        if (!mode || mode.type === "full") {
-          this.resetChatStateForReplay(workspaceId);
-        }
-
-        // Start watchdog after subscribe connects so timeout measures
-        // post-connect silence, not handshake latency.
-        watchdog.start();
-
-        for await (const data of iterator) {
-          if (signal.aborted) {
-            return;
-          }
-
-          watchdog.markEvent();
-
-          // Connection is alive again - don't carry old backoff into the next failure.
-          attempt = 0;
-
-          const attemptSignal = attemptController.signal;
-          queueMicrotask(() => {
-            // Workspace switches abort the previous attempt before starting a new one.
-            // Drop any already-queued chat events from that aborted attempt so stale
-            // replay buffers cannot be repopulated after we synchronously cleared them.
-            if (signal.aborted || attemptSignal.aborted) {
-              return;
-            }
+        if (!mode || mode.type === "full") this.resetChatStateForReplay(workspaceId);
+        return { events: iterator, context: attemptContext };
+      },
+      onEvent: (data, attemptContext, attemptSignal) =>
+        queueMicrotask(() => {
+          if (!signal.aborted && !attemptSignal.aborted)
             this.handleChatMessage(workspaceId, data, attemptContext);
-          });
-        }
-
-        // Iterator ended without an abort - treat as unexpected and retry.
-        if (signal.aborted) {
-          return;
-        }
-
-        if (attemptController.signal.aborted) {
-          // e.g., stall watchdog fired
-          console.warn(
-            `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
-          );
-        } else {
-          console.warn(
-            `[WorkspaceStore] onChat subscription ended unexpectedly for ${workspaceId}; retrying...`
-          );
-        }
-      } catch (error) {
-        // Suppress errors when subscription was intentionally cleaned up
-        if (signal.aborted) {
-          return;
-        }
-
+        }),
+      onUnexpectedEnd: ({ attemptAborted }) =>
+        console.warn(
+          attemptAborted
+            ? "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
+            : "[WorkspaceStore] onChat subscription ended unexpectedly for " +
+                workspaceId +
+                "; retrying..."
+        ),
+      onError: (error, { attemptAborted }) => {
         const abortError = isAbortError(error);
-
-        if (attemptController.signal.aborted) {
-          if (!abortError) {
+        if (attemptAborted) {
+          if (!abortError)
             console.warn(
-              `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
+              "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
             );
-          }
         } else if (isIteratorValidationFailed(error)) {
-          // EVENT_ITERATOR_VALIDATION_FAILED can happen when:
-          // 1. Schema validation fails (event doesn't match WorkspaceChatMessageSchema)
-          // 2. Workspace was removed on server side (iterator ends with error)
-          // 3. Connection dropped (WebSocket/MessagePort error)
-
-          // Only suppress if workspace no longer exists (was removed during the race)
-          if (!this.isWorkspaceRegistered(workspaceId)) {
-            return;
-          }
-          // Log with detailed validation info for debugging schema mismatches
+          if (!this.isWorkspaceRegistered(workspaceId)) return true;
           console.error(
-            `[WorkspaceStore] Event validation failed for ${workspaceId}: ${formatValidationError(error)}`
+            "[WorkspaceStore] Event validation failed for " +
+              workspaceId +
+              ": " +
+              formatValidationError(error)
           );
-        } else if (!abortError) {
-          console.error(`[WorkspaceStore] Error in onChat subscription for ${workspaceId}:`, error);
-        }
-      } finally {
-        releaseAttemptListeners();
-        watchdog.stop();
-      }
-
-      if (this.isWorkspaceRegistered(workspaceId)) {
-        // Failed reconnect attempts may have buffered partial replay data.
-        // Clear replay buffers before the next attempt so we don't append a
-        // second replay copy and duplicate deltas/tool events on caught-up.
+        } else if (!abortError)
+          console.error(
+            "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
+            error
+          );
+      },
+      onAttemptFinished: () => {
+        if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
-
-        // If catch-up fails before the authoritative marker arrives, fall back to
-        // normal transcript/retry UI immediately so hydration cannot remain pinned
-        // while we wait for client reconnects.
         const transient = this.chatTransientState.get(workspaceId);
         if (transient?.isHydratingTranscript && !transient.caughtUp) {
           transient.isHydratingTranscript = false;
           this.states.bump(workspaceId);
         }
-
-        // Full replay resets can preserve the last usage snapshot until caught-up.
-        // If reconnect fails before caught-up arrives, drop that snapshot so stale
-        // live usage isn't shown indefinitely while retries continue.
-        if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId)) {
+        if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
           this.usageStore.bump(workspaceId);
-        }
-
-        // Preserve pagination across transient reconnect retries. Incremental
-        // caught-up payloads intentionally omit hasOlderHistory, so resetting
-        // here would permanently hide "Load older messages" until a full replay.
         const existingPagination =
           this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
-        this.historyPagination.set(workspaceId, {
-          ...existingPagination,
-          loading: false,
-        });
-      }
-
-      const delayMs = calculateSubscriptionBackoffMs(attempt);
-      attempt++;
-
-      await this.sleepWithAbort(delayMs, signal);
-      if (signal.aborted) {
-        return;
-      }
-    }
+        this.historyPagination.set(workspaceId, { ...existingPagination, loading: false });
+      },
+    });
   }
 
   /**
@@ -4316,6 +4054,16 @@ export class WorkspaceStore {
     this.cancelPendingIdleBump(workspaceId);
     this.cancelPendingStreamingBump(workspaceId);
     this.streamingStatsStore.delete(workspaceId);
+    this.releaseStreamingMessageChannel(workspaceId);
+    const transientForRemoval = this.chatTransientState.get(workspaceId);
+    if (transientForRemoval) {
+      for (const toolCallId of new Set([
+        ...transientForRemoval.liveAdvisorOutput.keys(),
+        ...transientForRemoval.liveAdvisorReasoning.keys(),
+      ])) {
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
+      }
+    }
     this.lastUserPromptStore.bump(workspaceId);
     this.lastUserPromptStore.delete(workspaceId);
 
@@ -4686,12 +4434,21 @@ export class WorkspaceStore {
       if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {
         // Live tool-call UI is tied to the active stream context; clear it when replay
         // replaces history, reports no active stream, or reports a different stream ID.
+        const clearedAdvisorToolCallIds = new Set([
+          ...transient.liveAdvisorOutput.keys(),
+          ...transient.liveAdvisorReasoning.keys(),
+        ]);
         transient.liveBashOutput.clear();
         transient.liveAdvisorOutput.clear();
         transient.liveAdvisorReasoning.clear();
         transient.liveAdvisorPhase.clear();
         transient.liveWorkflowRuns.clear();
         transient.liveTaskIds.clear();
+        // delete() notifies subscribers, so mounted advisor cards re-read null
+        // instead of keeping pre-reconnect live output.
+        for (const toolCallId of clearedAdvisorToolCallIds) {
+          this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
+        }
       }
 
       if (sinceContext) {
@@ -4873,6 +4630,7 @@ export class WorkspaceStore {
       // streamingStatsStore cache so useWorkspaceStreamingStats returns null.
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
+      this.releaseStreamingMessageChannel(workspaceId);
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
       return;
@@ -4926,7 +4684,7 @@ export class WorkspaceStore {
         return;
       }
 
-      this.scheduleStreamingStateBump(workspaceId);
+      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
       return;
     }
 
@@ -4945,7 +4703,7 @@ export class WorkspaceStore {
         return;
       }
 
-      this.scheduleStreamingStateBump(workspaceId);
+      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
       return;
     }
 
@@ -5277,8 +5035,8 @@ export function useAdvisorToolLiveOutput(
 
   return useSyncExternalStore(
     (listener) => {
-      if (!workspaceId) return () => undefined;
-      return store.subscribeKey(workspaceId, listener);
+      if (!workspaceId || !toolCallId) return () => undefined;
+      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
@@ -5298,8 +5056,8 @@ export function useAdvisorToolLiveReasoning(
 
   return useSyncExternalStore(
     (listener) => {
-      if (!workspaceId) return () => undefined;
-      return store.subscribeKey(workspaceId, listener);
+      if (!workspaceId || !toolCallId) return () => undefined;
+      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
     },
     () => {
       if (!workspaceId || !toolCallId) return null;
@@ -5539,6 +5297,24 @@ export function useWorkspaceRoundedStreamingTps(workspaceId: string): number | n
   return useSyncExternalStore(
     (listener: () => void) => store.subscribeStreamingStats(workspaceId, listener),
     () => store.getWorkspaceRoundedStreamingTps(workspaceId)
+  );
+}
+
+export function useStreamingMessageDelta(
+  workspaceId: string | undefined,
+  message: DisplayedMessage
+): DisplayedMessage {
+  const store = getStoreInstance();
+  const messageId = "historyId" in message ? message.historyId : null;
+  return useSyncExternalStore(
+    (listener) => {
+      if (!workspaceId || !messageId) return () => undefined;
+      return store.subscribeStreamingMessage(workspaceId, message.id, listener);
+    },
+    () => {
+      if (!workspaceId || !messageId) return message;
+      return store.getStreamingMessage(workspaceId, message.id, messageId) ?? message;
+    }
   );
 }
 

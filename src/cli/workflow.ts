@@ -22,7 +22,8 @@ import { defaultModel } from "@/common/utils/ai/models";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
+import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
@@ -207,14 +208,20 @@ function generateWorkspaceId(): string {
   return `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function copyPersistentConfig(realConfig: Config, config: Config): Promise<void> {
-  const existingProviders = realConfig.loadProvidersConfig();
+async function copyPersistentConfig(
+  realStores: ConfigStores,
+  runStores: ConfigStores
+): Promise<void> {
+  const realConfig = realStores.config;
+  const config = runStores.config;
+  const realProvidersStore = realStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
   if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
-    config.saveProvidersConfig(existingProviders);
+    runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
-    await config.saveSecretsConfig(existingSecrets);
+    await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
   const existingConfig = realConfig.loadConfigOrDefault();
@@ -336,15 +343,20 @@ async function createWorkflowContext(options: {
   let realProviderService: ProviderService | undefined;
   let policyService: PolicyService | undefined;
   try {
-    const realConfig = new Config();
-    const config = new Config(tempDir.path);
-    await copyPersistentConfig(realConfig, config);
+    const realStores = createConfigStores();
+    const realConfig = realStores.config;
+    const runStores = createConfigStores(tempDir.path);
+    const config = runStores.config;
+    await copyPersistentConfig(realStores, runStores);
 
-    const existingProviders = realConfig.loadProvidersConfig();
+    const realProvidersStore = realStores.providersConfigStore;
+    const realFileLeaseManager = realStores.fileLeaseManager;
+    const runProvidersStore = runStores.providersConfigStore;
+    const existingProviders = realProvidersStore.loadProvidersConfig();
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
       if (hasAnyConfiguredProvider(providersFromEnv)) {
-        config.saveProvidersConfig(providersFromEnv);
+        runProvidersStore.saveProvidersConfig(providersFromEnv);
       }
     }
 
@@ -362,20 +374,26 @@ async function createWorkflowContext(options: {
     await policyService.initialize();
 
     services = createCoreServices({
-      config,
+      ...runStores,
       policyService,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
     });
-    codexOauthService = new CodexOauthService(config, services.providerService);
+    codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
     services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
     // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
     // Coder rotates the refresh token on every use, so persisting rotations
     // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
     // (dead) refresh token once this CLI session exits.
-    realProviderService = new ProviderService(realConfig, policyService);
-    coderOauthService = new CoderOauthService(
+    realProviderService = new ProviderService(
       realConfig,
+      policyService,
+      realProvidersStore,
+      realFileLeaseManager
+    );
+    coderOauthService = new CoderOauthService(
+      realProvidersStore,
+      realFileLeaseManager,
       realProviderService,
       undefined,
       // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
@@ -462,7 +480,7 @@ function createWorkflowService(input: {
     workspaceName: input.ctx.workspaceId,
     workspacePath: input.ctx.workspacePath,
   });
-  const workspaceSessionDir = input.ctx.config.getSessionDir(input.ctx.workspaceId);
+  const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),

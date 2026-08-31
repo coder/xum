@@ -678,9 +678,7 @@ export class MemoryService extends EventEmitter {
             "Workspace memory is unavailable: no workspace is associated with this session"
           );
         }
-        return new LocalMemoryStore(
-          path.join(this.config.getSessionDir(ctx.workspaceId), "memory")
-        );
+        return new LocalMemoryStore(path.join(this.config.sessionsDir, ctx.workspaceId, "memory"));
       }
     }
   }
@@ -752,7 +750,7 @@ export class MemoryService extends EventEmitter {
       return;
     }
     await appendRefinementEvent({
-      sessionDir: this.config.getSessionDir(ctx.workspaceId),
+      sessionDir: path.join(this.config.sessionsDir, ctx.workspaceId),
       workspaceId: ctx.workspaceId,
       kind: "memory",
       action,

@@ -1,3 +1,4 @@
+import * as path from "path";
 /* eslint-disable @typescript-eslint/unbound-method */
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import type { HistoryService } from "./historyService";
@@ -6,7 +7,6 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import * as fs from "fs/promises";
-import * as path from "path";
 
 describe("HistoryService partial persistence - Error Recovery", () => {
   let partialService: HistoryService;
@@ -326,7 +326,7 @@ describe("HistoryService partial persistence - Legacy compatibility", () => {
 
   test("readPartial upgrades legacy cmuxMetadata", async () => {
     const workspaceId = "legacy-ws";
-    const workspaceDir = config.getSessionDir(workspaceId);
+    const workspaceDir = path.join(config.sessionsDir, workspaceId);
     await fs.mkdir(workspaceDir, { recursive: true });
 
     const partialMessage = createMuxMessage("partial-1", "assistant", "legacy", {

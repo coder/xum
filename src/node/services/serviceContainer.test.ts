@@ -1,19 +1,21 @@
+import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
-import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { Config } from "@/node/config";
+import { createConfigStores, type Config, type ConfigStores } from "@/node/config";
 import { ServiceContainer } from "./serviceContainer";
 
 describe("ServiceContainer", () => {
   let tempDir: string;
   let config: Config;
+  let stores: ConfigStores;
   let services: ServiceContainer | undefined;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-service-container-test-"));
-    config = new Config(tempDir);
+    stores = createConfigStores(tempDir);
+    config = stores.config;
   });
 
   afterEach(async () => {
@@ -51,7 +53,7 @@ describe("ServiceContainer", () => {
       return cfg;
     });
 
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
     const ingestWorkspaceSpy = spyOn(
       services.analyticsService,
       "ingestWorkspace"
@@ -67,7 +69,7 @@ describe("ServiceContainer", () => {
 
     expect(ingestWorkspaceSpy).toHaveBeenCalledWith(
       workspaceId,
-      config.getSessionDir(workspaceId),
+      path.join(config.sessionsDir, workspaceId),
       {
         projectPath: primaryProjectPath,
         projectName: path.basename(primaryProjectPath),
@@ -78,7 +80,7 @@ describe("ServiceContainer", () => {
   });
 
   it("exposes desktopSessionManager in the ORPC context", () => {
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
 
     const context = services.toORPCContext();
 
@@ -86,7 +88,7 @@ describe("ServiceContainer", () => {
   });
 
   it("closes desktop sessions during shutdown", async () => {
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
     const closeAllSpy = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
       Promise.resolve(undefined)
     );
@@ -97,7 +99,7 @@ describe("ServiceContainer", () => {
   });
 
   it("closes desktop sessions during dispose", async () => {
-    services = new ServiceContainer(config);
+    services = new ServiceContainer(stores);
     const closeAllSpy = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
       Promise.resolve(undefined)
     );

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { z } from "zod";
 
 import assert from "@/common/utils/assert";
-import type { Config } from "@/node/config";
+import type { WorkspaceSessionLocator } from "@/node/config";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
@@ -78,11 +78,11 @@ const TerminalAttentionNotificationSchema = z.object({
  * by skipping malformed files at read time.
  */
 export class TerminalAttentionStore {
-  constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
+  constructor(private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir">) {}
 
   private dir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "TerminalAttentionStore requires ownerWorkspaceId");
-    return path.join(this.config.getSessionDir(ownerWorkspaceId), TERMINAL_ATTENTION_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, TERMINAL_ATTENTION_DIR);
   }
 
   /** Stable id keyed by source and optional execution generation for per-assignment idempotency. */

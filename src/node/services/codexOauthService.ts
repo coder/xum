@@ -12,7 +12,7 @@ import {
   CODEX_OAUTH_DEVICE_VERIFY_URL,
   CODEX_OAUTH_TOKEN_URL,
 } from "@/common/constants/codexOAuth";
-import type { Config } from "@/node/config";
+import type { ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
@@ -107,7 +107,7 @@ export class CodexOauthService {
   private cachedAuth: CodexOauthAuth | null = null;
 
   constructor(
-    private readonly config: Config,
+    private readonly providersConfigStore: ProvidersConfigStore,
     private readonly providerService: ProviderService,
     private readonly windowService?: WindowService
   ) {}
@@ -365,7 +365,7 @@ export class CodexOauthService {
     if (this.cachedAuth) {
       return this.cachedAuth;
     }
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const openaiConfig = providersConfig.openai as Record<string, unknown> | undefined;
     const auth = parseCodexOauthAuth(openaiConfig?.codexOauth);
     this.cachedAuth = auth;

@@ -15,7 +15,12 @@ import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import {
+  SecretsStore,
+  type Config,
+  type ProjectsConfig,
+  type Workspace as WorkspaceConfigEntry,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
@@ -1824,7 +1829,9 @@ export class TaskService implements AgentTaskIntegration {
     const runIds = new Set<string>();
     let references: Awaited<ReturnType<typeof readAgentWorkflowRunReferences>> = [];
     try {
-      references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+      references = await readAgentWorkflowRunReferences(
+        path.join(this.config.sessionsDir, workspaceId)
+      );
     } catch (error: unknown) {
       // Rediscovery is non-destructive and re-runs on the next listing; skip this pass.
       log.warn("Failed to read agent workflow run references", { workspaceId, error });
@@ -1873,7 +1880,9 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const referencedRunIdSet = new Set(referencedWorkflowRunIds);
-      const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      });
       const runs = await runStore.listRuns();
       return runs
         .filter(
@@ -1906,7 +1915,9 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const referencedRunIdSet = new Set(referencedWorkflowRunIds);
-      const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, workspaceId),
+      });
       const runs = await runStore.listRuns();
       const blockingRunIds: string[] = [];
       for (const run of runs) {
@@ -2001,7 +2012,7 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const runStore = new WorkflowRunStore({
-        sessionDir: this.config.getSessionDir(parentWorkspaceId),
+        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
       });
       const run = await runStore.getRun(workflowTask.runId);
       if (run.workspaceId !== parentWorkspaceId) {
@@ -2255,7 +2266,8 @@ export class TaskService implements AgentTaskIntegration {
     private readonly initStateManager: InitStateManager,
     private readonly sessionUsageService?: SessionUsageService,
     private readonly workspaceGoalService?: WorkspaceGoalService,
-    private readonly streamManager?: StreamManager
+    private readonly streamManager?: StreamManager,
+    private readonly secretsStore: SecretsStore = new SecretsStore(config.rootDir)
   ) {
     this.agentPeerMessageBroker = new AgentPeerMessageBroker(workspaceService);
     this.taskHandleStore = new TaskHandleStore(config);
@@ -2623,7 +2635,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       const projectEnv = await secretsToRecord(
-        this.config.getEffectiveSecrets(normalizedRuntimeProjectPath)
+        this.secretsStore.getEffectiveSecrets(normalizedRuntimeProjectPath)
       );
       projectEnvCache.set(normalizedRuntimeProjectPath, projectEnv);
       return projectEnv;
@@ -3676,7 +3688,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     try {
-      const sessionDir = this.config.getSessionDir(taskId);
+      const sessionDir = path.join(this.config.sessionsDir, taskId);
       await fsPromises.rm(sessionDir, { recursive: true, force: true });
     } catch (error: unknown) {
       log.error("Task launch cleanup: failed to remove session directory", {
@@ -4017,7 +4029,7 @@ export class TaskService implements AgentTaskIntegration {
       initLogger.logComplete(0);
     } else {
       const secrets = await secretsToRecord(
-        this.config.getEffectiveSecrets(plan.parentMeta.projectPath)
+        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
@@ -5621,7 +5633,7 @@ export class TaskService implements AgentTaskIntegration {
     // mutate the live parent workspace — skip it entirely.
     if (!useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.config.getEffectiveSecrets(parentMeta.projectPath)
+        this.secretsStore.getEffectiveSecrets(parentMeta.projectPath)
       );
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
@@ -7441,7 +7453,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     try {
-      const sessionDir = this.config.getSessionDir(taskId);
+      const sessionDir = path.join(this.config.sessionsDir, taskId);
       await fsPromises.rm(sessionDir, { recursive: true, force: true });
     } catch (error: unknown) {
       log.error("Task.create rollback: failed to remove session directory", {
@@ -7669,7 +7681,7 @@ export class TaskService implements AgentTaskIntegration {
           continue;
         }
         const runStore = new WorkflowRunStore({
-          sessionDir: this.config.getSessionDir(workspace.id),
+          sessionDir: path.join(this.config.sessionsDir, workspace.id),
         });
         let runs: Awaited<ReturnType<WorkflowRunStore["listRuns"]>>;
         try {
@@ -8022,7 +8034,7 @@ export class TaskService implements AgentTaskIntegration {
     let currentRunUpdatedAt: string | null;
     try {
       const runStore = new WorkflowRunStore({
-        sessionDir: this.config.getSessionDir(params.ownerWorkspaceId),
+        sessionDir: path.join(this.config.sessionsDir, params.ownerWorkspaceId),
       });
       currentRunUpdatedAt = (await runStore.getRun(params.runId)).updatedAt;
     } catch {
@@ -8325,7 +8337,7 @@ export class TaskService implements AgentTaskIntegration {
     assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
     assert(runId.length > 0, "buildWorkflowTerminalPrompt requires runId");
     const runStore = new WorkflowRunStore({
-      sessionDir: this.config.getSessionDir(ownerWorkspaceId),
+      sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
     });
     let run: Awaited<ReturnType<WorkflowRunStore["getRun"]>>;
     try {
@@ -8403,7 +8415,7 @@ export class TaskService implements AgentTaskIntegration {
     let initiatingAgent: WorkflowWakeInitiatingAgent | undefined;
     try {
       const references = await readAgentWorkflowRunReferences(
-        this.config.getSessionDir(ownerWorkspaceId)
+        path.join(this.config.sessionsDir, ownerWorkspaceId)
       );
       const reference = references.find((candidate) => candidate.runId === run.id);
       if (reference?.agentId != null) {
@@ -8475,7 +8487,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const workspaceTurnMuxMetadata =
       await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
-    const sessionDir = this.config.getSessionDir(ownerWorkspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, ownerWorkspaceId);
     for (const notification of notifications) {
       if (existingTaskIds.has(notification.sourceId)) {
         const existingMessage = existingReportMessages.get(notification.sourceId);
@@ -10902,7 +10914,7 @@ export class TaskService implements AgentTaskIntegration {
         return null;
       }
 
-      const sessionDir = this.config.getSessionDir(requestingWorkspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, requestingWorkspaceId);
       const artifact = await readSubagentReportArtifact(sessionDir, taskId);
       if (!artifact) {
         return null;
@@ -10956,7 +10968,7 @@ export class TaskService implements AgentTaskIntegration {
         return null;
       }
 
-      const sessionDir = this.config.getSessionDir(requestingWorkspaceId);
+      const sessionDir = path.join(this.config.sessionsDir, requestingWorkspaceId);
       const failure = await readSubagentFailureArtifact(sessionDir, taskId);
       return failure ? new Error(failure.errorMessage) : null;
     };
@@ -12698,7 +12710,7 @@ export class TaskService implements AgentTaskIntegration {
         const parentWorkspaceId = entry.workspace.parentWorkspaceId;
         if (parentWorkspaceId) {
           const patchArtifact = await readSubagentGitPatchArtifact(
-            this.config.getSessionDir(parentWorkspaceId),
+            path.join(this.config.sessionsDir, parentWorkspaceId),
             taskId
           );
           if (patchArtifact?.status === "pending") {
@@ -12727,7 +12739,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private removedAgentTaskTombstonePath(ownerWorkspaceId: string, taskId: string): string {
     return path.join(
-      this.config.getSessionDir(ownerWorkspaceId),
+      this.config.sessionsDir,
+      ownerWorkspaceId,
       REMOVED_AGENT_TASKS_DIR,
       `${encodeURIComponent(taskId)}.json`
     );
@@ -12909,7 +12922,7 @@ export class TaskService implements AgentTaskIntegration {
     // BOTH: a background-failed child that was cleaned up or lost to a restart
     // must stay in scope for task_await so waitForAgentReport can surface the
     // persisted typed failure instead of degrading to invalid_scope/not_found.
-    const sessionDir = this.config.getSessionDir(ancestorWorkspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
     const [reports, failures] = await Promise.all([
       readSubagentReportArtifactsFile(sessionDir),
       readSubagentFailureArtifactsFile(sessionDir),
@@ -12999,7 +13012,7 @@ export class TaskService implements AgentTaskIntegration {
       return false;
     }
 
-    const sessionDir = this.config.getSessionDir(ancestorWorkspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
     const persisted = await readSubagentReportArtifactsFile(sessionDir);
     const entry = persisted.artifactsByChildTaskId[taskId];
     if (entry != null) {
@@ -13061,7 +13074,7 @@ export class TaskService implements AgentTaskIntegration {
       return true;
     }
 
-    const sessionDir = this.config.getSessionDir(ancestorWorkspaceId);
+    const sessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
     const [reports, failures] = await Promise.all([
       readSubagentReportArtifactsFile(sessionDir),
       readSubagentFailureArtifactsFile(sessionDir),
@@ -13565,7 +13578,7 @@ export class TaskService implements AgentTaskIntegration {
       return [];
     }
     const runStore = new WorkflowRunStore({
-      sessionDir: this.config.getSessionDir(workspaceId),
+      sessionDir: path.join(this.config.sessionsDir, workspaceId),
     });
     const blocking: string[] = [];
     for (const runId of runIds) {
@@ -13616,7 +13629,9 @@ export class TaskService implements AgentTaskIntegration {
       workspaceId.length > 0,
       "listActiveWorkflowRunIdsForWorkspaceStrict requires workspaceId"
     );
-    const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(this.config.sessionsDir, workspaceId),
+    });
     const runs = await runStore.listRunsForActivityScan();
     return runs
       .filter(
@@ -15893,7 +15908,7 @@ export class TaskService implements AgentTaskIntegration {
         try {
           await upsertSubagentFailureArtifact({
             workspaceId: ancestorWorkspaceId,
-            workspaceSessionDir: this.config.getSessionDir(ancestorWorkspaceId),
+            workspaceSessionDir: path.join(this.config.sessionsDir, ancestorWorkspaceId),
             childTaskId: workspaceId,
             parentWorkspaceId,
             ancestorWorkspaceIds,
@@ -16631,7 +16646,7 @@ export class TaskService implements AgentTaskIntegration {
         }
       }
 
-      const parentSessionDir = this.config.getSessionDir(params.parentWorkspaceId);
+      const parentSessionDir = path.join(this.config.sessionsDir, params.parentWorkspaceId);
       for (const sibling of siblings) {
         if (
           parentTaskToolState.referencedTaskIds.has(sibling.taskId) ||
@@ -16750,7 +16765,7 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const runStore = new WorkflowRunStore({
-        sessionDir: this.config.getSessionDir(parentWorkspaceId),
+        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
       });
       const run = await runStore.getRun(workflowTask.runId);
       return run.agentOutputSchemaRequired !== true;
@@ -16921,7 +16936,7 @@ export class TaskService implements AgentTaskIntegration {
     const persistedAtMs = Date.now();
     for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
       try {
-        const ancestorSessionDir = this.config.getSessionDir(ancestorWorkspaceId);
+        const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
         await upsertSubagentReportArtifact({
           workspaceId: ancestorWorkspaceId,
           workspaceSessionDir: ancestorSessionDir,
@@ -17416,7 +17431,7 @@ export class TaskService implements AgentTaskIntegration {
     // Best-of creation can fail or be interrupted after only some candidates are spawned.
     // When recovering an interrupted parent stream, finalize against the siblings that
     // actually exist so the parent task tool call does not stay pending forever.
-    const parentSessionDir = this.config.getSessionDir(params.parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, params.parentWorkspaceId);
     const reports: Array<{
       taskId: string;
       reportMarkdown: string;
@@ -17908,7 +17923,7 @@ export class TaskService implements AgentTaskIntegration {
       return { ok: false, reason: "has_child_tasks" };
     }
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
     const patchArtifact = await readSubagentGitPatchArtifact(parentSessionDir, workspaceId);
     if (patchArtifact?.status === "pending") {
       log.debug("cleanupReportedLeafTask: deferring auto-delete; patch artifact pending", {

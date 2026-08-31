@@ -3,7 +3,7 @@ import * as crypto from "crypto";
 
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
-import type { Config, ProvidersConfig } from "@/node/config";
+import type { FileLeaseManager, ProvidersConfig, ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import type { ProviderModelEntry } from "@/common/config/schemas/providerModelEntry";
@@ -126,24 +126,23 @@ function createMockDeps(): MockDeps {
   };
 }
 
-function createMockConfig(
+function createMockProvidersConfigStore(
   deps: MockDeps
-): Pick<
-  Config,
-  | "loadProvidersConfig"
-  | "getProvidersFileFingerprint"
-  | "tryAcquireCoderOauthClientLease"
-  | "withCoderOauthRefreshLock"
-  | "withCoderOauthLoginCommitLock"
-> {
+): Pick<ProvidersConfigStore, "loadProvidersConfig" | "getProvidersFileFingerprint"> {
   return {
     loadProvidersConfig: () => deps.providersConfig,
-    // Mirrors Config.getProvidersFileFingerprint (content hash): changes
-    // whenever the in-memory providers config changes, exactly like the real
-    // file fingerprint changes on every persisted write.
     getProvidersFileFingerprint: () => JSON.stringify(deps.providersConfig),
-    // Mirrors Config.tryAcquireCoderOauthClientLease: non-blocking, exclusive,
-    // released via the returned function.
+  };
+}
+
+function createMockFileLeaseManager(
+  deps: MockDeps,
+  overrides?: Partial<FileLeaseManager>
+): Pick<
+  FileLeaseManager,
+  "tryAcquireCoderOauthClientLease" | "withCoderOauthRefreshLock" | "withCoderOauthLoginCommitLock"
+> {
+  return {
     tryAcquireCoderOauthClientLease: () => {
       if (deps.coderClientLeaseHeld) {
         return null;
@@ -153,10 +152,9 @@ function createMockConfig(
         deps.coderClientLeaseHeld = false;
       };
     },
-    // Single-process tests do not contend on the cross-process locks; the
-    // two-process race tests wire shared serializing locks instead.
     withCoderOauthRefreshLock: async <T>(fn: () => Promise<T> | T): Promise<T> => await fn(),
     withCoderOauthLoginCommitLock: async <T>(fn: () => Promise<T> | T): Promise<T> => await fn(),
+    ...overrides,
   };
 }
 
@@ -286,7 +284,8 @@ function createMockWindowService(deps: MockDeps): Pick<WindowService, "focusMain
 
 function createService(deps: MockDeps): CoderOauthService {
   return new CoderOauthService(
-    createMockConfig(deps) as Config,
+    createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+    createMockFileLeaseManager(deps) as FileLeaseManager,
     createMockProviderService(deps) as ProviderService,
     createMockWindowService(deps) as WindowService
   );
@@ -599,10 +598,10 @@ describe("CoderOauthService", () => {
       const sharedLock = createSharedCrossProcessLock();
       const makeProcess = (): CoderOauthService =>
         new CoderOauthService(
-          {
-            ...createMockConfig(deps),
+          createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+          createMockFileLeaseManager(deps, {
             withCoderOauthRefreshLock: sharedLock,
-          } as Config,
+          }) as FileLeaseManager,
           createMockProviderService(deps) as ProviderService,
           createMockWindowService(deps) as WindowService
         );
@@ -703,10 +702,10 @@ describe("CoderOauthService", () => {
         return await fn();
       };
       service = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthRefreshLock: lockSimulatingEdit,
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -789,7 +788,8 @@ describe("CoderOauthService", () => {
           Promise.resolve(Err("Failed to update provider config: disk full")),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1112,7 +1112,8 @@ describe("CoderOauthService", () => {
       // backend RPCs from registering OAuth clients or minting credentials —
       // not merely hide the login UI.
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1142,7 +1143,8 @@ describe("CoderOauthService", () => {
       // after coder was denied, and the exchanged tokens must be revoked.
       let coderAllowed = true;
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1241,7 +1243,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1354,18 +1357,18 @@ describe("CoderOauthService", () => {
         },
       };
       const serviceA = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: sharedCommitLock,
-        } as Config,
+        }) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
       const serviceB = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: sharedCommitLock,
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1455,7 +1458,8 @@ describe("CoderOauthService", () => {
       // must be revoked against their own issuer instead.
       let forcedUrl: string | undefined = undefined;
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1560,12 +1564,14 @@ describe("CoderOauthService", () => {
         },
       };
       const serviceA = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
       const serviceB = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1642,7 +1648,8 @@ describe("CoderOauthService", () => {
     it("logs in to the policy-forced deployment instead of the requested URL", async () => {
       const FORCED_URL = "http://locked.coder.test";
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -1883,7 +1890,8 @@ describe("CoderOauthService", () => {
           Promise.resolve({ success: false as const, error: "providers.jsonc is unwritable" }),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1947,11 +1955,11 @@ describe("CoderOauthService", () => {
       // task: the flow must finish with the error immediately (not hang until
       // the five-minute timeout) and the exchanged tokens must be revoked.
       service = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: <T>(_fn: () => Promise<T> | T): Promise<T> =>
             Promise.reject(new Error("EACCES: permission denied, mkdir lock")),
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2105,7 +2113,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2200,7 +2209,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2300,7 +2310,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2405,7 +2416,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2593,7 +2605,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2740,10 +2753,10 @@ describe("CoderOauthService", () => {
           },
         };
         const service = new CoderOauthService(
-          {
-            ...createMockConfig(deps),
+          createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+          createMockFileLeaseManager(deps, {
             withCoderOauthLoginCommitLock: sharedCommitLock,
-          } as Config,
+          }) as FileLeaseManager,
           gatedProviderService as unknown as ProviderService,
           createMockWindowService(deps) as WindowService
         );
@@ -3278,7 +3291,8 @@ describe("CoderOauthService", () => {
         updateProviderSection: () => Promise.resolve(Err("disk full")),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -3319,7 +3333,8 @@ describe("CoderOauthService", () => {
       // Policy is applied at exposure time instead (getConfig filtering,
       // routing checks, per-model factory enforcement).
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService,
         {
@@ -5053,7 +5068,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         injectingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -5104,7 +5120,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         injectingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );

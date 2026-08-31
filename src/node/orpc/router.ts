@@ -55,7 +55,8 @@ import {
   updateUpcomingWorkspaceGoal,
   removeWorkspace,
 } from "@/node/services/workspaceOperations";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import { getErrorMessage } from "@/common/utils/errors";
 
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 
@@ -726,17 +727,55 @@ export const router = (authToken?: string) => {
       get: t
         .input(schemas.secrets.get.input)
         .output(schemas.secrets.get.output)
-        .handler(({ context, input }) => context.config.getScopedSecrets(input.projectPath)),
+        .handler(({ context, input }) => {
+          const projectPath =
+            typeof input.projectPath === "string" && input.projectPath.trim().length > 0
+              ? input.projectPath
+              : undefined;
+
+          return projectPath
+            ? context.secretsStore.getProjectSecrets(projectPath)
+            : context.secretsStore.getGlobalSecrets();
+        }),
       getInjectedGlobals: t
         .input(schemas.secrets.getInjectedGlobals.input)
         .output(schemas.secrets.getInjectedGlobals.output)
-        .handler(({ context, input }) =>
-          context.config.getInjectedGlobalSecretKeys(input.projectPath)
-        ),
+        .handler(({ context, input }) => {
+          const projectPath =
+            typeof input.projectPath === "string" && input.projectPath.trim().length > 0
+              ? input.projectPath
+              : undefined;
+
+          if (!projectPath) {
+            return [];
+          }
+
+          return context.secretsStore
+            .getInjectedGlobalSecrets(projectPath)
+            .map((secret) => secret.key);
+        }),
       update: t
         .input(schemas.secrets.update.input)
         .output(schemas.secrets.update.output)
-        .handler(({ context, input }) => context.config.updateScopedSecrets(input)),
+        .handler(async ({ context, input }) => {
+          const projectPath =
+            typeof input.projectPath === "string" && input.projectPath.trim().length > 0
+              ? input.projectPath
+              : undefined;
+
+          try {
+            if (projectPath) {
+              await context.secretsStore.updateProjectSecrets(projectPath, input.secrets);
+            } else {
+              await context.secretsStore.updateGlobalSecrets(input.secrets);
+            }
+
+            return Ok(undefined);
+          } catch (error) {
+            const message = getErrorMessage(error);
+            return Err(message);
+          }
+        }),
     },
     mcp: {
       list: t

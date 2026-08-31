@@ -193,9 +193,7 @@ export async function appendReplayFixtureTurn(
       partialContinuation: spec.partialContinuation,
       workspaceId: ctx.workspaceId,
     });
-    // Wire tool definitions for the recorded request: same cache-control
-    // treatment StreamManager.buildStreamRequestConfig applies before
-    // streamText serializes tools.
+    // Wire tool definitions use the same cache treatment as the prompt assembler.
     const { tools: wireTools } = await captureLanguageModelPrompt({
       system: rebuilt.system,
       messages: rebuilt.messages,

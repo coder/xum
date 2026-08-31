@@ -131,8 +131,10 @@ function createBackgroundProcessManager(): BackgroundProcessManager {
 
 function createConfig(): Config {
   return {
+    rootDir: "/tmp",
+    sessionsDir: "/tmp",
     srcDir: "/tmp",
-    getSessionDir: mock(() => "/tmp"),
+    loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 }
 

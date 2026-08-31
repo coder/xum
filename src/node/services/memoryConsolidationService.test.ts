@@ -459,7 +459,7 @@ describe("MemoryConsolidationService", () => {
     // the sweep itself must request the ingest.
     expect(ingests).toEqual([{ workspaceId: "ws-dream" }]);
     const sidecar = await fsPromises.readFile(
-      path.join(fixture.config.getSessionDir("ws-dream"), "headless-usage.jsonl"),
+      path.join(fixture.config.sessionsDir, "ws-dream", "headless-usage.jsonl"),
       "utf-8"
     );
     expect(sidecar).toContain('"source":"memory_consolidation"');

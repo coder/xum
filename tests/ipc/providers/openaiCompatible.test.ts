@@ -1,7 +1,7 @@
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { OPENAI_RESPONSES_BASE_URL_HINT } from "@/node/services/utils/openAIResponsesBaseUrlHint";
 import { loadTokenizerModules } from "@/node/utils/main/tokenizer";
@@ -238,7 +238,7 @@ async function createConfiguredWorkspace(providersConfig: ProvidersConfig): Prom
 }> {
   const tempGitRepo = await createTempGitRepo();
   const env = await createTestEnvironment();
-  env.config.saveProvidersConfig(providersConfig);
+  new ProvidersConfigStore(env.config.rootDir).saveProvidersConfig(providersConfig);
 
   const created = await createWorkspace(env, tempGitRepo, generateBranchName("openai-compatible"));
   if (!created.success) {

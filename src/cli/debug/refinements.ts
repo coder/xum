@@ -1,3 +1,4 @@
+import * as path from "path";
 import { defaultConfig } from "@/node/config";
 import {
   MemoryRefinementActionSchema,
@@ -46,7 +47,7 @@ export async function refinementsCommand(
   workspaceId: string,
   opts: RefinementsCommandOptions = {}
 ): Promise<void> {
-  const sessionDir = opts.sessionDir ?? defaultConfig.getSessionDir(workspaceId);
+  const sessionDir = opts.sessionDir ?? path.join(defaultConfig.sessionsDir, workspaceId);
 
   if (opts.rollback !== undefined) {
     const result = await rollbackRefinement({

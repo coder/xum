@@ -1,7 +1,8 @@
+import { SecretsStore } from "@/node/config";
+import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { existsSync } from "fs";
-import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
 
@@ -149,7 +150,7 @@ function createWorkspaceTurnMetadata(projectPath: string): WorkspaceMetadata {
 
 async function workspaceGoalFileExists(config: Config, workspaceId: string): Promise<boolean> {
   try {
-    await fsPromises.access(path.join(config.getSessionDir(workspaceId), "goal.json"));
+    await fsPromises.access(path.join(config.sessionsDir, workspaceId, "goal.json"));
     return true;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -2030,7 +2031,11 @@ describe("TaskService", () => {
     // workflow runs is no longer provable, so archive must refuse instead of proceeding
     // while a crash-recovered run might still resume into the archived workspace.
     await fsPromises.mkdir(
-      path.join(harness.config.getSessionDir("childworkspace"), "workflows", "wfr_corrupt"),
+      path.join(
+        path.join(harness.config.sessionsDir, "childworkspace"),
+        "workflows",
+        "wfr_corrupt"
+      ),
       { recursive: true }
     );
 
@@ -2052,7 +2057,7 @@ describe("TaskService", () => {
   test("workspace lifecycle refuses archive while the target owns an active workflow run", async () => {
     const harness = await createWorkspaceLifecycleHarness();
     const runStore = new WorkflowRunStore({
-      sessionDir: harness.config.getSessionDir("childworkspace"),
+      sessionDir: path.join(harness.config.sessionsDir, "childworkspace"),
     });
     await runStore.createRun({
       id: "wfr_child_active",
@@ -3921,7 +3926,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentGitPatchArtifact({
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
@@ -5824,7 +5829,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_terminal_notify";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -5873,7 +5878,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_terminal_defer";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -5923,7 +5928,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_terminal_defer_retry";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -5987,7 +5992,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_terminal_enqueue_removed_owner";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6026,7 +6031,7 @@ describe("TaskService", () => {
       project.workspaces = project.workspaces.filter((workspace) => workspace.id !== parentId);
     }
     await config.editConfig(() => cfg);
-    const sessionDir = config.getSessionDir(parentId);
+    const sessionDir = path.join(config.sessionsDir, parentId);
     await fsPromises.rm(sessionDir, { recursive: true, force: true });
 
     taskService.noteWorkflowRunTerminalAttention({
@@ -6074,7 +6079,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_recovery_stale_generation";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6136,7 +6141,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_upgrade_stable_marker";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6206,7 +6211,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_unarchive_requeue";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6271,7 +6276,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_mid_settlement_resume";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6356,7 +6361,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_busy_fallback_clear";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6424,7 +6429,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_stable_marker_refresh";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6494,7 +6499,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_stable_marker_clock_skew";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6557,7 +6562,7 @@ describe("TaskService", () => {
   test("an unreadable settlement marker skips only that run and never rejects the sweep", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     for (const runId of ["wfr_sweep_marker_a", "wfr_sweep_marker_b"]) {
       await runStore.createRun({
         id: runId,
@@ -6654,7 +6659,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_clear_race";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6695,7 +6700,7 @@ describe("TaskService", () => {
       createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
     });
     (
@@ -6727,7 +6732,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_resolve_clear_race";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6776,7 +6781,7 @@ describe("TaskService", () => {
       createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
     });
     (
@@ -6801,7 +6806,7 @@ describe("TaskService", () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const oldRunId = "wfr_group_old";
     const newRunId = "wfr_group_new";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     for (const runId of [oldRunId, newRunId]) {
       await runStore.createRun({
         id: runId,
@@ -6850,13 +6855,13 @@ describe("TaskService", () => {
       createMuxMessage("manual", "user", "run the audits", { timestamp: 1_000 })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: oldRunId,
       createdAtMs: 1_100,
       agentId: "exec",
     });
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: newRunId,
       createdAtMs: 1_500,
       agentId: "plan",
@@ -6889,7 +6894,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_settled_requeue";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -6990,7 +6995,7 @@ describe("TaskService", () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const oldRunId = "wfr_backoff_old";
     const newRunId = "wfr_backoff_new";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     for (const runId of [oldRunId, newRunId]) {
       await runStore.createRun({
         id: runId,
@@ -7028,13 +7033,13 @@ describe("TaskService", () => {
       createMuxMessage("manual", "user", "run the audits", { timestamp: 1_000 })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: oldRunId,
       createdAtMs: 1_100,
       agentId: "exec",
     });
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: newRunId,
       createdAtMs: 1_500,
       agentId: "plan",
@@ -7068,7 +7073,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_nonworkflow_backoff";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7104,7 +7109,7 @@ describe("TaskService", () => {
       createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
       agentId: "plan",
     });
@@ -7164,7 +7169,7 @@ describe("TaskService", () => {
     const runId = "wfr_downgrade_stable";
     // A real run record also materializes the owner session dir: settlement markers refuse to
     // recreate a removed owner dir by design, so the fixture must exist like in production.
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7212,7 +7217,7 @@ describe("TaskService", () => {
   test("the sweep does not queue an intentionally interrupted run", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     for (const [runId, status] of [
       ["wfr_sweep_interrupted", "interrupted"],
       ["wfr_sweep_completed", "completed"],
@@ -7262,7 +7267,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_restart_compat";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7313,7 +7318,7 @@ describe("TaskService", () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_policy_reset_boundary";
     const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7384,7 +7389,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     const createRun = async (runId: string) => {
       await runStore.createRun({
         id: runId,
@@ -7463,7 +7468,7 @@ describe("TaskService", () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
     const runId = "wfr_policy_long_tail";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7533,7 +7538,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_initiating_agent";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7585,7 +7590,7 @@ describe("TaskService", () => {
       })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
       agentId: "plan",
     });
@@ -7605,7 +7610,7 @@ describe("TaskService", () => {
   test("coalesced workflow wakes split by initiating agent", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     const createRun = async (runId: string) => {
       await runStore.createRun({
         id: runId,
@@ -7647,13 +7652,13 @@ describe("TaskService", () => {
     // Two current runs from different initiating agents: one coalesced wake would hand the
     // older run's (attacker-influenced) output to the newer agent's tool grants.
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: "wfr_split_exec",
       createdAtMs: 1_000,
       agentId: "exec",
     });
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: "wfr_split_plan",
       createdAtMs: 2_000,
       agentId: "plan",
@@ -7691,7 +7696,7 @@ describe("TaskService", () => {
   test("coalesced workflow wakes split by strict pin within one agent", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     const createRun = async (runId: string) => {
       await runStore.createRun({
         id: runId,
@@ -7734,14 +7739,14 @@ describe("TaskService", () => {
     // launches): one coalesced wake would process the pinned run's output under the newer
     // verified-unpinned launch.
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: "wfr_pin_split_pinned",
       createdAtMs: 1_000,
       agentId: "plan",
       strictAgentResolution: { expectedScope: "built-in" },
     });
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: "wfr_pin_split_unpinned",
       createdAtMs: 2_000,
       agentId: "plan",
@@ -7784,7 +7789,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_mixed";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7824,7 +7829,7 @@ describe("TaskService", () => {
       createMuxMessage("agent-turn", "assistant", "on it", { timestamp: 1_001, agentId: "plan" })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
       agentId: "exec",
     });
@@ -7864,7 +7869,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_repoke";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7900,7 +7905,7 @@ describe("TaskService", () => {
       createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
       agentId: "exec",
     });
@@ -7950,7 +7955,7 @@ describe("TaskService", () => {
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
     const runId = "wfr_synthetic_pin";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -7998,7 +8003,7 @@ describe("TaskService", () => {
       })
     );
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
       agentId: "plan",
     });
@@ -8034,7 +8039,7 @@ describe("TaskService", () => {
     // stay queued for a later drain or sweep instead of being dropped.
     const unreadableRunId = "wfr_unreadable";
     await fsPromises.mkdir(
-      path.join(config.getSessionDir(parentId), "workflows", unreadableRunId, "run.json"),
+      path.join(config.sessionsDir, parentId, "workflows", unreadableRunId, "run.json"),
       { recursive: true }
     );
     taskService.noteWorkflowRunTerminalAttention({
@@ -8064,7 +8069,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_identity_unreadable";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -8095,7 +8100,7 @@ describe("TaskService", () => {
     // ...but the launch-identity read fails transiently (EISDIR). Delivering without the
     // recorded identity would bind the wake to the newest agent-bearing history row, so the
     // wake must stay queued for the retry drain.
-    await fsPromises.mkdir(path.join(config.getSessionDir(parentId), "agent-workflow-runs.json"), {
+    await fsPromises.mkdir(path.join(config.sessionsDir, parentId, "agent-workflow-runs.json"), {
       recursive: true,
     });
     taskService.noteWorkflowRunTerminalAttention({
@@ -8124,7 +8129,7 @@ describe("TaskService", () => {
   test("wake re-pins the selected group's recorded launch pin, not the newest row's", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     const createRun = async (runId: string) => {
       await runStore.createRun({
         id: runId,
@@ -8175,7 +8180,7 @@ describe("TaskService", () => {
 
     // A verified-unpinned launch (null) must suppress the walk pin entirely.
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: "wfr_pin_unpinned",
       agentId: "exec",
       strictAgentResolution: null,
@@ -8196,7 +8201,7 @@ describe("TaskService", () => {
 
     // A recorded launch pin overrides the walk pin exactly.
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId: "wfr_pin_recorded",
       agentId: "plan",
       strictAgentResolution: { expectedScope: "built-in" },
@@ -8218,7 +8223,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
     const runId = "wfr_policy_corrupt";
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: runId,
       workspaceId: parentId,
@@ -12753,7 +12758,9 @@ describe("TaskService", () => {
 
   test("workspace-turn deferred recovery waits for active workflow blockers", async () => {
     const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("childworkspace") });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "childworkspace"),
+    });
     await runStore.createRun({
       id: "wfr_child_background",
       workspaceId: "childworkspace",
@@ -12769,7 +12776,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus("wfr_child_background", "running", "2026-06-19T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir("childworkspace"),
+      workspaceSessionDir: path.join(config.sessionsDir, "childworkspace"),
       runId: "wfr_child_background",
       createdAtMs: Date.parse("2026-06-19T00:00:01.000Z"),
     });
@@ -14234,10 +14241,10 @@ describe("TaskService", () => {
       taskSettings: { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 },
     }));
 
-    await config.updateProjectSecrets(primaryProjectPath, [
+    await new SecretsStore(config.rootDir).updateProjectSecrets(primaryProjectPath, [
       { key: "PRIMARY_SECRET", value: "primary-secret" },
     ]);
-    await config.updateProjectSecrets(secondaryProjectPath, [
+    await new SecretsStore(config.rootDir).updateProjectSecrets(secondaryProjectPath, [
       { key: "SECONDARY_SECRET", value: "secondary-secret" },
     ]);
 
@@ -14875,7 +14882,8 @@ describe("TaskService", () => {
     );
 
     const queuedInitStatusPath = path.join(
-      config.getSessionDir(queued.data.taskId),
+      config.sessionsDir,
+      queued.data.taskId,
       "init-status.json"
     );
     await fsPromises.stat(queuedInitStatusPath).then(
@@ -16435,7 +16443,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16452,7 +16462,7 @@ describe("TaskService", () => {
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
 
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: Date.now(),
     });
@@ -16644,7 +16654,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16660,7 +16672,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -16702,7 +16714,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16718,7 +16732,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -16763,7 +16777,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16779,7 +16795,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: 2_000,
     });
@@ -16822,7 +16838,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16899,7 +16917,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16980,7 +17000,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -16996,7 +17018,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -17038,7 +17060,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -17054,7 +17078,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -17117,7 +17141,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -17133,7 +17159,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -17188,7 +17214,9 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootWorkspaceId,
@@ -21997,7 +22025,7 @@ describe("TaskService", () => {
       targetTaskId,
       createMuxMessage("seed-1", "user", "target brief", { historySequence: 1 })
     );
-    const targetSessionDir = config.getSessionDir(targetTaskId);
+    const targetSessionDir = path.join(config.sessionsDir, targetTaskId);
     await fsPromises.access(targetSessionDir);
 
     // Stall the send between its config snapshot and the payload append by
@@ -22866,7 +22894,7 @@ describe("TaskService", () => {
     );
     await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
-      workspaceSessionDir: config.getSessionDir(parentWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
       updater: () => ({
         childTaskId,
@@ -22937,7 +22965,7 @@ describe("TaskService", () => {
     );
     await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
-      workspaceSessionDir: config.getSessionDir(parentWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
       updater: () => ({
         childTaskId,
@@ -22981,7 +23009,7 @@ describe("TaskService", () => {
 
     await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
-      workspaceSessionDir: config.getSessionDir(parentWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentWorkspaceId),
       childTaskId,
       updater: (existing) => {
         assert(existing, "pending artifact must exist");
@@ -23908,7 +23936,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: rootWorkspaceId,
-      workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+      workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
       childTaskId: removedWorkflowChildTaskId,
       parentWorkspaceId: workflowTaskId,
       ancestorWorkspaceIds: [workflowTaskId, rootWorkspaceId],
@@ -24447,7 +24475,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings(10, 3)
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -24463,7 +24491,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
     const innerRunStore = new WorkflowRunStore({
-      sessionDir: config.getSessionDir(runningChildId),
+      sessionDir: path.join(config.sessionsDir, runningChildId),
     });
     await innerRunStore.createRun({
       id: innerWorkflowRunId,
@@ -24528,7 +24556,9 @@ describe("TaskService", () => {
       ],
       testTaskSettings(10, 3)
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentTaskId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, parentTaskId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentTaskId,
@@ -24893,7 +24923,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings(10, 3)
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, rootId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootId,
@@ -24973,7 +25003,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings(10, 3)
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, rootId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootId,
@@ -25069,7 +25099,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings(1, 3)
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, rootId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: rootId,
@@ -25649,7 +25679,7 @@ describe("TaskService", () => {
     const planFilePath = path.join(rootDir, "plans", "repo", "child-222.md");
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25705,7 +25735,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25755,7 +25785,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25800,7 +25830,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25841,7 +25871,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25877,7 +25907,7 @@ describe("TaskService", () => {
     // no config entry, no report artifact — only the failure artifact remains.
     await upsertSubagentFailureArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: failedChildId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25886,7 +25916,7 @@ describe("TaskService", () => {
     });
     await upsertSubagentFailureArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: workflowChildId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -25956,7 +25986,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -26128,7 +26158,7 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(
-      await readSubagentReportArtifact(config.getSessionDir(rootWorkspaceId), parentTaskId)
+      await readSubagentReportArtifact(path.join(config.sessionsDir, rootWorkspaceId), parentTaskId)
     ).toBeNull();
     const ws = findWorkspaceInConfig(config, parentTaskId);
     expect(ws?.taskStatus).toBe("running");
@@ -26302,7 +26332,9 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentTaskId) });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, parentTaskId),
+    });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentTaskId,
@@ -26319,7 +26351,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-19T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(parentTaskId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentTaskId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -26723,7 +26755,7 @@ describe("TaskService", () => {
     );
 
     const reportArtifact = await readSubagentReportArtifact(
-      config.getSessionDir(parentId),
+      path.join(config.sessionsDir, parentId),
       childId
     );
     expect(reportArtifact?.reportMarkdown).toBe("Hello from child");
@@ -26945,7 +26977,7 @@ describe("TaskService", () => {
       title: string;
     }>;
   }): Promise<void> {
-    const parentSessionDir = params.config.getSessionDir(params.parentId);
+    const parentSessionDir = path.join(params.config.sessionsDir, params.parentId);
     for (const report of params.reports) {
       await upsertSubagentReportArtifact({
         workspaceId: params.parentId,
@@ -27716,7 +27748,7 @@ describe("TaskService", () => {
     const writeChildPartial = await partialService.writePartial(childId, childPartial);
     expect(writeChildPartial.success).toBe(true);
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     const patchPath = getSubagentGitPatchMboxPath(parentSessionDir, childId, "repo");
 
     const waiter = taskService.waitForAgentReport(childId, {
@@ -27896,7 +27928,7 @@ describe("TaskService", () => {
     );
     expect((await partialService.writePartial(childId, childPartial)).success).toBe(true);
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     const secondaryPatchPath = getSubagentGitPatchMboxPath(parentSessionDir, childId, "project-b");
 
     const waiter = taskService.waitForAgentReport(childId, {
@@ -28050,7 +28082,7 @@ describe("TaskService", () => {
     const writeChildPartial = await partialService.writePartial(childId, childPartial);
     expect(writeChildPartial.success).toBe(true);
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     const patchPath = getSubagentGitPatchMboxPath(parentSessionDir, childId, "repo");
 
     const waiter = taskService.waitForAgentReport(childId, {
@@ -28526,7 +28558,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(childId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, childId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: childId,
@@ -28542,7 +28574,7 @@ describe("TaskService", () => {
     });
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(childId),
+      workspaceSessionDir: path.join(config.sessionsDir, childId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -28609,7 +28641,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(childId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, childId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: childId,
@@ -28626,7 +28658,7 @@ describe("TaskService", () => {
     await runStore.appendStatus(workflowRunId, "running", "2026-06-04T00:00:01.000Z");
     await runStore.appendStatus(workflowRunId, "completed", "2026-06-04T00:00:02.000Z");
     await recordAgentWorkflowRunReference({
-      workspaceSessionDir: config.getSessionDir(childId),
+      workspaceSessionDir: path.join(config.sessionsDir, childId),
       runId: workflowRunId,
       createdAtMs: 1_000,
     });
@@ -28699,7 +28731,7 @@ describe("TaskService", () => {
         testTaskSettings()
       );
 
-      const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(childId) });
+      const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, childId) });
       await runStore.createRun({
         id: workflowRunId,
         workspaceId: childId,
@@ -28941,7 +28973,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29026,7 +29058,9 @@ describe("TaskService", () => {
     expect(sendMessage.mock.calls[0]?.[1]).toContain('"status": "in_progress"');
     expect(sendMessage.mock.calls[1]?.[1]).toContain("Found a second issue.");
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
-    expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
+    expect(
+      await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
+    ).toBeNull();
   });
 
   // The scan case uses "plan" so it cannot pass via the exec recovery fallback.
@@ -29283,7 +29317,10 @@ describe("TaskService", () => {
       expect(outputJson).not.toContain("fallback");
     }
 
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.reportMarkdown).toBe(
       "## Final answer\n\nImplicit report content from the child."
     );
@@ -29336,7 +29373,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29385,7 +29422,10 @@ describe("TaskService", () => {
     });
 
     expect(sendMessage).not.toHaveBeenCalled();
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.reportMarkdown).toBe("## Final answer\n\nFinal prose after an earlier update.");
     expect(report?.structuredOutput).toEqual({ claims: ["persisted"] });
   });
@@ -29424,7 +29464,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29467,7 +29507,10 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.reportMarkdown).toBe(
       "## Final answer\n\nThis prose is the final workflow summary."
     );
@@ -29503,7 +29546,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29566,7 +29609,9 @@ describe("TaskService", () => {
     });
 
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("awaiting_report");
-    expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
+    expect(
+      await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
+    ).toBeNull();
     expect(sendMessage).toHaveBeenCalledWith(
       childId,
       expect.stringContaining("First call agent_report"),
@@ -29604,7 +29649,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29655,7 +29700,9 @@ describe("TaskService", () => {
     });
 
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("awaiting_report");
-    expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
+    expect(
+      await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
+    ).toBeNull();
     expect(sendMessage).toHaveBeenCalledWith(
       childId,
       expect.stringContaining("First call agent_report"),
@@ -29693,7 +29740,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29744,7 +29791,10 @@ describe("TaskService", () => {
     });
 
     expect(sendMessage).not.toHaveBeenCalled();
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.reportMarkdown).toBe("Final summary after correcting structured output.");
     expect(report?.structuredOutput).toEqual({ claims: ["corrected"] });
   });
@@ -29778,7 +29828,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29844,7 +29894,9 @@ describe("TaskService", () => {
     });
 
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("awaiting_report");
-    expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
+    expect(
+      await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
+    ).toBeNull();
     expect(sendMessage).toHaveBeenCalledWith(
       childId,
       expect.stringContaining("First call agent_report"),
@@ -29887,7 +29939,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -29939,7 +29991,9 @@ describe("TaskService", () => {
       expect.objectContaining({ synthetic: true, agentInitiated: true })
     );
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("awaiting_report");
-    expect(await readSubagentReportArtifact(config.getSessionDir(parentId), childId)).toBeNull();
+    expect(
+      await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
+    ).toBeNull();
   });
 
   test("legacy workflow subagent with invalid old outputSchema can finalize markdown-only report", async () => {
@@ -29971,7 +30025,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -30018,7 +30072,10 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.reportMarkdown).toBe("Legacy report");
     expect(report?.structuredOutput).toBeUndefined();
   });
@@ -30050,7 +30107,7 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -30130,7 +30187,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -30178,7 +30235,10 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.structuredOutput).toEqual({
       code: "ABC",
       nullableNote: null,
@@ -30215,7 +30275,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -30261,7 +30321,10 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report?.reportMarkdown).toBe("Done");
     expect(report?.structuredOutput).toEqual({ reportMarkdown: "Done", title: null });
   });
@@ -30430,7 +30493,10 @@ describe("TaskService", () => {
       expect(toolPart?.output).toBeUndefined();
     }
 
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report).toBeNull();
     expect(remove).not.toHaveBeenCalled();
   });
@@ -30600,7 +30666,7 @@ describe("TaskService", () => {
     ] as const) {
       await upsertSubagentReportArtifact({
         workspaceId: parentId,
-        workspaceSessionDir: config.getSessionDir(parentId),
+        workspaceSessionDir: path.join(config.sessionsDir, parentId),
         childTaskId,
         parentWorkspaceId: parentId,
         ancestorWorkspaceIds: [parentId],
@@ -30710,7 +30776,7 @@ describe("TaskService", () => {
     );
     expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
@@ -30828,7 +30894,7 @@ describe("TaskService", () => {
     );
     expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
@@ -30970,7 +31036,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -31103,7 +31169,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -31190,7 +31256,7 @@ describe("TaskService", () => {
     ).toBe(true);
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -31275,7 +31341,7 @@ describe("TaskService", () => {
     ).toBe(true);
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -31369,7 +31435,7 @@ describe("TaskService", () => {
 
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childOneId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -31494,7 +31560,7 @@ describe("TaskService", () => {
     );
     expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
 
-    const parentSessionDir = config.getSessionDir(parentId);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
@@ -32065,7 +32131,7 @@ describe("TaskService", () => {
       });
     const parentId = findWorkspaceInConfig(config, childId)?.parentWorkspaceId;
     assert(parentId, "workflow-owned plan test requires a parent workspace id");
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
     await runStore.createRun({
       id: workflowRunId,
       workspaceId: parentId,
@@ -32301,7 +32367,10 @@ describe("TaskService", () => {
       expect.objectContaining({ synthetic: true, agentInitiated: true })
     );
 
-    const report = await readSubagentReportArtifact(config.getSessionDir(parentId), childId);
+    const report = await readSubagentReportArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(report).toBeNull();
 
     const postCfg = config.loadConfigOrDefault();
@@ -32451,7 +32520,10 @@ describe("TaskService", () => {
     expect(childWorkspace?.taskLaunchError).toBe(refusalMessage);
 
     // Durable failure artifact persisted in the parent's session dir.
-    const failure = await readSubagentFailureArtifact(config.getSessionDir(parentId), childId);
+    const failure = await readSubagentFailureArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(failure).not.toBeNull();
     expect(failure?.errorType).toBe("model_refusal");
     expect(failure?.errorMessage).toBe(refusalMessage);
@@ -32927,7 +32999,10 @@ describe("TaskService", () => {
     expect(childWorkspace?.taskLaunchError).toContain("empty_output");
 
     // The terminal failure is durable: artifact carries the discriminated errorType.
-    const failure = await readSubagentFailureArtifact(config.getSessionDir(parentId), childId);
+    const failure = await readSubagentFailureArtifact(
+      path.join(config.sessionsDir, parentId),
+      childId
+    );
     expect(failure?.errorType).toBe("task_recovery_limit");
 
     // Waiters observe the same descriptive failure instead of timing out.
@@ -33184,7 +33259,7 @@ describe("TaskService", () => {
     // monotonicity: a completed report must win over the failure.
     await upsertSubagentReportArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -33194,7 +33269,7 @@ describe("TaskService", () => {
     });
     await upsertSubagentFailureArtifact({
       workspaceId: parentId,
-      workspaceSessionDir: config.getSessionDir(parentId),
+      workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
       parentWorkspaceId: parentId,
       ancestorWorkspaceIds: [parentId],
@@ -33991,7 +34066,9 @@ describe("TaskService", () => {
         taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
       }));
 
-      const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(rootWorkspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, rootWorkspaceId),
+      });
       await runStore.createRun({
         id: firstRunId,
         workspaceId: rootWorkspaceId,
@@ -34007,7 +34084,7 @@ describe("TaskService", () => {
       });
       await runStore.appendStatus(firstRunId, "running", "2026-06-04T00:00:01.000Z");
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
         runId: firstRunId,
         createdAtMs: 1_000,
       });
@@ -34052,7 +34129,7 @@ describe("TaskService", () => {
       });
       await runStore.appendStatus(secondRunId, "running", "2026-06-04T00:00:04.000Z");
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(rootWorkspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, rootWorkspaceId),
         runId: secondRunId,
         createdAtMs: 3_000,
       });

@@ -28,7 +28,7 @@ export function resolveReplaySessionDir(workspaceId: string): {
     };
   }
   return {
-    sessionDir: defaultConfig.getSessionDir(workspaceId),
+    sessionDir: path.join(defaultConfig.sessionsDir, workspaceId),
     historyService: new HistoryService(defaultConfig),
   };
 }

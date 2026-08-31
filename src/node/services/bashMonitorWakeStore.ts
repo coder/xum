@@ -8,7 +8,7 @@ import { z } from "zod";
 import assert from "@/common/utils/assert";
 import { BASH_MONITOR_WAKE_HEADINGS } from "@/common/utils/machineTurnPrompts";
 import type { BashMonitorFailedOperation, MuxMessageMetadata } from "@/common/types/message";
-import type { Config } from "@/node/config";
+import type { WorkspaceSessionLocator } from "@/node/config";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -721,7 +721,7 @@ export class BashMonitorWakeStore {
   private readonly activeClearIds = new Set<string>();
 
   constructor(
-    private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">,
+    private readonly config: Pick<WorkspaceSessionLocator, "sessionsDir">,
     options?: { stagedClearRefreshIntervalMs?: number }
   ) {
     this.stagedClearRefreshIntervalMs =
@@ -841,7 +841,7 @@ export class BashMonitorWakeStore {
 
   private dir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "BashMonitorWakeStore requires ownerWorkspaceId");
-    return path.join(this.config.getSessionDir(ownerWorkspaceId), BASH_MONITOR_WAKE_DIR);
+    return path.join(this.config.sessionsDir, ownerWorkspaceId, BASH_MONITOR_WAKE_DIR);
   }
 
   /**

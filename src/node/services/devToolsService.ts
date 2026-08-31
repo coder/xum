@@ -1,6 +1,6 @@
+import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
-import * as path from "path";
 import assert from "@/common/utils/assert";
 import type {
   DevToolsEvent,
@@ -411,7 +411,7 @@ export class DevToolsService extends EventEmitter {
   }
 
   private getSessionFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), "devtools.jsonl");
+    return path.join(this.config.sessionsDir, workspaceId, "devtools.jsonl");
   }
 
   private getOrCreateWorkspaceData(workspaceId: string): WorkspaceData {
@@ -651,7 +651,7 @@ export class DevToolsService extends EventEmitter {
   ): Promise<void> {
     await withTargetMutationLock(
       this.config.rootDir,
-      this.config.getSessionDir(workspaceId),
+      path.join(this.config.sessionsDir, workspaceId),
       async () => {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
           log.debug("Skipping DevTools write for removed workspace", { workspaceId });

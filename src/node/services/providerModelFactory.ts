@@ -20,6 +20,7 @@ import {
 } from "@/common/constants/codexOAuth";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
+import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
@@ -1086,19 +1087,22 @@ export class ProviderModelFactory {
   private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
   private readonly oauthServices?: OauthServiceBindings;
+  private readonly providersConfigStore: ProvidersConfigStore;
 
   constructor(
     config: Config,
     providerService: ProviderService,
     policyService?: PolicyService,
     oauthServices?: OauthServiceBindings,
-    devToolsService?: DevToolsService
+    devToolsService?: DevToolsService,
+    providersConfigStore?: ProvidersConfigStore
   ) {
     this.config = config;
     this.providerService = providerService;
     this.policyService = policyService;
     this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
   }
 
   /**
@@ -1239,7 +1243,8 @@ export class ProviderModelFactory {
       // Load providers configuration - the ONLY source of truth. A caller's
       // snapshot (resolveAndCreateModel) wins so the created model matches
       // the wire/route identity that snapshot produced (see createModel).
-      const providersConfig = opts?.providersConfig ?? this.config.loadProvidersConfig() ?? {};
+      const providersConfig =
+        opts?.providersConfig ?? this.providersConfigStore.loadProvidersConfig() ?? {};
       const providerConfigEntry = providersConfig[providerName];
       const providerIsBuiltIn = isBuiltInProvider(providerName);
       const customProviderType = isCustomProviderConfig(providerConfigEntry)
@@ -2482,7 +2487,7 @@ export class ProviderModelFactory {
     // through the built-in machinery instead of the user's custom endpoint.
     // The equivalent guard in resolveGatewayModelString only protects callers
     // that pass raw strings.
-    const providersConfigForShadowCheck = this.config.loadProvidersConfig() ?? {};
+    const providersConfigForShadowCheck = this.providersConfigStore.loadProvidersConfig() ?? {};
     const [rawProviderName] = parseModelString(modelString);
     const rawPrefixShadowedByCustomProvider =
       rawProviderName.length > 0 &&
@@ -2767,7 +2772,8 @@ export class ProviderModelFactory {
     // resolveAndCreateModel passes its snapshot so route availability,
     // accessibility, the wire snapshot, and model creation all read one
     // providers.jsonc state (see createModel's providersConfig option).
-    const providersConfig = providersConfigSnapshot ?? this.config.loadProvidersConfig?.() ?? {};
+    const providersConfig =
+      providersConfigSnapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
     const isGatewayModelAccessible = createGatewayModelAccessibilityChecker(
       providersConfig,
       this.policyService
@@ -2829,7 +2835,8 @@ export class ProviderModelFactory {
 
     // Same single-snapshot rule as resolveModelRoute: callers holding one
     // providers.jsonc read pass it so routing cannot diverge from it.
-    const providersConfig = providersConfigSnapshot ?? this.config.loadProvidersConfig() ?? {};
+    const providersConfig =
+      providersConfigSnapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
 
     // Shadow check on the RAW prefix, BEFORE gateway canonicalization: a
     // custom provider can shadow a built-in gateway id

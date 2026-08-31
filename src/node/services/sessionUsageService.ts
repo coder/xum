@@ -1,5 +1,5 @@
-import * as fs from "fs/promises";
 import * as path from "path";
+import * as fs from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
@@ -139,7 +139,7 @@ export class SessionUsageService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.SESSION_USAGE_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, this.SESSION_USAGE_FILE);
   }
 
   private createEmptyUsageFile(): SessionUsageFile {
@@ -256,7 +256,7 @@ export class SessionUsageService {
       // exists.
       return await withTargetMutationLock(
         this.config.rootDir,
-        this.config.getSessionDir(workspaceId),
+        path.join(this.config.sessionsDir, workspaceId),
         async () => {
           if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
             log.debug("Skipping headless usage write for removed workspace", { workspaceId });

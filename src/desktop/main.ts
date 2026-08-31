@@ -638,7 +638,7 @@ async function loadServices(): Promise<void> {
   // - These are large modules (~100ms load time) that would block splash from appearing
   // - Loading happens once, then cached
   const [
-    { Config: ConfigClass },
+    { createConfigStores },
     { ServiceContainer: ServiceContainerClass },
     { TerminalWindowManager: TerminalWindowManagerClass },
   ] = await Promise.all([
@@ -647,9 +647,10 @@ async function loadServices(): Promise<void> {
     import("./terminalWindowManager"),
   ]);
   /* eslint-enable no-restricted-syntax */
-  config = new ConfigClass();
+  const stores = createConfigStores();
+  config = stores.config;
 
-  services = new ServiceContainerClass(config);
+  services = new ServiceContainerClass(stores);
   // Desktop bootstrap owns interactive host-key trust policy
   setOpenSSHHostKeyPolicyMode("strict");
   await services.initialize();

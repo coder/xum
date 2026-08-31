@@ -140,7 +140,11 @@ describe("MemoryService", () => {
       );
       expect(created.success).toBe(true);
 
-      const physical = path.join(fixture.config.getSessionDir("ws-42"), "memory", "scratch.md");
+      const physical = path.join(
+        path.join(fixture.config.sessionsDir, "ws-42"),
+        "memory",
+        "scratch.md"
+      );
       expect(await fsPromises.readFile(physical, "utf-8")).toBe("branch context");
     });
 
@@ -594,7 +598,7 @@ describe("MemoryService", () => {
       );
       expect(result).toEqual({ success: true, data: { sha256: sha("fresh") } });
       const onDisk = await fsPromises.readFile(
-        path.join(fixture.config.getSessionDir("ws-ui"), "memory", "notes.md"),
+        path.join(fixture.config.sessionsDir, "ws-ui", "memory", "notes.md"),
         "utf-8"
       );
       expect(onDisk).toBe("fresh");
@@ -1150,7 +1154,7 @@ describe("MemoryService refinement journal", () => {
   const WORKSPACE_ID = "ws-1";
 
   function sessionDirOf(fixture: MemoryFixture): string {
-    return fixture.config.getSessionDir(WORKSPACE_ID);
+    return path.join(fixture.config.sessionsDir, WORKSPACE_ID);
   }
 
   it("journals create with a delete inverse that round-trips", async () => {
@@ -1491,7 +1495,7 @@ describe("MemoryService refinement journal", () => {
   it("does not fail the mutation when the journal is unavailable", async () => {
     using fixture = await createFixture();
     // Occupy the session dir path with a FILE so journal appends cannot mkdir.
-    const brokenSessionDir = fixture.config.getSessionDir("ws-broken");
+    const brokenSessionDir = path.join(fixture.config.sessionsDir, "ws-broken");
     await fsPromises.mkdir(path.dirname(brokenSessionDir), { recursive: true });
     await fsPromises.writeFile(brokenSessionDir, "not a directory", "utf-8");
 

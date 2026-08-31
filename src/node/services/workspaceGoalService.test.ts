@@ -1,6 +1,6 @@
+import * as path from "path";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
-import * as path from "path";
 import type { Config } from "@/node/config";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceGoalService, type GoalContinuationRuntimeBridge } from "./workspaceGoalService";
@@ -78,7 +78,7 @@ const PROJECT_PATH = "/tmp/mux-goal-service-test-project";
 
 async function goalFileExists(config: Config, workspaceId: string): Promise<boolean> {
   try {
-    await fs.access(path.join(config.getSessionDir(workspaceId), "goal.json"));
+    await fs.access(path.join(config.sessionsDir, workspaceId, "goal.json"));
     return true;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -254,7 +254,7 @@ describe("WorkspaceGoalService", () => {
 
     // Simulate a partially-written line from a prior crash. The board reader
     // must skip it instead of throwing.
-    const historyPath = path.join(config.getSessionDir(workspaceId), "goal-history.jsonl");
+    const historyPath = path.join(config.sessionsDir, workspaceId, "goal-history.jsonl");
     await fs.appendFile(historyPath, "{not-json}\n", "utf-8");
 
     const completed = (await service.getGoalBoard(workspaceId)).entries.filter(
@@ -476,7 +476,7 @@ describe("WorkspaceGoalService", () => {
         status: "paused",
         initiator: "user",
       });
-      const goalPath = path.join(config.getSessionDir(workspaceId), "goal.json");
+      const goalPath = path.join(config.sessionsDir, workspaceId, "goal.json");
       await waitForCondition(async () => {
         try {
           const raw = JSON.parse(await fs.readFile(goalPath, "utf-8")) as { status?: string };
@@ -1454,7 +1454,7 @@ describe("WorkspaceGoalService", () => {
       budgetCents: 100,
     });
     await fs.writeFile(
-      path.join(config.getSessionDir(workspaceId), "goal.json"),
+      path.join(config.sessionsDir, workspaceId, "goal.json"),
       JSON.stringify({ ...legacy, status: "budget_limited", budgetCents: 0 })
     );
 
@@ -1644,7 +1644,7 @@ describe("WorkspaceGoalService", () => {
   test("preserves goal id and accounting for same-objective set", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Same objective" });
     await fs.writeFile(
-      path.join(config.getSessionDir(workspaceId), "goal.json"),
+      path.join(config.sessionsDir, workspaceId, "goal.json"),
       JSON.stringify({ ...created, costCents: 123, turnsUsed: 4 })
     );
 
@@ -1662,7 +1662,7 @@ describe("WorkspaceGoalService", () => {
   test("replaces different objective with a new goal id and reset accounting", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "First objective" });
     await fs.writeFile(
-      path.join(config.getSessionDir(workspaceId), "goal.json"),
+      path.join(config.sessionsDir, workspaceId, "goal.json"),
       JSON.stringify({ ...created, costCents: 123, turnsUsed: 4 })
     );
 
@@ -1842,7 +1842,7 @@ describe("WorkspaceGoalService", () => {
         requireUserAcknowledgmentSinceMs: parent.createdAtMs + 1,
       };
       await fs.writeFile(
-        path.join(config.getSessionDir(workspaceId), "goal.json"),
+        path.join(config.sessionsDir, workspaceId, "goal.json"),
         `${JSON.stringify(parentWithAccounting, null, 2)}\n`
       );
 
@@ -1892,7 +1892,7 @@ describe("WorkspaceGoalService", () => {
   });
 
   test("renames corrupt goal file and treats workspace as having no goal", async () => {
-    const sessionDir = config.getSessionDir(workspaceId);
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
     await fs.mkdir(sessionDir, { recursive: true });
     await fs.writeFile(path.join(sessionDir, "goal.json"), "{ not json");
 
@@ -4877,7 +4877,7 @@ describe("WorkspaceGoalService", () => {
   test("attributes child report cost once and persists the per-goal ledger", async () => {
     await setGoalOk(service, { workspaceId, objective: "Account for child reports" });
     await fs.writeFile(
-      path.join(config.getSessionDir(workspaceId), "session-usage.json"),
+      path.join(config.sessionsDir, workspaceId, "session-usage.json"),
       JSON.stringify({ version: 1, byModel: {}, rolledUpFrom: { "child-a": true } }, null, 2)
     );
 
@@ -4906,12 +4906,12 @@ describe("WorkspaceGoalService", () => {
     });
 
     const goalOnDisk = JSON.parse(
-      await fs.readFile(path.join(config.getSessionDir(workspaceId), "goal.json"), "utf-8")
+      await fs.readFile(path.join(config.sessionsDir, workspaceId, "goal.json"), "utf-8")
     ) as GoalRecordV1;
     expect(goalOnDisk.attributedChildren).toEqual(["child-a"]);
 
     const sessionUsageOnDisk = JSON.parse(
-      await fs.readFile(path.join(config.getSessionDir(workspaceId), "session-usage.json"), "utf-8")
+      await fs.readFile(path.join(config.sessionsDir, workspaceId, "session-usage.json"), "utf-8")
     ) as { rolledUpFrom?: Record<string, unknown> };
     expect(sessionUsageOnDisk.rolledUpFrom).toEqual({ "child-a": true });
   });

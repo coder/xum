@@ -162,7 +162,9 @@ describe("WorkflowService request orchestration", () => {
     workspaceService.waitForWorkspaceIdle = mock(
       () => new Promise<void>((resolve) => (releaseIdle = resolve))
     );
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
 
     const start = startWorkflowRun(context, {
       workspaceId: "workspace-1",
@@ -237,7 +239,9 @@ describe("WorkflowService request orchestration", () => {
   });
 
   test("crash-resumed background runs note terminal attention on settle", async () => {
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
     await runStore.createRun({
       id: "wfr_crash_wake",
       workspaceId: "workspace-1",
@@ -271,7 +275,9 @@ describe("WorkflowService request orchestration", () => {
   });
 
   test("resuming a run clears the stale downgrade settlement marker", async () => {
-    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
     await runStore.createRun({
       id: "wfr_resume_compat",
       workspaceId: "workspace-1",

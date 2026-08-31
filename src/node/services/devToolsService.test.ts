@@ -1,6 +1,6 @@
+import * as path from "path";
 import { describe, expect, it } from "bun:test";
 import * as fs from "fs/promises";
-import * as path from "path";
 import { Config } from "@/node/config";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { workspaceRemovalTombstonePath } from "@/node/services/workspaceRemoval";
@@ -23,7 +23,7 @@ describe("DevToolsService removal gate (r64)", () => {
       workspaceId: liveId,
       startedAt: new Date().toISOString(),
     });
-    const liveFile = path.join(config.getSessionDir(liveId), "devtools.jsonl");
+    const liveFile = path.join(config.sessionsDir, liveId, "devtools.jsonl");
     expect(await fs.readFile(liveFile, "utf8")).toContain("run-1");
 
     // Removal-tombstoned workspace: with XUM_ALLOW_MULTIPLE_INSTANCES=1 a
@@ -43,7 +43,7 @@ describe("DevToolsService removal gate (r64)", () => {
       workspaceId: removedId,
       startedAt: new Date().toISOString(),
     });
-    const removedSessionDirExists = await fs.stat(config.getSessionDir(removedId)).then(
+    const removedSessionDirExists = await fs.stat(path.join(config.sessionsDir, removedId)).then(
       () => true,
       () => false
     );

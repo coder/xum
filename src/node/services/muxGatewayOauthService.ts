@@ -8,7 +8,7 @@ import {
   MUX_GATEWAY_ORIGIN,
   MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
 } from "@/common/constants/muxGatewayOAuth";
-import type { Config } from "@/node/config";
+import type { ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import type { WindowService } from "@/node/services/windowService";
@@ -31,7 +31,7 @@ export class MuxGatewayOauthService {
   private readonly serverFlows = new Map<string, ServerFlow>();
 
   constructor(
-    private readonly config: Pick<Config, "loadProvidersConfig">,
+    private readonly providersConfigStore: Pick<ProvidersConfigStore, "loadProvidersConfig">,
     private readonly providerService: ProviderService,
     private readonly windowService?: WindowService
   ) {}
@@ -45,7 +45,7 @@ export class MuxGatewayOauthService {
       string
     >
   > {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const muxConfig = (providersConfig["mux-gateway"] ?? {}) as Record<string, unknown>;
     const creds = resolveProviderCredentials("mux-gateway", {
       couponCode: typeof muxConfig.couponCode === "string" ? muxConfig.couponCode : undefined,

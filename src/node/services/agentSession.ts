@@ -1,13 +1,13 @@
+import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
-import * as path from "path";
 import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
-import type { Config } from "@/node/config";
+import { ProvidersConfigStore, type Config } from "@/node/config";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { StreamMessageOptions } from "@/node/services/turnRequestBuilder";
 import type { HistoryService } from "@/node/services/historyService";
@@ -927,7 +927,7 @@ export class AgentSession {
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
       historyService: this.historyService,
-      sessionDir: this.config.getSessionDir(this.workspaceId),
+      sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       telemetryService,
       emitter: this.emitter,
       onCompactionComplete: (metadata) => {
@@ -1349,7 +1349,10 @@ export class AgentSession {
   }
 
   private getAutoRetryPreferencePath(): string {
-    return path.join(this.config.getSessionDir(this.workspaceId), AUTO_RETRY_PREFERENCE_FILE);
+    return path.join(
+      path.join(this.config.sessionsDir, this.workspaceId),
+      AUTO_RETRY_PREFERENCE_FILE
+    );
   }
 
   setLegacyAutoRetryEnabledHint(enabled: boolean): void {
@@ -3343,7 +3346,7 @@ export class AgentSession {
       this.workspaceId,
       // Session dir enables the cross-process pending-marker wait (r48): a
       // fork registered in another backend has no entry in this process.
-      this.config.getSessionDir(this.workspaceId)
+      path.join(this.config.sessionsDir, this.workspaceId)
     );
     // Workspace removal disposes the session and cancels the summary writer
     // while this send is parked on the await above; every append between here
@@ -4300,17 +4303,8 @@ export class AgentSession {
         return maybeAIService.getProvidersConfig();
       }
 
-      // Some unit tests provide minimal service mocks; fall back to raw config so custom
-      // provider model context overrides still work in those environments.
-      const maybeConfig = this.config as Config & {
-        loadProvidersConfig?: () => ProvidersConfigMap | null;
-      };
-      if (typeof maybeConfig.loadProvidersConfig !== "function") {
-        return null;
-      }
-
-      // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-      return maybeConfig.loadProvidersConfig() as unknown as ProvidersConfigMap | null;
+      const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
+      return providersConfig as ProvidersConfigMap | null;
     } catch {
       // Best-effort read: if config cannot be loaded, keep null and rely on
       // built-in model limits. This matches prior behavior without crashing.
@@ -7679,7 +7673,7 @@ export class AgentSession {
     // Host-side disk read (session dir), independent of workspace metadata/runtime.
     const completedReportsAttachment = await AttachmentService.generateCompletedReportsAttachment({
       workspaceId: this.workspaceId,
-      sessionDir: this.config.getSessionDir(this.workspaceId),
+      sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       completedBeforeMs: context.reportsCompletedBeforeMs,
     });
 
@@ -8127,7 +8121,7 @@ export class AgentSession {
    */
   private async loadExcludedItems(): Promise<Set<string>> {
     const exclusionsPath = path.join(
-      this.config.getSessionDir(this.workspaceId),
+      path.join(this.config.sessionsDir, this.workspaceId),
       "exclusions.json"
     );
     try {
@@ -8167,7 +8161,7 @@ export class AgentSession {
       return null;
     }
 
-    const todoPath = path.join(this.config.getSessionDir(this.workspaceId), "todos.json");
+    const todoPath = path.join(this.config.sessionsDir, this.workspaceId, "todos.json");
 
     try {
       const data = await readFile(todoPath, "utf-8");

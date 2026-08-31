@@ -22,7 +22,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
-import type { Config } from "@/node/config";
+import type { Config, SecretsStore } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
@@ -179,6 +179,9 @@ const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
 };
 
 type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
+type MockWorkspaceConfig = Partial<Config> & {
+  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
+};
 
 function createMockAIService(overrides: Partial<AIService> = {}): AIService {
   return {
@@ -190,7 +193,9 @@ function createMockAIService(overrides: Partial<AIService> = {}): AIService {
 }
 
 function createWorkspaceServiceForTest(options: {
-  config: Partial<Config> | Config;
+  config:
+    | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
+    | Config;
   historyService?: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
@@ -202,6 +207,7 @@ function createWorkspaceServiceForTest(options: {
   experimentsService?: WorkspaceServiceArgs[9];
   sessionTimingService?: WorkspaceServiceArgs[10];
   streamManager?: WorkspaceServiceArgs[11];
+  secretsStore?: WorkspaceServiceArgs[12];
 }): WorkspaceService {
   // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -218,7 +224,8 @@ function createWorkspaceServiceForTest(options: {
     options.telemetryService,
     options.experimentsService,
     options.sessionTimingService,
-    options.streamManager
+    options.streamManager,
+    options.secretsStore
   );
 }
 
@@ -886,7 +893,8 @@ describe("WorkspaceService bash monitor wakes", () => {
       // durably (otherwise the staged-clear grace scan would eventually roll the
       // staging back and resurrect the retired wakes).
       const tombPath = path.join(
-        config.getSessionDir(workspaceId),
+        config.sessionsDir,
+        workspaceId,
         "bash-monitor-wakes",
         "cleared-at"
       );
@@ -971,7 +979,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       // fires; the retried commitClear's tombstone mutation must not mkdir the
       // session directory back into existence for a removed workspace.
       await config.removeWorkspace(workspaceId);
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fsPromises.rm(sessionDir, { recursive: true, force: true });
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       expect(existsSync(sessionDir)).toBe(false);
@@ -1048,7 +1056,8 @@ describe("WorkspaceService bash monitor wakes", () => {
       // The refused clear touched nothing: no retirement, no staged tombstone.
       expect((await wakeStore.get(workspaceId, "proc-removal-race"))?.status).toBe("pending");
       const tombPath = path.join(
-        config.getSessionDir(workspaceId),
+        config.sessionsDir,
+        workspaceId,
         "bash-monitor-wakes",
         "cleared-at"
       );
@@ -2303,7 +2312,8 @@ describe("WorkspaceService bash monitor wakes", () => {
       });
       const gen2Start = Date.now() - 1_000;
       const recordFile = path.join(
-        config.getSessionDir(workspaceId),
+        config.sessionsDir,
+        workspaceId,
         "bash-monitor-wakes",
         "proc-gen.json"
       );
@@ -2385,7 +2395,8 @@ describe("WorkspaceService bash monitor wakes", () => {
         terminal: { status: "exited", exitCode: 1 },
       });
       const recordFile = path.join(
-        config.getSessionDir(workspaceId),
+        config.sessionsDir,
+        workspaceId,
         "bash-monitor-wakes",
         "proc-nan.json"
       );
@@ -5533,7 +5544,9 @@ describe("WorkspaceService workflow activity", () => {
         historyService,
         extensionMetadata,
       });
-      const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(workspaceId) });
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, workspaceId),
+      });
       const definition = {
         name: "demo",
         description: "Demo workflow",
@@ -5983,13 +5996,14 @@ describe("WorkspaceService activity list scoping", () => {
         path.join(config.rootDir, "config.json"),
         JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]] })
       );
-      const basenameSessionDir = config.getSessionDir("old-ws");
+      const basenameSessionDir = path.join(config.sessionsDir, "old-ws");
       await fsPromises.mkdir(basenameSessionDir, { recursive: true });
       await fsPromises.writeFile(
         path.join(basenameSessionDir, "metadata.json"),
         JSON.stringify({ id: "basename-stable-id", name: "old-ws" })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -6234,7 +6248,7 @@ describe("WorkspaceService activity list scoping", () => {
         })
       );
       const legacyStableId = "legacy-stable-mid-enum";
-      const legacySessionDir = config.getSessionDir("legacy-ws");
+      const legacySessionDir = path.join(config.sessionsDir, "legacy-ws");
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
       await fsPromises.writeFile(
         path.join(legacySessionDir, "metadata.json"),
@@ -7027,7 +7041,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7072,7 +7087,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7231,7 +7247,7 @@ describe("WorkspaceService activity list scoping", () => {
             });
             await extensionMetadata.updateRecency(workspaceId, 888);
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(workspaceId),
+              sessionDir: path.join(config.sessionsDir, workspaceId),
             });
             await runStore.createRun({
               id: "wfr_midlist",
@@ -7296,7 +7312,8 @@ describe("WorkspaceService activity list scoping", () => {
                 projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
               })
             );
-            const legacySessionDir = config.getSessionDir(
+            const legacySessionDir = path.join(
+              config.sessionsDir,
               config.generateLegacyId(projectPath, workspacePath)
             );
             await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7354,7 +7371,7 @@ describe("WorkspaceService activity list scoping", () => {
               runtimeConfig: { type: "local" },
             });
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(workspaceId),
+              sessionDir: path.join(config.sessionsDir, workspaceId),
             });
             await runStore.createRun({
               id: "wfr_workflow_only",
@@ -7524,7 +7541,7 @@ describe("WorkspaceService activity list scoping", () => {
               runtimeConfig: { type: "local" },
             });
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(workspaceId),
+              sessionDir: path.join(config.sessionsDir, workspaceId),
             });
             await runStore.createRun({
               id: "wfr_reread_fail",
@@ -7591,7 +7608,8 @@ describe("WorkspaceService activity list scoping", () => {
                 projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
               })
             );
-            const legacySessionDir = config.getSessionDir(
+            const legacySessionDir = path.join(
+              config.sessionsDir,
               config.generateLegacyId(projectPath, workspacePath)
             );
             await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7600,7 +7618,7 @@ describe("WorkspaceService activity list scoping", () => {
               JSON.stringify({ id: stableId, name: "legacy-ws" })
             );
             const runStore = new WorkflowRunStore({
-              sessionDir: config.getSessionDir(stableId),
+              sessionDir: path.join(config.sessionsDir, stableId),
             });
             await runStore.createRun({
               id: "wfr_legacy_only",
@@ -7664,7 +7682,8 @@ describe("WorkspaceService activity list scoping", () => {
                 projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
               })
             );
-            const legacySessionDir = config.getSessionDir(
+            const legacySessionDir = path.join(
+              config.sessionsDir,
               config.generateLegacyId(projectPath, workspacePath)
             );
             await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7913,7 +7932,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -7982,7 +8002,8 @@ describe("WorkspaceService activity list scoping", () => {
           projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
         })
       );
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -8368,7 +8389,8 @@ describe("WorkspaceService activity list scoping", () => {
         })
       );
       // Corrupt the metadata.json holding that entry's stable id.
-      const legacySessionDir = config.getSessionDir(
+      const legacySessionDir = path.join(
+        config.sessionsDir,
         config.generateLegacyId(projectPath, workspacePath)
       );
       await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -8411,7 +8433,8 @@ describe("WorkspaceService activity list scoping", () => {
             projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
           })
         );
-        const legacySessionDir = config.getSessionDir(
+        const legacySessionDir = path.join(
+          config.sessionsDir,
           config.generateLegacyId(projectPath, workspacePath)
         );
         await fsPromises.mkdir(legacySessionDir, { recursive: true });
@@ -8479,10 +8502,10 @@ describe("WorkspaceService activity list scoping", () => {
         ...mockExtensionMetadataService,
         deleteWorkspace,
       } as unknown as ExtensionMetadataService;
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
+        sessionsDir: sessionRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -8813,7 +8836,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: "manual-user",
@@ -8832,7 +8855,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // A kernel workflow_resume re-records the reference after the supersession and
       // re-establishes provenance (latest record wins).
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_250,
         afterBoundaryMessageId: "manual-user-2",
@@ -8857,7 +8880,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // A kernel background resume issued after the delivered result re-records the reference,
       // so the retried run's next terminal wake must count as current again.
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_350,
         afterBoundaryMessageId: "workflow-result",
@@ -8901,7 +8924,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // and leaves the sidecar intact; the surviving reference must not inject a workflow
       // result into the freshly cleared conversation.
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: "manual-user",
@@ -8947,7 +8970,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // verified-empty snapshot (null). History still having no decision row means the launch
       // context is unchanged, so the wake must deliver.
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -8957,7 +8980,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // A reference without a verified snapshot cannot claim the empty history as its launch
       // context; it may merely have survived a full clear.
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId: legacyRunId,
         createdAtMs: 1_150,
       });
@@ -9009,7 +9032,7 @@ describe("WorkspaceService workflow invocation events", () => {
 
       // Launched from a decision-free history: the verified-empty snapshot delivers.
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9065,7 +9088,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9129,7 +9152,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9168,7 +9191,7 @@ describe("WorkspaceService workflow invocation events", () => {
       const retryResult = await workspaceService.truncateHistory(workspaceId, 1.0);
       expect(retryResult.success).toBe(true);
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9205,7 +9228,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9224,7 +9247,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(truncateResult.success).toBe(true);
       expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9261,7 +9284,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9296,7 +9319,7 @@ describe("WorkspaceService workflow invocation events", () => {
         expect(history.data).toHaveLength(1);
       }
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9333,7 +9356,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9365,7 +9388,7 @@ describe("WorkspaceService workflow invocation events", () => {
         expect(history.data).toHaveLength(1);
       }
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(true);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9402,7 +9425,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9443,7 +9466,7 @@ describe("WorkspaceService workflow invocation events", () => {
         expect(history.data).toHaveLength(6);
       }
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9480,7 +9503,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9505,7 +9528,7 @@ describe("WorkspaceService workflow invocation events", () => {
         expect(history.data).toHaveLength(1);
       }
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9542,7 +9565,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9621,7 +9644,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9639,7 +9662,7 @@ describe("WorkspaceService workflow invocation events", () => {
       );
       expect(replaceResult.success).toBe(true);
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9676,7 +9699,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9701,7 +9724,7 @@ describe("WorkspaceService workflow invocation events", () => {
         expect(history.data).toHaveLength(2);
       }
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(true);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9738,7 +9761,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9770,7 +9793,7 @@ describe("WorkspaceService workflow invocation events", () => {
         expect(history.data).toHaveLength(1);
       }
       expect(
-        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+        existsSync(path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json"))
       ).toBe(true);
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -9807,7 +9830,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
 
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: null,
@@ -9896,7 +9919,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // relative to every later history row; identity comparison must still deliver the wake.
       const skewedCreatedAtMs = Date.now() + 30 * 60_000;
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: skewedCreatedAtMs,
         afterBoundaryMessageId: "manual-user",
@@ -9954,7 +9977,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // failure) cannot be ordered against the decision row by identity: the wake fails quiet
       // (not_current) rather than delivering or deferring forever.
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
       });
@@ -10014,7 +10037,7 @@ describe("WorkspaceService workflow invocation events", () => {
         createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
       );
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: "manual-user",
@@ -10086,7 +10109,7 @@ describe("WorkspaceService workflow invocation events", () => {
         createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
       );
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: "manual-user",
@@ -10096,7 +10119,7 @@ describe("WorkspaceService workflow invocation events", () => {
       // The sidecar is the only invocation evidence for kernel-launched runs: an unreadable
       // file must read as "cannot know right now", not "no reference", or the drain would
       // settle the wake as superseded on a transient storage fault.
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
+      const sidecarPath = path.join(config.sessionsDir, workspaceId, "agent-workflow-runs.json");
       await fsPromises.rm(sidecarPath);
       await fsPromises.mkdir(sidecarPath);
       try {
@@ -10108,7 +10131,7 @@ describe("WorkspaceService workflow invocation events", () => {
         await fsPromises.rmdir(sidecarPath);
       }
       await recordAgentWorkflowRunReference({
-        workspaceSessionDir: config.getSessionDir(workspaceId),
+        workspaceSessionDir: path.join(config.sessionsDir, workspaceId),
         runId,
         createdAtMs: 1_150,
         afterBoundaryMessageId: "manual-user",
@@ -11276,7 +11299,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         workspaceId,
         createMuxMessage("pre-reset-user", "user", "before reset", {})
       );
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fsPromises.mkdir(sessionDir, { recursive: true });
       const pendingStatePath = path.join(sessionDir, "post-compaction.json");
       await fsPromises.writeFile(
@@ -11327,7 +11350,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       // Deterministic unlink failure: a DIRECTORY at the pending-state path
       // fails unlink with EISDIR (read errors are swallowed at load, so this
       // models exactly the stale-undeletable-file case).
-      const pendingStatePath = path.join(config.getSessionDir(workspaceId), "post-compaction.json");
+      const pendingStatePath = path.join(config.sessionsDir, workspaceId, "post-compaction.json");
       await fsPromises.mkdir(pendingStatePath, { recursive: true });
 
       const result = await workspaceService.resetContext(workspaceId);
@@ -12617,6 +12640,7 @@ describe("WorkspaceService initialize", () => {
       config,
       aiService,
       initStateManager: mockInitStateManager as InitStateManager,
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
   });
 
@@ -12916,9 +12940,9 @@ describe("WorkspaceService rename lock", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -13024,9 +13048,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => ({
         workspacePath: "/tmp/test/workspace",
@@ -14128,9 +14152,9 @@ describe("WorkspaceService idle compaction dispatch", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -14662,9 +14686,9 @@ describe("WorkspaceService streaming generation guard", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock((workspaceId: string) => `/tmp/test/sessions/${workspaceId}`),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -14981,12 +15005,11 @@ describe("WorkspaceService executeBash archive guards", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
-      getProjectSecrets: mock(() => []),
     };
     const mockInitStateManager: Partial<InitStateManager> = {
       on: mock(() => undefined as unknown as InitStateManager),
@@ -15133,7 +15156,7 @@ describe("WorkspaceService executeBash archive guards", () => {
     const service = createWorkspaceServiceForTest({
       config: {
         srcDir: "/tmp/test",
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
         getAllWorkspaceMetadata: mock(() => metadataGate),
       } as unknown as Config,
@@ -15170,7 +15193,6 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
   let waitForInitMock: ReturnType<typeof mock>;
   let getWorkspaceMetadataMock: ReturnType<typeof mock>;
   let findWorkspaceMock: ReturnType<typeof mock>;
-  let getEffectiveSecretsMock: ReturnType<typeof mock>;
   let createRuntimeSpy: Mock<typeof runtimeFactory.createRuntime>;
   let createBashToolSpy: Mock<typeof bashToolModule.createBashTool>;
   let historyService: HistoryService;
@@ -15183,7 +15205,6 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
       projectPath: "/tmp/proj",
       workspaceName: "ws",
     }));
-    getEffectiveSecretsMock = mock(() => []);
     getWorkspaceMetadataMock = mock(() =>
       Promise.resolve(
         Ok({
@@ -15210,12 +15231,11 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: findWorkspaceMock,
-      getEffectiveSecrets: getEffectiveSecretsMock,
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
     const mockInitStateManager: Partial<InitStateManager> = {
@@ -15228,6 +15248,7 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
       historyService,
       aiService,
       initStateManager: mockInitStateManager as InitStateManager,
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
 
     createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
@@ -15344,9 +15365,9 @@ describe("WorkspaceService getFileCompletions", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -15629,9 +15650,9 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       },
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -15881,9 +15902,9 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -16018,9 +16039,9 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
 
     const workspacePath = "/tmp/proj/ws";
     const projectPath = "/tmp/proj";
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((workspaceId: string) =>
         workspaceId === "ws" ? { projectPath, workspacePath } : null
@@ -16255,7 +16276,7 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
     return new WorkspaceService(
       {
         srcDir: "/tmp/test",
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         generateStableId: mock(() => "test-id"),
         findWorkspace: mock(() => null),
       } as unknown as Config,
@@ -16749,10 +16770,10 @@ describe("WorkspaceService remove timing rollup", () => {
       }
 
       const aiService = new FakeAIService() as unknown as AIService;
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
+        sessionsDir: sessionRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -16802,7 +16823,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       // <rootDir>/locks, which must not leak across tests or runs.
       rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
-      getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
+      sessionsDir: path.join(tmpdir(), "mux-shared-guard"),
       removeWorkspace: mock(() => Promise.resolve()),
       findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
       loadConfigOrDefault: mock(() => ({
@@ -16894,7 +16915,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     return {
       rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
-      getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
+      sessionsDir: path.join(tmpdir(), "mux-shared-guard"),
       removeWorkspace: mock(() => Promise.resolve()),
       findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
       loadConfigOrDefault: mock(() => ({
@@ -17038,12 +17059,12 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
       // r63: removal serializes session-dir deletion with the memory target
       // locks and removal tombstones under `<rootDir>/locks`.
       rootDir: tempRoot,
-      getSessionDir: mock((id: string) => path.join(tempRoot, "sessions", id)),
+      sessionsDir: path.join(tempRoot, "sessions"),
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -17166,13 +17187,16 @@ describe("WorkspaceService metadata listeners", () => {
     }
 
     const aiService = new FakeAIService() as unknown as AIService;
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = { setStreaming };
+    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
+      isWorkspaceDeleted: mock(() => false),
+      setStreaming,
+    };
 
     new WorkspaceService(
       mockConfig as Config,
@@ -17226,13 +17250,16 @@ describe("WorkspaceService metadata listeners", () => {
     }
 
     const aiService = new FakeAIService() as unknown as AIService;
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = { setTodoStatus };
+    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
+      isWorkspaceDeleted: mock(() => false),
+      setTodoStatus,
+    };
 
     new WorkspaceService(
       mockConfig as Config,
@@ -17256,7 +17283,9 @@ describe("WorkspaceService metadata listeners", () => {
 
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(readTodosSpy).toHaveBeenCalledWith("/tmp/test/sessions");
+      expect(readTodosSpy).toHaveBeenCalledWith(
+        path.join(mockConfig.sessionsDir ?? "", workspaceId)
+      );
       expect(setTodoStatus).toHaveBeenCalledWith(
         workspaceId,
         { emoji: "🔄", message: "Run typecheck" },
@@ -17311,9 +17340,9 @@ describe("WorkspaceService setPinned", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock((id: string) => {
         const entry = getEntry(id);
         if (!entry) return null;
@@ -17532,9 +17561,9 @@ describe("WorkspaceService reorderPinned", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock((id: string) => {
         const entry = getEntry(id);
         if (!entry) return null;
@@ -17680,6 +17709,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   const workspaceId = "ws-archive";
   const projectPath = "/tmp/project";
   const workspacePath = "/tmp/project/ws-archive";
+  const sessionsDir = "/tmp/test/sessions";
+  const externalEditorMarkerPath = path.join(sessionsDir, workspaceId, "external-editor-opened");
 
   let workspaceService: WorkspaceService;
   let mockAIService: AIService;
@@ -17721,9 +17752,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir,
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -18029,7 +18060,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("acquirePreInterruptionArchiveHold validates and arms the gate before turn interruption", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // In-flight user activity must refuse BEFORE the caller destroys delegated turns: the
     // sink's own gate runs only after interruption, when the turns are already lost.
@@ -18087,7 +18118,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // Released (e.g. the archive failed): admissions flow again.
     const allowed = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold-2");
     expect(allowed.success).toBe(true);
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("acquirePreInterruptionArchiveHold binds the stream exemption to the delegated turns", () => {
@@ -18229,7 +18260,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("recordExternalEditorOpen refuses while the workspace is being archived", async () => {
     // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
     addToArchivingWorkspaces(workspaceService, workspaceId);
 
     const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-refused");
@@ -18244,7 +18275,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("recordExternalEditorOpen rejects workspace IDs without a config entry", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Unknown IDs never reach the marker path (which joins the raw ID beneath the sessions
     // directory), closing both stale-ID requests and traversal-crafted IDs.
@@ -18256,7 +18287,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     }
     let markerExists = true;
     try {
-      await fsPromises.access("/tmp/test/sessions/external-editor-opened");
+      await fsPromises.access(externalEditorMarkerPath);
     } catch {
       markerExists = false;
     }
@@ -18267,7 +18298,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("recordExternalEditorOpen marks the workspace as having an untrackable app open", async () => {
     // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
 
     const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-marks");
@@ -18276,11 +18307,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     // The durable marker outlives this test run; remove it so "not yet opened" assertions in
     // future runs (this fixture shares one session dir) stay deterministic.
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("recordExternalEditorOpenForLaunch rolls back a freshly created marker after a failed launch", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     expect(admitted.success).toBe(true);
@@ -18295,7 +18326,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("rollbackAfterFailedLaunch removes the marker when every open in a concurrent batch fails", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Two first-time recordings overlap in flight: the second sees the marker written by the
     // first, but that in-flight marker must not masquerade as evidence of a real prior
@@ -18316,7 +18347,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("rollbackRecordedEditorOpen redeems a renderer launch token", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Client-generated token: the renderer knows it even when the recording response is
     // lost, so an ambiguous outcome can still be reconciled.
@@ -18342,7 +18373,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("rollbackRecordedEditorOpen tombstones a token whose recording is still in flight", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // The renderer saw its recording RPC reject at the transport while the backend handler
     // was still persisting the marker, and rolled back immediately. The not-yet-registered
@@ -18364,7 +18395,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("a failed marker persistence does not leave stale ancestry for the next attempt", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Same filesystem hiccup hits both the probe (EACCES -> fail-closed "unknown", so the
     // batch records markerPreexisted: true) and the write. The failed attempt must discard
@@ -18392,7 +18423,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("archive gating stays closed while an editor recording is in flight", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     // Freeze the recording at its marker write: the pending-recording count must keep the
     // untrackable-app probe true for the whole in-flight window even though no durable
@@ -18425,7 +18456,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // An earlier session's editor may still be running behind a pre-existing marker; a later
     // failed launch must not delete the evidence protecting it.
     await fsPromises.mkdir("/tmp/test/sessions", { recursive: true });
-    await fsPromises.writeFile("/tmp/test/sessions/external-editor-opened", "earlier session");
+    await fsPromises.writeFile(externalEditorMarkerPath, "earlier session");
 
     const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     expect(admitted.success).toBe(true);
@@ -18433,11 +18464,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await admitted.data.rollbackAfterFailedLaunch();
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("rollbackAfterFailedLaunch preserves the marker while another open holds launch evidence", async () => {
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
     const failing = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     expect(failing.success).toBe(true);
@@ -18450,7 +18481,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await failing.data.rollbackAfterFailedLaunch();
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
-    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    await fsPromises.rm(externalEditorMarkerPath, { force: true });
   });
 
   test("archive waits for a retained background-init settlement before proceeding", async () => {
@@ -18597,9 +18628,9 @@ describe("WorkspaceService archive init cancellation", () => {
       runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -18720,9 +18751,9 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
       return Promise.resolve();
     });
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -18860,9 +18891,9 @@ describe("WorkspaceService archive snapshots", () => {
       return Promise.resolve();
     });
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -19050,9 +19081,9 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
       worktreeArchiveBehavior: "snapshot",
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) return null;
@@ -19333,9 +19364,9 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       ]),
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock((id: string) => {
         if (id !== workspaceId) {
@@ -19497,9 +19528,9 @@ describe("WorkspaceService deleteWorktree", () => {
       };
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: tempSrcBaseDir,
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       getAllWorkspaceMetadata: mock(async () => [await getCurrentMetadata()]),
     };
@@ -19709,9 +19740,9 @@ describe("WorkspaceService archiveMergedInProject", () => {
     executeBashMock: ReturnType<typeof mock>;
     archiveMock: ReturnType<typeof mock>;
   } {
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
       getAllWorkspaceMetadata: mock(() => Promise.resolve(allMetadata)),
@@ -20121,10 +20152,10 @@ describe("WorkspaceService init cancellation", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: generateStableIdMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
@@ -20167,10 +20198,10 @@ describe("WorkspaceService init cancellation", () => {
   test("create() rejects slash branches whose sanitized workspace name already exists", async () => {
     const projectPath = "/tmp/proj";
     const generateStableIdMock = mock(() => "ws-conflict");
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: generateStableIdMock,
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
@@ -20218,12 +20249,12 @@ describe("WorkspaceService init cancellation", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
       editConfig: editConfigMock,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -20275,12 +20306,12 @@ describe("WorkspaceService init cancellation", () => {
       off: mock(() => {}),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
       editConfig: editConfigMock,
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -20338,10 +20369,10 @@ describe("WorkspaceService init cancellation", () => {
       runtimeConfig: { type: "local" },
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -20414,7 +20445,7 @@ describe("WorkspaceService init cancellation", () => {
       runtimeConfig: { type: "local" },
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
       generateStableId: mock(() => workspaceId),
@@ -20423,8 +20454,7 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       loadConfigOrDefault: mock(() => ({
         projects: new Map([
@@ -20473,14 +20503,15 @@ describe("WorkspaceService init cancellation", () => {
     } as unknown as AgentSession;
 
     try {
-      const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+      const workspaceService = createWorkspaceServiceForTest({
+        config: mockConfig,
         historyService,
-        mockAIService,
-        mockInitStateManager as InitStateManager,
-        mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
-      );
+        aiService: mockAIService,
+        initStateManager: mockInitStateManager as InitStateManager,
+        secretsStore: {
+          getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
+        } as unknown as SecretsStore,
+      });
 
       const metadataEvents: Array<FrontendWorkspaceMetadata | null> = [];
       workspaceService.on("metadata", (event: unknown) => {
@@ -20563,7 +20594,7 @@ describe("WorkspaceService init cancellation", () => {
       pendingAutoTitle: true,
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       rootDir: "/tmp/mux-root",
       srcDir: "/tmp/src",
       generateStableId: mock(() => workspaceId),
@@ -20572,8 +20603,7 @@ describe("WorkspaceService init cancellation", () => {
         return Promise.resolve();
       }),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
-      getEffectiveSecrets: mock(() => []),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
       // Two pre-existing workspaces — auto-naming should skip past them.
       loadConfigOrDefault: mock(() => ({
@@ -20615,7 +20645,14 @@ describe("WorkspaceService init cancellation", () => {
         mockAIService,
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        mockBackgroundProcessManager as BackgroundProcessManager,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore
       );
 
       const removingWorkspaces = (
@@ -20683,10 +20720,10 @@ describe("WorkspaceService init cancellation", () => {
         off: mock(() => {}),
       } as unknown as AIService;
 
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
       };
@@ -20760,9 +20797,9 @@ describe("WorkspaceService init cancellation", () => {
         off: mock(() => {}),
       } as unknown as AIService;
 
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        sessionsDir: tempRoot,
         removeWorkspace: removeWorkspaceMock,
         findWorkspace: mock(() => null),
       };
@@ -20829,10 +20866,10 @@ describe("WorkspaceService init cancellation", () => {
         off: mock(() => {}),
       } as unknown as AIService;
 
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
-        getSessionDir: mock((id: string) => path.join(tempRoot, id)),
+        sessionsDir: tempRoot,
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
@@ -20877,9 +20914,9 @@ describe("WorkspaceService regenerateTitle", () => {
 
     ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
     };
@@ -21097,12 +21134,11 @@ describe("WorkspaceService fork", () => {
       enterHookPhase: mock(() => undefined),
     };
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
       generateStableId: mock(() => newWorkspaceId),
       findWorkspace: mock(() => null),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
-      getEffectiveSecrets: mock(() => []),
+      sessionsDir: "/tmp/test/sessions",
       loadConfigOrDefault: mock(() => ({
         projects: new Map([[sourceProjectPath, { workspaces: [], trusted: true }]]),
       })),
@@ -21113,6 +21149,7 @@ describe("WorkspaceService fork", () => {
       historyService,
       aiService: mockAIService,
       initStateManager: mockInitStateManager as InitStateManager,
+      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
     });
 
     const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
@@ -21863,9 +21900,9 @@ describe("WorkspaceService interruptStream", () => {
   test("sendQueuedImmediately clears hard-interrupt suppression before queued resend", async () => {
     const workspaceId = "ws-interrupt-queue-111";
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       findWorkspace: mock(() => null),
     };
@@ -22024,11 +22061,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       off: mock(() => undefined),
     } as unknown as AIService;
 
-    const mockConfig: Partial<Config> = {
+    const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/test",
       findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
       getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      getSessionDir: mock(() => "/tmp/test/sessions"),
+      sessionsDir: "/tmp/test/sessions",
       generateStableId: mock(() => "test-id"),
       loadConfigOrDefault: mock(() => ({ projects: new Map() })),
     };
@@ -22165,10 +22202,10 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         on: mock(() => undefined as unknown as InitStateManager),
         getInitState: mock(() => undefined),
       };
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         srcDir: "/tmp/test",
         getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         generateStableId: mock(() => "test-id"),
       };
       const { historyService } = await createTestHistoryService();
@@ -22396,10 +22433,10 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         on: mock(() => undefined as unknown as InitStateManager),
         getInitState: mock(() => undefined),
       };
-      const mockConfig: Partial<Config> = {
+      const mockConfig: MockWorkspaceConfig = {
         srcDir: "/tmp/test",
         getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-        getSessionDir: mock(() => "/tmp/test/sessions"),
+        sessionsDir: "/tmp/test/sessions",
         generateStableId: mock(() => "test-id"),
         ...configOverrides,
       };
@@ -23465,7 +23502,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
         // session's chat.jsonl was not recreated by a late guarded append.
         expect(await awaitPendingBranchSummary(newWorkspaceId)).toBeNull();
         expect(guardedAppendSpy).not.toHaveBeenCalled();
-        const chatFile = path.join(config.getSessionDir(newWorkspaceId), "chat.jsonl");
+        const chatFile = path.join(config.sessionsDir, newWorkspaceId, "chat.jsonl");
         const chatExists = await fsPromises.access(chatFile).then(
           () => true,
           () => false

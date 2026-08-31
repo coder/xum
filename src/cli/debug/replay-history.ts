@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import * as path from "path";
 
 /**
  * Debug script to replay a chat history and send a new message.
@@ -12,7 +13,6 @@
  */
 
 import * as fs from "fs";
-import * as path from "path";
 import { parseArgs } from "util";
 import { defaultConfig } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
@@ -89,7 +89,7 @@ async function main() {
 
   // Create a temporary workspace
   const workspaceId = `debug-replay-${Date.now()}`;
-  const sessionDir = defaultConfig.getSessionDir(workspaceId);
+  const sessionDir = path.join(defaultConfig.sessionsDir, workspaceId);
   fs.mkdirSync(sessionDir, { recursive: true });
 
   // Create workspace metadata

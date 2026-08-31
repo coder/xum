@@ -1,3 +1,4 @@
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
@@ -16,9 +17,9 @@ const OPENAI_API_KEY = "sk-test";
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
 
 function saveOpenAIConfig(config: Config, overrides: Record<string, unknown> = {}): void {
-  config.saveProvidersConfig({
+  new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
     openai: { apiKey: OPENAI_API_KEY, ...overrides },
-  } as Parameters<Config["saveProvidersConfig"]>[0]);
+  } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
 }
 
 function localVllmConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -38,7 +39,9 @@ async function saveRoutePriority(
 }
 
 function saveMuxGatewayConfig(config: Config): void {
-  config.saveProvidersConfig({ "mux-gateway": { couponCode: "gateway-token" } });
+  new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+    "mux-gateway": { couponCode: "gateway-token" },
+  });
 }
 
 function withTempConfig(run: (config: Config, service: ProviderService) => void): void {
@@ -237,7 +240,7 @@ describe("ProviderService.getConfig", () => {
 
   it("surfaces only supported xAI processing tiers", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         xai: {
           apiKey: "xai-key",
           serviceTier: "priority",
@@ -247,13 +250,13 @@ describe("ProviderService.getConfig", () => {
       expect(service.getConfig().xai.serviceTier).toBe("priority");
       expect(service.getConfig().xai.fastModePreviousServiceTier).toBe("default");
 
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         xai: {
           apiKey: "xai-key",
           serviceTier: "flex",
           fastModePreviousServiceTier: "flex",
         },
-      } as Parameters<Config["saveProvidersConfig"]>[0]);
+      } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
       expect(service.getConfig().xai.serviceTier).toBeUndefined();
       expect(service.getConfig().xai.fastModePreviousServiceTier).toBeUndefined();
     });
@@ -261,7 +264,7 @@ describe("ProviderService.getConfig", () => {
 
   it("reports legacy op:// API key references as not set", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         anthropic: {
           apiKey: "op://Personal/Anthropic/credential",
         },
@@ -312,7 +315,7 @@ describe("ProviderService.getConfig", () => {
 
   it("treats disabled OpenAI as unconfigured even when Codex OAuth tokens are stored", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           enabled: false,
           codexOauth: {
@@ -373,7 +376,7 @@ describe("ProviderService.getConfig", () => {
 
   it("returns legacy baseURL config as editable baseUrl", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
           baseURL: "https://legacy.openai.test",
@@ -396,7 +399,7 @@ describe("ProviderService.getConfig", () => {
       },
       () => {
         withTempConfig((config, service) => {
-          config.saveProvidersConfig({
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
             anthropic: {
               apiKey: "sk-ant-config",
               baseUrl: "https://config.anthropic.test",
@@ -455,7 +458,7 @@ describe("ProviderService.getConfig", () => {
 
   it("surfaces keyless custom OpenAI-compatible providers", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": {
           providerType: "openai-compatible",
           displayName: "Local vLLM",
@@ -482,7 +485,7 @@ describe("ProviderService.getConfig", () => {
 
   it("surfaces disabled custom providers as unconfigured", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig({ enabled: false }),
       });
 
@@ -496,7 +499,7 @@ describe("ProviderService.getConfig", () => {
 
   it("omits unknown provider keys without a custom providerType", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "future-provider": {
           apiKey: "sk-future",
           baseUrl: "https://future.example/v1",
@@ -511,7 +514,7 @@ describe("ProviderService.getConfig", () => {
 
   it("keeps built-in providers alongside custom providers", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
         },
@@ -533,7 +536,7 @@ describe("ProviderService.getConfig", () => {
 
   it("prefers shadowed custom provider config over a built-in provider id", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           providerType: "openai-compatible",
           displayName: "Shadowed OpenAI",
@@ -552,7 +555,7 @@ describe("ProviderService.getConfig", () => {
 
   it("logs shadowed custom provider ids once per detected set", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           providerType: "openai-compatible",
           displayName: "Shadowed OpenAI",
@@ -591,7 +594,7 @@ describe("ProviderService.getConfig", () => {
         ],
       },
       async (config, service) => {
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           "local-vllm": localVllmConfig({ models: ["llama-3", "mistral"] }),
           "another-custom": {
             providerType: "openai-compatible",
@@ -628,9 +631,9 @@ describe("ProviderService.getConfig", () => {
         provider_access: [{ id: "openai" }],
       },
       async (config, service, policyService) => {
-        // A second Config on the same root stands in for another Xum process
-        // holding the providers file lock while setModels waits for it.
-        const otherProcess = new Config(config.rootDir);
+        // A second FileLeaseManager on the same root stands in for another Xum
+        // process holding the providers file lock while setModels waits for it.
+        const otherProcess = new FileLeaseManager(config.rootDir);
         let releaseLock!: () => void;
         const lockGate = new Promise<void>((resolve) => (releaseLock = resolve));
         let lockHeld!: () => void;
@@ -665,7 +668,9 @@ describe("ProviderService.getConfig", () => {
           expect(result.error).toContain("not allowed by policy");
         }
         // Nothing was persisted for the denied provider.
-        expect(config.loadProvidersConfig()?.openai?.models).toBeUndefined();
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.models
+        ).toBeUndefined();
       }
     );
   });
@@ -683,7 +688,7 @@ describe("ProviderService.getConfig", () => {
         // Connection status must follow routing — which uses the forced URL —
         // or Settings would show "Not connected" (and hide Disconnect) while
         // requests keep succeeding against the forced deployment.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: "https://user-edited.example.com",
             coderOauth: {
@@ -718,7 +723,7 @@ describe("ProviderService.getConfig", () => {
         // stored full-privilege credential is still live on its deployment.
         // getConfig() must surface its PRESENCE (nothing else) so the
         // Disconnect command keeps a revocation path.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: "https://coder.example.com",
             models: ["anthropic/model-a"],
@@ -745,7 +750,7 @@ describe("ProviderService.getConfig", () => {
         expect(cfg.coder.models).toBeUndefined();
 
         // Without a stored credential the denied provider stays fully hidden.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: { deploymentUrl: "https://coder.example.com" },
         });
         expect(service.getConfig().coder).toBeUndefined();
@@ -758,7 +763,7 @@ describe("ProviderService.getConfig", () => {
       // The stored blob no longer matches the configured URL: not routable
       // (coderOauthSet false), but the credential is still live on its own
       // issuer and must stay exposed so Disconnect can revoke it.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://new-deployment.example.com",
           coderOauth: {
@@ -779,7 +784,7 @@ describe("ProviderService.getConfig", () => {
       expect(cfg.coder.coderOauthCredentialStored).toBe(true);
 
       // No blob at all: nothing to disconnect.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: { deploymentUrl: "https://new-deployment.example.com" },
       });
       expect(service.getConfig().coder.coderOauthCredentialStored).toBe(false);
@@ -796,7 +801,7 @@ describe("ProviderService.getConfig", () => {
         // The persisted catalog is policy-unfiltered by design (a temporary
         // policy must not carve models out of durable state); getConfig()
         // applies the CURRENT policy when exposing the lists.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: "https://coder.example.com",
             models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
@@ -815,7 +820,7 @@ describe("ProviderService.getConfig", () => {
 describe("ProviderService model normalization", () => {
   it("normalizes malformed model entries when reading config", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
           models: [
@@ -855,7 +860,7 @@ describe("ProviderService model normalization", () => {
         // hidden entry. setModels must carry it forward or the edit would
         // carve it out of durable state until the next login even after the
         // policy broadens.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: "https://coder.example.com",
             models: ["anthropic/visible-model", "anthropic/other-visible", "anthropic/hidden"],
@@ -871,7 +876,8 @@ describe("ProviderService model normalization", () => {
         const result = await service.setModels("coder", ["anthropic/visible-model"]);
         expect(result.success).toBe(true);
 
-        const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+        const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+          ?.coder as Record<string, unknown>;
         // The hidden entry survives; only the visible removal took effect.
         expect(stored.models).toEqual(["anthropic/visible-model", "anthropic/hidden"]);
         expect(stored.removedModels).toEqual(["anthropic/other-visible"]);
@@ -881,7 +887,7 @@ describe("ProviderService model normalization", () => {
 
   it("records removals of discovered Coder models and clears them on re-add", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: ["anthropic/model-a", "anthropic/model-b"],
@@ -893,14 +899,20 @@ describe("ProviderService model normalization", () => {
       // refreshes and re-logins cannot resurrect it.
       const removal = await service.setModels("coder", ["anthropic/model-a"]);
       expect(removal.success).toBe(true);
-      let stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      let stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder as Record<
+        string,
+        unknown
+      >;
       expect(stored.models).toEqual(["anthropic/model-a"]);
       expect(stored.removedModels).toEqual(["anthropic/model-b"]);
 
       // Re-adding the model clears its exclusion.
       const readd = await service.setModels("coder", ["anthropic/model-a", "anthropic/model-b"]);
       expect(readd.success).toBe(true);
-      stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder as Record<
+        string,
+        unknown
+      >;
       expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-b"]);
       expect(stored.removedModels).toBeUndefined();
     });
@@ -913,7 +925,7 @@ describe("ProviderService model normalization", () => {
       // `models` still knows it). Deleting it in that state must still
       // record the exclusion, or the next catalog that lists the ID again
       // would resurrect a model the user explicitly removed.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: [
@@ -927,7 +939,8 @@ describe("ProviderService model normalization", () => {
 
       const result = await service.setModels("coder", ["anthropic/model-a"]);
       expect(result.success).toBe(true);
-      const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+        ?.coder as Record<string, unknown>;
       expect(stored.models).toEqual(["anthropic/model-a"]);
       expect(stored.removedModels).toEqual(["anthropic/overridden"]);
     });
@@ -938,7 +951,7 @@ describe("ProviderService model normalization", () => {
       // Post-login state: discoveredModels deleted (catalog unknown), but a
       // removal recorded earlier must survive an unrelated edit — otherwise
       // the pending discovery would resurrect the removed model.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: ["anthropic/model-a"],
@@ -948,7 +961,8 @@ describe("ProviderService model normalization", () => {
 
       const result = await service.setModels("coder", ["anthropic/model-a", "anthropic/manual"]);
       expect(result.success).toBe(true);
-      const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+      const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+        ?.coder as Record<string, unknown>;
       expect(stored.removedModels).toEqual(["anthropic/model-b"]);
     });
   });
@@ -965,7 +979,7 @@ describe("ProviderService model normalization", () => {
       ] as unknown as ProviderModelEntry[]);
 
       expect(result.success).toBe(true);
-      const providersConfig = config.loadProvidersConfig();
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig();
       expect(providersConfig?.openai?.models).toEqual([
         "gpt-5",
         { id: "custom-model", contextWindowTokens: 100_000 },
@@ -987,7 +1001,7 @@ describe("ProviderService custom provider mutations", () => {
       if (!result.success) {
         expect(result.error.code).toBe("built_in_provider");
       }
-      expect(config.loadProvidersConfig()).toBeNull();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
     });
   });
 
@@ -1003,13 +1017,13 @@ describe("ProviderService custom provider mutations", () => {
         expect(result.error.code).toBe("invalid_provider_id");
         expect(result.error.reason).toContain("whitespace");
       }
-      expect(config.loadProvidersConfig()).toBeNull();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
     });
   });
 
   it("rejects duplicate custom provider ids", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
 
@@ -1037,7 +1051,7 @@ describe("ProviderService custom provider mutations", () => {
         if (!result.success) {
           expect(result.error.code).toBe("invalid_base_url");
         }
-        expect(config.loadProvidersConfig()).toBeNull();
+        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
       });
     });
   }
@@ -1061,14 +1075,14 @@ describe("ProviderService custom provider mutations", () => {
           expect(result.error.code).toBe("invalid_base_url");
           expect(result.error.message).toContain("query");
         }
-        expect(config.loadProvidersConfig()).toBeNull();
+        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
       });
     });
   }
 
   it("rejects setConfig base URL edits carrying a query string or fragment", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
 
@@ -1091,7 +1105,9 @@ describe("ProviderService custom provider mutations", () => {
       );
       expect(fragmentResult.success).toBe(false);
 
-      expect(config.loadProvidersConfig()?.["local-vllm"]?.baseUrl).toBe(LOCAL_VLLM_BASE_URL);
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]?.baseUrl
+      ).toBe(LOCAL_VLLM_BASE_URL);
     });
   });
 
@@ -1130,7 +1146,9 @@ describe("ProviderService custom provider mutations", () => {
         { id: "mixtral", contextWindowTokens: 32_768, mappedToModel: "openai/gpt-4o" },
       ]);
 
-      expect(config.loadProvidersConfig()?.["local-vllm"]).toEqual({
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]
+      ).toEqual({
         providerType: "openai-compatible",
         baseUrl: LOCAL_VLLM_BASE_URL,
         enabled: true,
@@ -1156,7 +1174,10 @@ describe("ProviderService custom provider mutations", () => {
 
         expect(result.success).toBe(true);
         expect(result.success && result.data.providerType).toBe(providerType);
-        expect(config.loadProvidersConfig()?.["custom-provider"]?.providerType).toBe(providerType);
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["custom-provider"]
+            ?.providerType
+        ).toBe(providerType);
         expect(service.getConfig()["custom-provider"]?.providerType).toBe(providerType);
         expect(service.list()).toContain("custom-provider");
       });
@@ -1167,7 +1188,7 @@ describe("ProviderService custom provider mutations", () => {
     await withTempConfigAsync(async (config, service) => {
       // Upgraded installs can carry a custom provider whose id shadows a
       // built-in; the add-time id collision rule must not block format edits.
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           providerType: "openai-compatible",
           baseUrl: LOCAL_VLLM_BASE_URL,
@@ -1177,7 +1198,9 @@ describe("ProviderService custom provider mutations", () => {
       const result = await service.setConfig("coder", ["providerType"], "anthropic-messages");
 
       expect(result.success).toBe(true);
-      expect(config.loadProvidersConfig()?.coder?.providerType).toBe("anthropic-messages");
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder?.providerType
+      ).toBe("anthropic-messages");
     });
   });
 
@@ -1192,20 +1215,24 @@ describe("ProviderService custom provider mutations", () => {
       );
 
       expect(result.success).toBe(false);
-      expect(config.loadProvidersConfig()?.["ghost-provider"]).toBeUndefined();
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["ghost-provider"]
+      ).toBeUndefined();
     });
   });
 
   it("still rejects providerType writes that would convert a built-in entry", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: { apiKey: "sk-real" },
       });
 
       const result = await service.setConfig("openai", ["providerType"], "openai-compatible");
 
       expect(result.success).toBe(false);
-      expect(config.loadProvidersConfig()?.openai?.providerType).toBeUndefined();
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.providerType
+      ).toBeUndefined();
     });
   });
 
@@ -1225,7 +1252,7 @@ describe("ProviderService custom provider mutations", () => {
         if (!result.success) {
           expect(result.error.code).toBe("policy_denied");
         }
-        expect(config.loadProvidersConfig()).toBeNull();
+        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
       }
     );
   });
@@ -1246,7 +1273,7 @@ describe("ProviderService custom provider mutations", () => {
         if (!result.success) {
           expect(result.error.code).toBe("policy_denied");
         }
-        expect(config.loadProvidersConfig()).toBeNull();
+        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
       }
     );
   });
@@ -1268,7 +1295,7 @@ describe("ProviderService custom provider mutations", () => {
         if (!result.success) {
           expect(result.error.code).toBe("policy_denied");
         }
-        expect(config.loadProvidersConfig()).toBeNull();
+        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
       }
     );
   });
@@ -1281,7 +1308,7 @@ describe("ProviderService custom provider mutations", () => {
       if (!result.success) {
         expect(result.error.code).toBe("built_in_provider");
       }
-      expect(config.loadProvidersConfig()).toBeNull();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
     });
   });
 
@@ -1295,13 +1322,15 @@ describe("ProviderService custom provider mutations", () => {
       if (!result.success) {
         expect(result.error.code).toBe("built_in_provider");
       }
-      expect(config.loadProvidersConfig()?.openai?.apiKey).toBe("sk-test");
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.apiKey).toBe(
+        "sk-test"
+      );
     });
   });
 
   it("removes a shadowed built-in custom provider from providers config", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           providerType: "openai-compatible",
           baseUrl: LOCAL_VLLM_BASE_URL,
@@ -1315,7 +1344,9 @@ describe("ProviderService custom provider mutations", () => {
       const result = await service.removeCustomProvider("openai");
 
       expect(result.success).toBe(true);
-      expect(config.loadProvidersConfig()?.openai).toBeUndefined();
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai
+      ).toBeUndefined();
       expect(config.loadConfigOrDefault().defaultModel).toBeUndefined();
     });
   });
@@ -1328,13 +1359,13 @@ describe("ProviderService custom provider mutations", () => {
       if (!result.success) {
         expect(result.error.code).toBe("unknown_provider");
       }
-      expect(config.loadProvidersConfig()).toBeNull();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
     });
   });
 
   it("rejects removing non-custom provider entries", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "future-provider": {
           baseUrl: "https://future.example/v1",
         },
@@ -1346,7 +1377,9 @@ describe("ProviderService custom provider mutations", () => {
       if (!result.success) {
         expect(result.error.code).toBe("not_custom_provider");
       }
-      expect(config.loadProvidersConfig()?.["future-provider"]).toEqual({
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["future-provider"]
+      ).toEqual({
         baseUrl: "https://future.example/v1",
       });
     });
@@ -1354,7 +1387,7 @@ describe("ProviderService custom provider mutations", () => {
 
   it("removes a valid custom provider from providers config", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: { apiKey: OPENAI_API_KEY },
         "local-vllm": localVllmConfig(),
         "other-custom": {
@@ -1366,7 +1399,7 @@ describe("ProviderService custom provider mutations", () => {
       const result = await service.removeCustomProvider("local-vllm");
 
       expect(result.success).toBe(true);
-      const providersConfig = config.loadProvidersConfig();
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig();
       expect(providersConfig?.["local-vllm"]).toBeUndefined();
       expect(providersConfig?.openai?.apiKey).toBe("sk-test");
       expect(providersConfig?.["other-custom"]?.baseUrl).toBe("http://localhost:8001/v1");
@@ -1375,14 +1408,14 @@ describe("ProviderService custom provider mutations", () => {
 
   it("does not repair app config if provider deletion fails", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
       await config.editConfig(() => ({
         ...config.loadConfigOrDefault(),
         defaultModel: "local-vllm:qwen3-coder",
       }));
-      const saveProvidersConfigSpy = spyOn(config, "saveProvidersConfig");
+      const saveProvidersConfigSpy = spyOn(ProvidersConfigStore.prototype, "saveProvidersConfig");
       saveProvidersConfigSpy.mockImplementationOnce(() => {
         throw new Error("disk is read-only");
       });
@@ -1392,7 +1425,9 @@ describe("ProviderService custom provider mutations", () => {
 
         expect(result.success).toBe(false);
         expect(config.loadConfigOrDefault().defaultModel).toBe("local-vllm:qwen3-coder");
-        expect(config.loadProvidersConfig()?.["local-vllm"]).toBeDefined();
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]
+        ).toBeDefined();
       } finally {
         saveProvidersConfigSpy.mockRestore();
       }
@@ -1401,7 +1436,7 @@ describe("ProviderService custom provider mutations", () => {
 
   it("reports partial success and notifies when config repair fails after deletion", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
       await config.editConfig(() => ({
@@ -1424,7 +1459,9 @@ describe("ProviderService custom provider mutations", () => {
         if (!result.success) {
           expect(result.error.code).toBe("config_repair_failed");
         }
-        expect(config.loadProvidersConfig()?.["local-vllm"]).toBeUndefined();
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]
+        ).toBeUndefined();
         expect(config.loadConfigOrDefault().defaultModel).toBe("local-vllm:qwen3-coder");
         expect(configChangedCount).toBe(1);
       } finally {
@@ -1437,7 +1474,7 @@ describe("ProviderService custom provider mutations", () => {
   it("repairs durable app config references when removing a custom provider", async () => {
     await withTempConfigAsync(async (config, service) => {
       const provider = "local-vllm";
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: { apiKey: OPENAI_API_KEY },
         [provider]: {
           providerType: "openai-compatible",
@@ -1536,7 +1573,7 @@ describe("ProviderService custom provider mutations", () => {
       expect(result.success).toBe(true);
 
       const freshConfig = new Config(config.rootDir);
-      const providersConfig = freshConfig.loadProvidersConfig();
+      const providersConfig = new ProvidersConfigStore(freshConfig.rootDir).loadProvidersConfig();
       expect(providersConfig?.[provider]).toBeUndefined();
       expect(providersConfig?.openai?.apiKey).toBe("sk-test");
       expect(providersConfig?.["other-custom"]?.baseUrl).toBe("http://localhost:8001/v1");
@@ -1599,7 +1636,7 @@ describe("ProviderService custom provider mutations", () => {
   it("preserves workspace thinking level when repairing a removed provider model", async () => {
     await withTempConfigAsync(async (config, service) => {
       const provider = "local-vllm";
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         [provider]: {
           providerType: "openai-compatible",
           baseUrl: LOCAL_VLLM_BASE_URL,
@@ -1647,7 +1684,7 @@ describe("ProviderService.setConfig", () => {
       const result = await service.setConfig("mux-gateway", ["couponCode"], "gateway-token");
       expect(result.success).toBe(true);
 
-      const providersConfig = config.loadProvidersConfig();
+      const providersConfig = new ProvidersConfigStore(config.rootDir).loadProvidersConfig();
       expect(providersConfig?.["mux-gateway"]?.models).toEqual([
         "anthropic/claude-sonnet-5",
         "anthropic/claude-opus-5",
@@ -1659,7 +1696,7 @@ describe("ProviderService.setConfig", () => {
 
   it("removes legacy baseURL alias when editing canonical baseUrl", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
           baseURL: "https://legacy.openai.test",
@@ -1672,10 +1709,14 @@ describe("ProviderService.setConfig", () => {
         "https://canonical.openai.test"
       );
       expect(updateResult.success).toBe(true);
-      expect(config.loadProvidersConfig()?.openai?.baseURL).toBeUndefined();
-      expect(config.loadProvidersConfig()?.openai?.baseUrl).toBe("https://canonical.openai.test");
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.baseURL
+      ).toBeUndefined();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.baseUrl).toBe(
+        "https://canonical.openai.test"
+      );
 
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
           baseURL: "https://legacy.openai.test",
@@ -1684,14 +1725,18 @@ describe("ProviderService.setConfig", () => {
 
       const clearResult = await service.setConfig("openai", ["baseUrl"], "");
       expect(clearResult.success).toBe(true);
-      expect(config.loadProvidersConfig()?.openai?.baseURL).toBeUndefined();
-      expect(config.loadProvidersConfig()?.openai?.baseUrl).toBeUndefined();
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.baseURL
+      ).toBeUndefined();
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.baseUrl
+      ).toBeUndefined();
     });
   });
 
   it("removes OpenAI serviceTier when set to an empty string", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
           serviceTier: "auto",
@@ -1701,14 +1746,21 @@ describe("ProviderService.setConfig", () => {
       const result = await service.setConfig("openai", ["serviceTier"], "");
 
       expect(result.success).toBe(true);
-      expect(config.loadProvidersConfig()?.openai?.serviceTier).toBeUndefined();
-      expect(Object.hasOwn(config.loadProvidersConfig()?.openai ?? {}, "serviceTier")).toBe(false);
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai?.serviceTier
+      ).toBeUndefined();
+      expect(
+        Object.hasOwn(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai ?? {},
+          "serviceTier"
+        )
+      ).toBe(false);
     });
   });
 
   it("stores enabled=false without deleting existing credentials", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
           apiKey: OPENAI_API_KEY,
           baseUrl: "https://api.openai.com/v1",
@@ -1718,7 +1770,7 @@ describe("ProviderService.setConfig", () => {
       const disableResult = await service.setConfig("openai", ["enabled"], "false");
       expect(disableResult.success).toBe(true);
 
-      const afterDisable = config.loadProvidersConfig();
+      const afterDisable = new ProvidersConfigStore(config.rootDir).loadProvidersConfig();
       expect(afterDisable?.openai?.apiKey).toBe("sk-test");
       expect(afterDisable?.openai?.baseUrl).toBe("https://api.openai.com/v1");
       expect(afterDisable?.openai?.enabled).toBe(false);
@@ -1726,7 +1778,7 @@ describe("ProviderService.setConfig", () => {
       const enableResult = await service.setConfig("openai", ["enabled"], "");
       expect(enableResult.success).toBe(true);
 
-      const afterEnable = config.loadProvidersConfig();
+      const afterEnable = new ProvidersConfigStore(config.rootDir).loadProvidersConfig();
       expect(afterEnable?.openai?.apiKey).toBe("sk-test");
       expect(afterEnable?.openai?.baseUrl).toBe("https://api.openai.com/v1");
       expect(afterEnable?.openai?.enabled).toBeUndefined();
@@ -1760,20 +1812,25 @@ describe("ProviderService.setConfig", () => {
       if (!result.success) {
         expect(result.error).toContain("does not exist");
       }
-      expect(config.loadProvidersConfig()?.["bad provider"]).toBeUndefined();
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["bad provider"]
+      ).toBeUndefined();
     });
   });
 
   it("validates custom provider type edits", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
 
       for (const providerType of CUSTOM_PROVIDER_TYPES) {
         const result = await service.setConfig("local-vllm", ["providerType"], providerType);
         expect(result.success).toBe(true);
-        expect(config.loadProvidersConfig()?.["local-vllm"]?.providerType).toBe(providerType);
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]
+            ?.providerType
+        ).toBe(providerType);
       }
 
       const invalid = await service.setConfig("local-vllm", ["providerType"], "unknown-format");
@@ -1781,13 +1838,15 @@ describe("ProviderService.setConfig", () => {
       if (!invalid.success) {
         expect(invalid.error).toContain("Invalid custom provider type");
       }
-      expect(config.loadProvidersConfig()?.["local-vllm"]?.providerType).toBe("anthropic-messages");
+      expect(
+        new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]?.providerType
+      ).toBe("anthropic-messages");
     });
   });
 
   it("rejects custom providers as route override targets", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         "local-vllm": localVllmConfig(),
       });
 
@@ -1805,7 +1864,7 @@ describe("ProviderService.setConfig", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-service-"));
     try {
       const config = new Config(tmpDir);
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         anthropic: {
           apiKey: "sk-ant-test",
           cacheTtl: "1h",
@@ -1827,7 +1886,7 @@ describe("ProviderService.setConfig", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-service-"));
     try {
       const config = new Config(tmpDir);
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         anthropic: {
           apiKey: "sk-ant-test",
           // Intentionally invalid
@@ -1848,7 +1907,7 @@ describe("ProviderService.setConfig", () => {
 
   it("surfaces disableBetaFeatures: true for Anthropic", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         anthropic: { apiKey: "sk-ant-test", disableBetaFeatures: true },
       });
 
@@ -1860,7 +1919,7 @@ describe("ProviderService.setConfig", () => {
 
   it("omits disableBetaFeatures when not set for Anthropic", () => {
     withTempConfig((config, service) => {
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         anthropic: { apiKey: "sk-ant-test" },
       });
 
@@ -1887,7 +1946,7 @@ describe("ProviderService denied keyPath segments", () => {
           success: false,
           error: `Denied key path segment: "${deniedSegment}"`,
         });
-        expect(config.loadProvidersConfig()).toBeNull();
+        expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
       });
     });
   }
@@ -1900,7 +1959,7 @@ describe("ProviderService denied keyPath segments", () => {
         success: false,
         error: 'Denied key path segment: "__proto__"',
       });
-      expect(config.loadProvidersConfig()).toBeNull();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
     });
   });
 
@@ -1914,7 +1973,7 @@ describe("ProviderService denied keyPath segments", () => {
         success: false,
         error: 'Denied key path segment: "__proto__"',
       });
-      expect(config.loadProvidersConfig()).toBeNull();
+      expect(new ProvidersConfigStore(config.rootDir).loadProvidersConfig()).toBeNull();
     });
   });
 });
@@ -1922,7 +1981,9 @@ describe("ProviderService denied keyPath segments", () => {
 describe("ProviderService.updateConfigValue", () => {
   it("writes when the predicate accepts and skips when it returns null", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({ coder: { coderOauth: { refresh: "rt_a" } } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: { coderOauth: { refresh: "rt_a" } },
+      });
 
       // Predicate matches: write applies.
       const applied = await service.updateConfigValue("coder", ["coderOauth"], (current) =>
@@ -1932,7 +1993,11 @@ describe("ProviderService.updateConfigValue", () => {
       );
       expect(applied).toEqual({ success: true, data: { applied: true } });
       expect(
-        (config.loadProvidersConfig()?.coder?.coderOauth as { refresh?: string })?.refresh
+        (
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder?.coderOauth as {
+            refresh?: string;
+          }
+        )?.refresh
       ).toBe("rt_b");
 
       // Predicate no longer matches (rt_a was replaced): compare-and-set skips.
@@ -1943,14 +2008,20 @@ describe("ProviderService.updateConfigValue", () => {
       );
       expect(skipped).toEqual({ success: true, data: { applied: false } });
       expect(
-        (config.loadProvidersConfig()?.coder?.coderOauth as { refresh?: string })?.refresh
+        (
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder?.coderOauth as {
+            refresh?: string;
+          }
+        )?.refresh
       ).toBe("rt_b");
     });
   });
 
   it("serializes concurrent updates so no write is lost", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({ coder: { coderOauth: { generation: 0 } } });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: { coderOauth: { generation: 0 } },
+      });
 
       // Both updates read-modify-write the same value; the lock must serialize
       // them so both increments land.
@@ -1963,14 +2034,18 @@ describe("ProviderService.updateConfigValue", () => {
       const [a, b] = await Promise.all([increment(), increment()]);
       expect(a.success && b.success).toBe(true);
       expect(
-        (config.loadProvidersConfig()?.coder?.coderOauth as { generation?: number })?.generation
+        (
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder?.coderOauth as {
+            generation?: number;
+          }
+        )?.generation
       ).toBe(2);
     });
   });
 
   it("breaks stale locks left by crashed processes", async () => {
     await withTempConfigAsync(async (config, service) => {
-      config.saveProvidersConfig({ coder: {} });
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({ coder: {} });
       // Simulate a crashed process: lock dir exists with an old mtime.
       const lockPath = path.join(config.rootDir, "providers.jsonc.lock");
       await fsPromises.mkdir(lockPath);
@@ -2043,7 +2118,7 @@ describe("ProviderService gateway lifecycle", () => {
   it("preserves manual bedrock routePriority entry when only region is configured", async () => {
     await withTempConfigAsync(async (config, service) => {
       await saveRoutePriority(config, ["bedrock", "direct"]);
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         bedrock: { region: "us-east-1" },
       });
 
@@ -2059,7 +2134,7 @@ describe("ProviderService gateway lifecycle", () => {
   it("removes bedrock from routePriority when fully deconfigured", async () => {
     await withTempConfigAsync(async (config, service) => {
       await saveRoutePriority(config, ["bedrock", "direct"]);
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         bedrock: { region: "us-east-1" },
       });
 
@@ -2075,7 +2150,7 @@ describe("ProviderService gateway lifecycle", () => {
   it("removes bedrock from routePriority when explicitly disabled", async () => {
     await withTempConfigAsync(async (config, service) => {
       await saveRoutePriority(config, ["bedrock", "direct"]);
-      config.saveProvidersConfig({
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         bedrock: { region: "us-east-1" },
       });
 
@@ -2187,7 +2262,8 @@ describe("ProviderService gateway lifecycle", () => {
 
         expect(result).toEqual({ success: true, data: { applied: true } });
         // The credential write itself landed.
-        const stored = config.loadProvidersConfig()?.coder as Record<string, unknown>;
+        const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+          ?.coder as Record<string, unknown>;
         expect(stored.coderOauth).toBeDefined();
       } finally {
         editSpy.mockRestore();
@@ -2210,7 +2286,7 @@ describe("ProviderService gateway lifecycle", () => {
         // and runtime model creation — or this write would evict coder from
         // routePriority while requests keep working against the forced
         // deployment.
-        config.saveProvidersConfig({
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           coder: {
             deploymentUrl: "https://user-edited.example.com",
             coderOauth: {

@@ -56,7 +56,7 @@ export function isPathSafeWorkspaceId(workspaceId: string): boolean {
 }
 
 export async function getWorkflowRunStatusesForOwners(
-  context: { getSessionDir(workspaceId: string): string },
+  context: { sessionsDir: string },
   refs: ReadonlyArray<{ workspaceId: string; runId: string }>
 ) {
   const stores = new Map<string, WorkflowRunStore>();
@@ -68,7 +68,9 @@ export async function getWorkflowRunStatusesForOwners(
       try {
         let store = stores.get(ref.workspaceId);
         if (store == null) {
-          store = new WorkflowRunStore({ sessionDir: context.getSessionDir(ref.workspaceId) });
+          store = new WorkflowRunStore({
+            sessionDir: path.join(context.sessionsDir, ref.workspaceId),
+          });
           stores.set(ref.workspaceId, store);
         }
         const status = await store.getRunStatusForLiveness(ref);
@@ -82,12 +84,14 @@ export async function getWorkflowRunStatusesForOwners(
 }
 
 export async function listActiveWorkflowRunsForOwners(
-  context: { getSessionDir(workspaceId: string): string },
+  context: { sessionsDir: string },
   workspaceIds: readonly string[]
 ) {
   const results = await Promise.all(
     workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
-      const store = new WorkflowRunStore({ sessionDir: context.getSessionDir(workspaceId) });
+      const store = new WorkflowRunStore({
+        sessionDir: path.join(context.sessionsDir, workspaceId),
+      });
       const summaries = await store.listActiveRunSummaries({ workspaceId });
       return summaries.map((summary) => ({ workspaceId, ...summary }));
     })

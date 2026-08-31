@@ -1,3 +1,4 @@
+import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -15,10 +16,6 @@ import {
 } from "@/common/constants/advisor";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
-import {
-  addInterruptedSentinel,
-  filterEmptyAssistantMessages,
-} from "@/browser/utils/messages/modelMessageTransform";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
@@ -35,7 +32,7 @@ import {
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
-import type { Config } from "@/node/config";
+import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
@@ -96,8 +93,6 @@ import {
 } from "@/common/utils/ai/providerOptions";
 import { uniqueSuffix } from "@/common/utils/hasher";
 import { isPlainObject } from "@/common/utils/isPlainObject";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
-import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import {
@@ -147,7 +142,6 @@ import {
 } from "@/common/utils/tools/toolCatalog";
 import {
   buildWorkflowResultContextMessage,
-  filterWorkflowDisplayOnlyMessages,
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -167,12 +161,19 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
-import { prepareMessagesForProvider } from "./messagePipeline";
 import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
 import { modelCostsIncluded } from "./providerModelFactory";
-import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
+import {
+  assemblePromptPayload,
+  buildPlanInstructions,
+  buildStreamSystemContext,
+  formatMcpWarningPrefix,
+  prepareProviderRequestMessages,
+} from "./turnContextAssembler";
+export { prepareProviderRequestMessages };
 import {
   simulateContextLimitError,
   simulateToolPolicyNoop,
@@ -287,38 +288,6 @@ export interface StreamMessageOptions {
    * stream. See src/node/services/thinkingOverride.ts.
    */
   activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
-}
-
-export function prepareProviderRequestMessages(
-  messages: MuxMessage[],
-  canonicalProviderName: string,
-  effectiveThinkingLevel: ThinkingLevel
-): {
-  activeContextMessages: MuxMessage[];
-  providerRequestMessages: MuxMessage[];
-  contextBoundarySlicedCount: number;
-} {
-  // Workflow display rows are durable UI history, not main-agent context.
-  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
-  // RLM keep-recent floor: a stamped compaction request summarizes only the
-  // older head; the stamped tail is preserved verbatim after the boundary.
-  // No-op (same reference) unless the trailing user row carries the durable
-  // stamp, so RLM-off requests and replay stay byte-identical.
-  const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
-    sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
-  );
-  const contextBoundarySlicedCount =
-    messagesWithoutWorkflowDisplay.length - activeContextMessages.length;
-  const preserveReasoningOnly =
-    canonicalProviderName === "anthropic" && effectiveThinkingLevel !== "off";
-  return {
-    activeContextMessages,
-    providerRequestMessages: filterEmptyAssistantMessages(
-      activeContextMessages,
-      preserveReasoningOnly
-    ),
-    contextBoundarySlicedCount,
-  };
 }
 
 // Exported for the replay builder: fallback requests append the refusal's
@@ -496,6 +465,8 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
 
 interface TurnRequestBuilderDependencies {
   config: Config;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">;
   historyService: HistoryService;
   initStateManager: InitStateManager;
   providerService: ProviderService;
@@ -653,7 +624,7 @@ export class TurnRequestBuilder {
     );
     const resolvedOverrides = resolveModelParameterOverrides(
       pinCoderInstanceRawProvidersConfig(
-        this.dependencies.config.loadProvidersConfig(),
+        this.dependencies.providersConfigStore.loadProvidersConfig(),
         options.rawModelString,
         options.coderSelectedInstance
       ),
@@ -1041,8 +1012,6 @@ export class TurnRequestBuilder {
     if (wireProviderName === "openai") {
       log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
     }
-    const messagesWithSentinel = addInterruptedSentinel(providerRequestMessages);
-
     const getWorkspaceMetadataStartedAt = Date.now();
     const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
     recordStartupPhaseTiming("getWorkspaceMetadataMs", getWorkspaceMetadataStartedAt);
@@ -1372,7 +1341,7 @@ export class TurnRequestBuilder {
     try {
       await agentPluginHookService.ensureWorkspaceHooks({
         workspaceId,
-        sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+        sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
         journal: this.dependencies.durableEventJournalFor(workspaceId),
         enabled: this.dependencies.isAgentPluginsEnabled(),
         xumHome: this.dependencies.config.rootDir,
@@ -1521,8 +1490,8 @@ export class TurnRequestBuilder {
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
     const projectSecrets = isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, this.dependencies.config)
-      : this.dependencies.config.getEffectiveSecrets(metadata.projectPath);
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
 
     const streamToken = this.dependencies.streamManager.generateStreamToken();
 
@@ -1725,7 +1694,7 @@ export class TurnRequestBuilder {
       dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
         ? new WorkflowService({
             runStore: new WorkflowRunStore({
-              sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+              sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             }),
             // This build's settled markers are keyed by the run's terminal generation, so
             // a resumed run re-arms attention by itself; only the downgrade-compat stable
@@ -1752,7 +1721,7 @@ export class TurnRequestBuilder {
                   cwd: workspacePath,
                   runtime,
                   runtimeTempDir,
-                  workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
+                  workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
@@ -1932,7 +1901,8 @@ export class TurnRequestBuilder {
                 // pinned pricing identity: two independent reads would let
                 // a catalog refresh land between them, running the request
                 // on one wire while recording usage under another type.
-                const advisorProvidersConfig = this.dependencies.config.loadProvidersConfig() ?? {};
+                const advisorProvidersConfig =
+                  this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
                 // View snapshot captured at creation time for option
                 // building (buildProviderOptions takes the oRPC view, not
                 // the raw config shape).
@@ -2041,7 +2011,7 @@ export class TurnRequestBuilder {
       },
       workspaceProjectPath: metadata.projectPath,
       workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
-      workspaceSessionDir: this.dependencies.config.getSessionDir(workspaceId),
+      workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
       planFilePath,
       ancestorPlanFilePaths,
       workspaceId,
@@ -2202,16 +2172,13 @@ export class TurnRequestBuilder {
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
     const ptcEnabled = experiments?.programmaticToolCalling === true;
-    let mcpWarningPrefix: string | undefined;
-    if (mcpStats && mcpStats.failedServerCount > 0) {
-      const failedNames = mcpStats.failedServerNames.join(", ");
-      workspaceLog.warn("MCP servers failed to start", { failedNames });
-      mcpWarningPrefix =
-        "[Warning: " +
-        mcpStats.failedServerCount +
-        " MCP server(s) failed to start: " +
-        failedNames +
-        ". Tools from these servers are unavailable. Check MCP server configuration in Settings.]\n\n";
+    const mcpWarningPrefix = mcpStats
+      ? formatMcpWarningPrefix(mcpStats.failedServerCount, mcpStats.failedServerNames)
+      : undefined;
+    if (mcpWarningPrefix != null) {
+      workspaceLog.warn("MCP servers failed to start", {
+        failedNames: mcpStats?.failedServerNames.join(", "),
+      });
     }
 
     type ModelSeed = typeof modelResult.data;
@@ -2267,7 +2234,7 @@ export class TurnRequestBuilder {
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
-            sessionDir: this.dependencies.config.getSessionDir(workspaceId),
+            sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
         });
@@ -2364,32 +2331,14 @@ export class TurnRequestBuilder {
         }
 
         if (options.initializeToolSearch && toolSearchRuntime?.state) {
-          seedToolSearchActivationsFromMessages(toolSearchRuntime.state, messagesWithSentinel);
+          seedToolSearchActivationsFromMessages(
+            toolSearchRuntime.state,
+            attemptProviderRequestMessages
+          );
         }
         const toolNamesForSentinel = (
           computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
         ).sort();
-        const prepareMessagesForProviderStartedAt = Date.now();
-        const finalMessages = await prepareMessagesForProvider({
-          messagesWithSentinel: addInterruptedSentinel(attemptProviderRequestMessages),
-          effectiveAgentId,
-          toolNamesForSentinel,
-          planContentForTransition,
-          planFilePath,
-          postCompactionAttachments,
-          providerForMessages: seed.wireProviderName,
-          effectiveThinkingLevel: seed.effectiveThinkingLevel,
-          modelString: seed.rawModelString,
-          providersConfig: seed.providersConfig,
-          anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-          workspaceId,
-        });
-        if (options.recordTimings) {
-          recordStartupPhaseTiming(
-            "prepareMessagesForProviderMs",
-            prepareMessagesForProviderStartedAt
-          );
-        }
         const preparedAttempt = this.prepareModelAttempt({
           rawModelString: seed.rawModelString,
           canonicalModelString: seed.canonicalModelString,
@@ -2410,6 +2359,41 @@ export class TurnRequestBuilder {
           reasoningMode,
           ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
         });
+        // Manual cache markers must honor a TTL set through per-model
+        // providerOptions extras when the dedicated mux-level setting is
+        // unset, matching the pre-assembler request-config behavior.
+        const effectiveAnthropicCacheTtl =
+          effectiveMuxProviderOptions.anthropic?.cacheTtl ??
+          getAnthropicCacheTtl(preparedAttempt.providerOptions);
+        // Shared by the initial build and thinking rebuilds so their assembly
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
+          assemblePromptPayload({
+            history: options.sourceMessages,
+            systemMessage: attemptSystem,
+            tools: attemptTools,
+            modelString: seed.rawModelString,
+            routeProvider: seed.routeProvider,
+            providerForMessages: seed.wireProviderName,
+            effectiveThinkingLevel: level,
+            effectiveAgentId,
+            toolNamesForSentinel,
+            planContentForTransition,
+            planFilePath,
+            postCompactionAttachments,
+            providersConfig: seed.providersConfig,
+            anthropicCacheTtl: effectiveAnthropicCacheTtl,
+            workspaceId,
+          });
+        const prepareMessagesForProviderStartedAt = Date.now();
+        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+        if (options.recordTimings) {
+          recordStartupPhaseTiming(
+            "prepareMessagesForProviderMs",
+            prepareMessagesForProviderStartedAt
+          );
+        }
+        const finalMessages = attemptPayload.messages;
         const forcedFirstStepToolNames =
           seed.routeProvider === "xai"
             ? getForcedXaiSearchToolNames(
@@ -2437,7 +2421,7 @@ export class TurnRequestBuilder {
             requestHistorySequence: options.requestHistorySequence,
             sentinelToolNames: toolNamesForSentinel,
             wireProviderName: seed.wireProviderName,
-            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+            anthropicCacheTtl: effectiveAnthropicCacheTtl,
             planContentForTransition,
             planFilePath,
             postCompactionAttachments,
@@ -2445,25 +2429,8 @@ export class TurnRequestBuilder {
           });
         };
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
-          const rebuiltMessages = prepareProviderRequestMessages(
-            options.sourceMessages,
-            seed.wireProviderName,
-            level
-          ).providerRequestMessages;
-          return prepareMessagesForProvider({
-            messagesWithSentinel: addInterruptedSentinel(rebuiltMessages),
-            effectiveAgentId,
-            toolNamesForSentinel,
-            planContentForTransition,
-            planFilePath,
-            postCompactionAttachments,
-            providerForMessages: seed.wireProviderName,
-            effectiveThinkingLevel: level,
-            modelString: seed.rawModelString,
-            providersConfig: seed.providersConfig,
-            anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl,
-            workspaceId,
-          });
+          const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
+          return rebuiltPayload.messages;
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
           level,
@@ -2479,8 +2446,10 @@ export class TurnRequestBuilder {
           providerRequestMessages: attemptProviderRequestMessages,
           messages: finalMessages,
           system: attemptSystem,
+          engineSystem: attemptPayload.system,
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
+          engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
           providerOptions: preparedAttempt.providerOptions,
@@ -2522,6 +2491,14 @@ export class TurnRequestBuilder {
     systemMessage = primaryRequest.system;
     systemMessageTokens = primaryRequest.systemMessageTokens;
     const finalMessages = primaryRequest.messages;
+    // Debug sinks pair systemMessage with the message list, so when the
+    // assembler embedded the system prompt as a leading cached row
+    // (engineSystem undefined), drop that row to keep the system prompt
+    // single-sourced in captures.
+    const debugViewMessages =
+      primaryRequest.engineSystem == null && finalMessages[0]?.role === "system"
+        ? finalMessages.slice(1)
+        : finalMessages;
 
     captureMcpToolTelemetry({
       telemetryService: this.dependencies.telemetryService,
@@ -2632,7 +2609,7 @@ export class TurnRequestBuilder {
             workspaceId,
             model: modelString,
             systemMessage,
-            messages: finalMessages,
+            messages: debugViewMessages,
             tools: Object.fromEntries(
               Object.entries(tools).map(([n, t]) => [
                 n,
@@ -2678,7 +2655,7 @@ export class TurnRequestBuilder {
       agentId: effectiveAgentId,
       maxOutputTokens,
       systemMessage,
-      messages: finalMessages,
+      messages: debugViewMessages,
     };
 
     try {
@@ -2687,7 +2664,7 @@ export class TurnRequestBuilder {
       const errMsg = getErrorMessage(error);
       workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
     }
-    const toolsForStream = tools;
+    const toolsForStream = primaryRequest.engineTools;
 
     const devToolsService = this.dependencies.devToolsService;
     const canQueueDevToolsRunMetadata =
@@ -2785,12 +2762,11 @@ export class TurnRequestBuilder {
                 model: nextRequest.model,
                 modelString: nextModelString,
                 messages: nextRequest.messages,
-                system: nextRequest.system,
-                tools: nextRequest.tools,
+                system: nextRequest.engineSystem,
+                tools: nextRequest.engineTools,
                 providerOptions: nextRequest.providerOptions,
                 headers: nextHeaders,
                 callSettingsOverrides: nextRequest.resolvedOverrides.standard,
-                anthropicCacheTtl: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
                 thinkingLevel: nextRequest.effectiveThinkingLevel,
                 forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
                 rebuildProviderOptionsForThinkingLevel:
@@ -2857,7 +2833,7 @@ export class TurnRequestBuilder {
       model: modelResult.data.model,
       modelString,
       historySequence,
-      system: systemMessage,
+      system: primaryRequest.engineSystem,
       runtime,
       messageId: assistantMessageId,
       abortSignal: combinedAbortSignal,
@@ -2882,7 +2858,6 @@ export class TurnRequestBuilder {
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,
-      anthropicCacheTtlOverride: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
       callSettingsOverrides: resolvedOverrides.standard,
       onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
       onStepMessages: advisorToolEligible

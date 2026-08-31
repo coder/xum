@@ -209,7 +209,7 @@ export async function seedWorkspaceHistoryProfile(args: {
   const profileConfig = HISTORY_PROFILES[profile];
 
   const historyService = new HistoryService({
-    getSessionDir: (workspaceId: string) => path.join(demoProject.sessionsDir, workspaceId),
+    sessionsDir: demoProject.sessionsDir,
     rootDir: path.dirname(demoProject.sessionsDir),
   });
 

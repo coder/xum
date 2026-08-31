@@ -50,7 +50,7 @@ async function createFixture(): Promise<RollbackFixture> {
   return {
     muxHome,
     checkout,
-    sessionDir: config.getSessionDir(WORKSPACE_ID),
+    sessionDir: path.join(config.sessionsDir, WORKSPACE_ID),
     service,
     ctx: {
       runtime: new LocalRuntime(checkout),
