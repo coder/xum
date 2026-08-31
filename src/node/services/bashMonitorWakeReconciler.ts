@@ -25,7 +25,7 @@ export const BASH_MONITOR_SETTLE_LINE_PREFIX = "[monitor] process settled:";
 
 export type BashMonitorPendingWakeKind = "match" | "monitor-lost" | "settled";
 
-export interface BashMonitorMatchSnapshot {
+interface BashMonitorMatchSnapshot {
   throughOffset: number;
   lines: readonly string[];
   totalMatches: number;
@@ -107,7 +107,6 @@ export interface BashMonitorWakeReconcilerSnapshot {
 
 export interface BashMonitorFullHistoryClearToken {
   ownerWorkspaceId: string;
-  clearId: string;
 }
 
 interface WatermarkEntry {
@@ -346,6 +345,7 @@ function buildMetadata(
 export class BashMonitorWakeReconciler {
   private readonly locks = new MutexMap<string>();
   private readonly states = new Map<string, ReconcileState>();
+  private readonly legacyCleanupAttempted = new Set<string>();
 
   constructor(
     private readonly args: {
@@ -401,7 +401,7 @@ export class BashMonitorWakeReconciler {
   async beginFullHistoryClear(ownerWorkspaceId: string): Promise<BashMonitorFullHistoryClearToken> {
     this.abortDispatch(ownerWorkspaceId);
     await this.consumeCurrent(ownerWorkspaceId);
-    return { ownerWorkspaceId, clearId: randomUUID() };
+    return { ownerWorkspaceId };
   }
 
   async finishFullHistoryClear(token: BashMonitorFullHistoryClearToken): Promise<void> {
@@ -530,7 +530,7 @@ export class BashMonitorWakeReconciler {
     deferredReads: Array<Promise<void>>;
     watermarks: Map<string, WatermarkEntry>;
   }> {
-    await this.deleteLegacyWakeDir(ownerWorkspaceId);
+    await this.deleteLegacyWakeDirOnce(ownerWorkspaceId);
     const [live, registryRows, watermarks] = await Promise.all([
       this.args.processManager.pullMonitorWakeSignals(ownerWorkspaceId),
       this.args.registry.listAll(ownerWorkspaceId),
@@ -886,7 +886,9 @@ export class BashMonitorWakeReconciler {
     }
   }
 
-  private async deleteLegacyWakeDir(ownerWorkspaceId: string): Promise<void> {
+  private async deleteLegacyWakeDirOnce(ownerWorkspaceId: string): Promise<void> {
+    if (this.legacyCleanupAttempted.has(ownerWorkspaceId)) return;
+    this.legacyCleanupAttempted.add(ownerWorkspaceId);
     try {
       await fsPromises.rm(path.join(this.args.sessionsDir, ownerWorkspaceId, LEGACY_WAKE_DIR), {
         recursive: true,

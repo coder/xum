@@ -556,7 +556,7 @@ describe("BashMonitorWakeReconciler", () => {
     expect(afterRestart).toEqual([]);
   });
 
-  test("snapshot supplies pending kinds without dispatching and removes the legacy outbox", async () => {
+  test("snapshot supplies pending kinds without dispatching and removes the legacy wake directory", async () => {
     rows = [
       registryRecord({
         status: "exited",
@@ -576,5 +576,9 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toEqual([]);
     const statError = await fsPromises.stat(legacy).catch((error: unknown) => error);
     expect(statError).toMatchObject({ code: "ENOENT" });
+
+    await fsPromises.mkdir(legacy, { recursive: true });
+    await reconciler.snapshot(OWNER);
+    expect((await fsPromises.stat(legacy)).isDirectory()).toBe(true);
   });
 });

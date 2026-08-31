@@ -1838,7 +1838,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly bashMonitorWakeReconciler: BashMonitorWakeReconciler;
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
-  private readonly pendingBashMonitorWakeDrains = new Set<Promise<void>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly bashOutputShownListener = (
@@ -2301,13 +2300,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       })
       .then(() => this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId))
       .finally(() => {
-        this.pendingBashMonitorWakeDrains.delete(promise);
         if (this.pendingBashMonitorWakeIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
           this.pendingBashMonitorWakeIdleWaitsByOwner.delete(ownerWorkspaceId);
         }
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingBashMonitorWakeDrains.add(promise);
   }
 
   private async dispatchBashMonitorWake(

@@ -1851,7 +1851,7 @@ describe("BackgroundProcessManager", () => {
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].lines[0]).toBe("ERR final");
         // The matched line appears once in lines; its tail-window duplicate travels separately
-        // and is deduped by the wake store before persistence.
+        // and is deduped by BashMonitorWakeReconciler.composeLines before delivery.
         expect(matchEvents[0].lines.filter((line) => line === "ERR final")).toHaveLength(1);
         expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
         expect(stoppedEvents).toHaveLength(1);

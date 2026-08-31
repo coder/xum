@@ -23,6 +23,7 @@ import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
+import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
 import type { BashMonitorTerminalSummary } from "./bashMonitorRegistryStore";
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
@@ -192,20 +193,14 @@ export type MonitorWakeDeliveryState =
   | { status: "blocked"; readSettled: Promise<void> }
   | { status: "settled"; shownThroughOffset: number; terminalStatusShown: boolean };
 
-export interface MonitorRetainedMatchBatch {
+interface MonitorRetainedMatchBatch {
   lines: readonly string[];
   totalMatches: number;
   droppedLines: number;
   matchedThroughOffset: number;
 }
 
-export interface MonitorMatchedLineFrontier {
-  matchedThroughOffset: number;
-  retained: boolean;
-  retired: boolean;
-}
-
-export interface MonitorSettlementDisposition extends BashMonitorTerminalSummary {
+interface MonitorSettlementDisposition extends BashMonitorTerminalSummary {
   tailLines: readonly BashMonitorTailLine[];
 }
 
@@ -934,20 +929,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }, monitor.cooldownMs);
   }
 
-  private truncateUtf8Prefix(value: string, maxBytes: number): string {
-    assert(maxBytes > 0, "truncateUtf8Prefix requires a positive byte limit");
-    let bytes = 0;
-    let endIndex = 0;
-    for (const char of value) {
-      const charBytes = Buffer.byteLength(char, "utf8");
-      if (bytes + charBytes > maxBytes) break;
-      bytes += charBytes;
-      endIndex += char.length;
-    }
-
-    return value.slice(0, endIndex);
-  }
-
   private truncateUtf8Suffix(value: string, maxBytes: number): string {
     assert(maxBytes > 0, "truncateUtf8Suffix requires a positive byte limit");
     let bytes = 0;
@@ -972,7 +953,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const remainingBytes = Math.max(1, maxBytes - markerBytes);
     const prefixBytes = Math.floor(remainingBytes / 2);
     const suffixBytes = remainingBytes - prefixBytes;
-    return `${this.truncateUtf8Prefix(value, prefixBytes)}${MONITOR_TRUNCATION_MARKER}${this.truncateUtf8Suffix(value, suffixBytes)}`;
+    return `${truncateUtf8Prefix(value, prefixBytes)}${MONITOR_TRUNCATION_MARKER}${this.truncateUtf8Suffix(value, suffixBytes)}`;
   }
 
   private sanitizeMonitorLine(line: string): string {
@@ -1891,16 +1872,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (proc?.monitor?.stopped) proc.monitor = undefined;
   }
 
-  pullMonitorMatchedLineBatches(
-    processId: string,
-    originNotAfterMs: number
-  ): MonitorRetainedMatchBatch[] | undefined {
-    const proc = this.processes.get(processId);
-    if (proc == null || !(proc.startTime <= originNotAfterMs)) return undefined;
-    const match = proc.monitor?.retainedMatch;
-    return match == null ? [] : [{ ...match, lines: [...match.lines] }];
-  }
-
   dropMonitorMatchedLineBatchesThrough(
     processId: string,
     originNotAfterMs: number,
@@ -1915,39 +1886,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     ) {
       monitor.retainedMatch = undefined;
     }
-  }
-
-  getMonitorMatchedLineFrontier(
-    processId: string,
-    originNotAfterMs: number
-  ): MonitorMatchedLineFrontier | undefined {
-    const proc = this.processes.get(processId);
-    if (proc == null || !(proc.startTime <= originNotAfterMs) || proc.monitor == null) {
-      return undefined;
-    }
-    return {
-      matchedThroughOffset: proc.monitor.matchedThroughOffset,
-      retained: proc.monitor.retainedMatch != null,
-      retired: proc.monitor.stopped,
-    };
-  }
-
-  pullMonitorSettlementDisposition(
-    processId: string,
-    originNotAfterMs: number
-  ): MonitorSettlementDisposition | undefined {
-    const proc = this.processes.get(processId);
-    if (proc == null || !(proc.startTime <= originNotAfterMs)) return undefined;
-    const disposition = proc.monitor?.settlementDisposition;
-    return disposition == null
-      ? undefined
-      : { ...disposition, tailLines: disposition.tailLines.map((entry) => ({ ...entry })) };
-  }
-
-  dropMonitorSettlementDisposition(processId: string, originNotAfterMs: number): void {
-    const proc = this.processes.get(processId);
-    if (proc == null || !(proc.startTime <= originNotAfterMs)) return;
-    if (proc.monitor != null) proc.monitor.settlementDisposition = undefined;
   }
 
   async getMonitorWakeDeliveryState(

@@ -368,10 +368,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const internal = service as unknown as {
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: {
-        beginFullHistoryClear(
-          workspaceId: string
-        ): Promise<{ ownerWorkspaceId: string; clearId: string }>;
-        finishFullHistoryClear(token: { ownerWorkspaceId: string; clearId: string }): Promise<void>;
+        beginFullHistoryClear(workspaceId: string): Promise<{ ownerWorkspaceId: string }>;
+        finishFullHistoryClear(token: { ownerWorkspaceId: string }): Promise<void>;
       };
       clearHistoryWithRetiredBashMonitorWakes<T>(
         workspaceId: string,
@@ -384,7 +382,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       internal.bashMonitorWakeReconciler = {
         beginFullHistoryClear: (workspaceId) => {
           order.push("pre");
-          return Promise.resolve({ ownerWorkspaceId: workspaceId, clearId: "clear" });
+          return Promise.resolve({ ownerWorkspaceId: workspaceId });
         },
         finishFullHistoryClear: () => {
           order.push("post");
