@@ -116,43 +116,25 @@ describe("BashMonitorRegistryStore", () => {
     });
   });
 
-  test("consumeIfArmedBefore takes stale records but preserves live replacements", async () => {
+  test("keeps terminal disposition until delivery removes the row", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
-    const cutoffMs = Date.parse("2026-06-01T00:00:00.000Z");
+    await store.upsert(armedPayload());
 
-    // Stale record (armed before cutoff) is consumed and returned.
-    await store.upsert(armedPayload({ createdAt: "2026-01-01T00:00:00.000Z" }));
-    const consumed = await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs);
-    expect(consumed?.processId).toBe("proc-1");
-    expect(await store.listAll("owner-1")).toHaveLength(0);
+    await store.recordTerminal("owner-1", "proc-1", {
+      status: "exited",
+      exitCode: 0,
+      settledAt: "2026-01-01T00:00:01.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    });
 
-    // Live record (re-armed at/after cutoff, e.g. by a workspace resumed during recovery)
-    // must survive and yield null so no false monitor-lost wake is enqueued for it.
-    await store.upsert(armedPayload({ createdAt: "2026-06-01T00:00:00.000Z" }));
-    expect(await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs)).toBeNull();
-    expect(await store.listAll("owner-1")).toHaveLength(1);
-
-    // Missing record yields null.
-    expect(await store.consumeIfArmedBefore("owner-1", "proc-missing", cutoffMs)).toBeNull();
-  });
-
-  test("keeps a stale record when the pre-remove callback fails", async () => {
-    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
-    const cutoffMs = Date.parse("2026-06-01T00:00:00.000Z");
-    await store.upsert(armedPayload({ createdAt: "2026-01-01T00:00:00.000Z" }));
-
-    let rejection: unknown;
-    try {
-      await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs, () =>
-        Promise.reject(new Error("wake persistence failed"))
-      );
-    } catch (error) {
-      rejection = error;
-    }
-    expect(rejection).toBeInstanceOf(Error);
-    if (!(rejection instanceof Error)) throw new Error("expected callback rejection");
-    expect(rejection.message).toBe("wake persistence failed");
-    expect(await store.listAll("owner-1")).toHaveLength(1);
+    expect((await store.listAll("owner-1"))[0].terminal).toEqual({
+      status: "exited",
+      exitCode: 0,
+      settledAt: "2026-01-01T00:00:01.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    });
   });
 
   test("bounds persisted script length", async () => {
