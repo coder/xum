@@ -282,12 +282,16 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       events.emit("monitor:match", "owner", {});
       events.emit("output:shown", "owner", {});
       events.emit("monitor:armed", "owner", armed);
-      events.emit("monitor:stopped", "owner", { processId: "proc", reason: "canceled" });
+      events.emit("monitor:stopped", "owner", {
+        processId: "proc",
+        reason: "canceled",
+        armMetadata: armed,
+      });
       await Promise.resolve();
       await Promise.resolve();
 
       expect(upsert).toHaveBeenCalledWith(armed);
-      expect(remove).toHaveBeenCalledWith("owner", "proc");
+      expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
       await cleanup();

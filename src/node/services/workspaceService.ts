@@ -1872,7 +1872,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ): void => {
     const persist = async (): Promise<void> => {
       if (payload.reason === "canceled") {
-        await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId);
+        const createdAt = payload.armMetadata?.createdAt;
+        if (createdAt == null) return;
+        await this.bashMonitorWakeReconciler.discardProcess(
+          workspaceId,
+          payload.processId,
+          createdAt
+        );
+        await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
         return;
       }
       if (payload.reason === "failed") {

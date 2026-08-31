@@ -689,6 +689,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       this.emit("monitor:stopped", proc.workspaceId, {
         processId: proc.id,
         reason,
+        armMetadata: monitor.armMetadata,
         ...(monitor.settlementDisposition != null
           ? {
               terminal: {
@@ -708,7 +709,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
               ...(failure.failedOperations != null
                 ? { failedOperations: failure.failedOperations }
                 : {}),
-              armMetadata: monitor.armMetadata,
               ...(failedMatch != null ? { failedMatch } : {}),
             }
           : {}),
@@ -731,8 +731,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // A match may already have retired the monitor and queued a synthetic wake. Explicit process
     // cancellation must still retract that undelivered wake, so emit a cancellation notification
     // even though the in-memory monitor has no remaining timer or pending lines to clear.
+    monitor.retainedMatch = undefined;
+    monitor.settlementDisposition = undefined;
     if (!this.shuttingDown) {
-      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id, reason: "canceled" });
+      this.emit("monitor:stopped", proc.workspaceId, {
+        processId: proc.id,
+        reason: "canceled",
+        armMetadata: monitor.armMetadata,
+      });
     }
   }
 

@@ -80,7 +80,7 @@ export interface BashMonitorWakeReconcilerProcessManager {
 
 export interface BashMonitorWakeReconcilerRegistry {
   listAll(ownerWorkspaceId: string): Promise<readonly BashMonitorRegistryRecord[]>;
-  remove(ownerWorkspaceId: string, processId: string): Promise<void> | void;
+  remove(ownerWorkspaceId: string, processId: string, createdAt: string): Promise<void> | void;
   recordTerminal(
     ownerWorkspaceId: string,
     processId: string,
@@ -398,6 +398,24 @@ export class BashMonitorWakeReconciler {
     return snapshot.pendingWakeKinds.get(processId);
   }
 
+  async discardProcess(
+    ownerWorkspaceId: string,
+    processId: string,
+    createdAt: string
+  ): Promise<void> {
+    await this.locks.withLock(ownerWorkspaceId, () => {
+      const state = this.state(ownerWorkspaceId);
+      if (
+        state.dispatch?.signals.some(
+          (signal) => signal.processId === processId && signal.createdAt === createdAt
+        ) === true
+      ) {
+        state.dispatch.controller.abort();
+        state.dispatch = undefined;
+      }
+      return Promise.resolve();
+    });
+  }
   async beginFullHistoryClear(ownerWorkspaceId: string): Promise<BashMonitorFullHistoryClearToken> {
     this.abortDispatch(ownerWorkspaceId);
     await this.consumeCurrent(ownerWorkspaceId);
@@ -820,7 +838,11 @@ export class BashMonitorWakeReconciler {
         );
       }
       if (signal.deadRegistryRow || signal.retired) {
-        await this.args.registry.remove(signal.ownerWorkspaceId, signal.processId);
+        await this.args.registry.remove(
+          signal.ownerWorkspaceId,
+          signal.processId,
+          signal.createdAt
+        );
       }
       if (signal.retired) {
         await this.args.processManager.dropRetiredMonitor(signal.processId);

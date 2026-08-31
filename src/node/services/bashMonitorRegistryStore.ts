@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -152,11 +153,7 @@ export class BashMonitorRegistryStore {
       };
       const dir = this.dir(record.ownerWorkspaceId);
       await fsPromises.mkdir(dir, { recursive: true });
-      await fsPromises.writeFile(
-        this.file(record.ownerWorkspaceId, record.processId),
-        JSON.stringify(record, null, 2),
-        "utf-8"
-      );
+      await this.writeRecord(record);
     });
   }
 
@@ -177,7 +174,7 @@ export class BashMonitorRegistryStore {
       }
       const record = this.parse(raw);
       if (record == null) return;
-      await fsPromises.writeFile(file, JSON.stringify({ ...record, terminal }, null, 2), "utf-8");
+      await this.writeRecord({ ...record, terminal });
     });
   }
   async recordLost(
@@ -219,21 +216,37 @@ export class BashMonitorRegistryStore {
           : {}),
         failedAt: lost.failedAt,
       };
-      await fsPromises.writeFile(
-        file,
-        JSON.stringify({ ...record, lost: normalized }, null, 2),
-        "utf-8"
-      );
+      await this.writeRecord({ ...record, lost: normalized });
     });
   }
 
-  async remove(ownerWorkspaceId: string, processId: string): Promise<void> {
+  private async writeRecord(record: BashMonitorRegistryRecord): Promise<void> {
+    const file = this.file(record.ownerWorkspaceId, record.processId);
+    await fsPromises.mkdir(path.dirname(file), { recursive: true });
+    const temp = file + "." + process.pid + "." + randomUUID() + ".tmp";
+    await fsPromises.writeFile(temp, JSON.stringify(record, null, 2), "utf-8");
+    try {
+      await fsPromises.rename(temp, file);
+    } finally {
+      await fsPromises.rm(temp, { force: true });
+    }
+  }
+  async remove(ownerWorkspaceId: string, processId: string, createdAt: string): Promise<void> {
     assert(ownerWorkspaceId.trim().length > 0, "remove requires ownerWorkspaceId");
     assert(processId.trim().length > 0, "remove requires processId");
+    assert(createdAt.trim().length > 0, "remove requires createdAt");
 
     const key = `${ownerWorkspaceId}:${processId}`;
     return this.locks.withLock(key, async () => {
-      await fsPromises.rm(this.file(ownerWorkspaceId, processId), { force: true });
+      const file = this.file(ownerWorkspaceId, processId);
+      const raw = await fsPromises.readFile(file, "utf-8").catch((error: unknown) => {
+        if (isErrnoWithCode(error, "ENOENT")) return null;
+        throw error;
+      });
+      if (raw == null) return;
+      const record = this.parse(raw);
+      if (record?.createdAt !== createdAt) return;
+      await fsPromises.rm(file, { force: true });
     });
   }
 

@@ -53,11 +53,11 @@ describe("BashMonitorRegistryStore", () => {
       script: "echo hi",
     });
 
-    await store.remove("owner-1", "proc-1");
+    await store.remove("owner-1", "proc-1", "2026-01-01T00:00:00.000Z");
     expect((await store.listAll("owner-1")).map((record) => record.processId)).toEqual(["proc-2"]);
 
     // remove is idempotent for already-deleted records
-    await store.remove("owner-1", "proc-1");
+    await store.remove("owner-1", "proc-1", "2026-01-01T00:00:00.000Z");
   });
 
   test("upsert replaces an existing record for the same process", async () => {
@@ -91,7 +91,7 @@ describe("BashMonitorRegistryStore", () => {
     const store = new BashMonitorRegistryStore(config);
     await store.upsert(armedPayload({ workspaceId: "owner-b" }));
     await store.upsert(armedPayload({ workspaceId: "owner-a" }));
-    await store.remove("owner-b", "proc-1");
+    await store.remove("owner-b", "proc-1", "2026-01-01T00:00:00.000Z");
     // Session dir without a registry dir must be skipped, not crash the walk.
     await fsPromises.mkdir(path.join(config.sessionsDir, "owner-empty"), { recursive: true });
 
