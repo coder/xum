@@ -227,6 +227,206 @@ function createWorkspaceServiceForTest(options: {
   );
 }
 
+describe("WorkspaceService bash monitor wake reconciler wiring", () => {
+  async function createWakeWiringService() {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const events = new EventEmitter();
+    const backgroundProcessManager = Object.assign(events, {
+      notifyMonitorWakeStateChanged: mock(() => undefined),
+      getActiveMonitorCount: mock(() => 0),
+      pullMonitorWakeSignals: mock(() => Promise.resolve([])),
+      getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
+      acknowledgeMonitorWake: mock(() => undefined),
+      dropRetiredMonitor: mock(() => undefined),
+    }) as unknown as BackgroundProcessManager;
+    const service = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      extensionMetadata: new ExtensionMetadataService(
+        path.join(config.rootDir, "wake-wiring-extension-metadata.json")
+      ),
+      backgroundProcessManager,
+    });
+    return { config, service, events, cleanup };
+  }
+
+  test("monitor lifecycle and shown-output events poke the reconciler", async () => {
+    const { service, events, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    const upsert = mock(() => Promise.resolve());
+    const remove = mock(() => Promise.resolve());
+    const recordTerminal = mock(() => Promise.resolve());
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      bashMonitorRegistryStore: {
+        upsert: typeof upsert;
+        remove: typeof remove;
+        recordTerminal: typeof recordTerminal;
+      };
+    };
+    try {
+      await internal.bashMonitorRecoveryPromise;
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
+      const armed = {
+        processId: "proc",
+        taskId: "bash:proc",
+        workspaceId: "owner",
+        filter: "READY",
+        filterExclude: false,
+        script: "run",
+        createdAt: "2026-08-31T12:00:00.000Z",
+      };
+      events.emit("monitor:match", "owner", {});
+      events.emit("output:shown", "owner", {});
+      events.emit("monitor:armed", "owner", armed);
+      events.emit("monitor:stopped", "owner", { processId: "proc", reason: "canceled" });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(upsert).toHaveBeenCalledWith(armed);
+      expect(remove).toHaveBeenCalledWith("owner", "proc");
+      expect(scheduleReconcile).toHaveBeenCalledTimes(4);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("full clears preconsume and postconsume wakes while truncations leave them alone", async () => {
+    const { service, cleanup } = await createWakeWiringService();
+    const order: string[] = [];
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: {
+        beginFullHistoryClear(
+          workspaceId: string
+        ): Promise<{ ownerWorkspaceId: string; clearId: string }>;
+        finishFullHistoryClear(token: { ownerWorkspaceId: string; clearId: string }): Promise<void>;
+      };
+      clearHistoryWithRetiredBashMonitorWakes<T>(
+        workspaceId: string,
+        clear: () => Promise<Result<T>>,
+        options?: { discardUnacceptedOnSuccess?: boolean }
+      ): Promise<Result<T>>;
+    };
+    try {
+      await internal.bashMonitorRecoveryPromise;
+      internal.bashMonitorWakeReconciler = {
+        beginFullHistoryClear: async (workspaceId) => {
+          order.push("pre");
+          return { ownerWorkspaceId: workspaceId, clearId: "clear" };
+        },
+        finishFullHistoryClear: async () => {
+          order.push("post");
+        },
+      };
+      const truncate = await internal.clearHistoryWithRetiredBashMonitorWakes(
+        "owner",
+        async () => {
+          order.push("truncate");
+          return Ok(undefined);
+        },
+        { discardUnacceptedOnSuccess: false }
+      );
+      expect(truncate.success).toBe(true);
+      expect(order).toEqual(["truncate"]);
+
+      const clear = await internal.clearHistoryWithRetiredBashMonitorWakes(
+        "owner",
+        async () => {
+          order.push("clear");
+          return Ok(undefined);
+        },
+        { discardUnacceptedOnSuccess: true }
+      );
+      expect(clear.success).toBe(true);
+      expect(order).toEqual(["truncate", "pre", "clear", "post"]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("startup schedules reconciliation only for pre-construction registry rows", async () => {
+    const { service, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    const internal = service as unknown as {
+      constructedAtMs: number;
+      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      bashMonitorRegistryStore: {
+        listOwnerWorkspaceIds(): Promise<{ ownerWorkspaceIds: string[]; scanFailed: boolean }>;
+        listAll(workspaceId: string): Promise<Array<{ createdAt: string }>>;
+      };
+      recoverBashMonitorStateAfterRestart(): Promise<void>;
+    };
+    try {
+      internal.constructedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorRegistryStore = {
+        listOwnerWorkspaceIds: async () => ({
+          ownerWorkspaceIds: ["old", "new"],
+          scanFailed: false,
+        }),
+        listAll: async (workspaceId) => [
+          {
+            createdAt:
+              workspaceId === "old" ? "2026-08-31T11:59:00.000Z" : "2026-08-31T12:01:00.000Z",
+          },
+        ],
+      };
+
+      await internal.recoverBashMonitorStateAfterRestart();
+      expect(scheduleReconcile).toHaveBeenCalledTimes(1);
+      expect(scheduleReconcile).toHaveBeenCalledWith("old");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("busy owners defer reconciliation without queueing a synthetic turn", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "busy-wake-owner";
+    await config.addWorkspace("/tmp/busy-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "busy-wake-project",
+      projectPath: "/tmp/busy-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    const afterIdle = mock(() => undefined);
+    const onAccepted = mock(() => Promise.resolve());
+    const internal = service as unknown as {
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        dedupeKey: string;
+        cancelSignal: AbortSignal;
+        onAccepted(): Promise<void>;
+      }): Promise<void>;
+    };
+    try {
+      internal.hasPendingQueuedOrPreparingTurn = () => true;
+      internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
+      await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        dedupeKey: "wake",
+        cancelSignal: new AbortController().signal,
+        onAccepted,
+      });
+      expect(afterIdle).toHaveBeenCalledWith(workspaceId);
+      expect(onAccepted).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 async function setWorkspaceGoalOk(
   goalService: WorkspaceGoalService,
   input: Parameters<WorkspaceGoalService["setGoal"]>[0]
@@ -18299,206 +18499,6 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
       guardedAppendSpy.mockRestore();
       void realGuardedAppend;
       await fsPromises.rm(projectDir, { recursive: true, force: true });
-      await cleanup();
-    }
-  });
-});
-
-describe("WorkspaceService bash monitor wake reconciler wiring", () => {
-  async function createWakeWiringService() {
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    const events = new EventEmitter();
-    const backgroundProcessManager = Object.assign(events, {
-      notifyMonitorWakeStateChanged: mock(() => undefined),
-      getActiveMonitorCount: mock(() => 0),
-      pullMonitorWakeSignals: mock(() => Promise.resolve([])),
-      getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
-      acknowledgeMonitorWake: mock(() => undefined),
-      dropRetiredMonitor: mock(() => undefined),
-    }) as unknown as BackgroundProcessManager;
-    const service = createWorkspaceServiceForTest({
-      config,
-      historyService,
-      aiService: createMockAIService({ isStreaming: mock(() => false) }),
-      extensionMetadata: new ExtensionMetadataService(
-        path.join(config.rootDir, "wake-wiring-extension-metadata.json")
-      ),
-      backgroundProcessManager,
-    });
-    return { config, service, events, cleanup };
-  }
-
-  test("monitor lifecycle and shown-output events poke the reconciler", async () => {
-    const { service, events, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const upsert = mock(() => Promise.resolve());
-    const remove = mock(() => Promise.resolve());
-    const recordTerminal = mock(() => Promise.resolve());
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-      bashMonitorRegistryStore: {
-        upsert: typeof upsert;
-        remove: typeof remove;
-        recordTerminal: typeof recordTerminal;
-      };
-    };
-    try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
-      internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
-      const armed = {
-        processId: "proc",
-        taskId: "bash:proc",
-        workspaceId: "owner",
-        filter: "READY",
-        filterExclude: false,
-        script: "run",
-        createdAt: "2026-08-31T12:00:00.000Z",
-      };
-      events.emit("monitor:match", "owner", {});
-      events.emit("output:shown", "owner", {});
-      events.emit("monitor:armed", "owner", armed);
-      events.emit("monitor:stopped", "owner", { processId: "proc", reason: "canceled" });
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(upsert).toHaveBeenCalledWith(armed);
-      expect(remove).toHaveBeenCalledWith("owner", "proc");
-      expect(scheduleReconcile).toHaveBeenCalledTimes(4);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  test("full clears preconsume and postconsume wakes while truncations leave them alone", async () => {
-    const { service, cleanup } = await createWakeWiringService();
-    const order: string[] = [];
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: {
-        beginFullHistoryClear(
-          workspaceId: string
-        ): Promise<{ ownerWorkspaceId: string; clearId: string }>;
-        finishFullHistoryClear(token: { ownerWorkspaceId: string; clearId: string }): Promise<void>;
-      };
-      clearHistoryWithRetiredBashMonitorWakes<T>(
-        workspaceId: string,
-        clear: () => Promise<Result<T>>,
-        options?: { discardUnacceptedOnSuccess?: boolean }
-      ): Promise<Result<T>>;
-    };
-    try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = {
-        beginFullHistoryClear: async (workspaceId) => {
-          order.push("pre");
-          return { ownerWorkspaceId: workspaceId, clearId: "clear" };
-        },
-        finishFullHistoryClear: async () => {
-          order.push("post");
-        },
-      };
-      const truncate = await internal.clearHistoryWithRetiredBashMonitorWakes(
-        "owner",
-        async () => {
-          order.push("truncate");
-          return Ok(undefined);
-        },
-        { discardUnacceptedOnSuccess: false }
-      );
-      expect(truncate.success).toBe(true);
-      expect(order).toEqual(["truncate"]);
-
-      const clear = await internal.clearHistoryWithRetiredBashMonitorWakes(
-        "owner",
-        async () => {
-          order.push("clear");
-          return Ok(undefined);
-        },
-        { discardUnacceptedOnSuccess: true }
-      );
-      expect(clear.success).toBe(true);
-      expect(order).toEqual(["truncate", "pre", "clear", "post"]);
-    } finally {
-      await cleanup();
-    }
-  });
-
-  test("startup schedules reconciliation only for pre-construction registry rows", async () => {
-    const { service, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const internal = service as unknown as {
-      constructedAtMs: number;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-      bashMonitorRegistryStore: {
-        listOwnerWorkspaceIds(): Promise<{ ownerWorkspaceIds: string[]; scanFailed: boolean }>;
-        listAll(workspaceId: string): Promise<Array<{ createdAt: string }>>;
-      };
-      recoverBashMonitorStateAfterRestart(): Promise<void>;
-    };
-    try {
-      internal.constructedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
-      internal.bashMonitorRegistryStore = {
-        listOwnerWorkspaceIds: async () => ({
-          ownerWorkspaceIds: ["old", "new"],
-          scanFailed: false,
-        }),
-        listAll: async (workspaceId) => [
-          {
-            createdAt:
-              workspaceId === "old" ? "2026-08-31T11:59:00.000Z" : "2026-08-31T12:01:00.000Z",
-          },
-        ],
-      };
-
-      await internal.recoverBashMonitorStateAfterRestart();
-      expect(scheduleReconcile).toHaveBeenCalledTimes(1);
-      expect(scheduleReconcile).toHaveBeenCalledWith("old");
-    } finally {
-      await cleanup();
-    }
-  });
-
-  test("busy owners defer reconciliation without queueing a synthetic turn", async () => {
-    const { config, service, cleanup } = await createWakeWiringService();
-    const workspaceId = "busy-wake-owner";
-    await config.addWorkspace("/tmp/busy-wake-project", {
-      id: workspaceId,
-      name: workspaceId,
-      projectName: "busy-wake-project",
-      projectPath: "/tmp/busy-wake-project",
-      runtimeConfig: { type: "local" },
-    });
-    const afterIdle = mock(() => undefined);
-    const onAccepted = mock(() => Promise.resolve());
-    const internal = service as unknown as {
-      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
-      scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
-      dispatchBashMonitorWake(dispatch: {
-        ownerWorkspaceId: string;
-        prompt: string;
-        muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
-        cancelSignal: AbortSignal;
-        onAccepted(): Promise<void>;
-      }): Promise<void>;
-    };
-    try {
-      internal.hasPendingQueuedOrPreparingTurn = () => true;
-      internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
-      await internal.dispatchBashMonitorWake({
-        ownerWorkspaceId: workspaceId,
-        prompt: "wake",
-        muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey: "wake",
-        cancelSignal: new AbortController().signal,
-        onAccepted,
-      });
-      expect(afterIdle).toHaveBeenCalledWith(workspaceId);
-      expect(onAccepted).not.toHaveBeenCalled();
-    } finally {
       await cleanup();
     }
   });
