@@ -142,6 +142,7 @@ interface DerivedSignal {
 }
 
 interface DispatchState {
+  id: string;
   signature: string;
   controller: AbortController;
   signals: readonly DerivedSignal[];
@@ -450,6 +451,10 @@ export class BashMonitorWakeReconciler {
     });
   }
 
+  revive(ownerWorkspaceId: string): void {
+    this.defunctWorkspaces.delete(ownerWorkspaceId);
+  }
+
   private scheduleRetry(ownerWorkspaceId: string): void {
     if (this.defunctWorkspaces.has(ownerWorkspaceId) || this.retryTimers.has(ownerWorkspaceId)) {
       return;
@@ -520,6 +525,7 @@ export class BashMonitorWakeReconciler {
       }
       state.dispatch?.controller.abort();
       const next: DispatchState = {
+        id: randomUUID(),
         signature,
         controller: new AbortController(),
         signals: collected.signals,
@@ -535,7 +541,7 @@ export class BashMonitorWakeReconciler {
         ownerWorkspaceId,
         prompt: buildPrompt(dispatch.signals),
         muxMetadata: buildMetadata(dispatch.signals),
-        dedupeKey: "bash-monitor-wake:" + ownerWorkspaceId,
+        dedupeKey: "bash-monitor-wake:" + ownerWorkspaceId + ":" + dispatch.id,
         cancelSignal: dispatch.controller.signal,
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),

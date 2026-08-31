@@ -2273,18 +2273,36 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     });
   }
 
-  private async recoverBashMonitorStateAfterRestart(): Promise<void> {
+  private async recoverBashMonitorRegistryPass(): Promise<boolean> {
+    let scan: { ownerWorkspaceIds: string[]; scanFailed: boolean };
     try {
-      const scan = await this.bashMonitorRegistryStore.listOwnerWorkspaceIds();
-      for (const ownerWorkspaceId of scan.ownerWorkspaceIds) {
+      scan = await this.bashMonitorRegistryStore.listOwnerWorkspaceIds();
+    } catch (error) {
+      log.debug("Failed to scan bash monitor registry", { error });
+      return true;
+    }
+    let retryNeeded = scan.scanFailed;
+    for (const ownerWorkspaceId of scan.ownerWorkspaceIds) {
+      try {
         const records = await this.bashMonitorRegistryStore.listAll(ownerWorkspaceId);
         if (records.some((record) => Date.parse(record.createdAt) < this.constructedAtMs)) {
           this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
         }
+      } catch (error) {
+        retryNeeded = true;
+        log.debug("Failed to scan bash monitor registry owner", { ownerWorkspaceId, error });
       }
-    } catch (error) {
-      log.debug("Failed to schedule bash monitor restart reconciliation", { error });
     }
+    return retryNeeded;
+  }
+
+  private async recoverBashMonitorStateAfterRestart(): Promise<void> {
+    if (!(await this.recoverBashMonitorRegistryPass())) return;
+    if (!(await this.recoverBashMonitorRegistryPass())) return;
+    const timer = setTimeout(() => {
+      void this.recoverBashMonitorRegistryPass();
+    }, 1_000);
+    timer.unref();
   }
 
   private scheduleBashMonitorWakeReconcile(ownerWorkspaceId: string): void {
@@ -5890,6 +5908,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             { workspaceId, rollbackError }
           );
         }
+        this.bashMonitorWakeReconciler.revive(workspaceId);
         throw error;
       }
       removedFromConfig = true;

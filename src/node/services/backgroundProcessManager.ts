@@ -684,7 +684,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       clearTimeout(monitor.flushTimer);
       monitor.flushTimer = undefined;
     }
-    if (flushPending) {
+    if (reason === "failed") {
+      if (failedMatch?.matchedThroughOffset != null && failedMatch.lines.length > 0) {
+        this.retainMonitorMatch(monitor, {
+          lines: failedMatch.lines,
+          droppedLines: failedMatch.droppedLines,
+          matchedThroughOffset: failedMatch.matchedThroughOffset,
+        });
+      }
+      monitor.pendingLines = [];
+      monitor.droppedLines = 0;
+    } else if (flushPending) {
       this.emitMonitorMatch(proc, monitor);
     } else {
       // Explicit cancellation means the caller no longer wants this condition to produce a wake.
