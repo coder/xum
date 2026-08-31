@@ -59,8 +59,15 @@ import type { AnalyticsService } from "@/node/services/analytics/analyticsServic
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
+import type { WithEffectContext } from "@orpc/experimental-effect";
+import type { OrpcEffectServices } from "@/node/orpc/effectContext";
 
-export interface ORPCContext {
+/**
+ * Effect-migration spike: `WithEffectContext` adds the `"effect/context"` key
+ * carrying the Effect services available to Effect-native handlers (built via
+ * `buildOrpcEffectContext` in the service container).
+ */
+export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   config: Config;
   sessionLocator: WorkspaceSessionLocator;
   providersConfigStore: ProvidersConfigStore;

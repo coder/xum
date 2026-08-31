@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import { Effect, Result } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type * as schemas from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -116,42 +117,75 @@ export async function deleteMemory(
     : { success: false as const, error: result.error };
 }
 
+/**
+ * Effect-migration spike: `setMemoryPinned` converted to `Effect.gen`. The
+ * wire contract (ResultSchema(z.void(), z.string())) is unchanged; the router
+ * runs this via `handlerGen`, and the Promise wrapper below keeps pre-Effect
+ * callers (tests) working. Sidecar write failures arrive as the typed
+ * `MemoryMetaWriteError` and are mapped to the legacy string error channel
+ * instead of escaping as an untyped INTERNAL_SERVER_ERROR rejection.
+ */
+export function setMemoryPinnedEffect(
+  context: MemoryContext,
+  input: Input<typeof schemas.memory.setPinned>
+): Effect.Effect<{ success: true; data: undefined } | { success: false; error: string }> {
+  return Effect.gen(function* () {
+    // Sync ORPCError throw stays a runtime defect and reaches the client as
+    // the same BAD_REQUEST it does today from async handlers.
+    assertMemoryEnabled(context);
+    const resolved = yield* Effect.promise(() =>
+      resolveMemoryScopeContext(context, input.workspaceId)
+    );
+    if (!resolved) return { success: false as const, error: workspaceNotFound(input.workspaceId) };
+    const parsedResult = yield* Effect.result(
+      Effect.try({
+        try: () => parseMemoryPath(input.path),
+        catch: (error) => getErrorMessage(error),
+      })
+    );
+    if (Result.isFailure(parsedResult))
+      return { success: false as const, error: parsedResult.failure };
+    const { scope, relPath } = parsedResult.success;
+    if (scope === null || relPath === "")
+      return { success: false as const, error: "Cannot pin a directory: " + input.path };
+    if (input.workspaceId == null && scope !== "global")
+      return {
+        success: false as const,
+        error:
+          (scope === "project" ? "Project" : "Workspace") +
+          " memory is unavailable: no workspace is associated with this request",
+      };
+    if (scope === "project" && resolved.projectPath === "")
+      return {
+        success: false as const,
+        error: "Project memory is unavailable: no project is associated with this session",
+      };
+    return yield* context.memoryMetaService.effects
+      .setPinned(
+        memoryLogicalKey(scope, relPath, {
+          projectPath: resolved.projectPath,
+          workspaceId: input.workspaceId ?? "",
+        }),
+        input.pinned
+      )
+      .pipe(
+        Effect.map(() => ({ success: true as const, data: undefined })),
+        Effect.catchTag("MemoryMetaWriteError", (error) =>
+          Effect.succeed({
+            success: false as const,
+            error: `Failed to persist pin state: ${error.reason}`,
+          })
+        )
+      );
+  });
+}
+
+/** Promise facade over {@link setMemoryPinnedEffect} for pre-Effect callers. */
 export async function setMemoryPinned(
   context: MemoryContext,
   input: Input<typeof schemas.memory.setPinned>
 ) {
-  assertMemoryEnabled(context);
-  const resolved = await resolveMemoryScopeContext(context, input.workspaceId);
-  if (!resolved) return { success: false as const, error: workspaceNotFound(input.workspaceId) };
-  let parsed: ReturnType<typeof parseMemoryPath>;
-  try {
-    parsed = parseMemoryPath(input.path);
-  } catch (error) {
-    return { success: false as const, error: getErrorMessage(error) };
-  }
-  const { scope, relPath } = parsed;
-  if (scope === null || relPath === "")
-    return { success: false as const, error: "Cannot pin a directory: " + input.path };
-  if (input.workspaceId == null && scope !== "global")
-    return {
-      success: false as const,
-      error:
-        (scope === "project" ? "Project" : "Workspace") +
-        " memory is unavailable: no workspace is associated with this request",
-    };
-  if (scope === "project" && resolved.projectPath === "")
-    return {
-      success: false as const,
-      error: "Project memory is unavailable: no project is associated with this session",
-    };
-  await context.memoryMetaService.setPinned(
-    memoryLogicalKey(scope, relPath, {
-      projectPath: resolved.projectPath,
-      workspaceId: input.workspaceId ?? "",
-    }),
-    input.pinned
-  );
-  return { success: true as const, data: undefined };
+  return Effect.runPromise(setMemoryPinnedEffect(context, input));
 }
 
 export async function getMemoryConsolidationStatus(

@@ -8,6 +8,7 @@ import {
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
+import { handlerGen } from "@orpc/experimental-effect";
 import {
   assertMemoryEnabled,
   consolidateMemory,
@@ -16,8 +17,9 @@ import {
   listMemory,
   readMemory,
   saveMemory,
-  setMemoryPinned,
+  setMemoryPinnedEffect,
 } from "@/node/services/memoryOperations";
+import { effectSpike } from "@/node/orpc/effectSpike";
 import {
   controlBrowser,
   getBrowserBootstrap,
@@ -1150,10 +1152,16 @@ export const router = (authToken?: string) => {
         .input(schemas.memory.delete.input)
         .output(schemas.memory.delete.output)
         .handler(({ context, input }) => deleteMemory(context, input)),
+      // Effect-migration spike: this handler runs an Effect generator via
+      // handlerGen; the wire contract is unchanged.
       setPinned: t
         .input(schemas.memory.setPinned.input)
         .output(schemas.memory.setPinned.output)
-        .handler(({ context, input }) => setMemoryPinned(context, input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* setMemoryPinnedEffect(context, input);
+          })
+        ),
       consolidationStatus: t
         .input(schemas.memory.consolidationStatus.input)
         .output(schemas.memory.consolidationStatus.output)
@@ -1172,6 +1180,8 @@ export const router = (authToken?: string) => {
           )
         ),
     },
+    // Effect-migration spike namespace (see src/node/orpc/effectSpike.ts).
+    effectSpike,
     refinements: {
       // /refine trajectory distillation (RLM r11). Gating lives in the
       // service: it refuses when the rlm-mode machine overrides are off.

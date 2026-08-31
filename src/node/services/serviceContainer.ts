@@ -81,6 +81,7 @@ import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { ORPCContext } from "@/node/orpc/context";
+import { buildOrpcEffectContext } from "@/node/orpc/effectContext";
 /**
  * ServiceContainer - Central dependency container for all backend services.
  *
@@ -645,6 +646,9 @@ export class ServiceContainer {
    */
   toORPCContext(): Omit<ORPCContext, "headers"> {
     return {
+      // Effect-migration spike: pre-built Effect service context consumed by
+      // Effect-native oRPC handlers (see src/node/orpc/effectContext.ts).
+      "effect/context": buildOrpcEffectContext({ memoryMetaService: this.memoryMetaService }),
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
       sessionLocator: this.sessionLocator,
