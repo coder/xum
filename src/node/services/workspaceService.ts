@@ -2151,9 +2151,35 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
+    // Narrow WorkspaceService test doubles construct partial manager stubs (see the
+    // typeof guard on subscriptions below); a missing method reads as "no live monitor
+    // state" so shared paths like history clear still reconcile instead of crashing.
+    const monitorManager = this.backgroundProcessManager;
     this.bashMonitorWakeReconciler = new BashMonitorWakeReconciler({
       sessionsDir: config.sessionsDir,
-      processManager: this.backgroundProcessManager,
+      processManager: {
+        pullMonitorWakeSignals: (ownerWorkspaceId) =>
+          typeof monitorManager.pullMonitorWakeSignals === "function"
+            ? monitorManager.pullMonitorWakeSignals(ownerWorkspaceId)
+            : Promise.resolve([]),
+        getMonitorWakeDeliveryState: (processId, originNotAfterMs) =>
+          typeof monitorManager.getMonitorWakeDeliveryState === "function"
+            ? monitorManager.getMonitorWakeDeliveryState(processId, originNotAfterMs)
+            : Promise.resolve(undefined),
+        acknowledgeMonitorWake: (processId, originNotAfterMs, matchedThroughOffset, settledAt) =>
+          typeof monitorManager.acknowledgeMonitorWake === "function"
+            ? monitorManager.acknowledgeMonitorWake(
+                processId,
+                originNotAfterMs,
+                matchedThroughOffset,
+                settledAt
+              )
+            : undefined,
+        dropRetiredMonitor: (processId) =>
+          typeof monitorManager.dropRetiredMonitor === "function"
+            ? monitorManager.dropRetiredMonitor(processId)
+            : undefined,
+      },
       registry: this.bashMonitorRegistryStore,
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
