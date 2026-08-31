@@ -2688,6 +2688,56 @@ export class HistoryService {
    * @param percentage Percentage to truncate (0.0 to 1.0). 1.0 = delete all
    * @returns Result containing array of deleted historySequence numbers
    */
+  /**
+   * Token-proportional prefix length that truncateHistory removes at this percentage. Messages
+   * are stringified whole for counting; only relative weights matter.
+   */
+  private async computeTruncationRemoveCount(
+    messages: MuxMessage[],
+    percentage: number
+  ): Promise<number> {
+    const tokenizer = await getTokenizerForModel(KNOWN_MODELS.SONNET.id);
+    const messageTokens = await Promise.all(
+      messages.map((msg) => tokenizer.countTokens(safeStringifyForCounting(msg)))
+    );
+    const totalTokens = messageTokens.reduce((sum, tokens) => sum + tokens, 0);
+    const tokensToRemove = Math.floor(totalTokens * percentage);
+    let tokensRemoved = 0;
+    let removeCount = 0;
+    for (const tokens of messageTokens) {
+      if (tokensRemoved >= tokensToRemove) {
+        break;
+      }
+      tokensRemoved += tokens;
+      removeCount++;
+    }
+    return removeCount;
+  }
+
+  /**
+   * Preflight for truncateHistory: whether this percentage takes the full-delete fast path and
+   * removes every message. The requested percentage alone cannot distinguish an emptying
+   * truncation from a partial one, and callers that must apply full-clear semantics before the
+   * rewrite commits (workspaceService retires kernel workflow run references) need the answer
+   * up front.
+   */
+  async willTruncateHistoryRemoveAllMessages(
+    workspaceId: string,
+    percentage: number
+  ): Promise<boolean> {
+    if (percentage >= 1.0) {
+      return true;
+    }
+    const archivedMessages = await this.readArchivedHistory(workspaceId);
+    const chatMessages = await this.readChatHistory(workspaceId);
+    const messages = [...archivedMessages, ...chatMessages];
+    if (messages.length === 0) {
+      return false;
+    }
+    const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
+    return removeCount >= messages.length;
+  }
+
   async truncateHistory(
     workspaceId: string,
     percentage: number
@@ -2717,32 +2767,7 @@ export class HistoryService {
             return Ok([]); // Nothing to truncate
           }
 
-          // Get tokenizer for counting (use a default model)
-          const tokenizer = await getTokenizerForModel(KNOWN_MODELS.SONNET.id);
-
-          // Count tokens for each message
-          // We stringify the entire message for simplicity - only relative weights matter
-          const messageTokens: Array<{ message: MuxMessage; tokens: number }> = await Promise.all(
-            messages.map(async (msg) => {
-              const tokens = await tokenizer.countTokens(safeStringifyForCounting(msg));
-              return { message: msg, tokens };
-            })
-          );
-
-          // Calculate total tokens and target to remove
-          const totalTokens = messageTokens.reduce((sum, mt) => sum + mt.tokens, 0);
-          const tokensToRemove = Math.floor(totalTokens * percentage);
-
-          // Remove messages from beginning until we've removed enough tokens
-          let tokensRemoved = 0;
-          let removeCount = 0;
-          for (const mt of messageTokens) {
-            if (tokensRemoved >= tokensToRemove) {
-              break;
-            }
-            tokensRemoved += mt.tokens;
-            removeCount++;
-          }
+          const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
 
           // No-op truncation (percentage 0 or rounding to zero tokens) must not
           // rewrite anything — collapsing the archive back into chat.jsonl would

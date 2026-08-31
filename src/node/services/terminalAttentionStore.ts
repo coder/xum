@@ -161,18 +161,24 @@ export class TerminalAttentionStore {
     if (existing != null) {
       return;
     }
-    await this.write({
-      id,
-      ownerWorkspaceId: notification.ownerWorkspaceId,
-      sourceKind: notification.sourceKind,
-      sourceId: notification.sourceId,
-      generationId: notification.generationId,
-      outputDelivery: outputDeliveryForSource(notification.sourceKind),
-      terminalOutcome: notification.terminalOutcome,
-      status: notification.status,
-      createdAt: new Date().toISOString(),
-      ...(notification.status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
-    });
+    await this.write(
+      {
+        id,
+        ownerWorkspaceId: notification.ownerWorkspaceId,
+        sourceKind: notification.sourceKind,
+        sourceId: notification.sourceId,
+        generationId: notification.generationId,
+        outputDelivery: outputDeliveryForSource(notification.sourceKind),
+        terminalOutcome: notification.terminalOutcome,
+        status: notification.status,
+        createdAt: new Date().toISOString(),
+        ...(notification.status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+      },
+      // Settlement markers are re-derivable dedupe over run + history evidence, and reconcilers
+      // write them while workspace removal may be deleting the session directory: never mkdir
+      // the owner dir back into existence for one (orphaned session state); drop it instead.
+      { createOwnerDir: false }
+    );
   }
 
   async get(ownerWorkspaceId: string, id: string): Promise<TerminalAttentionNotification | null> {
@@ -267,9 +273,31 @@ export class TerminalAttentionStore {
     });
   }
 
-  private async write(record: TerminalAttentionNotification): Promise<void> {
+  private async write(
+    record: TerminalAttentionNotification,
+    options?: { createOwnerDir?: boolean }
+  ): Promise<void> {
     const dir = this.dir(record.ownerWorkspaceId);
-    await fsPromises.mkdir(dir, { recursive: true });
+    if (options?.createOwnerDir === false) {
+      try {
+        // Non-recursive: creates only the terminal-attention subdir under an owner session dir
+        // that still exists; a missing parent means the owner was removed.
+        await fsPromises.mkdir(dir);
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          log.debug("Dropping terminal attention write for removed owner session dir", {
+            ownerWorkspaceId: record.ownerWorkspaceId,
+            id: record.id,
+          });
+          return;
+        }
+        if (!isErrnoWithCode(error, "EEXIST")) {
+          throw error;
+        }
+      }
+    } else {
+      await fsPromises.mkdir(dir, { recursive: true });
+    }
     await fsPromises.writeFile(
       this.file(record.ownerWorkspaceId, record.id),
       JSON.stringify(record, null, 2),

@@ -6186,6 +6186,44 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("a failed settlement marker write never rejects and keeps the queue entry", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { taskService } = createTaskServiceHarness(config);
+    const internal = taskService as unknown as {
+      terminalAttentionStore: TerminalAttentionStore;
+      pendingWorkflowRunAttention: Map<string, Set<string>>;
+    };
+    internal.pendingWorkflowRunAttention.set(parentId, new Set(["wfr_marker_soft_fail"]));
+    const settleSpy = spyOn(internal.terminalAttentionStore, "recordSettled")
+      // Lazy rejection: an eager mockRejectedValueOnce promise trips bun's unhandled-rejection
+      // detector on this host before the call consumes it.
+      .mockImplementationOnce(() => Promise.reject(new Error("EACCES: marker dir unwritable")));
+
+    const settleParams = {
+      ownerWorkspaceId: parentId,
+      runId: "wfr_marker_soft_fail",
+      status: "completed" as const,
+      runUpdatedAt: "2026-06-19T00:00:03.000Z",
+      settledAs: "delivered" as const,
+    };
+    try {
+      // Marker I/O must stay contained (workflow_resume/task_await return durable results
+      // through this call), and the queue entry must survive so the next drain re-attempts.
+      await taskService.markWorkflowRunTerminalAttentionSettled(settleParams);
+      expect(internal.pendingWorkflowRunAttention.get(parentId)?.has("wfr_marker_soft_fail")).toBe(
+        true
+      );
+
+      await taskService.markWorkflowRunTerminalAttentionSettled(settleParams);
+      expect(internal.pendingWorkflowRunAttention.get(parentId)?.has("wfr_marker_soft_fail")).toBe(
+        false
+      );
+    } finally {
+      settleSpy.mockRestore();
+    }
+  });
+
   test("workflow wake restriction recovery stops at a context reset boundary", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

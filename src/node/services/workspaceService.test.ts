@@ -9165,6 +9165,62 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("a partial truncation that empties history retires kernel workflow references", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-partial-empty";
+    const runId = "wfr_currentness_partial_empty";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-partial-empty",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "single short message", { timestamp: 1_200 })
+      );
+
+      // Half of a single-message transcript crosses the whole-history removal budget, so the
+      // token-proportional truncation takes historyService's full-delete fast path. The
+      // emptied transcript must retire the null-snapshot reference exactly like an explicit
+      // clear, or the pre-truncation workflow result would read current against the emptied
+      // decision-free history.
+      const truncateResult = await workspaceService.truncateHistory(workspaceId, 0.5);
+      expect(truncateResult.success).toBe(true);
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a delivered coalesced workflow result consumes the kernel run's currentness", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-coalesced";
@@ -10793,9 +10849,15 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/full-clear-sandbox-project",
         runtimeConfig: { type: "local" },
       });
+      // Two similar-size messages: 50% removes only the first, keeping the truncation genuinely
+      // partial (a one-message 50% empties history and routes as a full clear).
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user-b", "user", "still here", {})
       );
       const discardSpy = spyOn(sandboxHostService, "discardScope").mockImplementation(() =>
         Promise.resolve()
@@ -10847,9 +10909,15 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/clear-drains-refine-project",
         runtimeConfig: { type: "local" },
       });
+      // Two similar-size messages keep the 50% truncation genuinely partial (see the sandbox
+      // discard test above).
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user-b", "user", "still here", {})
       );
       const drained: string[] = [];
       workspaceService.setRefinePassCanceller({

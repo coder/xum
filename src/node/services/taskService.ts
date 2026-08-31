@@ -7855,14 +7855,28 @@ export class TaskService implements AgentTaskIntegration {
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
-    await this.terminalAttentionStore.recordSettled({
-      ownerWorkspaceId: params.ownerWorkspaceId,
-      sourceKind: "workflow_run",
-      sourceId: params.runId,
-      generationId: params.runUpdatedAt,
-      terminalOutcome: terminalAttentionOutcome(params.status),
-      status: params.settledAs,
-    });
+    try {
+      await this.terminalAttentionStore.recordSettled({
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        sourceKind: "workflow_run",
+        sourceId: params.runId,
+        generationId: params.runUpdatedAt,
+        terminalOutcome: terminalAttentionOutcome(params.status),
+        status: params.settledAs,
+      });
+    } catch (error: unknown) {
+      // Contain marker I/O here so no caller fails on bookkeeping: workflow_resume and
+      // task_await must still return the run's durable result, and the drain must move on to
+      // its other candidates. Keep the queue entry so the next drain re-evaluates from run +
+      // history evidence and re-attempts the marker; at worst a truthful wake re-delivers.
+      log.warn("Failed to record workflow terminal settlement marker", {
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        runId: params.runId,
+        settledAs: params.settledAs,
+        error,
+      });
+      return;
+    }
     this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId)?.delete(params.runId);
   }
 
@@ -8714,24 +8728,15 @@ export class TaskService implements AgentTaskIntegration {
         await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
       }
       for (const candidate of selectedWorkflowPrompts) {
-        try {
-          await this.markWorkflowRunTerminalAttentionSettled({
-            ownerWorkspaceId,
-            runId: candidate.runId,
-            status: candidate.run.status,
-            runUpdatedAt: candidate.run.updatedAt,
-            settledAs: "delivered",
-          });
-        } catch (error: unknown) {
-          // Best-effort: the delivered wake itself is durable history evidence, so the next
-          // evaluation settles this run as consumed and re-attempts the marker.
-          log.warn("Failed to record delivered workflow wake marker", {
-            ownerWorkspaceId,
-            runId: candidate.runId,
-            error,
-          });
-          this.pendingWorkflowRunAttention.get(ownerWorkspaceId)?.delete(candidate.runId);
-        }
+        // Marker failures are contained inside the settle method; the delivered wake itself is
+        // durable history evidence, so the next evaluation settles this run as consumed.
+        await this.markWorkflowRunTerminalAttentionSettled({
+          ownerWorkspaceId,
+          runId: candidate.runId,
+          status: candidate.run.status,
+          runUpdatedAt: candidate.run.updatedAt,
+          settledAs: "delivered",
+        });
       }
     };
 

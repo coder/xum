@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -55,6 +56,33 @@ describe("TerminalAttentionStore", () => {
 
     const pending = await store.listPending("owner-1");
     expect(pending.map((n) => n.sourceId)).toEqual(["wst_abc"]);
+  });
+
+  test("recordSettled never recreates a removed owner session dir", async () => {
+    const config = makeConfig(rootDir);
+    const store = new TerminalAttentionStore(config);
+    const settled = {
+      sourceKind: "workflow_run" as const,
+      sourceId: "wfr_removed",
+      generationId: "2026-06-19T00:00:03.000Z",
+      terminalOutcome: "completed" as const,
+      status: "superseded" as const,
+    };
+
+    // No session dir: a workspace removal racing an in-flight drain settlement. The marker is
+    // re-derivable dedupe, so it must be dropped rather than resurrecting orphaned session
+    // state.
+    await store.recordSettled({ ...settled, ownerWorkspaceId: "owner-removed" });
+    expect(existsSync(config.getSessionDir("owner-removed"))).toBe(false);
+
+    // A live owner still gets the terminal-attention subdir created and the marker written.
+    await fsPromises.mkdir(config.getSessionDir("owner-live"), { recursive: true });
+    await store.recordSettled({ ...settled, ownerWorkspaceId: "owner-live" });
+    const record = await store.get(
+      "owner-live",
+      TerminalAttentionStore.notificationId("workflow_run", "wfr_removed", settled.generationId)
+    );
+    expect(record?.status).toBe("superseded");
   });
 
   test("loads pending notifications written with legacy derived fields", async () => {

@@ -12825,7 +12825,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
     const effectivePercentage = percentage ?? 1.0;
-    const isFullClear = effectivePercentage >= 1.0;
+    // A token-proportional truncation below 100% still empties the transcript when the removal
+    // budget reaches the final message (historyService's full-delete fast path), and an emptied
+    // transcript carries every full-clear hazard: most critically, a kernel workflow reference
+    // with a verified-empty (null) boundary snapshot reads decision-free history as current, so
+    // a surviving reference could wake a pre-truncation workflow result into the cleared
+    // conversation. Decide up front and route emptying truncations through the full-clear path
+    // (admission guard, refine drain, reference retirement). A preflight read failure counts as
+    // emptying: the guarded path fails safe (references retired first, wakes dropped but
+    // resumable) even if the truncation itself later fails.
+    const isFullClear =
+      effectivePercentage >= 1.0 ||
+      (effectivePercentage > 0 &&
+        (await this.historyService
+          .willTruncateHistoryRemoveAllMessages(workspaceId, effectivePercentage)
+          .catch((error: unknown) => {
+            log.warn("History truncation emptiness preflight failed; treating as full clear", {
+              workspaceId,
+              error,
+            });
+            return true;
+          })));
     // A full clear holds the admission guard across the refine drain/lock
     // awaits below: without it, a send admitted during those awaits could
     // snapshot the pre-clear transcript and stream across the truncation,
