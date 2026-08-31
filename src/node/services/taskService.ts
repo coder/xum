@@ -8317,6 +8317,57 @@ export class TaskService implements AgentTaskIntegration {
     this.pendingTerminalAttentionDrains.add(promise);
   }
 
+  /**
+   * Last-moment revalidation for an already-materialized workflow prompt candidate. The
+   * composed prompt retains the run snapshot captured at derivation, and invocation
+   * currentness alone (conversation evidence) misses two hazards that arrive without
+   * touching history or owner busy-ness:
+   * - the run's generation can change (a Workflows UI resume/retry flips it back to running;
+   *   a kernel resume can complete a NEWER generation), so the retained prompt would deliver
+   *   a stale result as if final;
+   * - a kernel-nested task_await can consume this generation, writing only the settlement
+   *   marker, so resending would replay output the conversation already handled.
+   * "superseded" settles the candidate; "defer" leaves its queue entry pending so a later
+   * drain re-derives from the then-current run record and markers.
+   */
+  private async revalidateWorkflowPromptForDispatch(
+    ownerWorkspaceId: string,
+    candidate: { runId: string; run: WorkflowRunRecord }
+  ): Promise<"deliverable" | "superseded" | "defer"> {
+    const currentness = await this.workspaceService
+      .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
+      .catch(() => "indeterminate" as const);
+    if (currentness !== "current") {
+      return currentness === "not_current" ? "superseded" : "defer";
+    }
+    try {
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
+      });
+      const currentRun = await runStore.getRun(candidate.runId);
+      if (
+        currentRun.status !== candidate.run.status ||
+        currentRun.updatedAt !== candidate.run.updatedAt
+      ) {
+        return "defer";
+      }
+      const settledMarker = await this.terminalAttentionStore.get(
+        ownerWorkspaceId,
+        TerminalAttentionStore.notificationId(
+          "workflow_run",
+          candidate.runId,
+          candidate.run.updatedAt
+        )
+      );
+      if (settledMarker != null) {
+        return "defer";
+      }
+    } catch {
+      return "defer";
+    }
+    return "deliverable";
+  }
+
   private async buildWorkflowTerminalPrompt(
     ownerWorkspaceId: string,
     runId: string
@@ -8960,7 +9011,7 @@ export class TaskService implements AgentTaskIntegration {
           this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
         }
       }
-      // Resolve the send identity before the currentness reread so the reread stays the last
+      // Resolve the send identity before the revalidation reread so the reread stays the last
       // await before dispatch: a history clear that completes during this history and
       // agent-settings read retires the sidecar, and a reread taken before it would go stale
       // and inject the pre-clear result into the freshly cleared conversation.
@@ -8970,19 +9021,17 @@ export class TaskService implements AgentTaskIntegration {
         defaultModel,
         groupAgent != null ? { agentId: groupAgent.agentId } : undefined
       );
-      const groupCurrentness = await Promise.all(
+      const groupRevalidation = await Promise.all(
         groupCandidates.map((candidate) =>
-          this.workspaceService
-            .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
-            .catch(() => "indeterminate" as const)
+          this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
         )
       );
       const groupCurrent: typeof deliverableWorkflowPrompts = [];
       groupCandidates.forEach((candidate, index) => {
-        const currentness = groupCurrentness[index];
-        if (currentness === "current") {
+        const verdict = groupRevalidation[index];
+        if (verdict === "deliverable") {
           groupCurrent.push(candidate);
-        } else if (currentness === "not_current") {
+        } else if (verdict === "superseded") {
           supersededWorkflowPrompts.push(candidate);
         }
       });
@@ -9165,19 +9214,20 @@ export class TaskService implements AgentTaskIntegration {
         // Security: the composed prompt retains the pre-check workflow results, and this
         // fallback send omits requireIdle, so its epoch snapshot postdates any clear or reset
         // that completed during the awaited checks above and the clear guard would accept the
-        // stale injection into the fresh context. Reread currentness so the fallback keeps
-        // the primary path's contract (no awaits between revalidation and delivery); any
-        // non-current candidate aborts toward a fresh drain that re-derives, and the queue
-        // entries survive for it.
+        // stale injection into the fresh context. The busy race the primary send just lost
+        // may also have been a competing owner turn consuming these very results through
+        // kernel-nested task_await (settlement marker only, no history evidence) or a
+        // Workflows UI resume changing the run generation. Revalidate everything so the
+        // fallback keeps the primary path's contract (no awaits between revalidation and
+        // delivery); any stale candidate aborts toward a fresh drain that re-derives, and
+        // the queue entries survive for it.
         if (currentWorkflowPrompts.length > 0) {
-          const fallbackCurrentness = await Promise.all(
+          const fallbackRevalidation = await Promise.all(
             currentWorkflowPrompts.map((candidate) =>
-              this.workspaceService
-                .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
-                .catch(() => "indeterminate" as const)
+              this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
             )
           );
-          if (fallbackCurrentness.some((currentness) => currentness !== "current")) {
+          if (fallbackRevalidation.some((verdict) => verdict !== "deliverable")) {
             log.debug("Terminal wake busy fallback aborted; workflow candidates went stale", {
               ownerWorkspaceId,
             });

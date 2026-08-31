@@ -6425,6 +6425,151 @@ describe("TaskService", () => {
     expect(marker?.status).toBe("superseded");
   });
 
+  test("a run generation change after prompt derivation defers the wake instead of delivering", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_dispatch_generation_drift";
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "failed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void, SendMessageError>> =>
+        Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // A Workflows UI retry flips the run back to running (a NEW generation) after the prompt
+    // snapshot is taken, without touching history or owner busy-ness: model it inside the
+    // derivation-time currentness read so the materialized candidate retains the failed
+    // generation while the run record has already moved on.
+    let retried = false;
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(async () => {
+        if (!retried) {
+          retried = true;
+          await runStore.appendStatus(runId, "running", "2026-06-19T00:00:05.000Z", {
+            allowFailedCheckpointRetry: true,
+          });
+        }
+        return "current" as const;
+      });
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    const pending = (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention;
+    pending.set(parentId, new Set([runId]));
+
+    await (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // The pre-dispatch revalidation sees the changed generation and defers: the retained
+    // prompt would present the superseded failed result as final. The queue entry survives
+    // so the resumed run's next terminal transition (or the sweep) re-derives.
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(pending.get(parentId)?.has(runId)).toBe(true);
+  });
+
+  test("a kernel-consumed generation during the busy fallback is not redelivered", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_busy_fallback_consumed";
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    const run = await runStore.getRun(runId);
+
+    // The busy race the idle-only send loses IS a competing owner turn consuming this very
+    // generation through kernel-nested task_await: that consumption writes only the
+    // settlement marker (no history evidence, owner idle again afterwards).
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const sendMessage = mock(
+      async (..._args: unknown[]): Promise<Result<void, SendMessageError>> => {
+        const internal = _args[3] as { requireIdle?: boolean } | undefined;
+        if (internal?.requireIdle === true) {
+          await terminalAttentionStore.recordSettled({
+            ownerWorkspaceId: parentId,
+            sourceKind: "workflow_run",
+            sourceId: runId,
+            generationId: run.updatedAt,
+            terminalOutcome: "completed",
+            status: "delivered",
+          });
+          return Err({ type: "unknown", raw: "Workspace is busy; idle-only send was skipped." });
+        }
+        return Ok(undefined);
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    const pending = (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention;
+    pending.set(parentId, new Set([runId]));
+
+    await (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // Only the rejected idle-only attempt: the fallback's settlement-marker recheck sees the
+    // consumption and aborts instead of replaying the result without requireIdle. The
+    // re-poked drain then drops the consumed candidate from the queue.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect((sendMessage.mock.calls[0]?.[3] as { requireIdle?: boolean })?.requireIdle).toBe(true);
+    const marker = await terminalAttentionStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+    );
+    expect(marker?.status).toBe("delivered");
+    expect(pending.get(parentId)?.has(runId) ?? false).toBe(false);
+  });
+
   test("a newer generation's settlement refreshes a surviving stale stable marker", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

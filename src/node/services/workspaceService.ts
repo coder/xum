@@ -9548,15 +9548,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Ok(undefined);
       }
 
-      // Archived owners park workflow terminal wakes unsettled; reconcile now so an idle
-      // workspace does not stay silent until the interval sweep. Contained: reconciliation
-      // failure must not fail the unarchive (the sweep retries on its own cadence).
-      try {
-        await this.agentTaskIntegration?.noteWorkspaceUnarchived(workspaceId);
-      } catch (error: unknown) {
-        log.warn("Unarchive workflow attention reconciliation failed", { workspaceId, error });
-      }
-
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
@@ -9635,6 +9626,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         projects: hookMetadata?.projects,
         subProjectPath: hookMetadata?.subProjectPath,
       });
+
+      // Archived owners park workflow terminal wakes unsettled; reconcile so an idle
+      // workspace does not stay silent until the interval sweep. Only AFTER snapshot
+      // restoration and lifecycle startup above: the drain can admit a synthetic agent turn,
+      // which must not run against a half-restored checkout or precede a failed restoration's
+      // config rollback. Contained: reconciliation failure must not fail the unarchive (the
+      // sweep retries on its own cadence).
+      try {
+        await this.agentTaskIntegration?.noteWorkspaceUnarchived(workspaceId);
+      } catch (error: unknown) {
+        log.warn("Unarchive workflow attention reconciliation failed", { workspaceId, error });
+      }
 
       return Ok(undefined);
     } catch (error) {
@@ -12861,6 +12864,33 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
     const effectivePercentage = percentage ?? 1.0;
+    // The admission guard is acquired BEFORE the scope preflight and held across every await
+    // below: a turn admitted during any of them could snapshot the pre-truncation transcript
+    // and stream across the mutation, and one admitted during the preflight itself could
+    // launch a kernel workflow whose sidecar reference the wholesale retirement below would
+    // delete while its launch turn's rows survive the prefix cut, permanently suppressing
+    // that run's wake. The preflight cannot yet prove scope "none", so every request that
+    // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
+    // no-op that retires nothing and keeps the plain busy pre-check.
+    let admissionGuard: Disposable | null = null;
+    if (effectivePercentage > 0) {
+      const guardResult = this.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "truncate history"
+      );
+      if (!guardResult.success) {
+        return Err(guardResult.error);
+      }
+      admissionGuard = guardResult.data;
+    } else if (
+      this.sessions.get(workspaceId)?.isBusy() ||
+      this.aiService.isStreaming(workspaceId)
+    ) {
+      return Err(
+        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+      );
+    }
+    using _admissionGuard = admissionGuard;
     // A token-proportional truncation below 100% can remove nothing (budget rounds to zero),
     // a proper prefix, or everything (historyService's full-delete fast path), and each scope
     // carries different obligations: an emptied transcript needs every full-clear guard, a
@@ -12891,31 +12921,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Err("Failed to read history to classify the truncation scope. Try again.");
     }
     const isFullClear = truncationScope === "all";
-    // Every row-removing truncation holds the admission guard across its awaits (full clear:
-    // the refine drain/lock below; partial: kernel workflow reference retirement): without
-    // it, a send admitted during those awaits could snapshot the pre-truncation transcript
-    // and stream across the mutation, or lose its turn's workflow provenance to the
-    // retirement. Scope "none" keeps the plain pre-check: it retires nothing, and
-    // historyService refuses row-removing drift under the write lock.
-    let admissionGuard: Disposable | null = null;
-    if (truncationScope !== "none") {
-      const guardResult = this.acquireContextMutationAdmissionGuard(
-        workspaceId,
-        "truncate history"
-      );
-      if (!guardResult.success) {
-        return Err(guardResult.error);
-      }
-      admissionGuard = guardResult.data;
-    } else if (
-      this.sessions.get(workspaceId)?.isBusy() ||
-      this.aiService.isStreaming(workspaceId)
-    ) {
-      return Err(
-        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
-      );
-    }
-    using _admissionGuard = admissionGuard;
     const session = this.sessions.get(workspaceId);
 
     // A full clear discards the transcript a streaming refine pass may be
@@ -12975,6 +12980,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(
           `Cannot clear history: stale workflow run references could not be retired ` +
             `(${getErrorMessage(error)}). Retry once the session storage is writable.`
+        );
+      }
+      // In-turn compaction retries bypass admission gating across a transient idle gap (see
+      // the full-clear recheck above), and this retirement is the last await before the
+      // rewrite for BOTH row-removing scopes: revalidate here or a retry admitted during it
+      // would have its history truncated underneath the stream. Refusing after retirement is
+      // the documented fail-safe direction (dropped wake, retrievable via resume).
+      if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+        return Err(
+          "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
         );
       }
     }

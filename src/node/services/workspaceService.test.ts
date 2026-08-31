@@ -9474,6 +9474,149 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("the admission guard is held across the truncation scope preflight", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-preflight-guard";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-preflight-guard",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+      for (let i = 0; i < 6; i++) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`manual-user-${i}`, "user", `padding message ${i}`, {
+            timestamp: 1_200 + i,
+          })
+        );
+      }
+
+      // A turn admitted during the preflight could launch a kernel workflow whose sidecar
+      // reference the wholesale retirement deletes while its rows survive the prefix cut,
+      // permanently suppressing that run's wake. Admission must therefore already be held
+      // while the classification snapshot is read: park the preflight and prove a concurrent
+      // context mutation is refused for the whole window.
+      let releasePreflight: ((scope: "partial") => void) | undefined;
+      const preflightGate = new Promise<"partial">((resolve) => {
+        releasePreflight = resolve;
+      });
+      const preflightSpy = spyOn(
+        historyService,
+        "classifyTruncationRemoval"
+      ).mockImplementationOnce(() => preflightGate);
+      try {
+        const first = workspaceService.truncateHistory(workspaceId, 0.5);
+        const second = await workspaceService.truncateHistory(workspaceId, 1.0);
+        expect(second.success).toBe(false);
+        if (!second.success) {
+          expect(second.error).toContain("already in progress");
+        }
+        releasePreflight?.("partial");
+        const firstResult = await first;
+        expect(firstResult.success).toBe(true);
+      } finally {
+        preflightSpy.mockRestore();
+      }
+      // The refused full clear touched nothing: the prefix cut left a suffix behind.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.length).toBeGreaterThan(0);
+      }
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a turn becoming active during reference retirement refuses the truncation", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-retirement-recheck";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-retirement-recheck",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      let streaming = false;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+          isStreaming: mock(() => streaming),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+      for (let i = 0; i < 6; i++) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`manual-user-${i}`, "user", `padding message ${i}`, {
+            timestamp: 1_200 + i,
+          })
+        );
+      }
+
+      // An in-turn compaction retry bypasses admission gating across a transient idle gap,
+      // and the retirement await is the last one before the rewrite: a retry that becomes
+      // active during it must refuse the truncation instead of streaming across it.
+      const retireSpy = spyOn(
+        workspaceService as unknown as {
+          retireKernelWorkflowRunReferences: (id: string) => Promise<void>;
+        },
+        "retireKernelWorkflowRunReferences"
+      ).mockImplementationOnce(() => {
+        streaming = true;
+        return Promise.resolve();
+      });
+      try {
+        const result = await workspaceService.truncateHistory(workspaceId, 0.5);
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("turn is active");
+        }
+      } finally {
+        retireSpy.mockRestore();
+      }
+      // Refused before the rewrite: the transcript is intact.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data).toHaveLength(6);
+      }
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a partial prefix truncation retires kernel workflow references", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-prefix-retire";
@@ -19039,6 +19182,84 @@ describe("WorkspaceService archive snapshots", () => {
     expect(entry?.archivedAt).toBeUndefined();
     expect(entry?.worktreeArchiveSnapshot).toBeUndefined();
     expect(editConfigSpy).toHaveBeenCalledTimes(0);
+  });
+
+  test("unarchive reconciles workflow attention only after snapshot restoration", async () => {
+    const snapshot = {
+      version: 1 as const,
+      capturedAt: "2026-03-30T00:00:00.000Z",
+      stateDirPath: "archive-state",
+      projects: [
+        {
+          projectPath,
+          projectName: "proj",
+          storageKey: "proj",
+          branchName: "ws-archive-snapshot",
+          trunkBranch: "main",
+          baseSha: "base-sha",
+          headSha: "head-sha",
+        },
+      ],
+    };
+    const order: string[] = [];
+    const noteWorkspaceUnarchived = mock((_workspaceId: string) => {
+      order.push("reconcile");
+      return Promise.resolve();
+    });
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ noteWorkspaceUnarchived })
+    );
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Ok(snapshot))),
+      restoreSnapshotAfterUnarchive: mock(() => {
+        order.push("restore");
+        return Promise.resolve(Ok("skipped" as const));
+      }),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    expect((await workspaceService.archive(workspaceId)).success).toBe(true);
+    expect((await workspaceService.unarchive(workspaceId)).success).toBe(true);
+    // The reconciliation drain can admit a synthetic agent turn, which must never run
+    // against a half-restored checkout.
+    expect(order).toEqual(["restore", "reconcile"]);
+  });
+
+  test("a failed snapshot restoration skips workflow attention reconciliation", async () => {
+    const snapshot = {
+      version: 1 as const,
+      capturedAt: "2026-03-30T00:00:00.000Z",
+      stateDirPath: "archive-state",
+      projects: [
+        {
+          projectPath,
+          projectName: "proj",
+          storageKey: "proj",
+          branchName: "ws-archive-snapshot",
+          trunkBranch: "main",
+          baseSha: "base-sha",
+          headSha: "head-sha",
+        },
+      ],
+    };
+    const noteWorkspaceUnarchived = mock((_workspaceId: string) => Promise.resolve());
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ noteWorkspaceUnarchived })
+    );
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Ok(snapshot))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Err("restore failed"))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+
+    expect((await workspaceService.archive(workspaceId)).success).toBe(true);
+    const result = await workspaceService.unarchive(workspaceId);
+    expect(result.success).toBe(false);
+    // The failed restoration rolled the unarchive back; reconciling would admit a synthetic
+    // turn into a workspace that is still archived.
+    expect(noteWorkspaceUnarchived).not.toHaveBeenCalled();
   });
 });
 
