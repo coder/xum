@@ -23769,7 +23769,7 @@ describe("TaskService", () => {
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
-    const correlation = workspaceTurnMuxMetadata(parentId) as const;
+    const correlation = workspaceTurnMuxMetadata(parentId);
 
     await internal.handleStreamEnd({
       type: "stream-end",
@@ -23825,7 +23825,7 @@ describe("TaskService", () => {
     const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
       hasPendingWorkspaceTurnContinuation,
     });
-    const correlation = workspaceTurnMuxMetadata(parentId) as const;
+    const correlation = workspaceTurnMuxMetadata(parentId);
 
     await config.editConfig((cfg) => {
       const project = cfg.projects.get(path.join(rootDir, "repo"));
@@ -26267,7 +26267,7 @@ describe("TaskService", () => {
     const internals = taskService as unknown as {
       workspaceStopsInProgress: Map<string, number>;
       taskHandleStore: {
-        upsertWorkspaceTurn: (record: Record<string, unknown>) => Promise<void>;
+        upsertWorkspaceTurn: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>;
       };
     };
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
