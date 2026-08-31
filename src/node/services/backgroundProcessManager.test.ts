@@ -1559,6 +1559,76 @@ describe("BackgroundProcessManager", () => {
       await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
 
+    it("cancellation after max-events retirement clears retained wake state", async () => {
+      const eventPromise = waitForMonitorMatch(manager);
+      const result = await manager.spawn(runtime, testWorkspaceId, "printf 'READY\n'; sleep 30", {
+        cwd: process.cwd(),
+        displayName: "retired-then-canceled",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 0,
+          maxEvents: 1,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      await eventPromise;
+      expect(
+        manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId)?.match?.lines
+      ).toEqual(["READY"]);
+
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+
+      expect(
+        manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId)?.match
+      ).toBeUndefined();
+    });
+
+    it("acknowledging one flush preserves only later retained batches", async () => {
+      const events: MonitorMatchPayload[] = [];
+      manager.on("monitor:match", (_workspaceId, payload) => events.push(payload));
+      const result = await manager.spawn(
+        runtime,
+        testWorkspaceId,
+        "printf 'BATCH_A\n'; sleep 0.5; printf 'BATCH_B\n'; sleep 30",
+        {
+          cwd: process.cwd(),
+          displayName: "retained-monitor-batches",
+          monitor: { filter: "BATCH_", pattern: /BATCH_/, exclude: false, cooldownMs: 0 },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      for (let attempt = 0; attempt < 80 && events.length < 1; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const first = manager
+        .pullMonitorWakeSignals(testWorkspaceId)
+        .find((snapshot) => snapshot.processId === result.processId);
+      expect(first?.match?.lines).toEqual(["BATCH_A"]);
+      for (let attempt = 0; attempt < 80 && events.length < 2; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      manager.acknowledgeMonitorWake(
+        result.processId,
+        Date.parse(first?.createdAt ?? ""),
+        first?.match?.throughOffset
+      );
+
+      const remaining = manager
+        .pullMonitorWakeSignals(testWorkspaceId)
+        .find((snapshot) => snapshot.processId === result.processId);
+      expect(remaining?.match?.lines).toEqual(["BATCH_B"]);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
+
     describe("settlement wakes", () => {
       it("wakes with a terminal payload when the process exits without any match, before monitor:stopped", async () => {
         // Incident regression (workspace 31d3dfd254): a watcher script exits printing a failure

@@ -70,6 +70,20 @@ describe("BashMonitorRegistryStore", () => {
     expect(records[0].filter).toBe("READY");
   });
 
+  test("remove preserves a newer generation for the same process ID", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    const oldCreatedAt = "2026-08-31T12:00:00.000Z";
+    const newCreatedAt = "2026-08-31T12:01:00.000Z";
+    await store.upsert(armedPayload({ createdAt: oldCreatedAt }));
+    await store.upsert(armedPayload({ createdAt: newCreatedAt, filter: "NEW" }));
+
+    await store.remove("owner-1", "proc-1", oldCreatedAt);
+
+    expect(await store.listAll("owner-1")).toMatchObject([
+      { processId: "proc-1", createdAt: newCreatedAt, filter: "NEW" },
+    ]);
+  });
+
   test("skips malformed records when listing", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);

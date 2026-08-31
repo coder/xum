@@ -87,9 +87,9 @@ describe("BashMonitorWakeReconciler", () => {
       },
       registry: {
         listAll: () => Promise.resolve(rows),
-        remove: (_ownerWorkspaceId, processId) => {
+        remove: (_ownerWorkspaceId, processId, createdAt) => {
           removed.push(processId);
-          rows = rows.filter((row) => row.processId !== processId);
+          rows = rows.filter((row) => row.processId !== processId || row.createdAt !== createdAt);
         },
         recordTerminal: () => undefined,
       },
@@ -386,6 +386,7 @@ describe("BashMonitorWakeReconciler", () => {
   test("settlement excludes tail lines already covered by the delivered match watermark", async () => {
     live = [
       liveSnapshot({
+        filter: "SET_",
         match: {
           throughOffset: 18,
           lines: ["SET_1", "SET_2", "SET_3"],
@@ -398,6 +399,7 @@ describe("BashMonitorWakeReconciler", () => {
 
     live = [
       liveSnapshot({
+        filter: "SET_",
         match: undefined,
         terminal: {
           status: "exited",
@@ -427,6 +429,7 @@ describe("BashMonitorWakeReconciler", () => {
   test("settlement keeps only the undelivered match before one composed marker", async () => {
     live = [
       liveSnapshot({
+        filter: "TICK_",
         match: { throughOffset: 7, lines: ["TICK_1"], totalMatches: 1 },
       }),
     ];
@@ -435,6 +438,7 @@ describe("BashMonitorWakeReconciler", () => {
 
     live = [
       liveSnapshot({
+        filter: "TICK_",
         match: {
           throughOffset: 14,
           lines: ["TICK_2", "[monitor] process settled: exited (code 0)"],
@@ -554,6 +558,132 @@ describe("BashMonitorWakeReconciler", () => {
 
     await restarted.reconcile(OWNER);
     expect(afterRestart).toEqual([]);
+  });
+
+  test("accepted stale generation does not remove a re-armed registry row", async () => {
+    rows = [registryRecord()];
+    await reconciler.reconcile(OWNER);
+    rows = [
+      {
+        ...registryRecord(),
+        createdAt: "2026-08-31T12:10:00.000Z",
+        filter: "NEW",
+      },
+    ];
+
+    await dispatches[0].onAccepted();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].createdAt).toBe("2026-08-31T12:10:00.000Z");
+  });
+
+  test("runtime failure combines retained and final matched output once", async () => {
+    live = [
+      liveSnapshot({
+        match: { throughOffset: 10, lines: ["EARLIER"], totalMatches: 1 },
+        lost: {
+          reason: "runtime-failure",
+          failedMatch: {
+            lines: ["FINAL"],
+            totalMatches: 2,
+            droppedLines: 0,
+            matchedThroughOffset: 20,
+          },
+          failedAt: "2026-08-31T12:11:00.000Z",
+        },
+        retired: true,
+      }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches[0].prompt.match(/EARLIER/g)).toHaveLength(1);
+    expect(dispatches[0].prompt.match(/FINAL/g)).toHaveLength(1);
+  });
+
+  test("retries a failed reconcile pass without another process event", async () => {
+    let pulls = 0;
+    const retryDispatches: BashMonitorWakeDispatch[] = [];
+    const retrying = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => {
+          pulls++;
+          if (pulls === 1) throw new Error("transient read failure");
+          return [liveSnapshot()];
+        },
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve([]),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      onWake: (dispatch) => {
+        retryDispatches.push(dispatch);
+        return "in-flight";
+      },
+    });
+
+    retrying.scheduleReconcile(OWNER);
+    for (let attempt = 0; attempt < 30 && retryDispatches.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(pulls).toBe(2);
+    expect(retryDispatches).toHaveLength(1);
+  });
+
+  test("keeps unmatched settlement context before a delivered match", async () => {
+    live = [
+      liveSnapshot({
+        filter: "DONE",
+        match: { throughOffset: 20, lines: ["DONE"], totalMatches: 1 },
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+    await dispatches[0].onAccepted();
+
+    live = [
+      liveSnapshot({
+        filter: "DONE",
+        match: undefined,
+        terminal: {
+          status: "exited",
+          exitCode: 1,
+          settledAt: "2026-08-31T12:12:00.000Z",
+          wakeOnExit: true,
+          terminalStatusShown: false,
+          tailLines: [
+            { line: "ERROR details", endOffset: 10 },
+            { line: "DONE", endOffset: 20 },
+          ],
+        },
+        retired: true,
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches[1].prompt).toContain("ERROR details");
+    expect(dispatches[1].prompt).not.toContain("> DONE");
+  });
+
+  test("disposed workspaces ignore late pokes without recreating session state", async () => {
+    const sessionDir = path.join(root, OWNER);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await reconciler.dispose(OWNER);
+    await fsPromises.rm(sessionDir, { recursive: true, force: true });
+    live = [liveSnapshot()];
+
+    reconciler.scheduleReconcile(OWNER);
+    await reconciler.reconcile(OWNER);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+
+    expect(dispatches).toEqual([]);
+    const statError = await fsPromises.stat(sessionDir).catch((error: unknown) => error);
+    expect(statError).toMatchObject({ code: "ENOENT" });
   });
 
   test("snapshot supplies pending kinds without dispatching and removes the legacy wake directory", async () => {

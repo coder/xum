@@ -366,6 +366,26 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("late monitor pokes are ignored after removal begins", async () => {
+    const { service, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    const internal = service as unknown as {
+      removingWorkspaces: Set<string>;
+      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      scheduleBashMonitorWakeReconcile(workspaceId: string): void;
+    };
+    try {
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.removingWorkspaces.add("removed-owner");
+
+      internal.scheduleBashMonitorWakeReconcile("removed-owner");
+
+      expect(scheduleReconcile).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("full clears preconsume and postconsume wakes while truncations leave them alone", async () => {
     const { service, cleanup } = await createWakeWiringService();
     const order: string[] = [];
