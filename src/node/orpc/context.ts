@@ -63,8 +63,8 @@ import type { WithEffectContext } from "@orpc/experimental-effect";
 import type { OrpcEffectServices } from "@/node/orpc/effectContext";
 
 /**
- * Effect-migration spike: `WithEffectContext` adds the `"effect/context"` key
- * carrying the Effect services available to Effect-native handlers (built via
+ * `WithEffectContext` adds the `"effect/context"` key carrying the Effect
+ * services available to Effect-native handlers (built via
  * `buildOrpcEffectContext` in the service container).
  */
 export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {

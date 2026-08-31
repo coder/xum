@@ -124,9 +124,9 @@ function sanitizeMetaFile(raw: unknown): MemoryMetaFile {
  * conflicts). Reads never fail — malformed or missing data self-heals to
  * empty — so writes are the only failure channel this service exposes.
  *
- * Effect-migration spike: `Schema.TaggedError` gives us an `Error` subclass
- * that is simultaneously a schema (usable in oRPC error payloads), a tagged
- * union member (usable with `Effect.catchTag`), and yieldable in `Effect.gen`.
+ * `Schema.TaggedError` gives us an `Error` subclass that is simultaneously a
+ * schema (usable in oRPC error payloads), a tagged union member (usable with
+ * `Effect.catchTag`), and yieldable in `Effect.gen`.
  */
 export class MemoryMetaWriteError extends Schema.TaggedError<MemoryMetaWriteError>()(
   "MemoryMetaWriteError",
@@ -140,19 +140,19 @@ export class MemoryMetaService {
   private readonly metaPath: string;
   /**
    * Serializes read-modify-write cycles against the (single) sidecar file.
-   * Effect-migration spike: an Effect `Semaphore` replaces the promise-based
-   * MutexMap so lock acquisition participates in interruption — a fiber
-   * cancelled while waiting for the permit never runs its critical section.
+   * An Effect `Semaphore` rather than a promise-based mutex so lock
+   * acquisition participates in interruption — a fiber cancelled while
+   * waiting for the permit never runs its critical section.
    */
   private readonly writeLock = Semaphore.makeUnsafe(1);
   private cache: MemoryMetaFile | null = null;
 
   /**
-   * Effect-native API (the migration target surface). The legacy Promise
-   * methods below are thin `Effect.runPromise` facades over these, so existing
-   * callers keep working unchanged while new Effect callers (oRPC `.effect`
-   * handlers, other migrated services) compose these directly and see typed
-   * errors in the `E` channel instead of untyped rejections.
+   * Effect-native API. The Promise methods below are thin `Effect.runPromise`
+   * facades over these, so pre-Effect callers keep working unchanged while
+   * Effect callers (oRPC `handlerGen` handlers, other migrated services)
+   * compose these directly and see typed errors in the `E` channel instead of
+   * untyped rejections.
    */
   readonly effects = {
     /** Logical keys of all pinned memory files. */
@@ -240,6 +240,12 @@ export class MemoryMetaService {
     this.metaPath = path.join(xumHome, "memory-meta.json");
   }
 
+  /**
+   * Load + cache the sidecar. The error channel is `never` by design, not an
+   * oversight: per the self-healing rule, a missing or unreadable sidecar must
+   * never brick memory routes, so read failures degrade to "no metadata"
+   * (logged for diagnosis) and only writes can fail.
+   */
   private load(): Effect.Effect<MemoryMetaFile> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;

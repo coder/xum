@@ -11,12 +11,12 @@ import {
 import { handlerGen } from "@orpc/experimental-effect";
 import {
   assertMemoryEnabled,
-  consolidateMemory,
-  deleteMemory,
-  getMemoryConsolidationStatus,
-  listMemory,
-  readMemory,
-  saveMemory,
+  consolidateMemoryEffect,
+  deleteMemoryEffect,
+  getMemoryConsolidationStatusEffect,
+  listMemoryEffect,
+  readMemoryEffect,
+  saveMemoryEffect,
   setMemoryPinnedEffect,
 } from "@/node/services/memoryOperations";
 import {
@@ -1134,25 +1134,41 @@ export const router = (authToken?: string) => {
         .output(schemas.coder.listWorkspaces.output)
         .handler(async ({ context }) => context.coderService.listWorkspaces()),
     },
+    // Memory handlers run Effect generators via handlerGen (client aborts
+    // interrupt the fiber); the wire contracts are unchanged.
     memory: {
       list: t
         .input(schemas.memory.list.input)
         .output(schemas.memory.list.output)
-        .handler(({ context, input }) => listMemory(context, input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* listMemoryEffect(context, input);
+          })
+        ),
       read: t
         .input(schemas.memory.read.input)
         .output(schemas.memory.read.output)
-        .handler(({ context, input }) => readMemory(context, input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* readMemoryEffect(context, input);
+          })
+        ),
       save: t
         .input(schemas.memory.save.input)
         .output(schemas.memory.save.output)
-        .handler(({ context, input }) => saveMemory(context, input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* saveMemoryEffect(context, input);
+          })
+        ),
       delete: t
         .input(schemas.memory.delete.input)
         .output(schemas.memory.delete.output)
-        .handler(({ context, input }) => deleteMemory(context, input)),
-      // Effect-migration spike: this handler runs an Effect generator via
-      // handlerGen; the wire contract is unchanged.
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* deleteMemoryEffect(context, input);
+          })
+        ),
       setPinned: t
         .input(schemas.memory.setPinned.input)
         .output(schemas.memory.setPinned.output)
@@ -1164,11 +1180,22 @@ export const router = (authToken?: string) => {
       consolidationStatus: t
         .input(schemas.memory.consolidationStatus.input)
         .output(schemas.memory.consolidationStatus.output)
-        .handler(({ context, input }) => getMemoryConsolidationStatus(context, input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* getMemoryConsolidationStatusEffect(context, input);
+          })
+        ),
       consolidate: t
         .input(schemas.memory.consolidate.input)
         .output(schemas.memory.consolidate.output)
-        .handler(({ context, input }) => consolidateMemory(context, input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* consolidateMemoryEffect(context, input);
+          })
+        ),
+      // Subscription, not a unary call: the handler returns an event iterator,
+      // which handlerGen cannot produce. Streams stay Promise/AsyncGenerator
+      // until an Effect Stream bridge exists (later migration phase).
       onChange: t
         .input(schemas.memory.onChange.input)
         .output(schemas.memory.onChange.output)

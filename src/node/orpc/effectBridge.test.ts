@@ -1,5 +1,5 @@
 /**
- * Validates the Effect ↔ oRPC bridge end-to-end (see effectSpike.ts):
+ * Validates the Effect ↔ oRPC bridge end-to-end (see effectBridge.ts):
  * service injection through "effect/context", Effect Schema input validation,
  * Schema.TaggedError → defined oRPC error propagation, abort-driven fiber
  * interruption with scope finalizers, and router-level auth middleware
@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ORPCError, createRouterClient, os as orpcBase } from "@orpc/server";
-import { effectSpike, scopeProbe } from "./effectSpike";
+import { effectBridge, scopeProbe } from "./effectBridge";
 import { buildOrpcEffectContext } from "./effectContext";
 import { createAuthMiddleware } from "./authMiddleware";
 import { createOpenAPIGenerator } from "./server";
@@ -22,7 +22,7 @@ let memoryMetaService: MemoryMetaService;
 let client: ReturnType<typeof createClient>;
 
 function makeContext(service: MemoryMetaService): ORPCContext {
-  // Spike procedures only consume Effect services; the remaining ~60 context
+  // Bridge probe procedures only consume Effect services; the remaining ~60 context
   // fields are irrelevant here (same partial-context pattern as router.test.ts).
   return {
     "effect/context": buildOrpcEffectContext({ memoryMetaService: service }),
@@ -30,7 +30,7 @@ function makeContext(service: MemoryMetaService): ORPCContext {
 }
 
 function createClient(service: MemoryMetaService) {
-  return createRouterClient(effectSpike, { context: makeContext(service) });
+  return createRouterClient(effectBridge, { context: makeContext(service) });
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -42,7 +42,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 }
 
 beforeEach(async () => {
-  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "effect-spike-"));
+  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "effect-bridge-"));
   memoryMetaService = new MemoryMetaService(tmpDir);
   client = createClient(memoryMetaService);
   scopeProbe.reset();
@@ -135,19 +135,19 @@ describe("cancellation + resource scoping", () => {
 
 describe("router-level middleware over Effect handlers", () => {
   test("auth middleware applies to handlerGen procedures mounted under it", async () => {
-    // The spike namespace is deliberately NOT part of the production router
+    // The effectBridge namespace is deliberately NOT part of the production router
     // (codex review on #4022); compose it the same way router() composes its
     // procedures to prove middleware still wraps Effect handlers.
     const authedRouter = orpcBase
       .$context<ORPCContext>()
       .use(createAuthMiddleware("secret-token"))
-      .router({ effectSpike });
+      .router({ effectBridge });
     const unauthedClient = createRouterClient(authedRouter, {
       context: { headers: {} } as unknown as ORPCContext,
     });
 
     try {
-      await unauthedClient.effectSpike.echoAsync({ n: 1 });
+      await unauthedClient.effectBridge.echoAsync({ n: 1 });
       expect.unreachable();
     } catch (error) {
       expect(error).toBeInstanceOf(ORPCError);
@@ -162,14 +162,14 @@ describe("OpenAPI generation for Effect Schema inputs", () => {
     // the generator silently drops the requestBody for Effect Schema inputs,
     // shipping a lossy spec (fields missing from /api/docs and generated clients).
     const spec = await createOpenAPIGenerator().generate(
-      orpcBase.$context<ORPCContext>().router({ effectSpike }),
-      { base: { info: { title: "spike", version: "0" } } }
+      orpcBase.$context<ORPCContext>().router({ effectBridge }),
+      { base: { info: { title: "effect-bridge", version: "0" } } }
     );
     const paths = (spec.paths ?? {}) as Record<
       string,
       { post?: { requestBody?: { content?: Record<string, unknown> } } }
     >;
-    const operation = paths["/effectSpike/pinnedCount"]?.post;
+    const operation = paths["/effectBridge/pinnedCount"]?.post;
     expect(operation).toBeDefined();
     const requestSchema = JSON.stringify(operation?.requestBody?.content ?? {});
     expect(requestSchema).toContain('"prefix"');
@@ -194,9 +194,9 @@ describe("benchmark: async handler vs Effect handler (informational)", () => {
     for (let i = 0; i < iterations; i++) await client.echoEffect({ n: i });
     const effectMs = performance.now() - effectStart;
 
-    // Informational output consumed by the spike findings doc.
+    // Informational output: tracks Effect runtime per-call overhead over time.
     console.log(
-      `[effect-spike bench] ${iterations} sequential calls — ` +
+      `[effect-bridge bench] ${iterations} sequential calls — ` +
         `async: ${asyncMs.toFixed(1)}ms (${((asyncMs / iterations) * 1000).toFixed(1)}µs/call), ` +
         `effect: ${effectMs.toFixed(1)}ms (${((effectMs / iterations) * 1000).toFixed(1)}µs/call), ` +
         `overhead: ${(((effectMs - asyncMs) / iterations) * 1000).toFixed(1)}µs/call`

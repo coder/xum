@@ -646,8 +646,8 @@ export class ServiceContainer {
    */
   toORPCContext(): Omit<ORPCContext, "headers"> {
     return {
-      // Effect-migration spike: pre-built Effect service context consumed by
-      // Effect-native oRPC handlers (see src/node/orpc/effectContext.ts).
+      // Pre-built Effect service context consumed by Effect-native oRPC
+      // handlers (see src/node/orpc/effectContext.ts).
       "effect/context": buildOrpcEffectContext({ memoryMetaService: this.memoryMetaService }),
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,

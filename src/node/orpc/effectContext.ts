@@ -1,6 +1,6 @@
 /**
- * Effect-migration spike: bridges xum services into the Effect runtime for
- * oRPC handlers written with `@orpc/experimental-effect`.
+ * Bridges xum services into the Effect runtime for oRPC handlers written
+ * with `@orpc/experimental-effect`.
  *
  * `ORPCContext` carries a pre-built `Context.Context` under the well-known
  * `"effect/context"` key (see `WithEffectContext`). `handlerGen` provides it to

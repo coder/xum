@@ -19,8 +19,8 @@ import { ZodToJsonSchemaConverter } from "@orpc/zod";
 import { EffectSchemaToJsonSchemaConverter } from "@orpc/experimental-effect";
 
 /**
- * Effect-migration spike: Effect Schema inputs need their own JSON-schema
- * converter; without it the generator silently emits operations with no
+ * Effect Schema inputs need their own JSON-schema converter alongside Zod's;
+ * without it the generator silently emits operations with no
  * requestBody, producing a lossy /api/spec.json. Exported so tests can verify
  * the production converter set against Effect Schema procedures.
  */

@@ -1,8 +1,10 @@
 /**
- * Effect-migration spike procedures (`effectSpike.*` namespace).
+ * Effect ↔ oRPC bridge regression procedures (`effectBridge.*` namespace).
  *
- * These procedures exist to validate the `@orpc/experimental-effect` bridge
- * end-to-end and are exercised by effectSpike.test.ts:
+ * Production handlers (router.ts `memory.*`) ride the
+ * `@orpc/experimental-effect` bridge; these probe procedures pin down the
+ * bridge behaviors those handlers rely on, and are exercised only by
+ * effectBridge.test.ts (never mounted on the production router):
  *
  * - `pinnedCount`: Effect service injection via the oRPC context's
  *   `"effect/context"` key + an Effect `Schema` input schema coexisting with
@@ -40,7 +42,7 @@ export const scopeProbe = {
   },
 };
 
-export const effectSpike = {
+export const effectBridge = {
   /** Count pinned memory keys matching a prefix (service via Effect context). */
   pinnedCount: t
     .input(toStandardSchema(Schema.Struct({ prefix: Schema.String })))
