@@ -10,8 +10,8 @@ import type {
 import {
   BashMonitorWakeReconciler,
   type BashMonitorProcessSnapshot,
+  type BashMonitorWakeDeliveryState,
   type BashMonitorWakeDispatch,
-  type BashMonitorWakeFrontier,
 } from "@/node/services/bashMonitorWakeReconciler";
 
 const OWNER = "owner";
@@ -52,7 +52,7 @@ describe("BashMonitorWakeReconciler", () => {
   let root: string;
   let live: BashMonitorProcessSnapshot[];
   let rows: BashMonitorRegistryRecord[];
-  let frontier: BashMonitorWakeFrontier | undefined;
+  let deliveryState: BashMonitorWakeDeliveryState | undefined;
   let dispatches: BashMonitorWakeDispatch[];
   let removed: string[];
   let dropped: string[];
@@ -62,7 +62,7 @@ describe("BashMonitorWakeReconciler", () => {
     root = await fsPromises.mkdtemp(path.join(os.tmpdir(), "bash-wake-reconciler-"));
     live = [];
     rows = [];
-    frontier = { shownThroughOffset: 0, terminalStatusShown: false, taskAwaitable: true };
+    deliveryState = { status: "settled", shownThroughOffset: 0, terminalStatusShown: false };
     dispatches = [];
     removed = [];
     dropped = [];
@@ -70,7 +70,7 @@ describe("BashMonitorWakeReconciler", () => {
       sessionsDir: root,
       processManager: {
         pullMonitorWakeSignals: async () => live,
-        getMonitorWakeFrontier: async () => frontier,
+        getMonitorWakeDeliveryState: async () => deliveryState,
         dropRetiredMonitor: async (processId) => {
           dropped.push(processId);
         },
@@ -119,12 +119,12 @@ describe("BashMonitorWakeReconciler", () => {
     await reconciler.reconcile(OWNER);
     const queued = dispatches[0];
 
-    frontier = { shownThroughOffset: 12, terminalStatusShown: false, taskAwaitable: true };
+    deliveryState = { status: "settled", shownThroughOffset: 12, terminalStatusShown: false };
     await reconciler.reconcile(OWNER);
 
     expect(queued.cancelSignal.aborted).toBe(true);
     await queued.onAccepted();
-    frontier = { shownThroughOffset: 0, terminalStatusShown: false, taskAwaitable: true };
+    deliveryState = { status: "settled", shownThroughOffset: 0, terminalStatusShown: false };
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(1);
 
@@ -196,6 +196,7 @@ describe("BashMonitorWakeReconciler", () => {
 
     expect(reconciler.pendingWakeKind(snapshot, "dead")).toBe("settled");
     expect(dispatches).toEqual([]);
-    await expect(fsPromises.stat(legacy)).rejects.toMatchObject({ code: "ENOENT" });
+    const statError = await fsPromises.stat(legacy).catch((error: unknown) => error);
+    expect(statError).toMatchObject({ code: "ENOENT" });
   });
 });

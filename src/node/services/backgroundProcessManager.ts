@@ -16,7 +16,6 @@ import {
   BG_OUTPUT_SUBDIR,
 } from "./backgroundProcessExecutor";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-export const BASH_MONITOR_SETTLE_LINE_PREFIX = "[monitor] process settled:";
 import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -26,9 +25,9 @@ import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
 import type { BashMonitorTerminalSummary } from "./bashMonitorRegistryStore";
-import type {
-  BashMonitorProcessSnapshot,
-  BashMonitorWakeFrontier,
+import {
+  BASH_MONITOR_SETTLE_LINE_PREFIX,
+  type BashMonitorProcessSnapshot,
 } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
@@ -1875,6 +1874,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
                 settledAt: monitor.settlementDisposition.settledAt,
                 wakeOnExit: monitor.settlementDisposition.wakeOnExit,
                 terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                tailLines: [...monitor.settlementDisposition.tailLines],
               },
             }
           : {}),
@@ -1882,24 +1882,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       });
     }
     return snapshots;
-  }
-
-  async getMonitorWakeFrontier(
-    processId: string,
-    originNotAfterMs: number
-  ): Promise<BashMonitorWakeFrontier | undefined> {
-    while (true) {
-      const state = await this.getMonitorWakeDeliveryState(processId, originNotAfterMs);
-      if (state == null) return undefined;
-      if (state.status === "settled") {
-        return {
-          shownThroughOffset: state.shownThroughOffset,
-          terminalStatusShown: state.terminalStatusShown,
-          taskAwaitable: true,
-        };
-      }
-      await state.readSettled;
-    }
   }
 
   dropRetiredMonitor(processId: string): void {
