@@ -1847,7 +1847,7 @@ export class TaskService implements AgentTaskIntegration {
     return latest;
   }
 
-  private async listAgentReferencedWorkflowRunIds(
+  async listAgentReferencedWorkflowRunIds(
     workspaceId: string,
     currentParts: readonly unknown[],
     currentMessageId?: string
@@ -1922,7 +1922,7 @@ export class TaskService implements AgentTaskIntegration {
     return Array.from(runIds);
   }
 
-  private async listActiveBackgroundWorkflowRunIds(
+  async listActiveBackgroundWorkflowRunIds(
     workspaceId: string,
     referencedWorkflowRunIds: readonly string[]
   ): Promise<string[]> {
@@ -2113,7 +2113,7 @@ export class TaskService implements AgentTaskIntegration {
     return null;
   }
 
-  private bumpWorkspaceStopEpoch(workspaceId: string): void {
+  bumpWorkspaceStopEpoch(workspaceId: string): void {
     this.workspaceStopEpochs.set(workspaceId, (this.workspaceStopEpochs.get(workspaceId) ?? 0) + 1);
   }
 
@@ -2126,7 +2126,7 @@ export class TaskService implements AgentTaskIntegration {
    * Callers latch synchronously with the epoch bump and release only after the cascade has
    * persisted terminal state, so sends entering mid-stop are refused at admission.
    */
-  private latchWorkspaceStopsInProgress(workspaceIds: readonly string[]): () => void {
+  latchWorkspaceStopsInProgress(workspaceIds: readonly string[]): () => void {
     for (const id of workspaceIds) {
       this.workspaceStopsInProgress.set(id, (this.workspaceStopsInProgress.get(id) ?? 0) + 1);
     }
@@ -2290,7 +2290,7 @@ export class TaskService implements AgentTaskIntegration {
     this.userBackgroundedTaskIds.add(taskId);
   }
 
-  private markTaskForegroundRelevant(taskId: string): void {
+  markTaskForegroundRelevant(taskId: string): void {
     this.userBackgroundedTaskIds.delete(taskId);
   }
 
@@ -2371,13 +2371,17 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
+  async acquireTaskCreationLock(): Promise<AsyncDisposable> {
+    return await this.mutex.acquire();
+  }
+
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
   }
 
   // Prefer per-agent settings so tasks inherit the correct agent defaults;
   // fall back to legacy workspace settings for older configs.
-  private resolveWorkspaceAISettings(
+  resolveWorkspaceAISettings(
     workspace: {
       aiSettingsByAgent?: Record<string, ResolvedWorkspaceAiSettings>;
       aiSettings?: ResolvedWorkspaceAiSettings;
@@ -2400,7 +2404,7 @@ export class TaskService implements AgentTaskIntegration {
    * agent bucket (the user toggles settings on the active agent, so the target
    * bucket rarely exists), then legacy workspace settings.
    */
-  private buildParentAiSettingsFallbacks(
+  buildParentAiSettingsFallbacks(
     parentMeta: TaskParentAiMeta,
     targetAgentId: string
   ): AgentAiSettingsLayerValues[] {
@@ -2744,7 +2748,7 @@ export class TaskService implements AgentTaskIntegration {
     return await acquire(0);
   }
 
-  private async editWorkspaceEntry(
+  async editWorkspaceEntry(
     workspaceId: string,
     updater: (workspace: WorkspaceConfigEntry) => void,
     options?: { allowMissing?: boolean }
@@ -3881,7 +3885,7 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
-  private scheduleMaybeStartQueuedTasks(): void {
+  scheduleMaybeStartQueuedTasks(): void {
     void this.maybeStartQueuedTasks().catch((error: unknown) => {
       log.error("TaskService.maybeStartQueuedTasks failed", { error });
     });
@@ -7669,12 +7673,12 @@ export class TaskService implements AgentTaskIntegration {
     }
   }
 
-  private isForegroundAwaiting(workspaceId: string): boolean {
+  isForegroundAwaiting(workspaceId: string): boolean {
     const count = this.foregroundAwaitCountByWorkspaceId.get(workspaceId);
     return typeof count === "number" && count > 0;
   }
 
-  private startForegroundAwait(workspaceId: string): () => void {
+  startForegroundAwait(workspaceId: string): () => void {
     assert(workspaceId.length > 0, "startForegroundAwait: workspaceId must be non-empty");
 
     const current = this.foregroundAwaitCountByWorkspaceId.get(workspaceId) ?? 0;
@@ -7699,7 +7703,7 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
-  private registerBackgroundableForegroundWaiter(
+  registerBackgroundableForegroundWaiter(
     workspaceId: string,
     waiter: BackgroundableForegroundWaiter
   ): void {
@@ -7711,7 +7715,7 @@ export class TaskService implements AgentTaskIntegration {
     set.add(waiter);
   }
 
-  private unregisterBackgroundableForegroundWaiter(
+  unregisterBackgroundableForegroundWaiter(
     workspaceId: string,
     waiter: BackgroundableForegroundWaiter
   ): void {
@@ -8397,7 +8401,7 @@ export class TaskService implements AgentTaskIntegration {
     return execution?.record.handleId;
   }
 
-  private async enqueueTerminalAttention(params: {
+  async enqueueTerminalAttention(params: {
     ownerWorkspaceId: string;
     sourceKind: TerminalAttentionNotification["sourceKind"];
     terminalOutcome: TerminalAttentionOutcome;
@@ -8411,7 +8415,7 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
-  private scheduleTerminalAttentionDrain(ownerWorkspaceId: string): void {
+  scheduleTerminalAttentionDrain(ownerWorkspaceId: string): void {
     const previous = this.pendingTerminalAttentionDrainsByOwner.get(ownerWorkspaceId);
     const promise = (previous ?? Promise.resolve())
       .catch(() => undefined)
@@ -9539,7 +9543,7 @@ export class TaskService implements AgentTaskIntegration {
    * on enqueue, so a message queued before the waiter registered must be re-checked
    * here. No-op when backgrounding is disabled or no requesting workspace is set.
    */
-  private backgroundForegroundWaitIfQueued(
+  backgroundForegroundWaitIfQueued(
     shouldBackgroundOnQueuedMessage: boolean,
     requestingWorkspaceId: string | undefined
   ): void {
@@ -9706,7 +9710,7 @@ export class TaskService implements AgentTaskIntegration {
     return status === "completed" || status === "interrupted" || status === "error";
   }
 
-  private async updateAgentTaskExecutionState(
+  async updateAgentTaskExecutionState(
     workspaceId: string,
     handleId: string,
     status: WorkspaceTurnTaskStatus | null
@@ -13134,7 +13138,7 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  private isDescendantAgentTaskUsingParentById(
+  isDescendantAgentTaskUsingParentById(
     parentById: Map<string, string>,
     ancestorWorkspaceId: string,
     taskId: string
@@ -13374,7 +13378,7 @@ export class TaskService implements AgentTaskIntegration {
     return tasks;
   }
 
-  private buildAgentTaskIndex(config: ReturnType<Config["loadConfigOrDefault"]>): AgentTaskIndex {
+  buildAgentTaskIndex(config: ReturnType<Config["loadConfigOrDefault"]>): AgentTaskIndex {
     const byId = new Map<string, AgentTaskWorkspaceEntry>();
     const childrenByParent = new Map<string, string[]>();
     const parentById = new Map<string, string>();
@@ -13673,7 +13677,7 @@ export class TaskService implements AgentTaskIntegration {
    * would otherwise restart inside a workspace whose archive was admitted on the false
    * empty answer.
    */
-  private async listActiveWorkflowRunIdsForWorkspaceStrict(workspaceId: string): Promise<string[]> {
+  async listActiveWorkflowRunIdsForWorkspaceStrict(workspaceId: string): Promise<string[]> {
     assert(
       workspaceId.length > 0,
       "listActiveWorkflowRunIdsForWorkspaceStrict requires workspaceId"
@@ -13764,7 +13768,7 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
-  private countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number {
+  countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number {
     let activeCount = 0;
     for (const task of this.listAgentTaskWorkspaces(config)) {
       const status: AgentTaskStatus = task.taskStatus ?? "running";
@@ -13800,7 +13804,7 @@ export class TaskService implements AgentTaskIntegration {
     return activeCount;
   }
 
-  private hasActiveDescendantAgentTasks(
+  hasActiveDescendantAgentTasks(
     config: ReturnType<Config["loadConfigOrDefault"]>,
     workspaceId: string
   ): boolean {
@@ -16421,7 +16425,7 @@ export class TaskService implements AgentTaskIntegration {
     await this.cleanupReportedLeafTask(workspaceId);
   }
 
-  private async maybeStartPatchGenerationForReportedTask(
+  async maybeStartPatchGenerationForReportedTask(
     workspaceId: string,
     options?: { refreshForContinuation?: boolean }
   ): Promise<void> {
