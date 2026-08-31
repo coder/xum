@@ -1656,6 +1656,12 @@ export class TaskService implements AgentTaskIntegration {
   // from run records + settled markers at startup and on the periodic sweep and added by live
   // terminal callbacks, so losing the map merely delays a wake until the next sweep.
   private readonly pendingWorkflowRunAttention = new Map<string, Set<string>>();
+  // Owner -> wake-group key -> epoch ms before which the drain skips selecting the group. A
+  // group whose send was rejected for group-specific reasons (for example an unresolvable
+  // strictly pinned agent) would otherwise be re-selected newest-first by every drain and
+  // sweep, starving older deliverable groups. In-memory only: a restart retries every group,
+  // and entries expire on read.
+  private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
@@ -3173,17 +3179,17 @@ export class TaskService implements AgentTaskIntegration {
         void this.sweepWorkflowRunTerminalAttention().catch((error: unknown) => {
           log.warn("Workflow terminal attention sweep failed", { error });
         });
+        void this.schedulePendingTerminalAttentionOwnerDrains().catch((error: unknown) => {
+          log.warn("Pending terminal attention re-poke failed", { error });
+        });
       }, WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS);
       this.workflowAttentionSweepTimer.unref?.();
     }
     const recoveredTerminalWorkspaceTurnNotificationCount =
       await this.recoverTerminalWorkspaceTurnAttentionNotifications();
     const terminalAttentionDrainStartedAt = Date.now();
-    const pendingTerminalAttentionOwnerWorkspaceIds =
-      await this.terminalAttentionStore.listPendingOwnerWorkspaceIds();
-    for (const ownerWorkspaceId of pendingTerminalAttentionOwnerWorkspaceIds) {
-      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-    }
+    const pendingTerminalAttentionOwnerWorkspaceCount =
+      await this.schedulePendingTerminalAttentionOwnerDrains();
     const terminalAttentionDrainMs = Date.now() - terminalAttentionDrainStartedAt;
 
     log.info("[startup] TaskService.initialize completed", {
@@ -3203,7 +3209,7 @@ export class TaskService implements AgentTaskIntegration {
       bestOfRecoveryMs,
       queuedTerminalWorkflowRunAttentionCount,
       recoveredTerminalWorkspaceTurnNotificationCount,
-      pendingTerminalAttentionOwnerWorkspaceCount: pendingTerminalAttentionOwnerWorkspaceIds.length,
+      pendingTerminalAttentionOwnerWorkspaceCount,
       terminalAttentionDrainMs,
       cleanupReportedTasksMs,
     });
@@ -7827,6 +7833,22 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
+  /**
+   * Level-triggered retry for outbox (sub-agent / workspace-turn) attention: pending records
+   * are the durable "wake owed" state, but unlike workflow runs they have no periodic
+   * re-derivation of their own, so a drain that failed transiently (for example an unreadable
+   * history for caller restrictions) would otherwise leave them stuck until restart. Startup
+   * and the sweep interval both re-poke their owners; drains are idempotent and no-op when
+   * nothing is deliverable.
+   */
+  private async schedulePendingTerminalAttentionOwnerDrains(): Promise<number> {
+    const ownerWorkspaceIds = await this.terminalAttentionStore.listPendingOwnerWorkspaceIds();
+    for (const ownerWorkspaceId of ownerWorkspaceIds) {
+      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+    }
+    return ownerWorkspaceIds.length;
+  }
+
   /** Returns true when the run was newly queued for this owner. */
   private queueWorkflowRunAttention(ownerWorkspaceId: string, runId: string): boolean {
     let runIds = this.pendingWorkflowRunAttention.get(ownerWorkspaceId);
@@ -7875,6 +7897,18 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     try {
+      // Downgrade compatibility: the previous build dedupes its startup re-derivation on the
+      // stable un-suffixed workflow_run id, so settling only the generation marker would let
+      // a downgraded build re-create a pending wake for a result the user already consumed.
+      // Stable-first ordering keeps the generation marker (this build's authority) retryable:
+      // if either write fails, the queue entry survives and the next drain re-settles both.
+      await this.terminalAttentionStore.recordSettled({
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        sourceKind: "workflow_run",
+        sourceId: params.runId,
+        terminalOutcome: terminalAttentionOutcome(params.status),
+        status: params.settledAs,
+      });
       await this.terminalAttentionStore.recordSettled({
         ownerWorkspaceId: params.ownerWorkspaceId,
         sourceKind: "workflow_run",
@@ -8180,6 +8214,28 @@ export class TaskService implements AgentTaskIntegration {
       // A resumed run left terminal state; its next terminal transition re-queues it.
       !isTerminalWorkflowRunStatus(run.status)
     ) {
+      return { outcome: "drop" };
+    }
+    // The durable settled marker outranks the in-memory queue entry: a kernel-nested
+    // task_await or workflow_resume can settle this generation after the terminal callback
+    // queued it, and that consumption leaves no history evidence for the classification
+    // below, so skipping this check would deliver a duplicate wake.
+    let settledMarker: Awaited<ReturnType<TerminalAttentionStore["get"]>>;
+    try {
+      settledMarker = await this.terminalAttentionStore.get(
+        ownerWorkspaceId,
+        TerminalAttentionStore.notificationId("workflow_run", run.id, run.updatedAt)
+      );
+    } catch (error: unknown) {
+      // An unreadable marker cannot prove the wake is owed; defer like indeterminate currentness.
+      log.warn("Deferring workflow terminal wake-up; settlement marker unreadable", {
+        ownerWorkspaceId,
+        runId,
+        error: getErrorMessage(error),
+      });
+      return { outcome: "defer" };
+    }
+    if (settledMarker != null) {
       return { outcome: "drop" };
     }
     const currentness = await this.workspaceService.getWorkflowInvocationCurrentness(
@@ -8688,6 +8744,23 @@ export class TaskService implements AgentTaskIntegration {
           : candidate.initiatingAgent != null &&
             workflowWakeGroupKey(candidate.initiatingAgent) === groupKey
       );
+      // Group keys embed \u0000, so the empty string safely keys the unpinned group.
+      const backoffKey = groupKey ?? "";
+      const ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
+      const backoffUntil = ownerBackoff?.get(backoffKey);
+      if (backoffUntil != null) {
+        if (backoffUntil > Date.now()) {
+          // Recently rejected send: leave the group queued and give the next group its turn.
+          remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
+            (candidate) => !groupCandidates.includes(candidate)
+          );
+          continue;
+        }
+        ownerBackoff?.delete(backoffKey);
+        if (ownerBackoff?.size === 0) {
+          this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
+        }
+      }
       const groupCurrentness = await Promise.all(
         groupCandidates.map((candidate) =>
           this.workspaceService
@@ -8895,7 +8968,25 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (!sendResult.success) {
-      // Owner became busy between the idle check and the send: leave pending and retry next drain.
+      if (currentWorkflowPrompts.length > 0 && !isWorkspaceBusyIdleOnlySend(sendResult.error)) {
+        // A non-busy rejection is likely group-specific (an unresolvable pinned agent, a model
+        // or provider gate). Back the selected group off until the sweep cadence retries it
+        // and re-poke so the remaining groups get their send this cycle instead of starving
+        // behind newest-first selection. Bounded: each re-poked drain either delivers or backs
+        // off one more group, and with every group backed off it selects nothing.
+        let ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
+        if (ownerBackoff == null) {
+          ownerBackoff = new Map();
+          this.workflowWakeGroupSendBackoffUntilMs.set(ownerWorkspaceId, ownerBackoff);
+        }
+        ownerBackoff.set(
+          workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : "",
+          Date.now() + WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS
+        );
+        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+      }
+      // Busy rejection: the owner started work between the idle check and the send; leave
+      // pending and retry on the next drain trigger.
       log.debug("Terminal attention wake-up not accepted; leaving pending", {
         ownerWorkspaceId,
         error: sendResult.error,

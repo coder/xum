@@ -141,14 +141,14 @@ export class TerminalAttentionStore {
   /**
    * Write-once settlement marker: records a notification directly in a terminal status with a
    * single write (no pending intermediate a concurrent reader could misread as an owed wake).
-   * An existing record for the same id is left untouched.
+   * An existing record for the same id is left untouched. Omitting generationId settles the
+   * stable (un-suffixed) id, which older builds use for whole-source dedupe.
    */
   async recordSettled(
     notification: Omit<
       TerminalAttentionNotification,
       "id" | "status" | "createdAt" | "outputDelivery"
     > & {
-      generationId: string;
       status: "delivered" | "superseded";
     }
   ): Promise<void> {
@@ -167,7 +167,7 @@ export class TerminalAttentionStore {
         ownerWorkspaceId: notification.ownerWorkspaceId,
         sourceKind: notification.sourceKind,
         sourceId: notification.sourceId,
-        generationId: notification.generationId,
+        ...(notification.generationId != null ? { generationId: notification.generationId } : {}),
         outputDelivery: outputDeliveryForSource(notification.sourceKind),
         terminalOutcome: notification.terminalOutcome,
         status: notification.status,
