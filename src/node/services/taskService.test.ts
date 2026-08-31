@@ -6224,6 +6224,79 @@ describe("TaskService", () => {
     }
   });
 
+  test("a history clear between classification and dispatch settles the wake instead of delivering", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_clear_race";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    const run = await runStore.getRun(runId);
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // Classification sees a current invocation; a full clear then retires the sidecar before
+    // the batch reaches sendMessage, so the last-moment reread must see not_current.
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("not_current")).mockImplementationOnce(() =>
+        Promise.resolve("current")
+      );
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // The pre-clear result must not wake the freshly cleared conversation; the run settles
+    // superseded for this terminal generation and stays retrievable via workflow_resume.
+    expect(sendMessage).not.toHaveBeenCalled();
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const marker = await terminalAttentionStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+    );
+    expect(marker?.status).toBe("superseded");
+    expect(
+      (
+        taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+      ).pendingWorkflowRunAttention
+        .get(parentId)
+        ?.has(runId) ?? false
+    ).toBe(false);
+  });
+
   test("workflow wake restriction recovery stops at a context reset boundary", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

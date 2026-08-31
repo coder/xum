@@ -2994,7 +2994,8 @@ export class HistoryService {
 
   async truncateHistory(
     workspaceId: string,
-    percentage: number
+    percentage: number,
+    options?: { refuseFullDelete?: boolean }
   ): Promise<Result<number[], string>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -3032,6 +3033,17 @@ export class HistoryService {
 
           // If we're removing all messages, use fast path
           if (removeCount >= messages.length) {
+            // Serialized revalidation of the caller's emptiness preflight: an overlapping
+            // truncation can shrink history between that unserialized read and this locked
+            // rewrite, turning a partial-classified request into a full delete that skipped
+            // the caller's full-clear guards (most critically kernel workflow reference
+            // retirement). Refuse instead of emptying; a retry re-runs the preflight against
+            // the settled history and routes through the full-clear path.
+            if (options?.refuseFullDelete === true) {
+              return Err(
+                "Truncation would remove every remaining message; retry to run it as a full clear."
+              );
+            }
             await this.rewriteHistoryFilesUnlocked(workspaceId, null, null);
             this.sequenceCounters.set(workspaceId, 0);
             return Ok(allSequences);

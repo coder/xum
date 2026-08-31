@@ -9221,6 +9221,76 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("an overlapping truncation that would empty history is refused, not silently cleared", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-preflight-race";
+    const runId = "wfr_currentness_preflight_race";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-preflight-race",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "single short message", { timestamp: 1_200 })
+      );
+
+      // Simulate the preflight racing an overlapping truncation: it classifies this request
+      // as non-emptying, but the locked rewrite's own recomputation would empty history. The
+      // serialized revalidation must refuse rather than skip the full-clear guards.
+      const preflightSpy = spyOn(
+        historyService,
+        "willTruncateHistoryRemoveAllMessages"
+      ).mockImplementationOnce(() => Promise.resolve(false));
+      try {
+        const result = await workspaceService.truncateHistory(workspaceId, 0.5);
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("full clear");
+        }
+      } finally {
+        preflightSpy.mockRestore();
+      }
+      // Nothing was cleared: the transcript and the kernel reference survive intact.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data).toHaveLength(1);
+      }
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(true);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a delivered coalesced workflow result consumes the kernel run's currentness", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-coalesced";

@@ -12941,7 +12941,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
-    const truncate = () => this.historyService.truncateHistory(workspaceId, effectivePercentage);
+    // refuseFullDelete makes historyService revalidate the emptiness preflight under the
+    // history write lock: an overlapping truncation can empty history after the preflight
+    // above said this one would not, silently skipping the full-clear guards.
+    const truncate = () =>
+      this.historyService.truncateHistory(workspaceId, effectivePercentage, {
+        refuseFullDelete: !isFullClear,
+      });
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {

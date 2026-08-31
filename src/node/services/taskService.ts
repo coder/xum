@@ -8561,7 +8561,6 @@ export class TaskService implements AgentTaskIntegration {
       initiatingAgent?: WorkflowWakeInitiatingAgent;
     }> = [];
 
-    const workflowPromptSections: string[] = [];
     for (const runId of queuedWorkflowRunIds) {
       const workflowPrompt = await this.buildWorkflowTerminalPrompt(ownerWorkspaceId, runId);
       if (workflowPrompt.outcome === "defer") {
@@ -8637,9 +8636,6 @@ export class TaskService implements AgentTaskIntegration {
     );
     // Unselected groups stay queued: the selected group's wake turn ends with a streamEnded
     // drain (and the sweep backstops an aborted one), which delivers the next group.
-    for (const candidate of selectedWorkflowPrompts) {
-      workflowPromptSections.push(candidate.prompt);
-    }
 
     const resumeOptions = await this.resolveParentAutoResumeOptions(
       ownerWorkspaceId,
@@ -8693,11 +8689,37 @@ export class TaskService implements AgentTaskIntegration {
     // closing it would require holding settlement locks across delivery,
     // which the drain must not do; worst case is one redundant wake (fail
     // toward notify, never a lost wake).
-    const candidateRecords = await Promise.all(
-      workspaceTurnCandidates.map((candidate) =>
-        this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, candidate.notification.sourceId)
-      )
-    );
+    const [candidateRecords, selectedWorkflowCurrentness] = await Promise.all([
+      Promise.all(
+        workspaceTurnCandidates.map((candidate) =>
+          this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, candidate.notification.sourceId)
+        )
+      ),
+      // Workflow candidates get the same last-moment treatment: a full history clear that
+      // completes after buildWorkflowTerminalPrompt classified these runs retires the sidecar
+      // but cannot retract the materialized candidates, and once the clear releases its
+      // admission guard the owner is idle again, so this requireIdle send would inject a
+      // pre-clear workflow result into the freshly cleared conversation. The clear retires
+      // references before truncating, so this reread sees not_current and settles; unreadable
+      // state stays queued for the next drain or sweep instead of settling.
+      Promise.all(
+        selectedWorkflowPrompts.map((candidate) =>
+          this.workspaceService
+            .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
+            .catch(() => "indeterminate" as const)
+        )
+      ),
+    ]);
+    const currentWorkflowPrompts: typeof selectedWorkflowPrompts = [];
+    const supersededWorkflowPrompts: typeof selectedWorkflowPrompts = [];
+    selectedWorkflowPrompts.forEach((candidate, index) => {
+      const currentness = selectedWorkflowCurrentness[index];
+      if (currentness === "current") {
+        currentWorkflowPrompts.push(candidate);
+      } else if (currentness === "not_current") {
+        supersededWorkflowPrompts.push(candidate);
+      }
+    });
     const deliverableWorkspaceTurnNotificationIds = new Set<string>();
     const publicAwaitIds: string[] = [];
     const suppressedNotificationIds: string[] = [];
@@ -8714,6 +8736,15 @@ export class TaskService implements AgentTaskIntegration {
       for (const id of suppressedNotificationIds) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
       }
+      for (const candidate of supersededWorkflowPrompts) {
+        await this.markWorkflowRunTerminalAttentionSettled({
+          ownerWorkspaceId,
+          runId: candidate.runId,
+          status: candidate.run.status,
+          runUpdatedAt: candidate.run.updatedAt,
+          settledAs: "superseded",
+        });
+      }
     };
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
@@ -8722,7 +8753,7 @@ export class TaskService implements AgentTaskIntegration {
     if (publicAwaitIds.length > 0) {
       promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
     }
-    promptSections.push(...workflowPromptSections);
+    promptSections.push(...currentWorkflowPrompts.map((candidate) => candidate.prompt));
     const prompt = promptSections.join("\n\n");
     const effectivePending = pending.filter((notification) => {
       if (notification.sourceKind === "agent_task") {
@@ -8730,13 +8761,17 @@ export class TaskService implements AgentTaskIntegration {
       }
       return deliverableWorkspaceTurnNotificationIds.has(notification.id);
     });
-    if (effectivePending.length === 0 && selectedWorkflowPrompts.length === 0) {
+    if (effectivePending.length === 0 && currentWorkflowPrompts.length === 0) {
       await markSuppressedSuperseded();
       // Suppression can empty the very batch that excluded agent-bound workflow groups; with
       // nothing sent there is no streamEnded drain, so re-poke instead of parking the queued
-      // wake on the sweep. No spin: the suppressed notifications were just durably marked
-      // superseded, so the re-drain sees no non-workflow deliverables and selects a group.
-      if (deliverableWorkflowPrompts.length > 0) {
+      // wake on the sweep. No spin: re-poke only when this drain durably changed state (a
+      // suppressed turn or superseded workflow was just marked), so the re-drain sees a
+      // different candidate set; an all-indeterminate batch parks for the sweep instead.
+      if (
+        deliverableWorkflowPrompts.length > 0 &&
+        (suppressedNotificationIds.length > 0 || supersededWorkflowPrompts.length > 0)
+      ) {
         this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
       }
       return;
@@ -8746,7 +8781,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const notification of effectivePending) {
         await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
       }
-      for (const candidate of selectedWorkflowPrompts) {
+      for (const candidate of currentWorkflowPrompts) {
         // Marker failures are contained inside the settle method; the delivered wake itself is
         // durable history evidence, so the next evaluation settles this run as consumed.
         await this.markWorkflowRunTerminalAttentionSettled({
