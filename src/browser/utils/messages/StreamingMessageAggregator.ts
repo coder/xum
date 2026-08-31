@@ -1943,6 +1943,10 @@ export class StreamingMessageAggregator {
     return this.getActiveStreamEntry()?.[0];
   }
 
+  isStreamActive(messageId: string): boolean {
+    return this.activeStreams.has(messageId);
+  }
+
   /**
    * Mark the current active stream as "interrupting" (transient state).
    * Called before interruptStream so UI shows "interrupting..." immediately.

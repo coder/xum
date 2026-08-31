@@ -2219,6 +2219,15 @@ describe("WorkspaceStore", () => {
         timestamp: 3,
       });
       expect(bump).toHaveBeenCalledWith(workspaceId);
+
+      // The live row lookup must accept any active message: keying it to the
+      // first active-stream entry would return null for the newer stream's row
+      // and leave it rendering a stale prop row between workspace bumps.
+      const secondRow = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .find((message) => "historyId" in message && message.historyId === secondMessageId)!;
+      expect(store.getStreamingMessage(workspaceId, secondRow.id, secondMessageId)).not.toBeNull();
     });
 
     it("releases the keyed channel when a background activity stop clears the stream", async () => {

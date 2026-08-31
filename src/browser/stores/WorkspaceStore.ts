@@ -1746,8 +1746,10 @@ export class WorkspaceStore {
   ): DisplayedMessage | null {
     const aggregator = this.aggregators.get(workspaceId);
     // Completed rows may be transformed by the transcript (e.g. merged stream
-    // errors); only the actively streaming message overrides its prop row.
-    if (!aggregator || aggregator.getActiveStreamMessageId() !== messageId) return null;
+    // errors); only an actively streaming message overrides its prop row. Check
+    // membership rather than the first active entry so a second concurrent
+    // stream's rows keep receiving live overrides.
+    if (!aggregator?.isStreamActive(messageId)) return null;
     return aggregator.getDisplayedMessages().find((message) => message.id === displayedId) ?? null;
   }
 
