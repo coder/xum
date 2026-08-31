@@ -12920,15 +12920,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       }
     }
-    // Kernel workflow run references belong to the cleared conversation: a verified-empty
-    // (null) boundary snapshot recorded before the clear is indistinguishable from one
-    // recorded after it, so a surviving reference could inject a pre-clear workflow result
-    // into the fresh conversation. Retire them BEFORE the truncation commits so both fault
-    // directions fail safe: a failed retirement aborts with the conversation intact, and a
-    // failed truncation leaves reference-less runs settling superseded (dropped wake, still
-    // retrievable via resume) rather than a committed clear racing a live null-boundary
-    // reference it could no longer delete. A post-clear resume re-records provenance.
-    if (isFullClear) {
+    // Kernel workflow run references belong to the conversation this truncation mutates: a
+    // full clear leaves a verified-empty (null) boundary snapshot reading the fresh
+    // conversation as current, and even a prefix truncation can delete the launch turn's
+    // restriction-bearing rows without appending any supersession decision, letting the wake
+    // recompose from unrestricted defaults. Retire the references on every row-removing
+    // truncation, BEFORE it commits, so both fault directions fail safe: a failed retirement
+    // aborts with the conversation intact, and a failed or refused truncation leaves
+    // reference-less runs settling superseded (dropped wake, still retrievable via resume,
+    // which re-records provenance under the surviving context).
+    if (effectivePercentage > 0) {
       try {
         await this.retireKernelWorkflowRunReferences(workspaceId);
       } catch (error) {
@@ -13376,6 +13377,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           if (!retryDiscard.success) {
             return Err(
               `Cannot replace history: pending retry state could not be discarded (${retryDiscard.error})`
+            );
+          }
+        }
+        // A destructive non-compaction replacement discards the conversation the kernel
+        // workflow references belong to, exactly like a full clear: a verified-empty (null)
+        // boundary snapshot reads the decision-free replacement history as current and would
+        // inject a pre-replacement workflow result into it. Same ordering and failure posture
+        // as truncateHistory: retire before the clear commits, abort when retirement fails.
+        // Compaction replaces preserve conversation identity, so their references stay live.
+        if (!isCompaction) {
+          try {
+            await this.retireKernelWorkflowRunReferences(workspaceId);
+          } catch (error) {
+            return Err(
+              `Cannot replace history: stale workflow run references could not be retired ` +
+                `(${getErrorMessage(error)}). Retry once the session storage is writable.`
             );
           }
         }

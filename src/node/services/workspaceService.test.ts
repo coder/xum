@@ -9276,7 +9276,9 @@ describe("WorkspaceService workflow invocation events", () => {
       } finally {
         preflightSpy.mockRestore();
       }
-      // Nothing was cleared: the transcript and the kernel reference survive intact.
+      // The transcript is intact; the reference was already retired before the refused
+      // rewrite (retirement precedes every row-removing truncation), which is the fail-safe
+      // direction: a dropped wake, with the result still retrievable via resume.
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
       if (history.success) {
@@ -9284,7 +9286,124 @@ describe("WorkspaceService workflow invocation events", () => {
       }
       expect(
         existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
-      ).toBe(true);
+      ).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a partial prefix truncation retires kernel workflow references", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-prefix-retire";
+    const runId = "wfr_currentness_prefix_retire";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-prefix-retire",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "before truncation", { timestamp: 1_200 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user-b", "user", "still here after", { timestamp: 1_300 })
+      );
+
+      // A genuinely partial prefix cut can delete the launch turn's restriction-bearing rows
+      // without adding a supersession decision, so the reference must not survive to
+      // recompose the wake from unrestricted defaults; the run stays retrievable via resume.
+      const truncateResult = await workspaceService.truncateHistory(workspaceId, 0.5);
+      expect(truncateResult.success).toBe(true);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data).toHaveLength(1);
+      }
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a destructive history replacement retires kernel workflow references", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-replace-retire";
+    const runId = "wfr_currentness_replace_retire";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-replace-retire",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "before replacement", { timestamp: 1_200 })
+      );
+
+      // A destructive non-compaction replacement leaves a decision-free transcript that a
+      // null-boundary reference would read as current, injecting the pre-replacement result.
+      const replaceResult = await workspaceService.replaceHistory(
+        workspaceId,
+        createMuxMessage("replacement-summary", "assistant", "Replacement summary", {})
+      );
+      expect(replaceResult.success).toBe(true);
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();
