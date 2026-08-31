@@ -254,12 +254,16 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
+    const discardProcess = mock(() => Promise.resolve());
     const upsert = mock(() => Promise.resolve());
     const remove = mock(() => Promise.resolve());
     const recordTerminal = mock(() => Promise.resolve());
     const internal = service as unknown as {
       bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      bashMonitorWakeReconciler: {
+        scheduleReconcile: typeof scheduleReconcile;
+        discardProcess: typeof discardProcess;
+      };
       bashMonitorRegistryStore: {
         upsert: typeof upsert;
         remove: typeof remove;
@@ -268,7 +272,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
       internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
       const armed = {
         processId: "proc",
@@ -291,6 +295,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await Promise.resolve();
 
       expect(upsert).toHaveBeenCalledWith(armed);
+      expect(discardProcess).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
