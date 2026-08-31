@@ -19,6 +19,9 @@ import { makeWorkspaceHostFake } from "@/node/services/taskWorkspaceSeam.testUti
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TaskService } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
+import type { StreamEndEvent } from "@/common/types/stream";
+import type { MuxMessageMetadata } from "@/common/types/message";
 export function initGitRepo(projectPath: string): void {
   execSync("git init -b main", { cwd: projectPath, stdio: "ignore" });
   execSync('git config user.email "test@example.com"', { cwd: projectPath, stdio: "ignore" });
@@ -363,4 +366,108 @@ export function workspaceTurnManagerFor(
   return (
     service as unknown as { getWorkspaceTurnManager(): WorkspaceTurnManager }
   ).getWorkspaceTurnManager();
+}
+
+export function workspaceTurnRecord(
+  ownerWorkspaceId: string,
+  workspaceId: string,
+  handleId: string,
+  status: WorkspaceTurnTaskHandleRecord["status"],
+  overrides: Partial<WorkspaceTurnTaskHandleRecord> = {}
+): WorkspaceTurnTaskHandleRecord {
+  return {
+    kind: "workspace_turn",
+    ownerWorkspaceId,
+    workspaceId,
+    handleId,
+    turnId: "turn",
+    status,
+    createdAt: "2026-06-19T00:00:00.000Z",
+    updatedAt: "2026-06-19T00:00:01.000Z",
+    createdWorkspace: false,
+    disposableWorkspace: false,
+    ...overrides,
+  };
+}
+
+export function workspaceTurnStreamEndEvent(
+  ownerWorkspaceId: string,
+  messageId: string,
+  text: string,
+  options: {
+    taskHandleId?: string;
+    turnId?: string;
+    finishReason?: StreamEndEvent["metadata"]["finishReason"];
+  } = {}
+): StreamEndEvent {
+  return {
+    type: "stream-end",
+    workspaceId: "childworkspace",
+    messageId,
+    metadata: {
+      model: "anthropic:claude-opus-4-6",
+      agentId: "exec",
+      finishReason: options.finishReason ?? "stop",
+      muxMetadata: {
+        type: "workspace-turn-task",
+        taskHandleId: options.taskHandleId ?? "wst_handle",
+        ownerWorkspaceId,
+        turnId: options.turnId ?? "turn",
+      },
+    },
+    parts: [{ type: "text", text }],
+  };
+}
+
+export function workspaceTurnMuxMetadata(
+  ownerWorkspaceId: string,
+  taskHandleId = "wst_handle",
+  turnId = "turn"
+): Extract<MuxMessageMetadata, { type: "workspace-turn-task" }> {
+  return { type: "workspace-turn-task", taskHandleId, ownerWorkspaceId, turnId };
+}
+
+export function createWorkspaceTurnMetadata(projectPath: string): WorkspaceMetadata {
+  return {
+    id: "childworkspace",
+    name: "workspace-turn",
+    title: "Workspace turn",
+    projectName: "repo",
+    projectPath,
+    runtimeConfig: { type: "local" },
+    createdAt: "2026-06-19T00:00:00.000Z",
+  };
+}
+
+export function makeWorkspaceTurnCreateMock(config: Config, projectPath: string) {
+  return mock(
+    async (
+      ...args: Parameters<WorkspaceHost["create"]>
+    ): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+      const tags = args[7];
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        if (project == null) throw new Error("test project must exist");
+        project.workspaces.push({
+          path: path.join(projectPath, "workspace-turn"),
+          id: "childworkspace",
+          name: "workspace-turn",
+          title: "Workspace turn",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+          tags,
+        });
+        return cfg;
+      });
+      return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+    }
+  );
+}
+
+export function workspaceTurnSnapshot(
+  service: TaskService | WorkspaceTurnManager,
+  ownerWorkspaceId: string,
+  handleId = "wst_handle"
+) {
+  return workspaceTurnManagerFor(service).getWorkspaceTurnSnapshot(ownerWorkspaceId, handleId);
 }
