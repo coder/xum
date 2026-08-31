@@ -174,7 +174,7 @@ export class BashMonitorRegistryStore {
         throw error;
       }
       const record = this.parse(raw);
-      if (record == null || record.createdAt !== createdAt) return;
+      if (record?.createdAt !== createdAt) return;
       await this.writeRecord({ ...record, terminal });
     });
   }
@@ -195,7 +195,7 @@ export class BashMonitorRegistryStore {
         throw error;
       }
       const record = this.parse(raw);
-      if (record == null || record.createdAt !== createdAt) return;
+      if (record?.createdAt !== createdAt) return;
       const boundedMatch =
         lost.failedMatch != null ? boundBashMonitorWakeLines(lost.failedMatch.lines) : undefined;
       const normalized: BashMonitorLostSummary = {

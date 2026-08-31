@@ -84,6 +84,36 @@ describe("BashMonitorRegistryStore", () => {
     ]);
   });
 
+  test("terminal and lost writes preserve a re-armed generation", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    const oldCreatedAt = "2026-08-31T12:00:00.000Z";
+    const newCreatedAt = "2026-08-31T12:01:00.000Z";
+    await store.upsert(armedPayload({ createdAt: oldCreatedAt }));
+    await store.upsert(armedPayload({ createdAt: newCreatedAt, filter: "NEW" }));
+
+    await store.recordTerminal("owner-1", "proc-1", oldCreatedAt, {
+      status: "exited",
+      exitCode: 1,
+      settledAt: "2026-08-31T12:02:00.000Z",
+      wakeOnExit: true,
+      terminalStatusShown: false,
+    });
+    await store.recordLost("owner-1", "proc-1", oldCreatedAt, {
+      reason: "runtime-failure",
+      failedAt: "2026-08-31T12:02:00.000Z",
+    });
+
+    const records = await store.listAll("owner-1");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      processId: "proc-1",
+      createdAt: newCreatedAt,
+      filter: "NEW",
+    });
+    expect(records[0].terminal).toBeUndefined();
+    expect(records[0].lost).toBeUndefined();
+  });
+
   test("skips malformed records when listing", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);

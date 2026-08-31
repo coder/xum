@@ -423,6 +423,44 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].prompt).toContain("READY");
   });
 
+  test("partially shown retained batches omit only the covered batch", async () => {
+    live = [
+      liveSnapshot({
+        match: {
+          batches: [
+            { throughOffset: 10, lines: ["BATCH_A"], totalMatches: 1, droppedLines: 0 },
+            { throughOffset: 20, lines: ["BATCH_B"], totalMatches: 2, droppedLines: 0 },
+          ],
+          throughOffset: 20,
+          lines: ["BATCH_A", "BATCH_B"],
+          totalMatches: 2,
+        },
+      }),
+    ];
+    deliveryState = { status: "settled", shownThroughOffset: 10, terminalStatusShown: false };
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches[0].prompt).not.toContain("BATCH_A");
+    expect(dispatches[0].prompt).toContain("BATCH_B");
+  });
+
+  test("matched user output resembling a settlement marker is preserved", async () => {
+    live = [
+      liveSnapshot({
+        match: {
+          throughOffset: 30,
+          lines: ["[monitor] process settled: user supplied detail"],
+          totalMatches: 1,
+        },
+      }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches[0].prompt).toContain("> [monitor] process settled: user supplied detail");
+  });
+
   test("settlement excludes tail lines already covered by the delivered match watermark", async () => {
     live = [
       liveSnapshot({
@@ -481,7 +519,7 @@ describe("BashMonitorWakeReconciler", () => {
         filter: "TICK_",
         match: {
           throughOffset: 14,
-          lines: ["TICK_2", "[monitor] process settled: exited (code 0)"],
+          lines: ["TICK_2"],
           totalMatches: 2,
         },
         terminal: {
