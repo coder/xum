@@ -483,6 +483,42 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("startup retries a partial registry scan before scheduling reconciliation", async () => {
+    const { service, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    let scans = 0;
+    const internal = service as unknown as {
+      constructedAtMs: number;
+      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      bashMonitorRegistryStore: {
+        listOwnerWorkspaceIds(): Promise<{ ownerWorkspaceIds: string[]; scanFailed: boolean }>;
+        listAll(workspaceId: string): Promise<Array<{ createdAt: string }>>;
+      };
+      recoverBashMonitorStateAfterRestart(): Promise<void>;
+    };
+    try {
+      internal.constructedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorRegistryStore = {
+        listOwnerWorkspaceIds: () => {
+          scans++;
+          return Promise.resolve({ ownerWorkspaceIds: ["owner"], scanFailed: scans === 1 });
+        },
+        listAll: () =>
+          scans === 1
+            ? Promise.reject(new Error("transient owner scan failure"))
+            : Promise.resolve([{ createdAt: "2026-08-31T11:59:00.000Z" }]),
+      };
+
+      await internal.recoverBashMonitorStateAfterRestart();
+
+      expect(scans).toBe(2);
+      expect(scheduleReconcile).toHaveBeenCalledWith("owner");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("busy owners defer reconciliation without queueing a synthetic turn", async () => {
     const { config, service, cleanup } = await createWakeWiringService();
     const workspaceId = "busy-wake-owner";

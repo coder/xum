@@ -510,6 +510,8 @@ describe("BackgroundProcessManager", () => {
     it("folds a same-poll read chunk into the failure payload when the exit probe escalates", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+      const matchEvents: MonitorMatchPayload[] = [];
+      manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
 
       const result = await manager.spawn(runtime, testWorkspaceId, "sleep 5", {
         cwd: process.cwd(),
@@ -553,6 +555,12 @@ describe("BackgroundProcessManager", () => {
       );
       expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
       expect(stoppedEvent?.failedMatch).toMatchObject({ lines: ["READY"], totalMatches: 1 });
+      expect(matchEvents).toEqual([]);
+      expect(
+        manager
+          .pullMonitorWakeSignals(testWorkspaceId)
+          .find((snapshot) => snapshot.processId === result.processId)?.match?.lines
+      ).toEqual(["READY"]);
     });
 
     it("retires a monitor after repeated output failures while exit probes stay healthy", async () => {

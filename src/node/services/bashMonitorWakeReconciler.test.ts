@@ -131,6 +131,42 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
+  test("superseding a queued wake uses a distinct queue key", async () => {
+    const queuedKeys = new Set<string>();
+    const queuedDispatches: BashMonitorWakeDispatch[] = [];
+    const queueing = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve([]),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      onWake: (dispatch) => {
+        if (queuedKeys.has(dispatch.dedupeKey)) return "deferred";
+        queuedKeys.add(dispatch.dedupeKey);
+        queuedDispatches.push(dispatch);
+        return "in-flight";
+      },
+    });
+    live = [liveSnapshot()];
+    await queueing.reconcile(OWNER);
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+
+    await queueing.reconcile(OWNER);
+
+    expect(queuedDispatches).toHaveLength(2);
+    expect(queuedKeys.size).toBe(2);
+    expect(queuedDispatches[0].cancelSignal.aborted).toBe(true);
+  });
+
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
     rows = [registryRecord()];
 
@@ -688,6 +724,16 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toEqual([]);
     const statError = await fsPromises.stat(sessionDir).catch((error: unknown) => error);
     expect(statError).toMatchObject({ code: "ENOENT" });
+  });
+
+  test("revived workspace resumes wake delivery after a failed removal", async () => {
+    await reconciler.dispose(OWNER);
+    reconciler.revive(OWNER);
+    live = [liveSnapshot()];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
   });
 
   test("snapshot supplies pending kinds without dispatching and removes the legacy wake directory", async () => {
