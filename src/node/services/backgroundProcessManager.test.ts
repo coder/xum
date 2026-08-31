@@ -2408,14 +2408,12 @@ describe("BackgroundProcessManager", () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "sleep 30", {
         cwd: process.cwd(),
         displayName: "non-probing-wake-frontier",
-        monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
       });
       expect(result.success).toBe(true);
       if (!result.success) return;
       const proc = await manager.getProcess(result.processId);
       expect(proc).not.toBeNull();
       if (proc == null) return;
-      if (proc.monitor != null) proc.monitor.stopped = true;
       const exitSpy = spyOn(proc.handle, "getExitCode").mockRejectedValue(
         new Error("persistent transport failure")
       );
