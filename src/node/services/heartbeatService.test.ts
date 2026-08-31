@@ -591,8 +591,11 @@ describe("HeartbeatService", () => {
       const emitter = new EventEmitter();
       let failListenerRegistration = true;
       const realOn = emitter.on.bind(emitter);
+      // Fail only the SECOND listener registration ("metadata") so the test
+      // also covers partial-acquisition rollback: the already-registered
+      // "activity" listener must be released, not leaked across retries.
       emitter.on = ((event: string, listener: (...args: unknown[]) => void) => {
-        if (failListenerRegistration) {
+        if (failListenerRegistration && event === "metadata") {
           throw new Error("listener registration failed");
         }
         return realOn(event, listener);
@@ -612,6 +615,11 @@ describe("HeartbeatService", () => {
       );
 
       expect(() => failingService.start()).toThrow();
+
+      // The "activity" listener registered before the failing "metadata"
+      // registration must have been rolled back — a leak here would double up
+      // event handling after a successful retry.
+      expect(emitter.listenerCount("activity")).toBe(0);
 
       // The idle-consumer registration acquired before the failing step must
       // have been released: re-registering the same consumer name would

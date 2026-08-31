@@ -170,14 +170,25 @@ export class HeartbeatService {
             self.heartbeatConsumerDisposer = null;
           })
       );
+      // One acquireRelease per listener: a combined acquisition would install
+      // its finalizer only after BOTH .on() calls succeed, so a throw from the
+      // second registration (e.g. a `newListener` hook) would leak the first
+      // listener across start() retries (Codex P2 on #4031).
       yield* Effect.acquireRelease(
         Effect.sync(() => {
           self.workspaceService.on("activity", self.onActivity);
-          self.workspaceService.on("metadata", self.onMetadata);
         }),
         () =>
           Effect.sync(() => {
             self.workspaceService.off("activity", self.onActivity);
+          })
+      );
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          self.workspaceService.on("metadata", self.onMetadata);
+        }),
+        () =>
+          Effect.sync(() => {
             self.workspaceService.off("metadata", self.onMetadata);
           })
       );
