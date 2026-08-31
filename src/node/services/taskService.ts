@@ -7716,10 +7716,10 @@ export class TaskService implements AgentTaskIntegration {
           }
           // Upgrade compatibility: the previous build recorded consumption only under the
           // stable un-suffixed id (no generation markers), including history-invisible
-          // consumption such as a kernel-nested task_await. The recency guard keeps
-          // generation markers authoritative: the restart-time stable clear is best-effort,
-          // so a marker older than this terminal generation is stale and must not suppress
-          // the newer result; unparseable timestamps fail toward notify.
+          // consumption such as a kernel-nested task_await. The guard keeps generation
+          // markers authoritative: the restart-time stable clear is best-effort, so a stale
+          // previous-generation marker must not suppress the newer result; mismatched or
+          // unparseable evidence fails toward notify.
           let stableMarker: Awaited<ReturnType<TerminalAttentionStore["get"]>>;
           try {
             stableMarker = await this.terminalAttentionStore.get(
@@ -7738,13 +7738,20 @@ export class TaskService implements AgentTaskIntegration {
             stableMarker != null &&
             (stableMarker.status === "delivered" || stableMarker.status === "superseded")
           ) {
-            const stableMarkerAt = Date.parse(stableMarker.createdAt);
-            const terminalGenerationAt = Date.parse(run.updatedAt);
-            if (
-              Number.isFinite(stableMarkerAt) &&
-              Number.isFinite(terminalGenerationAt) &&
-              stableMarkerAt >= terminalGenerationAt
-            ) {
+            // Prefer exact generation evidence (this build's settlement refresh records the
+            // consumed generation), which is immune to wall-clock corrections; the createdAt
+            // recency heuristic remains only for legacy markers from the previous build,
+            // which recorded no generation.
+            let consumedByStableMarker = stableMarker.generationId === run.updatedAt;
+            if (!consumedByStableMarker && stableMarker.generationId == null) {
+              const stableMarkerAt = Date.parse(stableMarker.createdAt);
+              const terminalGenerationAt = Date.parse(run.updatedAt);
+              consumedByStableMarker =
+                Number.isFinite(stableMarkerAt) &&
+                Number.isFinite(terminalGenerationAt) &&
+                stableMarkerAt >= terminalGenerationAt;
+            }
+            if (consumedByStableMarker) {
               try {
                 // Migrate the decision onto this generation's marker so later sweeps stay
                 // single-read; the stable marker already proves consumption, so a failed
@@ -7968,13 +7975,21 @@ export class TaskService implements AgentTaskIntegration {
       // a downgraded build re-create a pending wake for a result the user already consumed.
       // Stable-first ordering keeps the generation marker (this build's authority) retryable:
       // if either write fails, the queue entry survives and the next drain re-settles both.
-      await this.terminalAttentionStore.recordSettled({
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        sourceKind: "workflow_run",
-        sourceId: params.runId,
-        terminalOutcome: terminalAttentionOutcome(params.status),
-        status: params.settledAs,
-      });
+      // The refresh (not write-once) matters: a stale previous-generation stable marker can
+      // survive its best-effort restart-time clear, and a downgraded build would read it as
+      // consumption of THIS generation's result. The recorded generation also gives the
+      // sweep's upgrade fallback exact evidence immune to wall-clock corrections.
+      await this.terminalAttentionStore.recordSettled(
+        {
+          ownerWorkspaceId: params.ownerWorkspaceId,
+          sourceKind: "workflow_run",
+          sourceId: params.runId,
+          generationId: params.runUpdatedAt,
+          terminalOutcome: terminalAttentionOutcome(params.status),
+          status: params.settledAs,
+        },
+        { wholeSourceRefresh: true }
+      );
       await this.terminalAttentionStore.recordSettled({
         ownerWorkspaceId: params.ownerWorkspaceId,
         sourceKind: "workflow_run",

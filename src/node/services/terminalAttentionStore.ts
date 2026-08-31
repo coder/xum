@@ -143,6 +143,12 @@ export class TerminalAttentionStore {
    * single write (no pending intermediate a concurrent reader could misread as an owed wake).
    * An existing record for the same id is left untouched. Omitting generationId settles the
    * stable (un-suffixed) id, which older builds use for whole-source dedupe.
+   *
+   * wholeSourceRefresh instead settles the stable id while keeping the generationId FIELD and
+   * overwrites any existing record: that marker means "latest consumed generation of this
+   * source", so settlement must refresh a stale previous-generation record that survived its
+   * best-effort restart-time clear, and the recorded generation gives readers exact evidence
+   * that is immune to wall-clock corrections.
    */
   async recordSettled(
     notification: Omit<
@@ -150,16 +156,20 @@ export class TerminalAttentionStore {
       "id" | "status" | "createdAt" | "outputDelivery"
     > & {
       status: "delivered" | "superseded";
-    }
+    },
+    options?: { wholeSourceRefresh?: boolean }
   ): Promise<void> {
+    const wholeSourceRefresh = options?.wholeSourceRefresh === true;
     const id = TerminalAttentionStore.notificationId(
       notification.sourceKind,
       notification.sourceId,
-      notification.generationId
+      wholeSourceRefresh ? undefined : notification.generationId
     );
-    const existing = await this.get(notification.ownerWorkspaceId, id);
-    if (existing != null) {
-      return;
+    if (!wholeSourceRefresh) {
+      const existing = await this.get(notification.ownerWorkspaceId, id);
+      if (existing != null) {
+        return;
+      }
     }
     await this.write(
       {
