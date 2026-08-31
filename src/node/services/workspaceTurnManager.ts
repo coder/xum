@@ -1,20 +1,28 @@
 import assert from "node:assert/strict";
-import type { z } from "zod";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
-import type { QueueCutCutter } from "@/node/services/messageQueue";
 import {
   areArchiveUntrackedPathListsEqual,
+  formatSubagentFailureUserMessage,
+  formatSubagentReportUserMessage,
+  getIsoNow,
+  resolveTaskAgentIdForResume,
+  terminalAttentionOutcome,
+  type BackgroundableForegroundWaiter,
+  type QueueCutAttributionSnapshot,
+  type ResolvedWorkspaceAiSettings,
+  type TaskCreateArgs,
   type WorkspaceHost,
+  type WorkspaceLifecycleResult,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
+export type { TaskCreateArgs, TaskKind } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
-  formatSubagentReportEnvelope,
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
@@ -59,7 +67,7 @@ import { RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
-import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 import {
   type OpenAIReasoningMode,
   type ParsedThinkingInput,
@@ -75,11 +83,6 @@ import {
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
-import { type WorkflowRunStatus } from "@/common/types/workflow";
-import {
-  type TaskWorkspaceLifecycleToolTargetResultSchema,
-  type TaskIsolation,
-} from "@/common/utils/tools/toolDefinitions";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
@@ -101,23 +104,6 @@ import {
   TerminalAttentionStore,
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
-
-export type TaskKind = "agent";
-
-/**
- * Resolved per-agent AI settings (canonical model + optional thinking level).
- *
- * `thinkingLevel` is optional because internal callers read these settings off of
- * partial workspace metadata where the field may be missing on older entries.
- */
-interface ResolvedWorkspaceAiSettings {
-  model: string;
-  thinkingLevel?: ThinkingLevel;
-  /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
-  reasoningMode?: OpenAIReasoningMode;
-}
-
-type WorkspaceLifecycleResult = z.infer<typeof TaskWorkspaceLifecycleToolTargetResultSchema>;
 
 // Only the reversible verbs are restored; task_remove stays the sole irreversible verb
 // (delete_worktree/remove remain in the result schema for historical-transcript parsing only).
@@ -142,96 +128,6 @@ interface ResolvedWorkspaceLifecycleTarget {
   metadata: WorkspaceMetadata | null;
 }
 
-export interface TaskCreateArgs {
-  parentWorkspaceId: string;
-  kind: TaskKind;
-  /** Preferred identifier (matches agent definition id). */
-  agentId?: string;
-  /** @deprecated Legacy alias for agentId (kept for on-disk compatibility). */
-  agentType?: string;
-  prompt: string;
-  /** Human-readable title for the task (displayed in sidebar) */
-  title: string;
-  modelString?: string;
-  /**
-   * Explicit thinking override. Named levels apply directly; a numeric index is
-   * deferred (ParsedThinkingInput) and resolved against the chosen model's policy
-   * in resolveTaskAISettings, mirroring the UI's `/model+level` semantics.
-   */
-  thinkingLevel?: ParsedThinkingInput;
-  /**
-   * Workspace isolation for this task. "none" runs the sub-agent directly in the parent
-   * workspace's checkout (shared working tree, no fork) on runtimes that support it; defaults to
-   * "fork" (isolated copy) when omitted. Ignored (treated as "fork") on unsupported runtimes.
-   */
-  isolation?: TaskIsolation;
-  parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
-  /**
-   * Model-refusal policy persisted on the child workspace. "fail" opts the task
-   * out of configured model-fallback chains so a refusal settles terminally
-   * (workflow verifier steps demand honest failure). Defaults to "fallback".
-   */
-  onRefusal?: "fail" | "fallback";
-  /** Shared grouping metadata when one tool call spawns multiple sibling tasks. */
-  bestOf?: {
-    groupId: string;
-    index: number;
-    total: number;
-  };
-  workflowTask?: {
-    runId: string;
-    stepId: string;
-    workflowName?: string;
-    outputSchema?: unknown;
-  };
-  /**
-   * How the owner's stream-end treats this task while it is active. Derived from
-   * launch intent: `run_in_background: true` -> "notify_on_terminal" (non-blocking
-   * with terminal wake-up); foreground/default -> "blocking_until_terminal".
-   * Defaults to blocking when omitted.
-   */
-  attentionPolicy?: BackgroundWorkAttentionPolicy;
-  /** Experiments to inherit to subagent */
-  experiments?: {
-    programmaticToolCalling?: boolean;
-    /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
-    rlm?: boolean;
-    advisorTool?: boolean;
-    dynamicWorkflows?: boolean;
-  };
-}
-
-function formatSubagentReportUserMessage(params: {
-  childWorkspaceId: string;
-  agentType: string;
-  title: string;
-  reportMarkdown: string;
-  status: "in_progress" | "completed";
-  executionVersion?: string;
-  executionId?: string;
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-  structuredOutput?: unknown;
-}): string {
-  assert(params.childWorkspaceId.length > 0, "subagent report message requires child id");
-  assert(params.agentType.length > 0, "subagent report message requires agent type");
-  assert(params.title.length > 0, "subagent report message requires title");
-  assert(params.reportMarkdown.length > 0, "subagent report message requires markdown");
-
-  return formatSubagentReportEnvelope({
-    taskId: params.childWorkspaceId,
-    agentType: params.agentType,
-    status: params.status,
-    title: params.title,
-    reportMarkdown: params.reportMarkdown,
-    ...(params.executionVersion != null ? { executionVersion: params.executionVersion } : {}),
-    ...(params.executionId != null ? { executionId: params.executionId } : {}),
-    ...(params.model != null ? { model: params.model } : {}),
-    ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
-    ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
-  });
-}
-
 function parseTerminalSubagentExecutionVersion(content: string): string | null {
   const report = parseSubagentReportEnvelope(content);
   if (report?.executionVersion != null) return report.executionVersion;
@@ -239,55 +135,7 @@ function parseTerminalSubagentExecutionVersion(content: string): string | null {
   return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
 }
 
-// Failure twin of formatSubagentReportUserMessage: terminal child failures are
-// delivered into the parent context as an explicit failure block (never as a
-// report) so a later wake-up — by ANY sibling's settlement — cannot present the
-// fanout as fully successful.
-function formatSubagentFailureUserMessage(params: {
-  childWorkspaceId: string;
-  agentType: string;
-  executionVersion?: string;
-  executionId?: string;
-  errorType: string;
-  errorMessage: string;
-}): string {
-  assert(params.childWorkspaceId.length > 0, "subagent failure message requires child id");
-  assert(params.agentType.length > 0, "subagent failure message requires agent type");
-  assert(params.errorMessage.length > 0, "subagent failure message requires error message");
-
-  return [
-    SUBAGENT_FAILURE_ENVELOPE_TAG,
-    `<task_id>${params.childWorkspaceId}</task_id>`,
-    ...(params.executionVersion != null
-      ? [`<execution_version>${params.executionVersion}</execution_version>`]
-      : []),
-    ...(params.executionId != null ? [`<execution_id>${params.executionId}</execution_id>`] : []),
-    `<agent_type>${params.agentType}</agent_type>`,
-    `<error_type>${params.errorType}</error_type>`,
-    "<error_message>",
-    params.errorMessage,
-    "</error_message>",
-    "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
-    "</mux_subagent_failure>",
-  ].join("\n");
-}
-
-function terminalAttentionOutcome(
-  status: WorkflowRunStatus | WorkspaceTurnTaskStatus
-): TerminalAttentionOutcome {
-  switch (status) {
-    case "completed":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "interrupted":
-      return "interrupted";
-    default:
-      return "error";
-  }
-}
-
-type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
+export type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
 
 /**
  * Project-relative paths that contribute agent definitions to discovery
@@ -402,31 +250,12 @@ export interface WorkspaceTurnWaitResult {
 
 type WorkspaceTurnMuxMetadata = Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
 
-interface BackgroundableForegroundWaiter {
-  taskId: string;
-  reject: (error: Error) => void;
-  cleanup: () => void;
-  requestingWorkspaceId?: string;
-  backgroundOnMessageQueued: boolean;
-}
-
 interface WorkspaceTurnWaiter extends BackgroundableForegroundWaiter {
   handleId: string;
   resolve: (result: WorkspaceTurnWaitResult) => void;
 }
 
 /** Maximum consecutive auto-resumes before stopping. Prevents infinite loops when descendants are stuck. */
-// Task-recovery paths must stay deterministic and editing-capable even when
-// workspace/default agent preferences evolve (e.g., auto router defaults).
-const TASK_RECOVERY_FALLBACK_AGENT_ID = "exec";
-
-function resolveTaskAgentIdForResume(workspace: {
-  agentId?: string;
-  agentType?: string;
-  parentWorkspaceId?: string | null;
-}): string {
-  return resolvePersistedAgentId(workspace, TASK_RECOVERY_FALLBACK_AGENT_ID);
-}
 
 /**
  * Stream errors classified non-retryable by RetryManager that nevertheless have
@@ -465,7 +294,7 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
  * envelope when the parent IS the owner): an agent should not be woken merely
  * to learn the expected consequence of a follow-up it just initiated.
  */
-const WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX =
+export const WORKSPACE_TURN_SUPERSEDED_BY_OWNER_FOLLOW_UP_ERROR_PREFIX =
   "Workspace turn superseded by follow-up turn ";
 
 function buildOwnerFollowUpSupersededError(successorHandleId: string): string {
@@ -481,7 +310,7 @@ function buildOwnerFollowUpSupersededError(successorHandleId: string): string {
  * matching keeps old records parseable on downgrade while letting suppression
  * decisions derive purely from the persisted record.
  */
-function isOwnerFollowUpSupersededWorkspaceTurnInterrupt(
+export function isOwnerFollowUpSupersededWorkspaceTurnInterrupt(
   record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
 ): boolean {
   return (
@@ -516,7 +345,7 @@ function isSupersededWorkspaceTurnInterrupt(
  * notification was delivered"): deriving from the record keeps the audit trail
  * clean and stays downgrade-safe with no schema change.
  */
-function workspaceTurnTerminalAttentionSuppressed(
+export function workspaceTurnTerminalAttentionSuppressed(
   record: Pick<WorkspaceTurnTaskHandleRecord, "status" | "error">
 ): boolean {
   return isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record);
@@ -552,23 +381,6 @@ type QueueCutSupersedeEvidence =
   | { kind: "other_input" }
   | { kind: "preserved"; error: string }
   | null;
-
-/**
- * In-memory cut-attribution state captured synchronously when a stream-end
- * event is handled, BEFORE any awaits. handleStreamEnd performs async
- * persistence and attention work ahead of settlement, during which the child
- * session can dispatch further queued turns; classifying from live state at
- * that later point could attribute the cut to an input that engaged only
- * after the real cutter (e.g. a same-owner follow-up dispatched after a
- * manual message's turn failed instantly), wrongly suppressing the
- * notification for the real manual/cross-owner supersede. The snapshot pins
- * attribution to the state observed at the ended stream's own event.
- */
-interface QueueCutAttributionSnapshot {
-  activeStream: { messageId: string; muxMetadata: unknown } | undefined;
-  cutter: QueueCutCutter | undefined;
-  hasPendingQueuedOrPreparingTurn: boolean;
-}
 
 /**
  * Settled workspace-turn records eligible for self-heal correction (resettle from a
@@ -611,10 +423,6 @@ function isWorkspaceTurnRecoverableStreamError(errorType: StreamErrorType): bool
     WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS.has(errorType) ||
     !isNonRetryableStreamError({ type: errorType })
   );
-}
-
-function getIsoNow(): string {
-  return new Date().toISOString();
 }
 
 async function runtimePathExists(runtime: Runtime, path: string): Promise<boolean> {
@@ -666,7 +474,7 @@ export class WorkspaceTurnManager {
     return this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
   }
 
-  async markBackgroundWorkNotifyOnTerminal(
+  async markWorkspaceTurnBackgroundWorkNotifyOnTerminal(
     taskId: string,
     ownerWorkspaceId: string
   ): Promise<void> {

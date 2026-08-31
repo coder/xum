@@ -26,7 +26,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "@/node/services/aiService";
 import type {
   WorkspaceHost,
-  WorkspaceTurnBackgroundableForegroundWaiter,
+  BackgroundableForegroundWaiter,
   WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -121,7 +121,7 @@ function createWorkspaceTurnManagerHost(
   terminalAttentionStore: TerminalAttentionStore
 ): WorkspaceTurnManagerHostFake {
   const lifecycleLocks = new MutexMap<string>();
-  const foregroundWaiters = new Map<string, Set<WorkspaceTurnBackgroundableForegroundWaiter>>();
+  const foregroundWaiters = new Map<string, Set<BackgroundableForegroundWaiter>>();
   const foregroundAwaitCounts = new Map<string, number>();
   const agentTasks = (cfg: ReturnType<Config["loadConfigOrDefault"]>) =>
     Array.from(cfg.projects.values())
@@ -4243,7 +4243,7 @@ describe("WorkspaceTurnManager", () => {
     const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(terminal);
 
-    await taskService.markBackgroundWorkNotifyOnTerminal(terminal.handleId, parentId);
+    await taskService.markWorkspaceTurnBackgroundWorkNotifyOnTerminal(terminal.handleId, parentId);
 
     const updated = await taskHandleStore.getWorkspaceTurn(parentId, terminal.handleId);
     expect(updated).toMatchObject({

@@ -23,6 +23,21 @@ import type {
 import assert from "@/common/utils/assert";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
+import type { z } from "zod";
+import strictAssert from "node:assert/strict";
+import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
+import {
+  SUBAGENT_FAILURE_ENVELOPE_TAG,
+  formatSubagentReportEnvelope,
+} from "@/common/utils/subagentReportEnvelope";
+import { resolvePersistedAgentId } from "@/common/utils/agentIds";
+import type { ParsedThinkingInput } from "@/common/types/thinking";
+import type { WorkflowRunStatus } from "@/common/types/workflow";
+import type {
+  TaskIsolation,
+  TaskWorkspaceLifecycleToolTargetResultSchema,
+} from "@/common/utils/tools/toolDefinitions";
+import type { WorkspaceTurnTaskStatus } from "@/node/services/taskHandleStore";
 
 /**
  * One-directional service ports keep task and workspace orchestration from depending on each
@@ -31,6 +46,202 @@ import type { QueueCutCutter } from "@/node/services/messageQueue";
  */
 
 export type AgentTaskStatus = NonNullable<WorkspaceConfigEntry["taskStatus"]>;
+
+export type TaskKind = "agent";
+
+/**
+ * Resolved per-agent AI settings (canonical model + optional thinking level).
+ *
+ * `thinkingLevel` is optional because internal callers read these settings off of
+ * partial workspace metadata where the field may be missing on older entries.
+ */
+export interface ResolvedWorkspaceAiSettings {
+  model: string;
+  thinkingLevel?: ThinkingLevel;
+  /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
+  reasoningMode?: OpenAIReasoningMode;
+}
+
+export type WorkspaceLifecycleResult = z.infer<typeof TaskWorkspaceLifecycleToolTargetResultSchema>;
+
+export interface TaskCreateArgs {
+  parentWorkspaceId: string;
+  kind: TaskKind;
+  /** Preferred identifier (matches agent definition id). */
+  agentId?: string;
+  /** @deprecated Legacy alias for agentId (kept for on-disk compatibility). */
+  agentType?: string;
+  prompt: string;
+  /** Human-readable title for the task (displayed in sidebar) */
+  title: string;
+  modelString?: string;
+  /**
+   * Explicit thinking override. Named levels apply directly; a numeric index is
+   * deferred (ParsedThinkingInput) and resolved against the chosen model's policy
+   * in resolveTaskAISettings, mirroring the UI's `/model+level` semantics.
+   */
+  thinkingLevel?: ParsedThinkingInput;
+  /**
+   * Workspace isolation for this task. "none" runs the sub-agent directly in the parent
+   * workspace's checkout (shared working tree, no fork) on runtimes that support it; defaults to
+   * "fork" (isolated copy) when omitted. Ignored (treated as "fork") on unsupported runtimes.
+   */
+  isolation?: TaskIsolation;
+  parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
+  /**
+   * Model-refusal policy persisted on the child workspace. "fail" opts the task
+   * out of configured model-fallback chains so a refusal settles terminally
+   * (workflow verifier steps demand honest failure). Defaults to "fallback".
+   */
+  onRefusal?: "fail" | "fallback";
+  /** Shared grouping metadata when one tool call spawns multiple sibling tasks. */
+  bestOf?: {
+    groupId: string;
+    index: number;
+    total: number;
+  };
+  workflowTask?: {
+    runId: string;
+    stepId: string;
+    workflowName?: string;
+    outputSchema?: unknown;
+  };
+  /**
+   * How the owner's stream-end treats this task while it is active. Derived from
+   * launch intent: `run_in_background: true` -> "notify_on_terminal" (non-blocking
+   * with terminal wake-up); foreground/default -> "blocking_until_terminal".
+   * Defaults to blocking when omitted.
+   */
+  attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /** Experiments to inherit to subagent */
+  experiments?: {
+    programmaticToolCalling?: boolean;
+    /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
+    rlm?: boolean;
+    advisorTool?: boolean;
+    dynamicWorkflows?: boolean;
+  };
+}
+
+export function formatSubagentReportUserMessage(params: {
+  childWorkspaceId: string;
+  agentType: string;
+  title: string;
+  reportMarkdown: string;
+  status: "in_progress" | "completed";
+  executionVersion?: string;
+  executionId?: string;
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+  structuredOutput?: unknown;
+}): string {
+  strictAssert(params.childWorkspaceId.length > 0, "subagent report message requires child id");
+  strictAssert(params.agentType.length > 0, "subagent report message requires agent type");
+  strictAssert(params.title.length > 0, "subagent report message requires title");
+  strictAssert(params.reportMarkdown.length > 0, "subagent report message requires markdown");
+
+  return formatSubagentReportEnvelope({
+    taskId: params.childWorkspaceId,
+    agentType: params.agentType,
+    status: params.status,
+    title: params.title,
+    reportMarkdown: params.reportMarkdown,
+    ...(params.executionVersion != null ? { executionVersion: params.executionVersion } : {}),
+    ...(params.executionId != null ? { executionId: params.executionId } : {}),
+    ...(params.model != null ? { model: params.model } : {}),
+    ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
+    ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
+  });
+}
+
+// Failure twin of formatSubagentReportUserMessage: terminal child failures are
+// delivered into the parent context as an explicit failure block (never as a
+// report) so a later wake-up — by ANY sibling's settlement — cannot present the
+// fanout as fully successful.
+export function formatSubagentFailureUserMessage(params: {
+  childWorkspaceId: string;
+  agentType: string;
+  executionVersion?: string;
+  executionId?: string;
+  errorType: string;
+  errorMessage: string;
+}): string {
+  strictAssert(params.childWorkspaceId.length > 0, "subagent failure message requires child id");
+  strictAssert(params.agentType.length > 0, "subagent failure message requires agent type");
+  strictAssert(params.errorMessage.length > 0, "subagent failure message requires error message");
+
+  return [
+    SUBAGENT_FAILURE_ENVELOPE_TAG,
+    `<task_id>${params.childWorkspaceId}</task_id>`,
+    ...(params.executionVersion != null
+      ? [`<execution_version>${params.executionVersion}</execution_version>`]
+      : []),
+    ...(params.executionId != null ? [`<execution_id>${params.executionId}</execution_id>`] : []),
+    `<agent_type>${params.agentType}</agent_type>`,
+    `<error_type>${params.errorType}</error_type>`,
+    "<error_message>",
+    params.errorMessage,
+    "</error_message>",
+    "This sub-agent task failed terminally and will not produce a report. Do not re-await it.",
+    "</mux_subagent_failure>",
+  ].join("\n");
+}
+
+export function terminalAttentionOutcome(
+  status: WorkflowRunStatus | WorkspaceTurnTaskStatus
+): TerminalAttentionOutcome {
+  switch (status) {
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "interrupted":
+      return "interrupted";
+    default:
+      return "error";
+  }
+}
+
+export interface BackgroundableForegroundWaiter {
+  taskId: string;
+  reject: (error: Error) => void;
+  cleanup: () => void;
+  requestingWorkspaceId?: string;
+  backgroundOnMessageQueued: boolean;
+}
+
+// Task-recovery paths must stay deterministic and editing-capable even when
+// workspace/default agent preferences evolve (e.g., auto router defaults).
+export const TASK_RECOVERY_FALLBACK_AGENT_ID = "exec";
+
+export function resolveTaskAgentIdForResume(workspace: {
+  agentId?: string;
+  agentType?: string;
+  parentWorkspaceId?: string | null;
+}): string {
+  return resolvePersistedAgentId(workspace, TASK_RECOVERY_FALLBACK_AGENT_ID);
+}
+
+/**
+ * In-memory cut-attribution state captured synchronously when a stream-end
+ * event is handled, BEFORE any awaits. handleStreamEnd performs async
+ * persistence and attention work ahead of settlement, during which the child
+ * session can dispatch further queued turns; classifying from live state at
+ * that later point could attribute the cut to an input that engaged only
+ * after the real cutter (e.g. a same-owner follow-up dispatched after a
+ * manual message's turn failed instantly), wrongly suppressing the
+ * notification for the real manual/cross-owner supersede. The snapshot pins
+ * attribution to the state observed at the ended stream's own event.
+ */
+export interface QueueCutAttributionSnapshot {
+  activeStream: { messageId: string; muxMetadata: unknown } | undefined;
+  cutter: QueueCutCutter | undefined;
+  hasPendingQueuedOrPreparingTurn: boolean;
+}
+
+export function getIsoNow(): string {
+  return new Date().toISOString();
+}
 
 export interface ArchiveWorkspaceOptions {
   /**
@@ -292,20 +503,6 @@ export type WorkspaceHost = WorkspaceTurnHost &
   WorkspaceProvisioningHost &
   WorkspaceMetadataHost;
 
-export interface WorkspaceTurnBackgroundableForegroundWaiter {
-  taskId: string;
-  reject: (error: Error) => void;
-  cleanup: () => void;
-  requestingWorkspaceId?: string;
-  backgroundOnMessageQueued: boolean;
-}
-
-export interface WorkspaceTurnAiSettings {
-  model: string;
-  thinkingLevel?: ThinkingLevel;
-  reasoningMode?: OpenAIReasoningMode;
-}
-
 export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
@@ -334,8 +531,8 @@ export interface WorkspaceTurnTaskHost {
   buildParentAiSettingsFallbacks(
     parentMeta: {
       agentId?: string;
-      aiSettingsByAgent?: Record<string, WorkspaceTurnAiSettings>;
-      aiSettings?: WorkspaceTurnAiSettings;
+      aiSettingsByAgent?: Record<string, ResolvedWorkspaceAiSettings>;
+      aiSettings?: ResolvedWorkspaceAiSettings;
     },
     targetAgentId: string
   ): AgentAiSettingsLayerValues[];
@@ -385,22 +582,22 @@ export interface WorkspaceTurnTaskHost {
   ): Promise<void>;
   registerBackgroundableForegroundWaiter(
     workspaceId: string,
-    waiter: WorkspaceTurnBackgroundableForegroundWaiter
+    waiter: BackgroundableForegroundWaiter
   ): void;
   releaseRetainedStopLatches(workspaceId: string): void;
   resolveWorkspaceAISettings(
     workspace: {
-      aiSettingsByAgent?: Record<string, WorkspaceTurnAiSettings>;
-      aiSettings?: WorkspaceTurnAiSettings;
+      aiSettingsByAgent?: Record<string, ResolvedWorkspaceAiSettings>;
+      aiSettings?: ResolvedWorkspaceAiSettings;
     },
     agentId: string | undefined
-  ): WorkspaceTurnAiSettings | undefined;
+  ): ResolvedWorkspaceAiSettings | undefined;
   scheduleMaybeStartQueuedTasks(): void;
   scheduleTerminalAttentionDrain(ownerWorkspaceId: string): void;
   startForegroundAwait(workspaceId: string): () => void;
   unregisterBackgroundableForegroundWaiter(
     workspaceId: string,
-    waiter: WorkspaceTurnBackgroundableForegroundWaiter
+    waiter: BackgroundableForegroundWaiter
   ): void;
 }
 
