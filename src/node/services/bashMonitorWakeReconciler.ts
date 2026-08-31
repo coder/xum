@@ -785,7 +785,9 @@ export class BashMonitorWakeReconciler {
           }
         : {}),
       matchedOutputAlreadyShown,
-      ...(snapshot.terminal != null ? { terminal: snapshot.terminal } : {}),
+      ...(snapshot.terminal != null && (snapshot.terminal.wakeOnExit || snapshot.match == null)
+        ? { terminal: snapshot.terminal }
+        : {}),
       ...(snapshot.lost != null ? { lost: snapshot.lost } : {}),
       taskAwaitable,
       deadRegistryRow,

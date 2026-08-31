@@ -93,7 +93,7 @@ const BashMonitorRegistryRecordSchema = z
   })
   .strict();
 
-function boundScript(script: string): string {
+export function boundBashMonitorRegistryScript(script: string): string {
   if (Buffer.byteLength(script, "utf8") <= MAX_REGISTRY_SCRIPT_BYTES) return script;
   return `${truncateUtf8Prefix(script, MAX_REGISTRY_SCRIPT_BYTES)}… [truncated]`;
 }
@@ -148,7 +148,7 @@ export class BashMonitorRegistryStore {
         ...(payload.displayName != null ? { displayName: payload.displayName } : {}),
         filter: payload.filter,
         filterExclude: payload.filterExclude,
-        script: boundScript(payload.script),
+        script: boundBashMonitorRegistryScript(payload.script),
         createdAt: payload.createdAt,
       };
       const dir = this.dir(record.ownerWorkspaceId);

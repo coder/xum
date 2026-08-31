@@ -687,6 +687,7 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // workspace became active. This is an expected race, not a compaction failure, so the
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
+const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
 
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 const SEND_ADMISSION_STALE_MESSAGE =
@@ -1912,11 +1913,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       }
     };
-    void persist()
-      .then(() => this.scheduleBashMonitorWakeReconcile(workspaceId))
-      .catch((error: unknown) => {
-        log.error("Failed to retire bash monitor state", { workspaceId, error });
-      });
+    let retryIndex = 0;
+    const run = (): void => {
+      if (this.removingWorkspaces.has(workspaceId)) return;
+      void persist()
+        .then(() => this.scheduleBashMonitorWakeReconcile(workspaceId))
+        .catch((error: unknown) => {
+          const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
+          if (delay == null) {
+            log.error("Failed to retire bash monitor state", { workspaceId, error });
+            return;
+          }
+          const timer = setTimeout(run, delay);
+          timer.unref();
+        });
+    };
+    run();
   };
   // Last armed-monitor count successfully broadcast per workspace, so background process
   // churn that doesn't change the count (e.g. a monitorless bash exiting) skips the
@@ -2285,7 +2297,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     for (const ownerWorkspaceId of scan.ownerWorkspaceIds) {
       try {
         const records = await this.bashMonitorRegistryStore.listAll(ownerWorkspaceId);
-        if (records.some((record) => Date.parse(record.createdAt) < this.constructedAtMs)) {
+        if (
+          records.some((record) => {
+            const createdAtMs = Date.parse(record.createdAt);
+            return !Number.isFinite(createdAtMs) || createdAtMs < this.constructedAtMs;
+          })
+        ) {
           this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
         }
       } catch (error) {

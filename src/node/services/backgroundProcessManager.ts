@@ -25,7 +25,10 @@ import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
-import type { BashMonitorTerminalSummary } from "./bashMonitorRegistryStore";
+import {
+  boundBashMonitorRegistryScript,
+  type BashMonitorTerminalSummary,
+} from "./bashMonitorRegistryStore";
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
@@ -1855,7 +1858,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         ...(proc.displayName !== undefined ? { displayName: proc.displayName } : {}),
         filter: monitor.filter,
         filterExclude: monitor.exclude,
-        script: proc.script,
+        script: boundBashMonitorRegistryScript(proc.script),
         createdAt: monitor.armMetadata.createdAt,
         ...(match != null
           ? {
@@ -1927,24 +1930,25 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     );
   }
 
-  async getMonitorWakeDeliveryState(
+  getMonitorWakeDeliveryState(
     processId: string,
     originNotAfterMs?: number
   ): Promise<MonitorWakeDeliveryState | undefined> {
-    const proc = await this.getProcess(processId);
-    if (!proc) return undefined;
-    // Negated <= instead of > so a NaN bound (malformed persisted marker) also lands here:
-    // treating it as a generation mismatch fails open (the wake delivers) instead of letting an
-    // unrelated instance's read state supersede a durable wake or mark it awaitable.
-    if (originNotAfterMs != null && !(proc.startTime <= originNotAfterMs)) return undefined;
-    if (proc.monitorWakeBlockingReadSettled) {
-      return { status: "blocked", readSettled: proc.monitorWakeBlockingReadSettled };
+    const proc = this.processes.get(processId);
+    if (proc == null || (originNotAfterMs != null && !(proc.startTime <= originNotAfterMs))) {
+      return Promise.resolve(undefined);
     }
-    return {
+    if (proc.monitorWakeBlockingReadSettled) {
+      return Promise.resolve({
+        status: "blocked",
+        readSettled: proc.monitorWakeBlockingReadSettled,
+      });
+    }
+    return Promise.resolve({
       status: "settled",
       shownThroughOffset: proc.shownThroughOffset,
       terminalStatusShown: proc.terminalStatusShownToAgent,
-    };
+    });
   }
 
   /**
