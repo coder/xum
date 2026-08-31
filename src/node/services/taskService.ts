@@ -1166,6 +1166,11 @@ function workflowWakeGroupKey(agent: WorkflowWakeInitiatingAgent): string {
   return `${agent.agentId}\u0000${pin === undefined ? "walk" : JSON.stringify(pin)}`;
 }
 
+// Reserved workflowWakeGroupSendBackoffUntilMs key for the non-workflow (sub-agent and
+// workspace-turn) send batch. Group keys start with a non-empty agentId and the empty string
+// keys the unpinned group, so a leading \u0000 cannot collide.
+const NON_WORKFLOW_WAKE_BACKOFF_KEY = "\u0000non-workflow";
+
 function isTypedWorkspaceEvent(value: unknown, type: string): boolean {
   return (
     typeof value === "object" &&
@@ -8533,6 +8538,25 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * Back the given terminal-wake send batches off until the sweep cadence retries them and
+   * re-poke the drain so the remaining batches get their send this cycle instead of starving
+   * behind the failed one.
+   */
+  private backOffTerminalWakeSends(ownerWorkspaceId: string, keys: readonly string[]): void {
+    assert(keys.length > 0, "backOffTerminalWakeSends requires keys");
+    let ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
+    if (ownerBackoff == null) {
+      ownerBackoff = new Map();
+      this.workflowWakeGroupSendBackoffUntilMs.set(ownerWorkspaceId, ownerBackoff);
+    }
+    const retryAt = Date.now() + WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS;
+    for (const key of keys) {
+      ownerBackoff.set(key, retryAt);
+    }
+    this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+  }
+
+  /**
    * Drain pending terminal notifications for one owner workspace: defer (leave pending) when the
    * owner is busy/queued/preparing, otherwise send one coalesced synthetic wake-up and mark the
    * drained notifications delivered. Stale (deleted-workspace) notifications are marked superseded.
@@ -8703,8 +8727,27 @@ export class TaskService implements AgentTaskIntegration {
     // Suppression revalidation below can only shrink the workspace-turn set, so gating on
     // pre-suppression candidates over-approximates non-workflow deliverables: the safe
     // direction, deferring agent-bound groups rather than ever mixing identities in one send.
+    // A backed-off non-workflow batch (its conversation-identity send was rejected) sits out
+    // the drain entirely, staying pending for the sweep-cadence retry, so agent-bound groups
+    // are not starved behind a send that fails the same way on every drain.
+    const nonWorkflowSendBackoffUntil = this.workflowWakeGroupSendBackoffUntilMs
+      .get(ownerWorkspaceId)
+      ?.get(NON_WORKFLOW_WAKE_BACKOFF_KEY);
+    let nonWorkflowSendBackedOff = false;
+    if (nonWorkflowSendBackoffUntil != null) {
+      if (nonWorkflowSendBackoffUntil > Date.now()) {
+        nonWorkflowSendBackedOff = true;
+      } else {
+        const ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
+        ownerBackoff?.delete(NON_WORKFLOW_WAKE_BACKOFF_KEY);
+        if (ownerBackoff?.size === 0) {
+          this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
+        }
+      }
+    }
     const hasNonWorkflowDeliverables =
-      deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0;
+      !nonWorkflowSendBackedOff &&
+      (deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
     // Unselected groups stay queued: the delivered group's wake turn ends with a streamEnded
     // drain (and the sweep backstops an aborted one), which delivers the next group.
     const workspaceTurnMuxMetadata =
@@ -8740,8 +8783,8 @@ export class TaskService implements AgentTaskIntegration {
     // later candidate's await; suppressed handles are dropped instead of
     // waking the owner, and their notifications are marked superseded only
     // after the delivery decision. The residual window is the batch read →
-    // sendMessage gap below (no awaits in between besides the group-scoped
-    // resume-option resolution and delivery itself) — closing it would
+    // sendMessage gap below (no awaits in between besides workflow group
+    // selection and delivery itself) — closing it would
     // require holding settlement locks across delivery, which the drain must
     // not do; worst case is one redundant wake (fail toward notify, never a
     // lost wake).
@@ -8763,6 +8806,9 @@ export class TaskService implements AgentTaskIntegration {
     const supersededWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
     let currentWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
     let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
+    let resumeOptions:
+      | Awaited<ReturnType<TaskService["resolveParentAutoResumeOptions"]>>
+      | undefined;
     let remainingWorkflowPrompts = hasNonWorkflowDeliverables
       ? deliverableWorkflowPrompts.filter((candidate) => candidate.initiatingAgent == null)
       : deliverableWorkflowPrompts;
@@ -8798,6 +8844,16 @@ export class TaskService implements AgentTaskIntegration {
           this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
         }
       }
+      // Resolve the send identity before the currentness reread so the reread stays the last
+      // await before dispatch: a history clear that completes during this history and
+      // agent-settings read retires the sidecar, and a reread taken before it would go stale
+      // and inject the pre-clear result into the freshly cleared conversation.
+      const groupResumeOptions = await this.resolveParentAutoResumeOptions(
+        ownerWorkspaceId,
+        entry,
+        defaultModel,
+        groupAgent != null ? { agentId: groupAgent.agentId } : undefined
+      );
       const groupCurrentness = await Promise.all(
         groupCandidates.map((candidate) =>
           this.workspaceService
@@ -8817,6 +8873,7 @@ export class TaskService implements AgentTaskIntegration {
       if (groupCurrent.length > 0) {
         currentWorkflowPrompts = groupCurrent;
         workflowInitiatingAgent = groupAgent;
+        resumeOptions = groupResumeOptions;
         break;
       }
       remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
@@ -8824,11 +8881,13 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
-    const resumeOptions = await this.resolveParentAutoResumeOptions(
+    // No workflow group was selected: resolve under the conversation's own identity. The
+    // workspace-turn and sub-agent wakes tolerate this await in the residual window (worst
+    // case one redundant wake, never a stale workflow injection).
+    resumeOptions ??= await this.resolveParentAutoResumeOptions(
       ownerWorkspaceId,
       entry,
-      defaultModel,
-      workflowInitiatingAgent != null ? { agentId: workflowInitiatingAgent.agentId } : undefined
+      defaultModel
     );
     // Pair the pin with the delivered group: the newest pin-bearing history row can belong to
     // a different group's wake (each wake persists its own pin), and pinning another agent's
@@ -8845,6 +8904,10 @@ export class TaskService implements AgentTaskIntegration {
       const record = candidateRecords[index];
       if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
         suppressedNotificationIds.push(candidate.notification.id);
+        return;
+      }
+      if (nonWorkflowSendBackedOff) {
+        // Backed off: sits out this drain and stays pending for the sweep-cadence retry.
         return;
       }
       deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
@@ -8873,12 +8936,14 @@ export class TaskService implements AgentTaskIntegration {
     }
     promptSections.push(...currentWorkflowPrompts.map((candidate) => candidate.prompt));
     const prompt = promptSections.join("\n\n");
-    const effectivePending = pending.filter((notification) => {
-      if (notification.sourceKind === "agent_task") {
-        return deliverableAgentNotificationIds.has(notification.id);
-      }
-      return deliverableWorkspaceTurnNotificationIds.has(notification.id);
-    });
+    const effectivePending = nonWorkflowSendBackedOff
+      ? []
+      : pending.filter((notification) => {
+          if (notification.sourceKind === "agent_task") {
+            return deliverableAgentNotificationIds.has(notification.id);
+          }
+          return deliverableWorkspaceTurnNotificationIds.has(notification.id);
+        });
     if (effectivePending.length === 0 && currentWorkflowPrompts.length === 0) {
       await markSuppressedSuperseded();
       // Suppression can empty the very batch that excluded agent-bound workflow groups; with
@@ -8943,6 +9008,11 @@ export class TaskService implements AgentTaskIntegration {
           ownerWorkspaceId,
           error: resumeResult.error,
         });
+        // Same starvation shape as the prompt path: agent-bound groups were excluded by this
+        // batch, so back it off and re-poke to let them send under their own launch identity.
+        if (deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
+          this.backOffTerminalWakeSends(ownerWorkspaceId, [NON_WORKFLOW_WAKE_BACKOFF_KEY]);
+        }
         return;
       }
       if (!resumeResult.data.started) {
@@ -9005,22 +9075,26 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (!sendResult.success) {
-      if (currentWorkflowPrompts.length > 0 && !isWorkspaceBusyIdleOnlySend(sendResult.error)) {
-        // A non-busy rejection is likely group-specific (an unresolvable pinned agent, a model
-        // or provider gate). Back the selected group off until the sweep cadence retries it
+      if (!isWorkspaceBusyIdleOnlySend(sendResult.error)) {
+        // A non-busy rejection is likely batch-specific (an unresolvable pinned agent, a model
+        // or provider gate). Back the sent batches off until the sweep cadence retries them
         // and re-poke so the remaining groups get their send this cycle instead of starving
-        // behind newest-first selection. Bounded: each re-poked drain either delivers or backs
-        // off one more group, and with every group backed off it selects nothing.
-        let ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-        if (ownerBackoff == null) {
-          ownerBackoff = new Map();
-          this.workflowWakeGroupSendBackoffUntilMs.set(ownerWorkspaceId, ownerBackoff);
+        // behind newest-first selection; the non-workflow batch backs off the same way so a
+        // persistently rejected conversation-identity send cannot exclude agent-bound groups
+        // on every drain. Bounded: each re-poked drain either delivers or backs off one more
+        // key, and with every key backed off it selects nothing.
+        const backoffKeys: string[] = [];
+        if (currentWorkflowPrompts.length > 0) {
+          backoffKeys.push(
+            workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : ""
+          );
         }
-        ownerBackoff.set(
-          workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : "",
-          Date.now() + WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS
-        );
-        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+        if (effectivePending.length > 0) {
+          backoffKeys.push(NON_WORKFLOW_WAKE_BACKOFF_KEY);
+        }
+        if (backoffKeys.length > 0) {
+          this.backOffTerminalWakeSends(ownerWorkspaceId, backoffKeys);
+        }
       }
       // Busy rejection: the owner started work between the idle check and the send; leave
       // pending and retry on the next drain trigger.

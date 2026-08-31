@@ -6301,6 +6301,79 @@ describe("TaskService", () => {
     ).toBe(false);
   });
 
+  test("a history clear during resume-option resolution settles the wake instead of delivering", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_resolve_clear_race";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    const run = await runStore.getRun(runId);
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // Classification sees a current invocation; the clear completes while the drain resolves
+    // resume options, so only a currentness reread taken AFTER that resolution observes it.
+    let cleared = false;
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve(cleared ? "not_current" : "current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const svc = taskService as unknown as {
+      resolveParentAutoResumeOptions: (...args: unknown[]) => Promise<unknown>;
+    };
+    const originalResolve = svc.resolveParentAutoResumeOptions.bind(taskService);
+    svc.resolveParentAutoResumeOptions = async (...args: unknown[]) => {
+      const resolved = await originalResolve(...args);
+      cleared = true;
+      return resolved;
+    };
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // The pre-clear result must not wake the freshly cleared conversation.
+    expect(sendMessage).not.toHaveBeenCalled();
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const marker = await terminalAttentionStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+    );
+    expect(marker?.status).toBe("superseded");
+  });
+
   test("an indeterminate newest group does not stall an older deliverable group", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
@@ -6567,6 +6640,100 @@ describe("TaskService", () => {
     // The rejected group stays queued for the sweep-cadence retry, never settled.
     expect(queued?.has(newRunId)).toBe(true);
     expect(queued?.has(oldRunId) ?? false).toBe(false);
+  });
+
+  test("a rejected non-workflow send backs off and lets an agent-bound group deliver", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_nonworkflow_backoff";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    // The workspace-turn batch's conversation-identity send is persistently rejected; the
+    // agent-bound group's own pinned identity can still send.
+    const sendMessage = mock((..._args: unknown[]): Promise<Result<void, SendMessageError>> => {
+      const options = _args[2] as { agentId?: string } | undefined;
+      return options?.agentId === "plan"
+        ? Promise.resolve(Ok(undefined))
+        : Promise.resolve(Err({ type: "unknown", raw: "agent not resolvable" }));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+      agentId: "plan",
+    });
+
+    // A deliverable (non-suppressed) workspace-turn wake keeps the agent-bound group out of
+    // the batch until the batch's send is rejected.
+    const taskHandleStore = new TaskHandleStore(config);
+    await taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_backoff_deliverable",
+      ownerWorkspaceId: parentId,
+      workspaceId: parentId,
+      turnId: "backoff-deliverable",
+      status: "completed",
+      reportMarkdown: "turn done",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      updatedAt: "2026-08-11T00:00:01.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workspace_turn",
+      sourceId: "wst_backoff_deliverable",
+    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    await (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // First attempt sends the non-workflow batch and is rejected; the re-poked drain lets the
+    // backed-off batch sit out so the agent-bound group delivers in the same cycle.
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[1]?.[2]).toMatchObject({ agentId: "plan" });
+    expect(String(sendMessage.mock.calls[1]?.[1])).toContain(runId);
+    // The rejected wake stays pending for the sweep-cadence retry, never dropped.
+    const stillPending = await terminalAttentionStore.listPending(parentId);
+    expect(stillPending.map((notification) => notification.sourceId)).toEqual([
+      "wst_backoff_deliverable",
+    ]);
+    const queued = (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.get(parentId);
+    expect(queued?.has(runId) ?? false).toBe(false);
   });
 
   test("settlement writes the stable marker the previous build dedupes recovery on", async () => {
