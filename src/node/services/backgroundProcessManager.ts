@@ -469,11 +469,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Nudge background-bash subscribers after a monitor wake-state transition (pending
-   * enqueued, delivered, or superseded). Wake records live in BashMonitorWakeStore
-   * (owned by WorkspaceService), but subscribers observe them through this manager's
-   * "change" stream, so the owner needs a way to request an emit when only wake state
-   * — not process state — changed.
+   * Nudge background-bash subscribers after a monitor wake-state transition (pending,
+   * delivered, or consumed). Wake state lives in WorkspaceService's reconciler, but
+   * subscribers observe it through this manager's "change" stream, so the owner needs
+   * a way to request an emit when only wake state — not process state — changed.
    */
   notifyMonitorWakeStateChanged(workspaceId: string): void {
     assert(workspaceId.length > 0, "notifyMonitorWakeStateChanged requires a workspaceId");
@@ -772,9 +771,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * The payload coalesces (in order): pending matched lines still undelivered at settlement, a
    * synthetic settle line (the downgrade fallback: older builds strip the `terminal` field but
    * still deliver an actionable match-shaped wake), and a bounded recent-output tail. It is
-   * emitted BEFORE "monitor:stopped" so the wake record is persisted before the armed-monitor
-   * registry record is deleted (both WorkspaceService listeners enqueue their work onto the same
-   * per-workspace mutex synchronously and in FIFO emit order).
+   * emitted BEFORE "monitor:stopped" so the retained wake state is observable before the
+   * armed-monitor registry record gains its terminal summary (both WorkspaceService listeners
+   * enqueue their work onto the same per-workspace mutex synchronously and in FIFO emit order).
    *
    * Cancellation wins during the claimed window: explicit cancel (task_stop, workspace cleanup)
    * sets monitor.stopped and emits "monitor:stopped"(canceled); this helper re-checks that state
