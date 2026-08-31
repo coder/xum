@@ -74,6 +74,7 @@ export function makeAgentTaskIntegrationFake(
     markParentWorkspaceInterrupted: () => undefined,
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
+    noteWorkspaceUnarchived: () => Promise.resolve(),
     ...overrides,
   };
 }

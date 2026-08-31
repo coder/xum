@@ -302,6 +302,7 @@ export interface AgentTaskIntegration {
     workspaceId: string,
     options?: { workflowRunId?: string }
   ): Promise<string[]>;
+  noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
 }
 
 export function normalizeArchiveUntrackedPaths(paths: readonly string[]): string[] {

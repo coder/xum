@@ -9537,6 +9537,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Ok(undefined);
       }
 
+      // Archived owners park workflow terminal wakes unsettled; reconcile now so an idle
+      // workspace does not stay silent until the interval sweep. Contained: reconciliation
+      // failure must not fail the unarchive (the sweep retries on its own cadence).
+      try {
+        await this.agentTaskIntegration?.noteWorkspaceUnarchived(workspaceId);
+      } catch (error: unknown) {
+        log.warn("Unarchive workflow attention reconciliation failed", { workspaceId, error });
+      }
+
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);

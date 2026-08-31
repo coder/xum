@@ -7653,15 +7653,17 @@ export class TaskService implements AgentTaskIntegration {
    * startup and on a fixed sweep interval, so missed terminal callbacks, crashes, and
    * deferred (transiently unreadable) evaluations always get re-evaluated without any
    * per-failure retry bookkeeping. Archived workspaces are skipped, which parks their wakes
-   * unsettled: unarchiving re-queues them on the next sweep instead of dropping them.
+   * unsettled: the unarchive hook (noteWorkspaceUnarchived) and the next interval sweep
+   * re-queue them instead of dropping them.
    */
-  private async sweepWorkflowRunTerminalAttention(): Promise<number> {
+  private async sweepWorkflowRunTerminalAttention(onlyWorkspaceId?: string): Promise<number> {
     const cfg = this.config.loadConfigOrDefault();
     let queuedCount = 0;
     for (const project of cfg.projects.values()) {
       for (const workspace of project.workspaces) {
         if (
           workspace.id == null ||
+          (onlyWorkspaceId != null && workspace.id !== onlyWorkspaceId) ||
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
         ) {
           continue;
@@ -7711,6 +7713,59 @@ export class TaskService implements AgentTaskIntegration {
           }
           if (marker != null) {
             continue;
+          }
+          // Upgrade compatibility: the previous build recorded consumption only under the
+          // stable un-suffixed id (no generation markers), including history-invisible
+          // consumption such as a kernel-nested task_await. The recency guard keeps
+          // generation markers authoritative: the restart-time stable clear is best-effort,
+          // so a marker older than this terminal generation is stale and must not suppress
+          // the newer result; unparseable timestamps fail toward notify.
+          let stableMarker: Awaited<ReturnType<TerminalAttentionStore["get"]>>;
+          try {
+            stableMarker = await this.terminalAttentionStore.get(
+              workspace.id,
+              TerminalAttentionStore.notificationId("workflow_run", run.id)
+            );
+          } catch (error: unknown) {
+            log.warn("Failed to read stable workflow settlement marker; skipping run", {
+              workspaceId: workspace.id,
+              runId: run.id,
+              error: getErrorMessage(error),
+            });
+            continue;
+          }
+          if (
+            stableMarker != null &&
+            (stableMarker.status === "delivered" || stableMarker.status === "superseded")
+          ) {
+            const stableMarkerAt = Date.parse(stableMarker.createdAt);
+            const terminalGenerationAt = Date.parse(run.updatedAt);
+            if (
+              Number.isFinite(stableMarkerAt) &&
+              Number.isFinite(terminalGenerationAt) &&
+              stableMarkerAt >= terminalGenerationAt
+            ) {
+              try {
+                // Migrate the decision onto this generation's marker so later sweeps stay
+                // single-read; the stable marker already proves consumption, so a failed
+                // migration only re-runs this fallback on the next sweep.
+                await this.terminalAttentionStore.recordSettled({
+                  ownerWorkspaceId: workspace.id,
+                  sourceKind: "workflow_run",
+                  sourceId: run.id,
+                  generationId: run.updatedAt,
+                  terminalOutcome: terminalAttentionOutcome(run.status),
+                  status: stableMarker.status,
+                });
+              } catch (error: unknown) {
+                log.warn("Failed to migrate stable workflow settlement marker", {
+                  workspaceId: workspace.id,
+                  runId: run.id,
+                  error: getErrorMessage(error),
+                });
+              }
+              continue;
+            }
           }
           if (this.queueWorkflowRunAttention(workspace.id, run.id)) {
             queuedCount += 1;
@@ -7949,8 +8004,9 @@ export class TaskService implements AgentTaskIntegration {
    * the previous build's whole-run dedupe (see markWorkflowRunTerminalAttentionSettled), and a
    * restarted run invalidates it. Without this delete, downgrading after a resume would leave
    * the old build refusing to enqueue the run's newer result behind the stale stable marker.
-   * This build never reads the stable marker (generation markers are the authority), so the
-   * delete is best-effort and must never fail the status transition.
+   * This build reads the stable marker only as recency-gated upgrade evidence behind
+   * generation markers (see sweepWorkflowRunTerminalAttention), so the delete stays
+   * best-effort and must never fail the status transition.
    */
   async clearWorkflowRunDowngradeSettlement(params: {
     ownerWorkspaceId: string;
@@ -13448,6 +13504,14 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     return blocking;
+  }
+
+  async noteWorkspaceUnarchived(workspaceId: string): Promise<void> {
+    assert(workspaceId.length > 0, "noteWorkspaceUnarchived requires workspaceId");
+    // Archived owners park workflow terminal wakes unsettled (the drain drops the in-memory
+    // queue and the sweep skips archived workspaces), so without this unarchive-time
+    // reconciliation an idle owner would stay silent until the interval sweep.
+    await this.sweepWorkflowRunTerminalAttention(workspaceId);
   }
 
   /**

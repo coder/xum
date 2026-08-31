@@ -17299,6 +17299,23 @@ describe("WorkspaceService setPinned", () => {
     expect((await workspaceService.setPinned(rootId, true)).success).toBe(true);
     expect(getEntry(rootId)?.pinnedAt).toBeDefined();
   });
+
+  test("unarchive pokes task-side workflow attention reconciliation", async () => {
+    const noteWorkspaceUnarchived = mock(() => Promise.resolve());
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ noteWorkspaceUnarchived })
+    );
+    expect((await workspaceService.archive(rootId)).success).toBe(true);
+    expect(noteWorkspaceUnarchived).not.toHaveBeenCalled();
+
+    expect((await workspaceService.unarchive(rootId)).success).toBe(true);
+    expect(noteWorkspaceUnarchived).toHaveBeenCalledWith(rootId);
+    expect(noteWorkspaceUnarchived).toHaveBeenCalledTimes(1);
+
+    // No archived -> unarchived transition: a repeat unarchive must not re-poke.
+    expect((await workspaceService.unarchive(rootId)).success).toBe(true);
+    expect(noteWorkspaceUnarchived).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("WorkspaceService reorderPinned", () => {

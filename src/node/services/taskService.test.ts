@@ -6132,6 +6132,141 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  test("the sweep honors a recent stable marker from the previous build and re-queues past a stale one", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_upgrade_stable_marker";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: new Date(Date.now() - 120_000).toISOString(),
+    });
+    await runStore.appendStatus(runId, "running", new Date(Date.now() - 90_000).toISOString());
+    await runStore.appendStatus(runId, "failed", new Date(Date.now() - 60_000).toISOString());
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const sweep = () =>
+      (
+        taskService as unknown as {
+          sweepWorkflowRunTerminalAttention(): Promise<number>;
+        }
+      ).sweepWorkflowRunTerminalAttention();
+
+    // The previous build consumed the result (e.g. a kernel-nested task_await) and recorded
+    // only the stable un-suffixed marker; no generation marker exists.
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.recordSettled({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: runId,
+      terminalOutcome: "failed",
+      status: "delivered",
+    });
+
+    // Upgrade sweep: the stable marker postdates the terminal generation, so the wake is
+    // already consumed and the decision migrates onto this generation's marker.
+    expect(await sweep()).toBe(0);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+    const run = await runStore.getRun(runId);
+    const migrated = await terminalAttentionStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+    );
+    expect(migrated?.status).toBe("delivered");
+
+    // A resume that reaches terminal after the marker was written makes the stable marker
+    // stale (its restart-time clear is best-effort): the newer generation must re-queue.
+    await runStore.appendStatus(runId, "running", new Date(Date.now() + 30_000).toISOString(), {
+      allowFailedCheckpointRetry: true,
+    });
+    await runStore.appendStatus(runId, "failed", new Date(Date.now() + 60_000).toISOString());
+    expect(await sweep()).toBe(1);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("unarchive reconciliation delivers a wake parked by the archived-owner drain", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_unarchive_requeue";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    const setArchivedState = async (field: "archivedAt" | "unarchivedAt") => {
+      await config.editConfig((cfg) => {
+        const entry = cfg.projects
+          .get(projectPath)
+          ?.workspaces.find((workspace) => workspace.id === parentId);
+        assert(entry, "parent workspace must exist");
+        entry[field] = new Date().toISOString();
+        return cfg;
+      });
+    };
+    await setArchivedState("archivedAt");
+
+    // Terminal lands while archived: the drain parks the wake durably (queue dropped, no
+    // settlement marker).
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Unarchive-time reconciliation re-queues and delivers without waiting for the interval
+    // sweep.
+    await setArchivedState("unarchivedAt");
+    await taskService.noteWorkspaceUnarchived(parentId);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(String(sendMessage.mock.calls[0]?.[1])).toContain(runId);
+  });
+
   test("an unreadable settlement marker skips only that run and never rejects the sweep", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
