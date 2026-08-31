@@ -2414,15 +2414,15 @@ describe("BackgroundProcessManager", () => {
       const proc = await manager.getProcess(result.processId);
       expect(proc).not.toBeNull();
       if (proc == null) return;
-      const exitSpy = spyOn(proc.handle, "getExitCode").mockRejectedValue(
+      const getProcessSpy = spyOn(manager, "getProcess").mockRejectedValue(
         new Error("persistent transport failure")
       );
 
       const state = await manager.getMonitorWakeDeliveryState(result.processId, proc.startTime);
 
       expect(state).toMatchObject({ status: "settled", shownThroughOffset: 0 });
-      expect(exitSpy).not.toHaveBeenCalled();
-      exitSpy.mockRestore();
+      expect(getProcessSpy).not.toHaveBeenCalled();
+      getProcessSpy.mockRestore();
       await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
 
