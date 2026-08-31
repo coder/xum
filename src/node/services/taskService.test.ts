@@ -6352,6 +6352,74 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  test("a history clear during the busy fallback settles the wake instead of delivering", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_busy_fallback_clear";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    const run = await runStore.getRun(runId);
+
+    // The idle-only send loses the busy race while a full clear completes; the fallback path
+    // must not inject the retained pre-clear prompt without revalidating.
+    let cleared = false;
+    const sendMessage = mock((..._args: unknown[]): Promise<Result<void, SendMessageError>> => {
+      const internal = _args[3] as { requireIdle?: boolean } | undefined;
+      if (internal?.requireIdle === true) {
+        cleared = true;
+        return Promise.resolve(
+          Err({ type: "unknown", raw: "Workspace is busy; idle-only send was skipped." })
+        );
+      }
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve(cleared ? "not_current" : "current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+
+    await (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // Only the rejected idle-only attempt: the fallback aborts on the currentness reread and
+    // the re-poked drain settles the superseded generation instead of delivering it.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect((sendMessage.mock.calls[0]?.[3] as { requireIdle?: boolean })?.requireIdle).toBe(true);
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const marker = await terminalAttentionStore.get(
+      parentId,
+      TerminalAttentionStore.notificationId("workflow_run", runId, run.updatedAt)
+    );
+    expect(marker?.status).toBe("superseded");
+  });
+
   test("an unreadable settlement marker skips only that run and never rejects the sweep", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

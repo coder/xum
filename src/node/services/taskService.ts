@@ -9135,6 +9135,29 @@ export class TaskService implements AgentTaskIntegration {
         !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
         !(await this.hasBlockingActiveWorkForTerminalDrain(ownerWorkspaceId, latestTaskIndex))
       ) {
+        // Security: the composed prompt retains the pre-check workflow results, and this
+        // fallback send omits requireIdle, so its epoch snapshot postdates any clear or reset
+        // that completed during the awaited checks above and the clear guard would accept the
+        // stale injection into the fresh context. Reread currentness so the fallback keeps
+        // the primary path's contract (no awaits between revalidation and delivery); any
+        // non-current candidate aborts toward a fresh drain that re-derives, and the queue
+        // entries survive for it.
+        if (currentWorkflowPrompts.length > 0) {
+          const fallbackCurrentness = await Promise.all(
+            currentWorkflowPrompts.map((candidate) =>
+              this.workspaceService
+                .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
+                .catch(() => "indeterminate" as const)
+            )
+          );
+          if (fallbackCurrentness.some((currentness) => currentness !== "current")) {
+            log.debug("Terminal wake busy fallback aborted; workflow candidates went stale", {
+              ownerWorkspaceId,
+            });
+            this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+            return;
+          }
+        }
         let fallbackAccepted = false;
         sendResult = await this.workspaceService.sendMessage(
           ownerWorkspaceId,
