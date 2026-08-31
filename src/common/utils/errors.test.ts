@@ -51,6 +51,14 @@ describe("getErrorMessage", () => {
     expect(getErrorMessage(obj)).toBe('{"code":500,"self":"[Circular]"}');
   });
 
+  it("keeps shared (non-cyclic) sibling references intact", () => {
+    // Only true cycles become [Circular]; a payload referencing the same
+    // detail object from two fields must serialize both occurrences.
+    const detail = { reason: "quota" };
+    const obj = { error: detail, details: detail };
+    expect(getErrorMessage(obj)).toBe('{"error":{"reason":"quota"},"details":{"reason":"quota"}}');
+  });
+
   it("returns .message for a plain Error", () => {
     expect(getErrorMessage(new Error("something failed"))).toBe("something failed");
   });

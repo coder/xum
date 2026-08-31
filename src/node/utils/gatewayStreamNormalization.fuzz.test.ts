@@ -33,8 +33,8 @@ describe("gatewayStreamNormalization fuzz", () => {
       const options = rng() < 0.5 ? { outputExcludesReasoning: rng() < 0.5 } : undefined;
       const v3 = flatUsageToV3(usage, options);
       expect(isV3Usage(v3)).toBe(true);
-      // Numeric fields must be numbers or undefined — never NaN-producing
-      // arithmetic on non-numbers (string concatenation, object coercion).
+      // Numeric fields must be finite numbers or undefined — NaN/Infinity from
+      // malformed gateway payloads must not leak into usage/cost arithmetic.
       for (const value of [
         v3.inputTokens.total,
         v3.inputTokens.noCache,
@@ -43,7 +43,7 @@ describe("gatewayStreamNormalization fuzz", () => {
         v3.outputTokens.text,
         v3.outputTokens.reasoning,
       ]) {
-        expect(value === undefined || typeof value === "number").toBe(true);
+        expect(value === undefined || Number.isFinite(value)).toBe(true);
       }
     }
   });

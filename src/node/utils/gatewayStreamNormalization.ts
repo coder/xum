@@ -44,16 +44,20 @@ export interface FlatUsageOptions {
   outputExcludesReasoning?: boolean;
 }
 
+// Non-finite counts (NaN/Infinity from a malformed gateway payload) must not
+// leak into SDK usage/cost arithmetic; treat them the same as missing.
+function finiteTokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 /**
  * Convert flat (v2-style) usage to v3 nested format.
  */
 export function flatUsageToV3(usage: Record<string, unknown>, options?: FlatUsageOptions): V3Usage {
-  const inputTokens = typeof usage.inputTokens === "number" ? usage.inputTokens : undefined;
-  const outputTokens = typeof usage.outputTokens === "number" ? usage.outputTokens : undefined;
-  const cachedInputTokens =
-    typeof usage.cachedInputTokens === "number" ? usage.cachedInputTokens : undefined;
-  const reasoningTokens =
-    typeof usage.reasoningTokens === "number" ? usage.reasoningTokens : undefined;
+  const inputTokens = finiteTokenCount(usage.inputTokens);
+  const outputTokens = finiteTokenCount(usage.outputTokens);
+  const cachedInputTokens = finiteTokenCount(usage.cachedInputTokens);
+  const reasoningTokens = finiteTokenCount(usage.reasoningTokens);
 
   const outputExcludesReasoning = options?.outputExcludesReasoning === true;
   const outputTotal =

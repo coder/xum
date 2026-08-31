@@ -58,7 +58,9 @@ const fromSlashSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf("/");
-  if (separatorIndex === -1) {
+  // Reject leading/trailing separators: an empty origin or model id would
+  // otherwise canonicalize to invalid ":model" / "origin:" identities.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -93,7 +95,9 @@ const fromDotSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf(".");
-  if (separatorIndex <= 0) {
+  // Reject leading/trailing separators (empty origin or model id) — see
+  // fromSlashSeparatedGatewayModelId.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 

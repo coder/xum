@@ -181,9 +181,41 @@ describe("StreamManager chaos", () => {
         );
         expect(terminalTypes.length).toBeGreaterThan(0);
 
-        // The workspace must not be wedged: interruption/cleanup must allow
-        // reuse. stopStream must be a no-op that does not throw.
-        await streamManager.stopStream(workspaceId);
+        // The workspace must not be wedged: a second stream on the SAME
+        // workspace must start and settle (exercises the actual reuse path,
+        // not just stopStream's tolerant no-op behavior).
+        const reuseMessageId = `${messageId}-reuse`;
+        const reuseAppend = await historyService.appendToHistory(workspaceId, {
+          id: reuseMessageId,
+          role: "assistant",
+          metadata: { historySequence: 2, partial: true },
+          parts: [],
+        });
+        expect(reuseAppend.success).toBe(true);
+        const reuse = await streamManager.startStream({
+          workspaceId,
+          messageId: reuseMessageId,
+          model: createTestLanguageModel(),
+          messages: [{ role: "user", content: "again" }],
+          modelString: "openai:gpt-4.1-mini",
+          historySequence: 2,
+          system: "system",
+          runtime: LOCAL_TEST_RUNTIME,
+          providedRuntimeTempDir: "",
+        });
+        expect(reuse.success).toBe(true);
+        if (reuse.success) {
+          const reuseCompletion = await Promise.race([
+            reuse.data.completion,
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error(`iteration ${iter}: reused workspace wedged`)),
+                15_000
+              )
+            ),
+          ]);
+          expect(["completed", "failed", "aborted"]).toContain(reuseCompletion.status);
+        }
       }
 
       expect(unhandled).toEqual([]);

@@ -19,14 +19,21 @@ export function getErrorMessage(error: unknown): string {
 
         // Cycle/BigInt-safe: provider error payloads can carry circular
         // references (which make bare JSON.stringify throw) — degrading to
-        // String(error)'s useless "[object Object]".
-        const serializedSeen = new WeakSet<object>();
-        const serializedError = JSON.stringify(error, (_key, value: unknown) => {
+        // String(error)'s useless "[object Object]". Track only the current
+        // ancestor chain (not every object seen) so shared sibling references
+        // serialize normally and only true cycles become "[Circular]".
+        const ancestors: unknown[] = [];
+        const serializedError = JSON.stringify(error, function (_key, value: unknown) {
           if (typeof value === "bigint") return value.toString();
-          if (typeof value === "object" && value !== null) {
-            if (serializedSeen.has(value)) return "[Circular]";
-            serializedSeen.add(value);
+          if (typeof value !== "object" || value === null) return value;
+          // `this` is the holder of `value`; pop ancestors until the top of
+          // the stack is the holder, which keeps the stack equal to the
+          // ancestor chain of `value` (standard MDN cycle-detection pattern).
+          while (ancestors.length > 0 && ancestors.at(-1) !== this) {
+            ancestors.pop();
           }
+          if (ancestors.includes(value)) return "[Circular]";
+          ancestors.push(value);
           return value;
         });
         if (typeof serializedError === "string") {

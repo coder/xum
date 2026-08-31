@@ -77,14 +77,14 @@ describe("coder gateway fuzz", () => {
         const to = "toGatewayModelId" in def ? def.toGatewayModelId : undefined;
 
         // Parsing arbitrary catalog IDs must never throw, and parsed results
-        // must have non-empty origins (empty origins would produce ":model"
-        // pseudo-canonical strings downstream).
+        // must have non-empty origins and model ids (empty parts would
+        // produce invalid ":model" / "origin:" canonical strings downstream).
         const junkId = randomFragmentString(rng);
         if (from) {
           const parsed = from(junkId);
           if (parsed) {
-            expect(typeof parsed.origin).toBe("string");
-            expect(typeof parsed.modelId).toBe("string");
+            expect(parsed.origin.length).toBeGreaterThan(0);
+            expect(parsed.modelId.length).toBeGreaterThan(0);
           }
         }
 
