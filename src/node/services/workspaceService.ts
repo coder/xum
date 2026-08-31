@@ -1841,6 +1841,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
+  private readonly canceledBashMonitorGenerationByProcess = new Map<string, string>();
   private readonly bashOutputShownListener = (
     workspaceId: string,
     _payload: OutputShownPayload
@@ -1871,22 +1872,31 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     workspaceId: string,
     payload: MonitorStoppedPayload
   ): void => {
-    const persist = async (): Promise<void> => {
+    const processKey = workspaceId + "\u0000" + payload.processId;
+    const createdAt = payload.armMetadata?.createdAt;
+    if (payload.reason === "canceled" && createdAt != null) {
+      this.canceledBashMonitorGenerationByProcess.set(processKey, createdAt);
+    }
+    const wasCanceled = (): boolean =>
+      createdAt != null &&
+      this.canceledBashMonitorGenerationByProcess.get(processKey) === createdAt;
+    const persist = async (): Promise<boolean> => {
       if (payload.reason === "canceled") {
-        const createdAt = payload.armMetadata?.createdAt;
-        if (createdAt == null) return;
+        if (createdAt == null) return false;
         await this.bashMonitorWakeReconciler.discardProcess(
           workspaceId,
           payload.processId,
           createdAt
         );
         await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
-        return;
+        return true;
       }
       if (payload.reason === "failed") {
+        if (wasCanceled()) return false;
         if (payload.armMetadata != null) {
           await this.bashMonitorRegistryStore.upsert(payload.armMetadata);
         }
+        if (wasCanceled()) return false;
         if (payload.terminal != null) {
           await this.bashMonitorRegistryStore.recordTerminal(
             workspaceId,
@@ -1894,6 +1904,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             payload.terminal
           );
         }
+        if (wasCanceled()) return false;
         await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, {
           reason: "runtime-failure",
           ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
@@ -1903,7 +1914,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           ...(payload.failedMatch != null ? { failedMatch: payload.failedMatch } : {}),
           failedAt: new Date().toISOString(),
         });
-        return;
+        return !wasCanceled();
       }
       if (payload.terminal != null) {
         await this.bashMonitorRegistryStore.recordTerminal(
@@ -1912,13 +1923,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           payload.terminal
         );
       }
+      return true;
     };
     let retryIndex = 0;
     const run = (): void => {
-      if (this.removingWorkspaces.has(workspaceId)) return;
+      if (
+        this.removingWorkspaces.has(workspaceId) ||
+        (payload.reason === "failed" && wasCanceled())
+      ) {
+        return;
+      }
       void persist()
-        .then(() => this.scheduleBashMonitorWakeReconcile(workspaceId))
+        .then((persisted) => {
+          if (persisted && !(payload.reason === "failed" && wasCanceled())) {
+            this.scheduleBashMonitorWakeReconcile(workspaceId);
+          }
+        })
         .catch((error: unknown) => {
+          if (payload.reason === "failed" && wasCanceled()) return;
           const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
           if (delay == null) {
             log.error("Failed to retire bash monitor state", { workspaceId, error });

@@ -640,6 +640,31 @@ describe("BashMonitorWakeReconciler", () => {
     expect(rows[0].createdAt).toBe("2026-08-31T12:10:00.000Z");
   });
 
+  test("runtime failure counts a duplicated final batch drop only once", async () => {
+    const lines = Array.from({ length: 50 }, (_, index) => `MATCH_${index}`);
+    live = [
+      liveSnapshot({
+        match: { throughOffset: 100, lines, totalMatches: 60, droppedLines: 10 },
+        lost: {
+          reason: "runtime-failure",
+          failedMatch: {
+            lines,
+            totalMatches: 60,
+            droppedLines: 10,
+            matchedThroughOffset: 100,
+          },
+          failedAt: "2026-08-31T12:16:00.000Z",
+        },
+        retired: true,
+      }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches[0].prompt).toContain("Dropped matched lines: 10");
+    expect(dispatches[0].prompt).not.toContain("Dropped matched lines: 20");
+  });
+
   test("runtime failure combines retained and final matched output once", async () => {
     live = [
       liveSnapshot({

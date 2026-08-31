@@ -806,11 +806,10 @@ export class BashMonitorWakeReconciler {
     if (snapshot.lost != null) {
       const retained = [...(snapshot.match?.lines ?? [])];
       const failedMatch = snapshot.lost.failedMatch;
-      const failedLines =
+      const includeFailedBatch =
         failedMatch?.matchedThroughOffset == null ||
-        failedMatch.matchedThroughOffset > (snapshot.match?.throughOffset ?? -1)
-          ? [...(failedMatch?.lines ?? [])]
-          : [];
+        failedMatch.matchedThroughOffset > (snapshot.match?.throughOffset ?? -1);
+      const failedLines = includeFailedBatch ? [...(failedMatch?.lines ?? [])] : [];
       let overlap = Math.min(retained.length, failedLines.length);
       while (
         overlap > 0 &&
@@ -823,7 +822,7 @@ export class BashMonitorWakeReconciler {
         lines: bounded.lines,
         droppedLines:
           (snapshot.match?.droppedLines ?? 0) +
-          (failedMatch?.droppedLines ?? 0) +
+          (includeFailedBatch ? (failedMatch?.droppedLines ?? 0) : 0) +
           bounded.droppedLines,
       };
     }

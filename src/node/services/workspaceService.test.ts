@@ -427,6 +427,74 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("cancellation invalidates a scheduled runtime failure persistence retry", async () => {
+    const { service, events, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    const discardProcess = mock(() => Promise.resolve());
+    const upsert = mock(() => Promise.resolve());
+    const remove = mock(() => Promise.resolve());
+    const recordLost = mock(() => Promise.reject(new Error("transient registry write failure")));
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: {
+        scheduleReconcile: typeof scheduleReconcile;
+        discardProcess: typeof discardProcess;
+      };
+      bashMonitorRegistryStore: {
+        upsert: typeof upsert;
+        remove: typeof remove;
+        recordTerminal(): Promise<void>;
+        recordLost: typeof recordLost;
+      };
+    };
+    try {
+      await internal.bashMonitorRecoveryPromise;
+      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
+      internal.bashMonitorRegistryStore = {
+        upsert,
+        remove,
+        recordTerminal: () => Promise.resolve(),
+        recordLost,
+      };
+      const armMetadata = {
+        processId: "canceled-retry-proc",
+        taskId: "bash:canceled-retry-proc",
+        workspaceId: "owner",
+        filter: "READY",
+        filterExclude: false,
+        script: "run",
+        createdAt: "2026-08-31T12:15:00.000Z",
+      };
+      events.emit("monitor:stopped", "owner", {
+        processId: armMetadata.processId,
+        reason: "failed",
+        armMetadata,
+        failureMessage: "transport unavailable",
+      });
+      for (let attempt = 0; attempt < 20 && recordLost.mock.calls.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      events.emit("monitor:stopped", "owner", {
+        processId: armMetadata.processId,
+        reason: "canceled",
+        armMetadata,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      expect(recordLost).toHaveBeenCalledTimes(1);
+      expect(upsert).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledWith("owner", armMetadata.processId, armMetadata.createdAt);
+      expect(discardProcess).toHaveBeenCalledWith(
+        "owner",
+        armMetadata.processId,
+        armMetadata.createdAt
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("late monitor pokes are ignored after removal begins", async () => {
     const { service, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
