@@ -17,7 +17,7 @@ import {
   startAbandonedBranchSummaryInBackground,
   type BranchSummaryAiService,
 } from "./branchSummary";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { StreamMessageOptions } from "./aiService";
 import type { TurnCompletion } from "./streamManager";
 
@@ -39,6 +39,7 @@ describe("AgentSession disposal race conditions", () => {
     const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiHandlers.set(String(eventName), listener);
         return this;
@@ -136,6 +137,7 @@ describe("AgentSession disposal race conditions", () => {
   test("bails out of a send parked on the branch-summary await when removal disposes the session", async () => {
     const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },
@@ -254,6 +256,7 @@ describe("AgentSession disposal race conditions", () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiHandlers.set(String(eventName), listener);
         return this;
@@ -340,6 +343,7 @@ describe("AgentSession disposal race conditions", () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
         aiHandlers.set(String(eventName), listener);
         return this;
@@ -434,6 +438,7 @@ describe("AgentSession disposal race conditions", () => {
 
   test("does not reset auto-retry intent for synthetic or rejected sends", async () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },
@@ -578,6 +583,7 @@ describe("AgentSession disposal race conditions", () => {
 
   test("preserves synthetic flag when flushing queued messages", () => {
     const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
         return this;
       },

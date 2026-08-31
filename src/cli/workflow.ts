@@ -368,7 +368,7 @@ async function createWorkflowContext(options: {
       mcpConfig: realConfig,
     });
     codexOauthService = new CodexOauthService(config, services.providerService);
-    services.aiService.setCodexOauthService(codexOauthService);
+    services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
     // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
     // Coder rotates the refresh token on every use, so persisting rotations
     // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
@@ -382,7 +382,7 @@ async function createWorkflowContext(options: {
       // for token refreshes/issuer checks, and denied providers fail closed.
       policyService
     );
-    services.aiService.setCoderOauthService(coderOauthService);
+    services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
     // Const capture: `services` is a `let`, so the deferred sanitize closure
     // below would lose TypeScript's definite-assignment narrowing.
@@ -392,6 +392,7 @@ async function createWorkflowContext(options: {
       config,
       historyService: services.historyService,
       aiService: services.aiService,
+      streamManager: services.streamManager,
       initStateManager: services.initStateManager,
       backgroundProcessManager: services.backgroundProcessManager,
       workspaceGoalService: services.workspaceGoalService,

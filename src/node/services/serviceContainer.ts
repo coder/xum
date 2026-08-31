@@ -92,6 +92,8 @@ export class ServiceContainer {
   // Core services — instantiated by createCoreServices (shared with `xum run` CLI)
   private readonly historyService: CoreServices["historyService"];
   public readonly aiService: CoreServices["aiService"];
+  public readonly streamManager: CoreServices["streamManager"];
+  public readonly initStateManager: CoreServices["initStateManager"];
   public readonly workspaceService: CoreServices["workspaceService"];
   public readonly taskService: CoreServices["taskService"];
   public readonly providerService: CoreServices["providerService"];
@@ -190,7 +192,9 @@ export class ServiceContainer {
     // Spread core services into class fields
     this.historyService = core.historyService;
     this.aiService = core.aiService;
-    this.aiService.setAnalyticsService(this.analyticsService);
+    this.streamManager = core.streamManager;
+    this.initStateManager = core.initStateManager;
+    core.turnRequestBuilderBindings.analyticsService = this.analyticsService;
     this.browserSessionDiscoveryService = new AgentBrowserSessionDiscoveryService({
       resolveWorkspaceCandidatePathsFn: async (workspaceId: string) => {
         const allWorkspaceMetadata = await config.getAllWorkspaceMetadata();
@@ -251,7 +255,7 @@ export class ServiceContainer {
       experimentsService: this.experimentsService,
       workspaceService: this.workspaceService,
     });
-    this.aiService.setDesktopSessionManager(this.desktopSessionManager);
+    core.turnRequestBuilderBindings.desktopSessionManager = this.desktopSessionManager;
     this.desktopTokenManager = new DesktopTokenManager();
     this.desktopBridgeServer = new DesktopBridgeServer({
       desktopSessionManager: this.desktopSessionManager,
@@ -319,7 +323,7 @@ export class ServiceContainer {
     this.taskService.setTimelineRecorder(this.timelineService);
     this.heartbeatService.setTimelineRecorder(this.timelineService);
     this.workspaceGoalService.setTimelineRecorder(this.timelineService);
-    this.aiService.setTimelineService(this.timelineService);
+    core.turnRequestBuilderBindings.timelineService = this.timelineService;
     this.timelineService.subscribeToWorkspace(this.workspaceService);
     this.windowService = new WindowService();
     this.mcpOauthService = new McpOauthService(
@@ -345,7 +349,7 @@ export class ServiceContainer {
       this.providerService,
       this.windowService
     );
-    this.aiService.setCodexOauthService(this.codexOauthService);
+    core.turnRequestBuilderBindings.codexOauthService = this.codexOauthService;
     this.coderOauthService = new CoderOauthService(
       config,
       this.providerService,
@@ -354,7 +358,7 @@ export class ServiceContainer {
       // for logins, refreshes, and issuer checks.
       this.policyService
     );
-    this.aiService.setCoderOauthService(this.coderOauthService);
+    core.turnRequestBuilderBindings.coderOauthService = this.coderOauthService;
     this.copilotOauthService = new CopilotOauthService(this.providerService, this.windowService);
     // Terminal services - PTYService is cross-platform
     this.ptyService = new PTYService();
@@ -629,6 +633,8 @@ export class ServiceContainer {
       config: this.config,
       aiService: this.aiService,
       historyService: this.historyService,
+      streamManager: this.streamManager,
+      initStateManager: this.initStateManager,
       projectService: this.projectService,
       workspaceService: this.workspaceService,
       taskService: this.taskService,

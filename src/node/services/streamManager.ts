@@ -215,7 +215,7 @@ export interface TurnStreamHandle {
   completion: Promise<TurnCompletion>;
 }
 
-export interface TurnCompletionController {
+interface TurnCompletionController {
   promise: Promise<TurnCompletion>;
   settle: (completion: TurnCompletion) => void;
 }
@@ -323,7 +323,7 @@ interface StreamRequestConfig {
    */
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   /**
-   * Closure built by AIService that re-runs the effective-level pipeline
+   * Closure built by TurnRequestBuilder that re-runs the effective-level pipeline
    * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
    * options for the stream's model. `null` ⇒ not applicable / no-op.
    */
@@ -338,12 +338,12 @@ interface StreamRequestConfig {
 }
 
 /**
- * Per-model request pieces for a refusal-fallback swap, rebuilt by AIService so
+ * Per-model request pieces for a refusal-fallback swap, rebuilt by TurnRequestBuilder so
  * provider-specific message preparation, provider options, and headers match a
  * first-class send of the fallback model (reusing the source model's request
  * verbatim would leak provider-specific options/messages across providers).
  */
-export interface PreparedModelFallback {
+interface PreparedModelFallback {
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -385,7 +385,7 @@ export interface PreparedModelFallback {
   onStreamConstructed?: () => Promise<void>;
   /**
    * Pinned providers-config snapshot the fallback request was built from
-   * (see AIService's pinCoderWireProvidersConfig). The swap's request-config
+   * (see TurnRequestBuilder's pinCoderInstanceProvidersConfig). The swap's request-config
    * rebuild and metadata resolution must read THIS snapshot, not the live
    * config: a catalog refresh between prepare() and the swap could retag the
    * instance and hand the prepared SDK model another wire's cache wrappers,
@@ -566,7 +566,7 @@ function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
   };
 }
 
-function markProviderMetadataCostsIncluded(
+export function markProviderMetadataCostsIncluded(
   providerMetadata: Record<string, unknown> | undefined,
   costsIncluded: boolean | undefined
 ): Record<string, unknown> | undefined {
@@ -700,7 +700,7 @@ interface WorkspaceStreamInfo {
   // attempt's totalUsage only.
   didRetryAfterEmptyOutput?: boolean;
   // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
-  // (as passed by AIService) that prepare() does not rebuild, so the request can
+  // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
   // be rebuilt for a different model — buildStreamRequestConfig re-applies
   // provider-specific wrapping (e.g. Anthropic cached system message / tool
   // cache_control), which must not be applied twice or leak across providers.
@@ -782,15 +782,37 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
  * - Atomic stream creation/cancellation operations
  * - Guaranteed resource cleanup in all code paths
  */
+interface PendingStreamStartHandle {
+  readonly abortSignal: AbortSignal;
+  readonly syntheticMessageId: string;
+  finish(): void;
+}
+
+interface MockStreamLifecycle {
+  isStreaming(workspaceId: string): boolean;
+  stop(workspaceId: string): Promise<void>;
+  replayStream(workspaceId: string): Promise<void>;
+}
+
 export class StreamManager {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
+  private readonly pendingStreamStarts = new Map<
+    string,
+    {
+      abortController: AbortController;
+      startTime: number;
+      syntheticMessageId: string;
+      acpPromptId?: string;
+    }
+  >();
+  private mockStreamLifecycle?: MockStreamLifecycle;
   private streamLocks = new Map<WorkspaceId, AsyncMutex>();
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
   private readonly historyService: HistoryService;
   private mcpServerManager?: MCPServerManager;
   private readonly sessionUsageService?: SessionUsageService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
-  private readonly eventSink: TurnEngineEventSink;
+  private eventSink: TurnEngineEventSink;
   // Token tracker for live streaming statistics
   private tokenTracker = new StreamingTokenTracker();
   // Track OpenAI previousResponseIds that have been invalidated
@@ -806,6 +828,10 @@ export class StreamManager {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
+    this.eventSink = eventSink;
+  }
+
+  setEventSink(eventSink: TurnEngineEventSink): void {
     this.eventSink = eventSink;
   }
 
@@ -849,6 +875,44 @@ export class StreamManager {
 
   setMCPServerManager(manager: MCPServerManager | undefined): void {
     this.mcpServerManager = manager;
+  }
+
+  setMockStreamLifecycle(lifecycle: MockStreamLifecycle | undefined): void {
+    this.mockStreamLifecycle = lifecycle;
+  }
+
+  beginStreamStart(input: {
+    workspaceId: string;
+    abortSignal?: AbortSignal;
+    acpPromptId?: string;
+  }): PendingStreamStartHandle {
+    const abortController = new AbortController();
+    const startTime = Date.now();
+    const syntheticMessageId =
+      "starting-" + startTime + "-" + Math.random().toString(36).substring(2, 11);
+    const unlinkAbortSignal = linkAbortSignal(input.abortSignal, abortController);
+
+    this.pendingStreamStarts.set(input.workspaceId, {
+      abortController,
+      startTime,
+      syntheticMessageId,
+      acpPromptId: input.acpPromptId,
+    });
+
+    let finished = false;
+    return {
+      abortSignal: abortController.signal,
+      syntheticMessageId,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        unlinkAbortSignal();
+        const pending = this.pendingStreamStarts.get(input.workspaceId);
+        if (pending?.abortController === abortController) {
+          this.pendingStreamStarts.delete(input.workspaceId);
+        }
+      },
+    };
   }
 
   recordToolModelUsage(
@@ -2253,7 +2317,7 @@ export class StreamManager {
         // this step's provider request is built.
         const thinkingOverride = this.applyPendingThinkingOverride(request);
         // Step 0: an override consumed here raced stream setup (written during
-        // startStream's awaits, after AIService's pre-construction quiescence
+        // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
         // fold). Message preparation is thinking-level-dependent (Anthropic
         // signed-reasoning transforms), so rebuild the first-step messages
         // under the applied level too; the closure also emits a superseding
@@ -3914,7 +3978,7 @@ export class StreamManager {
                 ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
                 : {}),
               metadata: {
-                ...streamInfo.initialMetadata, // AIService-provided metadata (systemMessageTokens, etc)
+                ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
                 model: canonicalModel,
                 metadataModel: streamInfo.metadataModel,
                 routedThroughGateway,
@@ -4767,7 +4831,7 @@ export class StreamManager {
         }
 
         // Step 3: Create temp directory for this stream using runtime.
-        // AIService pre-creates this dir so tool configuration can reference the same stable path;
+        // TurnRequestBuilder pre-creates this dir so tool configuration can reference the same stable path;
         // once startStream receives it, StreamManager owns cleanup for both success and abort paths.
         runtimeTempDir =
           providedRuntimeTempDir ?? (await this.createTempDirForStream(streamToken, runtime));
@@ -4992,23 +5056,44 @@ export class StreamManager {
     options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
   ): Promise<Result<void>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
+    const pending = this.pendingStreamStarts.get(workspaceId);
+    const isActuallyStreaming = this.mockStreamLifecycle
+      ? this.mockStreamLifecycle.isStreaming(workspaceId)
+      : this.isStreaming(workspaceId);
+
+    if (pending) {
+      pending.abortController.abort();
+      if (!isActuallyStreaming) {
+        await this.emitStreamAbort(
+          typedWorkspaceId,
+          pending.syntheticMessageId,
+          { duration: Date.now() - pending.startTime },
+          options?.abortReason ?? "startup",
+          options?.abandonPartial,
+          pending.acpPromptId
+        );
+      }
+    }
+
+    if (this.mockStreamLifecycle) {
+      await this.mockStreamLifecycle.stop(workspaceId);
+      return Ok(undefined);
+    }
 
     try {
       const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
       if (!streamInfo) {
-        const abortReason = options?.abortReason ?? "startup";
-        // Emit abort event so frontend clears pending stream state.
-        // This handles the case where user interrupts before stream-start arrives.
-        // Use empty messageId - frontend handles gracefully (just clears pendingStreamStartTime).
-        void this.emitStreamAbort(
-          typedWorkspaceId,
-          "",
-          {},
-          abortReason,
-          options?.abandonPartial
-        ).catch((error) => {
-          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-        });
+        if (!pending) {
+          void this.emitStreamAbort(
+            typedWorkspaceId,
+            "",
+            {},
+            options?.abortReason ?? "startup",
+            options?.abandonPartial
+          ).catch((error) => {
+            log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+          });
+        }
         return Ok(undefined);
       }
 
@@ -5016,14 +5101,12 @@ export class StreamManager {
       const soft = options?.soft ?? false;
 
       if (soft) {
-        // Soft interrupt: set flag, will cancel at next block boundary
         streamInfo.softInterrupt = {
           pending: true,
           abandonPartial: options?.abandonPartial ?? false,
           abortReason,
         };
       } else {
-        // Hard interrupt: cancel immediately
         await this.cancelStreamSafely(
           typedWorkspaceId,
           streamInfo,
@@ -5034,7 +5117,7 @@ export class StreamManager {
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
-      return Err(`Failed to stop stream: ${message}`);
+      return Err("Failed to stop stream: " + message);
     }
   }
 
@@ -5051,6 +5134,9 @@ export class StreamManager {
    * Checks if a workspace currently has an active stream
    */
   isStreaming(workspaceId: string): boolean {
+    if (this.mockStreamLifecycle) {
+      return this.mockStreamLifecycle.isStreaming(workspaceId);
+    }
     const state = this.getStreamState(workspaceId);
     return state === StreamState.STARTING || state === StreamState.STREAMING;
   }
@@ -5109,6 +5195,11 @@ export class StreamManager {
    * This allows replay to flow through the same event path as live streaming (no duplication)
    */
   async replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
+    if (this.mockStreamLifecycle) {
+      await this.mockStreamLifecycle.replayStream(workspaceId);
+      return;
+    }
+
     const typedWorkspaceId = workspaceId as WorkspaceId;
     const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
 

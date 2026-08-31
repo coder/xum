@@ -10,6 +10,8 @@ import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { ProviderService } from "@/node/services/providerService";
 import { AIService } from "@/node/services/aiService";
+import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
+import { StreamManager } from "@/node/services/streamManager";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { log } from "@/node/services/log";
@@ -73,6 +75,7 @@ export interface CoreServices {
    */
   idleDispatcher: IdleDispatcher;
   aiService: AIService;
+  streamManager: StreamManager;
   mcpConfigService: MCPConfigService;
   mcpServerManager: MCPServerManager;
   extensionMetadata: ExtensionMetadataService;
@@ -81,6 +84,7 @@ export interface CoreServices {
   memoryService: MemoryService;
   memoryMetaService: MemoryMetaService;
   memoryConsolidationService: MemoryConsolidationService;
+  turnRequestBuilderBindings: TurnRequestBuilderBindings;
 }
 
 export function createCoreServices(opts: CoreServicesOptions): CoreServices {
@@ -151,6 +155,11 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   const workspaceMcpOverridesService =
     opts.workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
 
+  const turnRequestBuilderBindings: TurnRequestBuilderBindings = {};
+  const streamManager = new StreamManager(historyService, sessionUsageService, () =>
+    providerService.getConfig()
+  );
+
   const aiService = new AIService(
     config,
     historyService,
@@ -162,7 +171,9 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.policyService,
     opts.telemetryService,
     opts.devToolsService,
-    opts.experimentsService
+    opts.experimentsService,
+    streamManager,
+    turnRequestBuilderBindings
   );
 
   // Agent memory (memory experiment): scope roots derive from Config (xum home
@@ -170,7 +181,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   // Host-local sidecar for user-owned memory metadata (pins + usage stats).
   const memoryMetaService = new MemoryMetaService(config.rootDir);
   const memoryService = new MemoryService(config, memoryMetaService);
-  aiService.setMemoryService(memoryService);
+  turnRequestBuilderBindings.memoryService = memoryService;
 
   // Background dream consolidation (memory-consolidation experiment). Without
   // an ExperimentsService (CLI/test contexts) the service stays inert.
@@ -218,7 +229,8 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     },
     opts.policyService
   );
-  aiService.setMCPServerManager(mcpServerManager);
+  turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
+  streamManager.setMCPServerManager(mcpServerManager);
   // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
   // resolve credentials from current configuration.
   mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {
@@ -242,15 +254,15 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.policyService,
     opts.telemetryService,
     opts.experimentsService,
-    opts.sessionTimingService
+    opts.sessionTimingService,
+    streamManager
   );
-  aiService.setWorkspaceHeartbeatService(workspaceService);
+  turnRequestBuilderBindings.workspaceHeartbeatService = workspaceService;
   // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
   // so terminal updates must prune active run counts regardless of launch path.
-  aiService.setWorkflowRunStatusChangedHandler((event) =>
-    workspaceService.emitWorkflowRunActivity(event)
-  );
-  aiService.setWorkflowResultContinuationSender(workspaceService);
+  turnRequestBuilderBindings.onWorkflowRunStatusChanged = (event) =>
+    workspaceService.emitWorkflowRunActivity(event);
+  turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
   workspaceService.setMemoryConsolidationService(memoryConsolidationService);
   if (opts.devToolsService) {
     // DevTools debug-log cleanup when workspaces are archived/removed.
@@ -291,9 +303,10 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceService,
     initStateManager,
     sessionUsageService,
-    workspaceGoalService
+    workspaceGoalService,
+    streamManager
   );
-  aiService.setTaskService(taskService);
+  turnRequestBuilderBindings.taskService = taskService;
   workspaceService.setAgentTaskIntegration(taskService);
 
   // Goal continuation bridge lives at the core scope so every codepath that
@@ -320,6 +333,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceGoalService,
     idleDispatcher,
     aiService,
+    streamManager,
     mcpConfigService,
     mcpServerManager,
     extensionMetadata,
@@ -328,5 +342,6 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     memoryService,
     memoryMetaService,
     memoryConsolidationService,
+    turnRequestBuilderBindings,
   };
 }

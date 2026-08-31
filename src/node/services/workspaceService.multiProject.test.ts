@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { Config } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
+import { createStreamLifecycleMocks } from "@/node/services/agentSession.testHarness";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as gitModule from "@/node/git";
@@ -74,7 +75,7 @@ interface WorkspaceServiceTestOptions {
 }
 function createMockAIService(metadata?: WorkspaceMetadata): AIService {
   return {
-    isStreaming: mock(() => false),
+    ...createStreamLifecycleMocks(),
     getWorkspaceMetadata: mock(() => Promise.resolve(metadata ? Ok(metadata) : Ok(undefined))),
     on: mock(() => undefined),
     off: mock(() => undefined),
@@ -715,7 +716,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -882,7 +883,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1033,7 +1034,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1179,7 +1180,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1293,7 +1294,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         findWorkspace: mock(() => null),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;
@@ -1336,7 +1337,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         getSessionDir: mock((workspace: string) => path.join(rootDir, "sessions", workspace)),
       };
       const mockAIService = {
-        isStreaming: mock(() => false),
+        ...createStreamLifecycleMocks(),
         on: mock(() => undefined),
         off: mock(() => undefined),
       } as unknown as AIService;

@@ -17,6 +17,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { StreamManager } from "@/node/services/streamManager";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
 import {
   areArchiveUntrackedPathListsEqual,
@@ -2248,7 +2249,8 @@ export class TaskService implements AgentTaskIntegration {
     private readonly workspaceService: WorkspaceHost,
     private readonly initStateManager: InitStateManager,
     private readonly sessionUsageService?: SessionUsageService,
-    private readonly workspaceGoalService?: WorkspaceGoalService
+    private readonly workspaceGoalService?: WorkspaceGoalService,
+    private readonly streamManager?: StreamManager
   ) {
     this.agentPeerMessageBroker = new AgentPeerMessageBroker(workspaceService);
     this.taskHandleStore = new TaskHandleStore(config);
@@ -14659,7 +14661,7 @@ export class TaskService implements AgentTaskIntegration {
     if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
       return true;
     }
-    const activeStream = this.aiService.getStreamInfo(event.workspaceId);
+    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
     if (activeStream == null || activeStream.messageId === event.messageId) {
       return false;
     }
@@ -14691,7 +14693,7 @@ export class TaskService implements AgentTaskIntegration {
    * handleStreamEnd's awaits cannot steal attribution from the real cutter.
    */
   private captureQueueCutAttributionSnapshot(workspaceId: string): QueueCutAttributionSnapshot {
-    const activeStream = this.aiService.getStreamInfo(workspaceId);
+    const activeStream = this.streamManager?.getStreamInfo(workspaceId);
     return {
       activeStream:
         activeStream != null

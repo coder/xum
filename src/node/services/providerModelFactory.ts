@@ -1065,6 +1065,16 @@ function formatCustomProviderRequirementError(
 // ---------------------------------------------------------------------------
 
 /**
+ * OAuth services are wired after construction (they depend on services built
+ * later), so the factory reads them from this shared bindings object at use
+ * time instead of capturing instances up front.
+ */
+export interface OauthServiceBindings {
+  codexOauthService?: CodexOauthService;
+  coderOauthService?: CoderOauthService;
+}
+
+/**
  * Factory responsible for creating AI SDK LanguageModel instances from model strings.
  *
  * Extracted from AIService to isolate provider/model construction logic from the
@@ -1075,20 +1085,19 @@ export class ProviderModelFactory {
   private readonly providerService: ProviderService;
   private readonly policyService?: PolicyService;
   private readonly devToolsService?: DevToolsService;
-  codexOauthService?: CodexOauthService;
-  coderOauthService?: CoderOauthService;
+  private readonly oauthServices?: OauthServiceBindings;
 
   constructor(
     config: Config,
     providerService: ProviderService,
     policyService?: PolicyService,
-    codexOauthService?: CodexOauthService,
+    oauthServices?: OauthServiceBindings,
     devToolsService?: DevToolsService
   ) {
     this.config = config;
     this.providerService = providerService;
     this.policyService = policyService;
-    this.codexOauthService = codexOauthService;
+    this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
   }
 
@@ -1580,7 +1589,7 @@ export class ProviderModelFactory {
         const effectiveWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
 
         const baseFetch = getProviderFetch(providerConfig);
-        const codexOauthService = this.codexOauthService;
+        const codexOauthService = this.oauthServices?.codexOauthService;
         const webSocketTransportEnabled =
           (providerConfig as { webSocketTransportEnabled?: unknown }).webSocketTransportEnabled ===
           true;
@@ -2207,7 +2216,7 @@ export class ProviderModelFactory {
         }
         const deploymentUrl = creds.deploymentUrl;
 
-        const coderOauthService = this.coderOauthService;
+        const coderOauthService = this.oauthServices?.coderOauthService;
         if (!coderOauthService) {
           return Err({
             type: "invalid_model_string",

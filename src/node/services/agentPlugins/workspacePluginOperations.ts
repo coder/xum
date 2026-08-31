@@ -70,7 +70,7 @@ export async function listWorkspaceMcpPrompts(
   workspaceId: string,
   signal?: AbortSignal
 ) {
-  await context.aiService.waitForInit(workspaceId, signal);
+  await context.initStateManager.waitForInit(workspaceId, signal);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) throw new Error(metadataResult.error);
   const metadata = metadataResult.data;
@@ -152,7 +152,7 @@ export async function listWorkspacePluginSlashCommands(
   signal?: AbortSignal
 ) {
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)) return [];
-  await context.aiService.waitForInit(workspaceId, signal);
+  await context.initStateManager.waitForInit(workspaceId, signal);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) throw new Error(metadataResult.error);
   const metadata = metadataResult.data;
@@ -173,7 +173,7 @@ export async function getWorkspacePluginComposition(
   workspaceId: string,
   signal?: AbortSignal
 ) {
-  await context.aiService.waitForInit(workspaceId, signal);
+  await context.initStateManager.waitForInit(workspaceId, signal);
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) throw new Error(metadataResult.error);
   const metadata = metadataResult.data;

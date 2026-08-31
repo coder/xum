@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
-import { AgentSession, clearProviderConfigFixableAbandonMarkers } from "./agentSession";
+import {
+  AgentSession,
+  clearProviderConfigFixableAbandonMarkers,
+  type AgentSessionAIService,
+} from "./agentSession";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
-import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
@@ -40,7 +43,7 @@ interface SessionBundle {
   session: AgentSession;
   config: Config;
   historyService: HistoryService;
-  aiService: AIService;
+  aiService: AgentSessionAIService;
   initStateManager: InitStateManager;
   backgroundProcessManager: BackgroundProcessManager;
   events: WorkspaceChatMessage[];
@@ -270,10 +273,12 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const streamMessageMock = mock((_payload: Parameters<AIService["streamMessage"]>[0]) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
+    const streamMessageMock = mock(
+      (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+        Promise.resolve(Ok(createStartedTurnHandle()))
     );
-    aiService.streamMessage = streamMessageMock as unknown as AIService["streamMessage"];
+    aiService.streamMessage =
+      streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
     const privateSession = session as unknown as {
       retryActiveStream: () => Promise<void>;
       startupAutoRetryCheckPromise: Promise<void> | null;
@@ -314,10 +319,12 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const streamMessageMock = mock((_payload: Parameters<AIService["streamMessage"]>[0]) =>
-      Promise.resolve(Ok(createStartedTurnHandle()))
+    const streamMessageMock = mock(
+      (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+        Promise.resolve(Ok(createStartedTurnHandle()))
     );
-    aiService.streamMessage = streamMessageMock as unknown as AIService["streamMessage"];
+    aiService.streamMessage =
+      streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
     const privateSession = session as unknown as {
       retryActiveStream: () => Promise<void>;
       startupAutoRetryCheckPromise: Promise<void> | null;
@@ -1376,7 +1383,8 @@ describe("AgentSession startup auto-retry recovery", () => {
 
       return Promise.resolve(Ok(createStartedTurnHandle()));
     });
-    aiService.streamMessage = streamMessageMock as unknown as AIService["streamMessage"];
+    aiService.streamMessage =
+      streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
 
     const privateSession = session as unknown as {
       retryActiveStream: () => Promise<void>;
@@ -1551,9 +1559,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     const aiService = Object.assign(aiEmitter, {
       stopStream: mock(() => Promise.resolve(Ok(undefined))),
       isStreaming: mock(() => false),
+      getStreamInfo: mock(() => undefined),
+      replayStream: mock(() => Promise.resolve()),
       streamMessage: mock(() => Promise.resolve(Ok(createStartedTurnHandle()))),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-    }) as unknown as AIService;
+    }) as unknown as AgentSessionAIService;
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {

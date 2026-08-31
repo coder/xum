@@ -6,7 +6,6 @@
  * bricked workspace fetch in server mode.
  */
 import { describe, expect, it, mock, afterEach } from "bun:test";
-import type { AIService } from "@/node/services/aiService";
 import type { MuxMessage } from "@/common/types/message";
 import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
 import { isMuxMessage, type WorkspaceChatMessage } from "@/common/orpc/types";
@@ -16,7 +15,7 @@ async function createReplayHarness(workspaceId: string) {
   return await createAgentSessionHarness({
     workspaceId,
     aiServiceOverrides: {
-      getStreamInfo: mock((_workspaceId: string) => undefined) as AIService["getStreamInfo"],
+      getStreamInfo: mock((_workspaceId: string) => undefined),
       replayStream: mock((_workspaceId: string, _opts?: { afterTimestamp?: number }) =>
         Promise.resolve()
       ),

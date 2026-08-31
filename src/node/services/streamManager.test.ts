@@ -5636,6 +5636,53 @@ describe("StreamManager - categorizeError", () => {
   }
 });
 describe("StreamManager - stopStream", () => {
+  test("aborts a pending startup with its reserved identity", async () => {
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      events.push(event);
+    });
+    const startup = streamManager.beginStreamStart({
+      workspaceId: "pending-workspace",
+      acpPromptId: "prompt-1",
+    });
+
+    const result = await streamManager.stopStream("pending-workspace", {
+      abandonPartial: true,
+      abortReason: "user",
+    });
+    startup.finish();
+
+    expect(result.success).toBe(true);
+    expect(startup.abortSignal.aborted).toBe(true);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "stream-abort",
+      workspaceId: "pending-workspace",
+      messageId: startup.syntheticMessageId,
+      abortReason: "user",
+      abandonPartial: true,
+      acpPromptId: "prompt-1",
+    });
+  });
+
+  test("routes mock lifecycle operations through the engine", async () => {
+    const streamManager = new StreamManager(historyService);
+    const stop = mock(() => Promise.resolve());
+    const replayStream = mock(() => Promise.resolve());
+    streamManager.setMockStreamLifecycle({
+      isStreaming: (workspaceId) => workspaceId === "mock-workspace",
+      stop,
+      replayStream,
+    });
+
+    expect(streamManager.isStreaming("mock-workspace")).toBe(true);
+    expect((await streamManager.stopStream("mock-workspace")).success).toBe(true);
+    await streamManager.replayStream("mock-workspace", { afterTimestamp: 10 });
+
+    expect(stop).toHaveBeenCalledWith("mock-workspace");
+    expect(replayStream).toHaveBeenCalledWith("mock-workspace");
+  });
+
   test("emits stream-abort when stopping non-existent stream", async () => {
     const streamManager = new StreamManager(historyService);
 

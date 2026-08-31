@@ -651,6 +651,8 @@ async function main(): Promise<number> {
     workspaceService,
     workspaceGoalService,
     idleDispatcher,
+    streamManager,
+    turnRequestBuilderBindings,
   } = createCoreServices({
     config,
     policyService,
@@ -675,7 +677,7 @@ async function main(): Promise<number> {
   // Codex OAuth explicitly to ensure Codex-routed OpenAI requests can load/refresh
   // OAuth tokens from providers.jsonc.
   const codexOauthService = new CodexOauthService(config, providerService);
-  aiService.setCodexOauthService(codexOauthService);
+  turnRequestBuilderBindings.codexOauthService = codexOauthService;
   // Same for Coder OAuth: coder:* models need per-request token loading/refresh.
   // Bind it to the REAL config (not the ephemeral tempDir copy): Coder rotates
   // the refresh token on every use, so persisting rotations only to tempDir
@@ -690,7 +692,7 @@ async function main(): Promise<number> {
     // token refreshes/issuer checks, and denied providers fail closed.
     policyService
   );
-  aiService.setCoderOauthService(coderOauthService);
+  turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
   // CLI-only exit code control: allows agent to set the process exit code
   // Useful for CI workflows where the agent should block merge on failure
@@ -715,13 +717,14 @@ async function main(): Promise<number> {
       return { success: true, exit_code };
     },
   });
-  aiService.setExtraTools({ set_exit_code: setExitCodeTool });
+  turnRequestBuilderBindings.extraTools = { set_exit_code: setExitCodeTool };
 
   const session = new AgentSession({
     workspaceId,
     config,
     historyService,
     aiService,
+    streamManager,
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService,

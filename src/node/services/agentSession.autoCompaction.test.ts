@@ -19,7 +19,11 @@ import type { BackgroundProcessManager } from "@/node/services/backgroundProcess
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 describe("AgentSession on-send auto-compaction snapshot deferral", () => {
@@ -835,6 +839,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -955,6 +960,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       Promise.resolve(Ok(createStartedTurnHandle()))
     );
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -1064,6 +1070,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1212,6 +1219,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     const aiService = Object.assign(aiEmitter, {
+      ...createStreamLifecycleMocks(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
