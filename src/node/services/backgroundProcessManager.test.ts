@@ -1,11 +1,12 @@
 import { Buffer } from "node:buffer";
-import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
   boundTailContent,
   computeTailStartOffset,
   parseSpawnRecordMeta,
+  type BackgroundProcess,
   type BackgroundProcessMeta,
   type MonitorArmedPayload,
   type MonitorMatchPayload,
@@ -2405,26 +2406,28 @@ describe("BackgroundProcessManager", () => {
 
   describe("wake signal snapshots", () => {
     it("reads the delivery frontier without probing process transport", async () => {
-      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 30", {
-        cwd: process.cwd(),
-        displayName: "non-probing-wake-frontier",
-      });
-      expect(result.success).toBe(true);
-      if (!result.success) return;
-      const proc = await manager.getProcess(result.processId);
-      expect(proc).not.toBeNull();
-      if (proc == null) return;
-      await manager.terminate(result.processId, { monitorDisposition: "discard" });
-      proc.status = "running";
-      const exitSpy = spyOn(proc.handle, "getExitCode").mockRejectedValue(
-        new Error("persistent transport failure")
-      );
+      const processId = "non-probing-wake-frontier";
+      const startTime = Date.now();
+      const getExitCode = mock(() => Promise.reject(new Error("persistent transport failure")));
+      const processRecord = {
+        id: processId,
+        workspaceId: testWorkspaceId,
+        startTime,
+        status: "running",
+        shownThroughOffset: 0,
+        terminalStatusShownToAgent: false,
+        handle: { getExitCode } as unknown as BackgroundHandle,
+      } as unknown as BackgroundProcess;
+      const internal = manager as unknown as {
+        processes: Map<string, BackgroundProcess>;
+      };
+      internal.processes.set(processId, processRecord);
 
-      const state = await manager.getMonitorWakeDeliveryState(result.processId, proc.startTime);
+      const state = await manager.getMonitorWakeDeliveryState(processId, startTime);
 
       expect(state).toMatchObject({ status: "settled", shownThroughOffset: 0 });
-      expect(exitSpy).not.toHaveBeenCalled();
-      exitSpy.mockRestore();
+      expect(getExitCode).not.toHaveBeenCalled();
+      internal.processes.delete(processId);
     });
 
     it("bounds scripts exposed through live wake snapshots", async () => {
