@@ -2288,6 +2288,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private scheduleBashMonitorWakeReconcile(ownerWorkspaceId: string): void {
+    if (this.removingWorkspaces.has(ownerWorkspaceId)) return;
     assert(
       ownerWorkspaceId.trim().length > 0,
       "scheduleBashMonitorWakeReconcile requires workspaceId"
@@ -5749,7 +5750,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
       }
 
-      await this.bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
+      await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
+        this.bashMonitorWakeReconciler.dispose(workspaceId)
+      );
 
       // Remove session data
       const sessionDir = path.join(this.config.sessionsDir, workspaceId);

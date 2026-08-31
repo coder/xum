@@ -194,7 +194,7 @@ export type MonitorWakeDeliveryState =
   | { status: "settled"; shownThroughOffset: number; terminalStatusShown: boolean };
 
 interface MonitorRetainedMatchBatch {
-  lines: readonly string[];
+  lines: string[];
   totalMatches: number;
   droppedLines: number;
   matchedThroughOffset: number;
@@ -283,7 +283,7 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
    * agent's shown-read offset to suppress wakes for output already delivered inline.
    */
   matchedThroughOffset: number;
-  retainedMatch?: MonitorRetainedMatchBatch;
+  retainedMatches: MonitorRetainedMatchBatch[];
   settlementDisposition?: MonitorSettlementDisposition;
   pollIntervalMs: number;
   incompleteLineBuffer: string;
@@ -492,6 +492,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       lastLines: [],
       lastReadOffset: 0,
       matchedThroughOffset: 0,
+      retainedMatches: [],
       incompleteLineBuffer: "",
       stopped: false,
       probeFailures: {},
@@ -579,19 +580,30 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor: BackgroundProcessMonitorState,
     update: { lines: readonly string[]; droppedLines: number; matchedThroughOffset: number }
   ): void {
-    const previous = monitor.retainedMatch;
-    const lines = [...(previous?.lines ?? []), ...update.lines];
-    let droppedLines = (previous?.droppedLines ?? 0) + update.droppedLines;
-    while (lines.length > MONITOR_MAX_PENDING_LINES) {
-      lines.shift();
-      droppedLines++;
-    }
-    monitor.retainedMatch = {
-      lines,
+    monitor.retainedMatches.push({
+      lines: [...update.lines],
       totalMatches: monitor.matchesCount,
-      droppedLines,
+      droppedLines: update.droppedLines,
       matchedThroughOffset: update.matchedThroughOffset,
-    };
+    });
+    let retainedLineCount = monitor.retainedMatches.reduce(
+      (total, batch) => total + batch.lines.length,
+      0
+    );
+    while (retainedLineCount > MONITOR_MAX_PENDING_LINES) {
+      const first = monitor.retainedMatches[0];
+      const removeCount = Math.min(
+        retainedLineCount - MONITOR_MAX_PENDING_LINES,
+        first.lines.length
+      );
+      first.lines.splice(0, removeCount);
+      first.droppedLines += removeCount;
+      retainedLineCount -= removeCount;
+      if (first.lines.length === 0 && monitor.retainedMatches.length > 1) {
+        const removed = monitor.retainedMatches.shift();
+        if (removed != null) monitor.retainedMatches[0].droppedLines += removed.droppedLines;
+      }
+    }
   }
 
   /** Low-level "monitor:match" emitter shared by normal flushes and settlement payloads. */
@@ -679,7 +691,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Drop coalesced matches rather than letting monitor teardown create the late wake itself.
       monitor.pendingLines = [];
       monitor.droppedLines = 0;
-      monitor.retainedMatch = undefined;
+      monitor.retainedMatches = [];
       monitor.settlementDisposition = undefined;
     }
     // A monitor retiring while the app is alive means the agent no longer wants wakes for
@@ -731,7 +743,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // A match may already have retired the monitor and queued a synthetic wake. Explicit process
     // cancellation must still retract that undelivered wake, so emit a cancellation notification
     // even though the in-memory monitor has no remaining timer or pending lines to clear.
-    monitor.retainedMatch = undefined;
+    monitor.retainedMatches = [];
     monitor.settlementDisposition = undefined;
     if (!this.shuttingDown) {
       this.emit("monitor:stopped", proc.workspaceId, {
@@ -1812,7 +1824,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     for (const proc of this.processes.values()) {
       const monitor = proc.monitor;
       if (proc.workspaceId !== ownerWorkspaceId || monitor == null) continue;
-      const match = monitor.retainedMatch;
+      const match =
+        monitor.retainedMatches.length === 0
+          ? undefined
+          : {
+              throughOffset:
+                monitor.retainedMatches[monitor.retainedMatches.length - 1].matchedThroughOffset,
+              lines: monitor.retainedMatches.flatMap((batch) => batch.lines),
+              totalMatches:
+                monitor.retainedMatches[monitor.retainedMatches.length - 1].totalMatches,
+              droppedLines: monitor.retainedMatches.reduce(
+                (total, batch) => total + batch.droppedLines,
+                0
+              ),
+            };
       snapshots.push({
         processId: proc.id,
         taskId: monitor.armMetadata.taskId,
@@ -1825,7 +1850,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         ...(match != null
           ? {
               match: {
-                throughOffset: match.matchedThroughOffset,
+                throughOffset: match.throughOffset,
                 lines: [...match.lines],
                 totalMatches: match.totalMatches,
                 ...(match.droppedLines > 0 ? { droppedLines: match.droppedLines } : {}),
@@ -1886,12 +1911,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const proc = this.processes.get(processId);
     if (proc == null || !(proc.startTime <= originNotAfterMs)) return;
     const monitor = proc.monitor;
-    if (
-      monitor?.retainedMatch != null &&
-      monitor.retainedMatch.matchedThroughOffset <= matchedThroughOffset
-    ) {
-      monitor.retainedMatch = undefined;
-    }
+    if (monitor == null) return;
+    monitor.retainedMatches = monitor.retainedMatches.filter(
+      (batch) => batch.matchedThroughOffset > matchedThroughOffset
+    );
   }
 
   async getMonitorWakeDeliveryState(

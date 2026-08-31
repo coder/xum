@@ -21,6 +21,8 @@ const LEGACY_WAKE_DIR = "bash-monitor-wakes";
 const WATERMARK_VERSION = 1;
 const MAX_WAKE_LINES = 50;
 const MAX_WAKE_LINE_BYTES = 8_192;
+const RECONCILE_RETRY_BASE_MS = 50;
+const RECONCILE_RETRY_MAX_MS = 2_000;
 export const BASH_MONITOR_SETTLE_LINE_PREFIX = "[monitor] process settled:";
 
 export type BashMonitorPendingWakeKind = "match" | "monitor-lost" | "settled";
@@ -346,6 +348,9 @@ export class BashMonitorWakeReconciler {
   private readonly locks = new MutexMap<string>();
   private readonly states = new Map<string, ReconcileState>();
   private readonly legacyCleanupAttempted = new Set<string>();
+  private readonly retryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly retryAttempts = new Map<string, number>();
+  private readonly defunctWorkspaces = new Set<string>();
 
   constructor(
     private readonly args: {
@@ -359,6 +364,7 @@ export class BashMonitorWakeReconciler {
   ) {}
 
   scheduleReconcile(ownerWorkspaceId: string): void {
+    if (this.defunctWorkspaces.has(ownerWorkspaceId)) return;
     const state = this.state(ownerWorkspaceId);
     state.requested = true;
     if (state.promise != null || state.scheduled) return;
@@ -370,13 +376,20 @@ export class BashMonitorWakeReconciler {
   }
 
   reconcile(ownerWorkspaceId: string): Promise<void> {
+    if (this.defunctWorkspaces.has(ownerWorkspaceId)) return Promise.resolve();
     const state = this.state(ownerWorkspaceId);
     state.requested = true;
     if (state.promise != null) return state.promise;
-    const promise = this.runReconcileLoop(ownerWorkspaceId, state).finally(() => {
-      if (state.promise === promise) state.promise = undefined;
-      if (state.requested) this.scheduleReconcile(ownerWorkspaceId);
-    });
+    const promise = this.runReconcileLoop(ownerWorkspaceId, state)
+      .then(() => this.resetRetry(ownerWorkspaceId))
+      .catch((error: unknown) => {
+        this.scheduleRetry(ownerWorkspaceId);
+        throw error;
+      })
+      .finally(() => {
+        if (state.promise === promise) state.promise = undefined;
+        if (state.requested) this.scheduleReconcile(ownerWorkspaceId);
+      });
     state.promise = promise;
     return promise;
   }
@@ -426,6 +439,41 @@ export class BashMonitorWakeReconciler {
     await this.consumeCurrent(token.ownerWorkspaceId);
   }
 
+  async dispose(ownerWorkspaceId: string): Promise<void> {
+    this.defunctWorkspaces.add(ownerWorkspaceId);
+    this.resetRetry(ownerWorkspaceId);
+    await this.locks.withLock(ownerWorkspaceId, () => {
+      const state = this.states.get(ownerWorkspaceId);
+      state?.dispatch?.controller.abort();
+      this.states.delete(ownerWorkspaceId);
+      return Promise.resolve();
+    });
+  }
+
+  private scheduleRetry(ownerWorkspaceId: string): void {
+    if (this.defunctWorkspaces.has(ownerWorkspaceId) || this.retryTimers.has(ownerWorkspaceId)) {
+      return;
+    }
+    const attempt = (this.retryAttempts.get(ownerWorkspaceId) ?? 0) + 1;
+    this.retryAttempts.set(ownerWorkspaceId, attempt);
+    const delay = Math.min(
+      RECONCILE_RETRY_MAX_MS,
+      RECONCILE_RETRY_BASE_MS * 2 ** Math.min(attempt - 1, 6)
+    );
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(ownerWorkspaceId);
+      this.scheduleReconcile(ownerWorkspaceId);
+    }, delay);
+    timer.unref();
+    this.retryTimers.set(ownerWorkspaceId, timer);
+  }
+
+  private resetRetry(ownerWorkspaceId: string): void {
+    const timer = this.retryTimers.get(ownerWorkspaceId);
+    if (timer != null) clearTimeout(timer);
+    this.retryTimers.delete(ownerWorkspaceId);
+    this.retryAttempts.delete(ownerWorkspaceId);
+  }
   private state(ownerWorkspaceId: string): ReconcileState {
     let state = this.states.get(ownerWorkspaceId);
     if (state == null) {
@@ -644,7 +692,8 @@ export class BashMonitorWakeReconciler {
             deadRegistryRow,
             false,
             false,
-            watermark?.matchedThroughOffset ?? -1
+            watermark?.matchedThroughOffset ?? -1,
+            -1
           ),
           outstanding: false,
           consume: true,
@@ -666,7 +715,8 @@ export class BashMonitorWakeReconciler {
           deadRegistryRow,
           false,
           true,
-          watermark?.matchedThroughOffset ?? -1
+          watermark?.matchedThroughOffset ?? -1,
+          -1
         ),
         outstanding: false,
         consume: false,
@@ -685,10 +735,6 @@ export class BashMonitorWakeReconciler {
     const terminalWake = terminalNew && snapshot.terminal?.wakeOnExit === true && !terminalShown;
     const lostWake = lostNew;
     const matchWake = matchNew && !matchShown;
-    const deliveredThroughOffset = Math.max(
-      watermark?.matchedThroughOffset ?? -1,
-      deliveryState?.status === "settled" ? deliveryState.shownThroughOffset : -1
-    );
     const signal = this.toSignal(
       snapshot,
       deadRegistryRow,
@@ -696,7 +742,8 @@ export class BashMonitorWakeReconciler {
       deliveryState?.status === "settled"
         ? (deliveryState.taskAwaitable ?? true)
         : !deadRegistryRow,
-      deliveredThroughOffset
+      watermark?.matchedThroughOffset ?? -1,
+      deliveryState?.status === "settled" ? deliveryState.shownThroughOffset : -1
     );
     signal.kind = lostWake ? "monitor-lost" : matchWake ? "match" : "settled";
     const outstanding = lostWake || matchWake || terminalWake;
@@ -708,7 +755,8 @@ export class BashMonitorWakeReconciler {
     deadRegistryRow: boolean,
     matchedOutputAlreadyShown: boolean,
     taskAwaitable: boolean,
-    deliveredThroughOffset: number
+    deliveredMatchedThroughOffset: number,
+    shownThroughOffset: number
   ): DerivedSignal {
     return {
       key: signalKey(snapshot.processId, snapshot.createdAt),
@@ -721,12 +769,15 @@ export class BashMonitorWakeReconciler {
       script: snapshot.script,
       createdAt: snapshot.createdAt,
       kind: "match",
-      ...this.composeLines(snapshot, deliveredThroughOffset),
-      ...(snapshot.lost?.failedMatch?.matchedThroughOffset != null
-        ? { matchOffset: snapshot.lost.failedMatch.matchedThroughOffset }
-        : snapshot.match != null
-          ? { matchOffset: snapshot.match.throughOffset }
-          : {}),
+      ...this.composeLines(snapshot, deliveredMatchedThroughOffset, shownThroughOffset),
+      ...(snapshot.lost?.failedMatch?.matchedThroughOffset != null || snapshot.match != null
+        ? {
+            matchOffset: Math.max(
+              snapshot.lost?.failedMatch?.matchedThroughOffset ?? -1,
+              snapshot.match?.throughOffset ?? -1
+            ),
+          }
+        : {}),
       matchedOutputAlreadyShown,
       ...(snapshot.terminal != null ? { terminal: snapshot.terminal } : {}),
       ...(snapshot.lost != null ? { lost: snapshot.lost } : {}),
@@ -738,16 +789,34 @@ export class BashMonitorWakeReconciler {
 
   private composeLines(
     snapshot: BashMonitorProcessSnapshot,
-    deliveredThroughOffset: number
+    deliveredMatchedThroughOffset: number,
+    shownThroughOffset: number
   ): {
     lines: readonly string[];
     droppedLines: number;
   } {
     if (snapshot.lost != null) {
-      const bounded = boundBashMonitorWakeLines(snapshot.lost.failedMatch?.lines ?? []);
+      const retained = [...(snapshot.match?.lines ?? [])];
+      const failedMatch = snapshot.lost.failedMatch;
+      const failedLines =
+        failedMatch?.matchedThroughOffset == null ||
+        failedMatch.matchedThroughOffset > (snapshot.match?.throughOffset ?? -1)
+          ? [...(failedMatch?.lines ?? [])]
+          : [];
+      let overlap = Math.min(retained.length, failedLines.length);
+      while (
+        overlap > 0 &&
+        !retained.slice(-overlap).every((line, index) => line === failedLines[index])
+      ) {
+        overlap--;
+      }
+      const bounded = boundBashMonitorWakeLines([...retained, ...failedLines.slice(overlap)]);
       return {
         lines: bounded.lines,
-        droppedLines: (snapshot.lost.failedMatch?.droppedLines ?? 0) + bounded.droppedLines,
+        droppedLines:
+          (snapshot.match?.droppedLines ?? 0) +
+          (failedMatch?.droppedLines ?? 0) +
+          bounded.droppedLines,
       };
     }
     const matched = (snapshot.match?.lines ?? []).filter(
@@ -756,7 +825,16 @@ export class BashMonitorWakeReconciler {
     const counts = new Map<string, number>();
     for (const line of matched) counts.set(line, (counts.get(line) ?? 0) + 1);
     const tail = (snapshot.terminal?.tailLines ?? [])
-      .filter((entry) => entry.endOffset > deliveredThroughOffset)
+      .filter((entry) => {
+        if (entry.endOffset <= shownThroughOffset) return false;
+        if (entry.endOffset > deliveredMatchedThroughOffset) return true;
+        try {
+          const matched = new RegExp(snapshot.filter).test(entry.line);
+          return snapshot.filterExclude ? matched : !matched;
+        } catch {
+          return true;
+        }
+      })
       .map((entry) => entry.line)
       .filter((line) => {
         const count = counts.get(line) ?? 0;
