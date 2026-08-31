@@ -64,7 +64,10 @@ import {
   type AdvisorPhaseEvent,
   type StreamAbortEvent,
   type StreamAbortReasonSnapshot,
+  type StreamDeltaEvent,
   type StreamEndEvent,
+  type ToolCallDeltaEvent,
+  type ReasoningDeltaEvent,
   type StreamStartEvent,
   type RuntimeStatusEvent,
 } from "@/common/types/stream";
@@ -912,7 +915,7 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
     },
     "stream-delta": (workspaceId, aggregator, data) => {
-      this.applyStreamingDelta(workspaceId, aggregator, data);
+      this.applyStreamingDelta(workspaceId, aggregator, data as StreamDeltaEvent);
     },
     "stream-end": (workspaceId, aggregator, data) => {
       const streamEndData = data as StreamEndEvent;
@@ -1011,7 +1014,7 @@ export class WorkspaceStore {
       this.states.bump(workspaceId);
     },
     "tool-call-delta": (workspaceId, aggregator, data) => {
-      this.applyStreamingDelta(workspaceId, aggregator, data);
+      this.applyStreamingDelta(workspaceId, aggregator, data as ToolCallDeltaEvent);
     },
     "tool-call-end": (workspaceId, aggregator, data) => {
       const toolCallEnd = data as Extract<WorkspaceChatMessage, { type: "tool-call-end" }>;
@@ -1066,7 +1069,7 @@ export class WorkspaceStore {
       }
     },
     "reasoning-delta": (workspaceId, aggregator, data) => {
-      this.applyStreamingDelta(workspaceId, aggregator, data);
+      this.applyStreamingDelta(workspaceId, aggregator, data as ReasoningDeltaEvent);
     },
     "reasoning-end": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
@@ -1673,25 +1676,37 @@ export class WorkspaceStore {
   private applyStreamingDelta(
     workspaceId: string,
     aggregator: StreamingMessageAggregator,
-    data: WorkspaceChatMessage
+    data: StreamDeltaEvent | ToolCallDeltaEvent | ReasoningDeltaEvent
   ): void {
-    const messageId = aggregator.getActiveStreamMessageId();
-    const partsBefore = messageId ? aggregator.getMessagePartCount(messageId) : 0;
+    // Route by the delta's own message ID: a second stream can start before the
+    // previous stream context is removed, and the "first active entry" would
+    // then attribute this delta's part-count change to the wrong message.
+    const messageId = data.messageId;
+    const partsBefore = aggregator.getMessagePartCount(messageId);
     applyWorkspaceChatEventToAggregator(aggregator, data);
-    if (messageId && aggregator.getMessagePartCount(messageId) !== partsBefore) {
+    if (aggregator.getMessagePartCount(messageId) !== partsBefore) {
       this.states.bump(workspaceId);
       this.streamingStatsStore.bump(workspaceId);
     } else {
-      this.scheduleStreamingMessageBump(workspaceId, aggregator);
+      this.scheduleStreamingMessageBump(workspaceId, aggregator, messageId);
     }
   }
 
   private scheduleStreamingMessageBump(
     workspaceId: string,
-    aggregator: StreamingMessageAggregator
+    aggregator: StreamingMessageAggregator,
+    messageId: string
   ): void {
-    const messageId = aggregator.getActiveStreamMessageId();
-    if (!messageId || this.pendingStreamingMessageBump.has(workspaceId)) return;
+    const pendingId = this.pendingStreamingMessageBump.get(workspaceId);
+    if (pendingId === messageId) return;
+    if (pendingId !== undefined) {
+      // Deltas from two concurrent streams are interleaved in this pump. The
+      // per-row channel tracks one row, so refresh the whole workspace rather
+      // than waking only the other stream's row.
+      this.states.bump(workspaceId);
+      this.streamingStatsStore.bump(workspaceId);
+      return;
+    }
     this.pendingStreamingMessageBump.set(workspaceId, messageId);
     queueMicrotask(() => {
       if (this.pendingStreamingMessageBump.get(workspaceId) !== messageId) return;
@@ -3727,6 +3742,17 @@ export class WorkspaceStore {
 
     // Reset per-workspace transient state so the next replay rebuilds from the backend source of truth.
     const previousTransient = this.chatTransientState.get(workspaceId);
+    // Release keyed advisor channels before the transient maps are replaced:
+    // they are the only record of these tool-call IDs, so the caught-up and
+    // workspace-removal sweeps can never rediscover the keys afterwards.
+    if (previousTransient) {
+      for (const toolCallId of new Set([
+        ...previousTransient.liveAdvisorOutput.keys(),
+        ...previousTransient.liveAdvisorReasoning.keys(),
+      ])) {
+        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
+      }
+    }
     const nextTransient = createInitialChatTransientState();
 
     // Preserve active hydration across full replay resets so workspace-switch catch-up

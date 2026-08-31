@@ -2168,6 +2168,59 @@ describe("WorkspaceStore", () => {
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).toBeNull();
     });
 
+    it("mounts rows created by a second concurrent stream's deltas", () => {
+      const workspaceId = "concurrent-stream-deltas";
+      const firstMessageId = "stream-message-1";
+      const secondMessageId = "stream-message-2";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        states: { bump: (key: string) => void };
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        processStreamEvent: (
+          id: string,
+          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
+          event: WorkspaceChatMessage
+        ) => void;
+      }>(store);
+      const dispatch = (event: WorkspaceChatMessage) =>
+        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
+
+      rawStore.handleChatMessage(workspaceId, {
+        type: "stream-start",
+        workspaceId,
+        messageId: firstMessageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
+      // Second stream starts while the first stream's context is still active
+      // (its terminal event has not been processed yet).
+      dispatch({
+        type: "stream-start",
+        workspaceId,
+        messageId: secondMessageId,
+        historySequence: 2,
+        model: TEST_MODEL,
+        startTime: 2,
+      });
+
+      const bump = spyOn(rawStore.states, "bump");
+      bump.mockClear();
+      // The row-creating delta belongs to the newer stream; deriving the part
+      // count from the older active-stream entry would skip the mount bump and
+      // leave the new row hidden until the next structural event.
+      dispatch({
+        type: "stream-delta",
+        workspaceId,
+        messageId: secondMessageId,
+        delta: "hello",
+        tokens: 1,
+        timestamp: 3,
+      });
+      expect(bump).toHaveBeenCalledWith(workspaceId);
+    });
+
     it("releases the keyed channel when a background activity stop clears the stream", async () => {
       const workspaceId = "keyed-channel-background-stop";
       createAndAddWorkspace(store, workspaceId);
@@ -4709,6 +4762,40 @@ describe("WorkspaceStore", () => {
       expect(clearedLiveOutput).toBe(true);
       // The delete-time sweep must release the keyed channel as well: with the
       // transient entry gone, no later sweep can rediscover this key.
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
+    });
+
+    it("releases keyed advisor channels when a full replay resets transient state", async () => {
+      const workspaceId = "advisor-output-full-replay-reset";
+
+      mockChatScript(
+        [
+          caughtUpEvent(),
+          Promise.resolve(),
+          advisorOutputEvent(workspaceId, "call-advisor-replay-reset", "partial advice", 1),
+        ],
+        { keepOpen: true }
+      );
+
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+        resetChatStateForReplay: (workspaceId: string) => void;
+      }>(store);
+      const advisorKey = `${workspaceId}\u0000call-advisor-replay-reset`;
+
+      const hasLiveOutput = await waitUntil(
+        () =>
+          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")?.text ===
+          "partial advice"
+      );
+      expect(hasLiveOutput).toBe(true);
+      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(true);
+
+      rawStore.resetChatStateForReplay(workspaceId);
+
+      // The replaced transient maps were the only record of this tool-call ID,
+      // so the reset itself must release the keyed channel.
       expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
     });
 
