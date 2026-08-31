@@ -3,6 +3,7 @@ import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./w
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
+import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -9349,6 +9350,85 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(
         existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
       ).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a partial truncation blocks send admission across reference retirement", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-partial-admission";
+    const runId = "wfr_currentness_partial_admission";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-partial-admission",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "before truncation", { timestamp: 1_200 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user-b", "user", "still here after", { timestamp: 1_300 })
+      );
+
+      // A send racing the partial truncation during the retirement await must be refused:
+      // admitted, it would snapshot the pre-truncation transcript and lose its turn's
+      // workflow provenance to the reference retirement.
+      const internal = workspaceService as unknown as {
+        retireKernelWorkflowRunReferences: (id: string) => Promise<void>;
+      };
+      const originalRetire = internal.retireKernelWorkflowRunReferences.bind(workspaceService);
+      let raceSendOutcome: string | null = null;
+      const retireSpy = spyOn(internal, "retireKernelWorkflowRunReferences").mockImplementationOnce(
+        async (id: string) => {
+          const sendResult = await workspaceService.sendMessage(workspaceId, "race the cut", {
+            model: "openai:gpt-4o",
+            agentId: "exec",
+          });
+          raceSendOutcome = sendResult.success ? "accepted" : JSON.stringify(sendResult.error);
+          await originalRetire(id);
+        }
+      );
+      try {
+        const truncateResult = await workspaceService.truncateHistory(workspaceId, 0.5);
+        expect(truncateResult.success).toBe(true);
+      } finally {
+        retireSpy.mockRestore();
+      }
+      expect(raceSendOutcome ?? "").toContain(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data).toHaveLength(1);
+      }
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();

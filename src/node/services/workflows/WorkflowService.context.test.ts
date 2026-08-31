@@ -10,6 +10,7 @@ import { WorkflowRunStore } from "./WorkflowRunStore";
 import {
   listWorkflowRuns,
   listWorkflowScripts,
+  resumeWorkflowRun,
   startWorkflowRun,
   type WorkflowServiceContext,
 } from "./WorkflowService";
@@ -97,6 +98,7 @@ describe("WorkflowService request orchestration", () => {
       workspaceService,
       taskService: {
         noteWorkflowRunTerminalAttention: mock(() => undefined),
+        clearWorkflowRunDowngradeSettlement: mock(async () => undefined),
       },
       experimentsService: {
         isExperimentEnabled: mock(() => options.enabled ?? true),
@@ -265,6 +267,40 @@ describe("WorkflowService request orchestration", () => {
       ownerWorkspaceId: "workspace-1",
       runId: "wfr_crash_wake",
       status: "completed",
+    });
+  });
+
+  test("resuming a run clears the stale downgrade settlement marker", async () => {
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir("workspace-1") });
+    await runStore.createRun({
+      id: "wfr_resume_compat",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo", scope: "built-in", executable: true },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus("wfr_resume_compat", "running", "2026-05-29T00:00:01.000Z");
+    await runStore.appendStatus("wfr_resume_compat", "interrupted", "2026-05-29T00:00:02.000Z");
+
+    const clearWorkflowRunDowngradeSettlement = mock(async () => undefined);
+    const { context } = createContext();
+    (context as unknown as Record<string, unknown>).taskService = {
+      noteWorkflowRunTerminalAttention: mock(() => undefined),
+      clearWorkflowRunDowngradeSettlement,
+    };
+
+    // Leaving terminal state invalidates the stable downgrade marker written at settlement;
+    // without the clear, a downgraded build would refuse to enqueue the resumed result.
+    await resumeWorkflowRun(context, { workspaceId: "workspace-1", runId: "wfr_resume_compat" });
+    const deadline = Date.now() + 5_000;
+    while (clearWorkflowRunDowngradeSettlement.mock.calls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(clearWorkflowRunDowngradeSettlement).toHaveBeenCalledWith({
+      ownerWorkspaceId: "workspace-1",
+      runId: "wfr_resume_compat",
     });
   });
 

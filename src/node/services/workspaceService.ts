@@ -12857,13 +12857,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                 return "all" as const;
               });
     const isFullClear = truncationScope === "all";
-    // A full clear holds the admission guard across the refine drain/lock
-    // awaits below: without it, a send admitted during those awaits could
-    // snapshot the pre-clear transcript and stream across the truncation,
-    // repopulating the cleared context. Partial truncation keeps the plain
-    // pre-check — no awaits sit between it and the truncation.
+    // Every row-removing truncation holds the admission guard across its awaits (full clear:
+    // the refine drain/lock below; partial: kernel workflow reference retirement): without
+    // it, a send admitted during those awaits could snapshot the pre-truncation transcript
+    // and stream across the mutation, or lose its turn's workflow provenance to the
+    // retirement. Scope "none" keeps the plain pre-check: it retires nothing, and
+    // historyService refuses row-removing drift under the write lock.
     let admissionGuard: Disposable | null = null;
-    if (isFullClear) {
+    if (truncationScope !== "none") {
       const guardResult = this.acquireContextMutationAdmissionGuard(
         workspaceId,
         "truncate history"

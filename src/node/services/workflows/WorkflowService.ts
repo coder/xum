@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import {
   isTerminalWorkflowRunStatus,
+  WORKFLOW_BACKGROUND_CONTINUATION_STATUSES,
   type WorkflowScriptDescriptor,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
@@ -132,11 +133,6 @@ export interface StartNamedWorkflowResult {
   status: WorkflowRunStatus;
   result: unknown;
 }
-
-const WORKFLOW_BACKGROUND_CONTINUATION_STATUSES = new Set<WorkflowRunStatus>([
-  "completed",
-  "failed",
-]);
 
 // oRPC creates a WorkflowService per request, so workflow lifecycle state that spans requests
 // needs process-wide registries.
@@ -1076,9 +1072,19 @@ export async function resolveWorkflowContext(
           includeAgentPlugins,
           skillStorageContext,
         }),
-      // No reset bookkeeping on restarts: settled markers are keyed by the run's terminal
-      // generation, so a resumed run's next terminal transition re-arms attention by itself.
-      onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
+      // Settled markers are keyed by the run's terminal generation, so a resumed run's next
+      // terminal transition re-arms attention by itself; only the downgrade-compat stable
+      // marker needs clearing when the run leaves terminal state (see
+      // clearWorkflowRunDowngradeSettlement).
+      onRunStatusChanged: async (event) => {
+        if (!isTerminalWorkflowRunStatus(event.status)) {
+          await context.taskService.clearWorkflowRunDowngradeSettlement({
+            ownerWorkspaceId: event.workspaceId,
+            runId: event.runId,
+          });
+        }
+        await context.workspaceService.emitWorkflowRunActivity(event);
+      },
       // Read paths (listRuns / stream subscribe) create services purely to observe runs, but
       // crash recovery can resume an orphaned background run on them: without a terminal
       // callback the settled run would owe its wake to the next sweep. Explicit callbacks

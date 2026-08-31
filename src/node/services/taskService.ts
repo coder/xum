@@ -138,6 +138,7 @@ import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/type
 import {
   isActiveWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
+  WORKFLOW_BACKGROUND_CONTINUATION_STATUSES,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
 } from "@/common/types/workflow";
@@ -7677,7 +7678,10 @@ export class TaskService implements AgentTaskIntegration {
             run.workspaceId !== workspace.id ||
             run.parentWorkflow != null ||
             resolveBackgroundWorkAttentionPolicy(run.attentionPolicy) !== "notify_on_terminal" ||
-            !isTerminalWorkflowRunStatus(run.status)
+            // Interrupted runs were stopped deliberately: the terminal callback only notifies
+            // them under an explicit service opt-in, and this re-derivation must not undo the
+            // user's stop by injecting a continuation prompt. Opt-in callbacks queue directly.
+            !WORKFLOW_BACKGROUND_CONTINUATION_STATUSES.has(run.status)
           ) {
             continue;
           }
@@ -7931,6 +7935,37 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId)?.delete(params.runId);
+  }
+
+  /**
+   * Downgrade-compat bookkeeping only: settlement dual-writes a stable un-suffixed marker for
+   * the previous build's whole-run dedupe (see markWorkflowRunTerminalAttentionSettled), and a
+   * restarted run invalidates it. Without this delete, downgrading after a resume would leave
+   * the old build refusing to enqueue the run's newer result behind the stale stable marker.
+   * This build never reads the stable marker (generation markers are the authority), so the
+   * delete is best-effort and must never fail the status transition.
+   */
+  async clearWorkflowRunDowngradeSettlement(params: {
+    ownerWorkspaceId: string;
+    runId: string;
+  }): Promise<void> {
+    assert(
+      params.ownerWorkspaceId.length > 0,
+      "clearWorkflowRunDowngradeSettlement requires ownerWorkspaceId"
+    );
+    assert(params.runId.length > 0, "clearWorkflowRunDowngradeSettlement requires runId");
+    try {
+      await this.terminalAttentionStore.delete(
+        params.ownerWorkspaceId,
+        TerminalAttentionStore.notificationId("workflow_run", params.runId)
+      );
+    } catch (error: unknown) {
+      log.warn("Failed to clear stale workflow downgrade settlement marker", {
+        ownerWorkspaceId: params.ownerWorkspaceId,
+        runId: params.runId,
+        error,
+      });
+    }
   }
 
   async markWorkspaceTurnTerminalAttentionConsumed(params: {

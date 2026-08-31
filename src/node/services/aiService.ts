@@ -23,6 +23,7 @@ import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiment
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
+import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import type { Config } from "@/node/config";
 import {
   StreamManager,
@@ -2328,9 +2329,16 @@ export class AIService extends EventEmitter {
               runStore: new WorkflowRunStore({
                 sessionDir: this.config.getSessionDir(workspaceId),
               }),
-              // No reset bookkeeping on restarts: settled markers are keyed by the run's
-              // terminal generation, so a resumed run re-arms attention by itself.
+              // This build's settled markers are keyed by the run's terminal generation, so
+              // a resumed run re-arms attention by itself; only the downgrade-compat stable
+              // marker needs clearing when the run leaves terminal state.
               onRunStatusChanged: async (event) => {
+                if (!isTerminalWorkflowRunStatus(event.status)) {
+                  await this.taskService?.clearWorkflowRunDowngradeSettlement({
+                    ownerWorkspaceId: event.workspaceId,
+                    runId: event.runId,
+                  });
+                }
                 await this.onWorkflowRunStatusChanged?.(event);
               },
               runtimeFactory: new QuickJSRuntimeFactory(),
