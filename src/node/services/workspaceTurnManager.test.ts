@@ -5,10 +5,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
-import {
-  TerminalAttentionStore,
-  type TerminalAttentionOutcome,
-} from "@/node/services/terminalAttentionStore";
+import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import {
   TaskHandleStore,
   type WorkspaceTurnTaskHandleRecord,
@@ -111,6 +108,7 @@ function makeCreateMockReturning(result: Result<{ metadata: WorkspaceMetadata }>
 }
 
 type WorkspaceTurnManagerHostFake = WorkspaceTurnManagerHost & {
+  manager?: WorkspaceTurnManager;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
 };
 
@@ -164,6 +162,7 @@ function createWorkspaceTurnManagerHost(
     return signaled;
   };
   return {
+    manager: undefined,
     acquireTaskCreationLock: () =>
       Promise.resolve({
         [Symbol.asyncDispose]: () => Promise.resolve(),
@@ -313,21 +312,12 @@ function createWorkspaceTurnManagerHarness(
     typeof WorkspaceTurnManager
   >[8];
   const terminalAttentionStore = new TerminalAttentionStore(config);
-  const taskHostTarget = createWorkspaceTurnManagerHost(
+  const taskHost = createWorkspaceTurnManagerHost(
     config,
     workspaceService,
     aiService,
     terminalAttentionStore
   );
-  const taskServiceHolder: { current?: WorkspaceTurnManager } = {};
-  const taskHost = new Proxy(taskHostTarget, {
-    get: (target, key, receiver): unknown => {
-      const record = taskServiceHolder.current as unknown as Record<PropertyKey, unknown>;
-      return taskServiceHolder.current != null && Object.hasOwn(record, key)
-        ? record[key]
-        : Reflect.get(target, key, receiver);
-    },
-  });
   const taskService = new WorkspaceTurnManager(
     config,
     historyService,
@@ -339,15 +329,7 @@ function createWorkspaceTurnManagerHarness(
     new MutexMap<string>(),
     streamManager
   );
-  taskServiceHolder.current = taskService;
-  for (const key of Object.keys(taskHostTarget) as Array<keyof WorkspaceTurnManagerHostFake>) {
-    if (key in taskService) continue;
-    Object.defineProperty(taskService, key, {
-      configurable: true,
-      writable: true,
-      value: taskHostTarget[key],
-    });
-  }
+  taskHost.manager = taskService;
 
   return {
     historyService,
@@ -3681,7 +3663,7 @@ describe("WorkspaceTurnManager", () => {
   test("terminal recovery contains per-record attention persistence failures", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    const { taskService, taskHost } = createWorkspaceTurnManagerHarness(config);
     const taskHandleStore = new TaskHandleStore(config);
     for (const [index, handleId] of ["wst_attention_failure", "wst_attention_success"].entries()) {
       await taskHandleStore.upsertWorkspaceTurn({
@@ -3700,17 +3682,10 @@ describe("WorkspaceTurnManager", () => {
       });
     }
     const internal = taskService as unknown as {
-      enqueueTerminalAttention: (params: {
-        ownerWorkspaceId: string;
-        sourceKind: "workspace_turn";
-        terminalOutcome: TerminalAttentionOutcome;
-        sourceId: string;
-        generationId?: string;
-      }) => Promise<void>;
       recoverTerminalWorkspaceTurnAttentionNotifications: () => Promise<number>;
     };
-    const enqueueTerminalAttention = internal.enqueueTerminalAttention.bind(taskService);
-    const enqueue = spyOn(internal, "enqueueTerminalAttention")
+    const enqueueTerminalAttention = taskHost.enqueueTerminalAttention.bind(taskHost);
+    const enqueue = spyOn(taskHost, "enqueueTerminalAttention")
       .mockRejectedValueOnce(new Error("read-only attention store"))
       .mockImplementation(enqueueTerminalAttention);
 
@@ -3966,14 +3941,13 @@ describe("WorkspaceTurnManager", () => {
   });
 
   test("active workspace turn count excludes foreground-waiting workspace turns", async () => {
-    const { taskService } = await startWorkspaceTurnForTest();
+    const { taskService, taskHost } = await startWorkspaceTurnForTest();
     const internal = taskService as unknown as {
       countActiveWorkspaceTurns: () => Promise<number>;
-      startForegroundAwait: (workspaceId: string) => () => void;
     };
 
     expect(await internal.countActiveWorkspaceTurns()).toBe(1);
-    const stopForegroundAwait = internal.startForegroundAwait("childworkspace");
+    const stopForegroundAwait = taskHost.startForegroundAwait("childworkspace");
     try {
       expect(await internal.countActiveWorkspaceTurns()).toBe(0);
     } finally {
@@ -4004,7 +3978,7 @@ describe("WorkspaceTurnManager", () => {
     });
     const isStreaming = mock((workspaceId: string) => workspaceId === reawakenedTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { taskService } = createWorkspaceTurnManagerHarness(config, { aiService });
+    const { taskService, taskHost } = createWorkspaceTurnManagerHarness(config, { aiService });
     const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
       .taskHandleStore;
     await taskHandleStore.upsertWorkspaceTurn({
@@ -4020,11 +3994,10 @@ describe("WorkspaceTurnManager", () => {
       disposableWorkspace: false,
     });
     const internal = taskService as unknown as {
-      countActiveAgentTasks: (cfg: ReturnType<Config["loadConfigOrDefault"]>) => number;
       countActiveWorkspaceTurns: () => Promise<number>;
     };
 
-    const activeAgentCount = internal.countActiveAgentTasks(config.loadConfigOrDefault());
+    const activeAgentCount = taskHost.countActiveAgentTasks(config.loadConfigOrDefault());
     const activeWorkspaceTurnCount = await internal.countActiveWorkspaceTurns();
 
     expect(activeAgentCount).toBe(1);
@@ -4970,7 +4943,8 @@ describe("WorkspaceTurnManager", () => {
   });
 
   test("getWorkspaceTurnSnapshot repairs a stale error handle from self-healed history", async () => {
-    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, taskHost, historyService } =
+      await startWorkspaceTurnForTest();
     await config.editConfig((cfg) => {
       const child = Array.from(cfg.projects.values())
         .flatMap((project) => project.workspaces)
@@ -4983,9 +4957,7 @@ describe("WorkspaceTurnManager", () => {
       return cfg;
     });
     const patchGeneration = spyOn(
-      taskService as unknown as {
-        maybeStartPatchGenerationForReportedTask: WorkspaceTurnManagerHost["maybeStartPatchGenerationForReportedTask"];
-      },
+      taskHost,
       "maybeStartPatchGenerationForReportedTask"
     ).mockResolvedValue(undefined);
     const muxMetadata = {
