@@ -1042,12 +1042,13 @@ describe("BackgroundProcessManager", () => {
         expect(terminated.success).toBe(true);
         if (!terminated.success) return;
         await manager.terminate(terminated.processId, { monitorDisposition: "discard" });
-        expect(events.stopped).toContainEqual({
-          workspaceId: testWorkspaceId,
-          payload: expect.objectContaining({
-            processId: terminated.processId,
-            reason: "canceled",
-          }),
+        const canceled = events.stopped.find(
+          (event) => event.payload.processId === terminated.processId
+        );
+        expect(canceled?.workspaceId).toBe(testWorkspaceId);
+        expect(canceled?.payload).toMatchObject({
+          processId: terminated.processId,
+          reason: "canceled",
         });
       });
 
