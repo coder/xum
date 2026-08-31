@@ -2341,6 +2341,25 @@ describe("HistoryService", () => {
       expect(await service.getHistoryFromLatestBoundary(wsId)).toEqual({ success: true, data: [] });
     });
 
+    it("refuseRowRemoval refuses a truncation whose recomputed budget removes messages", async () => {
+      await appendNumberedMessages(service, wsId, 1);
+      const chatBefore = await fs.readFile(chatPath(wsId), "utf-8");
+
+      // The caller classified this request as a no-op (and skipped its row-removal guards),
+      // but the locked recomputation reaches real rows. Refuse instead of removing them.
+      const refused = await service.truncateHistory(wsId, 0.9, { refuseRowRemoval: true });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("no-op");
+      }
+      expect(await fs.readFile(chatPath(wsId), "utf-8")).toBe(chatBefore);
+
+      // A genuine no-op stays a silent success under the same flag.
+      const noop = await service.truncateHistory(wsId, 0.0001, { refuseRowRemoval: true });
+      expect(noop.success).toBe(true);
+      expect(await fs.readFile(chatPath(wsId), "utf-8")).toBe(chatBefore);
+    });
+
     it("does not reseed usage from before a partial prefix truncation", async () => {
       await appendNumberedMessages(service, wsId, 8);
       await service.appendToHistory(

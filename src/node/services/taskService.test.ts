@@ -6297,6 +6297,95 @@ describe("TaskService", () => {
     ).toBe(false);
   });
 
+  test("an indeterminate newest group does not stall an older deliverable group", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const oldRunId = "wfr_group_old";
+    const newRunId = "wfr_group_new";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    for (const runId of [oldRunId, newRunId]) {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    }
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // Classification (first call per run) sees both runs current; the last-moment reread then
+    // fails transiently for the NEWEST group only. The drain must fall through to the older
+    // group in the same cycle instead of parking every wake on the sweep.
+    const currentnessCalls = new Map<string, number>();
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock((_workspaceId: string, runId: string) => {
+        const count = (currentnessCalls.get(runId) ?? 0) + 1;
+        currentnessCalls.set(runId, count);
+        if (count === 1) {
+          return Promise.resolve("current");
+        }
+        return Promise.resolve(runId === newRunId ? "indeterminate" : "current");
+      });
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audits", { timestamp: 1_000 })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: oldRunId,
+      createdAtMs: 1_100,
+      agentId: "exec",
+    });
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: newRunId,
+      createdAtMs: 1_500,
+      agentId: "plan",
+    });
+    (
+      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+    ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
+
+    await drain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const prompt = String(sendMessage.mock.calls[0]?.[1]);
+    expect(prompt).toContain(oldRunId);
+    expect(prompt).not.toContain(newRunId);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "exec",
+    });
+    // The unreadable group stays queued for the next drain or sweep, never settled.
+    expect(
+      (
+        taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+      ).pendingWorkflowRunAttention
+        .get(parentId)
+        ?.has(newRunId)
+    ).toBe(true);
+  });
+
   test("workflow wake restriction recovery stops at a context reset boundary", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

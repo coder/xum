@@ -12832,27 +12832,31 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
     const effectivePercentage = percentage ?? 1.0;
-    // A token-proportional truncation below 100% still empties the transcript when the removal
-    // budget reaches the final message (historyService's full-delete fast path), and an emptied
-    // transcript carries every full-clear hazard: most critically, a kernel workflow reference
-    // with a verified-empty (null) boundary snapshot reads decision-free history as current, so
-    // a surviving reference could wake a pre-truncation workflow result into the cleared
-    // conversation. Decide up front and route emptying truncations through the full-clear path
-    // (admission guard, refine drain, reference retirement). A preflight read failure counts as
-    // emptying: the guarded path fails safe (references retired first, wakes dropped but
-    // resumable) even if the truncation itself later fails.
-    const isFullClear =
-      effectivePercentage >= 1.0 ||
-      (effectivePercentage > 0 &&
-        (await this.historyService
-          .willTruncateHistoryRemoveAllMessages(workspaceId, effectivePercentage)
-          .catch((error: unknown) => {
-            log.warn("History truncation emptiness preflight failed; treating as full clear", {
-              workspaceId,
-              error,
-            });
-            return true;
-          })));
+    // A token-proportional truncation below 100% can remove nothing (budget rounds to zero),
+    // a proper prefix, or everything (historyService's full-delete fast path), and each scope
+    // carries different obligations: an emptied transcript needs every full-clear guard, a
+    // prefix cut still needs kernel workflow reference retirement (it can delete the launch
+    // turn's restriction rows without a supersession decision), and a no-op must retire
+    // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
+    // Decide up front; historyService revalidates the dangerous drift directions under the
+    // history write lock (refuseFullDelete / refuseRowRemoval below). A preflight read failure
+    // counts as emptying: the guarded path fails safe (references retired first, wakes dropped
+    // but resumable) even if the truncation itself later fails.
+    const truncationScope =
+      effectivePercentage >= 1.0
+        ? ("all" as const)
+        : effectivePercentage <= 0
+          ? ("none" as const)
+          : await this.historyService
+              .classifyTruncationRemoval(workspaceId, effectivePercentage)
+              .catch((error: unknown) => {
+                log.warn("History truncation scope preflight failed; treating as full clear", {
+                  workspaceId,
+                  error,
+                });
+                return "all" as const;
+              });
+    const isFullClear = truncationScope === "all";
     // A full clear holds the admission guard across the refine drain/lock
     // awaits below: without it, a send admitted during those awaits could
     // snapshot the pre-clear transcript and stream across the truncation,
@@ -12929,7 +12933,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // aborts with the conversation intact, and a failed or refused truncation leaves
     // reference-less runs settling superseded (dropped wake, still retrievable via resume,
     // which re-records provenance under the surviving context).
-    if (effectivePercentage > 0) {
+    if (truncationScope !== "none") {
       try {
         await this.retireKernelWorkflowRunReferences(workspaceId);
       } catch (error) {
@@ -12942,12 +12946,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
-    // refuseFullDelete makes historyService revalidate the emptiness preflight under the
-    // history write lock: an overlapping truncation can empty history after the preflight
-    // above said this one would not, silently skipping the full-clear guards.
+    // historyService revalidates the scope preflight under the history write lock: an
+    // overlapping truncation can shift this one across a scope boundary in either dangerous
+    // direction (a partial cut becoming a full delete skips the full-clear guards; a no-op
+    // becoming a real cut skips reference retirement).
     const truncate = () =>
       this.historyService.truncateHistory(workspaceId, effectivePercentage, {
-        refuseFullDelete: !isFullClear,
+        refuseFullDelete: truncationScope === "partial",
+        refuseRowRemoval: truncationScope === "none",
       });
     const truncateResult =
       effectivePercentage > 0

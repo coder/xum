@@ -8612,37 +8612,8 @@ export class TaskService implements AgentTaskIntegration {
     // direction, deferring agent-bound groups rather than ever mixing identities in one send.
     const hasNonWorkflowDeliverables =
       deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0;
-    let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
-    if (!hasNonWorkflowDeliverables) {
-      for (const candidate of deliverableWorkflowPrompts) {
-        const agent = candidate.initiatingAgent;
-        if (
-          agent != null &&
-          (workflowInitiatingAgent == null ||
-            agent.createdAtMs > workflowInitiatingAgent.createdAtMs)
-        ) {
-          workflowInitiatingAgent = agent;
-        }
-      }
-    }
-    const selectedGroupKey =
-      workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : undefined;
-    const selectedWorkflowPrompts = deliverableWorkflowPrompts.filter((candidate) =>
-      hasNonWorkflowDeliverables
-        ? candidate.initiatingAgent == null
-        : selectedGroupKey == null ||
-          (candidate.initiatingAgent != null &&
-            workflowWakeGroupKey(candidate.initiatingAgent) === selectedGroupKey)
-    );
-    // Unselected groups stay queued: the selected group's wake turn ends with a streamEnded
+    // Unselected groups stay queued: the delivered group's wake turn ends with a streamEnded
     // drain (and the sweep backstops an aborted one), which delivers the next group.
-
-    const resumeOptions = await this.resolveParentAutoResumeOptions(
-      ownerWorkspaceId,
-      entry,
-      defaultModel,
-      workflowInitiatingAgent != null ? { agentId: workflowInitiatingAgent.agentId } : undefined
-    );
     const workspaceTurnMuxMetadata =
       await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
 
@@ -8668,15 +8639,6 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // Pair the pin with the selected group: the newest pin-bearing history row can belong to
-    // a different group's wake (each wake persists its own pin), and pinning another agent's
-    // provenance onto this group's agentId makes resolution reject the wake on every retry. A
-    // recorded pin (or a verified-unpinned null) overrides the walk; legacy references
-    // without the field keep the walk pin.
-    const groupPin = workflowInitiatingAgent?.strictAgentResolution;
-    const effectiveStrictPin =
-      groupPin !== undefined ? (groupPin ?? undefined) : wakeRestrictions.strictAgentResolution;
-
     // Last-moment suppression revalidation: a quiet owner-follow-up resettle
     // deletes its notification files, but cannot retract this drain's
     // already-taken listPending() snapshot, so the handle records are the
@@ -8685,41 +8647,87 @@ export class TaskService implements AgentTaskIntegration {
     // later candidate's await; suppressed handles are dropped instead of
     // waking the owner, and their notifications are marked superseded only
     // after the delivery decision. The residual window is the batch read →
-    // sendMessage gap below (no awaits in between besides delivery itself) —
-    // closing it would require holding settlement locks across delivery,
-    // which the drain must not do; worst case is one redundant wake (fail
-    // toward notify, never a lost wake).
-    const [candidateRecords, selectedWorkflowCurrentness] = await Promise.all([
-      Promise.all(
-        workspaceTurnCandidates.map((candidate) =>
-          this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, candidate.notification.sourceId)
-        )
-      ),
-      // Workflow candidates get the same last-moment treatment: a full history clear that
-      // completes after buildWorkflowTerminalPrompt classified these runs retires the sidecar
-      // but cannot retract the materialized candidates, and once the clear releases its
-      // admission guard the owner is idle again, so this requireIdle send would inject a
-      // pre-clear workflow result into the freshly cleared conversation. The clear retires
-      // references before truncating, so this reread sees not_current and settles; unreadable
-      // state stays queued for the next drain or sweep instead of settling.
-      Promise.all(
-        selectedWorkflowPrompts.map((candidate) =>
+    // sendMessage gap below (no awaits in between besides the group-scoped
+    // resume-option resolution and delivery itself) — closing it would
+    // require holding settlement locks across delivery, which the drain must
+    // not do; worst case is one redundant wake (fail toward notify, never a
+    // lost wake).
+    const candidateRecords = await Promise.all(
+      workspaceTurnCandidates.map((candidate) =>
+        this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, candidate.notification.sourceId)
+      )
+    );
+    // Workflow candidates get the same last-moment treatment, one launch-identity group at a
+    // time: a full history clear that completes after buildWorkflowTerminalPrompt classified
+    // these runs retires the sidecar but cannot retract the materialized candidates, and once
+    // the clear releases its admission guard the owner is idle again, so this requireIdle
+    // send would inject a pre-clear workflow result into the freshly cleared conversation.
+    // The clear retires references before truncating, so a reread sees not_current and
+    // settles; unreadable state stays queued for the next drain or sweep. Groups are tried
+    // newest-first until one revalidates, so one unreadable group cannot stall independent
+    // wakes behind the sweep. Bounded: every iteration permanently removes one group from
+    // this drain's consideration.
+    const supersededWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
+    let currentWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
+    let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
+    let remainingWorkflowPrompts = hasNonWorkflowDeliverables
+      ? deliverableWorkflowPrompts.filter((candidate) => candidate.initiatingAgent == null)
+      : deliverableWorkflowPrompts;
+    while (remainingWorkflowPrompts.length > 0) {
+      let groupAgent: WorkflowWakeInitiatingAgent | undefined;
+      for (const candidate of remainingWorkflowPrompts) {
+        const agent = candidate.initiatingAgent;
+        if (agent != null && (groupAgent == null || agent.createdAtMs > groupAgent.createdAtMs)) {
+          groupAgent = agent;
+        }
+      }
+      const groupKey = groupAgent != null ? workflowWakeGroupKey(groupAgent) : undefined;
+      const groupCandidates = remainingWorkflowPrompts.filter((candidate) =>
+        groupKey == null
+          ? candidate.initiatingAgent == null
+          : candidate.initiatingAgent != null &&
+            workflowWakeGroupKey(candidate.initiatingAgent) === groupKey
+      );
+      const groupCurrentness = await Promise.all(
+        groupCandidates.map((candidate) =>
           this.workspaceService
             .getWorkflowInvocationCurrentness(ownerWorkspaceId, candidate.runId)
             .catch(() => "indeterminate" as const)
         )
-      ),
-    ]);
-    const currentWorkflowPrompts: typeof selectedWorkflowPrompts = [];
-    const supersededWorkflowPrompts: typeof selectedWorkflowPrompts = [];
-    selectedWorkflowPrompts.forEach((candidate, index) => {
-      const currentness = selectedWorkflowCurrentness[index];
-      if (currentness === "current") {
-        currentWorkflowPrompts.push(candidate);
-      } else if (currentness === "not_current") {
-        supersededWorkflowPrompts.push(candidate);
+      );
+      const groupCurrent: typeof deliverableWorkflowPrompts = [];
+      groupCandidates.forEach((candidate, index) => {
+        const currentness = groupCurrentness[index];
+        if (currentness === "current") {
+          groupCurrent.push(candidate);
+        } else if (currentness === "not_current") {
+          supersededWorkflowPrompts.push(candidate);
+        }
+      });
+      if (groupCurrent.length > 0) {
+        currentWorkflowPrompts = groupCurrent;
+        workflowInitiatingAgent = groupAgent;
+        break;
       }
-    });
+      remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
+        (candidate) => !groupCandidates.includes(candidate)
+      );
+    }
+
+    const resumeOptions = await this.resolveParentAutoResumeOptions(
+      ownerWorkspaceId,
+      entry,
+      defaultModel,
+      workflowInitiatingAgent != null ? { agentId: workflowInitiatingAgent.agentId } : undefined
+    );
+    // Pair the pin with the delivered group: the newest pin-bearing history row can belong to
+    // a different group's wake (each wake persists its own pin), and pinning another agent's
+    // provenance onto this group's agentId makes resolution reject the wake on every retry. A
+    // recorded pin (or a verified-unpinned null) overrides the walk; legacy references
+    // without the field keep the walk pin.
+    const groupPin = workflowInitiatingAgent?.strictAgentResolution;
+    const effectiveStrictPin =
+      groupPin !== undefined ? (groupPin ?? undefined) : wakeRestrictions.strictAgentResolution;
     const deliverableWorkspaceTurnNotificationIds = new Set<string>();
     const publicAwaitIds: string[] = [];
     const suppressedNotificationIds: string[] = [];

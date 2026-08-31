@@ -2969,33 +2969,40 @@ export class HistoryService {
   }
 
   /**
-   * Preflight for truncateHistory: whether this percentage takes the full-delete fast path and
-   * removes every message. The requested percentage alone cannot distinguish an emptying
-   * truncation from a partial one, and callers that must apply full-clear semantics before the
-   * rewrite commits (workspaceService retires kernel workflow run references) need the answer
+   * Preflight for truncateHistory: whether this percentage removes no rows, a proper prefix,
+   * or every message (the full-delete fast path). The requested percentage alone cannot
+   * distinguish these, and callers that must apply per-scope semantics before the rewrite
+   * commits (workspaceService retires kernel workflow run references only when rows will
+   * actually be removed, and applies full-clear guards when everything will) need the answer
    * up front.
    */
-  async willTruncateHistoryRemoveAllMessages(
+  async classifyTruncationRemoval(
     workspaceId: string,
     percentage: number
-  ): Promise<boolean> {
+  ): Promise<"none" | "partial" | "all"> {
     if (percentage >= 1.0) {
-      return true;
+      return "all";
+    }
+    if (percentage <= 0) {
+      return "none";
     }
     const archivedMessages = await this.readArchivedHistory(workspaceId);
     const chatMessages = await this.readChatHistory(workspaceId);
     const messages = [...archivedMessages, ...chatMessages];
     if (messages.length === 0) {
-      return false;
+      return "none";
     }
     const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
-    return removeCount >= messages.length;
+    if (removeCount === 0) {
+      return "none";
+    }
+    return removeCount >= messages.length ? "all" : "partial";
   }
 
   async truncateHistory(
     workspaceId: string,
     percentage: number,
-    options?: { refuseFullDelete?: boolean }
+    options?: { refuseFullDelete?: boolean; refuseRowRemoval?: boolean }
   ): Promise<Result<number[], string>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -3023,6 +3030,17 @@ export class HistoryService {
           }
 
           const removeCount = await this.computeTruncationRemoveCount(messages, percentage);
+
+          // Mirror of refuseFullDelete for the opposite drift direction: the caller
+          // classified this request as a no-op (and so skipped its row-removal guards, e.g.
+          // kernel workflow reference retirement), but history grew enough between that
+          // unserialized read and this locked rewrite for the budget to reach real rows.
+          // Refuse instead of removing them unguarded; a retry re-classifies.
+          if (options?.refuseRowRemoval === true && removeCount > 0) {
+            return Err(
+              "Truncation classified as a no-op would remove messages; retry to re-run it."
+            );
+          }
 
           // No-op truncation (percentage 0 or rounding to zero tokens) must not
           // rewrite anything — collapsing the archive back into chat.jsonl would
