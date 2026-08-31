@@ -1,3 +1,4 @@
+import { Duration, Effect, Exit, Schedule, Scope, type Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import type { MuxMessage } from "@/common/types/message";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
@@ -61,8 +62,22 @@ export class HeartbeatService {
 
   private timelineRecorder: TimelineRecorder = NOOP_TIMELINE_RECORDER;
 
-  private startupTimeout: ReturnType<typeof setTimeout> | null = null;
-  private checkInterval: ReturnType<typeof setInterval> | null = null;
+  // The scheduler runs as a single Effect fiber forked into `lifecycleScope`:
+  // sleep(STARTUP_DELAY_MS), then tick immediately and every CHECK_INTERVAL_MS.
+  // The legacy two-field shape is preserved because it is the observable
+  // lifecycle contract (tests pin the null/non-null progression):
+  // `startupTimeout` holds the fiber while the startup delay is pending and
+  // `checkInterval` holds it once the periodic ticker is live.
+  private startupTimeout: Fiber.Fiber<void> | null = null;
+  private checkInterval: Fiber.Fiber<void> | null = null;
+  /**
+   * Owns every resource start() acquires — idle-consumer registration,
+   * workspace event listeners, and the scheduler fiber. Closing it releases
+   * them in reverse acquisition order (fiber interrupt, listeners off,
+   * consumer dispose — the same order the hand-rolled stop() used) and is
+   * guaranteed to run them even when a later startup step throws.
+   */
+  private lifecycleScope: Scope.Closeable | null = null;
   private stopped = true;
 
   private readonly nextEligibleAtByWorkspaceId = new Map<string, number>();
@@ -114,25 +129,79 @@ export class HeartbeatService {
     this.stopped = false;
     this.lifecycleVersion += 1;
 
-    this.heartbeatConsumerDisposer = this.idleDispatcher.registerConsumer({
-      name: HEARTBEAT_IDLE_CONSUMER_NAME,
-      priority: HEARTBEAT_IDLE_CONSUMER_PRIORITY,
-      buildPayload: (workspaceId) => this.buildHeartbeatDispatchPayload(workspaceId),
-    });
-    this.workspaceService.on("activity", this.onActivity);
-    this.workspaceService.on("metadata", this.onMetadata);
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    const scope = Scope.makeUnsafe();
+    this.lifecycleScope = scope;
 
-    this.startupTimeout = setTimeout(() => {
-      if (this.stopped) {
+    const scheduler = Effect.gen(function* () {
+      yield* Effect.sleep(Duration.millis(STARTUP_DELAY_MS));
+      // Defensive parity with the legacy setTimeout callback: interruption via
+      // stop() already prevents this resumption, so a stopped service must
+      // never transition into the ticking phase even if a wake-up raced it.
+      if (self.stopped) {
         return;
       }
 
+      // Startup delay elapsed: the same fiber now becomes the periodic ticker.
+      self.checkInterval = self.startupTimeout;
+      self.startupTimeout = null;
+      // Effect.repeat runs the first tick immediately (matching the legacy
+      // direct tick() call when the startup timer fired), then Schedule.fixed
+      // reproduces setInterval cadence: wall-clock anchored, no burst catch-up.
+      // tick() is synchronous fire-and-forget, so the body never delays a slot.
+      yield* Effect.sync(() => self.tick()).pipe(
+        Effect.repeat(Schedule.fixed(Duration.millis(CHECK_INTERVAL_MS)))
+      );
+    });
+
+    const acquireResources = Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          self.heartbeatConsumerDisposer = self.idleDispatcher.registerConsumer({
+            name: HEARTBEAT_IDLE_CONSUMER_NAME,
+            priority: HEARTBEAT_IDLE_CONSUMER_PRIORITY,
+            buildPayload: (workspaceId) => self.buildHeartbeatDispatchPayload(workspaceId),
+          });
+        }),
+        () =>
+          Effect.sync(() => {
+            self.heartbeatConsumerDisposer?.();
+            self.heartbeatConsumerDisposer = null;
+          })
+      );
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          self.workspaceService.on("activity", self.onActivity);
+          self.workspaceService.on("metadata", self.onMetadata);
+        }),
+        () =>
+          Effect.sync(() => {
+            self.workspaceService.off("activity", self.onActivity);
+            self.workspaceService.off("metadata", self.onMetadata);
+          })
+      );
+      self.startupTimeout = yield* Effect.forkIn(scheduler, scope);
+    });
+
+    try {
+      // Runs synchronously: acquisitions are Effect.sync and forkIn executes
+      // the scheduler up to its first sleep before returning, so the startup
+      // timer is registered before start() returns (same observable ordering
+      // as the previous setTimeout call).
+      Effect.runSync(Scope.provide(scope)(acquireResources));
+    } catch (error) {
+      // Guaranteed cleanup on partial startup failure: close the scope so the
+      // finalizers registered before the failing step run (the hand-rolled
+      // version leaked earlier acquisitions here), restore the stopped state
+      // so a later start() retry is possible, then surface the error.
+      this.lifecycleScope = null;
       this.startupTimeout = null;
-      this.tick();
-      this.checkInterval = setInterval(() => {
-        this.tick();
-      }, CHECK_INTERVAL_MS);
-    }, STARTUP_DELAY_MS);
+      this.checkInterval = null;
+      this.stopped = true;
+      Effect.runSync(Scope.close(scope, Exit.void));
+      throw error;
+    }
 
     log.info("HeartbeatService started", {
       startupDelayMs: STARTUP_DELAY_MS,
@@ -144,19 +213,25 @@ export class HeartbeatService {
     this.stopped = true;
     this.lifecycleVersion += 1;
 
-    if (this.startupTimeout) {
-      clearTimeout(this.startupTimeout);
-      this.startupTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
-    }
+    // Captured before teardown for the shutdown log below.
+    const schedulerPhase =
+      this.checkInterval != null
+        ? "ticking"
+        : this.startupTimeout != null
+          ? "startup_delay"
+          : "not_started";
 
-    this.workspaceService.off("activity", this.onActivity);
-    this.workspaceService.off("metadata", this.onMetadata);
-    this.heartbeatConsumerDisposer?.();
-    this.heartbeatConsumerDisposer = null;
+    if (this.lifecycleScope) {
+      const scope = this.lifecycleScope;
+      this.lifecycleScope = null;
+      // Releases everything start() acquired, in reverse acquisition order:
+      // scheduler fiber interrupt (synchronously clearing its pending timer),
+      // listeners off, consumer disposer — completing synchronously because
+      // the fiber only ever suspends on its clock timer.
+      Effect.runSync(Scope.close(scope, Exit.void));
+    }
+    this.startupTimeout = null;
+    this.checkInterval = null;
 
     this.nextEligibleAtByWorkspaceId.clear();
     this.trackedIntervalMsByWorkspaceId.clear();
@@ -166,7 +241,7 @@ export class HeartbeatService {
     this.isProcessingQueue = false;
     this.tickInFlight = false;
 
-    log.info("HeartbeatService stopped");
+    log.info("HeartbeatService stopped", { schedulerPhase });
   }
 
   private tick(): void {

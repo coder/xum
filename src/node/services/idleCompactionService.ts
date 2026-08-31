@@ -1,3 +1,4 @@
+import { Duration, Effect, Exit, Schedule, Scope } from "effect";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
@@ -44,8 +45,12 @@ export class IdleCompactionService {
   private readonly historyService: HistoryService;
   private readonly extensionMetadata: ExtensionMetadataService;
   private readonly executeIdleCompaction: (workspaceId: string) => Promise<void>;
-  private initialTimeout: ReturnType<typeof setTimeout> | null = null;
-  private checkInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Owns the checker fiber forked by start(): sleep(INITIAL_CHECK_DELAY_MS),
+   * then check immediately and every CHECK_INTERVAL_MS. Closing the scope in
+   * stop() interrupts the fiber, synchronously clearing its pending timer.
+   */
+  private lifecycleScope: Scope.Closeable | null = null;
   private readonly queue: QueuedIdleCompaction[] = [];
   private readonly queuedWorkspaceIds = new Set<string>();
   private readonly activeWorkspaceIds = new Set<string>();
@@ -76,14 +81,27 @@ export class IdleCompactionService {
   start(): void {
     this.stopped = false;
 
-    // First check after delay to let startup settle.
-    this.initialTimeout = setTimeout(() => {
-      void this.checkAllWorkspaces();
-      // Then periodically.
-      this.checkInterval = setInterval(() => {
-        void this.checkAllWorkspaces();
-      }, CHECK_INTERVAL_MS);
-    }, INITIAL_CHECK_DELAY_MS);
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    const scope = Scope.makeUnsafe();
+    this.lifecycleScope = scope;
+
+    const checker = Effect.gen(function* () {
+      // First check after delay to let startup settle.
+      yield* Effect.sleep(Duration.millis(INITIAL_CHECK_DELAY_MS));
+      // Effect.repeat runs the first check immediately (matching the legacy
+      // direct call when the initial timer fired), then Schedule.fixed
+      // reproduces setInterval cadence. The check stays fire-and-forget so a
+      // slow sweep never delays the next cadence slot (same as setInterval).
+      yield* Effect.sync(() => {
+        void self.checkAllWorkspaces();
+      }).pipe(Effect.repeat(Schedule.fixed(Duration.millis(CHECK_INTERVAL_MS))));
+    });
+    // Runs synchronously up to the checker's first sleep, so the initial-delay
+    // timer is registered before start() returns (same as the previous
+    // setTimeout call).
+    Effect.runSync(Effect.forkIn(checker, scope));
+
     log.info("IdleCompactionService started", {
       initialDelayMs: INITIAL_CHECK_DELAY_MS,
       intervalMs: CHECK_INTERVAL_MS,
@@ -96,13 +114,12 @@ export class IdleCompactionService {
   stop(): void {
     this.stopped = true;
 
-    if (this.initialTimeout) {
-      clearTimeout(this.initialTimeout);
-      this.initialTimeout = null;
-    }
-    if (this.checkInterval) {
-      clearInterval(this.checkInterval);
-      this.checkInterval = null;
+    if (this.lifecycleScope) {
+      const scope = this.lifecycleScope;
+      this.lifecycleScope = null;
+      // Interrupts the checker fiber, synchronously clearing its pending
+      // timer — the fiber only ever suspends on its clock timer.
+      Effect.runSync(Scope.close(scope, Exit.void));
     }
 
     // Best-effort queue reset: do not start new compactions after stop().

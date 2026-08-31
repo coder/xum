@@ -18,6 +18,7 @@ import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { advanceAnchoredDeadline, HeartbeatService } from "./heartbeatService";
 import type { HistoryService } from "./historyService";
+import { IdleDispatcher } from "./idleDispatcher";
 import type { InitStateManager } from "./initStateManager";
 import type { TaskService } from "./taskService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
@@ -583,6 +584,52 @@ describe("HeartbeatService", () => {
 
       expect(internals.queuedWorkspaceIds.size).toBe(0);
       expect(executeHeartbeatMock).not.toHaveBeenCalled();
+    });
+
+    test("start failure releases earlier acquisitions and leaves the service restartable", () => {
+      const dispatcher = new IdleDispatcher();
+      const emitter = new EventEmitter();
+      let failListenerRegistration = true;
+      const realOn = emitter.on.bind(emitter);
+      emitter.on = ((event: string, listener: (...args: unknown[]) => void) => {
+        if (failListenerRegistration) {
+          throw new Error("listener registration failed");
+        }
+        return realOn(event, listener);
+      }) as typeof emitter.on;
+      const failingWorkspaceService = Object.assign(emitter, {
+        getChatHistory: getChatHistoryMock,
+        executeHeartbeat: executeHeartbeatMock,
+        isBusyForMessage: isBusyForMessageMock,
+      }) as unknown as WorkspaceService;
+
+      const failingService = new HeartbeatService(
+        mockConfig,
+        mockExtensionMetadata,
+        failingWorkspaceService,
+        mockTaskService,
+        dispatcher
+      );
+
+      expect(() => failingService.start()).toThrow();
+
+      // The idle-consumer registration acquired before the failing step must
+      // have been released: re-registering the same consumer name would
+      // otherwise trip the dispatcher's duplicate-registration assert.
+      const disposeProbe = dispatcher.registerConsumer({
+        name: "heartbeat",
+        priority: 50,
+        buildPayload: () => Promise.resolve(null),
+      });
+      disposeProbe();
+
+      // The rollback restores the stopped state, so start() succeeds once the
+      // failure cause is fixed.
+      failListenerRegistration = false;
+      failingService.start();
+      expect(emitter.listenerCount("activity")).toBe(1);
+      failingService.stop();
+      expect(emitter.listenerCount("activity")).toBe(0);
     });
   });
 
