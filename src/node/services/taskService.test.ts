@@ -21740,15 +21740,12 @@ describe("TaskService", () => {
     expect(events).toEqual([`send:${childA}`, `send:${childB}`]);
   });
 
-  test("sendMessageToParentFromAgentTask refuses oversized messages without delivering", async () => {
-    // A kernel guest can synthesize huge strings cheaply; an unbounded family
-    // message would be persisted into the parent transcript and sent to its
-    // provider. The service boundary refuses independently of the tool schema.
+  test("tree message caps preserve each public route's error shape", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-msg-cap";
-    const childTaskId = "child-msg-cap";
-
+    const parentWorkspaceId = "message-cap-parent";
+    const childA = "message-cap-child-a";
+    const childB = "message-cap-child-b";
     await saveWorkspaces(
       config,
       projectPath,
@@ -21756,10 +21753,13 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "parent", parentWorkspaceId, {
           aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
         }),
-        projectWorkspace(projectPath, "child", childTaskId, {
+        projectWorkspace(projectPath, "child-a", childA, {
           parentWorkspaceId,
           taskStatus: "running",
-          taskExperiments: { rlm: true },
+        }),
+        projectWorkspace(projectPath, "child-b", childB, {
+          parentWorkspaceId,
+          taskStatus: "running",
         }),
       ],
       testTaskSettings()
@@ -21767,33 +21767,61 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
     const oversized = "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS + 1);
-    const result = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      oversized,
-      "tool-end"
-    );
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error.code).toBe("send_failed");
-      expect("message" in result.error && result.error.message).toContain("limit");
+    const cases = [
+      {
+        send: () => taskService.sendAgentTreeMessage(childA, childB, oversized),
+        code: "refused",
+        message: "peer-message limit",
+      },
+      {
+        send: () => taskService.sendMessageToParentFromAgentTask(childA, oversized, "tool-end"),
+        code: "send_failed",
+        message: "family-message limit",
+      },
+      {
+        send: () =>
+          taskService.sendMessageToSiblingAgentTask(childA, childB, oversized, "tool-end"),
+        code: "send_failed",
+        message: "family-message limit",
+      },
+    ] as const;
+    for (const route of cases) {
+      const result = await route.send();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.code).toBe(route.code);
+        const errorMessage =
+          "reason" in result.error
+            ? result.error.reason
+            : "message" in result.error
+              ? result.error.message
+              : undefined;
+        expect(errorMessage).toContain(route.message);
+      }
     }
     expect(sendMessage).not.toHaveBeenCalled();
 
-    // At the limit exactly: accepted.
-    const atLimit = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      "y".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
-      "tool-end"
-    );
-    expect(atLimit.success).toBe(true);
+    expect(
+      (await taskService.sendAgentTreeMessage(parentWorkspaceId, childB, oversized, "tool-end"))
+        .success
+    ).toBe(true);
+    expect(
+      (
+        await taskService.sendMessageToParentFromAgentTask(
+          childA,
+          "y".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+          "tool-end"
+        )
+      ).success
+    ).toBe(true);
   });
-  test("task_message_parent surfaces broker budget exhaustion", async () => {
+  test("family routes share the aggregate message-count budget and error shape", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-msg-budget";
-    const childTaskId = "child-msg-budget";
+    const parentWorkspaceId = "family-budget-parent";
+    const senderTaskId = "family-budget-sender";
+    const targetTaskId = "family-budget-target";
     await saveWorkspaces(
       config,
       projectPath,
@@ -21801,36 +21829,38 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "parent", parentWorkspaceId, {
           aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
         }),
-        projectWorkspace(projectPath, "child", childTaskId, {
+        projectWorkspace(projectPath, "sender", senderTaskId, {
           parentWorkspaceId,
           taskStatus: "running",
-          taskExperiments: { rlm: true },
+        }),
+        projectWorkspace(projectPath, "target", targetTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
         }),
       ],
       testTaskSettings()
     );
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, {
-      workspaceService,
-    });
-    for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-      expect(
-        (await taskService.sendMessageToParentFromAgentTask(childTaskId, `update ${i}`, "tool-end"))
-          .success
-      ).toBe(true);
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const routes = [
+      (message: string) =>
+        taskService.sendMessageToParentFromAgentTask(senderTaskId, message, "tool-end"),
+      (message: string) =>
+        taskService.sendMessageToSiblingAgentTask(senderTaskId, targetTaskId, message, "tool-end"),
+    ];
+    for (const send of routes) {
+      for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
+        expect((await send("update " + i)).success).toBe(true);
+      }
+      expect(await send("one too many")).toEqual(
+        Err(expect.objectContaining({ code: "send_failed" }))
+      );
     }
-
-    const exhausted = await taskService.sendMessageToParentFromAgentTask(
-      childTaskId,
-      "one too many",
-      "tool-end"
+    expect(sendMessage).toHaveBeenCalledTimes(
+      TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES * routes.length
     );
-    expect(exhausted.success).toBe(false);
-    if (!exhausted.success) {
-      expect(exhausted.error.code).toBe("send_failed");
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES);
   });
   test("post-acceptance wake failures retain the budget charge for persisted payload rows", async () => {
     // Codex round 18: refunding on wake failure let a child that catches the
@@ -22063,73 +22093,6 @@ describe("TaskService", () => {
       history.data.filter((m) => m.metadata?.muxMetadata?.type === "family-message")
     ).toHaveLength(0);
   });
-  test("sibling family messages enforce the aggregate message-count budget", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-sibling-budget";
-    const senderTaskId = "sender-sibling-budget";
-    const targetTaskId = "target-sibling-budget";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId),
-        projectWorkspace(projectPath, "sender", senderTaskId, {
-          parentWorkspaceId,
-          title: "Researcher A",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "target", targetTaskId, {
-          parentWorkspaceId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "running",
-          taskModelString: "openai:gpt-5.2",
-          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-      sendMessage: mock(
-        async (
-          _workspaceId: string,
-          _message: string,
-          _options: unknown,
-          internal?: { onAccepted?: () => Promise<void> | void }
-        ): Promise<Result<void>> => {
-          await internal?.onAccepted?.();
-          return Ok(undefined);
-        }
-      ),
-    });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    // Small messages exhaust the COUNT budget long before the chars budget.
-    for (let i = 0; i < TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES; i++) {
-      const sent = await taskService.sendMessageToSiblingAgentTask(
-        senderTaskId,
-        targetTaskId,
-        `update ${i}`,
-        "tool-end"
-      );
-      expect(sent.success).toBe(true);
-    }
-    const exhausted = await taskService.sendMessageToSiblingAgentTask(
-      senderTaskId,
-      targetTaskId,
-      "one too many",
-      "tool-end"
-    );
-    expect(exhausted.success).toBe(false);
-    if (!exhausted.success) {
-      expect(exhausted.error.code).toBe("send_failed");
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES);
-  });
-
   test("sendMessageToParentFromAgentTask refuses non-child and workflow-owned callers", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
