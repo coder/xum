@@ -2403,6 +2403,50 @@ describe("BackgroundProcessManager", () => {
     ]);
   });
 
+  describe("wake signal snapshots", () => {
+    it("reads the delivery frontier without probing process transport", async () => {
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 30", {
+        cwd: process.cwd(),
+        displayName: "non-probing-wake-frontier",
+        monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const proc = await manager.getProcess(result.processId);
+      expect(proc).not.toBeNull();
+      if (proc == null) return;
+      const exitSpy = spyOn(proc.handle, "getExitCode").mockRejectedValue(
+        new Error("persistent transport failure")
+      );
+
+      const state = await manager.getMonitorWakeDeliveryState(result.processId, proc.startTime);
+
+      expect(state).toMatchObject({ status: "settled", shownThroughOffset: 0 });
+      expect(exitSpy).not.toHaveBeenCalled();
+      exitSpy.mockRestore();
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
+
+    it("bounds scripts exposed through live wake snapshots", async () => {
+      const script = "sleep 30\n#" + "x".repeat(10_000);
+      const result = await manager.spawn(runtime, testWorkspaceId, script, {
+        cwd: process.cwd(),
+        displayName: "bounded-live-wake-script",
+        monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const snapshot = manager
+        .pullMonitorWakeSignals(testWorkspaceId)
+        .find((candidate) => candidate.processId === result.processId);
+
+      expect(Buffer.byteLength(snapshot?.script ?? "", "utf8")).toBeLessThan(2_200);
+      expect(snapshot?.script.endsWith("… [truncated]")).toBe(true);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+    });
+  });
+
   describe("getSettledShownThroughOffset", () => {
     it("resolves to the advanced frontier only after an in-flight unfiltered read settles", async () => {
       // Delay output so the unfiltered read is observably in flight (long-polling) when we query the

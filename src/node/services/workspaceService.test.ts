@@ -372,6 +372,61 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("runtime failure persistence retries before scheduling its wake", async () => {
+    const { service, events, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = mock(() => undefined);
+    const upsert = mock(() => Promise.resolve());
+    let lostAttempts = 0;
+    const recordLost = mock(() => {
+      lostAttempts++;
+      return lostAttempts === 1
+        ? Promise.reject(new Error("transient registry write failure"))
+        : Promise.resolve();
+    });
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
+      bashMonitorRegistryStore: {
+        upsert: typeof upsert;
+        recordTerminal(): Promise<void>;
+        recordLost: typeof recordLost;
+      };
+    };
+    try {
+      await internal.bashMonitorRecoveryPromise;
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorRegistryStore = {
+        upsert,
+        recordTerminal: () => Promise.resolve(),
+        recordLost,
+      };
+      const armMetadata = {
+        processId: "retry-failed-proc",
+        taskId: "bash:retry-failed-proc",
+        workspaceId: "owner",
+        filter: "READY",
+        filterExclude: false,
+        script: "run",
+        createdAt: "2026-08-31T12:14:00.000Z",
+      };
+
+      events.emit("monitor:stopped", "owner", {
+        processId: armMetadata.processId,
+        reason: "failed",
+        armMetadata,
+        failureMessage: "transport unavailable",
+      });
+      for (let attempt = 0; attempt < 40 && scheduleReconcile.mock.calls.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(recordLost).toHaveBeenCalledTimes(2);
+      expect(scheduleReconcile).toHaveBeenCalledWith("owner");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("late monitor pokes are ignored after removal begins", async () => {
     const { service, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
@@ -463,21 +518,26 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       internal.bashMonitorRegistryStore = {
         listOwnerWorkspaceIds: () =>
           Promise.resolve({
-            ownerWorkspaceIds: ["old", "new"],
+            ownerWorkspaceIds: ["old", "new", "invalid"],
             scanFailed: false,
           }),
         listAll: (workspaceId) =>
           Promise.resolve([
             {
               createdAt:
-                workspaceId === "old" ? "2026-08-31T11:59:00.000Z" : "2026-08-31T12:01:00.000Z",
+                workspaceId === "old"
+                  ? "2026-08-31T11:59:00.000Z"
+                  : workspaceId === "invalid"
+                    ? "not-a-date"
+                    : "2026-08-31T12:01:00.000Z",
             },
           ]),
       };
 
       await internal.recoverBashMonitorStateAfterRestart();
-      expect(scheduleReconcile).toHaveBeenCalledTimes(1);
+      expect(scheduleReconcile).toHaveBeenCalledTimes(2);
       expect(scheduleReconcile).toHaveBeenCalledWith("old");
+      expect(scheduleReconcile).toHaveBeenCalledWith("invalid");
     } finally {
       await cleanup();
     }

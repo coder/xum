@@ -508,6 +508,29 @@ describe("BashMonitorWakeReconciler", () => {
     expect(prompt.indexOf("TICK_2")).toBeLessThan(prompt.indexOf("[monitor] process settled:"));
   });
 
+  test("wake-on-exit opt-out keeps an undelivered exit flush match-only", async () => {
+    live = [
+      liveSnapshot({
+        match: { throughOffset: 12, lines: ["READY"], totalMatches: 1 },
+        terminal: {
+          status: "exited",
+          exitCode: 0,
+          settledAt: "2026-08-31T12:13:00.000Z",
+          wakeOnExit: false,
+          terminalStatusShown: false,
+        },
+        retired: true,
+      }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].prompt).toContain("Matched process output");
+    expect(dispatches[0].prompt).not.toContain("Status: exited");
+    expect(dispatches[0].muxMetadata.records[0]).not.toHaveProperty("terminal");
+  });
+
   test("shown matched output is suppressed while a new settlement still wakes with context", async () => {
     live = [
       liveSnapshot({
