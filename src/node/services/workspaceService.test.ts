@@ -291,8 +291,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         reason: "canceled",
         armMetadata: armed,
       });
-      await Promise.resolve();
-      await Promise.resolve();
+      for (let attempt = 0; attempt < 10 && scheduleReconcile.mock.calls.length < 4; attempt++) {
+        await Promise.resolve();
+      }
 
       expect(upsert).toHaveBeenCalledWith(armed);
       expect(discardProcess).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
