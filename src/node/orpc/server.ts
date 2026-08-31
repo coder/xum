@@ -16,6 +16,7 @@ import { ORPCError, onError } from "@orpc/server";
 import { OpenAPIGenerator } from "@orpc/openapi";
 import { OpenAPIHandler } from "@orpc/openapi/node";
 import { ZodToJsonSchemaConverter } from "@orpc/zod";
+import { EffectSchemaToJsonSchemaConverter } from "@orpc/experimental-effect";
 import { router, type AppRouter } from "@/node/orpc/router";
 import type { ORPCContext } from "@/node/orpc/context";
 import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authMiddleware";
@@ -1467,8 +1468,11 @@ export async function createOrpcServer({
   const orpcRouter = existingRouter ?? router(authToken);
 
   // OpenAPI generator for spec endpoint
+  // Effect-migration spike: Effect Schema inputs (effectSpike.pinnedCount) need
+  // their own JSON-schema converter; without it the generator silently emits
+  // operations with no requestBody, producing a lossy /api/spec.json.
   const openAPIGenerator = new OpenAPIGenerator({
-    converters: [new ZodToJsonSchemaConverter()],
+    converters: [new ZodToJsonSchemaConverter(), new EffectSchemaToJsonSchemaConverter()],
   });
 
   // OpenAPI spec endpoint
