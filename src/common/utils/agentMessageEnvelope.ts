@@ -16,8 +16,24 @@ export interface AgentMessageEnvelope {
   message: string;
 }
 
-const ROOT_OPEN = "<mux_agent_message>";
-const ROOT_CLOSE = "</mux_agent_message>";
+/**
+ * Tag name every envelope spelling is built from. Single-sourced because the open tag, the close
+ * tag, and the cheap "might contain an envelope" pre-check must all agree: a pre-check that missed
+ * a spelling would silently skip neutralization and let unauthored text keep the exact wrapper.
+ */
+const ENVELOPE_TAG = "mux_agent_message";
+const ROOT_OPEN = `<${ENVELOPE_TAG}>`;
+const ROOT_CLOSE = `</${ENVELOPE_TAG}>`;
+
+/**
+ * Cheap pre-check shared by every neutralization site: true when `text` mentions the envelope tag
+ * at all (either spelling, or a lookalike). Callers use it to skip work and, where it matters, to
+ * preserve the input reference when nothing needs rewriting — so they must test exactly what
+ * `neutralizeAgentEnvelopeLookalikes` rewrites rather than re-deriving the literal per call site.
+ */
+export function containsAgentEnvelopeLookalike(text: string): boolean {
+  return text.includes(ENVELOPE_TAG);
+}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -88,7 +104,7 @@ export function getValidAgentPeerTriggerMeta(value: unknown): AgentPeerMessageMe
  * sees what the user pasted.
  */
 export function neutralizeAgentEnvelopeLookalikes(text: string): string {
-  if (!text.includes("mux_agent_message")) return text;
+  if (!containsAgentEnvelopeLookalike(text)) return text;
   return text
     .replaceAll(ROOT_OPEN, "<user_pasted_mux_agent_message>")
     .replaceAll(ROOT_CLOSE, "</user_pasted_mux_agent_message>");

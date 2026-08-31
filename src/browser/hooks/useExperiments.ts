@@ -23,8 +23,8 @@ export {
  * For reactive updates in React components, use useExperimentValue (UI gating) or
  * useExperimentOverrideValue (backend send options).
  *
- * For user-overridable experiments, returns `undefined` when no explicit localStorage
- * override exists, so send options can distinguish "user chose off" from "user never chose".
+ * Returns `undefined` when no explicit localStorage override exists, so send options
+ * can distinguish "user chose off" from "user never chose".
  */
 export function isExperimentEnabled(experimentId: ExperimentId): boolean | undefined {
   if (!isExperimentSupportedOnPlatform(experimentId, window.api?.platform)) {

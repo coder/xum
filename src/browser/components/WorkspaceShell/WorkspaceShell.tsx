@@ -24,6 +24,7 @@ import {
   LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
+  MOBILE_TOUCH_MEDIA_QUERY,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 
@@ -157,7 +158,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const handleOpenTerminal = useCallback(
     (options?: TerminalSessionCreateOptions) => {
       // On mobile touch devices, always use popout since the right sidebar is hidden
-      const isMobileTouch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+      const isMobileTouch = window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY).matches;
       if (isMobileTouch) {
         void openTerminalPopout(props.workspaceId, props.runtimeConfig, options);
       } else {

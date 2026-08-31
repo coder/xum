@@ -176,6 +176,23 @@ export function isToolErrorResult(val: unknown): val is ToolErrorResult {
 }
 
 /**
+ * Error message from a persisted tool result, covering both shapes a card can see:
+ * top-level tools store `{ success: false, error }`, while a failure inside a nested
+ * code_execution/PTC call is reconstructed by displayedMessageBuilder as a bare `{ error }`
+ * with no `success` flag. Returns null when the result is not an error (including a
+ * successful payload that happens to carry an `error` field, which the `success` flag
+ * excludes).
+ *
+ * Callers should `unwrapResult` first; this does not unwrap the SDK JSON container.
+ */
+export function extractToolErrorMessage(result: unknown): string | null {
+  if (isToolErrorResult(result)) return result.error;
+  if (result == null || typeof result !== "object" || "success" in result) return null;
+  const error = (result as Record<string, unknown>).error;
+  return typeof error === "string" ? error : null;
+}
+
+/**
  * Determine if a tool output indicates failure.
  * Handles both `{ success: false }` and `{ error: "..." }` shapes.
  * Note: Use isToolErrorResult() when you need type narrowing.

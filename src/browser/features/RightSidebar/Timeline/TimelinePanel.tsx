@@ -472,6 +472,21 @@ function TimelineEventRow(props: {
   );
 }
 
+// Rules and events render as different rows but take identical props, so both the flat day list and
+// an expanded machinery group (which mixes absorbed rules into its events) route through one
+// dispatcher instead of repeating the branch at each call site.
+function TimelineRow(props: {
+  event: TimelineEvent;
+  selected: boolean;
+  onSelect: (eventId: string) => void;
+}) {
+  return isRuleKind(getTimelineEventKind(props.event)) ? (
+    <TimelineRuleRow {...props} />
+  ) : (
+    <TimelineEventRow {...props} />
+  );
+}
+
 function CollapsedEventRun(props: {
   run: CollapsedRun;
   expanded: boolean;
@@ -502,23 +517,14 @@ function CollapsedEventRun(props: {
           <span className="counter-nums shrink-0">{counted.length}</span>
           <span className="min-w-0 truncate">{label} events</span>
         </button>
-        {props.run.events.map((event) =>
-          isRuleKind(getTimelineEventKind(event)) ? (
-            <TimelineRuleRow
-              key={event.id}
-              event={event}
-              selected={props.selectedEventId === event.id}
-              onSelect={props.onSelect}
-            />
-          ) : (
-            <TimelineEventRow
-              key={event.id}
-              event={event}
-              selected={props.selectedEventId === event.id}
-              onSelect={props.onSelect}
-            />
-          )
-        )}
+        {props.run.events.map((event) => (
+          <TimelineRow
+            key={event.id}
+            event={event}
+            selected={props.selectedEventId === event.id}
+            onSelect={props.onSelect}
+          />
+        ))}
       </div>
     );
   }
@@ -881,18 +887,8 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
                         />
                       );
                     }
-                    if (isRuleKind(getTimelineEventKind(item))) {
-                      return (
-                        <TimelineRuleRow
-                          key={item.id}
-                          event={item}
-                          selected={selectedEventId === item.id}
-                          onSelect={setSelectedEventId}
-                        />
-                      );
-                    }
                     return (
-                      <TimelineEventRow
+                      <TimelineRow
                         key={item.id}
                         event={item}
                         selected={selectedEventId === item.id}

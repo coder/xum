@@ -15,6 +15,36 @@ import { streamToString } from "./streamUtils";
 type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
 
 /**
+ * Fork an internal AbortController that also aborts when `abortSignal` does.
+ *
+ * Both streaming helpers below need a controller they can abort themselves (on
+ * stream cancel/abort) while still following the caller's signal, so each had
+ * its own copy of this wiring. Sharing one keeps the two easy-to-miss details
+ * identical at both sites: an already-aborted caller signal must be honored
+ * synchronously, because the "abort" event has already fired and will never
+ * fire again; and `cleanup` must be reachable from every terminal path so a
+ * long-lived caller signal does not accumulate forwarders.
+ */
+function forkAbortSignal(abortSignal?: AbortSignal): {
+  controller: AbortController;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  if (abortSignal?.aborted) {
+    controller.abort();
+  } else {
+    abortSignal?.addEventListener("abort", forwardAbort, { once: true });
+  }
+  return {
+    controller,
+    cleanup: () => {
+      abortSignal?.removeEventListener("abort", forwardAbort);
+    },
+  };
+}
+
+/**
  * Read file contents as a stream via exec.
  */
 export function readFileViaExec(
@@ -27,16 +57,7 @@ export function readFileViaExec(
   // it a cancelled wrapper (e.g. mux.load's byte ceiling) left cat blocked
   // until its 300s timeout, accumulating remote processes (r18). The
   // caller's abortSignal forwards into the same controller.
-  const readAbort = new AbortController();
-  const forwardAbort = () => readAbort.abort();
-  if (abortSignal?.aborted) {
-    readAbort.abort();
-  } else {
-    abortSignal?.addEventListener("abort", forwardAbort, { once: true });
-  }
-  const cleanupAbortForwarder = () => {
-    abortSignal?.removeEventListener("abort", forwardAbort);
-  };
+  const { controller: readAbort, cleanup: cleanupAbortForwarder } = forkAbortSignal(abortSignal);
 
   return new ReadableStream<Uint8Array>({
     cancel: () => {
@@ -93,16 +114,8 @@ export function writeFileViaExec(
   abortSignal?: AbortSignal
 ): WritableStream<Uint8Array> {
   let execPromise: Promise<ExecStream> | null = null;
-  const writeAbortController = new AbortController();
-  const abortWrite = () => writeAbortController.abort();
-  if (abortSignal?.aborted) {
-    writeAbortController.abort();
-  } else {
-    abortSignal?.addEventListener("abort", abortWrite, { once: true });
-  }
-  const cleanupAbortForwarder = () => {
-    abortSignal?.removeEventListener("abort", abortWrite);
-  };
+  const { controller: writeAbortController, cleanup: cleanupAbortForwarder } =
+    forkAbortSignal(abortSignal);
 
   const getExecStream = () => {
     execPromise ??= startExec(writeAbortController.signal);

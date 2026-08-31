@@ -45,6 +45,7 @@ import {
   LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
+  MOBILE_TOUCH_MEDIA_QUERY,
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
@@ -233,8 +234,7 @@ function AppInner() {
       // because the sidebar width is controlled by CSS and shouldn't rewrite the user's desktop
       // width preference.
       const isMobileTouch =
-        typeof window !== "undefined" &&
-        window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+        typeof window !== "undefined" && window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY).matches;
       if (isMobileTouch) {
         return Number.POSITIVE_INFINITY;
       }

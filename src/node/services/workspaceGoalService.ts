@@ -3086,6 +3086,20 @@ export class WorkspaceGoalService {
         return stoppedBeforeRead;
       }
       const current = await this.readGoalFile(input.workspaceId);
+      // Unwind for every stop-veto recheck below: restore the durable record to
+      // its pre-mutation state so an aborted turn's write never survives, and
+      // republish so any transiently published snapshot is superseded. When no
+      // goal existed before, the restore is a removal instead of a rewrite.
+      // Shared here because all eight recheck branches unwind identically.
+      const restorePriorRecord = async (): Promise<void> => {
+        if (current) {
+          await this.writeGoal(input.workspaceId, current);
+          await this.pushSnapshot(input.workspaceId, current);
+        } else {
+          await fs.rm(this.getFilePath(input.workspaceId), { force: true });
+          await this.pushSnapshot(input.workspaceId, null);
+        }
+      };
       const conflict =
         this.conflictForExpectedGoalId(current, input.expectedGoalId) ??
         this.conflictForReplacementGuard(current, input.replacementGuard);
@@ -3167,8 +3181,7 @@ export class WorkspaceGoalService {
         // never survives.
         const stoppedDuringEditWrite = discardIfUserStopLanded();
         if (stoppedDuringEditWrite) {
-          await this.writeGoal(input.workspaceId, current);
-          await this.pushSnapshot(input.workspaceId, current);
+          await restorePriorRecord();
           return stoppedDuringEditWrite;
         }
         await this.pushSnapshot(input.workspaceId, withEdits);
@@ -3178,8 +3191,7 @@ export class WorkspaceGoalService {
         // awaited publication step.
         const stoppedDuringEditPublication = discardIfUserStopLanded();
         if (stoppedDuringEditPublication) {
-          await this.writeGoal(input.workspaceId, current);
-          await this.pushSnapshot(input.workspaceId, current);
+          await restorePriorRecord();
           return stoppedDuringEditPublication;
         }
         this.emitBudgetChanged(current, withEdits, input);
@@ -3206,8 +3218,7 @@ export class WorkspaceGoalService {
         if (stoppedDuringEditPromotion) {
           const durableNow = await this.readGoalFile(input.workspaceId);
           if (durableNow?.goalId === withEdits.goalId) {
-            await this.writeGoal(input.workspaceId, current);
-            await this.pushSnapshot(input.workspaceId, current);
+            await restorePriorRecord();
             return stoppedDuringEditPromotion;
           }
         }
@@ -3265,8 +3276,7 @@ export class WorkspaceGoalService {
           // restored record normally).
           const stoppedDuringMutableWrite = discardIfUserStopLanded();
           if (stoppedDuringMutableWrite) {
-            await this.writeGoal(input.workspaceId, current);
-            await this.pushSnapshot(input.workspaceId, current);
+            await restorePriorRecord();
             return stoppedDuringMutableWrite;
           }
           await this.pushSnapshot(input.workspaceId, updated);
@@ -3280,8 +3290,7 @@ export class WorkspaceGoalService {
           // transiently published mutation.
           const stoppedDuringPublication = discardIfUserStopLanded();
           if (stoppedDuringPublication) {
-            await this.writeGoal(input.workspaceId, current);
-            await this.pushSnapshot(input.workspaceId, current);
+            await restorePriorRecord();
             return stoppedDuringPublication;
           }
           this.emitBudgetChanged(current, updated, input);
@@ -3301,8 +3310,7 @@ export class WorkspaceGoalService {
           if (stoppedDuringPromotion) {
             const durableNow = await this.readGoalFile(input.workspaceId);
             if (durableNow?.goalId === updated.goalId) {
-              await this.writeGoal(input.workspaceId, current);
-              await this.pushSnapshot(input.workspaceId, current);
+              await restorePriorRecord();
               return stoppedDuringPromotion;
             }
           }
@@ -3400,13 +3408,7 @@ export class WorkspaceGoalService {
       // record is restored — or removed when no goal existed before.
       const stoppedDuringCreateWrite = discardIfUserStopLanded();
       if (stoppedDuringCreateWrite) {
-        if (current) {
-          await this.writeGoal(input.workspaceId, current);
-          await this.pushSnapshot(input.workspaceId, current);
-        } else {
-          await fs.rm(this.getFilePath(input.workspaceId), { force: true });
-          await this.pushSnapshot(input.workspaceId, null);
-        }
+        await restorePriorRecord();
         return stoppedDuringCreateWrite;
       }
       await this.pushSnapshot(input.workspaceId, next);
@@ -3415,13 +3417,7 @@ export class WorkspaceGoalService {
       // through it (same restore as the post-write branch above).
       const stoppedDuringCreatePublication = discardIfUserStopLanded();
       if (stoppedDuringCreatePublication) {
-        if (current) {
-          await this.writeGoal(input.workspaceId, current);
-          await this.pushSnapshot(input.workspaceId, current);
-        } else {
-          await fs.rm(this.getFilePath(input.workspaceId), { force: true });
-          await this.pushSnapshot(input.workspaceId, null);
-        }
+        await restorePriorRecord();
         return stoppedDuringCreatePublication;
       }
       this.emitBudgetChanged(current, next, input);

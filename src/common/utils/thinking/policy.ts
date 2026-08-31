@@ -38,20 +38,41 @@ import { normalizeSelectedModel, normalizeToCanonical } from "@/common/utils/ai/
 export type ThinkingPolicy = readonly ThinkingLevel[];
 
 /**
+ * Dotted Gemini Flash tiers that use Google's thinkingLevel config. Matching is
+ * prefix-based so version suffixes (`-001`, `-latest`, `-preview-…`) are covered;
+ * each tier's `-lite` sibling still uses thinkingBudget and is excluded.
+ *
+ * Every Flash release repoints the `gemini-flash` alias, so keep new tiers as a
+ * one-line addition here instead of another copy of the prefix/`-lite` pair.
+ */
+const GEMINI_FLASH_THINKING_LEVEL_TIERS = [
+  "gemini-3.5-flash",
+  "gemini-3.6-flash",
+  "gemini-3.7-flash",
+] as const;
+
+function matchesFlashTierExcludingLite(normalized: string, tier: string): boolean {
+  return normalized.startsWith(tier) && !normalized.startsWith(`${tier}-lite`);
+}
+
+/**
  * True when modelName is a bare Gemini Flash chat model ID using Google's
  * thinkingLevel config (minimal/low/medium/high) instead of Gemini 2.x thinkingBudget.
  * @param modelName Provider model ID without the provider prefix (e.g. "gemini-3.5-flash", not "google:gemini-3.5-flash").
  */
 export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean {
   const normalized = modelName.trim().toLowerCase();
+  // The dashless `gemini-3-flash` tier keeps a stricter boundary check (exact ID or a
+  // dash-delimited suffix such as `gemini-3-flash-preview-20251217`) rather than the
+  // plain prefix match the dotted tiers use, so it stays spelled out here.
+  const isGemini3FlashTier =
+    (normalized === "gemini-3-flash" || normalized.startsWith("gemini-3-flash-")) &&
+    !normalized.startsWith("gemini-3-flash-lite");
   return (
-    ((normalized === "gemini-3-flash" || normalized.startsWith("gemini-3-flash-")) &&
-      !normalized.startsWith("gemini-3-flash-lite")) ||
-    (normalized.startsWith("gemini-3.5-flash") &&
-      !normalized.startsWith("gemini-3.5-flash-lite")) ||
-    (normalized.startsWith("gemini-3.6-flash") &&
-      !normalized.startsWith("gemini-3.6-flash-lite")) ||
-    (normalized.startsWith("gemini-3.7-flash") && !normalized.startsWith("gemini-3.7-flash-lite"))
+    isGemini3FlashTier ||
+    GEMINI_FLASH_THINKING_LEVEL_TIERS.some((tier) =>
+      matchesFlashTierExcludingLite(normalized, tier)
+    )
   );
 }
 
@@ -89,8 +110,7 @@ export function getThinkingPolicyForModel(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): ThinkingPolicy {
-  const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  return getExplicitThinkingPolicy(capabilityModel) ?? DEFAULT_THINKING_POLICY;
+  return getExplicitThinkingPolicyForModel(modelString, providersConfig) ?? DEFAULT_THINKING_POLICY;
 }
 
 /**
@@ -204,6 +224,20 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   return null;
 }
 
+/**
+ * Resolve a model to its capability model (following `mappedToModel` aliases via
+ * {@link resolveModelForMetadata}) and return its explicit reasoning policy, or
+ * `null` when none matches. Shared by {@link getThinkingPolicyForModel} and
+ * {@link hasExplicitThinkingPolicy}, which must resolve aliases identically
+ * before rule matching so a mapped alias inherits its target's policy.
+ */
+function getExplicitThinkingPolicyForModel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): ThinkingPolicy | null {
+  return getExplicitThinkingPolicy(resolveModelForMetadata(modelString, providersConfig ?? null));
+}
+
 /** Canonical ordering index for a level (off=0 … max=5). */
 function thinkingLevelIndex(level: ThinkingLevel): number {
   return THINKING_LEVELS.indexOf(level);
@@ -245,10 +279,7 @@ export function hasExplicitThinkingPolicy(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): boolean {
-  return (
-    getExplicitThinkingPolicy(resolveModelForMetadata(modelString, providersConfig ?? null)) !==
-    null
-  );
+  return getExplicitThinkingPolicyForModel(modelString, providersConfig) !== null;
 }
 
 /**

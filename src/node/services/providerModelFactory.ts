@@ -598,6 +598,29 @@ function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fet
 }
 
 /**
+ * Build the effective request headers for a fetch wrapper.
+ *
+ * A fetch wrapper that wants to add/remove headers cannot just read one side:
+ * headers can arrive on a `Request` input, on `init.headers`, or both. Start
+ * from the Request's headers (when input is a Request), then overlay
+ * `init.headers` so per-call overrides win — matching how the platform fetch
+ * resolves the pair. Returning a fresh `Headers` also keeps callers from
+ * mutating a `Request`'s immutable header list.
+ */
+function mergeFetchHeaders(
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1]
+): Headers {
+  const merged = new Headers(input instanceof Request ? input.headers : undefined);
+  if (init?.headers) {
+    for (const [key, value] of new Headers(init.headers).entries()) {
+      merged.set(key, value);
+    }
+  }
+  return merged;
+}
+
+/**
  * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
  */
 function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
@@ -614,14 +637,7 @@ function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
     input: Parameters<typeof fetch>[0],
     init?: Parameters<typeof fetch>[1]
   ): Promise<Response> => {
-    // Build merged headers: start from the Request (if any), then overlay init.headers.
-    const merged = new Headers(input instanceof Request ? input.headers : undefined);
-    if (init?.headers) {
-      for (const [key, value] of new Headers(init.headers).entries()) {
-        merged.set(key, value);
-      }
-    }
-
+    const merged = mergeFetchHeaders(input, init);
     captureAndStripDevToolsHeader(merged);
     return customFetch(input, { ...init, headers: merged });
   };
@@ -1802,14 +1818,13 @@ export class ProviderModelFactory {
         // that capability; older custom model strings stay on Chat Completions for
         // legacy search_parameters compatibility.
         const capabilityModel = resolveModelForMetadata(`xai:${modelId}`, providersConfig);
-        const model = isGrokFrontierModel(capabilityModel)
-          ? provider.responses(modelId)
-          : provider.chat(modelId);
+        const isGrokFrontier = isGrokFrontierModel(capabilityModel);
+        const model = isGrokFrontier ? provider.responses(modelId) : provider.chat(modelId);
 
         // Frontier Grok Responses: force store=false by default so ZDR and non-ZDR share
         // one path. buildProviderOptions already defaults this; inject here too so
         // callers that omit providerOptions still get ZDR-safe requests.
-        if (isGrokFrontierModel(capabilityModel)) {
+        if (isGrokFrontier) {
           injectGrokStoreDefault(model, muxProviderOptions?.xai?.store);
         }
 
@@ -2105,12 +2120,7 @@ export class ProviderModelFactory {
           input: Parameters<typeof fetch>[0],
           init?: Parameters<typeof fetch>[1]
         ) => {
-          const headers = new Headers(input instanceof Request ? input.headers : undefined);
-          if (init?.headers) {
-            for (const [key, value] of new Headers(init.headers).entries()) {
-              headers.set(key, value);
-            }
-          }
+          const headers = mergeFetchHeaders(input, init);
           headers.set("Authorization", `Bearer ${resolvedApiKey ?? ""}`);
           headers.set("Openai-Intent", "conversation-edits");
 
@@ -2313,12 +2323,7 @@ export class ProviderModelFactory {
           // bypassed by a check that passed before the await.
           assertCoderModelAllowedByPolicy();
 
-          const headers = new Headers(input instanceof Request ? input.headers : undefined);
-          if (init?.headers) {
-            for (const [key, value] of new Headers(init.headers).entries()) {
-              headers.set(key, value);
-            }
-          }
+          const headers = mergeFetchHeaders(input, init);
           headers.set("Authorization", `Bearer ${authResult.data.access}`);
           // The Anthropic SDK authenticates via x-api-key; the bridge reads the
           // Bearer token instead, so drop the placeholder key.

@@ -192,6 +192,34 @@ class DisposableExec implements Disposable {
 }
 
 /**
+ * Rejection shape shared by {@link execAsync} and {@link execFileAsync}: an `Error` carrying the
+ * process outcome so callers can branch on exit code or signal instead of parsing the message.
+ */
+interface ExecError extends Error {
+  code: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Builds the augmented rejection error for a failed command. Extracted because all three failure
+ * paths (pre-execution abort, and the `close` handlers of `execAsync`/`execFileAsync`) must attach
+ * the same four fields; repeating the cast plus the assignments let those shapes drift.
+ */
+function createExecError(
+  message: string,
+  outcome: Pick<ExecError, "code" | "signal" | "stdout" | "stderr">
+): ExecError {
+  const error = new Error(message) as ExecError;
+  error.code = outcome.code;
+  error.signal = outcome.signal;
+  error.stdout = outcome.stdout;
+  error.stderr = outcome.stderr;
+  return error;
+}
+
+/**
  * Options for execAsync.
  */
 export interface ExecAsyncOptions {
@@ -245,17 +273,7 @@ export function execAsync(command: string, options?: ExecAsyncOptions): Disposab
           (exitSignal
             ? `Command killed by signal ${exitSignal}`
             : `Command failed with exit code ${exitCode ?? "unknown"}`);
-        const error = new Error(errorMsg) as Error & {
-          code: number | null;
-          signal: string | null;
-          stdout: string;
-          stderr: string;
-        };
-        error.code = exitCode;
-        error.signal = exitSignal;
-        error.stdout = stdout;
-        error.stderr = stderr;
-        reject(error);
+        reject(createExecError(errorMsg, { code: exitCode, signal: exitSignal, stdout, stderr }));
       }
     });
 
@@ -304,16 +322,12 @@ export function execFileAsync(
   options?: ExecFileAsyncOptions
 ): DisposableExec {
   if (options?.signal?.aborted) {
-    const error = new Error("Command aborted before execution") as Error & {
-      code: number | null;
-      signal: string | null;
-      stdout: string;
-      stderr: string;
-    };
-    error.code = null;
-    error.signal = null;
-    error.stdout = "";
-    error.stderr = "";
+    const error = createExecError("Command aborted before execution", {
+      code: null,
+      signal: null,
+      stdout: "",
+      stderr: "",
+    });
     const result = Promise.reject(error);
     void result.catch(() => undefined);
     return new DisposableExec(result);
@@ -403,17 +417,7 @@ export function execFileAsync(
             (exitSignal
               ? `Command killed by signal ${exitSignal}`
               : `Command failed with exit code ${exitCode ?? "unknown"}`);
-        const error = new Error(errorMsg) as Error & {
-          code: number | null;
-          signal: string | null;
-          stdout: string;
-          stderr: string;
-        };
-        error.code = exitCode;
-        error.signal = exitSignal;
-        error.stdout = stdout;
-        error.stderr = stderr;
-        reject(error);
+        reject(createExecError(errorMsg, { code: exitCode, signal: exitSignal, stdout, stderr }));
       }
     });
 

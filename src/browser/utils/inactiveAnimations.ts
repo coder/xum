@@ -23,3 +23,19 @@ export function installInactiveAnimationPause(): () => void {
     window.removeEventListener("blur", syncInactiveAnimationState);
   };
 }
+
+/**
+ * Renderer entrypoint helper: install the pause without ever failing startup.
+ *
+ * Animation throttling is only an optimization, so a broken install must not
+ * take the renderer down with it. Every entrypoint needs the same swallow, so
+ * it lives here instead of being repeated at each call site. The disposer is
+ * intentionally dropped: entrypoints keep the listeners for the window's life.
+ */
+export function installInactiveAnimationPauseSafely(): void {
+  try {
+    installInactiveAnimationPause();
+  } catch {
+    // Optimization only — never block renderer startup.
+  }
+}

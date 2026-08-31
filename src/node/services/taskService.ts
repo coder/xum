@@ -37,6 +37,7 @@ import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
   formatSubagentReportEnvelope,
   parseSubagentReportEnvelope,
+  parseSubagentReportFromMessage,
   subagentReportFallbackTitle,
   subagentUpdateFallbackTitle,
 } from "@/common/utils/subagentReportEnvelope";
@@ -377,6 +378,8 @@ function formatSubagentReportUserMessage(params: {
     ...(params.executionId != null ? { executionId: params.executionId } : {}),
     ...(params.model != null ? { model: params.model } : {}),
     ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
+    // Omit structuredOutput entirely when absent so callers can forward the value directly
+    // without re-implementing the undefined guard at each call site.
     ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
   });
 }
@@ -393,6 +396,17 @@ function parseTerminalSubagentExecutionVersion(content: string): string | null {
   if (report?.executionVersion != null) return report.executionVersion;
   if (!content.startsWith(SUBAGENT_FAILURE_ENVELOPE_TAG)) return null;
   return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
+}
+
+// Flattens a history message to the text payload that the sub-agent report/failure envelope
+// parsers expect. Both terminal-attention history scans below classify rows this way, so keeping
+// the part filter and separator in one place stops them from drifting apart and silently
+// disagreeing about which messages already carry a terminal report.
+function joinMessageText(message: MuxMessage): string {
+  return message.parts
+    .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
 }
 
 // Failure twin of formatSubagentReportUserMessage: terminal child failures are
@@ -1039,6 +1053,23 @@ interface QueueCutAttributionSnapshot {
 }
 
 /**
+ * The snapshot's active stream when it is a DIFFERENT (uncorrelated) message
+ * than the ended one: input that had already taken over the session at this
+ * cut, so its metadata — not the queue's — attributes the cut. Shared by cut
+ * attribution and disposable-ownership forwarding so the two cannot drift on
+ * what counts as "already streaming at the cut".
+ */
+function findQueueCutTakeoverStream(
+  event: StreamEndEvent,
+  snapshot: QueueCutAttributionSnapshot
+): { messageId: string; muxMetadata: unknown } | undefined {
+  const { activeStream } = snapshot;
+  return activeStream != null && activeStream.messageId !== event.messageId
+    ? activeStream
+    : undefined;
+}
+
+/**
  * Settled workspace-turn records eligible for self-heal correction (resettle from a
  * correlated stream-end, or read-time repair/revive): transient stream-error settlements
  * (status "error"), stale restart-recovery interrupts, and queue-cut supersedes (late
@@ -1058,6 +1089,23 @@ function isSelfHealEligibleSettledWorkspaceTurn(
     // Both supersede flavors (generic new input and owner follow-up) stay
     // self-heal eligible: late correlated evidence proves the turn continued.
     isSupersededWorkspaceTurnInterrupt(record)
+  );
+}
+
+/**
+ * Under the settlement lock, confirm a reloaded handle is still the exact record a read-time
+ * reconciliation resolved against before mutating it. Comparing updatedAt as well as status
+ * matters: a concurrent settlement can produce a NEWER record with the same status, and a
+ * stale read must not clobber it. Callers pass a `null` / non-matching `current` straight
+ * through so the concurrent winner is reported. Typed as a guard so the matched branch narrows
+ * `current` to a non-null record.
+ */
+function isReconciledWorkspaceTurnUnchanged(
+  current: WorkspaceTurnTaskHandleRecord | null,
+  record: WorkspaceTurnTaskHandleRecord
+): current is WorkspaceTurnTaskHandleRecord {
+  return (
+    current != null && current.status === record.status && current.updatedAt === record.updatedAt
   );
 }
 
@@ -1874,6 +1922,18 @@ export class TaskService implements AgentTaskIntegration {
     return Array.from(runIds);
   }
 
+  /**
+   * Workflow-run reads here all open a per-workspace store over that workspace's session
+   * directory, so the sessionDir join lives in exactly one place. The store constructor is
+   * pure bookkeeping (no I/O), so a fresh instance per call matches the previous inline
+   * construction exactly.
+   */
+  private workflowRunStoreFor(workspaceId: string): WorkflowRunStore {
+    return new WorkflowRunStore({
+      sessionDir: path.join(this.config.sessionsDir, workspaceId),
+    });
+  }
+
   private async listActiveBackgroundWorkflowRunIds(
     workspaceId: string,
     referencedWorkflowRunIds: readonly string[]
@@ -1885,9 +1945,7 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const referencedRunIdSet = new Set(referencedWorkflowRunIds);
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(workspaceId);
       const runs = await runStore.listRuns();
       return runs
         .filter(
@@ -1920,9 +1978,7 @@ export class TaskService implements AgentTaskIntegration {
 
     try {
       const referencedRunIdSet = new Set(referencedWorkflowRunIds);
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(workspaceId);
       const runs = await runStore.listRuns();
       const blockingRunIds: string[] = [];
       for (const run of runs) {
@@ -2016,9 +2072,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(parentWorkspaceId);
       const run = await runStore.getRun(workflowTask.runId);
       if (run.workspaceId !== parentWorkspaceId) {
         return {
@@ -7685,9 +7739,7 @@ export class TaskService implements AgentTaskIntegration {
         ) {
           continue;
         }
-        const runStore = new WorkflowRunStore({
-          sessionDir: path.join(this.config.sessionsDir, workspace.id),
-        });
+        const runStore = this.workflowRunStoreFor(workspace.id);
         let runs: Awaited<ReturnType<WorkflowRunStore["listRuns"]>>;
         try {
           runs = await runStore.listRuns();
@@ -8064,9 +8116,7 @@ export class TaskService implements AgentTaskIntegration {
     // its terminal callback re-queues behind this deletion.
     let currentRunUpdatedAt: string | null;
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, params.ownerWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(params.ownerWorkspaceId);
       currentRunUpdatedAt = (await runStore.getRun(params.runId)).updatedAt;
     } catch {
       currentRunUpdatedAt = null;
@@ -8369,9 +8419,7 @@ export class TaskService implements AgentTaskIntegration {
     candidate: { runId: string; run: WorkflowRunRecord }
   ): Promise<"deliverable" | "superseded" | "defer"> {
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(ownerWorkspaceId);
       const currentRun = await runStore.getRun(candidate.runId);
       if (
         currentRun.status !== candidate.run.status ||
@@ -8421,9 +8469,7 @@ export class TaskService implements AgentTaskIntegration {
   > {
     assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
     assert(runId.length > 0, "buildWorkflowTerminalPrompt requires runId");
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(this.config.sessionsDir, ownerWorkspaceId),
-    });
+    const runStore = this.workflowRunStoreFor(ownerWorkspaceId);
     let run: Awaited<ReturnType<WorkflowRunStore["getRun"]>>;
     try {
       run = await runStore.getRun(runId);
@@ -8552,12 +8598,7 @@ export class TaskService implements AgentTaskIntegration {
     const existingTaskIds = new Set<string>();
     for (const message of historyResult.data) {
       if (message.role !== "user" || message.metadata?.synthetic !== true) continue;
-      const taskId = parseTerminalSubagentTaskId(
-        message.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n")
-      );
+      const taskId = parseTerminalSubagentTaskId(joinMessageText(message));
       if (taskId == null) continue;
       existingTaskIds.add(taskId);
       existingReportMessages.set(taskId, message);
@@ -8709,11 +8750,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const message of historyResult.data) {
       if (message.role === "user" && message.metadata?.synthetic === true) {
-        const text = message.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
-        const taskId = parseTerminalSubagentTaskId(text);
+        const taskId = parseTerminalSubagentTaskId(joinMessageText(message));
         const historySequence = message.metadata?.historySequence;
         if (taskId != null && pendingIds.has(taskId) && typeof historySequence === "number") {
           terminalSequenceByTaskId.set(taskId, historySequence);
@@ -10335,9 +10372,7 @@ export class TaskService implements AgentTaskIntegration {
         ...(childEntry.workspace.taskThinkingLevel != null
           ? { thinkingLevel: childEntry.workspace.taskThinkingLevel }
           : {}),
-        ...(report.structuredOutput !== undefined
-          ? { structuredOutput: report.structuredOutput }
-          : {}),
+        structuredOutput: report.structuredOutput,
       });
       // A progress report is itself the wake-up message. Unlike terminal attention, it must be
       // allowed through while this child is still active so review findings and other incremental
@@ -11720,13 +11755,7 @@ export class TaskService implements AgentTaskIntegration {
         record.handleId
       );
       // A concurrent settlement/repair wins; only replace the exact record we reconciled.
-      // Comparing updatedAt (not just status) matters: a concurrent settlement can produce
-      // a NEWER record with the same status that must not be clobbered by our stale read.
-      if (
-        current == null ||
-        current.status !== record.status ||
-        current.updatedAt !== record.updatedAt
-      ) {
+      if (!isReconciledWorkspaceTurnUnchanged(current, record)) {
         // If this direct parent's task_await will return that concurrent terminal winner,
         // consume it here so its post-lock delivery cannot append the same outcome too.
         return await this.markDirectParentWorkspaceTurnResultConsumedUnlocked(
@@ -11791,15 +11820,10 @@ export class TaskService implements AgentTaskIntegration {
         record.ownerWorkspaceId,
         record.handleId
       );
-      // A concurrent transition wins; only revive the exact record we reconciled against.
-      // Comparing updatedAt (not just status) matters: the live retry itself can fail and
-      // settle a NEWER record with the same status (e.g. error → error) between our read
-      // and this lock — reviving that fresh terminal failure would strand task_await.
-      if (
-        current == null ||
-        current.status !== record.status ||
-        current.updatedAt !== record.updatedAt
-      ) {
+      // A concurrent transition wins; only revive the exact record we reconciled against — the
+      // live retry can itself fail into a NEWER error record between our read and this lock, and
+      // reviving that fresh terminal failure would strand task_await.
+      if (!isReconciledWorkspaceTurnUnchanged(current, record)) {
         return current;
       }
       // Another turn already owns the child workspace; the activity is not this turn's retry.
@@ -13661,9 +13685,7 @@ export class TaskService implements AgentTaskIntegration {
     if (runIds.length === 0) {
       return [];
     }
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(this.config.sessionsDir, workspaceId),
-    });
+    const runStore = this.workflowRunStoreFor(workspaceId);
     const blocking: string[] = [];
     for (const runId of runIds) {
       const run = await runStore.getRun(runId).catch(() => null);
@@ -13713,9 +13735,7 @@ export class TaskService implements AgentTaskIntegration {
       workspaceId.length > 0,
       "listActiveWorkflowRunIdsForWorkspaceStrict requires workspaceId"
     );
-    const runStore = new WorkflowRunStore({
-      sessionDir: path.join(this.config.sessionsDir, workspaceId),
-    });
+    const runStore = this.workflowRunStoreFor(workspaceId);
     const runs = await runStore.listRunsForActivityScan();
     return runs
       .filter(
@@ -15026,10 +15046,11 @@ export class TaskService implements AgentTaskIntegration {
     };
     // Already streaming at the cut: the uncorrelated active stream is the
     // engaged cutter.
-    const { activeStream, cutter } = snapshot;
-    if (activeStream != null && activeStream.messageId !== event.messageId) {
-      return classifyMetadata(activeStream.muxMetadata);
+    const takeoverStream = findQueueCutTakeoverStream(event, snapshot);
+    if (takeoverStream != null) {
+      return classifyMetadata(takeoverStream.muxMetadata);
     }
+    const { cutter } = snapshot;
     if (cutter?.stage === "preparing" || cutter?.stage === "dispatching") {
       // Engaged stages report even with undefined metadata (manual message) so
       // a same-owner follow-up queued BEHIND the engaged cutter cannot be
@@ -15074,10 +15095,11 @@ export class TaskService implements AgentTaskIntegration {
     record: WorkspaceTurnTaskHandleRecord,
     snapshot: QueueCutAttributionSnapshot
   ): string | undefined {
-    const { activeStream, cutter } = snapshot;
-    if (activeStream != null && activeStream.messageId !== event.messageId) {
-      return this.sameOwnerFollowUpHandleIdFromMetadata(record, activeStream.muxMetadata);
+    const takeoverStream = findQueueCutTakeoverStream(event, snapshot);
+    if (takeoverStream != null) {
+      return this.sameOwnerFollowUpHandleIdFromMetadata(record, takeoverStream.muxMetadata);
     }
+    const { cutter } = snapshot;
     return cutter != null
       ? this.sameOwnerFollowUpHandleIdFromMetadata(record, cutter.muxMetadata)
       : undefined;
@@ -15787,11 +15809,12 @@ export class TaskService implements AgentTaskIntegration {
     // Explicit in-session recovery cases (aborted, context_exceeded) may
     // continue through queued/preparing turns; auto-retryable errors require a
     // pending auto-retry of the same turn.
+    const errorType = event.errorType;
     const explicitRecovery =
-      event.errorType != null && WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS.has(event.errorType);
+      errorType != null && WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS.has(errorType);
     if (
-      event.errorType != null &&
-      isWorkspaceTurnRecoverableStreamError(event.errorType) &&
+      errorType != null &&
+      isWorkspaceTurnRecoverableStreamError(errorType) &&
       (await this.hasRecoverableWorkspaceTurnRetryInFlight(record.workspaceId, event.messageId, {
         requireAutoRetry: !explicitRecovery,
       }))
@@ -16718,11 +16741,7 @@ export class TaskService implements AgentTaskIntegration {
           if (message.role !== "user" || message.metadata?.synthetic !== true) {
             continue;
           }
-          const text = message.parts
-            .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-            .map((part) => part.text)
-            .join("\n");
-          const reportEnvelope = parseSubagentReportEnvelope(text);
+          const reportEnvelope = parseSubagentReportFromMessage(message);
           if (reportEnvelope == null || reportEnvelope.status === "in_progress") {
             continue;
           }
@@ -16848,9 +16867,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
-      });
+      const runStore = this.workflowRunStoreFor(parentWorkspaceId);
       const run = await runStore.getRun(workflowTask.runId);
       return run.agentOutputSchemaRequired !== true;
     } catch (error) {
@@ -17804,9 +17821,7 @@ export class TaskService implements AgentTaskIntegration {
       status: "completed",
       ...(childModelString != null ? { model: childModelString } : {}),
       ...(childThinkingLevel != null ? { thinkingLevel: childThinkingLevel } : {}),
-      ...(report.structuredOutput !== undefined
-        ? { structuredOutput: report.structuredOutput }
-        : {}),
+      structuredOutput: report.structuredOutput,
     });
 
     const workspaceTurnMuxMetadata =

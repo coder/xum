@@ -863,6 +863,18 @@ interface ConfigLoadFailureState {
   backupSignature: string | null;
 }
 
+/**
+ * Hash config bytes for `ConfigLoadFailureState.backupSignature`.
+ *
+ * Both producers of that signature must hash identically: the failed load records the
+ * corrupt bytes it backed up, and the edit gate re-hashes the file on disk and compares
+ * the two. Sharing one helper keeps that comparison meaningful, since any drift between
+ * two inlined hashes would silently make every signature mismatch and block edits.
+ */
+function configContentSignature(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
 // Process-scoped, keyed by config file path: production creates short-lived Config
 // instances (e.g. runtimeFactory per runtime check), so instance-local dedupe would
 // re-log the same corrupt-config error once per instance.
@@ -1011,8 +1023,7 @@ export class Config {
     const errorMessage = error instanceof Error ? error.message : String(error);
     // Backup confirmation is keyed on content alone: the same corrupt bytes need only one
     // sidecar regardless of which error message they produced.
-    const contentSignature =
-      rawBytes !== undefined ? crypto.createHash("sha256").update(rawBytes).digest("hex") : null;
+    const contentSignature = rawBytes !== undefined ? configContentSignature(rawBytes) : null;
 
     // Re-verify preservation against the disk on every failed load rather than trusting a
     // cached confirmation: a sidecar deleted or truncated since the last load must re-block
@@ -2444,9 +2455,9 @@ export class Config {
         let currentSignature: string | null = null;
         try {
           const currentBytes = fs.readFileSync(this.configFile);
-          currentSignature = crypto.createHash("sha256").update(currentBytes).digest("hex");
+          currentSignature = configContentSignature(currentBytes);
         } catch (readError) {
-          if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (!isEnoentError(readError)) {
             rejectEdit(
               `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
             );

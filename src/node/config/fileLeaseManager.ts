@@ -98,6 +98,22 @@ export class FileLeaseManager {
     }
   }
 
+  /**
+   * Prepares the filesystem for a lock install: the xum home directory may not
+   * exist yet on a fresh install, and crash-abandoned stages from a previous run
+   * must be swept before we start racing for the lock itself.
+   *
+   * The existsSync guard is deliberate rather than redundant: ensurePrivateDirSync
+   * also chmods an already-existing directory, and callers only want to create a
+   * missing one.
+   */
+  private prepareLockDir(lockPath: string, staleMs: number): void {
+    if (!fs.existsSync(this.rootDir)) {
+      ensurePrivateDirSync(this.rootDir);
+    }
+    this.cleanupAbandonedStageDirs(lockPath, staleMs);
+  }
+
   /** Acquires a bounded lock without deleting a live or successor generation. */
   private async withDirLock<T>(
     lockPath: string,
@@ -108,10 +124,7 @@ export class FileLeaseManager {
     const RETRY_DELAY_MS = 25;
     const deadline = Date.now() + acquireTimeoutMs;
 
-    if (!fs.existsSync(this.rootDir)) {
-      ensurePrivateDirSync(this.rootDir);
-    }
-    this.cleanupAbandonedStageDirs(lockPath, staleLockMs);
+    this.prepareLockDir(lockPath, staleLockMs);
 
     let ownerFile: string;
     for (;;) {
@@ -161,11 +174,7 @@ export class FileLeaseManager {
   tryAcquireCoderOauthClientLease(ttlMs: number): (() => void) | null {
     const leasePath = `${this.providersFile}.coder-client.lock`;
 
-    if (!fs.existsSync(this.rootDir)) {
-      ensurePrivateDirSync(this.rootDir);
-    }
-
-    this.cleanupAbandonedStageDirs(leasePath, ttlMs);
+    this.prepareLockDir(leasePath, ttlMs);
 
     for (let attempt = 0; attempt < 2; attempt++) {
       let ownerFile: string;

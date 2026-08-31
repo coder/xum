@@ -1245,21 +1245,30 @@ async function applyProjectPatch(params: {
   isReplay: boolean;
   abortSignal?: AbortSignal;
 }): Promise<{ success: boolean; projectResult: TaskApplyGitPatchProjectResult }> {
+  // Every failure path below reports the same project identity with status
+  // "failed"; only the error/conflict/note details differ. Building that shared
+  // shape once keeps each branch focused on what actually varies.
+  const failed = (
+    details: Omit<TaskApplyGitPatchProjectResult, "projectPath" | "projectName" | "status">
+  ): { success: false; projectResult: TaskApplyGitPatchProjectResult } => ({
+    success: false,
+    projectResult: {
+      projectPath: params.projectArtifact.projectPath,
+      projectName: params.projectArtifact.projectName,
+      status: "failed",
+      ...details,
+    },
+  });
+
   const taskIdError = validatePatchRuntimePathComponent(params.taskId, "task_id");
   const storageKeyError = validatePatchRuntimePathComponent(
     params.projectArtifact.storageKey,
     "storageKey"
   );
   if (taskIdError != null || storageKeyError != null) {
-    return {
-      success: false,
-      projectResult: {
-        projectPath: params.projectArtifact.projectPath,
-        projectName: params.projectArtifact.projectName,
-        status: "failed",
-        error: taskIdError ?? storageKeyError,
-      },
-    };
+    return failed({
+      error: taskIdError ?? storageKeyError,
+    });
   }
 
   const remotePatchPath = buildRuntimeTempPath({
@@ -1283,16 +1292,10 @@ async function applyProjectPatch(params: {
     artifactLookupNote: params.artifactLookupNote,
   });
   if ("error" in patchResolution) {
-    return {
-      success: false,
-      projectResult: {
-        projectPath: params.projectArtifact.projectPath,
-        projectName: params.projectArtifact.projectName,
-        status: "failed",
-        error: patchResolution.error,
-        note: patchResolution.note,
-      },
-    };
+    return failed({
+      error: patchResolution.error,
+      note: patchResolution.note,
+    });
   }
 
   const gitPrefix = await gitNoRepoAutomationPrefixForRuntime({
@@ -1307,16 +1310,10 @@ async function applyProjectPatch(params: {
     gitPrefix,
   });
   if (expectedHeadError != null) {
-    return {
-      success: false,
-      projectResult: {
-        projectPath: params.projectArtifact.projectPath,
-        projectName: params.projectArtifact.projectName,
-        status: "failed",
-        error: expectedHeadError,
-        note: patchResolution.note,
-      },
-    };
+    return failed({
+      error: expectedHeadError,
+      note: patchResolution.note,
+    });
   }
 
   try {
@@ -1340,20 +1337,14 @@ async function applyProjectPatch(params: {
         gitPrefix,
       });
       if (dryRunDirtyOverlap != null) {
-        return {
-          success: false,
-          projectResult: {
-            projectPath: params.projectArtifact.projectPath,
-            projectName: params.projectArtifact.projectName,
-            status: "failed",
-            error: dryRunDirtyOverlap.error,
-            conflictPaths: dryRunDirtyOverlap.conflictPaths,
-            note: mergeNotes(
-              patchResolution.note,
-              "Commit or stash local changes on overlapping patch paths before applying. Unrelated dirty files can remain in place."
-            ),
-          },
-        };
+        return failed({
+          error: dryRunDirtyOverlap.error,
+          conflictPaths: dryRunDirtyOverlap.conflictPaths,
+          note: mergeNotes(
+            patchResolution.note,
+            "Commit or stash local changes on overlapping patch paths before applying. Unrelated dirty files can remain in place."
+          ),
+        });
       }
 
       const dryRunHeadError = await checkExpectedHead({
@@ -1363,16 +1354,10 @@ async function applyProjectPatch(params: {
         gitPrefix,
       });
       if (dryRunHeadError != null) {
-        return {
-          success: false,
-          projectResult: {
-            projectPath: params.projectArtifact.projectPath,
-            projectName: params.projectArtifact.projectName,
-            status: "failed",
-            error: dryRunHeadError,
-            note: patchResolution.note,
-          },
-        };
+        return failed({
+          error: dryRunHeadError,
+          note: patchResolution.note,
+        });
       }
       const dryRunId = `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
       const dryRunWorktreePath = buildRuntimeTempPath({
@@ -1387,15 +1372,9 @@ async function applyProjectPatch(params: {
         { cwd: params.repoCwd, timeout: 60 }
       );
       if (addResult.exitCode !== 0) {
-        return {
-          success: false,
-          projectResult: {
-            projectPath: params.projectArtifact.projectPath,
-            projectName: params.projectArtifact.projectName,
-            status: "failed",
-            error: addResult.stderr.trim() || addResult.stdout.trim() || "git worktree add failed",
-          },
-        };
+        return failed({
+          error: addResult.stderr.trim() || addResult.stdout.trim() || "git worktree add failed",
+        });
       }
 
       try {
@@ -1426,24 +1405,18 @@ async function applyProjectPatch(params: {
           });
           const failedPatchSubject = parseFailedPatchSubjectFromGitAmOutput(errorOutput);
 
-          return {
-            success: false,
-            projectResult: {
-              projectPath: params.projectArtifact.projectPath,
-              projectName: params.projectArtifact.projectName,
-              status: "failed",
-              conflictPaths,
-              failedPatchSubject,
-              error:
-                errorOutput.length > 0
-                  ? errorOutput
-                  : `git am failed (exitCode=${amResult.exitCode})`,
-              note: mergeNotes(
-                patchResolution.note,
-                "Dry run failed; the patch does not apply cleanly against the current HEAD. If this is a parent integration workspace, do not attempt a real apply here; delegate conflict resolution to a sub-agent that can replay and resolve the patch. Dedicated reconciliation workspaces can proceed with real apply plus manual conflict resolution (`git am --continue` / `git am --abort`)."
-              ),
-            },
-          };
+          return failed({
+            conflictPaths,
+            failedPatchSubject,
+            error:
+              errorOutput.length > 0
+                ? errorOutput
+                : `git am failed (exitCode=${amResult.exitCode})`,
+            note: mergeNotes(
+              patchResolution.note,
+              "Dry run failed; the patch does not apply cleanly against the current HEAD. If this is a parent integration workspace, do not attempt a real apply here; delegate conflict resolution to a sub-agent that can replay and resolve the patch. Dedicated reconciliation workspaces can proceed with real apply plus manual conflict resolution (`git am --continue` / `git am --abort`)."
+            ),
+          });
         }
 
         const appliedCommits = await getAppliedCommits({
@@ -1556,20 +1529,14 @@ async function applyProjectPatch(params: {
       gitPrefix,
     });
     if (dirtyOverlap != null) {
-      return {
-        success: false,
-        projectResult: {
-          projectPath: params.projectArtifact.projectPath,
-          projectName: params.projectArtifact.projectName,
-          status: "failed",
-          error: dirtyOverlap.error,
-          conflictPaths: dirtyOverlap.conflictPaths,
-          note: mergeNotes(
-            patchResolution.note,
-            "Commit or stash local changes on overlapping patch paths before applying. Unrelated dirty files can remain in place."
-          ),
-        },
-      };
+      return failed({
+        error: dirtyOverlap.error,
+        conflictPaths: dirtyOverlap.conflictPaths,
+        note: mergeNotes(
+          patchResolution.note,
+          "Commit or stash local changes on overlapping patch paths before applying. Unrelated dirty files can remain in place."
+        ),
+      });
     }
 
     const applyHeadError = await checkExpectedHead({
@@ -1579,16 +1546,10 @@ async function applyProjectPatch(params: {
       gitPrefix,
     });
     if (applyHeadError != null) {
-      return {
-        success: false,
-        projectResult: {
-          projectPath: params.projectArtifact.projectPath,
-          projectName: params.projectArtifact.projectName,
-          status: "failed",
-          error: applyHeadError,
-          note: patchResolution.note,
-        },
-      };
+      return failed({
+        error: applyHeadError,
+        note: patchResolution.note,
+      });
     }
 
     const beforeHeadSha = await tryRevParseHead({
@@ -1627,19 +1588,13 @@ async function applyProjectPatch(params: {
           ? "git am stopped in conflict-recovery state. Resolve conflicts/issues and run `git am --continue`, or run `git am --abort` to restore a clean working tree and delegate resolution to a sub-agent."
           : "git am failed before entering conflict-recovery state. Review the error output above and fix the patch/input before retrying.";
 
-      return {
-        success: false,
-        projectResult: {
-          projectPath: params.projectArtifact.projectPath,
-          projectName: params.projectArtifact.projectName,
-          status: "failed",
-          conflictPaths,
-          failedPatchSubject,
-          error:
-            errorOutput.length > 0 ? errorOutput : `git am failed (exitCode=${amResult.exitCode})`,
-          note: mergeNotes(patchResolution.note, conflictRecoveryNote),
-        },
-      };
+      return failed({
+        conflictPaths,
+        failedPatchSubject,
+        error:
+          errorOutput.length > 0 ? errorOutput : `git am failed (exitCode=${amResult.exitCode})`,
+        note: mergeNotes(patchResolution.note, conflictRecoveryNote),
+      });
     }
 
     const headCommitSha = await tryRevParseHead({

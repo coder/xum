@@ -193,6 +193,28 @@ export interface DiscoverAgentPluginsResult {
   diagnostics: AgentPluginDiagnostic[];
 }
 
+/**
+ * Record a plugin/component failure (§11.3): warn once with the owning plugin
+ * directory for operator context, then surface the same text as a diagnostic.
+ */
+function pushErrorDiagnostic(args: {
+  diagnostics: AgentPluginDiagnostic[];
+  /** Plugin directory used as the log prefix (context for the operator). */
+  pluginPath: string;
+  /** Path the diagnostic refers to; may be a component inside the plugin. */
+  path: string;
+  scope: AgentPluginScope;
+  message: string;
+}): void {
+  log.warn(`Agent plugin ${args.pluginPath}: ${args.message}`);
+  args.diagnostics.push({
+    path: args.path,
+    scope: args.scope,
+    severity: "error",
+    message: args.message,
+  });
+}
+
 async function listChildDirectories(containerPath: string): Promise<string[]> {
   try {
     const entries = await fsPromises.readdir(containerPath, { withFileTypes: true });
@@ -236,11 +258,11 @@ async function resolveComponentPath(args: {
     }
 
     const message = `${args.componentLabel} resolves outside the plugin root; ignoring this component: ${getErrorMessage(error)}`;
-    log.warn(`Agent plugin ${args.rootReal}: ${message}`);
-    args.diagnostics.push({
+    pushErrorDiagnostic({
+      diagnostics: args.diagnostics,
+      pluginPath: args.rootReal,
       path: candidate,
       scope: args.scope,
-      severity: "error",
       message,
     });
     return undefined;
@@ -256,11 +278,11 @@ async function resolveComponentPath(args: {
   const kindOk = args.expectKind === "file" ? stat.isFile() : stat.isDirectory();
   if (!kindOk) {
     const message = `${args.componentLabel} must be a ${args.expectKind === "file" ? "regular file" : "directory"}; ignoring this component`;
-    log.warn(`Agent plugin ${args.rootReal}: ${message}`);
-    args.diagnostics.push({
+    pushErrorDiagnostic({
+      diagnostics: args.diagnostics,
+      pluginPath: args.rootReal,
       path: candidate,
       scope: args.scope,
-      severity: "error",
       message,
     });
     return undefined;
@@ -291,8 +313,7 @@ async function discoverPluginAt(args: {
   const { pluginDir, scope, diagnostics } = args;
 
   const pushError = (targetPath: string, message: string): void => {
-    log.warn(`Agent plugin ${pluginDir}: ${message}`);
-    diagnostics.push({ path: targetPath, scope, severity: "error", message });
+    pushErrorDiagnostic({ diagnostics, pluginPath: pluginDir, path: targetPath, scope, message });
   };
 
   // The canonical plugin root anchors every §4.1 containment check.

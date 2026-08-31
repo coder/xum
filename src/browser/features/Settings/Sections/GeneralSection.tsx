@@ -480,16 +480,25 @@ export function GeneralSection() {
     setEditorConfig((prev) => ({ ...normalizeEditorConfig(prev), customCommand }));
   };
 
+  // Every badge edit patches a single field onto the normalized previous
+  // config. Funnel them through one helper so the normalize-then-spread step
+  // is stated once and cannot drift between fields — persisted configs may
+  // predate a field, so normalizing before the patch is what keeps the stored
+  // value whole.
+  const patchTerminalBadgeConfig = (patch: Partial<TerminalBadgeConfig>) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), ...patch }));
+  };
+
   const handleTerminalBadgeEnabledChange = (enabled: boolean) => {
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), enabled }));
+    patchTerminalBadgeConfig({ enabled });
   };
 
   const handleTerminalBadgeTemplateChange = (template: string) => {
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), template }));
+    patchTerminalBadgeConfig({ template });
   };
 
   const handleTerminalBadgePositionChange = (position: TerminalBadgePosition) => {
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), position }));
+    patchTerminalBadgeConfig({ position });
   };
 
   const handleTerminalBadgeOpacityChange = (rawValue: string) => {
@@ -498,10 +507,7 @@ export function GeneralSection() {
       return;
     }
 
-    setTerminalBadgeConfig((prev) => ({
-      ...normalizeTerminalBadgeConfig(prev),
-      opacity: parsed / 100,
-    }));
+    patchTerminalBadgeConfig({ opacity: parsed / 100 });
   };
 
   const handleTerminalBadgeFontSizeChange = (rawValue: string) => {
@@ -510,7 +516,7 @@ export function GeneralSection() {
       return;
     }
 
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), fontSize: parsed }));
+    patchTerminalBadgeConfig({ fontSize: parsed });
   };
 
   const handleSshHostChange = useCallback(

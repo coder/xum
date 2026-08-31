@@ -151,6 +151,11 @@ function WorkspaceBranchControls(props: {
   );
 }
 
+// Shared by the footer's interactive pills (repository link, "Last prompt") so they keep reading as
+// one affordance family: restyling one silently drifting from the other is the failure mode here.
+const FOOTER_PILL_CLASS =
+  "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 shrink-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1";
+
 function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: string }) {
   const workspacePR = useWorkspacePR(props.workspaceId);
 
@@ -169,7 +174,7 @@ function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: strin
           target="_blank"
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
-          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 shrink-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
+          className={FOOTER_PILL_CLASS}
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
           <span className="font-mono">{slug}</span>
@@ -320,7 +325,8 @@ function FooterLastPrompt(props: { workspaceId: string }) {
           <PopoverTrigger asChild>
             <button
               type="button"
-              className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 shrink-0 cursor-pointer items-center gap-1 rounded-md border-0 bg-transparent px-1.5 transition-colors focus-visible:ring-1"
+              // The extra classes are <button> resets; the pill styling itself is shared.
+              className={cn(FOOTER_PILL_CLASS, "cursor-pointer border-0 bg-transparent")}
               data-testid="workspace-footer-last-prompt"
               onKeyDown={stopKeyboardPropagation}
             >

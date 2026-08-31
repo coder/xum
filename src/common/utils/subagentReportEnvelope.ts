@@ -1,3 +1,4 @@
+import type { MuxMessage } from "@/common/types/message";
 import { THINKING_LEVELS, type ThinkingLevel } from "@/common/types/thinking";
 
 export type SubagentReportStatus = "in_progress" | "completed";
@@ -168,4 +169,18 @@ export function parseSubagentReportEnvelope(content: string): SubagentReportEnve
 
 export function isCompletedSubagentReportEnvelope(content: string): boolean {
   return parseSubagentReportEnvelope(content)?.status === "completed";
+}
+
+/**
+ * Report envelopes reach history as synthetic user messages whose framing lives in the text parts.
+ * Every history scanner (terminal-attention suppression, sibling report discovery, retry gating)
+ * needs the same "concatenate every text part, then parse" projection, so keep that reconstruction
+ * beside the parser it feeds instead of re-inlining it per call site.
+ */
+export function parseSubagentReportFromMessage(message: MuxMessage): SubagentReportEnvelope | null {
+  const text = message.parts
+    .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+  return parseSubagentReportEnvelope(text);
 }

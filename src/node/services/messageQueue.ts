@@ -77,6 +77,20 @@ function isAgentPeerMessageMetadata(meta: unknown): boolean {
   return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
 }
 
+// Bash-monitor wake metadata. Only `type` is declared/validated because callers
+// just need to recognize a wake, not read its records. Shared with AgentSession
+// so the queue-head check and the mid-dispatch check cannot drift on how a wake
+// is identified (see AgentSession.hasPendingBashMonitorWakeContinuation).
+export interface BashMonitorWakeMetadata {
+  type: "bash-monitor-wake";
+}
+
+export function isBashMonitorWakeMetadata(meta: unknown): meta is BashMonitorWakeMetadata {
+  if (typeof meta !== "object" || meta === null) return false;
+  const obj = meta as Record<string, unknown>;
+  return obj.type === "bash-monitor-wake";
+}
+
 // Type guard for metadata with reviews
 interface MetadataWithReviews {
   reviews?: ReviewNoteData[];
@@ -332,9 +346,7 @@ export class MessageQueue {
    * supersedes the turn when it dispatches.
    */
   isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
-    if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
-    return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
+    return isBashMonitorWakeMetadata(this.entries[0]?.muxMetadata);
   }
 
   /**
@@ -726,18 +738,27 @@ export class MessageQueue {
   }
 
   /**
+   * Project a single entry's cancellation callbacks into the clear-callback shape.
+   * Shared by full-queue clears and targeted workspace-turn removal so both notify
+   * the same callback set.
+   */
+  private entryClearCallbacks(entry: QueueEntry): QueueClearCallbacks {
+    return {
+      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+      ...(entry.onAcceptedPreStreamFailure != null
+        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+        : {}),
+    };
+  }
+
+  /**
    * Cancellation callbacks for every pending entry, in queue order.
    * Callers must notify each one when clearing the queue.
    */
   getClearCallbacks(): QueueClearCallbacks[] {
     return this.entries
       .filter((entry) => entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null)
-      .map((entry) => ({
-        ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-        ...(entry.onAcceptedPreStreamFailure != null
-          ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-          : {}),
-      }));
+      .map((entry) => this.entryClearCallbacks(entry));
   }
 
   /**
@@ -757,12 +778,7 @@ export class MessageQueue {
       return null;
     }
     const [entry] = this.entries.splice(index, 1);
-    return {
-      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-      ...(entry.onAcceptedPreStreamFailure != null
-        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-        : {}),
-    };
+    return this.entryClearCallbacks(entry);
   }
 
   /** Remove queued entries carrying a dedupe key with the given prefix. */
@@ -776,9 +792,11 @@ export class MessageQueue {
     let removedCount = 0;
     const removedCallbacks: QueueClearCallbacks[] = [];
     this.entries = this.entries.flatMap((entry) => {
-      const matchingKeys = [...entry.dedupeKeys].filter((dedupeKey) =>
-        dedupeKey.startsWith(prefix)
-      );
+      // Snapshot the dedupe keys once: the message-index lookup below would otherwise
+      // re-spread the Set on every message iteration. The Set is not mutated until after
+      // keptMessages is computed, so both reads observe the same ordered snapshot.
+      const dedupeKeyList = [...entry.dedupeKeys];
+      const matchingKeys = dedupeKeyList.filter((dedupeKey) => dedupeKey.startsWith(prefix));
       if (matchingKeys.length === 0) {
         return [entry];
       }
@@ -788,7 +806,7 @@ export class MessageQueue {
       // preserve unrelated keys/messages that share the same entry.
       const matchingKeySet = new Set(matchingKeys);
       const keptMessages = entry.messages.filter((_message, index) => {
-        const key = [...entry.dedupeKeys][index];
+        const key = dedupeKeyList[index];
         return key == null || !matchingKeySet.has(key);
       });
       if (keptMessages.length > 0) {

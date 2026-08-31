@@ -32,6 +32,15 @@ function filterAndMapSuggestions<T extends SuggestionDefinition>(
     .map((definition) => build(definition));
 }
 
+/**
+ * Command replacements end in a space so the caret lands where arguments go; a definition opts out
+ * with `appendSpace: false` when the command is complete on its own.
+ */
+function buildCommandReplacement(base: string, definition: SuggestionDefinition): string {
+  const appendSpace = definition.appendSpace ?? true;
+  return `${base}${appendSpace ? " " : ""}`;
+}
+
 function buildTopLevelSuggestions(
   partial: string,
   context: SlashSuggestionContext
@@ -40,13 +49,12 @@ function buildTopLevelSuggestions(
     COMMAND_DEFINITIONS,
     partial,
     (definition) => {
-      const appendSpace = definition.appendSpace ?? true;
-      const replacement = `/${definition.key}${appendSpace ? " " : ""}`;
+      const display = `/${definition.key}`;
       return {
         id: `command:${definition.key}`,
-        display: `/${definition.key}`,
+        display,
         description: definition.description,
-        replacement,
+        replacement: buildCommandReplacement(display, definition),
       };
     },
     (definition) => isSlashCommandVisible(definition, context)
@@ -165,14 +173,13 @@ function buildSubcommandSuggestions(
     subcommands,
     partial,
     (definition) => {
-      const appendSpace = definition.appendSpace ?? true;
       const replacementTokens = [...prefixTokens, definition.key];
       const replacementBase = `/${replacementTokens.join(" ")}`;
       return {
         id: `command:${replacementTokens.join(":")}`,
         display: definition.key,
         description: definition.description,
-        replacement: `${replacementBase}${appendSpace ? " " : ""}`,
+        replacement: buildCommandReplacement(replacementBase, definition),
       };
     },
     (definition) => isSlashCommandVisible(definition, context)

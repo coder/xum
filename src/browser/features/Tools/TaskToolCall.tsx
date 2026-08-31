@@ -1282,13 +1282,15 @@ export const TaskAwaitToolCall: React.FC<TaskAwaitToolCallProps> = ({
       const resolvedAgentType = isWorkspaceTurn
         ? "workspace"
         : resolvePersistedAgentId(metadata, "");
+      // The empty fallback above means "no persisted agent id", so normalize it to undefined once
+      // here and let the row omit the agent badge entirely.
       const agentType = resolvedAgentType.length > 0 ? resolvedAgentType : undefined;
       const title = metadata.title?.trim().length ? metadata.title : metadata.name;
 
       awaitedRows.push({
         taskId,
         status: metadata.taskStatus ?? "waiting",
-        agentType: agentType && agentType.length > 0 ? agentType : undefined,
+        agentType,
         title,
         depth:
           workspaceId && workspaceMetadata

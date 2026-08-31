@@ -492,6 +492,14 @@ export interface BashMonitorWakePromptContext {
   taskAwaitable?: boolean;
 }
 
+/**
+ * Prefix each line with Markdown blockquote syntax (`> `) and join with newlines. Used for both
+ * the matched output and the lost-monitor script rendered in buildBashMonitorWakePrompt.
+ */
+function blockquoteLines(lines: readonly string[]): string {
+  return lines.map((line) => `> ${line}`).join("\n");
+}
+
 export function buildBashMonitorWakePrompt(
   records: readonly BashMonitorWakeRecord[],
   context?: ReadonlyMap<string, BashMonitorWakePromptContext>
@@ -517,20 +525,14 @@ export function buildBashMonitorWakePrompt(
   const sections = records.map((record) => {
     const displayName = record.displayName ?? record.processId;
     const monitorLine = `Monitor: /${record.filter}/${record.filterExclude ? " (inverted)" : ""}`;
-    const lines = record.lines
-      .map(sanitizeBashMonitorWakeLine)
-      .map((line) => `> ${line}`)
-      .join("\n");
+    const lines = blockquoteLines(record.lines.map(sanitizeBashMonitorWakeLine));
     const dropped =
       record.droppedLines > 0 ? `\nDropped matched lines: ${record.droppedLines}` : "";
 
     if (record.kind === "monitor-lost") {
       // The script is agent-authored (it wrote the bash call), so it is not marked
       // untrusted; any matched output lines keep the untrusted marker.
-      const script = (record.script ?? "")
-        .split("\n")
-        .map((line) => `> ${line}`)
-        .join("\n");
+      const script = blockquoteLines((record.script ?? "").split("\n"));
       const matchedOutputLabel =
         record.lostReason === "runtime-failure"
           ? "Matched output before monitor retirement"

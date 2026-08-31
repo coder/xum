@@ -48,6 +48,24 @@ function collectFlatSectionRows(
 }
 
 /**
+ * Resolve the pinned block for a flat-rendered section (multi-project or
+ * scratch). Both render as a single block regardless of source bucket, so the
+ * block's `fullOrder` and `blockIds` are identical: every pinned id of the
+ * section, in rendered order. Returns null when `meta` is not one of them.
+ */
+function locateFlatSectionPinnedBlock(
+  meta: FrontendWorkspaceMetadata,
+  sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
+  includeRow: (row: FrontendWorkspaceMetadata) => boolean
+): PinnedBlock | null {
+  const pinnedIds = collectFlatSectionRows(sortedWorkspacesByProject, includeRow)
+    .filter(isWorkspacePinned)
+    .map((row) => row.id);
+  if (!pinnedIds.includes(meta.id)) return null;
+  return { fullOrder: pinnedIds, blockIds: pinnedIds };
+}
+
+/**
  * Resolve the pinned block containing `meta`, mirroring the sidebar renderer:
  * multi-project rows form one flat block; regular rows partition by their
  * effective section. Returns null when the workspace is not a rendered pinned
@@ -65,22 +83,15 @@ export function locatePinnedBlock(
   // partitioning below would isolate every row into a block of one and
   // swallow reorders. Treat them like the multi-project section instead.
   if (meta.kind === "scratch") {
-    const pinnedIds = collectFlatSectionRows(
+    return locateFlatSectionPinnedBlock(
+      meta,
       sortedWorkspacesByProject,
       (row) => row.kind === "scratch"
-    )
-      .filter(isWorkspacePinned)
-      .map((row) => row.id);
-    if (!pinnedIds.includes(meta.id)) return null;
-    return { fullOrder: pinnedIds, blockIds: pinnedIds };
+    );
   }
 
   if (isMultiProject(meta)) {
-    const pinnedIds = collectFlatSectionRows(sortedWorkspacesByProject, isMultiProject)
-      .filter(isWorkspacePinned)
-      .map((row) => row.id);
-    if (!pinnedIds.includes(meta.id)) return null;
-    return { fullOrder: pinnedIds, blockIds: pinnedIds };
+    return locateFlatSectionPinnedBlock(meta, sortedWorkspacesByProject, isMultiProject);
   }
 
   const rows = sortedWorkspacesByProject.get(meta.projectPath) ?? [];

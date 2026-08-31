@@ -531,12 +531,16 @@ export function summarizeOperationalBundle(
   };
 }
 
-function isTaskAwaitMessage(message: OperationalBundleMemberMessage): boolean {
+// Type predicate so the task_await helpers below can read tool-only fields (status, result)
+// after a single shared shape check instead of repeating the type/toolName test.
+function isTaskAwaitMessage(
+  message: OperationalBundleMemberMessage
+): message is Extract<DisplayedMessage, { type: "tool" }> {
   return message.type === "tool" && message.toolName === "task_await";
 }
 
 function getTaskAwaitResultEntries(message: OperationalBundleMemberMessage): object[] {
-  if (message.type !== "tool" || message.toolName !== "task_await") return [];
+  if (!isTaskAwaitMessage(message)) return [];
 
   const result = unwrapJsonResult(message.result);
   if (!isPlainObject(result) || !Array.isArray(result.results)) return [];
@@ -571,7 +575,7 @@ function hasTaskAwaitResultFailure(message: OperationalBundleMemberMessage): boo
 }
 
 function hasTaskAwaitCallFailure(message: OperationalBundleMemberMessage): boolean {
-  if (message.type !== "tool" || message.toolName !== "task_await") return false;
+  if (!isTaskAwaitMessage(message)) return false;
   if (message.status === "failed") return true;
 
   const result = unwrapJsonResult(message.result);
@@ -579,9 +583,7 @@ function hasTaskAwaitCallFailure(message: OperationalBundleMemberMessage): boole
 }
 
 function hasTaskAwaitCallInterruption(message: OperationalBundleMemberMessage): boolean {
-  return (
-    message.type === "tool" && message.toolName === "task_await" && message.status === "interrupted"
-  );
+  return isTaskAwaitMessage(message) && message.status === "interrupted";
 }
 
 function hasTaskAwaitTerminalIssue(messages: readonly OperationalBundleMemberMessage[]): boolean {

@@ -44,6 +44,7 @@ import type { ServiceTier } from "../common/config/schemas/providersConfig";
 import { createDisplayUsage } from "../common/utils/tokens/displayUsage";
 import {
   getTotalCost,
+  getTotalTokens,
   formatCostWithDollar,
   sumUsageHistory,
   type ChatUsageDisplay,
@@ -994,6 +995,17 @@ async function main(): Promise<number> {
   // Budget tracking state
   let budgetExceeded = false;
 
+  // Three separate budget checks (stream-end, sub-agent usage roll-up, and usage-delta) all
+  // report an exceeded budget the same way; only whether the stream still needs interrupting
+  // differs. Share the reporting so the JSON event and the human-readable line cannot drift.
+  const reportBudgetExceeded = (cost: number, budgetLimit: number): void => {
+    budgetExceeded = true;
+    emitJsonLine({ type: "budget-exceeded", spent: cost, budget: budgetLimit });
+    writeHumanLineClosed(
+      `\n${chalk.yellow(`Budget exceeded ($${cost.toFixed(2)} of $${budgetLimit.toFixed(2)}) - stopping`)}`
+    );
+  };
+
   // Centralized output type tracking for spacing
   type OutputType = "none" | "text" | "thinking" | "tool";
   let lastOutputType: OutputType = "none";
@@ -1300,14 +1312,7 @@ async function main(): Promise<number> {
         if (budget !== undefined && !budgetExceeded) {
           const totalUsage = sumUsageHistory(usageHistory);
           const cost = getTotalCost(totalUsage);
-          const hasTokens = totalUsage
-            ? totalUsage.input.tokens +
-                totalUsage.output.tokens +
-                totalUsage.cached.tokens +
-                totalUsage.cacheCreate.tokens +
-                totalUsage.reasoning.tokens >
-              0
-            : false;
+          const hasTokens = getTotalTokens(totalUsage) > 0;
 
           if (hasTokens && cost === undefined) {
             const errMsg = `Cannot enforce budget: unknown pricing for model "${payload.metadata.model ?? model}"`;
@@ -1321,10 +1326,7 @@ async function main(): Promise<number> {
           }
 
           if (cost !== undefined && cost > budget) {
-            budgetExceeded = true;
-            const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
-            emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
-            writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
+            reportBudgetExceeded(cost, budget);
             // Don't interrupt - stream is already ending
           }
         }
@@ -1358,10 +1360,7 @@ async function main(): Promise<number> {
         }
 
         if (cost !== undefined && cost > budget) {
-          budgetExceeded = true;
-          const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
-          emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
-          writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
+          reportBudgetExceeded(cost, budget);
           void session.interruptStream({ abandonPartial: false });
         }
       }
@@ -1390,14 +1389,7 @@ async function main(): Promise<number> {
         // Reject if model has unknown pricing: displayUsage exists with tokens but cost is undefined
         // (createDisplayUsage doesn't set hasUnknownCosts; that's only set by sumUsageHistory)
         // Include all token types: input, output, cached, cacheCreate, and reasoning
-        const hasTokens =
-          displayUsage &&
-          displayUsage.input.tokens +
-            displayUsage.output.tokens +
-            displayUsage.cached.tokens +
-            displayUsage.cacheCreate.tokens +
-            displayUsage.reasoning.tokens >
-            0;
+        const hasTokens = getTotalTokens(displayUsage) > 0;
         if (hasTokens && cost === undefined) {
           const errMsg = `Cannot enforce budget: unknown pricing for model "${model}"`;
           emitJsonLine({ type: "budget-error", error: errMsg, model });
@@ -1406,10 +1398,7 @@ async function main(): Promise<number> {
         }
 
         if (cost !== undefined && cost > budget) {
-          budgetExceeded = true;
-          const msg = `Budget exceeded ($${cost.toFixed(2)} of $${budget.toFixed(2)}) - stopping`;
-          emitJsonLine({ type: "budget-exceeded", spent: cost, budget });
-          writeHumanLineClosed(`\n${chalk.yellow(msg)}`);
+          reportBudgetExceeded(cost, budget);
           void session.interruptStream({ abandonPartial: false });
         }
       }

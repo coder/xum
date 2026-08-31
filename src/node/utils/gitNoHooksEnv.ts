@@ -148,6 +148,23 @@ const REPO_AUTOMATION_CONFIG_KEY_REGEX =
   /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs|proxy)$/i;
 const MAX_REPO_AUTOMATION_DRIVERS = 128;
 
+/**
+ * Write one numbered `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` override pair and return the next
+ * index. Every override append goes through this so the key/value suffixes can never drift apart
+ * from each other or from the `GIT_CONFIG_COUNT` the callers write at the end: a mismatched pair
+ * would silently drop a repo-automation override git is supposed to neutralize.
+ */
+function appendGitConfigOverride(
+  env: Record<string, string>,
+  index: number,
+  key: string,
+  value: string
+): number {
+  env["GIT_CONFIG_KEY_" + index] = key;
+  env["GIT_CONFIG_VALUE_" + index] = value;
+  return index + 1;
+}
+
 function appendDisabledRepoAutomationDrivers(
   env: Record<string, string>,
   configEntries: Iterable<string>
@@ -217,14 +234,10 @@ function appendDisabledRepoAutomationDrivers(
 
   let configIndex = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
   for (const key of [...exactKeys].sort()) {
-    env["GIT_CONFIG_KEY_" + configIndex] = key;
-    env["GIT_CONFIG_VALUE_" + configIndex] = "";
-    configIndex += 1;
+    configIndex = appendGitConfigOverride(env, configIndex, key, "");
   }
   if (hasDiffExternal) {
-    env["GIT_CONFIG_KEY_" + configIndex] = "diff.external";
-    env["GIT_CONFIG_VALUE_" + configIndex] = "";
-    configIndex += 1;
+    configIndex = appendGitConfigOverride(env, configIndex, "diff.external", "");
   }
   for (const { kind, name } of [...drivers.values()].sort((a, b) =>
     (a.kind + "\0" + a.name).localeCompare(b.kind + "\0" + b.name)
@@ -251,9 +264,12 @@ function appendDisabledRepoAutomationDrivers(
                 ["proxy", ""],
               ] as const);
     for (const [field, value] of fields) {
-      env["GIT_CONFIG_KEY_" + configIndex] = kind + "." + name + "." + field;
-      env["GIT_CONFIG_VALUE_" + configIndex] = value;
-      configIndex += 1;
+      configIndex = appendGitConfigOverride(
+        env,
+        configIndex,
+        kind + "." + name + "." + field,
+        value
+      );
     }
   }
   env.GIT_CONFIG_COUNT = String(configIndex);
@@ -295,9 +311,7 @@ export function combineGitNoRepoAutomationEnvs(
   }
   let index = baseCount;
   for (const [key, value] of [...overrides].sort(([a], [b]) => a.localeCompare(b))) {
-    env["GIT_CONFIG_KEY_" + index] = key;
-    env["GIT_CONFIG_VALUE_" + index] = value;
-    index += 1;
+    index = appendGitConfigOverride(env, index, key, value);
   }
   env.GIT_CONFIG_COUNT = String(index);
   return env;

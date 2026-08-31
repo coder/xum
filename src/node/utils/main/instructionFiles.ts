@@ -66,15 +66,27 @@ function createRuntimeFileReader(runtime: Runtime): FileReader {
 
 type ReadInstructionFileResult = { exists: false } | { exists: true; file: InstructionFile | null };
 
+/**
+ * Metadata stamped onto a file read by {@link readSingleFile}. Named fields keep
+ * call sites readable: the flags are otherwise indistinguishable positional
+ * booleans.
+ */
+interface InstructionFileTags {
+  scope: InstructionScope;
+  /** True for `.local.md` companions that layer on top of a base file. */
+  isLocal: boolean;
+  /** Project name (only meaningful for "project" scope). */
+  projectName: string | undefined;
+  /** True when the file is Xum-dedicated, so scoped Model:/Mode: directives apply. */
+  xumOnly: boolean;
+}
+
 /** Read a single instruction file via the given reader, returning structured info. */
 async function readSingleFile(
   reader: FileReader,
   directory: string,
   filename: string,
-  scope: InstructionScope,
-  isLocal: boolean,
-  projectName: string | undefined,
-  xumOnly: boolean
+  tags: InstructionFileTags
 ): Promise<ReadInstructionFileResult> {
   let raw: string;
   try {
@@ -89,10 +101,10 @@ async function readSingleFile(
     file: {
       path: path.join(directory, filename),
       filename,
-      isLocal,
-      xumOnly,
-      scope,
-      projectName: projectName ?? null,
+      isLocal: tags.isLocal,
+      xumOnly: tags.xumOnly,
+      scope: tags.scope,
+      projectName: tags.projectName ?? null,
       content: sanitized,
       bytes: Buffer.byteLength(sanitized, "utf-8"),
       tokens: null,
@@ -104,20 +116,10 @@ async function readSingleFile(
 async function readBaseInstructionFile(
   reader: FileReader,
   directory: string,
-  scope: InstructionScope,
-  projectName: string | undefined,
-  xumOnly: boolean
+  tags: Omit<InstructionFileTags, "isLocal">
 ): Promise<ReadInstructionFileResult> {
   for (const filename of INSTRUCTION_FILE_NAMES) {
-    const result = await readSingleFile(
-      reader,
-      directory,
-      filename,
-      scope,
-      false,
-      projectName,
-      xumOnly
-    );
+    const result = await readSingleFile(reader, directory, filename, { ...tags, isLocal: false });
     // Existence, not post-comment content, decides base-file priority. This
     // preserves the historical behavior where an AGENTS.md containing only
     // comments still enables AGENTS.local.md and prevents lower-priority
@@ -146,18 +148,19 @@ async function readInstructionSetWith(
   // are honored there and we must not look for a nested ~/.xum/.xum/AGENTS.md.
   const isGlobalScope = scope === INSTRUCTION_SCOPE.GLOBAL;
 
-  const base = await readBaseInstructionFile(reader, directory, scope, projectName, isGlobalScope);
+  const base = await readBaseInstructionFile(reader, directory, {
+    scope,
+    projectName,
+    xumOnly: isGlobalScope,
+  });
 
   const local = base.exists
-    ? await readSingleFile(
-        reader,
-        directory,
-        LOCAL_INSTRUCTION_FILENAME,
+    ? await readSingleFile(reader, directory, LOCAL_INSTRUCTION_FILENAME, {
         scope,
-        true,
+        isLocal: true,
         projectName,
-        isGlobalScope
-      )
+        xumOnly: isGlobalScope,
+      })
     : ({ exists: false } satisfies ReadInstructionFileResult);
 
   // Read one Xum-dedicated companion tree, preferring .xum and falling back
@@ -167,24 +170,18 @@ async function readInstructionSetWith(
   if (!isGlobalScope) {
     for (const relativeDirectory of listProjectMetadataRelativePaths("")) {
       const dedicatedDirectory = path.join(directory, relativeDirectory);
-      dedicatedBase = await readSingleFile(
-        reader,
-        dedicatedDirectory,
-        XUM_INSTRUCTION_FILENAME,
+      dedicatedBase = await readSingleFile(reader, dedicatedDirectory, XUM_INSTRUCTION_FILENAME, {
         scope,
-        false,
+        isLocal: false,
         projectName,
-        true
-      );
+        xumOnly: true,
+      });
       if (!dedicatedBase.exists) continue;
       dedicatedLocal = await readSingleFile(
         reader,
         dedicatedDirectory,
         LOCAL_INSTRUCTION_FILENAME,
-        scope,
-        true,
-        projectName,
-        true
+        { scope, isLocal: true, projectName, xumOnly: true }
       );
       break;
     }
@@ -253,10 +250,13 @@ export async function readClaudeCompatGlobalInstructionSet(
     createLocalFileReader(),
     resolvedDirectory,
     CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME,
-    INSTRUCTION_SCOPE.GLOBAL,
-    false,
-    undefined,
-    false
+    {
+      scope: INSTRUCTION_SCOPE.GLOBAL,
+      isLocal: false,
+      projectName: undefined,
+      // Shared with Claude Code, so scoped Model:/Mode: headings stay plain markdown.
+      xumOnly: false,
+    }
   );
   if (!result.exists || !result.file) return null;
 

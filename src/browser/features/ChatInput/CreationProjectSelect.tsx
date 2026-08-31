@@ -6,12 +6,33 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import type { ProjectConfig } from "@/common/types/project";
+import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
+
+export interface CreationProjectOption {
+  value: string;
+  label: string;
+}
+
+/**
+ * Every user project as picker options, labeled with the same hierarchy label
+ * the trigger uses so sub-projects read as "parent/child" in both places.
+ * Shared so callers that prepend extra entries (e.g. Scratch) stay consistent.
+ */
+export function projectSelectOptions(
+  userProjects: Map<string, ProjectConfig>
+): CreationProjectOption[] {
+  return Array.from(userProjects.keys()).map((path) => ({
+    value: path,
+    label: formatProjectHierarchyLabel(path, userProjects),
+  }));
+}
 
 interface CreationProjectSelectProps {
   selected: string;
   selectedLabel: string;
   tooltip?: string;
-  options: Array<{ value: string; label: string }>;
+  options: CreationProjectOption[];
   onChange: (value: string) => void;
 }
 

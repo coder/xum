@@ -17,8 +17,8 @@ import {
   ToolIcon,
 } from "./Shared/ToolPrimitives";
 import {
+  extractToolErrorMessage,
   getStatusDisplay,
-  isToolErrorResult,
   unwrapResult,
   useToolExpansion,
   type ToolStatus,
@@ -117,24 +117,6 @@ const TimelineRowPreview: React.FC<{
   );
 };
 
-/**
- * Both persisted error shapes: top-level tools store `{ success: false, error }`, while a
- * failure inside a nested code_execution call is reconstructed as a bare `{ error }` with
- * no success flag.
- */
-function extractErrorMessage(result: unknown): string | null {
-  if (isToolErrorResult(result)) {
-    return result.error;
-  }
-  if (result != null && typeof result === "object" && !("success" in result)) {
-    const error = (result as Record<string, unknown>).error;
-    if (typeof error === "string") {
-      return error;
-    }
-  }
-  return null;
-}
-
 // Results flow verbatim from persisted transcripts, so validate against the schema rather
 // than trusting the shape (self-healing: a malformed result degrades to a status note).
 function extractTimelineEventSuccess(result: unknown): TimelineEventSuccess | null {
@@ -178,7 +160,7 @@ export const TimelineEventToolCall: React.FC<TimelineEventToolCallProps> = (prop
   const category = props.args.category;
   // Results can arrive wrapped in the SDK JSON container { type: "json", value: ... }.
   const result = unwrapResult(props.result);
-  const errorMessage = extractErrorMessage(result);
+  const errorMessage = extractToolErrorMessage(result);
   const success = extractTimelineEventSuccess(result);
   const blurb = category != null ? CATEGORY_PRESENTATION[category].blurb : FALLBACK_BLURB;
 

@@ -581,8 +581,8 @@ export function buildProviderOptions(
 
   // Build Moonshot-specific options
   if (formatProvider === "moonshotai") {
-    // Kimi K3 always reasons and supports only the max reasoning effort. Send it
-    // explicitly rather than relying on the API default.
+    // Send the max reasoning effort explicitly rather than relying on the API
+    // default (see isKimiK3Model for why K3 only accepts "max").
     if (isKimiK3Model(capabilityModel)) {
       const options = {
         moonshotai: { reasoningEffort: "max" },
@@ -618,9 +618,9 @@ export function buildProviderOptions(
 
   // Build OpenRouter-specific options
   if (formatProvider === "openrouter") {
-    // Kimi K3 always reasons and supports only the max reasoning effort. Send it
-    // explicitly: `enabled: true` alone falls back to OpenRouter's default (medium)
-    // effort, which the model does not support.
+    // Send the max reasoning effort explicitly: `enabled: true` alone falls back
+    // to OpenRouter's default (medium) effort, which K3 does not support (see
+    // isKimiK3Model for why K3 only accepts "max").
     const reasoningEffort = isKimiK3Model(capabilityModel)
       ? "max"
       : OPENROUTER_REASONING_EFFORT[effectiveThinking];

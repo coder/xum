@@ -125,6 +125,33 @@ export function parseCoderGatewayProviders(value: unknown): CoderGatewayProvider
 }
 
 /**
+ * Split a gateway-scoped `<instance>/<model>` ID into the gateway provider it
+ * addresses and the instance-stripped model ID. Returns null when the ID is
+ * not `<instance>/<model>` shaped (no separator, or an empty instance/model
+ * half) or when the instance resolves to no known provider — the same
+ * "cannot know the upstream" outcome both canonical-identity resolvers below
+ * report to their callers.
+ */
+function splitCoderGatewayModelId(
+  gatewayModelId: string,
+  metadata?: { discoveredProviders?: unknown; additionalProviders?: unknown }
+): { provider: CoderGatewayProvider; modelId: string } | null {
+  const separatorIndex = gatewayModelId.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
+    return null;
+  }
+  const provider = resolveCoderGatewayProvider(
+    gatewayModelId.slice(0, separatorIndex),
+    parseCoderGatewayProviders(metadata?.discoveredProviders),
+    parseCoderGatewayProviders(metadata?.additionalProviders)
+  );
+  if (!provider) {
+    return null;
+  }
+  return { provider, modelId: gatewayModelId.slice(separatorIndex + 1) };
+}
+
+/**
  * Wire-canonical identity for a Coder gateway model ID that stayed
  * gateway-scoped (custom-named instance, or an instance whose name is not a
  * canonical coder route): the origin whose payload/options/header format the
@@ -138,29 +165,21 @@ export function resolveCoderWireCanonicalModel(
   gatewayModelId: string,
   metadata?: { discoveredProviders?: unknown; additionalProviders?: unknown }
 ): { origin: "anthropic" | "openai"; modelId: string; providerType: string } | null {
-  const separatorIndex = gatewayModelId.indexOf("/");
-  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
+  const gatewayModel = splitCoderGatewayModelId(gatewayModelId, metadata);
+  if (!gatewayModel) {
     return null;
   }
-  const provider = resolveCoderGatewayProvider(
-    gatewayModelId.slice(0, separatorIndex),
-    parseCoderGatewayProviders(metadata?.discoveredProviders),
-    parseCoderGatewayProviders(metadata?.additionalProviders)
-  );
-  if (!provider) {
-    return null;
-  }
-  const wire = coderGatewayWireProtocol(provider.type);
+  const wire = coderGatewayWireProtocol(gatewayModel.provider.type);
   if (!wire) {
     return null;
   }
   return {
     origin: wire === "anthropic" ? "anthropic" : "openai",
-    modelId: gatewayModelId.slice(separatorIndex + 1),
+    modelId: gatewayModel.modelId,
     // The instance's exact type: origin collapses every OpenAI-shaped wire
     // to "openai", but some config is upstream-specific (e.g. the OpenAI ZDR
     // store flag applies to the real OpenAI Responses upstream only).
-    providerType: provider.type,
+    providerType: gatewayModel.provider.type,
   };
 }
 
@@ -179,19 +198,11 @@ export function resolveCoderMetadataCanonicalModel(
   gatewayModelId: string,
   metadata?: { discoveredProviders?: unknown; additionalProviders?: unknown }
 ): string | null {
-  const separatorIndex = gatewayModelId.indexOf("/");
-  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
+  const gatewayModel = splitCoderGatewayModelId(gatewayModelId, metadata);
+  if (!gatewayModel) {
     return null;
   }
-  const provider = resolveCoderGatewayProvider(
-    gatewayModelId.slice(0, separatorIndex),
-    parseCoderGatewayProviders(metadata?.discoveredProviders),
-    parseCoderGatewayProviders(metadata?.additionalProviders)
-  );
-  if (!provider) {
-    return null;
-  }
-  const modelId = gatewayModelId.slice(separatorIndex + 1);
+  const { provider, modelId } = gatewayModel;
   switch (provider.type) {
     case "anthropic":
     case "openai":

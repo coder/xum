@@ -3,7 +3,11 @@ import {
   parseStagedAttachmentNotice,
 } from "@/browser/features/ChatInput/stagedAttachments";
 import type { StagedChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
-import type { DisplayedMessage, ReviewNoteDataForDisplay } from "@/common/types/message";
+import type {
+  DisplayedMessage,
+  DisplayedUserMessage,
+  ReviewNoteDataForDisplay,
+} from "@/common/types/message";
 import { formatReviewForModel } from "@/common/types/review";
 import type { BashOutputToolArgs } from "@/common/types/tools";
 
@@ -92,6 +96,16 @@ export interface BashOutputGroupInfo {
   processId: string;
   /** Index of the first message in this group (used as expand/collapse key) */
   firstIndex: number;
+}
+
+/**
+ * Background monitor wakes are machine-authored events that happen to be persisted as
+ * user turns. Consumers that must tell them apart from human prompts (transcript
+ * routing, prev/next prompt navigation) have to agree on this test, so keep it here
+ * rather than re-deriving `bashMonitorWake` inline at each site.
+ */
+export function isBashMonitorWakeMessage(message: DisplayedUserMessage): boolean {
+  return message.bashMonitorWake != null;
 }
 
 interface InterruptedBarrierVisibilityOptions {

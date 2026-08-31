@@ -113,6 +113,29 @@ export const AgentSkillDescriptorSchema = z.object({
   pluginName: z.string().min(1).optional(),
 });
 
+/**
+ * Map validated SKILL.md frontmatter to the normalized AgentSkillDescriptor shape.
+ *
+ * Centralizes the frontmatter→descriptor field mapping (advertise / user-invocable /
+ * argument-hint / when-to-use normalization) so every discovery path produces byte-identical
+ * descriptors. Callers still validate the result with AgentSkillDescriptorSchema, since they
+ * handle validation failures differently (tool listing vs. diagnostics-collecting discovery).
+ */
+export function buildSkillDescriptor(
+  frontmatter: z.infer<typeof AgentSkillFrontmatterSchema>,
+  scope: z.infer<typeof AgentSkillScopeSchema>
+): z.infer<typeof AgentSkillDescriptorSchema> {
+  return {
+    name: frontmatter.name,
+    description: frontmatter.description,
+    scope,
+    advertise: resolveSkillAdvertise(frontmatter),
+    userInvocable: resolveSkillUserInvocable(frontmatter),
+    argumentHint: frontmatter["argument-hint"],
+    whenToUse: resolveSkillWhenToUse(frontmatter),
+  };
+}
+
 export const AgentSkillPackageSchema = z
   .object({
     scope: AgentSkillScopeSchema,

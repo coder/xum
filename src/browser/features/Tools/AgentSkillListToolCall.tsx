@@ -16,8 +16,8 @@ import {
   ToolIcon,
 } from "./Shared/ToolPrimitives";
 import {
+  extractToolErrorMessage,
   getStatusDisplay,
-  isToolErrorResult,
   unwrapResult,
   useToolExpansion,
   type ToolStatus,
@@ -104,14 +104,8 @@ export function toSkillListView(result: unknown): SkillListView {
   const unwrapped = unwrapResult(result);
   if (unwrapped == null || typeof unwrapped !== "object") return { kind: "none" };
 
-  if (isToolErrorResult(unwrapped)) return { kind: "error", error: unwrapped.error };
-  if (
-    !("success" in unwrapped) &&
-    "error" in unwrapped &&
-    typeof (unwrapped as { error: unknown }).error === "string"
-  ) {
-    return { kind: "error", error: (unwrapped as { error: string }).error };
-  }
+  const errorMessage = extractToolErrorMessage(unwrapped);
+  if (errorMessage != null) return { kind: "error", error: errorMessage };
 
   const parsed = SkillListSuccessSchema.safeParse(unwrapped);
   if (!parsed.success) return { kind: "none" };

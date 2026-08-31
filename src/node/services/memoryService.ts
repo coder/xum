@@ -716,6 +716,21 @@ export class MemoryService extends EventEmitter {
     return store;
   }
 
+  /**
+   * Enforce the per-scope file cap before creating a new file. Throws a
+   * MemoryCommandError with a uniform "scope is full" message when the store
+   * already holds MEMORY_MAX_FILES_PER_SCOPE files. Deduplicated from the
+   * `create` and `saveFile` (new-file) paths, which enforced this identically.
+   */
+  private async assertScopeHasRoom(store: MemoryStore, scope: MemoryScope): Promise<void> {
+    const files = await store.listFiles();
+    if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
+      throw new MemoryCommandError(
+        `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
+      );
+    }
+  }
+
   private requireFilePath(parsed: ParsedMemoryPath, virtualPath: string): MemoryScope {
     if (parsed.scope === null || parsed.relPath === "") {
       throw new MemoryCommandError(
@@ -972,12 +987,7 @@ export class MemoryService extends EventEmitter {
             `A ${existing === "dir" ? "directory" : "file"} already exists at ${virtualPath}. To overwrite a file, delete it first, then create it.`
           );
         }
-        const files = await store.listFiles();
-        if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
-          throw new MemoryCommandError(
-            `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
-          );
-        }
+        await this.assertScopeHasRoom(store, scope);
         await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
@@ -1451,12 +1461,7 @@ export class MemoryService extends EventEmitter {
             if (kind !== null) {
               return conflict(`A file already exists at ${virtualPath}; reload before saving`);
             }
-            const files = await store.listFiles();
-            if (files.length >= MEMORY_MAX_FILES_PER_SCOPE) {
-              throw new MemoryCommandError(
-                `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
-              );
-            }
+            await this.assertScopeHasRoom(store, scope);
           } else {
             if (kind === null) {
               return conflict(`${virtualPath} no longer exists; it may have been deleted`);

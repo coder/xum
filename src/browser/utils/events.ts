@@ -8,6 +8,17 @@ export function isEventFromDialogPortal(target: EventTarget | null): boolean {
 }
 
 /**
+ * `MouseEvent.button === 0` is the primary button (left button under a default layout);
+ * every other value is a secondary or auxiliary press. Click-style mousedown handlers
+ * have to gate on it so right-click, middle-click, and back/forward presses don't run
+ * primary-click behavior. Shared so call sites state that intent instead of repeating
+ * the bare magic number.
+ */
+export function isPrimaryMouseButton(event: React.MouseEvent | MouseEvent): boolean {
+  return event.button === 0;
+}
+
+/**
  * Stop keyboard event propagation for both React synthetic events and native KeyboardEvents.
  *
  * Use this when handling keyboard events in React components that need to prevent

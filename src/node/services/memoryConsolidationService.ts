@@ -17,6 +17,7 @@ import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 import { z } from "zod";
 import type { LanguageModel } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { modelCostsIncluded } from "@/node/services/providerModelFactory";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -497,6 +498,39 @@ export class MemoryConsolidationService extends EventEmitter {
   }
 
   /**
+   * Build the `recordUsage` callback shared by the consolidation and harvest
+   * sweeps. Both route the sweep's billed usage to the headless-usage sidecar
+   * and, when a row is recorded, request an ingest pass (forwarded by
+   * ServiceContainer) so sweep spend reaches dashboard totals promptly instead
+   * of stranding until an unrelated stream-end or restart.
+   */
+  private makeSweepUsageRecorder(
+    workspaceId: string,
+    modelString: string,
+    created: { model: LanguageModel; metadataModel: string },
+    analyticsSource: "memory_consolidation" | "memory_harvest"
+  ): (usage: LanguageModelV2Usage, providerMetadata?: Record<string, unknown>) => Promise<void> {
+    return async (usage, providerMetadata) => {
+      const recorded = await this.sessionUsageService?.recordHeadlessUsage(
+        workspaceId,
+        modelString,
+        usage,
+        providerMetadata,
+        {
+          costsIncluded: modelCostsIncluded(created.model),
+          analyticsSource,
+          // Creation-time identity: a catalog refresh mid-run must not
+          // re-attribute this spend (see ModelFactoryLike).
+          metadataModel: created.metadataModel,
+        }
+      );
+      if (recorded) {
+        this.emit("analyticsIngest", { workspaceId });
+      }
+    };
+  }
+
+  /**
    * Workspace-removal drain (r60): abort every in-flight dream/harvest run
    * for this workspace and await them BOUNDED. The stream abort settles a
    * run promptly, but one wedged in pre-stream awaits or tool filesystem
@@ -664,27 +698,12 @@ export class MemoryConsolidationService extends EventEmitter {
         AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
         removalSignal,
       ]),
-      recordUsage: async (usage, providerMetadata) => {
-        const recorded = await this.sessionUsageService?.recordHeadlessUsage(
-          workspaceId,
-          modelString,
-          usage,
-          providerMetadata,
-          {
-            costsIncluded: modelCostsIncluded(modelResult.data.model),
-            analyticsSource: "memory_consolidation",
-            // Creation-time identity: a catalog refresh mid-run must not
-            // re-attribute this spend (see ModelFactoryLike).
-            metadataModel: modelResult.data.metadataModel,
-          }
-        );
-        // The sidecar row only reaches dashboard totals via an explicit
-        // ingest pass; request one (forwarded by ServiceContainer) so sweep
-        // spend doesn't strand until an unrelated stream-end or restart.
-        if (recorded) {
-          this.emit("analyticsIngest", { workspaceId });
-        }
-      },
+      recordUsage: this.makeSweepUsageRecorder(
+        workspaceId,
+        modelString,
+        modelResult.data,
+        "memory_consolidation"
+      ),
     });
     // A stream failure (provider error or the run timeout) means the pass did
     // NOT cover the memory state: skip the journal record so the debounce and
@@ -821,25 +840,12 @@ export class MemoryConsolidationService extends EventEmitter {
             AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
             removalSignal,
           ]),
-          recordUsage: async (usage, providerMetadata) => {
-            const recorded = await this.sessionUsageService?.recordHeadlessUsage(
-              metadata.workspaceId,
-              modelString,
-              usage,
-              providerMetadata,
-              {
-                costsIncluded: modelCostsIncluded(modelResult.data.model),
-                analyticsSource: "memory_harvest",
-                // Creation-time identity (see ModelFactoryLike).
-                metadataModel: modelResult.data.metadataModel,
-              }
-            );
-            // Same as consolidation above: request an ingest pass so harvest
-            // spend reaches dashboard totals promptly.
-            if (recorded) {
-              this.emit("analyticsIngest", { workspaceId: metadata.workspaceId });
-            }
-          },
+          recordUsage: this.makeSweepUsageRecorder(
+            metadata.workspaceId,
+            modelString,
+            modelResult.data,
+            "memory_harvest"
+          ),
         });
         if (harvest.streamError !== undefined) {
           throw new Error(`harvest stream failed: ${harvest.streamError}`);

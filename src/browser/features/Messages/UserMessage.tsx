@@ -18,6 +18,7 @@ import {
 } from "./SubagentReportMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { MOBILE_TOUCH_MEDIA_QUERY } from "@/constants/layout";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
 import { createDownloadRetryCache } from "@/browser/utils/downloadFile";
@@ -99,8 +100,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     : visibleContent;
   const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
   const isMobileTouch =
-    typeof window !== "undefined" &&
-    window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+    typeof window !== "undefined" && window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY).matches;
 
   const apiState = React.useContext(APIContext);
   const api = apiState?.api ?? null;

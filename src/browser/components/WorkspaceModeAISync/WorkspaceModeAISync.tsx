@@ -43,7 +43,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     const modelKey = getModelKey(workspaceId);
     const thinkingKey = getThinkingLevelKey(workspaceId);
 
-    const normalizedAgentId = normalizeAgentId(agentId, "exec");
+    const normalizedAgentId = normalizeAgentId(agentId);
 
     const isExplicitAgentSwitch =
       prevAgentIdRef.current !== null &&

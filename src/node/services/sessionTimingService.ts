@@ -749,12 +749,29 @@ export class SessionTimingService {
     this.emitChange(data.workspaceId);
   }
 
-  handleStreamDelta(data: StreamDeltaEvent): void {
-    if (data.replay === true) return;
+  /**
+   * Resolve the live stream state a real (non-replay) event belongs to, advancing the stream's
+   * last-event watermark.
+   *
+   * Every per-event handler below opens with this same bookkeeping: replayed events re-deliver
+   * history and must never re-time a stream, an event for a workspace with no active stream has
+   * nothing to update, and anything that survives both checks still counts as activity. Returns
+   * `null` when the caller should drop the event.
+   */
+  private touchActiveStream(
+    data: Pick<StreamDeltaEvent, "replay" | "workspaceId" | "timestamp">
+  ): ActiveStreamState | null {
+    if (data.replay === true) return null;
     const state = this.activeStreams.get(data.workspaceId);
-    if (!state) return;
+    if (!state) return null;
 
     state.lastEventTimestampMs = Math.max(state.lastEventTimestampMs, data.timestamp);
+    return state;
+  }
+
+  handleStreamDelta(data: StreamDeltaEvent): void {
+    const state = this.touchActiveStream(data);
+    if (!state) return;
 
     const isFirstToken = data.delta.length > 0 && state.firstTokenTimeMs === null;
     if (isFirstToken) {
@@ -773,11 +790,8 @@ export class SessionTimingService {
   }
 
   handleReasoningDelta(data: ReasoningDeltaEvent): void {
-    if (data.replay === true) return;
-    const state = this.activeStreams.get(data.workspaceId);
+    const state = this.touchActiveStream(data);
     if (!state) return;
-
-    state.lastEventTimestampMs = Math.max(state.lastEventTimestampMs, data.timestamp);
 
     const isFirstToken = data.delta.length > 0 && state.firstTokenTimeMs === null;
     if (isFirstToken) {
@@ -800,11 +814,8 @@ export class SessionTimingService {
   }
 
   handleToolCallStart(data: ToolCallStartEvent): void {
-    if (data.replay === true) return;
-    const state = this.activeStreams.get(data.workspaceId);
+    const state = this.touchActiveStream(data);
     if (!state) return;
-
-    state.lastEventTimestampMs = Math.max(state.lastEventTimestampMs, data.timestamp);
 
     // Defensive: ignore duplicate tool-call-start events.
     if (state.pendingToolStarts.has(data.toolCallId)) {
@@ -837,11 +848,9 @@ export class SessionTimingService {
   }
 
   handleToolCallDelta(data: ToolCallDeltaEvent): void {
-    if (data.replay === true) return;
-    const state = this.activeStreams.get(data.workspaceId);
+    const state = this.touchActiveStream(data);
     if (!state) return;
 
-    state.lastEventTimestampMs = Math.max(state.lastEventTimestampMs, data.timestamp);
     state.deltaStorage.addDelta({
       tokens: data.tokens,
       timestamp: data.timestamp,
@@ -852,11 +861,8 @@ export class SessionTimingService {
   }
 
   handleToolCallEnd(data: ToolCallEndEvent): void {
-    if (data.replay === true) return;
-    const state = this.activeStreams.get(data.workspaceId);
+    const state = this.touchActiveStream(data);
     if (!state) return;
-
-    state.lastEventTimestampMs = Math.max(state.lastEventTimestampMs, data.timestamp);
 
     const start = state.pendingToolStarts.get(data.toolCallId);
     if (start === undefined) {

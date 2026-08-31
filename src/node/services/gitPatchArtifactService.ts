@@ -586,78 +586,56 @@ export class GitPatchArtifactService {
 
       const ws = entry.workspace;
 
-      const workspacePath = coerceNonEmptyString(ws.path);
-      if (!workspacePath) {
+      // Once the workspace entry is known, every writer below seeds the same
+      // pending artifact when none has been persisted yet: one pending entry
+      // per project repo in the task workspace. The `!entry` path above cannot
+      // use this because it has no workspace to enumerate projects from, and
+      // the outer catch seeds an empty list for the same reason.
+      const seedPendingArtifact = (
+        existing: SubagentGitPatchArtifact | null
+      ): SubagentGitPatchArtifact =>
+        existing ??
+        buildPendingPatchArtifact({
+          childTaskId: childWorkspaceId,
+          parentWorkspaceId,
+          createdAtMs: nowMs,
+          updatedAtMs: nowMs,
+          projectArtifacts: buildPendingProjectArtifacts({
+            projectPath: entry.projectPath,
+            projects: ws.projects,
+            taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha) ?? undefined,
+            taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
+          }),
+        });
+
+      // Marks every still-pending project artifact failed with the same reason.
+      // Used by the workspace-shape guards below, which cannot proceed to
+      // per-project patch generation at all.
+      const failGeneration = async (error: string): Promise<void> => {
         await updateArtifact((existing) =>
           failPendingProjectArtifacts({
-            artifact:
-              existing ??
-              buildPendingPatchArtifact({
-                childTaskId: childWorkspaceId,
-                parentWorkspaceId,
-                createdAtMs: nowMs,
-                updatedAtMs: nowMs,
-                projectArtifacts: buildPendingProjectArtifacts({
-                  projectPath: entry.projectPath,
-                  projects: ws.projects,
-                  taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha) ?? undefined,
-                  taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
-                }),
-              }),
-            error: "Task workspace path missing.",
+            artifact: seedPendingArtifact(existing),
+            error,
             updatedAtMs: nowMs,
           })
         );
+      };
+
+      const workspacePath = coerceNonEmptyString(ws.path);
+      if (!workspacePath) {
+        await failGeneration("Task workspace path missing.");
         return;
       }
 
       if (!ws.runtimeConfig) {
-        await updateArtifact((existing) =>
-          failPendingProjectArtifacts({
-            artifact:
-              existing ??
-              buildPendingPatchArtifact({
-                childTaskId: childWorkspaceId,
-                parentWorkspaceId,
-                createdAtMs: nowMs,
-                updatedAtMs: nowMs,
-                projectArtifacts: buildPendingProjectArtifacts({
-                  projectPath: entry.projectPath,
-                  projects: ws.projects,
-                  taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha) ?? undefined,
-                  taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
-                }),
-              }),
-            error: "Task runtimeConfig missing.",
-            updatedAtMs: nowMs,
-          })
-        );
+        await failGeneration("Task runtimeConfig missing.");
         return;
       }
 
       const fallbackName = workspacePath.split("/").pop() ?? workspacePath.split("\\").pop() ?? "";
       const workspaceName = coerceNonEmptyString(ws.name) ?? coerceNonEmptyString(fallbackName);
       if (!workspaceName) {
-        await updateArtifact((existing) =>
-          failPendingProjectArtifacts({
-            artifact:
-              existing ??
-              buildPendingPatchArtifact({
-                childTaskId: childWorkspaceId,
-                parentWorkspaceId,
-                createdAtMs: nowMs,
-                updatedAtMs: nowMs,
-                projectArtifacts: buildPendingProjectArtifacts({
-                  projectPath: entry.projectPath,
-                  projects: ws.projects,
-                  taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha) ?? undefined,
-                  taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
-                }),
-              }),
-            error: "Task workspace name missing.",
-            updatedAtMs: nowMs,
-          })
-        );
+        await failGeneration("Task workspace name missing.");
         return;
       }
 
@@ -692,20 +670,7 @@ export class GitPatchArtifactService {
         nextProjectArtifact: SubagentGitProjectPatchArtifact
       ): Promise<void> => {
         await updateArtifact((existing) => {
-          const pendingArtifact =
-            existing ??
-            buildPendingPatchArtifact({
-              childTaskId: childWorkspaceId,
-              parentWorkspaceId,
-              createdAtMs: nowMs,
-              updatedAtMs: nowMs,
-              projectArtifacts: buildPendingProjectArtifacts({
-                projectPath: entry.projectPath,
-                projects: ws.projects,
-                taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha) ?? undefined,
-                taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
-              }),
-            });
+          const pendingArtifact = seedPendingArtifact(existing);
           return upsertProjectArtifact({
             artifact: pendingArtifact,
             nextProjectArtifact,

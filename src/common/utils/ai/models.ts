@@ -176,21 +176,30 @@ export function getModelProvider(modelString: string): string {
 export type Anthropic1MContextMode = "none" | "beta" | "native";
 
 const OPTIONAL_VERSION_SUFFIX = String.raw`(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?`;
+
+/**
+ * Build a case-insensitive, fully anchored matcher for a base Anthropic model id
+ * plus its optional dated snapshot suffix (e.g. `claude-opus-5-20260724`). Base
+ * ids are literal model names, so no regex escaping is needed.
+ */
+function anthropicModelIdPattern(baseModelId: string): RegExp {
+  return new RegExp(`^${baseModelId}${OPTIONAL_VERSION_SUFFIX}$`, "i");
+}
+
 const ANTHROPIC_NATIVE_1M_PATTERNS = [
   // Mythos-class models (Fable 5 / Mythos 5) ship 1M context as standard metadata.
-  new RegExp(`^claude-fable-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-mythos-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-opus-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-opus-4-8${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-opus-4-7${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-opus-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-sonnet-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-sonnet-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-];
-const ANTHROPIC_BETA_1M_PATTERNS = [
-  new RegExp(`^claude-sonnet-4-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-  new RegExp(`^claude-sonnet-4-20250514${OPTIONAL_VERSION_SUFFIX}$`, "i"),
-];
+  "claude-fable-5",
+  "claude-mythos-5",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
+].map(anthropicModelIdPattern);
+const ANTHROPIC_BETA_1M_PATTERNS = ["claude-sonnet-4-5", "claude-sonnet-4-20250514"].map(
+  anthropicModelIdPattern
+);
 
 function matchesAnthropicPattern(modelName: string, patterns: readonly RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(modelName));

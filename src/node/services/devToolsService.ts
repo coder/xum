@@ -349,10 +349,7 @@ export class DevToolsService extends EventEmitter {
 
     // Wait for any in-flight load to finish before clearing, otherwise the
     // pending loadFromDisk can repopulate stale data after the clear.
-    const pendingLoad = this.loadingPromises.get(workspaceId);
-    if (pendingLoad) {
-      await pendingLoad;
-    }
+    await this.awaitPendingLoad(workspaceId);
 
     const data = this.getOrCreateWorkspaceData(workspaceId);
     data.runs.clear();
@@ -388,10 +385,7 @@ export class DevToolsService extends EventEmitter {
 
     // Wait for any in-flight load to finish so it cannot repopulate state
     // after the removal below.
-    const pendingLoad = this.loadingPromises.get(workspaceId);
-    if (pendingLoad) {
-      await pendingLoad;
-    }
+    await this.awaitPendingLoad(workspaceId);
 
     // Deleting the entry (rather than clearing it in place) makes stale queued
     // appends no-ops via the existence guard in appendToFile.
@@ -404,6 +398,18 @@ export class DevToolsService extends EventEmitter {
     });
 
     this.emitWorkspaceEvent(workspaceId, { type: "cleared" });
+  }
+
+  /**
+   * Wait for any in-flight load for this workspace to finish before mutating
+   * its state, otherwise a pending loadFromDisk can repopulate stale data after
+   * the mutation.
+   */
+  private async awaitPendingLoad(workspaceId: string): Promise<void> {
+    const pendingLoad = this.loadingPromises.get(workspaceId);
+    if (pendingLoad) {
+      await pendingLoad;
+    }
   }
 
   private emitWorkspaceEvent(workspaceId: string, event: DevToolsEvent): void {

@@ -12,13 +12,7 @@
  * aiService or streamText.
  */
 
-import type {
-  AssistantModelMessage,
-  Tool,
-  ToolCallPart,
-  ToolModelMessage,
-  ToolResultPart,
-} from "ai";
+import type { AssistantModelMessage, Tool, ToolModelMessage } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
@@ -328,6 +322,12 @@ export function buildToolCatalogOverview(catalog: readonly ToolCatalogEntry[]): 
   return `${OVERVIEW_HEADER}\n${lines.join("\n")}\n${OVERVIEW_END_MARKER}`;
 }
 
+/** Return the tool record with the built-in `tool_search` entry removed. */
+function withoutToolSearch(tools: Record<string, Tool>): Record<string, Tool> {
+  const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = tools;
+  return rest;
+}
+
 /**
  * Post-policy gate: decides whether tool-search deferral is active for this
  * stream and returns the (possibly adjusted) tool record plus the seed state.
@@ -372,13 +372,11 @@ export function prepareToolSearch(inputs: ToolCatalogInputs): {
   // Gated on the actual PTC flag, not record presence: a `code_execution`
   // record entry may be a same-named MCP tool (classified as normal deferred).
   if (inputs.ptcEnabled === true) {
-    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
-    return { tools: rest };
+    return { tools: withoutToolSearch(inputs.tools) };
   }
   const classification = buildToolCatalog(inputs);
   if (classification.deferredToolNames.size === 0) {
-    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = inputs.tools;
-    return { tools: rest };
+    return { tools: withoutToolSearch(inputs.tools) };
   }
   // Advertise the deferred surface area up front: append a compact per-server
   // index of deferred tool names to tool_catalog_search's description so the
@@ -573,13 +571,10 @@ function isMuxToolSearchOutput(output: unknown): boolean {
   );
 }
 
-function renameLegacyToolSearchCallPart(part: ToolCallPart): ToolCallPart {
-  return part.toolName === LEGACY_TOOL_SEARCH_TOOL_NAME
-    ? { ...part, toolName: TOOL_SEARCH_TOOL_NAME }
-    : part;
-}
-
-function renameLegacyToolSearchResultPart(part: ToolResultPart): ToolResultPart {
+// Generic over the part shape so the assistant tool-call and tool-result paths
+// share one implementation: both parts carry a `toolName`, and the rename is
+// identical regardless of which kind of part is being rewritten.
+function renameLegacyToolSearchPart<T extends { toolName: string }>(part: T): T {
   return part.toolName === LEGACY_TOOL_SEARCH_TOOL_NAME
     ? { ...part, toolName: TOOL_SEARCH_TOOL_NAME }
     : part;
@@ -659,10 +654,10 @@ export function normalizeLegacyToolSearchMessages(messages: ModelMessage[]): Mod
             return part;
           }
           if (part.type === "tool-call") {
-            return renameLegacyToolSearchCallPart(part);
+            return renameLegacyToolSearchPart(part);
           }
           if (part.type === "tool-result") {
-            return renameLegacyToolSearchResultPart(part);
+            return renameLegacyToolSearchPart(part);
           }
           return part;
         }
@@ -674,7 +669,7 @@ export function normalizeLegacyToolSearchMessages(messages: ModelMessage[]): Mod
     if (message.role === "tool") {
       const content: ToolModelMessage["content"] = message.content.map((part) => {
         if (part.type === "tool-result" && legacyCallIds.has(part.toolCallId)) {
-          return renameLegacyToolSearchResultPart(part);
+          return renameLegacyToolSearchPart(part);
         }
         return part;
       });

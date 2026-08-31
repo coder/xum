@@ -288,6 +288,16 @@ function belowBaseline(count: number, baseline: number): boolean {
 }
 
 /**
+ * Whether a candidate value drifted beyond MAX_MAGNITUDE_SHIFT_FACTOR from a
+ * positive `baseline` in either direction. A missing candidate (`null`) reads
+ * as 0, which always trips the lower bound. Callers must pass a baseline > 0.
+ */
+function exceedsMagnitudeShift(candidate: number | null, baseline: number): boolean {
+  const ratio = candidate === null ? 0 : candidate / baseline;
+  return ratio > MAX_MAGNITUDE_SHIFT_FACTOR || ratio < 1 / MAX_MAGNITUDE_SHIFT_FACTOR;
+}
+
+/**
  * Throws when the sanitized upstream data is unfit to replace the vendored
  * models.json. `baselineCatalog` is the currently vendored catalog (defaults
  * to empty when unavailable, disabling the relative checks).
@@ -336,7 +346,7 @@ export function validateModelData(
   // catalog could retain every field while rescaling values (prices toward
   // zero or absurdly high, token limits toward 1). A collapsed sample count
   // (e.g. every price zeroed) fails both the sample shrink and the median
-  // check, since a zero median is more than MAX_MEDIAN_SHIFT_FACTOR below any
+  // check, since a zero median is more than MAX_MAGNITUDE_SHIFT_FACTOR below any
   // positive baseline.
   for (const [field, baselineStats] of Object.entries(baseline.numericFields)) {
     if (baselineStats.samples < MIN_BASELINE_FOR_SHRINK_CHECK || baselineStats.median <= 0) {
@@ -344,8 +354,7 @@ export function validateModelData(
     }
     const candidate = summary.numericFields[field] ?? { samples: 0, median: 0 };
     shrinkChecks.push([`${field} positive-value count`, candidate.samples, baselineStats.samples]);
-    const ratio = candidate.median / baselineStats.median;
-    if (ratio > MAX_MAGNITUDE_SHIFT_FACTOR || ratio < 1 / MAX_MAGNITUDE_SHIFT_FACTOR) {
+    if (exceedsMagnitudeShift(candidate.median, baselineStats.median)) {
       errors.push(
         `${field} median shifted from ${baselineStats.median} to ${candidate.median} ` +
           `(more than ${MAX_MAGNITUDE_SHIFT_FACTOR}x from the vendored baseline; possible corruption)`
@@ -403,8 +412,7 @@ export function validateModelData(
         continue;
       }
       const candidateNum = parseNum(entry[field]);
-      const ratio = candidateNum === null ? 0 : candidateNum / baselineNum;
-      if (ratio > MAX_MAGNITUDE_SHIFT_FACTOR || ratio < 1 / MAX_MAGNITUDE_SHIFT_FACTOR) {
+      if (exceedsMagnitudeShift(candidateNum, baselineNum)) {
         entryShifts.push(`${id} ${field}: ${baselineNum} -> ${candidateNum ?? "absent"}`);
       }
     }

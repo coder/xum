@@ -182,6 +182,24 @@ function jsonByteLength(value: unknown): number {
   }
 }
 
+/**
+ * Oversize gate shared by the pass-through result shapes (non-standard
+ * `toolResult`, content-less objects). Returns the serialized size when the
+ * whole result exceeds the text cap and must be replaced by a bounded notice,
+ * or null when it fits and can pass through untouched.
+ */
+function oversizedPassthroughBytes(result: unknown, logMessage: string): number | null {
+  const size = jsonByteLength(result);
+  if (size <= MCP_TOOL_RESULT_MAX_TEXT_BYTES) {
+    return null;
+  }
+  log.warn(logMessage, {
+    size,
+    cap: MCP_TOOL_RESULT_MAX_TEXT_BYTES,
+  });
+  return size;
+}
+
 /** Binary media guard shared by image/audio content and blob resources. */
 function toGuardedMediaPart(
   kind: string,
@@ -234,28 +252,20 @@ export function transformMCPResult(result: unknown): unknown {
   // If it has toolResult (non-standard result shape), pass through as-is when
   // it fits the cap; otherwise replace it with a bounded notice.
   if (typed.toolResult !== undefined) {
-    const size = jsonByteLength(result);
-    if (size <= MCP_TOOL_RESULT_MAX_TEXT_BYTES) {
+    const size = oversizedPassthroughBytes(result, "[MCP] toolResult too large, omitting");
+    if (size === null) {
       return result;
     }
-    log.warn("[MCP] toolResult too large, omitting", {
-      size,
-      cap: MCP_TOOL_RESULT_MAX_TEXT_BYTES,
-    });
     return { toolResult: omittedValueNotice("toolResult", size) };
   }
 
   // If no content array, pass through when it fits the cap; otherwise replace
   // with a bounded notice in MCP text shape so toModelOutput surfaces it.
   if (!typed.content || !Array.isArray(typed.content)) {
-    const size = jsonByteLength(result);
-    if (size <= MCP_TOOL_RESULT_MAX_TEXT_BYTES) {
+    const size = oversizedPassthroughBytes(result, "[MCP] tool result too large, omitting");
+    if (size === null) {
       return result;
     }
-    log.warn("[MCP] tool result too large, omitting", {
-      size,
-      cap: MCP_TOOL_RESULT_MAX_TEXT_BYTES,
-    });
     return { content: [{ type: "text", text: omittedValueNotice("tool result", size) }] };
   }
 

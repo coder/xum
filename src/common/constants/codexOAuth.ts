@@ -139,7 +139,6 @@ export const CODEX_OAUTH_REQUIRED_MODELS = new Set<string>([
 const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   // The public API exposes a 1.05M window for these models, but the ChatGPT/Codex
   // model catalog publishes smaller context windows (372K for the GPT-5.6 family).
-  // Keep auth-route caps separate so API-key requests retain the full public window.
   "gpt-5.5": 272_000,
   "gpt-5.6": 372_000,
   "gpt-5.6-sol": 372_000,

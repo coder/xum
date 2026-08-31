@@ -1,6 +1,9 @@
 import React from "react";
 import type { DisplayedMessage } from "@/common/types/message";
-import type { BashOutputGroupInfo } from "@/browser/utils/messages/messageUtils";
+import {
+  isBashMonitorWakeMessage,
+  type BashOutputGroupInfo,
+} from "@/browser/utils/messages/messageUtils";
 import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
@@ -98,35 +101,34 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
       case "user": {
         const backgroundWorkWakeSummary =
           message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
-        renderedMessage =
-          message.bashMonitorWake != null ? (
-            <BashMonitorWakeMessage message={message} className={className} />
-          ) : message.agentPeerMessageTrigger != null ? (
-            // The wake trigger is backend-generated control text: a full user bubble would
-            // falsely present it as human input (the payload renders separately as the
-            // assistant-side agent-message card).
-            <CollapsibleMachineMessage
-              content={message.content}
-              summary="Agent message notification"
-              icon={<MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />}
-              marker="agent-peer-message-trigger"
-              className={className}
-            />
-          ) : backgroundWorkWakeSummary != null ? (
-            <BackgroundWorkWakeMessage
-              message={message}
-              summary={backgroundWorkWakeSummary}
-              className={className}
-            />
-          ) : (
-            <UserMessage
-              message={message}
-              className={className}
-              onEdit={onEditUserMessage}
-              isCompacting={isCompacting}
-              navigation={userMessageNavigation}
-            />
-          );
+        renderedMessage = isBashMonitorWakeMessage(message) ? (
+          <BashMonitorWakeMessage message={message} className={className} />
+        ) : message.agentPeerMessageTrigger != null ? (
+          // The wake trigger is backend-generated control text: a full user bubble would
+          // falsely present it as human input (the payload renders separately as the
+          // assistant-side agent-message card).
+          <CollapsibleMachineMessage
+            content={message.content}
+            summary="Agent message notification"
+            icon={<MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />}
+            marker="agent-peer-message-trigger"
+            className={className}
+          />
+        ) : backgroundWorkWakeSummary != null ? (
+          <BackgroundWorkWakeMessage
+            message={message}
+            summary={backgroundWorkWakeSummary}
+            className={className}
+          />
+        ) : (
+          <UserMessage
+            message={message}
+            className={className}
+            onEdit={onEditUserMessage}
+            isCompacting={isCompacting}
+            navigation={userMessageNavigation}
+          />
+        );
         break;
       }
       case "assistant":
