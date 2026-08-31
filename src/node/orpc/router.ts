@@ -485,9 +485,11 @@ export const router = (authToken?: string) => {
         .input(schemas.providers.getConfig.input)
         .output(schemas.providers.getConfig.output)
         .handler(({ context }) => context.providerService.getConfig()),
-      // Provider mutations run Effect generators via handlerGen (client aborts
-      // interrupt the fiber); the wire contracts are unchanged. Sync reads
-      // (list/getConfig) and subscriptions stay plain handlers.
+      // Provider mutations run Effect generators via handlerGen; the wire
+      // contracts are unchanged. The service pipelines are uninterruptible
+      // (see asAtomicMutation in providerService.ts), so a client abort
+      // cannot strand a persisted write without its post-write steps. Sync
+      // reads (list/getConfig) and subscriptions stay plain handlers.
       addCustomProvider: t
         .input(schemas.providers.addCustomProvider.input)
         .output(schemas.providers.addCustomProvider.output)

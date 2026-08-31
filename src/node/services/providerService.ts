@@ -5,8 +5,11 @@
  * Mutation internals are Effect-native: each fallible pipeline is an
  * `Effect.gen` program and the public Promise methods are thin
  * `Effect.runPromise` facades, so pre-Effect callers (OAuth services, tests)
- * keep working unchanged while oRPC routes ride `handlerGen` directly (client
- * aborts interrupt the fiber). The wire `Result` unions stay in the success
+ * keep working unchanged while oRPC routes ride `handlerGen` directly. Every
+ * mutation pipeline is uninterruptible (see `asAtomicMutation`), so a client
+ * abort defers until the write and its post-write consistency steps finish —
+ * matching the pre-Effect Promise chains, which aborts never cancelled.
+ * The wire `Result` unions stay in the success
  * channel — callers branch on `success`, not on thrown errors — and the only
  * typed failure is `ProviderPersistenceError`, which carries the
  * `getErrorMessage` string each facade folds into its own wire error shape
@@ -161,6 +164,19 @@ class ProviderPersistenceError extends Schema.TaggedError<ProviderPersistenceErr
 
 function toPersistenceError(error: unknown): ProviderPersistenceError {
   return new ProviderPersistenceError({ message: getErrorMessage(error) });
+}
+
+/**
+ * Provider mutations must run their write + post-write consistency steps
+ * (change notification, gateway routePriority sync, durable-reference
+ * repair) to completion once started: a client abort interrupting the
+ * handler fiber mid-lock would otherwise persist the callback's write while
+ * skipping the follow-ups, leaving observers and routing state inconsistent.
+ * The pre-Effect implementation had exactly these semantics — an aborted
+ * oRPC request never cancelled the running Promise chain.
+ */
+function asAtomicMutation<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> {
+  return Effect.uninterruptible(effect);
 }
 
 export class ProviderService {
@@ -842,7 +858,8 @@ export class ProviderService {
             error.message
           ),
         })
-      )
+      ),
+      asAtomicMutation
     );
   }
 
@@ -981,7 +998,7 @@ export class ProviderService {
 
       self.notifyFromMutation();
       return { success: true as const, data: undefined };
-    });
+    }).pipe(asAtomicMutation);
   }
 
   private repairRemovedCustomProviderReferences(
@@ -1150,7 +1167,8 @@ export class ProviderService {
           success: false,
           error: `Failed to set models: ${error.message}`,
         })
-      )
+      ),
+      asAtomicMutation
     );
   }
 
@@ -1417,7 +1435,8 @@ export class ProviderService {
           success: false,
           error: `Failed to set provider config: ${error.message}`,
         })
-      )
+      ),
+      asAtomicMutation
     );
   }
 
@@ -1510,7 +1529,8 @@ export class ProviderService {
           success: false,
           error: `Failed to update provider config: ${error.message}`,
         })
-      )
+      ),
+      asAtomicMutation
     );
   }
 
@@ -1602,7 +1622,8 @@ export class ProviderService {
           success: false,
           error: `Failed to update provider config: ${error.message}`,
         })
-      )
+      ),
+      asAtomicMutation
     );
   }
 
@@ -1753,7 +1774,8 @@ export class ProviderService {
           success: false,
           error: `Failed to set provider config: ${error.message}`,
         })
-      )
+      ),
+      asAtomicMutation
     );
   }
 

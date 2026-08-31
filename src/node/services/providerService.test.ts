@@ -1,5 +1,6 @@
 import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
+import { Effect, Fiber } from "effect";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import { writeFile } from "node:fs/promises";
@@ -2344,6 +2345,41 @@ describe("ProviderService gateway lifecycle", () => {
 
       expect(result.success).toBe(true);
       expect(config.loadConfigOrDefault().routePriority).toEqual(["mux-gateway", "direct"]);
+    });
+  });
+});
+
+describe("ProviderService mutation interruption", () => {
+  it("runs the write and post-write steps to completion when interrupted mid-mutation", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      await saveRoutePriority(config, ["direct"]);
+      let notified = 0;
+      const unsubscribe = service.onConfigChanged(() => {
+        notified += 1;
+      });
+      try {
+        // runFork executes synchronously up to the first async yield (the
+        // providers-file lock); interrupting there mirrors an oRPC client
+        // abort landing while the mutation is in flight (handlerGen
+        // interrupts the handler fiber on abort).
+        const fiber = Effect.runFork(
+          service.setConfigEffect("mux-gateway", ["couponCode"], "gateway-token")
+        );
+        await Effect.runPromise(Fiber.interrupt(fiber));
+
+        // The mutation pipeline is uninterruptible: the persisted write, the
+        // change notification, and the gateway routePriority sync must all
+        // have completed — a write that lands without its post-write steps
+        // would leave observers and routing state inconsistent.
+        const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.[
+          "mux-gateway"
+        ] as Record<string, unknown>;
+        expect(stored.couponCode).toBe("gateway-token");
+        expect(notified).toBe(1);
+        expect(config.loadConfigOrDefault().routePriority).toEqual(["mux-gateway", "direct"]);
+      } finally {
+        unsubscribe();
+      }
     });
   });
 });
