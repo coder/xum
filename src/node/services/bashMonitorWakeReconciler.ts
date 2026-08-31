@@ -467,6 +467,7 @@ export class BashMonitorWakeReconciler {
       await this.locks.withLock(ownerWorkspaceId, () => {
         const state = this.state(ownerWorkspaceId);
         if (state.dispatch === dispatch) state.dispatch = undefined;
+        return Promise.resolve();
       });
       throw error;
     }
