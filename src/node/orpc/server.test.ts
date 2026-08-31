@@ -103,7 +103,8 @@ function createHttpClient(
   headers?: Record<string, string>
 ): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
     headers,
   });
 

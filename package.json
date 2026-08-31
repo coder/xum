@@ -70,10 +70,11 @@
     "@mozilla/readability": "^0.6.0",
     "@novnc/novnc": "^1.6.0",
     "@openrouter/ai-sdk-provider": "^3.0.0",
-    "@orpc/client": "^1.11.3",
-    "@orpc/openapi": "^1.12.2",
-    "@orpc/server": "^1.11.3",
-    "@orpc/zod": "^1.11.3",
+    "@orpc/client": "1.14.11",
+    "@orpc/experimental-effect": "1.14.11",
+    "@orpc/openapi": "1.14.11",
+    "@orpc/server": "1.14.11",
+    "@orpc/zod": "1.14.11",
     "@radix-ui/react-checkbox": "^1.3.3",
     "@radix-ui/react-context-menu": "^2.2.16",
     "@radix-ui/react-dialog": "^1.1.15",
@@ -102,6 +103,7 @@
     "crc-32": "^1.2.2",
     "diff": "^8.0.2",
     "disposablestack": "^1.1.7",
+    "effect": "4.0.0-rc.112",
     "electron-updater": "^6.6.2",
     "electron-window-state": "^5.0.3",
     "express": "^5.1.0",
@@ -338,6 +340,7 @@
     "unrs-resolver"
   ],
   "patchedDependencies": {
-    "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch"
+    "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
+    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch"
   }
 }

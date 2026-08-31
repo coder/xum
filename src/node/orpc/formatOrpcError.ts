@@ -1,4 +1,5 @@
 import { ORPCError, ValidationError } from "@orpc/server";
+import { COMMON_ERROR_STATUS_MAP } from "@orpc/client";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { inspect } from "node:util";
 import { DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE } from "@/node/services/workflows/WorkflowService";
@@ -274,7 +275,8 @@ function getValidationErrorInfo(
     return {
       message: cause.message,
       issues: cause.issues,
-      data: cause.data,
+      // oRPC >=1.14 renamed `ValidationError.data` to `invalidData`.
+      data: cause.invalidData,
     };
   }
 
@@ -315,7 +317,10 @@ export function formatOrpcError(error: unknown, interceptorOptions?: unknown): F
 
     if (error instanceof ORPCError) {
       const code = typeof error.code === "string" ? error.code : String(error.code);
-      const status = typeof error.status === "number" ? error.status : undefined;
+      // oRPC >=1.14 removed `ORPCError.status`; derive the HTTP status from the
+      // shared code→status table (custom codes have no fixed status).
+      const statusFromCode = (COMMON_ERROR_STATUS_MAP as Record<string, number>)[code];
+      const status = typeof statusFromCode === "number" ? statusFromCode : undefined;
 
       debugDump.error = {
         type: "ORPCError",

@@ -172,7 +172,8 @@ function createBrowserClient(
   }
 
   const ws = createWebSocket(wsUrl.toString());
-  const link = new WebSocketLink({ websocket: ws });
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
+  const link = new WebSocketLink({ connect: () => ws });
 
   return {
     client: createClient(link),

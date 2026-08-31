@@ -168,7 +168,8 @@ function renderAnalyticsHook<TResult>(callback: () => TResult) {
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- typed test helper

@@ -85,7 +85,8 @@ async function createTestServer(): Promise<TestServerHandle> {
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- needed for tsgo typecheck
   return createORPCClient(link) as RouterClient<AppRouter>;
@@ -107,7 +108,8 @@ async function createWebSocketClient(wsUrl: string): Promise<WebSocketClientHand
     ws.on("error", reject);
   });
 
-  const link = new WebSocketRPCLink({ websocket: ws as unknown as globalThis.WebSocket });
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
+  const link = new WebSocketRPCLink({ connect: () => ws as unknown as globalThis.WebSocket });
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- needed for tsgo typecheck
   const client = createORPCClient(link) as RouterClient<AppRouter>;
 

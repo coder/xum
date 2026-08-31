@@ -10,7 +10,7 @@
 
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
-import { isProcedure } from "@orpc/server";
+import { Procedure } from "@orpc/server";
 import { z } from "zod";
 import type { AppRouter } from "@/node/orpc/router";
 import type { RouterClient } from "@orpc/server";
@@ -26,9 +26,15 @@ export interface ProxifyOrpcOptions {
 }
 
 interface OrpcDef {
+  /** Legacy (<1.14) singular schema field; still read by trpc-cli. */
   inputSchema?: unknown;
   outputSchema?: unknown;
+  /** oRPC >=1.14 stores merged schema chains as arrays. */
+  inputSchemas?: unknown[];
+  outputSchemas?: unknown[];
   middlewares?: unknown[];
+  /** oRPC >=1.14 replaced `middlewares` + validation indexes with this. */
+  orderedMiddlewares?: unknown[];
   inputValidationIndex?: number;
   outputValidationIndex?: number;
   errorMap?: unknown;
@@ -567,8 +573,10 @@ type ClientFactory = () => RouterClient<AppRouter>;
 export function proxifyOrpc(router: AppRouter, options: ProxifyOrpcOptions): AppRouter {
   // Client factory - creates a new client on each procedure invocation
   const createClient: ClientFactory = () => {
+    // oRPC >=1.14 splits the request URL into `origin` (base) + `url` (path).
     const link = new HTTPRPCLink({
-      url: `${options.baseUrl}/orpc`,
+      origin: options.baseUrl,
+      url: "/orpc",
       headers: options.authToken ? { Authorization: `Bearer ${options.authToken}` } : undefined,
     });
     return createORPCClient(link);
@@ -593,7 +601,8 @@ function createRouterProxy(
   for (const [key, value] of Object.entries(router)) {
     const newPath = [...path, key];
 
-    if (isProcedure(value)) {
+    // oRPC >=1.14 removed `isProcedure`; `Procedure` implements `Symbol.hasInstance`.
+    if (value instanceof Procedure) {
       result[key] = createProcedureProxy(
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         value as unknown as OrpcProcedureLike,
@@ -614,7 +623,9 @@ function createProcedureProxy(
   path: string[]
 ): OrpcProcedureLike {
   const originalDef = procedure["~orpc"];
-  const originalInputSchema = originalDef.inputSchema;
+  // oRPC >=1.14 stores `.input()` schemas as an array; xum procedures declare at
+  // most one input schema, so the head is the whole story.
+  const originalInputSchema = originalDef.inputSchema ?? originalDef.inputSchemas?.[0];
 
   // Check if the original schema was void/undefined - trpc-cli sends {} but server expects undefined
   const isVoidInput = isVoidOrUndefinedSchema(originalInputSchema);
@@ -641,11 +652,14 @@ function createProcedureProxy(
   const proxy: OrpcProcedureLike = {
     "~orpc": {
       ...originalDef,
-      // Use enhanced schema for CLI help generation
+      // Use enhanced schema for CLI help generation. Both spellings are set:
+      // trpc-cli reads the legacy singular field, oRPC >=1.14 `call()` reads the array.
       inputSchema: enhancedInputSchema,
+      inputSchemas: enhancedInputSchema === undefined ? undefined : [enhancedInputSchema],
       // Keep the original middlewares empty for the proxy - we don't need them
       // since the server will run its own middleware chain
       middlewares: [],
+      orderedMiddlewares: [],
       // The handler that will be called by @orpc/server's `call()` function
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       handler: async (opts: { input: unknown }): Promise<any> => {

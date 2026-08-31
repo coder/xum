@@ -229,9 +229,10 @@ async function connectViaWebSocket(
   await waitForWebSocketOpen(websocket, wsUrl);
 
   // oRPC expects a browser-like WebSocket surface; ws is compatible at runtime.
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
   const link = new WebSocketRPCLink({
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    websocket: websocket as unknown as globalThis.WebSocket,
+    connect: () => websocket as unknown as globalThis.WebSocket,
   });
   const client = createTypedClient(link);
 
