@@ -448,12 +448,53 @@ type WorkspaceTurnManagerHostFake = WorkspaceTurnManagerHost & {
 
 function createWorkspaceTurnManagerHost(
   config: Config,
-  workspaceService: WorkspaceHost
+  workspaceService: WorkspaceHost,
+  aiService: AIService,
+  terminalAttentionStore: TerminalAttentionStore
 ): WorkspaceTurnManagerHostFake {
   const lifecycleLocks = new MutexMap<string>();
   const foregroundWaiters = new Map<string, Set<WorkspaceTurnBackgroundableForegroundWaiter>>();
-  const backgroundForegroundWaitsForWorkspace = (workspaceId: string) =>
-    foregroundWaiters.get(workspaceId)?.size ?? 0;
+  const foregroundAwaitCounts = new Map<string, number>();
+  const agentTasks = (cfg: ReturnType<Config["loadConfigOrDefault"]>) =>
+    Array.from(cfg.projects.values())
+      .flatMap((project) => project.workspaces)
+      .filter((workspace) => workspace.id != null && workspace.parentWorkspaceId != null);
+  const isActiveAgentTask = (workspace: WorkspaceConfigEntry) => {
+    if (
+      workspace.archivedAt != null &&
+      (workspace.unarchivedAt == null || workspace.unarchivedAt < workspace.archivedAt)
+    ) {
+      return workspace.id != null && aiService.isStreaming(workspace.id);
+    }
+    return (
+      ["starting", "running", "awaiting_report"].includes(workspace.taskStatus ?? "running") ||
+      ["starting", "running"].includes(workspace.taskExecutionStatus ?? "")
+    );
+  };
+  const isDescendant = (
+    cfg: ReturnType<Config["loadConfigOrDefault"]>,
+    ancestorWorkspaceId: string,
+    taskId: string
+  ) => {
+    const parents = new Map(
+      agentTasks(cfg).map((workspace) => [workspace.id, workspace.parentWorkspaceId])
+    );
+    let current: string | undefined = taskId;
+    for (let depth = 0; depth < 32 && current != null; depth++) {
+      current = parents.get(current);
+      if (current === ancestorWorkspaceId) return true;
+    }
+    return false;
+  };
+  const backgroundForegroundWaitsForWorkspace = (workspaceId: string) => {
+    let signaled = 0;
+    for (const waiter of foregroundWaiters.get(workspaceId) ?? []) {
+      waiter.cleanup();
+      waiter.reject(new ForegroundWaitBackgroundedError());
+      signaled += 1;
+    }
+    return signaled;
+  };
   return {
     acquireTaskCreationLock: async () => ({
       [Symbol.asyncDispose]: async () => undefined,
@@ -465,14 +506,27 @@ function createWorkspaceTurnManagerHost(
         !workspaceService.hasQueuedMessages(workspaceId, "tool-end")
       )
         return;
-      for (const waiter of foregroundWaiters.get(workspaceId) ?? []) {
-        waiter.reject(new ForegroundWaitBackgroundedError());
-      }
+      backgroundForegroundWaitsForWorkspace(workspaceId);
     },
     backgroundForegroundWaitsForWorkspace,
-    buildParentAiSettingsFallbacks: () => [],
+    buildParentAiSettingsFallbacks: (parent, targetAgentId) =>
+      [
+        parent.aiSettingsByAgent?.[targetAgentId],
+        parent.agentId == null ? undefined : parent.aiSettingsByAgent?.[parent.agentId],
+        parent.aiSettings,
+      ].filter((settings) => settings != null),
     bumpWorkspaceStopEpoch: () => undefined,
-    countActiveAgentTasks: () => 0,
+    countActiveAgentTasks: (cfg) =>
+      agentTasks(cfg).filter(
+        (workspace) =>
+          isActiveAgentTask(workspace) &&
+          workspace.id != null &&
+          !foregroundAwaitCounts.has(workspace.id) &&
+          !(
+            workspace.taskExecutionId?.startsWith("wst_") === true &&
+            ["starting", "running"].includes(workspace.taskExecutionStatus ?? "")
+          )
+      ).length,
     editWorkspaceEntry: async (workspaceId, updater, options) => {
       let found = false;
       await config.editConfig((cfg) => {
@@ -491,12 +545,33 @@ function createWorkspaceTurnManagerHost(
       return found;
     },
     emitWorkspaceMetadata: async () => undefined,
-    enqueueTerminalAttention: async () => undefined,
-    hasActiveDescendantAgentTasks: () => false,
-    isDescendantAgentTaskInConfig: () => false,
-    isForegroundAwaiting: () => false,
+    enqueueTerminalAttention: async (params) => {
+      await terminalAttentionStore.enqueueIfAbsent(params);
+    },
+    hasActiveDescendantAgentTasks: (cfg, workspaceId) =>
+      agentTasks(cfg).some(
+        (workspace) =>
+          workspace.id != null &&
+          isActiveAgentTask(workspace) &&
+          isDescendant(cfg, workspaceId, workspace.id)
+      ),
+    isDescendantAgentTaskInConfig: isDescendant,
+    isForegroundAwaiting: (workspaceId) => foregroundAwaitCounts.has(workspaceId),
     latchWorkspaceStopsInProgress: () => () => undefined,
-    listActiveBackgroundWorkflowRunIds: async () => [],
+    listActiveBackgroundWorkflowRunIds: async (workspaceId, referencedRunIds) => {
+      if (referencedRunIds.length === 0) return [];
+      const runs = await new WorkflowRunStore({
+        sessionDir: path.join(config.sessionsDir, workspaceId),
+      }).listRuns();
+      return runs
+        .filter(
+          (run) =>
+            referencedRunIds.includes(run.id) &&
+            run.workspaceId === workspaceId &&
+            ["pending", "running", "backgrounded"].includes(run.status)
+        )
+        .map((run) => run.id);
+    },
     listActiveWorkflowRunIdsForWorkspaceStrict: async (workspaceId) => {
       const runStore = new WorkflowRunStore({
         sessionDir: path.join(config.sessionsDir, workspaceId),
@@ -512,7 +587,7 @@ function createWorkspaceTurnManagerHost(
         .map((run) => run.id);
     },
     listAgentReferencedWorkflowRunIds: async () => [],
-    listAgentTaskExecutionEntries: () => [],
+    listAgentTaskExecutionEntries: agentTasks,
     markTaskForegroundRelevant: () => undefined,
     maybeStartPatchGenerationForReportedTask: async () => undefined,
     registerBackgroundableForegroundWaiter: (workspaceId, waiter) => {
@@ -526,7 +601,14 @@ function createWorkspaceTurnManagerHost(
       workspace.aiSettings,
     scheduleMaybeStartQueuedTasks: () => undefined,
     scheduleTerminalAttentionDrain: () => undefined,
-    startForegroundAwait: () => () => undefined,
+    startForegroundAwait: (workspaceId) => {
+      foregroundAwaitCounts.set(workspaceId, (foregroundAwaitCounts.get(workspaceId) ?? 0) + 1);
+      return () => {
+        const count = foregroundAwaitCounts.get(workspaceId) ?? 0;
+        if (count <= 1) foregroundAwaitCounts.delete(workspaceId);
+        else foregroundAwaitCounts.set(workspaceId, count - 1);
+      };
+    },
     unregisterBackgroundableForegroundWaiter: (workspaceId, waiter) => {
       const waiters = foregroundWaiters.get(workspaceId);
       waiters?.delete(waiter);
@@ -566,8 +648,21 @@ function createWorkspaceTurnManagerHarness(
     typeof WorkspaceTurnManager
   >[8];
   const terminalAttentionStore = new TerminalAttentionStore(config);
-  const taskHost = createWorkspaceTurnManagerHost(config, workspaceService);
-  const taskService = new WorkspaceTurnManager(
+  const taskHostTarget = createWorkspaceTurnManagerHost(
+    config,
+    workspaceService,
+    aiService,
+    terminalAttentionStore
+  );
+  let taskService: WorkspaceTurnManager | undefined;
+  const taskHost = new Proxy(taskHostTarget, {
+    get: (target, key, receiver) => {
+      const override =
+        taskService == null ? undefined : Object.getOwnPropertyDescriptor(taskService, key)?.value;
+      return override ?? Reflect.get(target, key, receiver);
+    },
+  });
+  taskService = new WorkspaceTurnManager(
     config,
     historyService,
     aiService,
@@ -578,14 +673,12 @@ function createWorkspaceTurnManagerHarness(
     new MutexMap<string>(),
     streamManager
   );
-  for (const key of Object.keys(taskHost) as Array<keyof WorkspaceTurnManagerHostFake>) {
+  for (const key of Object.keys(taskHostTarget) as Array<keyof WorkspaceTurnManagerHostFake>) {
     if (key in taskService) continue;
     Object.defineProperty(taskService, key, {
       configurable: true,
-      get: () => taskHost[key],
-      set: (value) => {
-        Object.assign(taskHost, { [key]: value });
-      },
+      writable: true,
+      value: taskHostTarget[key],
     });
   }
 
@@ -1886,9 +1979,13 @@ describe("WorkspaceTurnManager", () => {
     expect(data?.status === "error" ? data.error : "").toContain("Could not verify");
     expect(harness.archive).not.toHaveBeenCalled();
     // The sink-side recheck fails closed on the same unreadable store.
-    expect(
-      await harness.taskHost.listActiveWorkflowRunIdsForWorkspaceStrict("childworkspace")
-    ).rejects.toThrow();
+    let scanError: unknown;
+    try {
+      await harness.taskHost.listActiveWorkflowRunIdsForWorkspaceStrict("childworkspace");
+    } catch (error: unknown) {
+      scanError = error;
+    }
+    expect(scanError).toBeInstanceOf(Error);
   });
 
   test("workspace lifecycle refuses archive while the target owns an active workflow run", async () => {
@@ -4497,88 +4594,6 @@ describe("WorkspaceTurnManager", () => {
 
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";
 
-  function ownerFollowUpCutter(ownerWorkspaceId: string, successorHandleId: string) {
-    return {
-      stage: "queued" as const,
-      dispatchMode: "tool-end" as const,
-      muxMetadata: {
-        type: "workspace-turn-task",
-        taskHandleId: successorHandleId,
-        ownerWorkspaceId,
-        turnId: "turn2",
-      },
-    };
-  }
-
-  function ownerFollowUpCutEvent(parentId: string, messageId: string): StreamEndEvent {
-    return {
-      type: "stream-end",
-      workspaceId: "childworkspace",
-      messageId,
-      metadata: {
-        model: "anthropic:claude-opus-4-6",
-        agentId: "exec",
-        finishReason: "tool-calls",
-        muxMetadata: {
-          type: "workspace-turn-task",
-          taskHandleId: "wst_handle",
-          ownerWorkspaceId: parentId,
-          turnId: "turn",
-        },
-      },
-      parts: [{ type: "text", text: "Cut mid-work" }],
-    };
-  }
-
-  test("cut attribution is captured at event time, before the workspace event lock", async () => {
-    // Codex P1: when another operation holds the workspace event lock as
-    // stream-end arrives, the session can drain the real manual cutter and
-    // engage a later same-owner follow-up during the wait. The snapshot must
-    // be captured synchronously in the event listener (before the lock), so
-    // the manual supersede keeps its wake.
-    const { config, parentId, taskService, workspaceMocks, aiMocks } =
-      await startWorkspaceTurnForTest();
-    let followUpEngaged = false;
-    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
-      followUpEngaged
-        ? ownerFollowUpCutter(parentId, "wst_successor")
-        : { stage: "preparing" as const, muxMetadata: undefined }
-    );
-    const streamEndListener = aiMocks.on.mock.calls.find(
-      (call: unknown[]) => call[0] === "stream-end"
-    )?.[1] as ((payload: unknown) => void) | undefined;
-    assert(streamEndListener != null, "stream-end listener must be registered");
-    const internal = taskService as unknown as {
-      workspaceEventLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
-    };
-
-    let releaseLock: (() => void) | undefined;
-    const lockHeld = new Promise<void>((resolve) => {
-      releaseLock = resolve;
-    });
-    const lockOwner = internal.workspaceEventLocks.withLock("childworkspace", async () => {
-      await lockHeld;
-    });
-    // Event arrives while the lock is held: capture happens NOW (manual
-    // cutter engaged), handling is queued behind the lock.
-    streamEndListener(ownerFollowUpCutEvent(parentId, "msg_lock_wait_cut"));
-    // The follow-up engages before the queued handler can run.
-    followUpEngaged = true;
-    assert(releaseLock != null, "lock owner must have started");
-    releaseLock();
-    await lockOwner;
-    // Sequence after the queued stream-end handler.
-    await internal.workspaceEventLocks.withLock("childworkspace", () => Promise.resolve());
-
-    expect(
-      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
-    ).toMatchObject({
-      status: "interrupted",
-      error:
-        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
-    });
-  });
-
   test("startup recovery does not resurrect a quiet owner-follow-up supersede wake", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
@@ -5301,12 +5316,10 @@ describe("WorkspaceTurnManager", () => {
       return cfg;
     });
     const patchGeneration = spyOn(
-      (
-        taskService as unknown as {
-          gitPatchArtifactService: { maybeStartGeneration: (...args: unknown[]) => Promise<void> };
-        }
-      ).gitPatchArtifactService,
-      "maybeStartGeneration"
+      taskService as unknown as {
+        maybeStartPatchGenerationForReportedTask: WorkspaceTurnManagerHost["maybeStartPatchGenerationForReportedTask"];
+      },
+      "maybeStartPatchGenerationForReportedTask"
     ).mockResolvedValue(undefined);
     const muxMetadata = {
       type: "workspace-turn-task" as const,
@@ -5389,7 +5402,7 @@ describe("WorkspaceTurnManager", () => {
       messageId: "msg_selfhealed",
       reportMarkdown: "Self-healed final text",
     });
-    expect(patchGeneration).toHaveBeenCalledWith(parentId, "childworkspace", expect.any(Function), {
+    expect(patchGeneration).toHaveBeenCalledWith("childworkspace", {
       refreshForContinuation: true,
     });
     const deliveredSnapshot = await new TaskHandleStore(config).getWorkspaceTurn(

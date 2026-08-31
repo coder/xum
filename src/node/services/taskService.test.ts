@@ -24948,7 +24948,7 @@ describe("TaskService", () => {
     expect(aiMocks.stopStream).not.toHaveBeenCalled();
   });
 
-  test("cut attribution uses the state captured at stream-end, not later live state", async () => {
+  test("cut attribution is captured at event time, before the workspace event lock", async () => {
     // Race pin (Codex P1): a manual/cross-owner input cuts the turn, then a
     // same-owner follow-up engages while handleStreamEnd's awaits run.
     // Classification must use the attribution snapshot captured synchronously
