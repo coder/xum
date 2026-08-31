@@ -2414,16 +2414,17 @@ describe("BackgroundProcessManager", () => {
       const proc = await manager.getProcess(result.processId);
       expect(proc).not.toBeNull();
       if (proc == null) return;
-      const getProcessSpy = spyOn(manager, "getProcess").mockRejectedValue(
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      proc.status = "running";
+      const exitSpy = spyOn(proc.handle, "getExitCode").mockRejectedValue(
         new Error("persistent transport failure")
       );
 
       const state = await manager.getMonitorWakeDeliveryState(result.processId, proc.startTime);
 
       expect(state).toMatchObject({ status: "settled", shownThroughOffset: 0 });
-      expect(getProcessSpy).not.toHaveBeenCalled();
-      getProcessSpy.mockRestore();
-      await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      expect(exitSpy).not.toHaveBeenCalled();
+      exitSpy.mockRestore();
     });
 
     it("bounds scripts exposed through live wake snapshots", async () => {
