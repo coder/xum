@@ -12857,9 +12857,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // turn's restriction rows without a supersession decision), and a no-op must retire
     // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
     // Decide up front; historyService revalidates the dangerous drift directions under the
-    // history write lock (refuseFullDelete / refuseRowRemoval below). A preflight read failure
-    // counts as emptying: the guarded path fails safe (references retired first, wakes dropped
-    // but resumable) even if the truncation itself later fails.
+    // history write lock (refuseFullDelete / refuseRowRemoval below).
     const truncationScope =
       effectivePercentage >= 1.0
         ? ("all" as const)
@@ -12868,12 +12866,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           : await this.historyService
               .classifyTruncationRemoval(workspaceId, effectivePercentage)
               .catch((error: unknown) => {
-                log.warn("History truncation scope preflight failed; treating as full clear", {
+                log.warn("History truncation scope preflight failed; refusing truncation", {
                   workspaceId,
                   error,
                 });
-                return "all" as const;
+                return null;
               });
+    if (truncationScope == null) {
+      // An unknown scope must not choose a side-effect set: labeling it a full clear would
+      // discard goal/plan/retry state and advance the context epoch while rows may remain,
+      // and labeling it smaller would skip full-clear guards. Nothing is mutated or retired
+      // yet, so refusing is lossless and the user can simply retry.
+      return Err("Failed to read history to classify the truncation scope. Try again.");
+    }
     const isFullClear = truncationScope === "all";
     // Every row-removing truncation holds the admission guard across its awaits (full clear:
     // the refine drain/lock below; partial: kernel workflow reference retirement): without

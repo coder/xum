@@ -9304,6 +9304,75 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("an unreadable truncation scope preflight refuses instead of applying full-clear effects", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-preflight-refuse";
+    const runId = "wfr_currentness_preflight_refuse";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-preflight-refuse",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "single short message", { timestamp: 1_200 })
+      );
+
+      // A transiently unreadable preflight must refuse: an unknown scope labeled "all" would
+      // apply full-clear side effects while a prefix removal can leave rows behind.
+      const preflightSpy = spyOn(historyService, "classifyTruncationRemoval").mockRejectedValueOnce(
+        new Error("EIO: history unreadable")
+      );
+      try {
+        const result = await workspaceService.truncateHistory(workspaceId, 0.5);
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("classify");
+        }
+      } finally {
+        preflightSpy.mockRestore();
+      }
+      // Lossless refusal: the transcript is intact and the kernel workflow reference survives
+      // for the retry (no wake was settled superseded by a truncation that never happened).
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data).toHaveLength(1);
+      }
+      expect(
+        existsSync(path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json"))
+      ).toBe(true);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a partial prefix truncation retires kernel workflow references", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-prefix-retire";
