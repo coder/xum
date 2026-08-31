@@ -1841,6 +1841,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         monitor.retainedMatches.length === 0
           ? undefined
           : {
+              batches: monitor.retainedMatches.map((batch) => ({
+                throughOffset: batch.matchedThroughOffset,
+                lines: [...batch.lines],
+                totalMatches: batch.totalMatches,
+                droppedLines: batch.droppedLines,
+              })),
               throughOffset:
                 monitor.retainedMatches[monitor.retainedMatches.length - 1].matchedThroughOffset,
               lines: monitor.retainedMatches.flatMap((batch) => batch.lines),
@@ -1863,6 +1869,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         ...(match != null
           ? {
               match: {
+                batches: match.batches,
                 throughOffset: match.throughOffset,
                 lines: [...match.lines],
                 totalMatches: match.totalMatches,

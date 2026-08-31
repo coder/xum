@@ -27,7 +27,15 @@ export const BASH_MONITOR_SETTLE_LINE_PREFIX = "[monitor] process settled:";
 
 export type BashMonitorPendingWakeKind = "match" | "monitor-lost" | "settled";
 
+interface BashMonitorMatchBatchSnapshot {
+  throughOffset: number;
+  lines: readonly string[];
+  totalMatches: number;
+  droppedLines: number;
+}
+
 interface BashMonitorMatchSnapshot {
+  batches?: readonly BashMonitorMatchBatchSnapshot[];
   throughOffset: number;
   lines: readonly string[];
   totalMatches: number;
@@ -86,6 +94,7 @@ export interface BashMonitorWakeReconcilerRegistry {
   recordTerminal(
     ownerWorkspaceId: string,
     processId: string,
+    createdAt: string,
     terminal: BashMonitorTerminalSummary
   ): Promise<void> | void;
 }
@@ -803,8 +812,18 @@ export class BashMonitorWakeReconciler {
     lines: readonly string[];
     droppedLines: number;
   } {
+    const visibleMatchBatches = snapshot.match?.batches?.filter(
+      (batch) => batch.throughOffset > shownThroughOffset
+    );
+    const retained =
+      visibleMatchBatches != null
+        ? visibleMatchBatches.flatMap((batch) => batch.lines)
+        : [...(snapshot.match?.lines ?? [])];
+    const retainedDroppedLines =
+      visibleMatchBatches != null
+        ? visibleMatchBatches.reduce((total, batch) => total + batch.droppedLines, 0)
+        : (snapshot.match?.droppedLines ?? 0);
     if (snapshot.lost != null) {
-      const retained = [...(snapshot.match?.lines ?? [])];
       const failedMatch = snapshot.lost.failedMatch;
       const includeFailedBatch =
         failedMatch?.matchedThroughOffset == null ||
@@ -821,14 +840,12 @@ export class BashMonitorWakeReconciler {
       return {
         lines: bounded.lines,
         droppedLines:
-          (snapshot.match?.droppedLines ?? 0) +
+          retainedDroppedLines +
           (includeFailedBatch ? (failedMatch?.droppedLines ?? 0) : 0) +
           bounded.droppedLines,
       };
     }
-    const matched = (snapshot.match?.lines ?? []).filter(
-      (line) => !line.startsWith(BASH_MONITOR_SETTLE_LINE_PREFIX)
-    );
+    const matched = retained;
     const counts = new Map<string, number>();
     for (const line of matched) counts.set(line, (counts.get(line) ?? 0) + 1);
     const tail = (snapshot.terminal?.tailLines ?? [])
@@ -860,7 +877,7 @@ export class BashMonitorWakeReconciler {
     const overflow = Math.max(0, combined.length - MAX_WAKE_LINES);
     return {
       lines: combined.slice(-MAX_WAKE_LINES),
-      droppedLines: (snapshot.match?.droppedLines ?? 0) + overflow,
+      droppedLines: retainedDroppedLines + overflow,
     };
   }
 

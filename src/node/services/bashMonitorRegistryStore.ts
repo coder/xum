@@ -160,6 +160,7 @@ export class BashMonitorRegistryStore {
   async recordTerminal(
     ownerWorkspaceId: string,
     processId: string,
+    createdAt: string,
     terminal: BashMonitorTerminalSummary
   ): Promise<void> {
     const key = ownerWorkspaceId + ":" + processId;
@@ -173,13 +174,14 @@ export class BashMonitorRegistryStore {
         throw error;
       }
       const record = this.parse(raw);
-      if (record == null) return;
+      if (record == null || record.createdAt !== createdAt) return;
       await this.writeRecord({ ...record, terminal });
     });
   }
   async recordLost(
     ownerWorkspaceId: string,
     processId: string,
+    createdAt: string,
     lost: BashMonitorLostSummary
   ): Promise<void> {
     const key = ownerWorkspaceId + ":" + processId;
@@ -193,7 +195,7 @@ export class BashMonitorRegistryStore {
         throw error;
       }
       const record = this.parse(raw);
-      if (record == null) return;
+      if (record == null || record.createdAt !== createdAt) return;
       const boundedMatch =
         lost.failedMatch != null ? boundBashMonitorWakeLines(lost.failedMatch.lines) : undefined;
       const normalized: BashMonitorLostSummary = {

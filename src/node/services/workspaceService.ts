@@ -1918,14 +1918,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         if (wasCanceled()) return false;
         if (payload.terminal != null) {
+          if (createdAt == null) return false;
           await this.bashMonitorRegistryStore.recordTerminal(
             workspaceId,
             payload.processId,
+            createdAt,
             payload.terminal
           );
         }
         if (wasCanceled()) return false;
-        await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, {
+        if (createdAt == null) return false;
+        await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, createdAt, {
           reason: "runtime-failure",
           ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
           ...(payload.failedOperations != null
@@ -1936,10 +1939,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
         return !wasCanceled();
       }
-      if (payload.terminal != null) {
+      if (payload.terminal != null && createdAt != null) {
         await this.bashMonitorRegistryStore.recordTerminal(
           workspaceId,
           payload.processId,
+          createdAt,
           payload.terminal
         );
       }
@@ -2406,12 +2410,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
         return "in-flight";
       }
-      if (
-        this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId) ||
-        this.isBusyForMessage(ownerWorkspaceId) ||
-        this.aiService.isStreaming(ownerWorkspaceId)
-      ) {
+      const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
+      const hasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
+      const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
+      if (hasPendingTurn || (hasSessionBackedBusyState && !hasAiServiceStream)) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+        return "deferred";
+      }
+      if (hasAiServiceStream && !hasSessionBackedBusyState) {
         return "deferred";
       }
       const sendOptions =

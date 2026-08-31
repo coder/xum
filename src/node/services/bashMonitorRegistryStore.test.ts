@@ -134,7 +134,7 @@ describe("BashMonitorRegistryStore", () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     await store.upsert(armedPayload());
 
-    await store.recordTerminal("owner-1", "proc-1", {
+    await store.recordTerminal("owner-1", "proc-1", "2026-01-01T00:00:00.000Z", {
       status: "exited",
       exitCode: 0,
       settledAt: "2026-01-01T00:00:01.000Z",
@@ -154,7 +154,7 @@ describe("BashMonitorRegistryStore", () => {
   test("persists bounded runtime failure evidence until delivery", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     await store.upsert(armedPayload());
-    await store.recordLost("owner-1", "proc-1", {
+    await store.recordLost("owner-1", "proc-1", "2026-01-01T00:00:00.000Z", {
       reason: "runtime-failure",
       failureMessage: "\u001b[31mtransport unavailable\u001b[0m",
       failedOperations: ["readOutput", "getExitCode"],
