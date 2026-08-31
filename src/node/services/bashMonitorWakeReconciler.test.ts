@@ -222,7 +222,7 @@ describe("BashMonitorWakeReconciler", () => {
           settledAt: "2026-08-31T12:01:00.000Z",
           wakeOnExit: true,
           terminalStatusShown: false,
-          tailLines: ["complete"],
+          tailLines: [{ line: "complete", endOffset: 8 }],
         },
         retired: true,
       }),
@@ -381,6 +381,87 @@ describe("BashMonitorWakeReconciler", () => {
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(1);
     expect(dispatches[0].prompt).toContain("READY");
+  });
+
+  test("settlement excludes tail lines already covered by the delivered match watermark", async () => {
+    live = [
+      liveSnapshot({
+        match: {
+          throughOffset: 18,
+          lines: ["SET_1", "SET_2", "SET_3"],
+          totalMatches: 3,
+        },
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+    await dispatches[0].onAccepted();
+
+    live = [
+      liveSnapshot({
+        match: undefined,
+        terminal: {
+          status: "exited",
+          exitCode: 0,
+          settledAt: "2026-08-31T12:07:00.000Z",
+          wakeOnExit: true,
+          terminalStatusShown: false,
+          tailLines: [
+            { line: "SET_1", endOffset: 6 },
+            { line: "SET_2", endOffset: 12 },
+            { line: "SET_3", endOffset: 18 },
+          ],
+        },
+        retired: true,
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(2);
+    const prompt = dispatches[1].prompt;
+    expect(prompt.match(/\[monitor\] process settled:/g)).toHaveLength(1);
+    expect(prompt).not.toContain("SET_1");
+    expect(prompt).not.toContain("SET_2");
+    expect(prompt).not.toContain("SET_3");
+  });
+
+  test("settlement keeps only the undelivered match before one composed marker", async () => {
+    live = [
+      liveSnapshot({
+        match: { throughOffset: 7, lines: ["TICK_1"], totalMatches: 1 },
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+    await dispatches[0].onAccepted();
+
+    live = [
+      liveSnapshot({
+        match: {
+          throughOffset: 14,
+          lines: ["TICK_2", "[monitor] process settled: exited (code 0)"],
+          totalMatches: 2,
+        },
+        terminal: {
+          status: "exited",
+          exitCode: 0,
+          settledAt: "2026-08-31T12:08:00.000Z",
+          wakeOnExit: true,
+          terminalStatusShown: false,
+          tailLines: [
+            { line: "TICK_1", endOffset: 7 },
+            { line: "TICK_2", endOffset: 14 },
+          ],
+        },
+        retired: true,
+      }),
+    ];
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(2);
+    const prompt = dispatches[1].prompt;
+    expect(prompt.match(/\[monitor\] process settled:/g)).toHaveLength(1);
+    expect(prompt.match(/TICK_2/g)).toHaveLength(1);
+    expect(prompt).not.toContain("TICK_1");
+    expect(prompt.indexOf("TICK_2")).toBeLessThan(prompt.indexOf("[monitor] process settled:"));
   });
 
   test("shown matched output is suppressed while a new settlement still wakes with context", async () => {

@@ -25,10 +25,7 @@ import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
 import type { BashMonitorTerminalSummary } from "./bashMonitorRegistryStore";
-import {
-  BASH_MONITOR_SETTLE_LINE_PREFIX,
-  type BashMonitorProcessSnapshot,
-} from "./bashMonitorWakeReconciler";
+import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 
@@ -209,7 +206,7 @@ export interface MonitorMatchedLineFrontier {
 }
 
 export interface MonitorSettlementDisposition extends BashMonitorTerminalSummary {
-  tailLines: readonly string[];
+  tailLines: readonly BashMonitorTailLine[];
 }
 
 export interface OutputShownPayload {
@@ -825,7 +822,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // beginShutdown can never leak a pending-match emit past this point.
     if (monitor.stopped || this.shuttingDown) return;
 
-    let tailLines: string[] = [];
+    let tailLines: BashMonitorTailLine[] = [];
     if (monitor.wakeOnExit) {
       try {
         tailLines = await this.readSettlementTailLines(proc);
@@ -869,20 +866,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         });
       }
     } else {
-      // No task_await instruction here: the durable line outlives the process registration (a
-      // recovered wake after a Xum restart would direct the agent at a not_found task ID), so
-      // awaitability guidance lives only in the prompt builder, which renders it conditionally.
-      // Downgraded builds keep actionability from their generic match-record closing guidance.
-      const settleLine =
-        `${BASH_MONITOR_SETTLE_LINE_PREFIX} ${terminal.status}` +
-        `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}`;
-      // The tail travels separately from the event lines: a matched line inside the final tail
-      // window would otherwise render twice, and only the wake store can also see matches that
-      // were already flushed into a persisted pending record while the owner was busy. The store
-      // dedupes the tail against both before persisting one combined line list.
       this.emitMonitorUpdate(proc, monitor, {
-        lines: [...(includeMatched ? pendingLines : []), settleLine],
-        ...(tailLines.length > 0 ? { tailLines } : {}),
+        lines: includeMatched ? pendingLines : [],
+        ...(tailLines.length > 0 ? { tailLines: tailLines.map((entry) => entry.line) } : {}),
         droppedLines: includeMatched ? droppedLines : 0,
         ...(includeMatched ? { matchedThroughOffset: monitor.matchedThroughOffset } : {}),
         terminal,
@@ -900,38 +886,36 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * ~4 KB, sanitized and middle-truncated like matched lines. Read failure propagates to the
    * caller, which treats it as an empty tail.
    */
-  private async readSettlementTailLines(proc: BackgroundProcess): Promise<string[]> {
+  private async readSettlementTailLines(proc: BackgroundProcess): Promise<BashMonitorTailLine[]> {
     const fileSizeBytes = await proc.handle.getOutputFileSize();
     const windowStart = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
-    // Exclude bytes the owner was already shown: an unfiltered read can consume the final lines
-    // while the process is still running, and repeating them after the settle marker as "new
-    // output" could retrigger work the agent already handled. The frontier always sits at the
-    // end of a complete line, so a frontier start begins exactly on a line boundary and its
-    // first segment is a real line (no fragment to drop).
     const offset = Math.max(windowStart, proc.shownThroughOffset);
     const startedAtLineBoundary = offset === proc.shownThroughOffset;
     const result = await proc.handle.readOutput(offset);
-    // Re-enforce the byte bound on the returned content: a degraded size query above (see
-    // boundTailContent) would otherwise let a large remote log flow into line processing whole.
     const bounded = boundTailContent(result.content, MONITOR_SETTLEMENT_TAIL_BYTES);
     const startedMidLine = (offset > 0 && !startedAtLineBoundary) || bounded.startedMidContent;
     const segments = bounded.content.split("\n");
-    // A mid-file (or mid-content, after the byte cut) start almost certainly begins inside a
-    // line; drop that partial fragment rather than presenting it as a complete output line.
-    const rawLines = startedMidLine ? segments.slice(1) : segments;
+    let cursor = result.newOffset - Buffer.byteLength(bounded.content, "utf8");
+    const positioned = segments.map((line, index) => {
+      cursor += Buffer.byteLength(line, "utf8");
+      if (index < segments.length - 1) cursor += 1;
+      return { line, endOffset: cursor };
+    });
+    const rawLines = startedMidLine ? positioned.slice(1) : positioned;
     const lines = rawLines
-      .map((line) => this.sanitizeMonitorLine(line))
-      .filter((line) => line.length > 0)
+      .map((entry) => ({ ...entry, line: this.sanitizeMonitorLine(entry.line) }))
+      .filter((entry) => entry.line.length > 0)
       .slice(-MONITOR_SETTLEMENT_TAIL_MAX_LINES)
-      .map((line) => this.truncateMonitorLine(line));
+      .map((entry) => ({ ...entry, line: this.truncateMonitorLine(entry.line) }));
     if (lines.length > 0 || !startedMidLine) return lines;
-    // The whole window sat inside one oversized line (no line boundary in the final ~4 KB —
-    // e.g. long JSON diagnostics or a single-line compiler failure): dropping the lone fragment
-    // would deliver an empty tail exactly when that line IS the decisive output. Keep the
-    // bounded suffix, explicitly marked as a mid-line cut.
     const fragment = this.sanitizeMonitorLine(segments[0] ?? "");
     if (fragment.length === 0) return [];
-    return [this.truncateMonitorLine(`${MONITOR_TRUNCATION_MARKER}${fragment}`)];
+    return [
+      {
+        line: this.truncateMonitorLine(`${MONITOR_TRUNCATION_MARKER}${fragment}`),
+        endOffset: result.newOffset,
+      },
+    ];
   }
 
   private scheduleMonitorFlush(

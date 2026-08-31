@@ -32,6 +32,11 @@ export interface BashMonitorMatchSnapshot {
   droppedLines?: number;
 }
 
+export interface BashMonitorTailLine {
+  line: string;
+  endOffset: number;
+}
+
 export interface BashMonitorProcessSnapshot {
   processId: string;
   taskId: string;
@@ -42,7 +47,7 @@ export interface BashMonitorProcessSnapshot {
   script: string;
   createdAt: string;
   match?: BashMonitorMatchSnapshot;
-  terminal?: BashMonitorTerminalSummary & { tailLines?: readonly string[] };
+  terminal?: BashMonitorTerminalSummary & { tailLines?: readonly BashMonitorTailLine[] };
   lost?: BashMonitorLostSummary;
   retired: boolean;
 }
@@ -616,7 +621,13 @@ export class BashMonitorWakeReconciler {
     if (!matchNew && !terminalNew && !lostNew) {
       if (deadRegistryRow || snapshot.retired) {
         return {
-          signal: this.toSignal(snapshot, deadRegistryRow, false, false),
+          signal: this.toSignal(
+            snapshot,
+            deadRegistryRow,
+            false,
+            false,
+            watermark?.matchedThroughOffset ?? -1
+          ),
           outstanding: false,
           consume: true,
         };
@@ -632,7 +643,13 @@ export class BashMonitorWakeReconciler {
       : undefined;
     if (deliveryState?.status === "blocked") {
       return {
-        signal: this.toSignal(snapshot, deadRegistryRow, false, true),
+        signal: this.toSignal(
+          snapshot,
+          deadRegistryRow,
+          false,
+          true,
+          watermark?.matchedThroughOffset ?? -1
+        ),
         outstanding: false,
         consume: false,
         deferredRead: deliveryState.readSettled,
@@ -650,11 +667,18 @@ export class BashMonitorWakeReconciler {
     const terminalWake = terminalNew && snapshot.terminal?.wakeOnExit === true && !terminalShown;
     const lostWake = lostNew;
     const matchWake = matchNew && !matchShown;
+    const deliveredThroughOffset = Math.max(
+      watermark?.matchedThroughOffset ?? -1,
+      deliveryState?.status === "settled" ? deliveryState.shownThroughOffset : -1
+    );
     const signal = this.toSignal(
       snapshot,
       deadRegistryRow,
       matchShown,
-      deliveryState?.status === "settled" ? (deliveryState.taskAwaitable ?? true) : !deadRegistryRow
+      deliveryState?.status === "settled"
+        ? (deliveryState.taskAwaitable ?? true)
+        : !deadRegistryRow,
+      deliveredThroughOffset
     );
     signal.kind = lostWake ? "monitor-lost" : matchWake ? "match" : "settled";
     const outstanding = lostWake || matchWake || terminalWake;
@@ -665,7 +689,8 @@ export class BashMonitorWakeReconciler {
     snapshot: BashMonitorProcessSnapshot,
     deadRegistryRow: boolean,
     matchedOutputAlreadyShown: boolean,
-    taskAwaitable: boolean
+    taskAwaitable: boolean,
+    deliveredThroughOffset: number
   ): DerivedSignal {
     return {
       key: signalKey(snapshot.processId, snapshot.createdAt),
@@ -678,7 +703,7 @@ export class BashMonitorWakeReconciler {
       script: snapshot.script,
       createdAt: snapshot.createdAt,
       kind: "match",
-      ...this.composeLines(snapshot),
+      ...this.composeLines(snapshot, deliveredThroughOffset),
       ...(snapshot.lost?.failedMatch?.matchedThroughOffset != null
         ? { matchOffset: snapshot.lost.failedMatch.matchedThroughOffset }
         : snapshot.match != null
@@ -693,7 +718,10 @@ export class BashMonitorWakeReconciler {
     };
   }
 
-  private composeLines(snapshot: BashMonitorProcessSnapshot): {
+  private composeLines(
+    snapshot: BashMonitorProcessSnapshot,
+    deliveredThroughOffset: number
+  ): {
     lines: readonly string[];
     droppedLines: number;
   } {
@@ -704,15 +732,20 @@ export class BashMonitorWakeReconciler {
         droppedLines: (snapshot.lost.failedMatch?.droppedLines ?? 0) + bounded.droppedLines,
       };
     }
-    const matched = [...(snapshot.match?.lines ?? [])];
+    const matched = (snapshot.match?.lines ?? []).filter(
+      (line) => !line.startsWith(BASH_MONITOR_SETTLE_LINE_PREFIX)
+    );
     const counts = new Map<string, number>();
     for (const line of matched) counts.set(line, (counts.get(line) ?? 0) + 1);
-    const tail = (snapshot.terminal?.tailLines ?? []).filter((line) => {
-      const count = counts.get(line) ?? 0;
-      if (count === 0) return true;
-      counts.set(line, count - 1);
-      return false;
-    });
+    const tail = (snapshot.terminal?.tailLines ?? [])
+      .filter((entry) => entry.endOffset > deliveredThroughOffset)
+      .map((entry) => entry.line)
+      .filter((line) => {
+        const count = counts.get(line) ?? 0;
+        if (count === 0) return true;
+        counts.set(line, count - 1);
+        return false;
+      });
     const terminalLine =
       snapshot.terminal?.wakeOnExit === true
         ? [
