@@ -296,25 +296,6 @@ async function expectWebSocketOriginCase(input: {
   );
 }
 
-describe("OpenAPI spec generation", () => {
-  test("emits request bodies for Effect Schema inputs (converter registered)", async () => {
-    await withTestOrpcServer(async (server) => {
-      const response = await fetch(`${server.baseUrl}/api/spec.json`);
-      expect(response.status).toBe(200);
-      const spec = (await response.json()) as {
-        paths?: Record<string, { post?: { requestBody?: { content?: Record<string, unknown> } } }>;
-      };
-      // Regression: without EffectSchemaToJsonSchemaConverter the generator
-      // silently drops the requestBody for Effect Schema inputs, shipping a
-      // lossy spec (fields missing from /api/docs and generated clients).
-      const operation = spec.paths?.["/effectSpike/pinnedCount"]?.post;
-      expect(operation).toBeDefined();
-      const requestSchema = JSON.stringify(operation?.requestBody?.content ?? {});
-      expect(requestSchema).toContain('"prefix"');
-    });
-  });
-});
-
 describe("createOrpcServer", () => {
   test("serveStatic fallback does not swallow /api routes", async () => {
     // Minimal context stub - router won't be exercised by this test.

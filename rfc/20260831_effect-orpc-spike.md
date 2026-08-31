@@ -19,7 +19,9 @@ anchored on the existing oRPC layer:
 5. Recommend an incremental adoption architecture.
 
 Everything below was validated by code in this branch (`src/node/orpc/effectSpike.ts`,
-`src/node/orpc/effectSpike.test.ts`, converted `MemoryMetaService`/`setMemoryPinned`),
+`src/node/orpc/effectSpike.test.ts`, converted `MemoryMetaService`/`setMemoryPinned`).
+The `effectSpike.*` validation namespace is mounted only by its tests — it is
+deliberately not part of the production router (codex review),
 with all affected suites green: 128 tests across oRPC/memory/CLI files plus 7 new spike tests.
 
 ## TL;DR
@@ -197,7 +199,8 @@ renderer/browser side, and Effect Schema replacing zod wholesale (coexistence wo
 
 - `make typecheck` green (both tsconfigs).
 - `bun test src/node/orpc/ src/node/services/memoryMeta.test.ts src/node/services/memoryOperations.test.ts src/cli/cli.test.ts src/cli/server.test.ts` → 125 pass / 3 skip / 0 fail.
-- `bun test src/node/orpc/effectSpike.test.ts` → 7/7: service injection, Effect Schema
+- `bun test src/node/orpc/effectSpike.test.ts` → 9/9: service injection, Effect Schema
   validation, typed error round-trip (success + failure with `defined:true` + data),
-  abort-interruption with exactly-once finalizers, normal-completion finalizers, benchmark.
+  abort-interruption with exactly-once finalizers, normal-completion finalizers,
+  auth-middleware-over-handlerGen composition, OpenAPI converter regression, benchmark.
 - ESLint clean on all touched files.

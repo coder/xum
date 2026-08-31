@@ -9,10 +9,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ORPCError, createRouterClient } from "@orpc/server";
+import { ORPCError, createRouterClient, os as orpcBase } from "@orpc/server";
 import { effectSpike, scopeProbe } from "./effectSpike";
 import { buildOrpcEffectContext } from "./effectContext";
-import { router } from "./router";
+import { createAuthMiddleware } from "./authMiddleware";
+import { createOpenAPIGenerator } from "./server";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { ORPCContext } from "./context";
 
@@ -133,8 +134,14 @@ describe("cancellation + resource scoping", () => {
 });
 
 describe("router-level middleware over Effect handlers", () => {
-  test("effectSpike procedures inherit the router's auth middleware", async () => {
-    const authedRouter = router("secret-token");
+  test("auth middleware applies to handlerGen procedures mounted under it", async () => {
+    // The spike namespace is deliberately NOT part of the production router
+    // (codex review on #4022); compose it the same way router() composes its
+    // procedures to prove middleware still wraps Effect handlers.
+    const authedRouter = orpcBase
+      .$context<ORPCContext>()
+      .use(createAuthMiddleware("secret-token"))
+      .router({ effectSpike });
     const unauthedClient = createRouterClient(authedRouter, {
       context: { headers: {} } as unknown as ORPCContext,
     });
@@ -146,6 +153,26 @@ describe("router-level middleware over Effect handlers", () => {
       expect(error).toBeInstanceOf(ORPCError);
       expect((error as ORPCError<string, unknown>).code).toBe("UNAUTHORIZED");
     }
+  });
+});
+
+describe("OpenAPI generation for Effect Schema inputs", () => {
+  test("production converter set emits request bodies for Effect Schema inputs", async () => {
+    // Regression (codex P1 on #4022): without EffectSchemaToJsonSchemaConverter
+    // the generator silently drops the requestBody for Effect Schema inputs,
+    // shipping a lossy spec (fields missing from /api/docs and generated clients).
+    const spec = await createOpenAPIGenerator().generate(
+      orpcBase.$context<ORPCContext>().router({ effectSpike }),
+      { base: { info: { title: "spike", version: "0" } } }
+    );
+    const paths = (spec.paths ?? {}) as Record<
+      string,
+      { post?: { requestBody?: { content?: Record<string, unknown> } } }
+    >;
+    const operation = paths["/effectSpike/pinnedCount"]?.post;
+    expect(operation).toBeDefined();
+    const requestSchema = JSON.stringify(operation?.requestBody?.content ?? {});
+    expect(requestSchema).toContain('"prefix"');
   });
 });
 
