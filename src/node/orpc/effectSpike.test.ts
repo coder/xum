@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { ORPCError, createRouterClient } from "@orpc/server";
 import { effectSpike, scopeProbe } from "./effectSpike";
 import { buildOrpcEffectContext } from "./effectContext";
+import { router } from "./router";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { ORPCContext } from "./context";
 
@@ -128,6 +129,23 @@ describe("cancellation + resource scoping", () => {
     expect(result).toEqual({ held: true });
     expect(scopeProbe.acquired).toBe(1);
     expect(scopeProbe.released).toBe(1);
+  });
+});
+
+describe("router-level middleware over Effect handlers", () => {
+  test("effectSpike procedures inherit the router's auth middleware", async () => {
+    const authedRouter = router("secret-token");
+    const unauthedClient = createRouterClient(authedRouter, {
+      context: { headers: {} } as unknown as ORPCContext,
+    });
+
+    try {
+      await unauthedClient.effectSpike.echoAsync({ n: 1 });
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect((error as ORPCError<string, unknown>).code).toBe("UNAUTHORIZED");
+    }
   });
 });
 
