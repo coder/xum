@@ -151,12 +151,15 @@ describe("Persistent sub-agent compaction", () => {
     const executionTaskId = reactivated.data.executionTaskId;
     if (!executionTaskId) throw new Error("Expected a reactivated execution task ID");
 
-    const continuation = await env.services.taskService.waitForWorkspaceTurn(executionTaskId, {
-      requestingWorkspaceId: parentWorkspaceId,
-      ownerWorkspaceId: parentWorkspaceId,
-      backgroundOnMessageQueued: false,
-      timeoutMs: 10_000,
-    });
+    const continuation = await env.services.workspaceTurnManager.waitForWorkspaceTurn(
+      executionTaskId,
+      {
+        requestingWorkspaceId: parentWorkspaceId,
+        ownerWorkspaceId: parentWorkspaceId,
+        backgroundOnMessageQueued: false,
+        timeoutMs: 10_000,
+      }
+    );
     expect(continuation).toMatchObject({
       taskId: executionTaskId,
       workspaceId: childWorkspaceId,

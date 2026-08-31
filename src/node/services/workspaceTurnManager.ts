@@ -8,6 +8,7 @@ import type { QueueCutCutter } from "@/node/services/messageQueue";
 import {
   areArchiveUntrackedPathListsEqual,
   type WorkspaceHost,
+  type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -100,7 +101,6 @@ import {
   TerminalAttentionStore,
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
-import type { TaskService } from "@/node/services/taskService";
 
 export type TaskKind = "agent";
 
@@ -643,7 +643,7 @@ export class WorkspaceTurnManager {
     private readonly aiService: AIService,
     private readonly workspaceService: WorkspaceHost,
     private readonly initStateManager: InitStateManager,
-    private readonly taskService: TaskService,
+    private readonly taskHost: WorkspaceTurnManagerHost,
     private readonly terminalAttentionStore: TerminalAttentionStore,
     private readonly workspaceLifecycleLocks: MutexMap<string>,
     private readonly streamManager?: StreamManager
@@ -715,7 +715,7 @@ export class WorkspaceTurnManager {
       }
     );
     if (pendingNotification != null) {
-      await this.taskService.enqueueTerminalAttention({
+      await this.taskHost.enqueueTerminalAttention({
         ownerWorkspaceId,
         sourceKind: "workspace_turn",
         sourceId: pendingNotification.handleId,
@@ -1035,7 +1035,7 @@ export class WorkspaceTurnManager {
       requestedAgentId = parsedAgentId.data;
     }
 
-    await using _lock = await this.taskService.acquireTaskCreationLock();
+    await using _lock = await this.taskHost.acquireTaskCreationLock();
 
     const parentMetaResult = await this.aiService.getWorkspaceMetadata(ownerWorkspaceId);
     if (!parentMetaResult.success) {
@@ -1064,7 +1064,7 @@ export class WorkspaceTurnManager {
     const ownerWorkspaceTurns = allWorkspaceTurns.filter(
       (record) => record.ownerWorkspaceId === ownerWorkspaceId
     );
-    const activeAgentCount = this.taskService.countActiveAgentTasks(cfg);
+    const activeAgentCount = this.taskHost.countActiveAgentTasks(cfg);
     const ensureParallelSlot = async (): Promise<Result<void, string>> => {
       const activeWorkspaceTurnCount = await this.countActiveWorkspaceTurns(allWorkspaceTurns);
       const activeCount = activeAgentCount + activeWorkspaceTurnCount;
@@ -1119,18 +1119,14 @@ export class WorkspaceTurnManager {
         return Err("Task.createWorkspaceTurn: workspace.workspaceId is required for existing mode");
       }
       const targetEntry = findWorkspaceEntry(cfg, existingWorkspaceId);
-      const targetTaskIndex = this.taskService.buildAgentTaskIndex(cfg);
+
       const ownsExistingWorkspaceTurn = ownerWorkspaceTurns.some(
         (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
       );
       const ownsDescendantAgentWorkspace =
         args.allowAgentWorkspace === true &&
         targetEntry?.workspace.parentWorkspaceId != null &&
-        this.taskService.isDescendantAgentTaskUsingParentById(
-          targetTaskIndex.parentById,
-          ownerWorkspaceId,
-          existingWorkspaceId
-        );
+        this.taskHost.isDescendantAgentTaskInConfig(cfg, ownerWorkspaceId, existingWorkspaceId);
       if (!ownsExistingWorkspaceTurn && !ownsDescendantAgentWorkspace) {
         return Err("Task.createWorkspaceTurn: invalid_scope for existing workspace");
       }
@@ -1212,7 +1208,7 @@ export class WorkspaceTurnManager {
       // message — the owner changing its model/thinking must not drag
       // already-created children along.
       targetAiSettings = targetEntry
-        ? this.taskService.resolveWorkspaceAISettings(targetEntry.workspace, workspaceTurnAgentId)
+        ? this.taskHost.resolveWorkspaceAISettings(targetEntry.workspace, workspaceTurnAgentId)
         : undefined;
       queuedForExistingWorkspace = this.workspaceService.isBusyForMessage(existingWorkspaceId);
       const activeWorkspaceTurn = await this.findActiveWorkspaceTurnForWorkspace(
@@ -1438,10 +1434,7 @@ export class WorkspaceTurnManager {
               thinkingLevel: args.parentRuntimeAiSettings.thinkingLevel,
             }
           : undefined,
-        fallbacks: this.taskService.buildParentAiSettingsFallbacks(
-          parentMeta,
-          workspaceTurnAgentId
-        ),
+        fallbacks: this.taskHost.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
         // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
         // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
         // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
@@ -1601,7 +1594,7 @@ export class WorkspaceTurnManager {
           await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, "running");
           // A stopped queued child keeps its only copy of the initial brief in taskPrompt. Once the
           // continuation accepts the replayed prompt, history owns that brief and the config copy can go.
-          await this.taskService.editWorkspaceEntry(
+          await this.taskHost.editWorkspaceEntry(
             targetWorkspaceId,
             (workspace) => {
               delete workspace.taskPrompt;
@@ -1782,7 +1775,7 @@ export class WorkspaceTurnManager {
         if (!legacyRepresentsCurrentOutcome) {
           // Corrected outcomes must bypass a stale legacy tombstone. New settlements use this same
           // versioned ID, while the timestamp check preserves old ordinary-settlement dedupe.
-          await this.taskService.enqueueTerminalAttention({
+          await this.taskHost.enqueueTerminalAttention({
             ownerWorkspaceId: record.ownerWorkspaceId,
             sourceKind: "workspace_turn",
             terminalOutcome: outcome,
@@ -2272,7 +2265,7 @@ export class WorkspaceTurnManager {
       }
       this.workspaceService.emitChatEvent(directParentWorkspaceId, { ...message, type: "message" });
     }
-    await this.taskService.enqueueTerminalAttention({
+    await this.taskHost.enqueueTerminalAttention({
       ownerWorkspaceId: directParentWorkspaceId,
       sourceKind: "agent_task",
       sourceId: record.workspaceId,
@@ -2380,7 +2373,7 @@ export class WorkspaceTurnManager {
             current.handleId,
             current.status
           );
-          this.taskService.markTaskForegroundRelevant(current.handleId);
+          this.taskHost.markTaskForegroundRelevant(current.handleId);
           return { pendingNotify: null, winningStatus: current.status };
         }
 
@@ -2456,7 +2449,7 @@ export class WorkspaceTurnManager {
         if (requiresDirectParentDelivery && nextRecord.status === "completed") {
           // Persistent exec children reuse one stable task ID. Refresh their artifact before the
           // continuation becomes inactive so task_remove cannot race the background format-patch.
-          await this.taskService.maybeStartPatchGenerationForReportedTask(nextRecord.workspaceId, {
+          await this.taskHost.maybeStartPatchGenerationForReportedTask(nextRecord.workspaceId, {
             refreshForContinuation: true,
           });
         }
@@ -2480,9 +2473,9 @@ export class WorkspaceTurnManager {
         const ownerHadForegroundWaiter = foregroundWaiterWorkspaceIds.has(
           params.record.ownerWorkspaceId
         );
-        this.taskService.markTaskForegroundRelevant(params.record.handleId);
+        this.taskHost.markTaskForegroundRelevant(params.record.handleId);
         await this.cleanupDisposableWorkspaceTurn(nextRecord);
-        this.taskService.scheduleMaybeStartQueuedTasks();
+        this.taskHost.scheduleMaybeStartQueuedTasks();
 
         // Suppress the owner-scoped wake only when the owner itself received this terminal result.
         // Another workspace (for example the persistent child's direct parent) can await the same
@@ -2534,7 +2527,7 @@ export class WorkspaceTurnManager {
       return;
     }
     if (pendingNotify.kind === "drain_pending") {
-      this.taskService.scheduleTerminalAttentionDrain(params.record.ownerWorkspaceId);
+      this.taskHost.scheduleTerminalAttentionDrain(params.record.ownerWorkspaceId);
       return;
     }
 
@@ -2569,7 +2562,7 @@ export class WorkspaceTurnManager {
         return;
       }
     }
-    await this.taskService.enqueueTerminalAttention({
+    await this.taskHost.enqueueTerminalAttention({
       ownerWorkspaceId: params.record.ownerWorkspaceId,
       sourceKind: "workspace_turn",
       terminalOutcome: terminalAttentionOutcome(settlementResult.winningStatus),
@@ -2618,13 +2611,13 @@ export class WorkspaceTurnManager {
     const ownerWorkspaceId = options.ownerWorkspaceId ?? options.requestingWorkspaceId;
     assert(ownerWorkspaceId.length > 0, "waitForWorkspaceTurn: ownerWorkspaceId must be non-empty");
 
-    this.taskService.markTaskForegroundRelevant(handleId);
+    this.taskHost.markTaskForegroundRelevant(handleId);
 
     return await new Promise<WorkspaceTurnWaitResult>((resolve, reject) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
       let abortListener: (() => void) | null = null;
-      let stopBlockingRequester: (() => void) | null = this.taskService.startForegroundAwait(
+      let stopBlockingRequester: (() => void) | null = this.taskHost.startForegroundAwait(
         options.requestingWorkspaceId
       );
       const shouldBackgroundOnQueuedMessage = options.backgroundOnMessageQueued ?? true;
@@ -2641,7 +2634,7 @@ export class WorkspaceTurnManager {
           abortListener = null;
         }
         if (waiterEntry.backgroundOnMessageQueued && waiterEntry.requestingWorkspaceId) {
-          this.taskService.unregisterBackgroundableForegroundWaiter(
+          this.taskHost.unregisterBackgroundableForegroundWaiter(
             waiterEntry.requestingWorkspaceId,
             waiterEntry
           );
@@ -2681,7 +2674,7 @@ export class WorkspaceTurnManager {
       waiters.push(waiterEntry);
       this.pendingWorkspaceTurnWaitersByHandleId.set(handleId, waiters);
       if (shouldBackgroundOnQueuedMessage) {
-        this.taskService.registerBackgroundableForegroundWaiter(
+        this.taskHost.registerBackgroundableForegroundWaiter(
           options.requestingWorkspaceId,
           waiterEntry
         );
@@ -2698,7 +2691,7 @@ export class WorkspaceTurnManager {
         timeoutMs
       );
 
-      this.taskService.backgroundForegroundWaitIfQueued(
+      this.taskHost.backgroundForegroundWaitIfQueued(
         shouldBackgroundOnQueuedMessage,
         options.requestingWorkspaceId
       );
@@ -2828,7 +2821,7 @@ export class WorkspaceTurnManager {
     const turnLive =
       this.aiService.isStreaming(record.workspaceId) ||
       this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
-      this.taskService.hasActiveDescendantAgentTasks(
+      this.taskHost.hasActiveDescendantAgentTasks(
         this.config.loadConfigOrDefault(),
         record.workspaceId
       );
@@ -3004,7 +2997,7 @@ export class WorkspaceTurnManager {
       ) {
         // History repair can be the only terminal path after a crash/restart. Refresh the stable
         // child's patch before persisting the recovered inactive handle, matching normal settlement.
-        await this.taskService.maybeStartPatchGenerationForReportedTask(recovered.workspaceId, {
+        await this.taskHost.maybeStartPatchGenerationForReportedTask(recovered.workspaceId, {
           refreshForContinuation: true,
         });
       }
@@ -3197,8 +3190,8 @@ export class WorkspaceTurnManager {
         // persistence: ROOT targets have no task lifecycle status to refuse on, so a send
         // admitted during the wind-down would queue behind the dying stream and auto-dispatch
         // when it ends, defeating the stop.
-        this.taskService.bumpWorkspaceStopEpoch(record.workspaceId);
-        releaseStopLatch = this.taskService.latchWorkspaceStopsInProgress([record.workspaceId]);
+        this.taskHost.bumpWorkspaceStopEpoch(record.workspaceId);
+        releaseStopLatch = this.taskHost.latchWorkspaceStopsInProgress([record.workspaceId]);
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
@@ -3219,7 +3212,7 @@ export class WorkspaceTurnManager {
           status: "error",
           error: new Error("Workspace turn interrupted"),
         });
-        this.taskService.markTaskForegroundRelevant(record.handleId);
+        this.taskHost.markTaskForegroundRelevant(record.handleId);
         return Ok({ workspaceId: record.workspaceId });
       });
 
@@ -3251,7 +3244,7 @@ export class WorkspaceTurnManager {
       if (interruptedRecord != null && options?.suppressDisposableCleanup !== true) {
         await this.cleanupDisposableWorkspaceTurn(interruptedRecord);
       }
-      this.taskService.scheduleMaybeStartQueuedTasks();
+      this.taskHost.scheduleMaybeStartQueuedTasks();
       return result;
     } finally {
       releaseStopLatch?.();
@@ -3277,7 +3270,7 @@ export class WorkspaceTurnManager {
     // acquiring a tree lock — that edge closed a three-way cycle with createMany
     // (tree → mutex) and createWorkspaceTurn's persist section (mutex → lifecycle).
     const lifecycleResult: Result<WorkspaceLifecycleResult, string> =
-      await this.taskService.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
+      await this.taskHost.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
         this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
           if (resolved.metadata == null) {
             return Ok({
@@ -3397,10 +3390,9 @@ export class WorkspaceTurnManager {
           // the absence of active runs, so scan failures refuse instead of reading as none.
           let activeWorkflowRunIds: string[];
           try {
-            activeWorkflowRunIds =
-              await this.taskService.listActiveWorkflowRunIdsForWorkspaceStrict(
-                resolved.workspaceId
-              );
+            activeWorkflowRunIds = await this.taskHost.listActiveWorkflowRunIdsForWorkspaceStrict(
+              resolved.workspaceId
+            );
           } catch (error: unknown) {
             return Ok({
               status: "error",
@@ -3689,7 +3681,7 @@ export class WorkspaceTurnManager {
     // Same lock order as archive (task-tree → workspace lifecycle): unarchive shares the
     // task-tree lock with archive so it cannot interleave with an archive's post-persist
     // cleanup, and pre-acquiring it before the lifecycle lock preserves the global order.
-    return await this.taskService.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
+    return await this.taskHost.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
       this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
         if (resolved.metadata == null) {
           return Ok({
@@ -3941,7 +3933,7 @@ export class WorkspaceTurnManager {
   }
 
   private isActiveWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): boolean {
-    if (record.status === "running" && this.taskService.isForegroundAwaiting(record.workspaceId)) {
+    if (record.status === "running" && this.taskHost.isForegroundAwaiting(record.workspaceId)) {
       return false;
     }
     return isActiveWorkspaceTurnTaskStatus(record.status);
@@ -3975,7 +3967,7 @@ export class WorkspaceTurnManager {
     record: WorkspaceTurnTaskHandleRecord
   ): Promise<boolean> {
     if (
-      this.taskService.hasActiveDescendantAgentTasks(
+      this.taskHost.hasActiveDescendantAgentTasks(
         this.config.loadConfigOrDefault(),
         record.workspaceId
       )
@@ -3983,13 +3975,13 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    const referencedWorkflowRunIds = await this.taskService.listAgentReferencedWorkflowRunIds(
+    const referencedWorkflowRunIds = await this.taskHost.listAgentReferencedWorkflowRunIds(
       record.workspaceId,
       []
     );
     if (
       (
-        await this.taskService.listActiveBackgroundWorkflowRunIds(
+        await this.taskHost.listActiveBackgroundWorkflowRunIds(
           record.workspaceId,
           referencedWorkflowRunIds
         )
@@ -4984,7 +4976,7 @@ export class WorkspaceTurnManager {
       recordsByWorkspaceId.set(candidate.record.workspaceId, workspaceRecords);
     }
 
-    for (const task of this.taskService.listAgentTaskWorkspaces(config)) {
+    for (const task of this.taskHost.listAgentTaskExecutionEntries(config)) {
       if (task.id == null) continue;
       try {
         const candidates = recordsByWorkspaceId.get(task.id) ?? [];
@@ -5031,7 +5023,7 @@ export class WorkspaceTurnManager {
           continue;
         }
 
-        await this.taskService.editWorkspaceEntry(
+        await this.taskHost.editWorkspaceEntry(
           task.id,
           (workspace) => {
             workspace.taskExecutionId = normalized.handleId;
@@ -5039,7 +5031,7 @@ export class WorkspaceTurnManager {
           },
           { allowMissing: true }
         );
-        await this.taskService.emitWorkspaceMetadata(task.id);
+        await this.taskHost.emitWorkspaceMetadata(task.id);
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
             handleId: normalized.handleId,
@@ -5071,7 +5063,7 @@ export class WorkspaceTurnManager {
     // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
     // points at — track whether the matching mirror was actually mutated.
     let settledMatchingMirror = false;
-    const updated = await this.taskService.editWorkspaceEntry(
+    const updated = await this.taskHost.editWorkspaceEntry(
       workspaceId,
       (workspace) => {
         if (status == null) {
@@ -5113,9 +5105,9 @@ export class WorkspaceTurnManager {
         if (live?.handleId === handleId) {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
         }
-        this.taskService.releaseRetainedStopLatches(workspaceId);
+        this.taskHost.releaseRetainedStopLatches(workspaceId);
       }
-      await this.taskService.emitWorkspaceMetadata(workspaceId);
+      await this.taskHost.emitWorkspaceMetadata(workspaceId);
     }
   }
 }

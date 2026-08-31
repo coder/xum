@@ -2108,44 +2108,6 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceTurnManager;
   }
 
-  createWorkspaceTurn(...args: Parameters<WorkspaceTurnManager["createWorkspaceTurn"]>) {
-    return this.getWorkspaceTurnManager().createWorkspaceTurn(...args);
-  }
-
-  waitForWorkspaceTurn(...args: Parameters<WorkspaceTurnManager["waitForWorkspaceTurn"]>) {
-    return this.getWorkspaceTurnManager().waitForWorkspaceTurn(...args);
-  }
-
-  interruptWorkspaceTurn(...args: Parameters<WorkspaceTurnManager["interruptWorkspaceTurn"]>) {
-    return this.getWorkspaceTurnManager().interruptWorkspaceTurn(...args);
-  }
-
-  getWorkspaceTurnSnapshot(...args: Parameters<WorkspaceTurnManager["getWorkspaceTurnSnapshot"]>) {
-    return this.getWorkspaceTurnManager().getWorkspaceTurnSnapshot(...args);
-  }
-
-  listWorkspaceTurnTasks(...args: Parameters<WorkspaceTurnManager["listWorkspaceTurnTasks"]>) {
-    return this.getWorkspaceTurnManager().listWorkspaceTurnTasks(...args);
-  }
-
-  archiveOwnedWorkspaceTurnWorkspace(
-    ...args: Parameters<WorkspaceTurnManager["archiveOwnedWorkspaceTurnWorkspace"]>
-  ) {
-    return this.getWorkspaceTurnManager().archiveOwnedWorkspaceTurnWorkspace(...args);
-  }
-
-  unarchiveOwnedWorkspaceTurnWorkspace(
-    ...args: Parameters<WorkspaceTurnManager["unarchiveOwnedWorkspaceTurnWorkspace"]>
-  ) {
-    return this.getWorkspaceTurnManager().unarchiveOwnedWorkspaceTurnWorkspace(...args);
-  }
-
-  markWorkspaceTurnTerminalAttentionConsumed(
-    ...args: Parameters<WorkspaceTurnManager["markWorkspaceTurnTerminalAttentionConsumed"]>
-  ) {
-    return this.getWorkspaceTurnManager().markWorkspaceTurnTerminalAttentionConsumed(...args);
-  }
-
   async acquireTaskCreationLock(): Promise<AsyncDisposable> {
     return await this.mutex.acquire();
   }
@@ -9774,6 +9736,24 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     return tasks;
+  }
+
+  isDescendantAgentTaskInConfig(
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): boolean {
+    return this.isDescendantAgentTaskUsingParentById(
+      this.buildAgentTaskIndex(config).parentById,
+      ancestorWorkspaceId,
+      taskId
+    );
+  }
+
+  listAgentTaskExecutionEntries(
+    config: ReturnType<Config["loadConfigOrDefault"]>
+  ): Array<{ id?: string; taskExecutionId?: string }> {
+    return this.listAgentTaskWorkspaces(config);
   }
 
   buildAgentTaskIndex(config: ReturnType<Config["loadConfigOrDefault"]>): AgentTaskIndex {

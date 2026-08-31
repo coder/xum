@@ -14,6 +14,12 @@ import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import type {
+  TerminalAttentionNotification,
+  TerminalAttentionOutcome,
+} from "@/node/services/terminalAttentionStore";
 import assert from "@/common/utils/assert";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
@@ -286,6 +292,20 @@ export type WorkspaceHost = WorkspaceTurnHost &
   WorkspaceProvisioningHost &
   WorkspaceMetadataHost;
 
+export interface WorkspaceTurnBackgroundableForegroundWaiter {
+  taskId: string;
+  reject: (error: Error) => void;
+  cleanup: () => void;
+  requestingWorkspaceId?: string;
+  backgroundOnMessageQueued: boolean;
+}
+
+export interface WorkspaceTurnAiSettings {
+  model: string;
+  thinkingLevel?: ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
+}
+
 export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
@@ -304,6 +324,88 @@ export interface AgentTaskIntegration {
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
 }
+
+export interface WorkspaceTurnTaskHost {
+  acquireTaskCreationLock(): Promise<AsyncDisposable>;
+  backgroundForegroundWaitIfQueued(
+    shouldBackgroundOnQueuedMessage: boolean,
+    requestingWorkspaceId: string | undefined
+  ): void;
+  buildParentAiSettingsFallbacks(
+    parentMeta: {
+      agentId?: string;
+      aiSettingsByAgent?: Record<string, WorkspaceTurnAiSettings>;
+      aiSettings?: WorkspaceTurnAiSettings;
+    },
+    targetAgentId: string
+  ): AgentAiSettingsLayerValues[];
+  bumpWorkspaceStopEpoch(workspaceId: string): void;
+  countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
+  editWorkspaceEntry(
+    workspaceId: string,
+    updater: (workspace: WorkspaceConfigEntry) => void,
+    options?: { allowMissing?: boolean }
+  ): Promise<boolean>;
+  emitWorkspaceMetadata(workspaceId: string): Promise<void>;
+  enqueueTerminalAttention(params: {
+    ownerWorkspaceId: string;
+    sourceKind: TerminalAttentionNotification["sourceKind"];
+    terminalOutcome: TerminalAttentionOutcome;
+    sourceId: string;
+    generationId?: string;
+  }): Promise<void>;
+  hasActiveDescendantAgentTasks(
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    workspaceId: string
+  ): boolean;
+  isDescendantAgentTaskInConfig(
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    ancestorWorkspaceId: string,
+    taskId: string
+  ): boolean;
+  isForegroundAwaiting(workspaceId: string): boolean;
+  latchWorkspaceStopsInProgress(workspaceIds: readonly string[]): () => void;
+  listActiveBackgroundWorkflowRunIds(
+    workspaceId: string,
+    referencedWorkflowRunIds: readonly string[]
+  ): Promise<string[]>;
+  listActiveWorkflowRunIdsForWorkspaceStrict(workspaceId: string): Promise<string[]>;
+  listAgentReferencedWorkflowRunIds(
+    workspaceId: string,
+    currentParts: readonly unknown[],
+    currentMessageId?: string
+  ): Promise<string[]>;
+  listAgentTaskExecutionEntries(
+    config: ReturnType<Config["loadConfigOrDefault"]>
+  ): Array<{ id?: string; taskExecutionId?: string }>;
+  markTaskForegroundRelevant(taskId: string): void;
+  maybeStartPatchGenerationForReportedTask(
+    workspaceId: string,
+    options?: { refreshForContinuation?: boolean }
+  ): Promise<void>;
+  registerBackgroundableForegroundWaiter(
+    workspaceId: string,
+    waiter: WorkspaceTurnBackgroundableForegroundWaiter
+  ): void;
+  releaseRetainedStopLatches(workspaceId: string): void;
+  resolveWorkspaceAISettings(
+    workspace: {
+      aiSettingsByAgent?: Record<string, WorkspaceTurnAiSettings>;
+      aiSettings?: WorkspaceTurnAiSettings;
+    },
+    agentId: string | undefined
+  ): WorkspaceTurnAiSettings | undefined;
+  scheduleMaybeStartQueuedTasks(): void;
+  scheduleTerminalAttentionDrain(ownerWorkspaceId: string): void;
+  startForegroundAwait(workspaceId: string): () => void;
+  unregisterBackgroundableForegroundWaiter(
+    workspaceId: string,
+    waiter: WorkspaceTurnBackgroundableForegroundWaiter
+  ): void;
+}
+
+export type WorkspaceTurnManagerHost = Pick<AgentTaskIntegration, "withTaskTreeLifecycleLock"> &
+  WorkspaceTurnTaskHost;
 
 export function normalizeArchiveUntrackedPaths(paths: readonly string[]): string[] {
   const normalizedPaths = paths.map((untrackedPath) => {
