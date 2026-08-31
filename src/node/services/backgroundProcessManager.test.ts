@@ -1542,7 +1542,7 @@ describe("BackgroundProcessManager", () => {
       if (!result.success) return;
       await eventPromise;
 
-      const before = await manager.pullMonitorWakeSignals(testWorkspaceId);
+      const before = manager.pullMonitorWakeSignals(testWorkspaceId);
       const snapshot = before.find((candidate) => candidate.processId === result.processId);
       expect(snapshot?.match?.lines).toEqual(["READY"]);
       expect(snapshot?.match?.throughOffset).toBeGreaterThan(0);
@@ -1552,7 +1552,7 @@ describe("BackgroundProcessManager", () => {
         Date.parse(snapshot?.createdAt ?? ""),
         snapshot?.match?.throughOffset
       );
-      const after = await manager.pullMonitorWakeSignals(testWorkspaceId);
+      const after = manager.pullMonitorWakeSignals(testWorkspaceId);
       expect(
         after.find((candidate) => candidate.processId === result.processId)?.match
       ).toBeUndefined();
