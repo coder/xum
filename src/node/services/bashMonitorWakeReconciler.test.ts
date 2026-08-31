@@ -54,6 +54,7 @@ describe("BashMonitorWakeReconciler", () => {
   let rows: BashMonitorRegistryRecord[];
   let deliveryState: BashMonitorWakeDeliveryState | undefined;
   let dispatches: BashMonitorWakeDispatch[];
+  let dispatchOutcome: "in-flight" | "deferred";
   let acknowledged: Array<{ processId: string; matchedThroughOffset?: number }>;
   let removed: string[];
   let dropped: string[];
@@ -65,6 +66,7 @@ describe("BashMonitorWakeReconciler", () => {
     rows = [];
     deliveryState = { status: "settled", shownThroughOffset: 0, terminalStatusShown: false };
     dispatches = [];
+    dispatchOutcome = "in-flight";
     acknowledged = [];
     removed = [];
     dropped = [];
@@ -93,12 +95,36 @@ describe("BashMonitorWakeReconciler", () => {
       },
       onWake: (dispatch) => {
         dispatches.push(dispatch);
+        return dispatchOutcome;
       },
     });
   });
 
   afterEach(async () => {
     await fsPromises.rm(root, { recursive: true, force: true });
+  });
+
+  test("re-dispatches unchanged signals after a busy delivery defers", async () => {
+    live = [liveSnapshot()];
+    dispatchOutcome = "deferred";
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+
+    dispatchOutcome = "in-flight";
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+  });
+
+  test("re-dispatches unchanged signals after a queued delivery is canceled", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const queued = dispatches[0];
+
+    await queued.onDeferred();
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(2);
   });
 
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
@@ -239,6 +265,7 @@ describe("BashMonitorWakeReconciler", () => {
       },
       onWake: (dispatch) => {
         restartedDispatches.push(dispatch);
+        return "in-flight";
       },
     });
 
@@ -320,6 +347,7 @@ describe("BashMonitorWakeReconciler", () => {
       },
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
+        return "in-flight";
       },
     });
     await restarted.reconcile(OWNER);
@@ -439,6 +467,7 @@ describe("BashMonitorWakeReconciler", () => {
       },
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
+        return "in-flight";
       },
     });
 

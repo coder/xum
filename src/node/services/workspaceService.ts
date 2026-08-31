@@ -307,6 +307,7 @@ import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeReconciler,
   type BashMonitorWakeDispatch,
+  type BashMonitorWakeDispatchOutcome,
   type BashMonitorWakeReconcilerSnapshot,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
@@ -2309,14 +2310,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.pendingBashMonitorWakeDrains.add(promise);
   }
 
-  private async dispatchBashMonitorWake(dispatch: BashMonitorWakeDispatch): Promise<void> {
-    await this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {
+  private async dispatchBashMonitorWake(
+    dispatch: BashMonitorWakeDispatch
+  ): Promise<BashMonitorWakeDispatchOutcome> {
+    return this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {
       const ownerWorkspaceId = dispatch.ownerWorkspaceId;
       const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
       if (entry == null) {
         await dispatch.onAccepted();
         this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
-        return;
+        return "in-flight";
       }
       if (
         this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId) ||
@@ -2324,14 +2327,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.aiService.isStreaming(ownerWorkspaceId)
       ) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
-        return;
+        return "deferred";
       }
       const sendOptions =
         (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
         (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
       if (sendOptions == null) {
         log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
-        return;
+        return "deferred";
       }
 
       let accepted = false;
@@ -2358,14 +2361,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           onAcceptedPreStreamFailure: async () => {
             if (accepted) await dispatch.onAccepted();
           },
-          onCanceled: () => {
-            if (!accepted) this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
+          onCanceled: async () => {
+            if (!accepted) {
+              await dispatch.onDeferred();
+              this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
+            }
           },
         }
       );
       if (!sendResult.success && !accepted) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
+        return "deferred";
       }
+      return "in-flight";
     });
   }
 

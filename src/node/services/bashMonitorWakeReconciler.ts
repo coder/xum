@@ -83,6 +83,8 @@ export interface BashMonitorWakeReconcilerRegistry {
   ): Promise<void> | void;
 }
 
+export type BashMonitorWakeDispatchOutcome = "in-flight" | "deferred";
+
 export interface BashMonitorWakeDispatch {
   ownerWorkspaceId: string;
   prompt: string;
@@ -90,6 +92,7 @@ export interface BashMonitorWakeDispatch {
   dedupeKey: string;
   cancelSignal: AbortSignal;
   onAccepted(): Promise<void>;
+  onDeferred(): Promise<void>;
 }
 
 export interface BashMonitorWakeReconcilerSnapshot {
@@ -344,7 +347,9 @@ export class BashMonitorWakeReconciler {
       sessionsDir: string;
       processManager: BashMonitorWakeReconcilerProcessManager;
       registry: BashMonitorWakeReconcilerRegistry;
-      onWake(dispatch: BashMonitorWakeDispatch): Promise<void> | void;
+      onWake(
+        dispatch: BashMonitorWakeDispatch
+      ): Promise<BashMonitorWakeDispatchOutcome> | BashMonitorWakeDispatchOutcome;
     }
   ) {}
 
@@ -455,14 +460,16 @@ export class BashMonitorWakeReconciler {
     if (dispatch == null) return;
 
     try {
-      await this.args.onWake({
+      const outcome = await this.args.onWake({
         ownerWorkspaceId,
         prompt: buildPrompt(dispatch.signals),
         muxMetadata: buildMetadata(dispatch.signals),
         dedupeKey: "bash-monitor-wake:" + ownerWorkspaceId,
         cancelSignal: dispatch.controller.signal,
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
+        onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
       });
+      if (outcome === "deferred") await this.defer(ownerWorkspaceId, dispatch);
     } catch (error) {
       await this.locks.withLock(ownerWorkspaceId, () => {
         const state = this.state(ownerWorkspaceId);
@@ -473,6 +480,13 @@ export class BashMonitorWakeReconciler {
     }
   }
 
+  private async defer(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
+    await this.locks.withLock(ownerWorkspaceId, () => {
+      const state = this.state(ownerWorkspaceId);
+      if (state.dispatch === dispatch && !dispatch.accepted) state.dispatch = undefined;
+      return Promise.resolve();
+    });
+  }
   private async accept(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
       if (dispatch.accepted || dispatch.controller.signal.aborted) return;
