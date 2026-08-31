@@ -1837,9 +1837,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * `originNotAfterMs` binds the answer to the process instance that produced the wake. Process IDs
    * are reclaimed across restarts, so a newer instance must not suppress an older instance's wake.
    */
-  async pullMonitorWakeSignals(
-    ownerWorkspaceId: string
-  ): Promise<readonly BashMonitorProcessSnapshot[]> {
+  pullMonitorWakeSignals(ownerWorkspaceId: string): readonly BashMonitorProcessSnapshot[] {
     const snapshots: BashMonitorProcessSnapshot[] = [];
     for (const proc of this.processes.values()) {
       const monitor = proc.monitor;

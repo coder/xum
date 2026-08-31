@@ -71,27 +71,27 @@ describe("BashMonitorWakeReconciler", () => {
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
-        pullMonitorWakeSignals: async () => live,
-        getMonitorWakeDeliveryState: async () => deliveryState,
-        acknowledgeMonitorWake: async (processId, _generation, matchedThroughOffset) => {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
           acknowledged.push({
             processId,
             ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
           });
         },
-        dropRetiredMonitor: async (processId) => {
+        dropRetiredMonitor: (processId) => {
           dropped.push(processId);
         },
       },
       registry: {
-        listAll: async () => rows,
-        remove: async (_ownerWorkspaceId, processId) => {
+        listAll: () => Promise.resolve(rows),
+        remove: (_ownerWorkspaceId, processId) => {
           removed.push(processId);
           rows = rows.filter((row) => row.processId !== processId);
         },
-        recordTerminal: async () => undefined,
+        recordTerminal: () => undefined,
       },
-      onWake: async (dispatch) => {
+      onWake: (dispatch) => {
         dispatches.push(dispatch);
       },
     });
@@ -225,19 +225,19 @@ describe("BashMonitorWakeReconciler", () => {
     const restarted = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
-        pullMonitorWakeSignals: async () => live,
-        getMonitorWakeDeliveryState: async () => undefined,
-        acknowledgeMonitorWake: async () => undefined,
-        dropRetiredMonitor: async () => undefined,
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(undefined),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
       },
       registry: {
-        listAll: async () => rows,
-        remove: async (_ownerWorkspaceId, processId) => {
+        listAll: () => Promise.resolve(rows),
+        remove: (_ownerWorkspaceId, processId) => {
           rows = rows.filter((row) => row.processId !== processId);
         },
-        recordTerminal: async () => undefined,
+        recordTerminal: () => undefined,
       },
-      onWake: async (dispatch) => {
+      onWake: (dispatch) => {
         restartedDispatches.push(dispatch);
       },
     });
@@ -308,17 +308,17 @@ describe("BashMonitorWakeReconciler", () => {
     const restarted = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
-        pullMonitorWakeSignals: async () => live,
-        getMonitorWakeDeliveryState: async () => deliveryState,
-        acknowledgeMonitorWake: async () => undefined,
-        dropRetiredMonitor: async () => undefined,
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
       },
       registry: {
-        listAll: async () => rows,
-        remove: async () => undefined,
-        recordTerminal: async () => undefined,
+        listAll: () => Promise.resolve(rows),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
       },
-      onWake: async (dispatch) => {
+      onWake: (dispatch) => {
         afterRestart.push(dispatch);
       },
     });
@@ -425,19 +425,19 @@ describe("BashMonitorWakeReconciler", () => {
     const restarted = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
-        pullMonitorWakeSignals: async () => live,
-        getMonitorWakeDeliveryState: async () => undefined,
-        acknowledgeMonitorWake: async () => undefined,
-        dropRetiredMonitor: async () => undefined,
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(undefined),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
       },
       registry: {
-        listAll: async () => rows,
-        remove: async (_ownerWorkspaceId, processId) => {
+        listAll: () => Promise.resolve(rows),
+        remove: (_ownerWorkspaceId, processId) => {
           rows = rows.filter((row) => row.processId !== processId);
         },
-        recordTerminal: async () => undefined,
+        recordTerminal: () => undefined,
       },
-      onWake: async (dispatch) => {
+      onWake: (dispatch) => {
         afterRestart.push(dispatch);
       },
     });

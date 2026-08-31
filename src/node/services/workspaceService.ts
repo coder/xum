@@ -2358,7 +2358,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           onAcceptedPreStreamFailure: async () => {
             if (accepted) await dispatch.onAccepted();
           },
-          onCanceled: async () => {
+          onCanceled: () => {
             if (!accepted) this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
           },
         }

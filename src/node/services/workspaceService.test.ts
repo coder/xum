@@ -382,19 +382,20 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     try {
       await internal.bashMonitorRecoveryPromise;
       internal.bashMonitorWakeReconciler = {
-        beginFullHistoryClear: async (workspaceId) => {
+        beginFullHistoryClear: (workspaceId) => {
           order.push("pre");
-          return { ownerWorkspaceId: workspaceId, clearId: "clear" };
+          return Promise.resolve({ ownerWorkspaceId: workspaceId, clearId: "clear" });
         },
-        finishFullHistoryClear: async () => {
+        finishFullHistoryClear: () => {
           order.push("post");
+          return Promise.resolve();
         },
       };
       const truncate = await internal.clearHistoryWithRetiredBashMonitorWakes(
         "owner",
-        async () => {
+        () => {
           order.push("truncate");
-          return Ok(undefined);
+          return Promise.resolve(Ok(undefined));
         },
         { discardUnacceptedOnSuccess: false }
       );
@@ -403,9 +404,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
       const clear = await internal.clearHistoryWithRetiredBashMonitorWakes(
         "owner",
-        async () => {
+        () => {
           order.push("clear");
-          return Ok(undefined);
+          return Promise.resolve(Ok(undefined));
         },
         { discardUnacceptedOnSuccess: true }
       );
@@ -432,16 +433,18 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       internal.constructedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
       internal.bashMonitorWakeReconciler = { scheduleReconcile };
       internal.bashMonitorRegistryStore = {
-        listOwnerWorkspaceIds: async () => ({
-          ownerWorkspaceIds: ["old", "new"],
-          scanFailed: false,
-        }),
-        listAll: async (workspaceId) => [
-          {
-            createdAt:
-              workspaceId === "old" ? "2026-08-31T11:59:00.000Z" : "2026-08-31T12:01:00.000Z",
-          },
-        ],
+        listOwnerWorkspaceIds: () =>
+          Promise.resolve({
+            ownerWorkspaceIds: ["old", "new"],
+            scanFailed: false,
+          }),
+        listAll: (workspaceId) =>
+          Promise.resolve([
+            {
+              createdAt:
+                workspaceId === "old" ? "2026-08-31T11:59:00.000Z" : "2026-08-31T12:01:00.000Z",
+            },
+          ]),
       };
 
       await internal.recoverBashMonitorStateAfterRestart();

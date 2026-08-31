@@ -57,7 +57,9 @@ export type BashMonitorWakeDeliveryState =
     };
 
 export interface BashMonitorWakeReconcilerProcessManager {
-  pullMonitorWakeSignals(ownerWorkspaceId: string): Promise<readonly BashMonitorProcessSnapshot[]>;
+  pullMonitorWakeSignals(
+    ownerWorkspaceId: string
+  ): Promise<readonly BashMonitorProcessSnapshot[]> | readonly BashMonitorProcessSnapshot[];
   getMonitorWakeDeliveryState(
     processId: string,
     originNotAfterMs: number
@@ -73,12 +75,12 @@ export interface BashMonitorWakeReconcilerProcessManager {
 
 export interface BashMonitorWakeReconcilerRegistry {
   listAll(ownerWorkspaceId: string): Promise<readonly BashMonitorRegistryRecord[]>;
-  remove(ownerWorkspaceId: string, processId: string): Promise<void>;
+  remove(ownerWorkspaceId: string, processId: string): Promise<void> | void;
   recordTerminal(
     ownerWorkspaceId: string,
     processId: string,
     terminal: BashMonitorTerminalSummary
-  ): Promise<void>;
+  ): Promise<void> | void;
 }
 
 export interface BashMonitorWakeDispatch {
@@ -462,7 +464,7 @@ export class BashMonitorWakeReconciler {
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
       });
     } catch (error) {
-      await this.locks.withLock(ownerWorkspaceId, async () => {
+      await this.locks.withLock(ownerWorkspaceId, () => {
         const state = this.state(ownerWorkspaceId);
         if (state.dispatch === dispatch) state.dispatch = undefined;
       });
@@ -505,7 +507,7 @@ export class BashMonitorWakeReconciler {
   ): Promise<{
     signals: DerivedSignal[];
     autoConsumed: DerivedSignal[];
-    deferredReads: Promise<void>[];
+    deferredReads: Array<Promise<void>>;
     watermarks: Map<string, WatermarkEntry>;
   }> {
     await this.deleteLegacyWakeDir(ownerWorkspaceId);
@@ -552,7 +554,7 @@ export class BashMonitorWakeReconciler {
 
     const signals: DerivedSignal[] = [];
     const autoConsumed: DerivedSignal[] = [];
-    const deferredReads: Promise<void>[] = [];
+    const deferredReads: Array<Promise<void>> = [];
     for (const candidate of candidates) {
       const derived = await this.derive(
         candidate.snapshot,
