@@ -567,9 +567,10 @@ export class BashMonitorWakeReconciler {
 
   private async cleanup(signals: readonly DerivedSignal[]): Promise<void> {
     for (const signal of signals) {
-      if (signal.deadRegistryRow) {
+      if (signal.deadRegistryRow || signal.retired) {
         await this.args.registry.remove(signal.ownerWorkspaceId, signal.processId);
-      } else if (signal.retired) {
+      }
+      if (signal.retired) {
         await this.args.processManager.dropRetiredMonitor(signal.processId);
       }
     }

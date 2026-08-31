@@ -16,7 +16,7 @@ import {
   BG_OUTPUT_SUBDIR,
 } from "./backgroundProcessExecutor";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { BASH_MONITOR_SETTLE_LINE_PREFIX } from "./bashMonitorWakeStore";
+export const BASH_MONITOR_SETTLE_LINE_PREFIX = "[monitor] process settled:";
 import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
