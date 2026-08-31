@@ -10,6 +10,7 @@ import { BASH_MONITOR_WAKE_HEADINGS } from "@/common/utils/machineTurnPrompts";
 import type { BashMonitorFailedOperation, MuxMessageMetadata } from "@/common/types/message";
 import type { WorkspaceSessionLocator } from "@/node/config";
 import { log } from "@/node/services/log";
+import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
@@ -341,19 +342,6 @@ const BashMonitorWakeRecordSchema = z
   // a newer build that added a field must still parse here and deliver rather than be dropped as
   // malformed. Missing required fields and wrong types are still rejected -- only extra keys pass.
   .strip();
-
-export function truncateUtf8Prefix(value: string, maxBytes: number): string {
-  assert(maxBytes > 0, "truncateUtf8Prefix requires a positive byte limit");
-  let bytes = 0;
-  let endIndex = 0;
-  for (const char of value) {
-    const charBytes = Buffer.byteLength(char, "utf8");
-    if (bytes + charBytes > maxBytes) break;
-    bytes += charBytes;
-    endIndex += char.length;
-  }
-  return value.slice(0, endIndex);
-}
 
 export function sanitizeBashMonitorWakeLine(line: string): string {
   const sanitized = stripAnsiControlChars(line);

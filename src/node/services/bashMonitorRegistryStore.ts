@@ -7,7 +7,7 @@ import { z } from "zod";
 import assert from "@/common/utils/assert";
 import type { WorkspaceSessionLocator } from "@/node/config";
 import type { MonitorArmedPayload } from "@/node/services/backgroundProcessManager";
-import { truncateUtf8Prefix } from "@/node/services/bashMonitorWakeStore";
+import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -16,6 +16,14 @@ export const BASH_MONITOR_REGISTRY_DIR = "bash-monitor-registry";
 // Bound the persisted script so a huge agent-authored script can't bloat the registry
 // or the eventual monitor-lost wake prompt.
 const MAX_REGISTRY_SCRIPT_BYTES = 2_048;
+
+export interface BashMonitorTerminalSummary {
+  status: "exited" | "killed" | "timed_out" | "failed";
+  exitCode?: number;
+  settledAt: string;
+  wakeOnExit: boolean;
+  terminalStatusShown: boolean;
+}
 
 export interface BashMonitorRegistryRecord {
   processId: string;
@@ -26,6 +34,7 @@ export interface BashMonitorRegistryRecord {
   filterExclude: boolean;
   script: string;
   createdAt: string;
+  terminal?: BashMonitorTerminalSummary;
 }
 
 const BashMonitorRegistryRecordSchema = z
@@ -38,6 +47,15 @@ const BashMonitorRegistryRecordSchema = z
     filterExclude: z.boolean(),
     script: z.string(),
     createdAt: z.string().min(1),
+    terminal: z
+      .object({
+        status: z.enum(["exited", "killed", "timed_out", "failed"]),
+        exitCode: z.number().int().optional(),
+        settledAt: z.string().min(1),
+        wakeOnExit: z.boolean(),
+        terminalStatusShown: z.boolean(),
+      })
+      .optional(),
   })
   .strict();
 
@@ -106,6 +124,27 @@ export class BashMonitorRegistryStore {
         JSON.stringify(record, null, 2),
         "utf-8"
       );
+    });
+  }
+
+  async recordTerminal(
+    ownerWorkspaceId: string,
+    processId: string,
+    terminal: BashMonitorTerminalSummary
+  ): Promise<void> {
+    const key = ownerWorkspaceId + ":" + processId;
+    return this.locks.withLock(key, async () => {
+      const file = this.file(ownerWorkspaceId, processId);
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(file, "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) return;
+        throw error;
+      }
+      const record = this.parse(raw);
+      if (record == null) return;
+      await fsPromises.writeFile(file, JSON.stringify({ ...record, terminal }, null, 2), "utf-8");
     });
   }
 
