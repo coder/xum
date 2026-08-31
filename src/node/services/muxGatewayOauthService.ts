@@ -95,25 +95,38 @@ export class MuxGatewayOauthService {
       string
     >
   > {
+    return Effect.runPromise(this.getAccountStatusEffect());
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Left
+   * interruptible: the balance fetch is a pure read, and the session-expired
+   * credential clear is a single best-effort promise that runs to completion
+   * even if the fiber is interrupted while awaiting it.
+   */
+  getAccountStatusEffect(): Effect.Effect<
+    Result<
+      { remaining_microdollars: number; ai_gateway_concurrent_requests_per_user: number },
+      string
+    >
+  > {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    return Effect.runPromise(
-      toWireResult(
-        this.getAccountStatusEffect().pipe(
-          Effect.catchTag("MuxGatewaySessionExpiredError", () =>
-            Effect.gen(function* () {
-              yield* self.clearStoredCredentials();
-              return yield* Effect.fail(
-                new MuxGatewayOAuthError({ reason: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE })
-              );
-            })
-          )
+    return toWireResult(
+      this.fetchAccountStatusEffect().pipe(
+        Effect.catchTag("MuxGatewaySessionExpiredError", () =>
+          Effect.gen(function* () {
+            yield* self.clearStoredCredentials();
+            return yield* Effect.fail(
+              new MuxGatewayOAuthError({ reason: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE })
+            );
+          })
         )
       )
     );
   }
 
-  private getAccountStatusEffect(): Effect.Effect<
+  private fetchAccountStatusEffect(): Effect.Effect<
     { remaining_microdollars: number; ai_gateway_concurrent_requests_per_user: number },
     MuxGatewaySessionExpiredError | MuxGatewayOAuthError
   > {
@@ -225,10 +238,24 @@ export class MuxGatewayOauthService {
   async startDesktopFlow(): Promise<
     Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>
   > {
-    return Effect.runPromise(toWireResult(this.startDesktopFlowEffect()));
+    return Effect.runPromise(this.startDesktopFlowEffect());
   }
 
-  private startDesktopFlowEffect(): Effect.Effect<
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
+   * (mirrors asAtomicMutation in providerService.ts): a client abort between
+   * the loopback-server acquisition and `desktopFlows.register` would leak the
+   * server with nothing left to close it. Flow startup is quick and local, so
+   * running it to completion on abort is cheap; an abandoned flow still
+   * self-cleans via the registered timeout.
+   */
+  startDesktopFlowEffect(): Effect.Effect<
+    Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>
+  > {
+    return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect()));
+  }
+
+  private launchDesktopFlowEffect(): Effect.Effect<
     { flowId: string; authorizeUrl: string; redirectUri: string },
     MuxGatewayOAuthError
   > {

@@ -1,3 +1,22 @@
+/**
+ * oRPC router: procedure definitions only — behavior lives in services.
+ *
+ * Handler convention (Effect migration, phases 1-4): new unary procedures
+ * should ride `handlerGen` from `@orpc/experimental-effect` and yield a
+ * wire-shaped Effect exposed by the backing service (see `memory.*`,
+ * `providers.*` mutations, and `muxGateway*` for the house pattern). Plain
+ * async handlers remain appropriate only when:
+ * - the backing service is still Promise-based (convert the service surface
+ *   first; do not wrap Promises in Effect at the router),
+ * - the procedure returns an event iterator (subscriptions — handlerGen
+ *   cannot produce those until an Effect Stream bridge exists), or
+ * - the handler is a trivial synchronous read.
+ *
+ * handlerGen makes handlers interruptible on client abort: before converting
+ * a mutation, audit its abort-atomicity and keep multi-step writes
+ * uninterruptible in the service pipeline (see asAtomicMutation in
+ * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
+ */
 import { os } from "@orpc/server";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
@@ -549,14 +568,26 @@ export const router = (authToken?: string) => {
       getAccountStatus: t
         .input(schemas.muxGateway.getAccountStatus.input)
         .output(schemas.muxGateway.getAccountStatus.output)
-        .handler(({ context }) => context.muxGatewayOauthService.getAccountStatus()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.muxGatewayOauthService.getAccountStatusEffect();
+          })
+        ),
     },
 
     muxGatewayOauth: {
+      // startDesktopFlow rides handlerGen; its service pipeline is
+      // uninterruptible (see startDesktopFlowEffect) so a client abort cannot
+      // leak the loopback server. waitFor/cancel stay plain handlers until the
+      // promise-native OAuthFlowManager grows an Effect surface.
       startDesktopFlow: t
         .input(schemas.muxGatewayOauth.startDesktopFlow.input)
         .output(schemas.muxGatewayOauth.startDesktopFlow.output)
-        .handler(({ context }) => context.muxGatewayOauthService.startDesktopFlow()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.muxGatewayOauthService.startDesktopFlowEffect();
+          })
+        ),
       waitForDesktopFlow: t
         .input(schemas.muxGatewayOauth.waitForDesktopFlow.input)
         .output(schemas.muxGatewayOauth.waitForDesktopFlow.output)
