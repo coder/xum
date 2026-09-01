@@ -2130,29 +2130,62 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * a follow-up redispatched from within the originating send's own turn
    * (e.g. its on-send compaction completing) must not veto itself, and once
    * handed off the session's own queue/turn-phase state governs visibility.
+   * Tickets are kept in arrival order so a send can tell whether an EARLIER
+   * send is still in preflight (sendMessage queues behind it) without two
+   * simultaneous arrivals each deferring to the other.
    */
-  private readonly sessionInvisiblePreflightCounts = new Map<string, number>();
+  private readonly sessionInvisiblePreflights = new Map<string, Set<number>>();
+  private nextSessionInvisiblePreflightTicket = 0;
 
-  /** See sessionInvisiblePreflightCounts. Release is idempotent. */
-  private armSessionInvisiblePreflight(workspaceId: string): { release: () => void } & Disposable {
-    this.sessionInvisiblePreflightCounts.set(
-      workspaceId,
-      (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) + 1
-    );
+  private hasSessionInvisiblePreflight(workspaceId: string): boolean {
+    return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
+  }
+
+  /** See sessionInvisiblePreflights. Release is idempotent. */
+  private armSessionInvisiblePreflight(
+    workspaceId: string
+  ): { release: () => void; hasEarlierPreflight: () => boolean } & Disposable {
+    const ticket = this.nextSessionInvisiblePreflightTicket++;
+    let tickets = this.sessionInvisiblePreflights.get(workspaceId);
+    if (tickets == null) {
+      tickets = new Set();
+      this.sessionInvisiblePreflights.set(workspaceId, tickets);
+    }
+    tickets.add(ticket);
     let released = false;
     const release = () => {
       if (released) {
         return;
       }
       released = true;
-      const remaining = (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 1) - 1;
-      if (remaining <= 0) {
-        this.sessionInvisiblePreflightCounts.delete(workspaceId);
-      } else {
-        this.sessionInvisiblePreflightCounts.set(workspaceId, remaining);
+      const live = this.sessionInvisiblePreflights.get(workspaceId);
+      live?.delete(ticket);
+      if (live?.size === 0) {
+        this.sessionInvisiblePreflights.delete(workspaceId);
       }
     };
-    return { release, [Symbol.dispose]: release };
+    // Set iteration follows insertion order, so the first live ticket is the oldest.
+    const hasEarlierPreflight = () =>
+      !released &&
+      this.sessionInvisiblePreflights.get(workspaceId)?.values().next().value !== ticket;
+    return { release, hasEarlierPreflight, [Symbol.dispose]: release };
+  }
+
+  /**
+   * Messages queued behind a send's preflight (sendMessage's hasEarlierPreflight) have no
+   * stream end to drain them when that send settles without a turn: refused, rejected, or
+   * startup failed. Declare BEFORE armSessionInvisiblePreflight so it disposes after the
+   * ticket is released and only the last live preflight drains.
+   */
+  private armQueuedBehindPreflightDrain(workspaceId: string): Disposable {
+    return {
+      [Symbol.dispose]: () => {
+        if (this.hasSessionInvisiblePreflight(workspaceId)) {
+          return;
+        }
+        this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
+      },
+    };
   }
   // In-flight renderer executeBash requests per workspace. Incremented in the same
   // synchronous block as executeBash's archivingWorkspaces check (mirroring
@@ -3935,8 +3968,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // counter, not preflightSendCounts — the originating send's reservation
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
-      hasExternalSendPreflight: () =>
-        (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) > 0,
+      hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
     });
   }
 
@@ -10519,6 +10551,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
+      using _drainQueuedBehindPreflight = this.armQueuedBehindPreflightDrain(workspaceId);
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
       // (context mutations instead refuse the send itself via the epoch
@@ -10680,7 +10713,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Persist last-used model + thinking level for cross-device consistency.
       await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
 
-      const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
+      // A send between service entry and the session's PREPARING claim is invisible to
+      // isBusy(). A later send admitted against that idle snapshot reaches StreamManager
+      // while the earlier turn is streaming, and ensureStreamSafety aborts the earlier turn
+      // to start the later one. Queue behind the earlier in-preflight send instead.
+      // requireIdle callers keep their skip semantics below; edits bypass the queue by design.
+      const shouldQueue =
+        !normalizedOptions?.editMessageId &&
+        (session.isBusy() ||
+          (sessionInvisiblePreflight.hasEarlierPreflight() && internal?.requireIdle !== true));
 
       // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
       // captured before a manual send entered preflight would otherwise win
@@ -11064,6 +11105,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // (mirrors sendMessage): the archive gate refuses while a resume that already passed
       // these guards is still doing pre-admission work, so neither side can slip past the
       // other's snapshot.
+      using _drainQueuedBehindPreflight = this.armQueuedBehindPreflightDrain(workspaceId);
       this.preflightSendCounts.set(
         workspaceId,
         (this.preflightSendCounts.get(workspaceId) ?? 0) + 1

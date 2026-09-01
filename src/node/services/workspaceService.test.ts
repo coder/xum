@@ -6242,6 +6242,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       const fakeSession = {
         isBusy: mock(() => false),
         emitMetadata: mock(() => undefined),
+        drainQueuedMessagesIfIdle: mock(() => undefined),
         sendMessage: mock(
           (_msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
             capturedProbe = internal?.admissionStale;
@@ -8354,6 +8355,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
+    drainQueuedMessagesIfIdle: ReturnType<typeof mock>;
   };
 
   beforeEach(async () => {
@@ -8428,6 +8430,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
+      drainQueuedMessagesIfIdle: mock(() => undefined),
     };
 
     (
@@ -8471,6 +8474,62 @@ describe("WorkspaceService sendMessage status clearing", () => {
       expect.objectContaining({ model: "custom:unpriced-model", agentId: "exec" }),
       expect.objectContaining({ synthetic: undefined })
     );
+  });
+
+  test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
+    // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
+    // later send admitted against the idle snapshot would start a competing stream that
+    // StreamManager resolves by aborting the earlier turn. Both sends sit in preflight
+    // awaits here, so arrival order (not who checks first) must decide who yields.
+    fakeSession.isBusy.mockReturnValue(false);
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    const secondResult = workspaceService.sendMessage("test-workspace", "second", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect((await secondResult).success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.queueMessage.mock.calls[0]?.[0]).toBe("second");
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("first");
+
+    firstSend.resolve(Ok(undefined));
+    expect((await firstResult).success).toBe(true);
+  });
+
+  test("entries queued behind a preflight send drain only once that send settles without a turn", async () => {
+    // Nothing else will drain them: the failed send never claimed PREPARING, so no stream
+    // end fires. Draining while the earlier send is still in preflight would let the queued
+    // entry jump ahead of it.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstSend.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
@@ -9164,6 +9223,9 @@ describe("WorkspaceService pending auto-title", () => {
   let workspacePath: string;
   let fakeSession: {
     isBusy: ReturnType<typeof mock>;
+    hasQueuedMessages: ReturnType<typeof mock>;
+    hasQueuedOrDispatchingEntry: ReturnType<typeof mock>;
+    dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
@@ -9246,6 +9308,9 @@ describe("WorkspaceService pending auto-title", () => {
 
     fakeSession = {
       isBusy: mock(() => false),
+      hasQueuedMessages: mock(() => false),
+      hasQueuedOrDispatchingEntry: mock(() => false),
+      dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),

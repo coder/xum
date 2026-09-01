@@ -6898,6 +6898,25 @@ export class AgentSession {
   }
 
   /**
+   * Drain the queue when no turn owns the next dispatch. For callers whose
+   * reservation kept a send invisible to isBusy() (WorkspaceService preflight)
+   * and that settled without a turn, so no stream end will drain what queued
+   * behind them. A pending auto-retry or the edit flow still owns the next
+   * dispatch, so the queue keeps waiting for them.
+   */
+  drainQueuedMessagesIfIdle(): void {
+    if (
+      this.isBusy() ||
+      this.hasPendingAutoRetry() ||
+      this.deferQueuedFlushUntilAfterEdit ||
+      this.messageQueue.isEmpty()
+    ) {
+      return;
+    }
+    this.sendQueuedMessages();
+  }
+
+  /**
    * Send queued messages if any exist.
    * Called when the current turn ends or the user chooses to send immediately.
    */
