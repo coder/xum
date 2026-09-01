@@ -995,6 +995,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       idleReleased = true;
       idleGate.resolve();
       await secondAccepted.promise;
+      await internal.bashMonitorWakeReconciler.reconcile(workspaceId);
       expect(sendCount).toBe(2);
       expect(secondStartedAfterIdle).toBe(true);
       expect(acknowledgeMonitorWake).toHaveBeenCalledTimes(2);
