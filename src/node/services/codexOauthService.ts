@@ -798,7 +798,17 @@ export class CodexOauthService {
       }
 
       return next;
-    });
+    }).pipe(
+      // Mirror the pre-Effect whole-body try/catch: an unexpected throw —
+      // e.g. a rejected persistAuth/disconnect config write, which
+      // Effect.promise surfaces as a defect — must fold into the wire error
+      // so getValidAuth() keeps returning Err(...) instead of rejecting.
+      Effect.catchDefect((defect) =>
+        Effect.fail(
+          new CodexOauthError({ reason: `Codex OAuth refresh failed: ${getErrorMessage(defect)}` })
+        )
+      )
+    );
   }
 
   private requestDeviceUserCode(): Effect.Effect<
