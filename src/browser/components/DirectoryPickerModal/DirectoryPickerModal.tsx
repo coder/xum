@@ -13,7 +13,7 @@ import { Input } from "@/browser/components/Input/Input";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import { DirectoryTree } from "../DirectoryTree/DirectoryTree";
 import { useAPI } from "@/browser/contexts/API";
-import { formatKeybind, isMac } from "@/browser/utils/ui/keybinds";
+import { formatKeybind } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 
 const OPEN_KEYBIND = { key: "o", ctrl: true };
@@ -215,7 +215,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
       .filter((child) => showHiddenFiles || !child.name.startsWith("."))
       .map((child) => ({ name: child.name, path: child.path })) ?? [];
 
-  const shortcutLabel = isMac() ? "⌘O" : formatKeybind(OPEN_KEYBIND);
+  const shortcutLabel = formatKeybind(OPEN_KEYBIND);
 
   return (
     <Dialog open={isOpen} onOpenChange={handleOpenChange}>

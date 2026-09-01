@@ -1,5 +1,5 @@
-import { describe, it, expect, test } from "bun:test";
-import { isMac, matchesKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
+import { describe, it, expect, test, afterAll } from "bun:test";
+import { isMac, matchesKeybind, formatKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
 
 // Helper to create a minimal keyboard event
@@ -123,6 +123,51 @@ describe("isKeybindDeprecated", () => {
     expect(isKeybindDeprecated(KEYBINDS.TOGGLE_THINKING)).toBe(true);
     expect(isKeybindDeprecated(KEYBINDS.INCREASE_THINKING)).toBe(false);
     expect(isKeybindDeprecated(KEYBINDS.DECREASE_THINKING)).toBe(false);
+  });
+});
+
+describe("formatKeybind", () => {
+  const originalWindow = globalThis.window;
+  afterAll(() => {
+    globalThis.window = originalWindow;
+  });
+
+  describe("on macOS", () => {
+    const mockMac = () => {
+      globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    };
+
+    it("renders ctrl as Command with no separator", () => {
+      mockMac();
+      expect(formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)).toBe("\u2318P");
+    });
+
+    it("orders modifiers Control, Option, Shift, Command", () => {
+      mockMac();
+      expect(formatKeybind(KEYBINDS.OPEN_COMMAND_PALETTE)).toBe("\u21E7\u2318P");
+      expect(formatKeybind({ key: "i", ctrl: true, alt: true, shift: true })).toBe(
+        "\u2325\u21E7\u2318I"
+      );
+      expect(formatKeybind({ key: "k", ctrl: true, meta: true })).toBe("\u2303\u2318K");
+    });
+
+    it("renders ctrl as Control when macCtrlBehavior is control", () => {
+      mockMac();
+      expect(formatKeybind(KEYBINDS.INTERRUPT_STREAM_VIM)).toBe("\u2303C");
+    });
+
+    it("keeps key formatting (Space)", () => {
+      mockMac();
+      expect(formatKeybind({ key: " ", ctrl: true })).toBe("\u2318Space");
+    });
+  });
+
+  describe("on Linux/Windows", () => {
+    it("joins text modifiers with +", () => {
+      globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+      expect(formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)).toBe("Ctrl+P");
+      expect(formatKeybind(KEYBINDS.OPEN_COMMAND_PALETTE)).toBe("Ctrl+Shift+P");
+    });
   });
 });
 

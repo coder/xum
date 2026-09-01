@@ -234,27 +234,20 @@ export function isDialogOpen(): boolean {
 
 /**
  * Format a keybind for display to users.
- * Returns Mac-style symbols on macOS, or Windows-style text elsewhere.
+ * macOS: native symbol run with no separator, modifiers ordered ⌃⌥⇧⌘ ("⇧⌘P").
+ * Elsewhere: "+"-joined text ("Ctrl+Shift+P").
  */
 export function formatKeybind(keybind: Keybind): string {
   const parts: string[] = [];
 
   if (isMac()) {
-    // Mac-style formatting with symbols (using Unicode escapes for safety)
     // For ctrl on Mac, we actually mean Cmd in most cases since matcher treats them as equivalent
-    if (keybind.ctrl && !keybind.meta) {
-      const macCtrlBehavior = keybind.macCtrlBehavior ?? "either";
-      if (macCtrlBehavior === "control") {
-        parts.push("\u2303"); // ⌃ Control
-      } else {
-        parts.push("\u2318"); // ⌘ Command
-      }
-    } else if (keybind.ctrl) {
-      parts.push("\u2303"); // ⌃ Control
-    }
+    const macCtrlBehavior = keybind.macCtrlBehavior ?? "either";
+    const ctrlIsCommand = keybind.ctrl && !keybind.meta && macCtrlBehavior !== "control";
+    if (keybind.ctrl && !ctrlIsCommand) parts.push("\u2303"); // ⌃ Control
     if (keybind.alt) parts.push("\u2325"); // ⌥ Option
     if (keybind.shift) parts.push("\u21E7"); // ⇧ Shift
-    if (keybind.meta) parts.push("\u2318"); // ⌘ Command
+    if (keybind.meta || ctrlIsCommand) parts.push("\u2318"); // ⌘ Command
   } else {
     // Windows/Linux-style formatting with text
     if (keybind.ctrl) parts.push("Ctrl");
@@ -274,7 +267,7 @@ export function formatKeybind(keybind: Keybind): string {
   }
   parts.push(key);
 
-  return isMac() ? parts.join("\u00B7") : parts.join("+"); // · on Mac, + elsewhere
+  return isMac() ? parts.join("") : parts.join("+");
 }
 
 /**
