@@ -36,7 +36,8 @@
  * - **Laziness**: nothing (not even `validate`) runs until the consumer's
  *   first `next()` call, matching async-generator semantics.
  */
-import { Cause, Effect, Queue, Stream } from "effect";
+import type { Cause } from "effect";
+import { Effect, Queue, Stream } from "effect";
 import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
 
 /** Producer-facing handle. Safe to call from any non-Effect callsite. */
