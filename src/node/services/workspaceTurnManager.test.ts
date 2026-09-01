@@ -3493,6 +3493,10 @@ describe("WorkspaceTurnManager", () => {
         (workspaceId: string, handleId: string) =>
           workspaceId === "childworkspace" && handleId === "wst_secondhandle"
       ),
+      hasPendingWorkspaceTurnContinuation: mock(
+        (workspaceId: string, metadata: ReturnType<typeof workspaceTurnMuxMetadata>) =>
+          workspaceId === "childworkspace" && metadata.taskHandleId === "wst_secondhandle"
+      ),
       isBusyForMessage,
       hasQueuedMessages,
     });
@@ -4209,12 +4213,13 @@ describe("WorkspaceTurnManager", () => {
   });
 
   test("mode=existing tool-end follow-up reports the same-owner turn it may supersede", async () => {
-    const hasPendingQueuedOrPreparingTurn = mock(
-      (workspaceId: string) => workspaceId === "childworkspace"
+    const hasPendingWorkspaceTurnContinuation = mock(
+      (workspaceId: string, metadata: ReturnType<typeof workspaceTurnMuxMetadata>) =>
+        workspaceId === "childworkspace" && metadata.taskHandleId === "wst_handle2"
     );
     const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
       stableIds: ["handle", "turn", "handle2", "turn2", "handle3", "turn3"],
-      hasPendingQueuedOrPreparingTurn,
+      hasPendingWorkspaceTurnContinuation,
     });
     workspaceMocks.isBusyForMessage.mockImplementation(
       (workspaceId: string) => workspaceId === "childworkspace"
@@ -4269,12 +4274,13 @@ describe("WorkspaceTurnManager", () => {
     // queued, C supersedes B (not A) at B's first boundary — and B's own
     // settlement wake is suppressed, so C's announcement is the only place
     // B's interruption can surface.
-    const hasPendingQueuedOrPreparingTurn = mock(
-      (workspaceId: string) => workspaceId === "childworkspace"
+    const hasPendingWorkspaceTurnContinuation = mock(
+      (workspaceId: string, metadata: ReturnType<typeof workspaceTurnMuxMetadata>) =>
+        workspaceId === "childworkspace" && metadata.taskHandleId === "wst_handle2"
     );
     const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
       stableIds: ["handle", "turn", "handle2", "turn2", "handle3", "turn3"],
-      hasPendingQueuedOrPreparingTurn,
+      hasPendingWorkspaceTurnContinuation,
     });
     workspaceMocks.isBusyForMessage.mockImplementation(
       (workspaceId: string) => workspaceId === "childworkspace"
