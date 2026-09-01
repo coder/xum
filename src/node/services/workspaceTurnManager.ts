@@ -2152,12 +2152,11 @@ export class WorkspaceTurnManager {
         // error / stale restart interrupt — never an explicit user interrupt) may be
         // corrected once by an explicitly allowed resettle, but only when the new settlement
         // actually changes the outcome (duplicate stream-end replays must stay idempotent).
-        const currentIsProvisional = current.provisionalOutcome === true;
         const resettleStaleTerminal =
           params.allowTerminalResettle === true &&
           this.isTerminalWorkspaceTurnStatus(current.status) &&
-          (current.status !== "completed" || currentIsProvisional) &&
-          (currentIsProvisional || isSelfHealEligibleSettledWorkspaceTurn(current)) &&
+          current.status !== "completed" &&
+          isSelfHealEligibleSettledWorkspaceTurn(current) &&
           (params.next.status !== current.status || params.next.messageId !== current.messageId);
         if (this.isTerminalWorkspaceTurnStatus(current.status) && !resettleStaleTerminal) {
           const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(params.record.workspaceId);
@@ -2237,7 +2236,6 @@ export class WorkspaceTurnManager {
             nextStatus: nextRecord.status,
           });
           delete nextRecord.terminalAttentionNotifiedAt;
-          delete nextRecord.provisionalOutcome;
         }
         if (suppressedQuietSettlement) {
           // Downgrade-compatible suppression marker (upgrade↔downgrade rule):
@@ -3811,9 +3809,7 @@ export class WorkspaceTurnManager {
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     const hasRuntimeActivity =
       this.aiService.isStreaming(record.workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId) ||
-      this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
-      this.workspaceService.hasPendingBashMonitorWakeContinuation(record.workspaceId);
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId);
     if (hasRuntimeActivity) {
       return true;
     }
@@ -4074,26 +4070,6 @@ export class WorkspaceTurnManager {
     };
   }
 
-  /** Rebuild a deferred uncorrelated wake end after its continuation evidence clears. */
-  private buildDeferredWakeEndEventFromHistory(
-    record: WorkspaceTurnTaskHandleRecord,
-    message: MuxMessage
-  ): StreamEndEvent | null {
-    if (message.role !== "assistant" || message.metadata?.partial === true) {
-      return null;
-    }
-    return {
-      type: "stream-end",
-      workspaceId: record.workspaceId,
-      messageId: message.id,
-      metadata: {
-        ...message.metadata,
-        model: coerceNonEmptyString(message.metadata?.model) ?? record.modelString ?? defaultModel,
-      },
-      parts: message.parts as StreamEndEvent["parts"],
-    };
-  }
-
   private buildTerminalWorkspaceTurnRecordFromEvent(
     record: WorkspaceTurnTaskHandleRecord,
     event: StreamEndEvent,
@@ -4102,7 +4078,6 @@ export class WorkspaceTurnManager {
     const baseRecord = { ...record };
     delete baseRecord.error;
     delete baseRecord.deferredMessageIds;
-    delete baseRecord.provisionalOutcome;
     // A "tool-calls" finish on a delegated turn backed by queue-dispatch
     // evidence is a queue cut: some other queued input (a manual user message,
     // /compact, the owner's own follow-up turn) dispatched at the tool boundary
@@ -4189,13 +4164,10 @@ export class WorkspaceTurnManager {
 
     const allowDeferredMessages = !(await this.hasActiveWorkspaceTurnDeferredBlockers(record));
     for (const message of historyResult.data.toReversed()) {
-      const isDeferred = this.isDeferredWorkspaceTurnMessage(record, message.id);
-      if (isDeferred && !allowDeferredMessages) {
+      if (this.isDeferredWorkspaceTurnMessage(record, message.id) && !allowDeferredMessages) {
         continue;
       }
-      const event =
-        this.buildWorkspaceTurnStreamEndEventFromHistory(record, message) ??
-        (isDeferred ? this.buildDeferredWakeEndEventFromHistory(record, message) : null);
+      const event = this.buildWorkspaceTurnStreamEndEventFromHistory(record, message);
       if (event != null) {
         // History order alone cannot prove a queue cut (a later unrelated user
         // message is not causal evidence), so stale recovery conservatively
@@ -4250,6 +4222,29 @@ export class WorkspaceTurnManager {
     };
   }
 
+  private isWorkspaceTurnAnchorForRecord(
+    record: WorkspaceTurnTaskHandleRecord,
+    message: MuxMessage
+  ): boolean {
+    const muxMetadata = message.metadata?.muxMetadata;
+    if (muxMetadata?.type === "workspace-turn-task") {
+      return (
+        muxMetadata.taskHandleId === record.handleId &&
+        muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
+        muxMetadata.turnId === record.turnId
+      );
+    }
+    if (muxMetadata?.type === "compaction-summary") {
+      const preserved = muxMetadata.pendingFollowUp?.workspaceTurnMetadata;
+      return (
+        preserved?.taskHandleId === record.handleId &&
+        preserved.ownerWorkspaceId === record.ownerWorkspaceId &&
+        preserved.turnId === record.turnId
+      );
+    }
+    return false;
+  }
+
   private async interruptWorkspaceTurnFromUncorrelatedStreamEnd(
     event: StreamEndEvent
   ): Promise<boolean> {
@@ -4293,22 +4288,21 @@ export class WorkspaceTurnManager {
     }
 
     let streamEndIndex = -1;
-    let promptIndex = -1;
+    let turnAnchorIndex = -1;
     for (const [index, message] of historyResult.data.entries()) {
       if (message.id === event.messageId) {
         streamEndIndex = index;
       }
-      const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
-      if (
-        metadata?.taskHandleId === record.handleId &&
-        metadata.ownerWorkspaceId === record.ownerWorkspaceId &&
-        metadata.turnId === record.turnId
-      ) {
-        promptIndex = index;
+      if (this.isWorkspaceTurnAnchorForRecord(record, message)) {
+        turnAnchorIndex = index;
       }
     }
 
-    if (streamEndIndex !== -1 && promptIndex !== -1 && streamEndIndex < promptIndex) {
+    if (streamEndIndex === -1 || turnAnchorIndex === -1) {
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      return true;
+    }
+    if (streamEndIndex < turnAnchorIndex) {
       log.debug("Ignoring stale uncorrelated stream-end before queued workspace turn prompt", {
         workspaceId: event.workspaceId,
         taskHandleId: record.handleId,
@@ -4317,90 +4311,13 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    if (promptIndex !== -1) {
-      const scanEnd = streamEndIndex === -1 ? historyResult.data.length : streamEndIndex;
-      const hasManualSupersessionInput = historyResult.data
-        .slice(promptIndex + 1, scanEnd)
-        .some(isManualChildWorkspaceInput);
-      if (hasManualSupersessionInput) {
-        await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
-        return true;
-      }
-
-      if (await this.hasLiveUncorrelatedWakeContinuationEvidence(event, record)) {
-        await this.persistDeferredUncorrelatedWakeEnd(record, event);
-        return true;
-      }
-
-      const next = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
-        supersedeEvidence: null,
-      });
-      next.provisionalOutcome = true;
-      await this.settleWorkspaceTurn({
-        record,
-        next,
-        waiterSettlement:
-          next.status === "completed"
-            ? { status: "completed", result: this.buildWorkspaceTurnWaitResult(next) }
-            : { status: "error", error: new Error(next.error ?? "Workspace turn failed") },
-        allowTerminalResettle: true,
-      });
-      return true;
+    const hasManualSupersessionInput = historyResult.data
+      .slice(turnAnchorIndex + 1, streamEndIndex)
+      .some(isManualChildWorkspaceInput);
+    if (hasManualSupersessionInput) {
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
     }
-
-    await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
     return true;
-  }
-
-  private async hasLiveUncorrelatedWakeContinuationEvidence(
-    event: StreamEndEvent,
-    record: WorkspaceTurnTaskHandleRecord
-  ): Promise<boolean> {
-    if (await this.hasActiveWorkspaceTurnDeferredBlockers(record)) {
-      return true;
-    }
-    if (
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(event.workspaceId) ||
-      this.workspaceService.hasPendingAutoRetry(event.workspaceId) ||
-      this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)
-    ) {
-      return true;
-    }
-    if (
-      this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
-        type: "workspace-turn-task",
-        taskHandleId: record.handleId,
-        ownerWorkspaceId: record.ownerWorkspaceId,
-        turnId: record.turnId,
-      })
-    ) {
-      return true;
-    }
-    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
-    return activeStream != null && activeStream.messageId !== event.messageId;
-  }
-
-  private async persistDeferredUncorrelatedWakeEnd(
-    record: WorkspaceTurnTaskHandleRecord,
-    event: StreamEndEvent
-  ): Promise<void> {
-    await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
-      const current = await this.taskHandleStore.getWorkspaceTurn(
-        record.ownerWorkspaceId,
-        record.handleId
-      );
-      if (current == null || !isActiveWorkspaceTurnTaskStatus(current.status)) {
-        return;
-      }
-      if (this.isDeferredWorkspaceTurnMessage(current, event.messageId)) {
-        return;
-      }
-      await this.taskHandleStore.upsertWorkspaceTurn({
-        ...current,
-        updatedAt: getIsoNow(),
-        deferredMessageIds: [...(current.deferredMessageIds ?? []), event.messageId],
-      });
-    });
   }
 
   private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
@@ -4415,7 +4332,6 @@ export class WorkspaceTurnManager {
       messageId: event.messageId,
       error,
     };
-    delete next.provisionalOutcome;
     delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
       record,
