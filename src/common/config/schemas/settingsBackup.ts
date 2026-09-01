@@ -214,6 +214,7 @@ export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
   if (url === "" || url.length > 2048) return undefined;
   // Control characters and whitespace have no place in a remote URL and are how command
   // injection into a later shell paste would start.
+  // eslint-disable-next-line no-control-regex
   if (/[\s\u0000-\u001f\u007f]/.test(url)) return undefined;
   if (hasUrlCredentials(url)) return undefined;
   if (/^(?:https?|ssh):\/\/[^/]+/i.test(url)) return url;

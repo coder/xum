@@ -6,7 +6,8 @@ import * as path from "node:path";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupNonFastForwardError, backupCachePath } from "./gitRepo";
-import { TestBackupConfig, runGit, writeFixtureFile } from "./testHelpers";
+import { projectMemoryDirName } from "@/node/services/memoryService";
+import { TestBackupConfig, captureRejection, runGit, writeFixtureFile } from "./testHelpers";
 
 describe("backup adapters", () => {
   let tempDir: string;
@@ -40,7 +41,11 @@ describe("backup adapters", () => {
     const repository = await gitRepo.prepare(settings);
     expect(repository.remoteCommit).toBeNull();
 
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     const changes = await gitRepo.getPushChanges(repository);
     expect(changes.map((change) => change.path)).toContain("mux/AGENTS.md");
 
@@ -54,7 +59,11 @@ describe("backup adapters", () => {
     );
 
     const second = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: second.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: second.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     const unchanged = await gitRepo.commitAndPush(second, {
       message: "Back up Xum settings",
       expectedRemoteCommit: second.remoteCommit,
@@ -87,7 +96,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(repository, {
       message: "Back up Xum settings",
       expectedRemoteCommit: repository.remoteCommit,
@@ -121,7 +134,11 @@ describe("backup adapters", () => {
 
     // A preview writes the payload into the cache but never pushes it.
     const first = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: first.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: first.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     const second = await gitRepo.prepare(settings);
     const preview = await payload.previewRestore({
@@ -138,7 +155,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const prepared = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: prepared.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: prepared.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     // Without the preflight this reads as a plain addition, and the restore the user accepts
     // then fails on the same unchanged filesystem state.
@@ -146,7 +167,11 @@ describe("backup adapters", () => {
     await fs.mkdir(path.join(muxRoot, "agents/foo.md"), { recursive: true });
 
     const refused = await payload
-      .previewRestore({ repositoryRoot: prepared.rootDir, managedPath: settings.path, includeProjects: false })
+      .previewRestore({
+        repositoryRoot: prepared.rootDir,
+        managedPath: settings.path,
+        includeProjects: false,
+      })
       .then(
         () => null,
         (error: unknown) => error
@@ -161,14 +186,22 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const first = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: first.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: first.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(first, {
       message: "Back up Xum settings",
       expectedRemoteCommit: first.remoteCommit,
     });
 
     const second = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: second.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: second.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     expect(await gitRepo.getPushChanges(second)).toEqual([]);
 
     // Another client advances the branch after this cache fetched it.
@@ -206,7 +239,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const first = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: first.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: first.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(first, {
       message: "Back up Xum settings",
       expectedRemoteCommit: first.remoteCommit,
@@ -215,7 +252,11 @@ describe("backup adapters", () => {
     // A preview rewrites the tracked payload in the cache without pushing it.
     await writeFixtureFile(muxRoot, "AGENTS.md", "local only\n");
     const second = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: second.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: second.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     const third = await gitRepo.prepare(settings);
     const preview = await payload.previewRestore({
@@ -233,7 +274,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const first = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: first.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: first.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(first, {
       message: "Back up Xum settings",
       expectedRemoteCommit: first.remoteCommit,
@@ -341,7 +386,11 @@ describe("backup adapters", () => {
     const previousUmask = process.umask(0o022);
     try {
       const repository = await gitRepo.prepare(settings);
-      await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+      await payload.exportTo({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: false,
+      });
     } finally {
       process.umask(previousUmask);
     }
@@ -476,7 +525,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const first = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: first.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: first.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(first, {
       message: "Back up Xum settings",
       expectedRemoteCommit: first.remoteCommit,
@@ -488,7 +541,11 @@ describe("backup adapters", () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "second\n");
     const second = await gitRepo.prepare(settings);
     expect(second.remoteCommit).toBeNull();
-    await payload.exportTo({ repositoryRoot: second.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: second.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(second, {
       message: "Back up Xum settings",
       expectedRemoteCommit: second.remoteCommit,
@@ -504,7 +561,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     const preview = await payload.previewRestore({
       repositoryRoot: repository.rootDir,
@@ -534,7 +595,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     const preview = await payload.previewRestore({
       repositoryRoot: repository.rootDir,
@@ -551,7 +616,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     await fs.chmod(path.join(muxRoot, "skills/demo/run.sh"), 0o644);
     const preview = await payload.previewRestore({
@@ -577,7 +646,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
-    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: legacy.managedPath, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: legacy.rootDir,
+      managedPath: legacy.managedPath,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(legacy, {
       message: "Back up Mux settings",
       expectedRemoteCommit: legacy.remoteCommit,
@@ -615,7 +688,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
-    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: legacy.managedPath, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: legacy.rootDir,
+      managedPath: legacy.managedPath,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(legacy, {
       message: "Back up Mux settings",
       expectedRemoteCommit: legacy.remoteCommit,
@@ -624,7 +701,11 @@ describe("backup adapters", () => {
     // A xum-configured push updates the legacy backup in place rather than creating xum/.
     await writeFixtureFile(muxRoot, "AGENTS.md", "updated instructions\n");
     const prepared = await gitRepo.prepare({ ...settings, path: "xum/" });
-    await payload.exportTo({ repositoryRoot: prepared.rootDir, managedPath: prepared.managedPath, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: prepared.rootDir,
+      managedPath: prepared.managedPath,
+      includeProjects: false,
+    });
     const pushed = await gitRepo.commitAndPush(prepared, {
       message: "Back up Xum settings",
       expectedRemoteCommit: prepared.remoteCommit,
@@ -641,7 +722,11 @@ describe("backup adapters", () => {
 
     await writeFixtureFile(muxRoot, "AGENTS.md", "legacy\n");
     const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
-    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: legacy.managedPath, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: legacy.rootDir,
+      managedPath: legacy.managedPath,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(legacy, {
       message: "Back up Mux settings",
       expectedRemoteCommit: legacy.remoteCommit,
@@ -686,7 +771,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const canonical = await gitRepo.prepare({ ...settings, path: "xum/" });
-    await payload.exportTo({ repositoryRoot: canonical.rootDir, managedPath: "xum/", includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: canonical.rootDir,
+      managedPath: "xum/",
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(canonical, {
       message: "Back up Xum settings",
       expectedRemoteCommit: canonical.remoteCommit,
@@ -738,7 +827,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
-    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: legacy.managedPath, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: legacy.rootDir,
+      managedPath: legacy.managedPath,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(legacy, {
       message: "Back up Mux settings",
       expectedRemoteCommit: legacy.remoteCommit,
@@ -793,7 +886,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
-    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: legacy.managedPath, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: legacy.rootDir,
+      managedPath: legacy.managedPath,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(legacy, {
       message: "Back up Mux settings",
       expectedRemoteCommit: legacy.remoteCommit,
@@ -839,7 +936,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     config.state = {
       projects: new Map(),
@@ -872,7 +973,11 @@ describe("backup adapters", () => {
     await fs.symlink(outside, path.join(repository.rootDir, "linked"));
 
     try {
-      await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: "linked/mux", includeProjects: false });
+      await payload.exportTo({
+        repositoryRoot: repository.rootDir,
+        managedPath: "linked/mux",
+        includeProjects: false,
+      });
       throw new Error("Expected the symlinked ancestor to be rejected");
     } catch (error) {
       if (!(error instanceof Error)) throw error;
@@ -905,7 +1010,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
     await fs.rm(path.join(muxRoot, "agents/shared.md"));
@@ -933,7 +1042,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     // Commands are never exported, so the only way a backup carries one is if someone with
     // repository write access put it there.
@@ -984,7 +1097,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     await writeFixtureFile(muxRoot, "AGENTS.md", "locally edited\n");
     await writeFixtureFile(muxRoot, "agents/local-only.md", "local only\n");
@@ -1020,7 +1137,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "light" } } };
     // A swallowed write failure: the edit callback runs, editConfig resolves, and the
@@ -1031,7 +1152,11 @@ describe("backup adapters", () => {
     });
 
     try {
-      await payload.restore({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+      await payload.restore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: false,
+      });
       throw new Error("Expected the lost preferences write to be reported");
     } catch (error) {
       if (!(error instanceof Error)) throw error;
@@ -1046,7 +1171,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "light" } } };
     config.beforeEdit = () => {
@@ -1124,7 +1253,11 @@ describe("backup adapters", () => {
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const payload = createBackupPayloadStore({ config });
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     for (const alias of ["Note.md", "NOTE.md"]) {
       await fs.link(
         path.join(muxRoot, "skills/demo/note.md"),
@@ -1167,7 +1300,11 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
     await gitRepo.commitAndPush(repository, {
       message: "Back up Xum settings",
       expectedRemoteCommit: repository.remoteCommit,
@@ -1175,7 +1312,11 @@ describe("backup adapters", () => {
 
     await fs.rename(path.join(muxRoot, "agents/first.md"), path.join(muxRoot, "agents/second.md"));
     const next = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: next.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: next.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     const changes = await gitRepo.getPushChanges(next);
     expect(changes.map((change) => change.path)).toContain("mux/agents/second.md");
@@ -1190,10 +1331,348 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
 
     const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({ repositoryRoot: repository.rootDir, managedPath: settings.path, includeProjects: false });
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
 
     const paths = (await gitRepo.getPushChanges(repository)).map((change) => change.path);
 
     expect(paths).toContain("mux/skills/café/SKILL.md");
+  });
+});
+
+describe("backup adapters project bundle", () => {
+  let tempDir: string;
+  let muxRoot: string;
+  let originPath: string;
+  let cacheRoot: string;
+  let settings: SettingsBackupInput;
+  let config: TestBackupConfig;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-backup-bundle-"));
+    muxRoot = path.join(tempDir, "mux-root");
+    originPath = path.join(tempDir, "origin.git");
+    cacheRoot = path.join(tempDir, "cache");
+    await fs.mkdir(muxRoot, { recursive: true });
+    await runGit(["init", "--bare", "--initial-branch=main", originPath]);
+    settings = { repoUrl: originPath, branch: "main", path: "mux" };
+    config = new TestBackupConfig(muxRoot);
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  function registerProject(projectPath: string): void {
+    config.state.projects.set(projectPath, { workspaces: [] });
+  }
+
+  async function seedProjectMemory(
+    projectPath: string,
+    fileName: string,
+    content: string
+  ): Promise<void> {
+    await writeFixtureFile(
+      muxRoot,
+      `memory/project/${projectMemoryDirName(projectPath)}/${fileName}`,
+      content
+    );
+  }
+
+  async function exportBundle(payload = createBackupPayloadStore({ config })) {
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    return { gitRepo, repository, payload };
+  }
+
+  it("exports every user project including zero-memory ones and filters system entries", async () => {
+    const projectA = path.join(tempDir, "projects", "alpha");
+    const projectB = path.join(tempDir, "projects", "beta");
+    registerProject(projectA);
+    registerProject(projectB);
+    config.state.projects.set("_multi", { workspaces: [] });
+    config.state.projects.set("_scratch", { workspaces: [] });
+    config.state.projects.set(path.join(tempDir, "system"), {
+      workspaces: [],
+      projectKind: "system",
+    });
+    await seedProjectMemory(projectA, "notes.md", "alpha notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+
+    const { repository } = await exportBundle();
+
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(repository.rootDir, settings.path, "project-bundle", "manifest.json"),
+        "utf-8"
+      )
+    ) as { projects: Array<{ path: string; memoryDir: string }>; files: Array<{ path: string }> };
+    expect(manifest.projects.map((entry) => entry.path).sort()).toEqual(
+      [projectA, projectB].sort()
+    );
+    expect(manifest.files.map((file) => file.path)).toEqual([
+      `memory/project/${projectMemoryDirName(projectA)}/notes.md`,
+    ]);
+  });
+
+  it("records portable git remotes and drops credentialed ones", async () => {
+    const plainProject = path.join(tempDir, "projects", "plain");
+    const credentialedProject = path.join(tempDir, "projects", "credentialed");
+    for (const [projectPath, remote] of [
+      [plainProject, "git@github.com:dev/plain.git"],
+      [credentialedProject, "https://user:secret@example.com/repo.git"],
+    ] as const) {
+      await fs.mkdir(projectPath, { recursive: true });
+      await runGit(["-C", projectPath, "init"]);
+      await runGit(["-C", projectPath, "remote", "add", "origin", remote]);
+      registerProject(projectPath);
+    }
+
+    const { repository } = await exportBundle();
+
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(repository.rootDir, settings.path, "project-bundle", "manifest.json"),
+        "utf-8"
+      )
+    ) as { projects: Array<{ path: string; gitRemote?: string }> };
+    const byPath = new Map(manifest.projects.map((entry) => [entry.path, entry]));
+    expect(byPath.get(plainProject)?.gitRemote).toBe("git@github.com:dev/plain.git");
+    expect(byPath.get(credentialedProject)?.gitRemote).toBeUndefined();
+  });
+
+  it("removes a previously pushed bundle when the toggle is disabled", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+
+    const { gitRepo, repository, payload } = await exportBundle();
+    const bundlePath = path.join(repository.rootDir, settings.path, "project-bundle");
+    expect(
+      await fs.stat(bundlePath).then(
+        () => true,
+        () => false
+      )
+    ).toBe(true);
+    await gitRepo.commitAndPush(repository, {
+      message: "with bundle",
+      expectedRemoteCommit: repository.remoteCommit,
+    });
+
+    const second = await gitRepo.prepare(settings);
+    await payload.exportTo({
+      repositoryRoot: second.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    expect(
+      await fs.stat(path.join(second.rootDir, settings.path, "project-bundle")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("restores matched project memory verbatim and previews the change", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryPath = `memory/project/${projectMemoryDirName(project)}/notes.md`;
+
+    const { repository, payload } = await exportBundle();
+
+    // Local edit after the export, as if made on this machine since the last push.
+    await seedProjectMemory(project, "notes.md", "local edit\n");
+
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(preview.projectImports).toEqual([]);
+    expect(preview.projectBundleSkipped).toBe(false);
+    expect(preview.changes).toContainEqual({ status: "M", path: memoryPath });
+
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(restored.changedFiles).toContain(memoryPath);
+    expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
+      "backup version\n"
+    );
+  });
+
+  it("surfaces unmatched projects as import candidates and writes nothing for them", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryDir = projectMemoryDirName(project);
+
+    const { repository, payload } = await exportBundle();
+
+    // The project vanishes locally: unregistered and its memory directory removed, as on a
+    // fresh machine restoring this backup.
+    config.state.projects.delete(project);
+    await fs.rm(path.join(muxRoot, "memory", "project", memoryDir), {
+      recursive: true,
+      force: true,
+    });
+
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(preview.projectImports).toHaveLength(1);
+    expect(preview.projectImports[0]).toMatchObject({
+      sourcePath: project,
+      name: "alpha",
+      memoryFileCount: 1,
+    });
+
+    const validated = await payload.validateRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(validated.hasProjectBundle).toBe(true);
+    expect(validated.projectImports[0]?.token).toBe(preview.projectImports[0].token);
+
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(restored.changedFiles.some((file) => file.startsWith("memory/project"))).toBe(false);
+    expect(
+      await fs.stat(path.join(muxRoot, "memory", "project", memoryDir)).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("imports approved project memory re-keyed to the target path, add-only", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await seedProjectMemory(project, "conflict.md", "backup conflict\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+
+    const { repository, payload } = await exportBundle();
+
+    config.state.projects.delete(project);
+    await fs.rm(path.join(muxRoot, "memory", "project", projectMemoryDirName(project)), {
+      recursive: true,
+      force: true,
+    });
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    const token = preview.projectImports[0].token;
+
+    const targetPath = path.join(tempDir, "projects", "alpha-moved");
+    const targetDir = projectMemoryDirName(targetPath);
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/conflict.md`, "local wins\n");
+
+    const imported = await payload.importProjectMemory({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      token,
+      targetPath,
+    });
+
+    expect(imported.writtenFiles).toEqual([`memory/project/${targetDir}/notes.md`]);
+    expect(imported.skippedFiles).toEqual([`memory/project/${targetDir}/conflict.md`]);
+    expect(
+      await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "notes.md"), "utf-8")
+    ).toBe("alpha notes\n");
+    expect(
+      await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "conflict.md"), "utf-8")
+    ).toBe("local wins\n");
+  });
+
+  it("skips a malformed sidecar when the toggle is off but refuses it when on", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+    const repository = await gitRepo.prepare(settings);
+    await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    await writeFixtureFile(
+      path.join(repository.rootDir, settings.path),
+      "project-bundle/manifest.json",
+      "{ not json"
+    );
+
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    expect(preview.projectBundleSkipped).toBe(true);
+
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: false,
+    });
+    expect(restored.projectBundleSkipped).toBe(true);
+
+    const error = await captureRejection(
+      payload.previewRestore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+      })
+    );
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+  });
+
+  it("covers registered project memory in the safety snapshot only when asked", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "before restore\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const payload = createBackupPayloadStore({ config });
+
+    const withProjects = path.join(tempDir, "snapshot-with");
+    await payload.writeSafetySnapshot(withProjects, { includeProjectMemory: true });
+    const snapshotFile = path.join(
+      withProjects,
+      "project-bundle",
+      "memory",
+      "project",
+      projectMemoryDirName(project),
+      "notes.md"
+    );
+    expect(await fs.readFile(snapshotFile, "utf-8")).toBe("before restore\n");
+
+    const withoutProjects = path.join(tempDir, "snapshot-without");
+    await payload.writeSafetySnapshot(withoutProjects, { includeProjectMemory: false });
+    expect(
+      await fs.stat(path.join(withoutProjects, "project-bundle")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
   });
 });

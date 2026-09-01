@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import type { BackupProjectImport, SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import { Err, Ok } from "@/common/types/result";
 import { BackupNonFastForwardError, backupCachePath, isBackupCacheName } from "./gitRepo";
 import { BackupRemoteUnreachableError } from "./credentials";
 import { BackupCommandApprovalRequiredError } from "./payload";
@@ -533,7 +534,11 @@ describe("BackupService", () => {
         },
         restore: (options) => {
           recordManagedPath(options);
-          return Promise.resolve({ changedFiles: [], localOnlyFiles: [], projectBundleSkipped: false });
+          return Promise.resolve({
+            changedFiles: [],
+            localOnlyFiles: [],
+            projectBundleSkipped: false,
+          });
         },
       }),
     });
@@ -1012,5 +1017,215 @@ describe("BackupService", () => {
         lastRestoredCommit: undefined,
       },
     });
+  });
+});
+
+describe("BackupService project imports", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-backup-imports-"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  function candidate(overrides: Partial<BackupProjectImport> = {}): BackupProjectImport {
+    return {
+      sourcePath: "/home/dev/src/alpha",
+      name: "alpha",
+      memoryFileCount: 1,
+      token: "candidate-token",
+      ...overrides,
+    };
+  }
+
+  test("persists includeProjects and passes it to the payload store", async () => {
+    const seen: boolean[] = [];
+    const config = new TestBackupConfig(tempDir);
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        exportTo: (options) => {
+          seen.push(options.includeProjects);
+          return Promise.resolve({ redactions: [], secretFiles: [], secretApproval: "" });
+        },
+      }),
+    });
+
+    const saved = await service.saveSettings({ ...SETTINGS, includeProjects: true });
+    expect(saved.success).toBe(true);
+    expect(service.getSettings()?.includeProjects).toBe(true);
+
+    expect((await service.push({ ...SETTINGS, includeProjects: true })).success).toBe(true);
+    expect((await service.push(SETTINGS)).success).toBe(true);
+    expect(seen).toEqual([true, false]);
+  });
+
+  test("refuses an unknown import token with fresh candidates before the snapshot", async () => {
+    const fresh = candidate();
+    let snapshots = 0;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () => Promise.resolve({ hasProjectBundle: true, projectImports: [fresh] }),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "stale-token", targetPath: tempDir }] }
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.code).toBe("PROJECT_IMPORT_APPROVAL_REQUIRED");
+      expect(result.error.projectImports).toEqual([fresh]);
+      expect(result.error.snapshotPath).toBeUndefined();
+    }
+    expect(snapshots).toBe(0);
+  });
+
+  test("refuses an unusable import target before the snapshot", async () => {
+    let snapshots = 0;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({ hasProjectBundle: true, projectImports: [candidate()] }),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+
+    for (const targetPath of [path.join(tempDir, "missing"), "relative/path"]) {
+      const result = await service.restore(
+        { ...SETTINGS, includeProjects: true },
+        { projectImports: [{ token: "candidate-token", targetPath }] }
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.code).toBe("IO_ERROR");
+        expect(result.error.snapshotPath).toBeUndefined();
+      }
+    }
+    expect(snapshots).toBe(0);
+  });
+
+  test("registers a project before writing its memory and isolates per-candidate failures", async () => {
+    const goodDir = path.join(tempDir, "good");
+    const badDir = path.join(tempDir, "bad");
+    await fs.mkdir(goodDir);
+    await fs.mkdir(badDir);
+    const candidates = [
+      candidate({ sourcePath: "/src/good", name: "good", token: "good-token" }),
+      candidate({ sourcePath: "/src/bad", name: "bad", token: "bad-token" }),
+    ];
+    const events: string[] = [];
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({ hasProjectBundle: true, projectImports: candidates }),
+        importProjectMemory: (options) => {
+          events.push(`import:${options.targetPath}`);
+          return Promise.resolve({
+            writtenFiles: ["memory/project/good-abc/notes.md"],
+            skippedFiles: [],
+          });
+        },
+      }),
+    });
+    service.setProjectService({
+      create: (projectPath) => {
+        events.push(`create:${projectPath}`);
+        return Promise.resolve(
+          projectPath === goodDir ? Ok({ normalizedPath: projectPath }) : Err("registration failed")
+        );
+      },
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      {
+        projectImports: [
+          { token: "good-token", targetPath: goodDir },
+          { token: "bad-token", targetPath: badDir },
+        ],
+      }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults).toEqual([
+        {
+          sourcePath: "/src/good",
+          targetPath: goodDir,
+          name: "good",
+          status: "imported",
+          writtenFiles: ["memory/project/good-abc/notes.md"],
+          skippedFiles: [],
+        },
+        {
+          sourcePath: "/src/bad",
+          targetPath: badDir,
+          name: "bad",
+          status: "failed",
+          message: "registration failed",
+          writtenFiles: [],
+          skippedFiles: [],
+        },
+      ]);
+    }
+    // Registration always completes before the memory write for its candidate; the failed
+    // registration never reaches the memory write.
+    expect(events).toEqual([`create:${goodDir}`, `import:${goodDir}`, `create:${badDir}`]);
+  });
+
+  test("tolerates a project already registered at the target path", async () => {
+    const target = path.join(tempDir, "already");
+    await fs.mkdir(target);
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({ hasProjectBundle: true, projectImports: [candidate()] }),
+      }),
+    });
+    service.setProjectService({
+      create: () => Promise.resolve(Err("Project already exists")),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]?.status).toBe("imported");
+    }
+  });
+
+  test("asks the snapshot to cover project memory only when the payload carries a bundle", async () => {
+    const flags: boolean[] = [];
+    const payload = (hasProjectBundle: boolean) =>
+      createPayload({
+        validateRestore: () => Promise.resolve({ hasProjectBundle, projectImports: [] }),
+        writeSafetySnapshot: (_snapshotRoot, options) => {
+          flags.push(options.includeProjectMemory);
+          return Promise.resolve();
+        },
+      });
+
+    const withBundle = createService(tempDir, { payload: payload(true) });
+    expect((await withBundle.restore({ ...SETTINGS, includeProjects: true })).success).toBe(true);
+    const withoutToggle = createService(tempDir, { payload: payload(false) });
+    expect((await withoutToggle.restore(SETTINGS)).success).toBe(true);
+
+    expect(flags).toEqual([true, false]);
   });
 });

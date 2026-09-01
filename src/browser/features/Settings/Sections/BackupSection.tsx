@@ -950,13 +950,13 @@ export function BackupSection() {
                           {candidate.memoryFileCount === 1 ? "file" : "files"})
                         </span>
                       </span>
-                      <span className="text-muted mt-0.5 block break-all text-xs">
+                      <span className="text-muted mt-0.5 block text-xs break-all">
                         Backed up from: {candidate.sourcePath}
                       </span>
                       {/* Inert text on purpose: the remote is repository-controlled data,
                           never a link and never executed. */}
                       {candidate.gitRemote != null ? (
-                        <span className="text-muted mt-0.5 block break-all text-xs">
+                        <span className="text-muted mt-0.5 block text-xs break-all">
                           Remote: {candidate.gitRemote}
                         </span>
                       ) : null}

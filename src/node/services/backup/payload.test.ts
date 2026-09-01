@@ -18,22 +18,38 @@ import {
   MAX_BACKUP_MCP_REDACTION_SEGMENTS,
   MAX_BACKUP_PATH_DEPTH,
   MAX_BACKUP_TOTAL_BYTES,
+  PROJECT_BUNDLE_DIR,
   REDACTED_BACKUP_VALUE,
   backupCommandApprovalToken,
   backupSecretApprovalDigest,
   collectAllowlistedFiles,
   collectMcpCommandApprovals,
+  collectProjectBundle,
   createBackupPayload,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
+  planProjectBundleRestore,
   planRestoreWrites,
+  projectBundleExists,
+  projectImportToken,
+  readProjectBundle,
+  rekeyProjectMemoryPath,
   serializeBackupPreferences,
   readBackupPayload,
   resolveRestoredContent,
   restoreBackupPayload,
   scanBackupFilesForSecrets,
   writeBackupPayload,
+  writeProjectBundle,
+  writeProjectMemoryFiles,
+  type BackupProjectBundle,
 } from "./payload";
+import { projectMemoryDirName, projectPathHashSuffix } from "@/node/services/memoryService";
+import {
+  MAX_BACKUP_PROJECT_ENTRIES,
+  sanitizeBackupGitRemote,
+  type BackupProjectBundleEntry,
+} from "@/common/config/schemas/settingsBackup";
 import { captureRejection, writeFixtureFile } from "./testHelpers";
 
 async function isExecutable(filePath: string): Promise<boolean> {
@@ -3468,5 +3484,380 @@ describe("backup payload", () => {
     };
     expect(restoredMcp.servers.api.url).toBe("https://backup.example.com/mcp?mode=backup");
     expect(restoredMcp.servers.api.headers).toBeUndefined();
+  });
+});
+
+describe("project bundle", () => {
+  let tempDir: string;
+  let muxRoot: string;
+  let managedDir: string;
+
+  function entryFor(projectPath: string, name?: string): BackupProjectBundleEntry {
+    return {
+      path: projectPath,
+      name: name ?? path.basename(projectPath),
+      memoryDir: projectMemoryDirName(projectPath),
+    };
+  }
+
+  async function writeBundleTo(destination: string, bundle: BackupProjectBundle): Promise<void> {
+    await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle);
+  }
+
+  async function rewriteBundleManifest(destination: string, manifest: unknown): Promise<void> {
+    await fs.mkdir(path.join(destination, PROJECT_BUNDLE_DIR), { recursive: true });
+    await fs.writeFile(
+      path.join(destination, PROJECT_BUNDLE_DIR, "manifest.json"),
+      JSON.stringify(manifest, null, 2),
+      "utf-8"
+    );
+  }
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-project-bundle-"));
+    muxRoot = path.join(tempDir, "mux-root");
+    managedDir = path.join(tempDir, "managed");
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.mkdir(managedDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("round-trips project entries and memory files, keeping zero-memory projects as entries", async () => {
+    const withMemory = entryFor("/home/dev/src/alpha");
+    const withoutMemory = entryFor("/home/dev/src/beta");
+    await writeFixtureFile(
+      muxRoot,
+      `memory/project/${withMemory.memoryDir}/notes.md`,
+      "alpha notes\n"
+    );
+
+    const bundle = await collectProjectBundle(muxRoot, [withoutMemory, withMemory]);
+    expect(bundle.manifest.projects.map((entry) => entry.path)).toEqual([
+      "/home/dev/src/alpha",
+      "/home/dev/src/beta",
+    ]);
+    expect(bundle.manifest.files.map((file) => file.path)).toEqual([
+      `memory/project/${withMemory.memoryDir}/notes.md`,
+    ]);
+
+    await writeBundleTo(managedDir, bundle);
+    expect(await projectBundleExists(managedDir)).toBe(true);
+    const read = await readProjectBundle(managedDir);
+    expect(read).not.toBeNull();
+    expect(read?.manifest.projects).toEqual(bundle.manifest.projects);
+    expect(read?.files[0]?.content.toString("utf-8")).toBe("alpha notes\n");
+  });
+
+  it("returns null when the backup carries no bundle", async () => {
+    expect(await readProjectBundle(managedDir)).toBeNull();
+    expect(await projectBundleExists(managedDir)).toBe(false);
+  });
+
+  it("rejects more project entries than the cap", async () => {
+    const entries = Array.from({ length: MAX_BACKUP_PROJECT_ENTRIES + 1 }, (_, index) =>
+      entryFor(`/home/dev/src/project-${index}`)
+    );
+    const error = await captureRejection(collectProjectBundle(muxRoot, entries));
+    expect((error as Error).message).toContain(`${MAX_BACKUP_PROJECT_ENTRIES}`);
+  });
+
+  it("rejects a bundle file whose checksum does not match", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/notes.md`, "original\n");
+    const bundle = await collectProjectBundle(muxRoot, [entry]);
+    await writeBundleTo(managedDir, bundle);
+
+    await fs.writeFile(
+      path.join(managedDir, PROJECT_BUNDLE_DIR, "memory", "project", entry.memoryDir, "notes.md"),
+      "tampered\n",
+      "utf-8"
+    );
+
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    expect((error as Error).message).toContain("checksum");
+  });
+
+  it("rejects a recorded memory directory whose hash suffix does not match its path", async () => {
+    await rewriteBundleManifest(managedDir, {
+      schemaVersion: 1,
+      projects: [
+        {
+          path: "/home/dev/src/alpha",
+          name: "alpha",
+          // A valid-looking dir name recorded for a DIFFERENT project path.
+          memoryDir: projectMemoryDirName("/home/dev/src/other"),
+        },
+      ],
+      files: [],
+    });
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    expect((error as Error).message).toContain("memory directory");
+  });
+
+  it("rejects unsafe memory directory segments", async () => {
+    for (const memoryDir of ["..", "evil/../../up", "nul", ".hidden-abcdef123456"]) {
+      await rewriteBundleManifest(managedDir, {
+        schemaVersion: 1,
+        projects: [{ path: "/home/dev/src/alpha", name: "alpha", memoryDir }],
+        files: [],
+      });
+      const error = await captureRejection(readProjectBundle(managedDir));
+      expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    }
+  });
+
+  it("keeps a foreign-OS entry with a correct hash suffix as an import candidate", async () => {
+    // A Windows export records a dir name whose sanitized basename this POSIX host would
+    // never recompute, while the pure string hash still matches the recorded path.
+    const windowsPath = "C:\\Users\\dev\\src\\gamma";
+    const recordedDir = `gamma-${projectPathHashSuffix(windowsPath)}`;
+    await rewriteBundleManifest(managedDir, {
+      schemaVersion: 1,
+      projects: [{ path: windowsPath, name: "gamma", memoryDir: recordedDir }],
+      files: [],
+    });
+
+    const bundle = await readProjectBundle(managedDir);
+    expect(bundle).not.toBeNull();
+    // Even a registered project at that exact path with a different local dir name is not
+    // auto-restored: the entry downgrades to an explicit import candidate.
+    const registered = new Map([[windowsPath, projectMemoryDirName(windowsPath)]]);
+    expect(projectMemoryDirName(windowsPath)).not.toBe(recordedDir);
+    const plan = planProjectBundleRestore(bundle!, registered);
+    expect(plan.matched).toEqual([]);
+    expect(plan.imports.map((candidate) => candidate.entry.path)).toEqual([windowsPath]);
+  });
+
+  it("rejects bundle files outside their entry's memory directory or the bundle allowlist", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    const sha = createHash("sha256").update(Buffer.from("x", "utf-8")).digest("hex");
+    for (const filePath of [
+      "skills/evil.md",
+      "memory/global/evil.md",
+      `memory/project/${projectMemoryDirName("/home/dev/src/unlisted")}/notes.md`,
+      "memory/project/../evil.md",
+      `memory/project/${entry.memoryDir}/.env`,
+      `memory/project/${entry.memoryDir}/memory-meta.json`,
+      `memory/project/${entry.memoryDir}`,
+    ]) {
+      await rewriteBundleManifest(managedDir, {
+        schemaVersion: 1,
+        projects: [{ path: entry.path, name: entry.name, memoryDir: entry.memoryDir }],
+        files: [{ path: filePath, sha256: sha }],
+      });
+      const error = await captureRejection(readProjectBundle(managedDir));
+      expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    }
+  });
+
+  it("drops non-portable git remotes instead of failing the bundle", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await rewriteBundleManifest(managedDir, {
+      schemaVersion: 1,
+      projects: [
+        { ...entry, gitRemote: "ext::sh -c whoami" },
+        { ...entryFor("/home/dev/src/beta"), gitRemote: "git@github.com:dev/beta.git" },
+      ],
+      files: [],
+    });
+    const bundle = await readProjectBundle(managedDir);
+    expect(bundle?.manifest.projects[0]?.gitRemote).toBeUndefined();
+    expect(bundle?.manifest.projects[1]?.gitRemote).toBe("git@github.com:dev/beta.git");
+  });
+
+  it("keeps the core manifest free of bundle paths so an old reader ignores the sidecar", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const entry = entryFor("/home/dev/src/alpha");
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/notes.md`, "notes\n");
+
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "test",
+      sourceLabel: "test",
+    });
+    await writeBackupPayload(managedDir, payload);
+    await writeBundleTo(managedDir, await collectProjectBundle(muxRoot, [entry]));
+
+    const coreManifest = JSON.parse(
+      await fs.readFile(path.join(managedDir, "manifest.json"), "utf-8")
+    ) as { files: Array<{ path: string }> };
+    expect(
+      coreManifest.files.some(
+        (file) => file.path.startsWith(PROJECT_BUNDLE_DIR) || file.path.startsWith("memory/project")
+      )
+    ).toBe(false);
+
+    // The manifest-driven core reader never touches the sidecar (old-build restore).
+    const read = await readBackupPayload(managedDir);
+    expect(read.files.some((file) => file.path.startsWith("memory/project"))).toBe(false);
+  });
+
+  it("still rejects a core manifest that lists bundle paths", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "test",
+      sourceLabel: "test",
+    });
+    await writeBackupPayload(managedDir, payload);
+
+    const manifestPath = path.join(managedDir, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8")) as {
+      files: Array<{ path: string; sha256: string }>;
+    };
+    const content = "smuggled\n";
+    await writeFixtureFile(managedDir, "project-bundle/memory/project/x-abc/evil.md", content);
+    manifest.files.push({
+      path: "project-bundle/memory/project/x-abc/evil.md",
+      sha256: sha256Hex(content),
+    });
+    await fs.writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
+
+    const error = await captureRejection(readBackupPayload(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+  });
+
+  it("binds the import token to entry metadata and file content", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/notes.md`, "v1\n");
+    const bundle = await collectProjectBundle(muxRoot, [entry]);
+    const token = projectImportToken(bundle.manifest.projects[0], bundle.files);
+    // Deterministic across recomputation.
+    expect(projectImportToken(bundle.manifest.projects[0], bundle.files)).toBe(token);
+
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/notes.md`, "v2\n");
+    const changed = await collectProjectBundle(muxRoot, [entry]);
+    expect(projectImportToken(changed.manifest.projects[0], changed.files)).not.toBe(token);
+
+    const renamed = { ...bundle.manifest.projects[0], name: "other-name" };
+    expect(projectImportToken(renamed, bundle.files)).not.toBe(token);
+  });
+
+  it("partitions matched and import entries against the registered project map", async () => {
+    const matched = entryFor("/home/dev/src/alpha");
+    const unmatched = entryFor("/home/dev/src/beta");
+    await writeFixtureFile(muxRoot, `memory/project/${matched.memoryDir}/notes.md`, "a\n");
+    await writeFixtureFile(muxRoot, `memory/project/${unmatched.memoryDir}/notes.md`, "b\n");
+    const bundle = await collectProjectBundle(muxRoot, [matched, unmatched]);
+
+    const plan = planProjectBundleRestore(
+      bundle,
+      new Map([[matched.path, projectMemoryDirName(matched.path)]])
+    );
+    expect(plan.matched.map((item) => item.entry.path)).toEqual([matched.path]);
+    expect(plan.imports.map((item) => item.entry.path)).toEqual([unmatched.path]);
+    expect(plan.imports[0]?.files.map((file) => file.path)).toEqual([
+      `memory/project/${unmatched.memoryDir}/notes.md`,
+    ]);
+  });
+
+  it("re-keys bundle paths to the locally computed target directory", () => {
+    expect(
+      rekeyProjectMemoryPath("memory/project/alpha-123456789abc/deep/notes.md", "beta-fed")
+    ).toBe("memory/project/beta-fed/deep/notes.md");
+  });
+
+  it("writes project memory add-only, skipping conflicts and identical files", async () => {
+    const targetDir = projectMemoryDirName("/home/dev/target");
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/existing.md`, "local version\n");
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/same.md`, "identical\n");
+
+    const result = await writeProjectMemoryFiles(
+      muxRoot,
+      [
+        {
+          path: `memory/project/${targetDir}/existing.md`,
+          content: Buffer.from("backup version\n"),
+        },
+        { path: `memory/project/${targetDir}/same.md`, content: Buffer.from("identical\n") },
+        { path: `memory/project/${targetDir}/new.md`, content: Buffer.from("added\n") },
+      ],
+      { addOnly: true }
+    );
+
+    expect(result.written).toEqual([`memory/project/${targetDir}/new.md`]);
+    expect(result.skipped).toEqual([`memory/project/${targetDir}/existing.md`]);
+    expect(
+      await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "existing.md"), "utf-8")
+    ).toBe("local version\n");
+    expect(
+      await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "new.md"), "utf-8")
+    ).toBe("added\n");
+  });
+
+  it("overwrites in matched mode but reports only files that actually changed", async () => {
+    const targetDir = projectMemoryDirName("/home/dev/target");
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/existing.md`, "local version\n");
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/same.md`, "identical\n");
+
+    const result = await writeProjectMemoryFiles(
+      muxRoot,
+      [
+        {
+          path: `memory/project/${targetDir}/existing.md`,
+          content: Buffer.from("backup version\n"),
+        },
+        { path: `memory/project/${targetDir}/same.md`, content: Buffer.from("identical\n") },
+      ],
+      { addOnly: false }
+    );
+
+    expect(result.written).toEqual([`memory/project/${targetDir}/existing.md`]);
+    expect(result.skipped).toEqual([]);
+    expect(
+      await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "existing.md"), "utf-8")
+    ).toBe("backup version\n");
+  });
+
+  it("refuses memory writes outside the project memory tree", async () => {
+    for (const filePath of ["memory/project/../global/evil.md", "skills/evil.md"]) {
+      const error = await captureRejection(
+        writeProjectMemoryFiles(muxRoot, [{ path: filePath, content: Buffer.from("x") }], {
+          addOnly: true,
+        })
+      );
+      expect((error as Error).message).toContain("disallowed path");
+    }
+  });
+
+  it("treats bundle memory files as recursively collected in the secret scan", () => {
+    const flagged = scanBackupFilesForSecrets([
+      { path: "memory/project/alpha-123456789abc/data.bin", content: Buffer.from("binary") },
+      { path: "memory/project/alpha-123456789abc/notes.md", content: Buffer.from("plain notes") },
+    ]);
+    expect(flagged).toEqual(["memory/project/alpha-123456789abc/data.bin"]);
+  });
+});
+
+describe("sanitizeBackupGitRemote", () => {
+  it("keeps plain https, ssh, and scp-like remotes", () => {
+    expect(sanitizeBackupGitRemote("https://github.com/dev/repo.git")).toBe(
+      "https://github.com/dev/repo.git"
+    );
+    expect(sanitizeBackupGitRemote("ssh://git@github.com/dev/repo.git")).toBe(
+      "ssh://git@github.com/dev/repo.git"
+    );
+    expect(sanitizeBackupGitRemote("git@github.com:dev/repo.git")).toBe(
+      "git@github.com:dev/repo.git"
+    );
+  });
+
+  it("drops credentialed, executable, and local shapes", () => {
+    for (const remote of [
+      "https://user:secret@github.com/dev/repo.git",
+      "ext::sh -c whoami",
+      "file:///tmp/repo",
+      "/tmp/repo",
+      "../relative/repo",
+      "git@github.com:dev/repo.git --upload-pack=evil",
+      "https://github.com/dev/repo.git?token=abc",
+    ]) {
+      expect(sanitizeBackupGitRemote(remote)).toBeUndefined();
+    }
   });
 });

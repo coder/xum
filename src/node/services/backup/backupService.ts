@@ -637,7 +637,7 @@ export class BackupService {
         // Re-verify under the local payload lock: the preflight ran before the snapshot and
         // the directory may have vanished since.
         const stat = await fs.lstat(targetPath).catch(() => null);
-        if (stat === null || !stat.isDirectory()) {
+        if (!stat?.isDirectory()) {
           results.push(failed(`'${targetPath}' is not an existing directory`));
           continue;
         }
