@@ -20,7 +20,9 @@
  */
 import {
   isActiveWorkflowRunStatus,
+  isTerminalWorkflowRunStatus,
   type StructuredTaskOutput,
+  type WorkflowPhaseManifest,
   type WorkflowResult,
   type WorkflowRunEvent,
   type WorkflowRunRecord,
@@ -61,6 +63,40 @@ export interface WorkflowStepView {
   nestedWorkflowStatus?: Extract<WorkflowRunEvent, { type: "workflow" }>["status"];
 }
 
+/**
+ * Rail lifecycle for a phase, derived from the declared manifest (intent) merged
+ * with observed phase events (truth):
+ * - "pending": declared but not yet visited while the run is active.
+ * - "running"/"completed"/"failed"/"interrupted": visited; latest-visited phases
+ *   mirror the run status, earlier visited phases read as completed unless a
+ *   step in them failed.
+ * - "skipped"/"not-reached": declared but never visited once the run settled
+ *   (completed vs failed/interrupted).
+ * - "not-visited": the neutral terminal-unvisited state for INFERRED manifests,
+ *   which cannot distinguish mutually-exclusive branches from skipped work.
+ */
+export type WorkflowPhaseLifecycle =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | "skipped"
+  | "not-reached"
+  | "not-visited";
+
+/** Lifecycles of phases that never emitted a phase event. */
+const UNVISITED_PHASE_LIFECYCLES: ReadonlySet<WorkflowPhaseLifecycle> = new Set([
+  "pending",
+  "skipped",
+  "not-reached",
+  "not-visited",
+]);
+
+export function isUnvisitedPhaseLifecycle(lifecycle: WorkflowPhaseLifecycle): boolean {
+  return UNVISITED_PHASE_LIFECYCLES.has(lifecycle);
+}
+
 export interface WorkflowPhaseView {
   /** Phase id; "" for the implicit bucket holding steps with no announced phase. */
   name: string;
@@ -79,6 +115,9 @@ export interface WorkflowPhaseView {
   total: number;
   running: boolean;
   failed: boolean;
+  lifecycle: WorkflowPhaseLifecycle;
+  /** Declared fan-out marker from meta.phases (presentational). */
+  parallel?: boolean;
 }
 
 export interface WorkflowRunStats {
@@ -214,7 +253,9 @@ function buildPhaseView(
   label: string,
   detail: string | undefined,
   details: unknown,
-  steps: WorkflowStepView[]
+  steps: WorkflowStepView[],
+  lifecycle: WorkflowPhaseLifecycle,
+  parallel?: boolean
 ): WorkflowPhaseView {
   return {
     name,
@@ -226,7 +267,105 @@ function buildPhaseView(
     total: steps.length,
     running: steps.some((step) => step.status === "running"),
     failed: steps.some((step) => step.status === "failed"),
+    lifecycle,
+    ...(parallel === true ? { parallel: true } : {}),
   };
+}
+
+/**
+ * Collapse consecutive duplicate phase events (same name back-to-back) into one
+ * transition. Required for correctness after workflow resume: the runner replays
+ * the script from the start and `phase()` re-appends its event unconditionally
+ * (WorkflowRunner has no phase-event dedup, unlike checkpointed agent steps), so
+ * a resumed run's log contains duplicate consecutive phase events. This also
+ * makes lifecycle derivation robust to scripts announcing the same phase twice.
+ */
+function collapsePhaseTransitions(events: readonly WorkflowRunEvent[]): string[] {
+  const transitions: string[] = [];
+  for (const event of events) {
+    if (event.type !== "phase") {
+      continue;
+    }
+    if (transitions.at(-1) !== event.name) {
+      transitions.push(event.name);
+    }
+  }
+  return transitions;
+}
+
+/**
+ * Merge the declared manifest order (intent) with observed phase transitions
+ * (truth). Declared phases always keep manifest order — out-of-order visits do
+ * NOT reorder the rail. A dynamic (observed-but-undeclared) phase is inserted
+ * immediately after its anchor: the most recent declared phase observed before
+ * it; dynamic phases sharing an anchor keep observation order, and a dynamic
+ * phase observed before any declared phase anchors at the head of the rail.
+ */
+function mergeManifestPhaseOrder(
+  manifest: WorkflowPhaseManifest,
+  transitions: readonly string[]
+): string[] {
+  const declaredNames = new Set(manifest.phases.map((phase) => phase.name));
+  const dynamicByAnchor = new Map<string | null, string[]>();
+  const seenDynamic = new Set<string>();
+  let currentAnchor: string | null = null;
+  for (const name of transitions) {
+    if (declaredNames.has(name)) {
+      currentAnchor = name;
+      continue;
+    }
+    if (seenDynamic.has(name)) {
+      continue;
+    }
+    seenDynamic.add(name);
+    const bucket = dynamicByAnchor.get(currentAnchor);
+    if (bucket != null) {
+      bucket.push(name);
+    } else {
+      dynamicByAnchor.set(currentAnchor, [name]);
+    }
+  }
+
+  const order: string[] = [...(dynamicByAnchor.get(null) ?? [])];
+  for (const phase of manifest.phases) {
+    order.push(phase.name);
+    order.push(...(dynamicByAnchor.get(phase.name) ?? []));
+  }
+  return order;
+}
+
+function derivePhaseLifecycle(input: {
+  name: string;
+  visited: ReadonlySet<string>;
+  latestVisited: string | null;
+  runStatus: WorkflowRunStatus;
+  hasFailedStep: boolean;
+  inferredProvenance: boolean;
+}): WorkflowPhaseLifecycle {
+  const isLatest = input.name === input.latestVisited;
+  if (input.visited.has(input.name)) {
+    // A failed step marks its phase regardless of position; the latest-visited
+    // phase of a failed run is also failed even without a failed step record.
+    if (input.hasFailedStep || (isLatest && input.runStatus === "failed")) {
+      return "failed";
+    }
+    if (isLatest && input.runStatus === "interrupted") {
+      return "interrupted";
+    }
+    if (isLatest && !isTerminalWorkflowRunStatus(input.runStatus)) {
+      return "running";
+    }
+    return "completed";
+  }
+  if (isActiveWorkflowRunStatus(input.runStatus)) {
+    return "pending";
+  }
+  // Terminal-unvisited. Inference cannot distinguish mutually-exclusive branches
+  // from genuinely skipped work, so inferred rails stay judgment-free.
+  if (input.inferredProvenance) {
+    return "not-visited";
+  }
+  return input.runStatus === "completed" ? "skipped" : "not-reached";
 }
 
 // Events that belong to a step. Steps are recorded via task events (agent steps) and also via
@@ -476,25 +615,55 @@ export function projectWorkflowRun(
     }
   }
 
+  // Declared manifest (hydrated onto the run's workflow descriptor) merged with
+  // observed events. Absent manifest → observed-only order, exactly as before.
+  const manifest = run.workflow.phaseManifest;
+  const transitions = collapsePhaseTransitions(events);
+  const visited = new Set(transitions);
+  const latestVisited = transitions.at(-1) ?? null;
+  const inferredProvenance = manifest?.provenance === "inferred";
+  const declaredByName = new Map(manifest?.phases.map((phase) => [phase.name, phase]) ?? []);
+  const orderedNames =
+    manifest != null ? mergeManifestPhaseOrder(manifest, transitions) : phaseOrder;
+
   const phases: WorkflowPhaseView[] = [];
-  for (const name of phaseOrder) {
+  for (const name of orderedNames) {
     const meta = phaseMeta.get(name);
+    const declared = declaredByName.get(name);
+    const phaseSteps = stepsByPhase.get(name) ?? [];
     phases.push(
       buildPhaseView(
         name,
-        meta?.label ?? name,
-        meta?.detail,
+        declared?.label ?? meta?.label ?? name,
+        meta?.detail ?? declared?.description,
         meta?.details,
-        stepsByPhase.get(name) ?? []
+        phaseSteps,
+        derivePhaseLifecycle({
+          name,
+          visited,
+          latestVisited,
+          runStatus: run.status,
+          hasFailedStep: phaseSteps.some((step) => step.status === "failed"),
+          inferredProvenance,
+        }),
+        declared?.parallel
       )
     );
   }
   const ungrouped = stepsByPhase.get(null) ?? [];
   if (ungrouped.length > 0) {
     // Steps with no announced phase precede the named phases chronologically. When
-    // the run declares no phases at all, this is the sole flat group.
-    const label = phaseOrder.length === 0 ? "Steps" : "Other steps";
-    phases.unshift(buildPhaseView("", label, undefined, undefined, ungrouped));
+    // the run declares no phases at all, this is the sole flat group. The bucket
+    // holds real observed steps, so its lifecycle derives from them directly.
+    const label = orderedNames.length === 0 ? "Steps" : "Other steps";
+    const bucketLifecycle: WorkflowPhaseLifecycle = ungrouped.some(
+      (step) => step.status === "failed"
+    )
+      ? "failed"
+      : ungrouped.some((step) => step.status === "running")
+        ? "running"
+        : "completed";
+    phases.unshift(buildPhaseView("", label, undefined, undefined, ungrouped, bucketLifecycle));
   }
 
   let result: WorkflowResult | null = null;
@@ -545,6 +714,25 @@ export function projectWorkflowRun(
       usage: usageTotal,
     },
   };
+}
+
+/**
+ * The phase a compact summary should name: the running phase, else the last
+ * VISITED phase. With a declared manifest the raw last entry of `phases` can be
+ * an unvisited (pending/skipped) rail node, which would misreport progress.
+ */
+export function getActiveWorkflowPhase(
+  phases: readonly WorkflowPhaseView[]
+): WorkflowPhaseView | null {
+  return (
+    // `running` (a step is executing) preserves the pre-manifest heuristic;
+    // lifecycle "running" additionally matches the latest-visited phase of an
+    // active run even before its first step starts.
+    phases.find((phase) => phase.running || phase.lifecycle === "running") ??
+    phases.findLast((phase) => !isUnvisitedPhaseLifecycle(phase.lifecycle)) ??
+    phases.at(-1) ??
+    null
+  );
 }
 
 /**

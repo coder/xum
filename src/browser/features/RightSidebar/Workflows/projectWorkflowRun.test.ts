@@ -6,6 +6,7 @@ import type {
   WorkflowStepRecord,
 } from "@/common/types/workflow";
 import {
+  getActiveWorkflowPhase,
   projectWorkflowRun,
   selectPrimaryWorkflowRun,
   type WorkflowStepUsage,
@@ -736,5 +737,183 @@ describe("selectPrimaryWorkflowRun", () => {
 
   test("returns null for an empty list", () => {
     expect(selectPrimaryWorkflowRun([])).toBeNull();
+  });
+});
+
+describe("projectWorkflowRun — declared phase manifest", () => {
+  const MANIFEST = {
+    provenance: "declared" as const,
+    phases: [
+      { name: "scope", label: "Scope", description: "Pick angles" },
+      { name: "verify", parallel: true },
+      { name: "synthesize" },
+    ],
+  };
+
+  function manifestRun(overrides: Partial<WorkflowRunRecord>): WorkflowRunRecord {
+    const base = makeRun(overrides);
+    return { ...base, workflow: { ...base.workflow, phaseManifest: MANIFEST } };
+  }
+
+  const phaseEvent = (sequence: number, name: string): WorkflowRunEvent => ({
+    sequence,
+    type: "phase",
+    at: at(sequence),
+    name,
+  });
+
+  test("seeds the full declared rail with lifecycle states mid-run", () => {
+    const view = projectWorkflowRun(
+      manifestRun({ events: [phaseEvent(1, "scope"), phaseEvent(2, "verify")] })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "completed"],
+      ["verify", "running"],
+      ["synthesize", "pending"],
+    ]);
+    // Declared display metadata applies without any observed detail.
+    expect(view.phases[0]).toMatchObject({ label: "Scope", detail: "Pick angles" });
+    expect(view.phases[1].parallel).toBe(true);
+    expect(getActiveWorkflowPhase(view.phases)?.name).toBe("verify");
+  });
+
+  test("inserts dynamic phases after their anchor and head-anchors pre-declared ones", () => {
+    const view = projectWorkflowRun(
+      manifestRun({
+        events: [
+          phaseEvent(1, "bootstrap"),
+          phaseEvent(2, "scope"),
+          phaseEvent(3, "detour-a"),
+          phaseEvent(4, "detour-b"),
+          phaseEvent(5, "verify"),
+        ],
+      })
+    );
+    expect(view.phases.map((phase) => phase.name)).toEqual([
+      "bootstrap",
+      "scope",
+      "detour-a",
+      "detour-b",
+      "verify",
+      "synthesize",
+    ]);
+    expect(view.phases.map((phase) => phase.lifecycle)).toEqual([
+      "completed",
+      "completed",
+      "completed",
+      "completed",
+      "running",
+      "pending",
+    ]);
+  });
+
+  test("out-of-order declared visits keep manifest order; loop re-entry re-activates a phase", () => {
+    const view = projectWorkflowRun(
+      manifestRun({
+        events: [
+          phaseEvent(1, "verify"),
+          phaseEvent(2, "scope"),
+          // Loop back to verify: no error, verify becomes latest-visited again.
+          phaseEvent(3, "verify"),
+          // Replay-style consecutive duplicate must collapse into the same visit.
+          phaseEvent(4, "verify"),
+        ],
+      })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "completed"],
+      ["verify", "running"],
+      ["synthesize", "pending"],
+    ]);
+  });
+
+  test("terminal completed run resolves unvisited declared phases to skipped", () => {
+    const view = projectWorkflowRun(
+      manifestRun({ status: "completed", events: [phaseEvent(1, "scope")] })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "completed"],
+      ["verify", "skipped"],
+      ["synthesize", "skipped"],
+    ]);
+  });
+
+  test("failed and interrupted runs mark the latest-visited phase and not-reached tail", () => {
+    const failed = projectWorkflowRun(
+      manifestRun({ status: "failed", events: [phaseEvent(1, "scope"), phaseEvent(2, "verify")] })
+    );
+    expect(failed.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "completed"],
+      ["verify", "failed"],
+      ["synthesize", "not-reached"],
+    ]);
+
+    const interrupted = projectWorkflowRun(
+      manifestRun({ status: "interrupted", events: [phaseEvent(1, "scope")] })
+    );
+    expect(interrupted.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "interrupted"],
+      ["verify", "not-reached"],
+      ["synthesize", "not-reached"],
+    ]);
+  });
+
+  test("a failed step marks its phase failed even when the run keeps going", () => {
+    const events: WorkflowRunEvent[] = [
+      phaseEvent(1, "scope"),
+      {
+        sequence: 2,
+        type: "task",
+        at: at(2),
+        stepId: "scope-step",
+        taskId: "ws-scope",
+        status: "started",
+        title: "Scope",
+      },
+      phaseEvent(3, "verify"),
+    ];
+    const steps: WorkflowStepRecord[] = [
+      {
+        stepId: "scope-step",
+        inputHash: "sha256:scope",
+        status: "failed",
+        taskId: "ws-scope",
+        startedAt: at(2),
+        completedAt: at(3),
+        error: "boom",
+      },
+    ];
+    const view = projectWorkflowRun(manifestRun({ events, steps }));
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "failed"],
+      ["verify", "running"],
+      ["synthesize", "pending"],
+    ]);
+  });
+
+  test("inferred provenance resolves terminal-unvisited phases to neutral not-visited", () => {
+    const base = makeRun({ status: "completed", events: [phaseEvent(1, "scope")] });
+    const view = projectWorkflowRun({
+      ...base,
+      workflow: {
+        ...base.workflow,
+        phaseManifest: { ...MANIFEST, provenance: "inferred" },
+      },
+    });
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["scope", "completed"],
+      ["verify", "not-visited"],
+      ["synthesize", "not-visited"],
+    ]);
+  });
+
+  test("manifest-less runs keep observed-only order and derive lifecycles", () => {
+    const view = projectWorkflowRun(
+      makeRun({ events: [phaseEvent(1, "alpha"), phaseEvent(2, "beta")] })
+    );
+    expect(view.phases.map((phase) => [phase.name, phase.lifecycle])).toEqual([
+      ["alpha", "completed"],
+      ["beta", "running"],
+    ]);
   });
 });

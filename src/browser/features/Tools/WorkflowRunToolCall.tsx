@@ -17,7 +17,10 @@ import {
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { WorkflowTimeline } from "@/browser/features/RightSidebar/Workflows/WorkflowTimeline";
-import { projectWorkflowRun } from "@/browser/features/RightSidebar/Workflows/projectWorkflowRun";
+import {
+  getActiveWorkflowPhase,
+  projectWorkflowRun,
+} from "@/browser/features/RightSidebar/Workflows/projectWorkflowRun";
 import {
   formatWorkflowCost,
   formatWorkflowDuration,
@@ -299,10 +302,31 @@ function getWorkflowChildProgressSummary(run: WorkflowRunRecord | null): string 
     return null;
   }
   const view = projectWorkflowRun(run);
-  const activePhase = view.phases.find((phase) => phase.running) ?? view.phases.at(-1);
+  const activePhase = getActiveWorkflowPhase(view.phases);
   const phaseLabel =
     activePhase != null && activePhase.label.length > 0 ? ` · ${activePhase.label}` : "";
   return `${view.status} · ${view.stats.done}/${view.stats.total} steps${phaseLabel}`;
+}
+
+/**
+ * "phase 2/5 · Verify" position label, present only when the run DECLARES
+ * meta.phases and the active phase is one of the declared names. Inferred
+ * manifests never produce a fraction (source order is not runtime order).
+ */
+function getDeclaredPhasePositionLabel(
+  run: WorkflowRunRecord,
+  activePhase: { name: string; label: string } | null
+): string | null {
+  const manifest = run.workflow.phaseManifest;
+  if (manifest?.provenance !== "declared" || activePhase == null) {
+    return null;
+  }
+  const index = manifest.phases.findIndex((phase) => phase.name === activePhase.name);
+  if (index < 0) {
+    return null;
+  }
+  const label = activePhase.label.length > 0 ? ` · ${activePhase.label}` : "";
+  return `phase ${index + 1}/${manifest.phases.length}${label}`;
 }
 
 /**
@@ -324,9 +348,20 @@ export function getWorkflowHeaderProgressSummary(
     parts.push(`${view.stats.done}/${view.stats.total} steps`);
   }
   const runningSteps = view.steps.filter((step) => step.status === "running");
-  const activePhase = view.phases.find((phase) => phase.running) ?? view.phases.at(-1);
+  const activePhase = getActiveWorkflowPhase(view.phases);
+  // Declared manifests upgrade the phase label to "phase 2/5 · Verify".
+  const declaredPosition = getDeclaredPhasePositionLabel(run, activePhase);
   if (runningSteps.length === 1) {
     parts.push(runningSteps[0].title);
+    if (declaredPosition != null) {
+      parts.push(declaredPosition);
+    }
+  } else if (declaredPosition != null) {
+    parts.push(
+      runningSteps.length > 1
+        ? `${declaredPosition} · ${runningSteps.length} running`
+        : declaredPosition
+    );
   } else if (activePhase != null && activePhase.label.length > 0) {
     parts.push(
       runningSteps.length > 1

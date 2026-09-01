@@ -78,7 +78,6 @@ describe("inferPhaseManifest", () => {
 
   test("bails on dynamic names (concatenation and template interpolation)", () => {
     expect(phaseNames(legacyWorkflow(`phase("implement-" + args.key);`))).toBeUndefined();
-    // eslint-disable-next-line no-template-curly-in-string
     expect(phaseNames(legacyWorkflow("phase(`implement-${args.key}`);"))).toBeUndefined();
     expect(phaseNames(legacyWorkflow(`phase(args.name);`))).toBeUndefined();
     expect(phaseNames(legacyWorkflow(`phase();`))).toBeUndefined();

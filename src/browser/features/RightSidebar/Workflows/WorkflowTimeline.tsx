@@ -24,7 +24,10 @@ import {
 
 import { WorkflowLiveDot } from "./WorkflowBadges";
 import { WorkflowLongText } from "./WorkflowLongText";
+import { WorkflowPhaseFlow, phaseFlowNodesFromView } from "./WorkflowPhaseFlow";
 import {
+  getActiveWorkflowPhase,
+  isUnvisitedPhaseLifecycle,
   projectWorkflowRun,
   type WorkflowPhaseView,
   type WorkflowRunView,
@@ -54,6 +57,8 @@ interface WorkflowPhaseSectionProps {
   phase: WorkflowPhaseView;
   workspaceId?: string;
   nestedDepth: number;
+  /** Registers the section root so the phase rail can scroll it into view. */
+  sectionRef?: (element: HTMLDivElement | null) => void;
 }
 
 interface WorkflowStepRowProps {
@@ -70,8 +75,7 @@ function getNestedWorkflowSummary(input: {
   if (input.childView == null) {
     return input.fallbackStatus ?? "loading";
   }
-  const activePhase =
-    input.childView.phases.find((phase) => phase.running) ?? input.childView.phases.at(-1);
+  const activePhase = getActiveWorkflowPhase(input.childView.phases);
   const phaseLabel =
     activePhase != null && activePhase.label.length > 0 ? ` · ${activePhase.label}` : "";
   return `${input.childView.status} · ${input.childView.stats.done}/${input.childView.stats.total} steps${phaseLabel}`;
@@ -442,7 +446,7 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
   );
 
   return (
-    <div>
+    <div ref={props.sectionRef}>
       {hasBody ? (
         <button
           type="button"
@@ -565,6 +569,14 @@ const WorkflowFinalReport: React.FC<{ view: WorkflowRunView }> = (props) => {
 export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
   const view = props.view;
   const nestedDepth = props.nestedDepth ?? 0;
+  const phaseManifest = view.workflow.phaseManifest;
+  // The step stream keeps today's observed-only sections: declared-but-unvisited
+  // phases live on the rail (pending/skipped/…), not as empty step sections.
+  const visitedPhases = view.phases.filter((phase) => !isUnvisitedPhaseLifecycle(phase.lifecycle));
+  const phaseSectionRefs = React.useRef(new Map<string, HTMLDivElement>());
+  const scrollToPhase = (name: string) => {
+    phaseSectionRefs.current.get(name)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
   return (
     <div className="flex flex-col gap-4">
       {/* Surface a run-level failure (e.g. setup/compile/eval errors that occur before any step)
@@ -583,19 +595,39 @@ export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
         </div>
       )}
       {props.showFinalReport !== false && <WorkflowFinalReport view={view} />}
+      {/* Runs without a manifest render exactly as before (no rail). */}
+      {phaseManifest != null && (
+        <div className="flex flex-col gap-1">
+          <div className="text-muted flex items-center gap-1.5 text-[11px] font-semibold tracking-wide uppercase">
+            <GitBranch className="h-3 w-3" /> Phases
+          </div>
+          <WorkflowPhaseFlow
+            nodes={phaseFlowNodesFromView(view.phases)}
+            provenance={phaseManifest.provenance}
+            onPhaseSelect={scrollToPhase}
+          />
+        </div>
+      )}
       <div className="flex flex-col gap-1">
         <div className="text-muted flex items-center gap-1.5 text-[11px] font-semibold tracking-wide uppercase">
           <ListTree className="h-3 w-3" /> Step stream
         </div>
-        {view.phases.length === 0 ? (
+        {visitedPhases.length === 0 ? (
           <div className="text-muted px-2 py-3 text-xs">No steps yet.</div>
         ) : (
-          view.phases.map((phase) => (
+          visitedPhases.map((phase) => (
             <WorkflowPhaseSection
               key={phase.name || "__ungrouped"}
               phase={phase}
               workspaceId={props.workspaceId}
               nestedDepth={nestedDepth}
+              sectionRef={(element) => {
+                if (element != null) {
+                  phaseSectionRefs.current.set(phase.name, element);
+                } else {
+                  phaseSectionRefs.current.delete(phase.name);
+                }
+              }}
             />
           ))
         )}
