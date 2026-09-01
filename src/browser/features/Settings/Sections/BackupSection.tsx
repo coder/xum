@@ -954,7 +954,8 @@ export function BackupSection() {
                       aria-label={`Import project ${candidate.name}`}
                     />
                     <span className="min-w-0 flex-1">
-                      <span className="text-foreground block text-xs font-medium">
+                      {/* break-all: the name is repository-controlled and may be one long token. */}
+                      <span className="text-foreground block text-xs font-medium break-all">
                         {candidate.name}
                         <span className="text-muted ml-1 font-normal">
                           ({candidate.memoryFileCount} memory{" "}

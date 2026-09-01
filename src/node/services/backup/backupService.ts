@@ -593,12 +593,15 @@ export class BackupService {
             snapshotPath,
             matchedProjectPaths: validated.matchedProjectPaths,
           });
+          // Announced as soon as the memory is on disk: a failure recording the commit below
+          // must not leave subscribers showing pre-restore contents.
+          this.notifyProjectMemoryChanges(restored.restoredProjectMemory, []);
           // Recorded before the imports: they register projects and create files the snapshot
           // does not cover, and their per-candidate results are the user's only undo list, so
           // nothing that can fail may run after them and discard those results.
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
           const projectImportResults = await this.executeProjectImports(repository, plannedImports);
-          this.notifyProjectMemoryChanges(restored.restoredProjectMemory, projectImportResults);
+          this.notifyProjectMemoryChanges([], projectImportResults);
           return Ok({
             commit: remoteCommit,
             snapshotPath,

@@ -4016,7 +4016,12 @@ describe("project bundle", () => {
       expect(error).toBeInstanceOf(ProjectMemoryWriteError);
       const writeError = error as ProjectMemoryWriteError;
       expect(writeError.message).toContain("disk fault");
-      expect(writeError.written).toEqual([`memory/project/${targetDir}/first.md`]);
+      // The attempted file is listed too: a write can fail after creating or truncating
+      // its destination, and the cleanup list must not omit it.
+      expect(writeError.written).toEqual([
+        `memory/project/${targetDir}/first.md`,
+        `memory/project/${targetDir}/faulty/inner.md`,
+      ]);
       expect(writeError.skipped).toEqual([`memory/project/${targetDir}/kept.md`]);
     } finally {
       mkdir.mockRestore();

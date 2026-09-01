@@ -1592,6 +1592,49 @@ describe("BackupService project imports", () => {
     expect(events).toEqual(["import:remote-commit"]);
   });
 
+  test("announces restored memory even when recording the commit fails afterwards", async () => {
+    const notified: string[] = [];
+    const config = new TestBackupConfig(tempDir);
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [],
+            matchedProjectPaths: ["/home/dev/src/alpha"],
+          }),
+        restore: () =>
+          Promise.resolve({
+            changedFiles: ["memory/project/alpha-abc/notes.md"],
+            localOnlyFiles: [],
+            projectBundleSkipped: false,
+            restoredProjectMemory: [
+              { projectPath: "/home/dev/src/alpha", files: ["memory/project/alpha-abc/notes.md"] },
+            ],
+          }),
+      }),
+    });
+    service.setMemoryNotifier({
+      notifyExternalProjectChange: (projectPath) => {
+        notified.push(projectPath);
+      },
+    });
+    expect((await service.saveSettings({ ...SETTINGS, includeProjects: true })).success).toBe(true);
+    // config.json stops accepting writes after the restore has already landed on disk.
+    spyOn(config, "editConfig").mockImplementation(() => Promise.resolve());
+
+    const result = await service.restore({ ...SETTINGS, includeProjects: true });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.code).toBe("IO_ERROR");
+      expect(result.error.snapshotPath).toBeDefined();
+    }
+    // Restored memory was on disk before the persist step failed.
+    expect(notified).toEqual(["/home/dev/src/alpha"]);
+  });
+
   test("announces memory a failed matched restore already wrote", async () => {
     const notified: string[] = [];
     const service = createService(tempDir, {

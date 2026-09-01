@@ -1773,8 +1773,10 @@ describe("backup adapters project bundle", () => {
         })
       );
       expect(error).toBeInstanceOf(ProjectMemoryRestoreError);
+      // The first project's completed write and the second's attempted one both count.
       expect((error as ProjectMemoryRestoreError).restoredProjectMemory).toEqual([
         { projectPath: first, files: [firstMemoryPath] },
+        { projectPath: second, files: [`memory/project/${projectMemoryDirName(second)}/notes.md`] },
       ]);
     } finally {
       mkdir.mockRestore();

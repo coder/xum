@@ -3081,12 +3081,14 @@ export async function writeProjectMemoryFiles(
           continue;
         }
       }
-      await writeCheckedFile(root, write.path, write.content, false);
+      // Recorded before the mutating call: a write that fails midway (ENOSPC after the
+      // destination was created or truncated) must still appear in the cleanup list.
       written.push(write.path);
+      await writeCheckedFile(root, write.path, write.content, false);
     }
   } catch (error) {
-    // Sequential writes without rollback: report what already landed so the caller's
-    // failure result can double as the cleanup list.
+    // Sequential writes without rollback: report what already landed, including the
+    // attempted file, so the caller's failure result can double as the cleanup list.
     throw new ProjectMemoryWriteError(
       error instanceof Error ? error.message : String(error),
       { written, skipped },
