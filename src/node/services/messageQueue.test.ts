@@ -646,7 +646,12 @@ describe("MessageQueue", () => {
       const liveController = new AbortController();
       queue.add(
         "Canceled monitor wake",
-        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
         { cancelSignal: canceledController.signal }
       );
       queue.add(
@@ -656,9 +661,37 @@ describe("MessageQueue", () => {
       );
       canceledController.abort("task output consumed the first wake");
 
+      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.isNextEntryBashMonitorWake()).toBe(false);
+      expect(queue.getNextQueueCutCandidate()?.muxMetadata).toBeUndefined();
       expect(queue.claimNextToolEndEntry()).toBeDefined();
       expect(queue.dequeueNext().internal?.cancelSignal).toBe(canceledController.signal);
       expect(queue.dequeueNext().internal?.cancelSignal).toBeUndefined();
+    });
+
+    it("finds a live workspace-turn continuation after a canceled predecessor", () => {
+      const canceledController = new AbortController();
+      queue.add(
+        "Canceled predecessor",
+        { model: "gpt-4", agentId: "exec" },
+        { cancelSignal: canceledController.signal }
+      );
+      queue.add("Workspace-turn continuation", {
+        model: "gpt-4",
+        agentId: "exec",
+        muxMetadata: metadata,
+      });
+      canceledController.abort("predecessor became stale");
+
+      expect(
+        queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+      expect((queue.getNextQueueCutCandidate()?.muxMetadata as MuxMessageMetadata).type).toBe(
+        "workspace-turn-task"
+      );
     });
 
     it("never batches a user message into a sealed workspace-turn entry", () => {

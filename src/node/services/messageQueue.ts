@@ -265,9 +265,17 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
-  /** Dispatch boundary for the FIFO head entry — the only entry the next drain can send. */
+  private getLiveEntries(): QueueEntry[] {
+    return this.entries.filter((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
+  private getNextLiveEntry(): QueueEntry | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
+  /** Dispatch boundary for the next live FIFO entry. */
   getNextQueueDispatchMode(): QueueDispatchMode {
-    return this.entries[0]?.dispatchMode ?? "tool-end";
+    return this.getNextLiveEntry()?.dispatchMode ?? "tool-end";
   }
 
   /**
@@ -278,7 +286,7 @@ export class MessageQueue {
    * then detach cancellation synchronously before returning the claim.
    */
   claimNextToolEndEntry(): ToolEndQueueClaim | undefined {
-    const entry = this.entries.find((candidate) => candidate.cancelSignal?.aborted !== true);
+    const entry = this.getNextLiveEntry();
     if (entry?.dispatchMode !== "tool-end") {
       return undefined;
     }
@@ -303,9 +311,10 @@ export class MessageQueue {
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
+    const liveEntries = this.getLiveEntries();
     return (
-      this.entries.length > 0 &&
-      this.entries.every((entry) => {
+      liveEntries.length > 0 &&
+      liveEntries.every((entry) => {
         const metadata = entry.muxMetadata;
         return (
           isWorkspaceTurnMetadata(metadata) &&
@@ -325,7 +334,7 @@ export class MessageQueue {
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    const metadata = this.entries[0]?.muxMetadata;
+    const metadata = this.getNextLiveEntry()?.muxMetadata;
     return (
       isWorkspaceTurnMetadata(metadata) &&
       metadata.taskHandleId === taskHandleId &&
@@ -335,7 +344,7 @@ export class MessageQueue {
   }
 
   /**
-   * FIFO head entry's cut-attribution view: its first muxMetadata plus dispatch mode.
+   * Next live FIFO entry's cut-attribution view.
    *
    * Soundness of metadata-based cut attribution rests on the sealing invariant
    * (see class docblock): workspace-turn entries are sealed at add time and
@@ -346,11 +355,11 @@ export class MessageQueue {
   getNextQueueCutCandidate():
     | { muxMetadata: unknown; dispatchMode: QueueDispatchMode }
     | undefined {
-    const head = this.entries[0];
-    if (head == null) {
+    const entry = this.getNextLiveEntry();
+    if (entry == null) {
       return undefined;
     }
-    return { muxMetadata: head.muxMetadata, dispatchMode: head.dispatchMode };
+    return { muxMetadata: entry.muxMetadata, dispatchMode: entry.dispatchMode };
   }
 
   /**
@@ -360,7 +369,7 @@ export class MessageQueue {
    * supersedes the turn when it dispatches.
    */
   isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
+    const muxMetadata = this.getNextLiveEntry()?.muxMetadata;
     if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
     return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
   }
@@ -371,7 +380,7 @@ export class MessageQueue {
    * otherwise turn-end. Empty queue reports the tool-end default.
    */
   getQueueDispatchMode(): QueueDispatchMode {
-    return this.getDispatchMode(this.entries);
+    return this.getDispatchMode(this.getLiveEntries());
   }
 
   /**
