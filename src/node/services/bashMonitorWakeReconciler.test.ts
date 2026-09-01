@@ -57,6 +57,7 @@ describe("BashMonitorWakeReconciler", () => {
   let dispatchOutcome: "in-flight" | "deferred";
   let acknowledged: Array<{ processId: string; matchedThroughOffset?: number }>;
   let removed: string[];
+  let removedOwners: string[];
   let dropped: string[];
   let reconciler: BashMonitorWakeReconciler;
 
@@ -69,6 +70,7 @@ describe("BashMonitorWakeReconciler", () => {
     dispatchOutcome = "in-flight";
     acknowledged = [];
     removed = [];
+    removedOwners = [];
     dropped = [];
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
@@ -81,13 +83,18 @@ describe("BashMonitorWakeReconciler", () => {
             ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
           });
         },
-        dropRetiredMonitor: (processId) => {
-          dropped.push(processId);
+        dropRetiredMonitor: (processId, createdAt) => {
+          const current = live.find((snapshot) => snapshot.processId === processId);
+          if (current?.createdAt === createdAt && current.retired) {
+            dropped.push(processId);
+            live = live.filter((snapshot) => snapshot !== current);
+          }
         },
       },
       registry: {
         listAll: () => Promise.resolve(rows),
-        remove: (_ownerWorkspaceId, processId, createdAt) => {
+        remove: (ownerWorkspaceId, processId, createdAt) => {
+          removedOwners.push(ownerWorkspaceId);
           removed.push(processId);
           rows = rows.filter((row) =>
             createdAt == null
@@ -659,6 +666,48 @@ describe("BashMonitorWakeReconciler", () => {
 
     await restarted.reconcile(OWNER);
     expect(afterRestart).toEqual([]);
+  });
+
+  test("stale accepted wake does not drop a newer retired monitor generation", async () => {
+    rows = [
+      {
+        ...registryRecord(),
+        processId: "proc",
+        taskId: "bash:proc",
+        filter: "READY",
+      },
+    ];
+    await reconciler.reconcile(OWNER);
+    live = [
+      liveSnapshot({
+        createdAt: "2026-08-31T12:20:00.000Z",
+        match: { throughOffset: 10, lines: ["NEW MATCH"], totalMatches: 1 },
+        retired: true,
+      }),
+    ];
+    rows = [
+      {
+        ...registryRecord(),
+        processId: "proc",
+        taskId: "bash:proc",
+        filter: "READY",
+        createdAt: "2026-08-31T12:20:00.000Z",
+      },
+    ];
+
+    await dispatches[0].onAccepted();
+
+    expect(live).toHaveLength(1);
+    expect(live[0].match?.lines).toEqual(["NEW MATCH"]);
+  });
+
+  test("dead registry cleanup uses the scanned workspace instead of embedded owner", async () => {
+    rows = [{ ...registryRecord(), ownerWorkspaceId: "other-owner" }];
+
+    await reconciler.reconcile(OWNER);
+    await dispatches[0].onAccepted();
+
+    expect(removedOwners).toEqual([OWNER]);
   });
 
   test("accepted stale generation does not remove a re-armed registry row", async () => {

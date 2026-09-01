@@ -85,7 +85,7 @@ export interface BashMonitorWakeReconcilerProcessManager {
     matchedThroughOffset?: number,
     terminalSettledAt?: string
   ): Promise<void> | void;
-  dropRetiredMonitor(processId: string): Promise<void> | void;
+  dropRetiredMonitor(processId: string, createdAt: string): Promise<void> | void;
 }
 
 export interface BashMonitorWakeReconcilerRegistry {
@@ -639,7 +639,10 @@ export class BashMonitorWakeReconciler {
       }),
       ...registryRows
         .filter((record) => !liveKeys.has(signalKey(record.processId, record.createdAt)))
-        .map((record) => ({ snapshot: this.fromRegistry(record), deadRegistryRow: true })),
+        .map((record) => ({
+          snapshot: this.fromRegistry(record, ownerWorkspaceId),
+          deadRegistryRow: true,
+        })),
     ];
     const activeKeys = new Set(
       candidates.map(({ snapshot }) => signalKey(snapshot.processId, snapshot.createdAt))
@@ -881,11 +884,14 @@ export class BashMonitorWakeReconciler {
     };
   }
 
-  private fromRegistry(record: BashMonitorRegistryRecord): BashMonitorProcessSnapshot {
+  private fromRegistry(
+    record: BashMonitorRegistryRecord,
+    ownerWorkspaceId: string
+  ): BashMonitorProcessSnapshot {
     return {
       processId: record.processId,
       taskId: record.taskId,
-      ownerWorkspaceId: record.ownerWorkspaceId,
+      ownerWorkspaceId,
       ...(record.displayName != null ? { displayName: record.displayName } : {}),
       filter: record.filter,
       filterExclude: record.filterExclude,
@@ -947,7 +953,7 @@ export class BashMonitorWakeReconciler {
         );
       }
       if (signal.retired) {
-        await this.args.processManager.dropRetiredMonitor(signal.processId);
+        await this.args.processManager.dropRetiredMonitor(signal.processId, signal.createdAt);
       }
     }
   }

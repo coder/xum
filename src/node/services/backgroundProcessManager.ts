@@ -1918,9 +1918,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
   }
 
-  dropRetiredMonitor(processId: string): void {
+  dropRetiredMonitor(processId: string, createdAt: string): void {
     const proc = this.processes.get(processId);
-    if (proc?.monitor?.stopped) proc.monitor = undefined;
+    if (proc?.monitor?.stopped && proc.monitor.armMetadata.createdAt === createdAt) {
+      proc.monitor = undefined;
+    }
   }
 
   dropMonitorMatchedLineBatchesThrough(

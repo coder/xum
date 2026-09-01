@@ -175,7 +175,7 @@ export class BashMonitorRegistryStore {
       }
       const record = this.parse(raw);
       if (record?.createdAt !== createdAt) return;
-      await this.writeRecord({ ...record, terminal });
+      await this.writeRecord({ ...record, ownerWorkspaceId, terminal });
     });
   }
   async recordLost(
@@ -218,7 +218,7 @@ export class BashMonitorRegistryStore {
           : {}),
         failedAt: lost.failedAt,
       };
-      await this.writeRecord({ ...record, lost: normalized });
+      await this.writeRecord({ ...record, ownerWorkspaceId, lost: normalized });
     });
   }
 
@@ -286,7 +286,8 @@ export class BashMonitorRegistryStore {
         if (isErrnoWithCode(error, "ENOENT")) return null;
         throw error;
       }
-      const current = this.parse(raw);
+      const parsed = this.parse(raw);
+      const current = parsed == null ? null : { ...parsed, ownerWorkspaceId };
       if (current != null && Date.parse(current.createdAt) >= cutoffMs) return null;
       if (current != null) await beforeRemove?.(current);
       // Malformed records are deleted as dead weight but yield null (nothing to enqueue).
@@ -310,7 +311,7 @@ export class BashMonitorRegistryStore {
       const raw = await fsPromises.readFile(path.join(dir, entry), "utf-8").catch(() => null);
       if (raw == null) continue;
       const parsed = this.parse(raw);
-      if (parsed != null) records.push(parsed);
+      if (parsed != null) records.push({ ...parsed, ownerWorkspaceId });
     }
     records.sort(
       (a, b) => a.createdAt.localeCompare(b.createdAt) || a.processId.localeCompare(b.processId)

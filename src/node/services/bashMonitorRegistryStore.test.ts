@@ -60,6 +60,21 @@ describe("BashMonitorRegistryStore", () => {
     await store.remove("owner-1", "proc-1", "2026-01-01T00:00:00.000Z");
   });
 
+  test("registry directory owns records with mismatched embedded owners", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload());
+    const file = path.join(config.sessionsDir, "owner-1", BASH_MONITOR_REGISTRY_DIR, "proc-1.json");
+    const record = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown>;
+    await fsPromises.writeFile(
+      file,
+      JSON.stringify({ ...record, ownerWorkspaceId: "other-owner" }),
+      "utf-8"
+    );
+
+    expect((await store.listAll("owner-1"))[0].ownerWorkspaceId).toBe("owner-1");
+  });
+
   test("upsert replaces an existing record for the same process", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     await store.upsert(armedPayload({ filter: "ERROR" }));

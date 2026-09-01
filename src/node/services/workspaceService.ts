@@ -2268,9 +2268,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                 settledAt
               )
             : undefined,
-        dropRetiredMonitor: (processId) =>
+        dropRetiredMonitor: (processId, createdAt) =>
           typeof monitorManager.dropRetiredMonitor === "function"
-            ? monitorManager.dropRetiredMonitor(processId)
+            ? monitorManager.dropRetiredMonitor(processId, createdAt)
             : undefined,
       },
       registry: this.bashMonitorRegistryStore,
