@@ -987,6 +987,130 @@ describe("StreamManager - cleanupStreamTempDir", () => {
   });
 });
 
+describe("StreamManager - stream resource scope", () => {
+  function createLifecycleStreamManagerForTests(fullStreamParts: unknown[]): {
+    streamManager: StreamManager;
+    cleanupCalls: string[];
+  } {
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createStreamResult", () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield* fullStreamParts;
+        })()
+      )
+    );
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/phase10-scope-tempdir")
+    );
+    const cleanupCalls: string[] = [];
+    Reflect.set(streamManager, "cleanupStreamTempDir", (_runtime: unknown, dir: string) => {
+      cleanupCalls.push(dir);
+    });
+    return { streamManager, cleanupCalls };
+  }
+
+  async function runLifecycleStreamForTests(
+    streamManager: StreamManager,
+    workspaceId: string
+  ): Promise<void> {
+    const messageId = `${workspaceId}-msg`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected stream to start");
+    }
+    await result.data.completion;
+    // Let the fire-and-forget scope close settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  test("releases the temp dir exactly once when the stream completes", async () => {
+    // The temp-dir release finalizer is owned by the stream's resource scope:
+    // ownership transfers from startStream to processStreamWithCleanup at
+    // registration, and Scope.close must run the release on natural
+    // completion without double-releasing across the two cleanup paths.
+    const { streamManager, cleanupCalls } = createLifecycleStreamManagerForTests([
+      { type: "text-delta", text: "hello" },
+      { type: "finish", finishReason: "stop" },
+    ]);
+
+    await runLifecycleStreamForTests(streamManager, "scope-release-once-workspace");
+
+    expect(cleanupCalls).toEqual(["/tmp/phase10-scope-tempdir"]);
+  });
+
+  test("interrupts a pending debounced partial write when the stream ends", async () => {
+    // A debounced partial flush scheduled during streaming is tied to the
+    // stream's resource scope. Once the stream ends, the pending flush must be
+    // interrupted with the scope — a late write would resurrect partial state
+    // for a dead stream.
+    const workspaceId = "scope-debounce-interrupt-workspace";
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/phase10-scope-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+
+    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+    const streamInfoForTests = () =>
+      workspaceStreams.get(workspaceId) as
+        | { lastPartialWriteTime?: number; partialWriteFiber?: unknown }
+        | undefined;
+
+    let debounceArmedBeforeFinish = false;
+    Reflect.set(streamManager, "createStreamResult", () =>
+      createStreamResultForTests(
+        (async function* () {
+          // First delta writes immediately (lastPartialWriteTime starts at 0).
+          yield { type: "text-delta", text: "first" };
+          // Wait until that write stamps the throttle clock so the second
+          // delta deterministically lands inside the throttle window.
+          while ((streamInfoForTests()?.lastPartialWriteTime ?? 0) === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          yield { type: "text-delta", text: "second" };
+          // The consumer fully processed the second delta before pulling the
+          // next part, and the debounce arms synchronously.
+          debounceArmedBeforeFinish = streamInfoForTests()?.partialWriteFiber != null;
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      )
+    );
+    const writePartialSpy = spyOn(historyService, "writePartial");
+
+    const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
+    if (typeof throttleMs !== "number") {
+      throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
+    }
+
+    await runLifecycleStreamForTests(streamManager, workspaceId);
+
+    expect(debounceArmedBeforeFinish).toBe(true);
+    const writesAtStreamEnd = writePartialSpy.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, throttleMs + 200));
+    expect(writePartialSpy.mock.calls.length).toBe(writesAtStreamEnd);
+  });
+});
+
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
   type BuildStopWhenCondition = (request: {

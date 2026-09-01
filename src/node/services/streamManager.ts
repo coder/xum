@@ -1,4 +1,5 @@
 import * as path from "path";
+import { Duration, Effect, Exit, Fiber, Scope } from "effect";
 import { PlatformPaths } from "@/common/utils/paths";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import {
@@ -685,8 +686,12 @@ interface WorkspaceStreamInfo {
   reasoningBackfillStartIndex?: number;
   // Track last partial write time for throttling
   lastPartialWriteTime: number;
-  // Throttle timer for partial writes
-  partialWriteTimer?: ReturnType<typeof setTimeout>;
+  // Debounce fiber for throttled partial writes (Effect migration Phase 10).
+  // Non-null exactly while a delayed flush is scheduled; interrupted on re-arm,
+  // on explicit flush, and with resourceScope when the stream ends. Effect's
+  // clock registers a plain setTimeout under the hood, so scheduling semantics
+  // match the previous timer.
+  partialWriteFiber?: Fiber.Fiber<void>;
   // Track in-flight write to serialize writes
   partialWritePromise?: Promise<void>;
   // Track background processing promise for guaranteed cleanup
@@ -699,6 +704,13 @@ interface WorkspaceStreamInfo {
   runtimeTempDir: string;
   // Runtime for temp directory cleanup
   runtime: Runtime;
+  // Owns this stream's Effect-managed resources: the temp-dir release
+  // finalizer (registered via acquireRelease in startStream) and the
+  // scope-tied partial-write debounce fiber. Closed exactly once — by
+  // processStreamWithCleanup's finally after registration, or by startStream
+  // when registration fails. Optional: whitebox test fixtures register stream
+  // infos without a resource scope.
+  resourceScope?: Scope.Closeable;
   // Cumulative usage across all steps (for live cost display during streaming)
   cumulativeUsage: LanguageModelV2Usage;
   // Cumulative provider metadata across all steps (for live cost display with cache tokens)
@@ -770,6 +782,11 @@ export class StreamManager {
   private tokenTracker = new StreamingTokenTracker();
   // Track OpenAI previousResponseIds that have been invalidated
   // When frontend retries, buildProviderOptions will omit these IDs
+  //
+  // Effect migration Phase 10: stays a plain Set by the plain-mutables rule —
+  // every mutator runs in a non-Effect context (AI-SDK error paths inside
+  // processStreamWithCleanup) and no fiber reads or mutates it, so a Ref would
+  // add ceremony without adding safety.
   private lostResponseIds = new Set<string>();
 
   constructor(
@@ -1094,15 +1111,51 @@ export class StreamManager {
       return;
     }
 
-    // Otherwise, schedule write for remaining time (fire-and-forget for scheduled writes)
-    if (streamInfo.partialWriteTimer) {
-      clearTimeout(streamInfo.partialWriteTimer);
-    }
+    // Otherwise, schedule a delayed flush (fire-and-forget for scheduled
+    // writes). Re-arming replaces the previous debounce fiber, mirroring the
+    // previous clearTimeout.
+    this.interruptPartialWriteFiber(streamInfo);
 
     const remainingTime = this.PARTIAL_WRITE_THROTTLE_MS - timeSinceLastWrite;
-    streamInfo.partialWriteTimer = setTimeout(() => {
-      void this.flushPartialWrite(workspaceId, streamInfo);
-    }, remainingTime);
+    const delayedFlush = Effect.sleep(Duration.millis(remainingTime)).pipe(
+      // Clear the self-reference before flushing so flushPartialWrite's re-arm
+      // cancellation cannot interrupt the very fiber performing the flush.
+      Effect.flatMap(() =>
+        Effect.sync(() => {
+          streamInfo.partialWriteFiber = undefined;
+        })
+      ),
+      // Async thunk: flush errors are contained inside flushPartialWrite, so
+      // this mirrors the previous `void this.flushPartialWrite(...)` callback.
+      Effect.flatMap(() =>
+        Effect.promise(async () => this.flushPartialWrite(workspaceId, streamInfo))
+      )
+    );
+
+    // Fork into the stream's resource scope so a pending flush is interrupted
+    // with the stream — a debounced write must never fire after the stream
+    // ends and resurrect partial.json. runFork/forkIn execute synchronously up
+    // to the sleep, so the debounce delay is registered before this method
+    // returns (same observable ordering as the previous setTimeout call).
+    streamInfo.partialWriteFiber = streamInfo.resourceScope
+      ? Effect.runSync(Effect.forkIn(delayedFlush, streamInfo.resourceScope))
+      : // Whitebox test fixtures register stream infos without a resource scope.
+        Effect.runFork(delayedFlush);
+  }
+
+  /**
+   * Interrupt a scheduled (not yet flushed) partial-write debounce fiber, if
+   * any. The interrupt is fire-and-forget: the signal lands synchronously for
+   * a fiber sleeping on Effect's clock (house pattern: retryManager), which
+   * mirrors the previous clearTimeout semantics.
+   */
+  private interruptPartialWriteFiber(streamInfo: WorkspaceStreamInfo): void {
+    const fiber = streamInfo.partialWriteFiber;
+    if (fiber == null) {
+      return;
+    }
+    streamInfo.partialWriteFiber = undefined;
+    Effect.runFork(Fiber.interrupt(fiber));
   }
 
   private async awaitPendingPartialWrite(streamInfo: WorkspaceStreamInfo): Promise<void> {
@@ -1122,11 +1175,8 @@ export class StreamManager {
     // Wait for any in-flight write to complete first (serialization)
     await this.awaitPendingPartialWrite(streamInfo);
 
-    // Clear throttle timer
-    if (streamInfo.partialWriteTimer) {
-      clearTimeout(streamInfo.partialWriteTimer);
-      streamInfo.partialWriteTimer = undefined;
-    }
+    // Cancel any scheduled debounce flush — we're writing now
+    this.interruptPartialWriteFiber(streamInfo);
 
     // Start new write and track the promise
     streamInfo.partialWritePromise = (async () => {
@@ -2296,6 +2346,7 @@ export class StreamManager {
     ctx: {
       streamToken: StreamToken;
       runtimeTempDir: string;
+      resourceScope: Scope.Closeable;
       abortController: AbortController;
       completionController: TurnCompletionController;
     }
@@ -2378,6 +2429,7 @@ export class StreamManager {
       completionController: ctx.completionController,
       runtimeTempDir: ctx.runtimeTempDir, // Stream-scoped temp directory for tool outputs
       runtime, // Runtime for temp directory cleanup
+      resourceScope: ctx.resourceScope, // Owns temp-dir release + debounce fiber
       // Initialize cumulative tracking for multi-step streams
       cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cumulativeProviderMetadata: undefined,
@@ -3728,7 +3780,16 @@ export class StreamManager {
                   finishStepPart.usage
                 );
 
-                // Update cumulative totals for this stream
+                // Update cumulative totals for this stream.
+                //
+                // Effect migration Phase 10: usage accounting stays in plain
+                // mutables on streamInfo by the plain-mutables rule — the only
+                // mutators are this AI-SDK fullStream loop and plain
+                // retry/reset methods, never fibers. The emit below runs with
+                // zero suspension after the mutation (emitTurnEvent invokes
+                // the sink synchronously), so downstream Effect queue bridges
+                // (SubscriptionEmit's offerUnsafe) observe usage-delta events
+                // in mutation order.
                 streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
                 streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
                   streamInfo.cumulativeProviderMetadata,
@@ -3980,24 +4041,23 @@ export class StreamManager {
     } finally {
       this.mcpServerManager?.releaseLease(workspaceId as string);
 
-      // Guaranteed cleanup in all code paths
-      // Clear any pending timers to prevent keeping process alive
-      if (streamInfo.partialWriteTimer) {
-        clearTimeout(streamInfo.partialWriteTimer);
-        streamInfo.partialWriteTimer = undefined;
+      // Guaranteed cleanup in all code paths: close the stream's resource
+      // scope. Finalizers run in reverse acquisition order — the scope-tied
+      // debounce fiber is interrupted first (replaces manual clearTimeout
+      // bookkeeping; a pending partial flush must not fire after the stream
+      // ends and resurrect partial.json), then the temp-dir release runs (the
+      // fire-and-forget rm registered by acquireRelease in startStream; don't
+      // block stream completion on directory deletion — especially on SSH
+      // where rm -rf can take 500ms-2s). Scope.close is idempotent, so the
+      // never-registered path in startStream can never double-release.
+      if (streamInfo.resourceScope) {
+        Effect.runFork(Scope.close(streamInfo.resourceScope, Exit.void));
       }
 
       runLanguageModelCleanup(streamInfo.request?.model);
 
       streamInfo.unlinkAbortSignal?.();
       streamInfo.unlinkAbortSignal = undefined;
-
-      // Clean up stream temp directory using runtime (fire-and-forget)
-      // Don't block stream completion waiting for directory deletion
-      // This is especially important for SSH where rm -rf can take 500ms-2s
-      if (streamInfo.runtimeTempDir) {
-        this.cleanupStreamTempDir(streamInfo.runtime, streamInfo.runtimeTempDir);
-      }
 
       this.workspaceStreams.delete(workspaceId);
 
@@ -4318,10 +4378,7 @@ export class StreamManager {
     const preserveParts = options?.preserveParts ?? false;
     const preserveUsage = options?.preserveUsage ?? false;
 
-    if (streamInfo.partialWriteTimer) {
-      clearTimeout(streamInfo.partialWriteTimer);
-      streamInfo.partialWriteTimer = undefined;
-    }
+    this.interruptPartialWriteFiber(streamInfo);
 
     await this.awaitPendingPartialWrite(streamInfo);
     streamInfo.partialWritePromise = undefined;
@@ -4704,7 +4761,10 @@ export class StreamManager {
       const streamAbortController = new AbortController();
       const unlinkAbortSignal = linkAbortSignal(abortSignal, streamAbortController);
 
-      let runtimeTempDir: string | undefined;
+      // Owns this stream's Effect-managed resources (temp dir, debounce
+      // fiber). Ownership transfers to processStreamWithCleanup once the
+      // stream registers; otherwise the finally below closes it.
+      const resourceScope = Scope.makeUnsafe();
       let streamRegistered = false;
 
       try {
@@ -4721,11 +4781,37 @@ export class StreamManager {
           return settleStartupAbort();
         }
 
-        // Step 3: Create temp directory for this stream using runtime.
-        // TurnRequestBuilder pre-creates this dir so tool configuration can reference the same stable path;
-        // once startStream receives it, StreamManager owns cleanup for both success and abort paths.
-        runtimeTempDir =
-          providedRuntimeTempDir ?? (await this.createTempDirForStream(streamToken, runtime));
+        // Step 3: Acquire the temp directory for this stream as a scoped
+        // resource. The release finalizer registers only after acquisition
+        // succeeds, and Scope.close runs it exactly once across both cleanup
+        // paths (startup failure in the finally below, stream teardown in
+        // processStreamWithCleanup). TurnRequestBuilder pre-creates this dir
+        // so tool configuration can reference the same stable path; once
+        // startStream receives it, StreamManager owns cleanup for both
+        // success and abort paths.
+        const runtimeTempDir = await Effect.runPromise(
+          Scope.provide(resourceScope)(
+            Effect.acquireRelease(
+              Effect.tryPromise({
+                // Async thunk: createTempDirForStream failures follow the same
+                // rejection path into this method's catch as the previous
+                // plain await.
+                try: async () =>
+                  providedRuntimeTempDir ??
+                  (await this.createTempDirForStream(streamToken, runtime)),
+                catch: (error) => error,
+              }),
+              (dir) =>
+                Effect.sync(() => {
+                  // Whitebox tests pass providedRuntimeTempDir: "" to skip
+                  // cleanup; mirror the previous falsy guard.
+                  if (dir) {
+                    this.cleanupStreamTempDir(runtime, dir);
+                  }
+                })
+            )
+          )
+        );
 
         if (streamAbortController.signal.aborted) {
           return settleStartupAbort();
@@ -4735,6 +4821,7 @@ export class StreamManager {
         const streamInfo = this.createStreamAtomically(options, {
           streamToken,
           runtimeTempDir,
+          resourceScope,
           abortController: streamAbortController,
           completionController,
         });
@@ -4789,9 +4876,10 @@ export class StreamManager {
         if (!streamRegistered) {
           runLanguageModelCleanup(model);
           unlinkAbortSignal();
-          if (runtimeTempDir) {
-            this.cleanupStreamTempDir(runtime, runtimeTempDir);
-          }
+          // Releases the temp dir if it was acquired (no-op otherwise). The
+          // finalizer is synchronous and runFork executes it before returning
+          // control, mirroring the previous direct cleanup call.
+          Effect.runFork(Scope.close(resourceScope, Exit.void));
         }
       }
     } catch (error) {
