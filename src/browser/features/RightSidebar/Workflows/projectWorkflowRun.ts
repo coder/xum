@@ -274,11 +274,18 @@ function buildPhaseView(
 
 /**
  * Collapse consecutive duplicate phase events (same name back-to-back) into one
- * transition. Required for correctness after workflow resume: the runner replays
- * the script from the start and `phase()` re-appends its event unconditionally
- * (WorkflowRunner has no phase-event dedup, unlike checkpointed agent steps), so
- * a resumed run's log contains duplicate consecutive phase events. This also
- * makes lifecycle derivation robust to scripts announcing the same phase twice.
+ * transition.
+ *
+ * Replay finding (verified empirically via interrupt + workflow_resume): the
+ * runner replays the script from the start and `phase()` re-appends its event
+ * unconditionally (WorkflowRunner has no phase-event dedup, unlike checkpointed
+ * agent steps). A resumed run's log therefore contains the ENTIRE phase walk
+ * again (e.g. plan → verify → plan → verify → finalize). Reconciliation absorbs
+ * that as loop re-entry — visited-set + latest-visited semantics with manifest
+ * order — while this collapse handles the same-phase-resume case (interrupt and
+ * resume inside one phase re-announces it back-to-back) and scripts announcing
+ * a phase twice in a row. This is also why per-phase iteration counters stay
+ * out of v1: entry counts would double after every resume.
  */
 function collapsePhaseTransitions(events: readonly WorkflowRunEvent[]): string[] {
   const transitions: string[] = [];
