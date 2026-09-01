@@ -18,7 +18,7 @@ import { Ok, Err, type Result } from "@/common/types/result";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "@/node/services/aiService";
 import type {
@@ -3994,7 +3994,7 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
-  test("user-triggered auto-compaction still supersedes an active workspace turn", async () => {
+  test("malformed user-triggered auto-compaction still supersedes an active workspace turn", async () => {
     const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest();
     const prompt = createMuxMessage("turn-prompt", "user", "Summarize the repo", {
       muxMetadata: workspaceTurnMuxMetadata(parentId, created.taskId),
@@ -4009,9 +4009,9 @@ describe("WorkspaceTurnManager", () => {
         muxMetadata: {
           type: "compaction-request",
           rawCommand: "/compact",
-          parsed: {},
+          parsed: null,
           source: "auto-compaction",
-        },
+        } as unknown as MuxMessageMetadata,
       }
     );
     expect(

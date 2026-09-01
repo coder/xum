@@ -52,6 +52,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
@@ -293,7 +294,7 @@ function isManualChildWorkspaceInput(message: MuxMessage): boolean {
   return (
     muxMetadata?.type === "compaction-request" &&
     muxMetadata.source === "auto-compaction" &&
-    muxMetadata.parsed.followUpContent?.dispatchOptions?.source !== "internal-resume"
+    getCompactionFollowUpContent(muxMetadata)?.dispatchOptions?.source !== "internal-resume"
   );
 }
 
