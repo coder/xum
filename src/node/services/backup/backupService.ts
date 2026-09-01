@@ -30,7 +30,6 @@ import {
   BackupProjectImportApprovalRequiredError,
   ProjectMemoryRestoreError,
   ProjectMemoryWriteError,
-  projectMemoryRelPath,
 } from "./payload";
 
 export interface PreparedBackupRepository {
@@ -147,7 +146,7 @@ export interface BackupProjectRegistrar {
  * external writer would leave an open memory browser showing pre-restore contents.
  */
 export interface BackupMemoryNotifier {
-  notifyExternalProjectChange(projectPath: string, relPaths: readonly string[]): void;
+  notifyExternalProjectChange(projectPath: string): void;
 }
 
 export interface BackupServiceDependencies {
@@ -579,9 +578,12 @@ export class BackupService {
             snapshotPath,
             matchedProjectPaths: validated.matchedProjectPaths,
           });
+          // Recorded before the imports: they register projects and create files the snapshot
+          // does not cover, and their per-candidate results are the user's only undo list, so
+          // nothing that can fail may run after them and discard those results.
+          await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
           const projectImportResults = await this.executeProjectImports(repository, plannedImports);
           this.notifyProjectMemoryChanges(restored.restoredProjectMemory, projectImportResults);
-          await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
           return Ok({
             commit: remoteCommit,
             snapshotPath,
@@ -773,21 +775,21 @@ export class BackupService {
     return null;
   }
 
+  /** One notification per project whose memory changed; failed imports' partial writes count too. */
   private notifyProjectMemoryChanges(
     restoredProjectMemory: ReadonlyArray<{ projectPath: string; files: string[] }>,
     importResults: readonly BackupProjectImportResult[]
   ): void {
     if (this.memoryNotifier === null) return;
+    const changed = new Set<string>();
     for (const { projectPath, files } of restoredProjectMemory) {
-      this.memoryNotifier.notifyExternalProjectChange(projectPath, files.map(projectMemoryRelPath));
+      if (files.length > 0) changed.add(projectPath);
     }
-    // Failed imports included: their partial writes are on disk too.
     for (const result of importResults) {
-      if (result.writtenFiles.length === 0) continue;
-      this.memoryNotifier.notifyExternalProjectChange(
-        result.targetPath,
-        result.writtenFiles.map(projectMemoryRelPath)
-      );
+      if (result.writtenFiles.length > 0) changed.add(result.targetPath);
+    }
+    for (const projectPath of changed) {
+      this.memoryNotifier.notifyExternalProjectChange(projectPath);
     }
   }
 

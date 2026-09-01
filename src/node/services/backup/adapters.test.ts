@@ -6,7 +6,7 @@ import * as path from "node:path";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupNonFastForwardError, backupCachePath } from "./gitRepo";
-import { ProjectMemoryRestoreError } from "./payload";
+import { MAX_BACKUP_FILE_COUNT, ProjectMemoryRestoreError } from "./payload";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
 import {
@@ -1472,6 +1472,66 @@ describe("backup adapters project bundle", () => {
     expect(byPath.get(plainProject)?.gitRemote).toBe("git@github.com:dev/plain.git");
     expect(byPath.get(credentialedProject)?.gitRemote).toBeUndefined();
   });
+
+  it("flags a token published through a project remote's path in the secret scan", async () => {
+    const project = path.join(tempDir, "projects", "leaky");
+    await fs.mkdir(project, { recursive: true });
+    await runGit(["-C", project, "init"]);
+    // Not userinfo, so the URL credential sanitizer keeps it; the pattern scan must catch it.
+    await runGit([
+      "-C",
+      project,
+      "remote",
+      "add",
+      "origin",
+      `https://example.com/ghp_${"a".repeat(24)}/repo.git`,
+    ]);
+    registerProject(project);
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const payload = createBackupPayloadStore({ config });
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+
+    const exported = await payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+
+    expect(exported.secretFiles).toEqual(["project-bundle/manifest.json"]);
+    expect(exported.secretApproval).not.toBe("");
+  });
+
+  it("refuses an export whose core and bundle halves exceed the combined tree limits", async () => {
+    // Each half stays under the per-payload file count (and each project under the memory
+    // scope cap); together they exceed the single limit the checkout applies.
+    const half = Math.ceil(MAX_BACKUP_FILE_COUNT / 2);
+    const perProject = Math.ceil(half / 3);
+    const fixtures: Array<[string, string]> = [];
+    for (let index = 0; index < half; index += 1) {
+      fixtures.push([`skills/bulk/s${index}.md`, "skill\n"]);
+    }
+    for (const name of ["alpha", "beta", "gamma"]) {
+      const project = path.join(tempDir, "projects", name);
+      registerProject(project);
+      for (let index = 0; index < perProject; index += 1) {
+        fixtures.push([`memory/project/${projectMemoryDirName(project)}/m${index}.md`, "note\n"]);
+      }
+    }
+    await Promise.all(fixtures.map(([file, content]) => writeFixtureFile(muxRoot, file, content)));
+    const payload = createBackupPayloadStore({ config });
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+
+    const error = await captureRejection(
+      payload.exportTo({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+      })
+    );
+    expect((error as Error).message).toContain(`${MAX_BACKUP_FILE_COUNT}`);
+  }, 30_000);
 
   it("removes a previously pushed bundle when the toggle is disabled", async () => {
     const project = path.join(tempDir, "projects", "alpha");

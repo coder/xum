@@ -1496,7 +1496,7 @@ describe("BackupService project imports", () => {
   test("announces restored and imported project memory to the memory notifier", async () => {
     const target = path.join(tempDir, "imported");
     await fs.mkdir(target);
-    const notified: Array<{ projectPath: string; relPaths: readonly string[] }> = [];
+    const notified: string[] = [];
     const service = createService(tempDir, {
       payload: createPayload({
         validateRestore: () =>
@@ -1532,8 +1532,8 @@ describe("BackupService project imports", () => {
       create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
     });
     service.setMemoryNotifier({
-      notifyExternalProjectChange: (projectPath, relPaths) => {
-        notified.push({ projectPath, relPaths });
+      notifyExternalProjectChange: (projectPath) => {
+        notified.push(projectPath);
       },
     });
 
@@ -1543,15 +1543,57 @@ describe("BackupService project imports", () => {
     );
 
     expect(result.success).toBe(true);
-    // Scope-relative paths, as a project memory store addresses them.
-    expect(notified).toEqual([
-      { projectPath: "/home/dev/src/matched", relPaths: ["deep/notes.md"] },
-      { projectPath: target, relPaths: ["todo.md"] },
-    ]);
+    // One event per project, not per file.
+    expect(notified).toEqual(["/home/dev/src/matched", target]);
+  });
+
+  test("records the restored commit before running imports so their results survive", async () => {
+    const target = path.join(tempDir, "imported");
+    await fs.mkdir(target);
+    const events: string[] = [];
+    const config = new TestBackupConfig(tempDir);
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjectPaths: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() => {
+              events.push(`import:${config.state.settingsBackup?.lastRestoredCommit ?? "none"}`);
+              return Promise.resolve({
+                writtenFiles: ["memory/project/alpha-abc/notes.md"],
+                skippedFiles: [],
+              });
+            })
+          ),
+      }),
+    });
+    service.setProjectService({
+      create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
+    });
+    expect((await service.saveSettings({ ...SETTINGS, includeProjects: true })).success).toBe(true);
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]?.status).toBe("imported");
+    }
+    // The commit was already persisted when the import ran: no config write can fail
+    // afterwards and discard the import results, which the snapshot cannot undo.
+    expect(events).toEqual(["import:remote-commit"]);
   });
 
   test("announces memory a failed matched restore already wrote", async () => {
-    const notified: Array<{ projectPath: string; relPaths: readonly string[] }> = [];
+    const notified: string[] = [];
     const service = createService(tempDir, {
       payload: createPayload({
         validateRestore: () =>
@@ -1569,8 +1611,8 @@ describe("BackupService project imports", () => {
       }),
     });
     service.setMemoryNotifier({
-      notifyExternalProjectChange: (projectPath, relPaths) => {
-        notified.push({ projectPath, relPaths });
+      notifyExternalProjectChange: (projectPath) => {
+        notified.push(projectPath);
       },
     });
 
@@ -1582,7 +1624,7 @@ describe("BackupService project imports", () => {
       expect(result.error.snapshotPath).toBeDefined();
     }
     // Disk changed for alpha even though the restore failed on beta.
-    expect(notified).toEqual([{ projectPath: "/home/dev/src/alpha", relPaths: ["notes.md"] }]);
+    expect(notified).toEqual(["/home/dev/src/alpha"]);
   });
 
   test("keeps the restore half of a preview when the export half fails", async () => {

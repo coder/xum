@@ -2771,7 +2771,7 @@ export async function writeProjectBundle(
     if (claimed.has(claim)) throw new Error(`Duplicate backup path '${file.path}'`);
     claimed.add(claim);
   }
-  const manifestJson = `${JSON.stringify(bundle.manifest, null, 2)}\n`;
+  const manifestJson = serializeProjectBundleManifest(bundle.manifest).toString("utf-8");
   // Bound what is published so a bundle that writes is never one every later read rejects.
   const budget = createByteBudget();
   budget(BACKUP_MANIFEST_FILE, Buffer.byteLength(manifestJson, "utf-8"));
@@ -2787,6 +2787,35 @@ export async function writeProjectBundle(
   await writeCheckedFile(root, BACKUP_MANIFEST_FILE, Buffer.from(manifestJson, "utf-8"), false, {
     ownerOnly,
   });
+}
+
+/** The bytes `writeProjectBundle` publishes for the manifest; exported so the secret scan sees them too. */
+export function serializeProjectBundleManifest(manifest: BackupProjectBundleManifest): Buffer {
+  return Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+}
+
+/** Where the bundle manifest lands relative to the managed path. */
+export const PROJECT_BUNDLE_MANIFEST_PATH = `${PROJECT_BUNDLE_DIR}/${BACKUP_MANIFEST_FILE}`;
+
+/**
+ * The checkout side bounds the whole managed tree — core payload, bundle, both manifests —
+ * with one file-count, byte, and path-complexity limit set, while export budgets the two
+ * halves independently. An export both halves accept individually can still exceed the
+ * combined limits, so it is measured here exactly as the next checkout will measure it.
+ */
+export async function assertManagedTreeWithinLimits(destinationDir: string): Promise<void> {
+  const entries = await fs.readdir(destinationDir, { withFileTypes: true, recursive: true });
+  const files = entries.filter((entry) => entry.isFile());
+  assertBackupFileCount(files.length);
+  const relativePaths = files.map((entry) =>
+    path.relative(destinationDir, path.join(entry.parentPath, entry.name)).split(path.sep).join("/")
+  );
+  assertBackupPathComplexity(relativePaths);
+  const budget = createByteBudget();
+  for (const [index, entry] of files.entries()) {
+    const stat = await fs.lstat(path.join(entry.parentPath, entry.name));
+    budget(relativePaths[index] ?? entry.name, stat.size);
+  }
 }
 
 /**
@@ -2960,11 +2989,6 @@ export function planProjectBundleRestore(
 export function rekeyProjectMemoryPath(bundlePath: string, targetDirName: string): string {
   const segments = bundlePath.split("/");
   return [segments[0], segments[1], targetDirName, ...segments.slice(3)].join("/");
-}
-
-/** `memory/project/<dir>/rest` → `rest`, the path a project-scope memory store uses. */
-export function projectMemoryRelPath(bundlePath: string): string {
-  return bundlePath.split("/").slice(3).join("/");
 }
 
 /**

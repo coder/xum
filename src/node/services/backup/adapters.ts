@@ -30,10 +30,13 @@ import { BACKUP_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { BackupRepoCache } from "./gitRepo";
 import {
   PROJECT_BUNDLE_DIR,
+  PROJECT_BUNDLE_MANIFEST_PATH,
   ProjectMemoryRestoreError,
   ProjectMemoryWriteError,
+  assertManagedTreeWithinLimits,
   backupPayloadExists,
   bundleEntryFiles,
+  serializeProjectBundleManifest,
   collectProjectBundle,
   planProjectBundleRestore,
   projectBundleExists,
@@ -390,9 +393,21 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle, {
           ownerOnly: true,
         });
-        // One scan and one digest over core and bundle files together, so the secret gate
-        // and its approval bind the exact combined payload a push would publish.
-        scanFiles = [...payload.files, ...bundle.files];
+        // Core and bundle were budgeted separately; the next checkout will bound them as
+        // one tree, so refuse here what it would refuse there.
+        await assertManagedTreeWithinLimits(destination);
+        // One scan and one digest over everything the push would publish: core files,
+        // bundle files, and the bundle manifest itself — project paths, names, and remotes
+        // are published text too, and a token in a remote's path survives the URL
+        // credential sanitizer.
+        scanFiles = [
+          ...payload.files,
+          ...bundle.files,
+          {
+            path: PROJECT_BUNDLE_MANIFEST_PATH,
+            content: serializeProjectBundleManifest(bundle.manifest),
+          },
+        ];
       }
       const secretFiles = scanBackupFilesForSecrets(scanFiles);
       return {

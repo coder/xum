@@ -33,7 +33,6 @@ import {
   planRestoreWrites,
   projectBundleExists,
   projectImportToken,
-  projectMemoryRelPath,
   readProjectBundle,
   rekeyProjectMemoryPath,
   serializeBackupPreferences,
@@ -4001,12 +4000,6 @@ describe("project bundle", () => {
     } finally {
       mkdir.mockRestore();
     }
-  });
-
-  it("maps bundle paths to scope-relative memory paths", () => {
-    expect(projectMemoryRelPath("memory/project/alpha-123456789abc/deep/notes.md")).toBe(
-      "deep/notes.md"
-    );
   });
 
   it("refuses memory writes outside the project memory tree", async () => {
