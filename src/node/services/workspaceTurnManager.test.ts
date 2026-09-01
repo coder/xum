@@ -3652,8 +3652,10 @@ describe("WorkspaceTurnManager", () => {
         createdAt,
         updatedAt: createdAt,
         createdWorkspace: true,
+        deferredMessageIds: ["assistant-deferred"],
       })
     );
+    markWorkspaceTurnActive(taskService, "otherworkspace", "wst_other", parentId);
 
     const result = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
@@ -5638,9 +5640,19 @@ describe("WorkspaceTurnManager", () => {
     },
   ]) {
     test(scenario.name, async () => {
+      let ownerWorkspaceId = "";
       let retryDecisionAwaited = false;
       const pending = mock(
         (workspaceId: string) => retryDecisionAwaited && workspaceId === "childworkspace"
+      );
+      const hasPendingWorkspaceTurnContinuation = mock(
+        (workspaceId: string, metadata: ReturnType<typeof workspaceTurnMuxMetadata>) =>
+          scenario.pending === "queued" &&
+          retryDecisionAwaited &&
+          workspaceId === "childworkspace" &&
+          metadata.taskHandleId === "wst_handle" &&
+          metadata.ownerWorkspaceId === ownerWorkspaceId &&
+          metadata.turnId === "turn"
       );
       const waitForPendingStreamErrorRecoveryDecision = mock((): Promise<void> => {
         retryDecisionAwaited = true;
@@ -5648,10 +5660,14 @@ describe("WorkspaceTurnManager", () => {
       });
       const { parentId, taskService } = await startWorkspaceTurnForTest({
         ...(scenario.pending === "queued"
-          ? { hasPendingQueuedOrPreparingTurn: pending }
+          ? {
+              hasPendingQueuedOrPreparingTurn: pending,
+              hasPendingWorkspaceTurnContinuation,
+            }
           : { hasPendingAutoRetry: pending }),
         waitForPendingStreamErrorRecoveryDecision,
       });
+      ownerWorkspaceId = parentId;
 
       await taskService.finalizeWorkspaceTurnFromStreamError(scenario.event);
 

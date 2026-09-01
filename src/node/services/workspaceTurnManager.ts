@@ -3800,25 +3800,59 @@ export class WorkspaceTurnManager {
     return (await this.listActiveWorkspaceTurnTaskIdsForOwner(record.workspaceId)).length > 0;
   }
 
-  private async isLiveWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
-    const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
+  private getWorkspaceTurnRuntimeActivity(record: WorkspaceTurnTaskHandleRecord): {
+    hasAnyActivity: boolean;
+    hasCorrelatedActivity: boolean;
+  } {
     const activeStreamCorrelation = parseWorkspaceTurnTaskCorrelation(
       this.streamManager?.getStreamInfo(record.workspaceId)?.muxMetadata
     );
-    const hasRuntimeActivity =
-      (activeStreamCorrelation?.taskHandleId === record.handleId &&
-        activeStreamCorrelation.ownerWorkspaceId === record.ownerWorkspaceId &&
-        activeStreamCorrelation.turnId === record.turnId) ||
+    const hasActiveStream =
+      this.aiService.isStreaming(record.workspaceId) || activeStreamCorrelation != null;
+    const hasPendingQueuedOrPreparingTurn = this.workspaceService.hasPendingQueuedOrPreparingTurn(
+      record.workspaceId
+    );
+    const hasCorrelatedStream =
+      hasActiveStream &&
+      activeStreamCorrelation?.taskHandleId === record.handleId &&
+      activeStreamCorrelation.ownerWorkspaceId === record.ownerWorkspaceId &&
+      activeStreamCorrelation.turnId === record.turnId;
+    const hasCorrelatedQueuedOrPreparingTurn =
       this.workspaceService.hasPendingWorkspaceTurnContinuation(
         record.workspaceId,
         this.buildWorkspaceTurnMuxMetadata(record)
-      ) ||
-      this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
-      this.workspaceService.hasPendingBashMonitorWakeContinuation(record.workspaceId);
-    if (hasRuntimeActivity) {
+      );
+    const hasPendingAutoRetry = this.workspaceService.hasPendingAutoRetry(record.workspaceId);
+    const hasPendingBashMonitorWake = this.workspaceService.hasPendingBashMonitorWakeContinuation(
+      record.workspaceId
+    );
+
+    return {
+      hasAnyActivity:
+        hasActiveStream ||
+        hasPendingQueuedOrPreparingTurn ||
+        hasCorrelatedQueuedOrPreparingTurn ||
+        hasPendingAutoRetry ||
+        hasPendingBashMonitorWake,
+      hasCorrelatedActivity:
+        hasCorrelatedStream ||
+        hasCorrelatedQueuedOrPreparingTurn ||
+        hasPendingAutoRetry ||
+        hasPendingBashMonitorWake,
+    };
+  }
+
+  private async isLiveWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
+    const runtimeActivity = this.getWorkspaceTurnRuntimeActivity(record);
+    if (runtimeActivity.hasCorrelatedActivity) {
       return true;
     }
+    // Unrelated target activity cannot prove that this persisted handle still owns the workspace.
+    if (runtimeActivity.hasAnyActivity) {
+      return false;
+    }
 
+    const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     const isActiveHandle =
       active?.handleId === record.handleId && active.ownerWorkspaceId === record.ownerWorkspaceId;
     if (!isActiveHandle) {
@@ -3853,11 +3887,15 @@ export class WorkspaceTurnManager {
     }
 
     // Same-process deferred stream-ends can be observed before the final assistant message is
-    // readable from history. Keep the handle alive in that narrow window; after restart the active
-    // map is empty, so unrecoverable deferred handles still settle terminally instead of leaking.
+    // readable from history. Keep the handle alive only while it still owns the runtime activity.
+    const runtimeActivity = this.getWorkspaceTurnRuntimeActivity(record);
+    if (runtimeActivity.hasCorrelatedActivity) {
+      return;
+    }
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     if (
       (record.deferredMessageIds?.length ?? 0) > 0 &&
+      !runtimeActivity.hasAnyActivity &&
       active?.handleId === record.handleId &&
       active.ownerWorkspaceId === record.ownerWorkspaceId
     ) {
