@@ -244,7 +244,7 @@ interface StreamRequestOptions {
   maxOutputTokens?: number;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  claimQueuedToolEndMessage?: () => boolean;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -289,7 +289,7 @@ interface StreamRequestConfig {
   headers?: Record<string, string | undefined>;
   maxOutputTokens?: number;
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  claimQueuedToolEndMessage?: () => boolean;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2068,7 +2068,7 @@ export class StreamManager {
       maxOutputTokens,
       callSettingsOverrides,
       toolPolicy,
-      hasQueuedMessages,
+      claimQueuedToolEndMessage,
       headers,
       onChunk,
       onStepMessages,
@@ -2118,7 +2118,7 @@ export class StreamManager {
       maxOutputTokens: effectiveMaxOutputTokens,
       streamCallSettings:
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
-      hasQueuedMessages,
+      claimQueuedToolEndMessage,
       onChunk,
       onStepMessages,
       toolPolicy,
@@ -2131,7 +2131,7 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "toolPolicy">
+    request: Pick<StreamRequestConfig, "claimQueuedToolEndMessage" | "toolPolicy">
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2177,7 +2177,7 @@ export class StreamManager {
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
-      () => request.hasQueuedMessages?.("tool-end") ?? false,
+      () => request.claimQueuedToolEndMessage?.() ?? false,
       hasSuccessfulRequiredToolResult,
     ];
   }
@@ -3155,7 +3155,7 @@ export class StreamManager {
       maxOutputTokens: fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
-      hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      claimQueuedToolEndMessage: streamInfo.request.claimQueuedToolEndMessage,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,

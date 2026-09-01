@@ -1226,7 +1226,7 @@ describe("StreamManager - stream resource scope", () => {
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
   type BuildStopWhenCondition = (request: {
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    claimQueuedToolEndMessage?: () => boolean;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
 
@@ -1239,7 +1239,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   function requiredToolConditionForTests(toolPolicy: ToolPolicy): StopWhenCondition {
     const [, , requiredToolCondition] = buildStopWhenForTests()({
-      hasQueuedMessages: () => false,
+      claimQueuedToolEndMessage: () => false,
       toolPolicy,
     });
     return requiredToolCondition;
@@ -1251,7 +1251,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("returns step-cap and queued-message conditions with no policy", () => {
     let queued = false;
-    const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
+    const stopWhen = buildStopWhenForTests()({ claimQueuedToolEndMessage: () => queued });
     expect(stopWhen).toHaveLength(3);
 
     const [maxStepCondition, queuedMessageCondition, requiredToolCondition] = stopWhen;
@@ -1797,7 +1797,7 @@ describe("StreamManager - sequential tool execution", () => {
     headers?: Record<string, string | undefined>;
     maxOutputTokens?: number;
     streamCallSettings?: Record<string, unknown>;
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    claimQueuedToolEndMessage?: () => boolean;
     toolPolicy?: ToolPolicy;
     toolChoice?: { type: "tool"; toolName: string };
   }
@@ -1906,7 +1906,7 @@ describe("StreamManager - sequential tool execution", () => {
       messages: [{ role: "user", content: "hello" }],
       system: "system",
       tools,
-      hasQueuedMessages: () => false,
+      claimQueuedToolEndMessage: () => false,
     });
     createStreamResult(request, new AbortController());
 

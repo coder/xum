@@ -335,6 +335,72 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("dispatches a claimed monitor wake after task output cancels its signal", async () => {
+    const workspaceId = "queue-dispatch-claimed-monitor-wake";
+    let claimQueuedToolEndMessage: (() => boolean) | undefined;
+    const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
+      claimQueuedToolEndMessage ??= options.claimQueuedToolEndMessage;
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+
+    try {
+      const initialSend = await session.sendMessage("Start work", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(initialSend.success).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+
+      const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      const onCanceled = mock(() => undefined);
+      session.queueMessage(
+        "Background monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          queueDispatchMode: "tool-end",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelState,
+          cancelSignal: controller.signal,
+          onCanceled,
+        }
+      );
+
+      expect(claimQueuedToolEndMessage?.()).toBe(true);
+      controller.abort("task_await returned the terminal output");
+      aiEmitter.emit("stream-end", {
+        type: "stream-end",
+        workspaceId,
+        messageId: "assistant-1",
+        parts: [],
+        metadata: {
+          model: TEST_MODEL,
+          contextUsage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          providerMetadata: {},
+          finishReason: "tool-calls",
+        },
+      });
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(cancelState.canceledBeforeAcceptance).toBe(false);
+      expect(onCanceled).not.toHaveBeenCalled();
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("soft-stops after a provider-executed tool result and dispatches after abort", async () => {
     const workspaceId = "queue-dispatch-provider-tool";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({

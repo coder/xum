@@ -265,6 +265,23 @@ export class MessageQueue {
   }
 
   /**
+   * Claim the head entry as the continuation for a tool-end queue cut.
+   *
+   * Once this claim stops the current model step, a later cancellation must not
+   * retract the continuation and leave the session idle. Reject already-canceled
+   * entries, then detach cancellation synchronously before returning true.
+   */
+  claimNextToolEndEntry(): boolean {
+    const entry = this.entries[0];
+    if (entry?.dispatchMode !== "tool-end" || entry.cancelSignal?.aborted === true) {
+      return false;
+    }
+
+    entry.cancelSignal = undefined;
+    return true;
+  }
+
+  /**
    * Whether every queued entry continues the exact workspace turn correlation.
    *
    * The caller uses this for a new continuation that has not entered the queue.

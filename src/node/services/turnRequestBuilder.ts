@@ -272,7 +272,8 @@ export interface StreamMessageOptions {
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /** Atomically claim the queued continuation before a tool-end queue cut. */
+  claimQueuedToolEndMessage?: () => boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -736,7 +737,7 @@ export class TurnRequestBuilder {
       allowAgentSetGoal,
       workspaceGoalService,
       disableWorkspaceAgents,
-      hasQueuedMessages,
+      claimQueuedToolEndMessage,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -2856,7 +2857,7 @@ export class TurnRequestBuilder {
       maxOutputTokens,
       toolPolicy: effectiveToolPolicy,
       providedStreamToken: streamToken,
-      hasQueuedMessages,
+      claimQueuedToolEndMessage,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

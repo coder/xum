@@ -5210,7 +5210,7 @@ export class AgentSession {
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
-      hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      claimQueuedToolEndMessage: this.messageQueue.claimNextToolEndEntry.bind(this.messageQueue),
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).

@@ -600,6 +600,32 @@ describe("MessageQueue", () => {
       expect((candidate?.muxMetadata as MuxMessageMetadata).type).toBe("workspace-turn-task");
     });
 
+    it("keeps a claimed tool-end entry dispatchable after its cancel signal aborts", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal }
+      );
+
+      expect(queue.claimNextToolEndEntry()).toBe(true);
+      controller.abort("task output consumed the wake");
+
+      expect(queue.dequeueNext().internal?.cancelSignal).toBeUndefined();
+    });
+
+    it("does not claim a tool-end entry that cancellation already retracted", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal }
+      );
+      controller.abort("task output consumed the wake");
+
+      expect(queue.claimNextToolEndEntry()).toBe(false);
+    });
+
     it("never batches a user message into a sealed workspace-turn entry", () => {
       // Cut attribution reads the head entry's muxMetadata; the sealing
       // invariant guarantees a manual user message queued after a
