@@ -468,6 +468,11 @@ export function BackupSection() {
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setSecretScanApproval(null);
+      // The push replaced the remote bundle the candidates and the skipped flag described;
+      // their tokens no longer match anything, so a restore would only be refused.
+      setProjectImports([]);
+      setProjectImportSelections({});
+      setProjectBundleSkipped(false);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${getCredentialLabel(result.data.credential)}.`
       );

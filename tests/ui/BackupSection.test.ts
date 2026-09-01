@@ -745,6 +745,38 @@ describe("BackupSection", () => {
     );
   });
 
+  test("drops stale project import candidates after a push replaces the remote bundle", async () => {
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [
+          {
+            sourcePath: "/home/dev/src/rocket",
+            name: "rocket",
+            memoryFileCount: 1,
+            token: "rocket-token",
+          },
+        ],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+
+    // The push rewrote the remote bundle; the candidates' tokens describe the old one.
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await canvas.findByText(/Backed up settings at/);
+    expect(canvas.queryByText("Projects to reimport")).toBeNull();
+  });
+
   test("reports a skipped project bundle after a preview", async () => {
     const { view } = renderBackupSection({
       backupPreview: {

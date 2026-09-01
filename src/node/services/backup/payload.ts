@@ -3058,6 +3058,53 @@ export async function writeProjectMemoryFiles(
   options: { addOnly: boolean }
 ): Promise<{ written: string[]; skipped: string[] }> {
   const root = await resolveRoot(muxRoot);
+  // Re-run under the lock even when the caller already ran it as a preflight: the
+  // destinations may have changed since, and these checks are what make the write safe.
+  const planned = await planProjectMemoryWrites(root, writes);
+  const written: string[] = [];
+  const skipped: string[] = [];
+  try {
+    for (const write of planned) {
+      if (write.exists) {
+        const current = await readCheckedFile(root, write.path, () => undefined);
+        if (current.content.equals(write.content)) continue;
+        if (options.addOnly) {
+          skipped.push(write.path);
+          continue;
+        }
+      }
+      await writeCheckedFile(root, write.path, write.content, false);
+      written.push(write.path);
+    }
+  } catch (error) {
+    // Sequential writes without rollback: report what already landed so the caller's
+    // failure result can double as the cleanup list.
+    throw new ProjectMemoryWriteError(
+      error instanceof Error ? error.message : String(error),
+      { written, skipped },
+      { cause: error }
+    );
+  }
+  return { written, skipped };
+}
+
+/**
+ * Everything about a set of project-memory writes that can be refused without touching the
+ * disk: path shape, the memory subsystem's per-file size and per-scope count limits, and
+ * destinations that are not plain files. Exposed so the restore preflight can refuse a
+ * bundle that would fail here before the core restore has overwritten anything.
+ */
+export async function assertProjectMemoryWritesAllowed(
+  muxRoot: string,
+  writes: ReadonlyArray<{ path: string; content: Buffer }>
+): Promise<void> {
+  await planProjectMemoryWrites(await resolveRoot(muxRoot), writes);
+}
+
+async function planProjectMemoryWrites(
+  root: BackupRoot,
+  writes: ReadonlyArray<{ path: string; content: Buffer }>
+): Promise<Array<{ path: string; content: Buffer; exists: boolean }>> {
   // Charged so a marker-thin bundle cannot expand past the same bound reads enforce.
   const budget = createByteBudget();
   // Everything refusable is refused before the first write, so a rejected bundle
@@ -3098,29 +3145,48 @@ export async function writeProjectMemoryFiles(
       );
     }
   }
-  const written: string[] = [];
-  const skipped: string[] = [];
-  try {
-    for (const write of planned) {
-      if (write.exists) {
-        const current = await readCheckedFile(root, write.path, () => undefined);
-        if (current.content.equals(write.content)) continue;
-        if (options.addOnly) {
-          skipped.push(write.path);
-          continue;
-        }
-      }
-      await writeCheckedFile(root, write.path, write.content, false);
-      written.push(write.path);
+  return planned;
+}
+
+/**
+ * A recovery copy of exactly the local files a matched restore may overwrite: the current
+ * contents at the incoming bundle paths, and nothing else in the project's memory
+ * directory. Collecting whole directories would let an unrelated local-only note — say,
+ * one past the backup size budget — fail a restore that never touches it.
+ */
+export async function collectOverwritableProjectMemory(
+  muxRoot: string,
+  matched: ReadonlyArray<{ entry: BackupProjectBundleEntry; files: readonly BackupFile[] }>
+): Promise<BackupProjectBundle> {
+  const root = await resolveRoot(muxRoot);
+  const budget = createByteBudget();
+  const files: BackupFile[] = [];
+  for (const match of matched) {
+    for (const incoming of match.files) {
+      assertAllowedBundleFilePath(incoming.path);
+      const destination = await resolveContainedPath(root.path, incoming.path);
+      if ((await lstatOrNull(destination))?.isFile() !== true) continue;
+      const current = await readCheckedFile(root, incoming.path, (size) => {
+        budget(incoming.path, size);
+      });
+      files.push({ path: incoming.path, content: current.content });
     }
-  } catch (error) {
-    // Sequential writes without rollback: report what already landed so the caller's
-    // failure result can double as the cleanup list.
-    throw new ProjectMemoryWriteError(
-      error instanceof Error ? error.message : String(error),
-      { written, skipped },
-      { cause: error }
-    );
   }
-  return { written, skipped };
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  const entries = [...matched.map((match) => match.entry)].sort((a, b) =>
+    a.path.localeCompare(b.path)
+  );
+  return {
+    manifest: {
+      schemaVersion: 1,
+      projects: entries.map((entry) => ({
+        path: entry.path,
+        name: entry.name,
+        ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
+        memoryDir: entry.memoryDir,
+      })),
+      files: files.map((file) => ({ path: file.path, sha256: sha256(file.content) })),
+    },
+    files,
+  };
 }

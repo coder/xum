@@ -6,7 +6,8 @@ import * as path from "node:path";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupNonFastForwardError, backupCachePath } from "./gitRepo";
-import { MAX_BACKUP_FILE_COUNT, ProjectMemoryRestoreError } from "./payload";
+import { MAX_BACKUP_FILE_BYTES, MAX_BACKUP_FILE_COUNT, ProjectMemoryRestoreError } from "./payload";
+import { MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
 import {
@@ -1614,6 +1615,103 @@ describe("backup adapters project bundle", () => {
         "utf-8"
       )
     ).toBe("local edit\n");
+  });
+
+  it("snapshots only the files a matched restore overwrites, not the whole project", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryDir = projectMemoryDirName(project);
+    const { repository, payload } = await exportBundle();
+
+    // A local-only note past the backup file budget: never overwritten, so it must
+    // neither be snapshotted nor fail the restore.
+    await fs.writeFile(
+      path.join(muxRoot, "memory", "project", memoryDir, "huge-local.md"),
+      Buffer.alloc(MAX_BACKUP_FILE_BYTES + 1, "x")
+    );
+    await seedProjectMemory(project, "notes.md", "local edit\n");
+
+    const snapshotPath = path.join(tempDir, "restore-snapshot");
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+      snapshotPath,
+      matchedProjectPaths: [project],
+    });
+    expect(restored.changedFiles).toContain(`memory/project/${memoryDir}/notes.md`);
+    const snapshotBundle = JSON.parse(
+      await fs.readFile(path.join(snapshotPath, "project-bundle", "manifest.json"), "utf-8")
+    ) as { files: Array<{ path: string }> };
+    expect(snapshotBundle.files.map((file) => file.path)).toEqual([
+      `memory/project/${memoryDir}/notes.md`,
+    ]);
+    expect(
+      await fs.readFile(
+        path.join(snapshotPath, "project-bundle", "memory", "project", memoryDir, "notes.md"),
+        "utf-8"
+      )
+    ).toBe("local edit\n");
+  });
+
+  it("refuses a matched entry that would break memory limits before the core restore", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backup instructions\n");
+    const memoryDir = projectMemoryDirName(project);
+    const { repository, payload } = await exportBundle();
+
+    // A crafted checkout grows the matched entry's file past the memory read limit.
+    const bundleDir = path.join(repository.rootDir, settings.path, "project-bundle");
+    const oversized = Buffer.alloc(MEMORY_MAX_FILE_BYTES + 1, "x");
+    await fs.writeFile(path.join(bundleDir, "memory", "project", memoryDir, "notes.md"), oversized);
+    const manifestPath = path.join(bundleDir, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8")) as {
+      files: Array<{ path: string; sha256: string }>;
+    };
+    manifest.files[0].sha256 = createHash("sha256").update(oversized).digest("hex");
+    await fs.writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local instructions\n");
+
+    const error = await captureRejection(
+      payload.validateRestore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+      })
+    );
+    expect((error as Error).message).toContain("memory file limit");
+    // Refused in the preflight: the core restore never ran.
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "local instructions\n"
+    );
+  });
+
+  it("leaves a project alone that was unregistered after the plan was computed", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryPath = `memory/project/${projectMemoryDirName(project)}/notes.md`;
+    const { repository, payload } = await exportBundle();
+    await seedProjectMemory(project, "notes.md", "local edit\n");
+
+    // Unregistered between validation (which matched it) and the write boundary.
+    config.state.projects.delete(project);
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [project],
+    });
+    expect(restored.changedFiles).not.toContain(memoryPath);
+    expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
+      "local edit\n"
+    );
   });
 
   it("reports the memory a failed matched restore already wrote", async () => {

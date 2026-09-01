@@ -34,8 +34,10 @@ import {
   ProjectMemoryRestoreError,
   ProjectMemoryWriteError,
   assertManagedTreeWithinLimits,
+  assertProjectMemoryWritesAllowed,
   backupPayloadExists,
   bundleEntryFiles,
+  collectOverwritableProjectMemory,
   serializeProjectBundleManifest,
   collectProjectBundle,
   planProjectBundleRestore,
@@ -531,6 +533,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       if (bundlePlan === null) {
         return { hasProjectBundle: false, projectImports: [], matchedProjectPaths: [] };
       }
+      // The matched writes' own refusals (memory size and count limits, non-file
+      // destinations) belong to the preflight too: found only inside the restore, they
+      // would surface after the core settings were already overwritten.
+      for (const match of bundlePlan.plan.matched) {
+        await assertProjectMemoryWritesAllowed(muxRoot, match.files);
+      }
       return {
         hasProjectBundle: true,
         projectImports: toProjectImports(bundlePlan.plan),
@@ -612,19 +620,25 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           // by the snapshot, so it must not be overwritten here; one unregistered since
           // validation drops out of the recomputed plan on its own.
           const validatedMatched = new Set(restoreOptions.matchedProjectPaths);
-          const matched = bundlePlan.plan.matched.filter((match) =>
-            validatedMatched.has(match.entry.path)
-          );
           // One lock window for the snapshot and the overwrite: a memory edit landing
           // between them would otherwise be destroyed with a snapshot that predates it.
           await withMemoryLock(async () => {
+            // Registration is re-read at the write boundary so a project unregistered since
+            // the plan was computed is left alone. Project registration is not serialized
+            // with memory writes (config edits take no memory lock), so this is the
+            // narrowest check available, not a guarantee against a concurrent edit landing
+            // between this read and the write.
+            const registered = registeredProjectDirs();
+            const matched = bundlePlan.plan.matched.filter(
+              (match) =>
+                validatedMatched.has(match.entry.path) &&
+                registered.get(match.entry.path) === match.entry.memoryDir
+            );
             if (matched.length > 0) {
-              // Exactly the memory these writes can overwrite — unrelated registered
-              // projects neither need covering nor may count against the bundle limits.
-              const localBundle = await collectProjectBundle(
-                muxRoot,
-                matched.map((match) => match.entry)
-              );
+              // Exactly the files these writes can overwrite: not whole project directories,
+              // whose unrelated local-only notes neither need covering nor may fail the
+              // restore, and never other registered projects.
+              const localBundle = await collectOverwritableProjectMemory(muxRoot, matched);
               await writeProjectBundle(
                 path.join(restoreOptions.snapshotPath, PROJECT_BUNDLE_DIR),
                 localBundle,
