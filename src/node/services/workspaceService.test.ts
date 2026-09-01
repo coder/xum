@@ -846,6 +846,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
   test("defers a second wake while the accepted first wake waits to start", async () => {
     const { config, service, backgroundProcessManager, cleanup } = await createWakeWiringService();
+    const acknowledgeMonitorWake = mock(() => undefined);
+    Object.assign(backgroundProcessManager, { acknowledgeMonitorWake });
     const workspaceId = "concurrent-wake-owner";
     await config.addWorkspace("/tmp/concurrent-wake-project", {
       id: workspaceId,
@@ -887,6 +889,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     );
 
     const idleGate = createDeferred<void>();
+    const idleWaitStarted = createDeferred<void>();
+    const secondAccepted = createDeferred<void>();
+    let idleWaitObserved = false;
     let queuedEntryCount = 0;
     let preparing = false;
     let busy = true;
@@ -897,7 +902,13 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       isPreparingTurn: () => preparing,
       hasPendingAutoRetry: () => false,
       isBusy: () => busy,
-      waitForIdle: () => idleGate.promise,
+      waitForIdle: () => {
+        if (!idleWaitObserved) {
+          idleWaitObserved = true;
+          idleWaitStarted.resolve();
+        }
+        return idleGate.promise;
+      },
       onChatEvent: () => () => undefined,
     } as unknown as AgentSession;
 
@@ -923,9 +934,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           return Promise.resolve(Ok(undefined));
         }
         secondStartedAfterIdle = idleReleased;
-        return (
-          callbacks?.onAccepted?.().then(() => Ok(undefined)) ?? Promise.resolve(Ok(undefined))
-        );
+        const onAccepted = callbacks?.onAccepted;
+        if (onAccepted == null) {
+          throw new Error("Expected the second wake to provide an acceptance callback");
+        }
+        return onAccepted().then(() => {
+          secondAccepted.resolve();
+          return Ok(undefined);
+        });
       }
     );
 
@@ -951,7 +967,18 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       queuedEntryCount--;
       preparing = true;
       streaming = false;
-      await firstCallbacks?.onAccepted?.();
+      const firstOnAccepted = firstCallbacks?.onAccepted;
+      expect(firstOnAccepted).toBeDefined();
+      if (firstOnAccepted == null) {
+        throw new Error("Expected the first wake to provide an acceptance callback");
+      }
+      await firstOnAccepted();
+      expect(acknowledgeMonitorWake).toHaveBeenCalledWith(
+        "first-proc",
+        Date.parse(firstWake.createdAt),
+        firstWake.match?.throughOffset,
+        undefined
+      );
       await internal.bashMonitorWakeReconciler.reconcile(workspaceId);
 
       expect(sendCount).toBe(1);
@@ -960,15 +987,23 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
       preparing = false;
       streaming = true;
-      await Promise.resolve();
+      await idleWaitStarted.promise;
       expect(sendCount).toBe(1);
 
       busy = false;
       streaming = false;
       idleReleased = true;
       idleGate.resolve();
-      await waitForCondition(() => sendCount === 2);
+      await secondAccepted.promise;
+      expect(sendCount).toBe(2);
       expect(secondStartedAfterIdle).toBe(true);
+      expect(acknowledgeMonitorWake).toHaveBeenCalledTimes(2);
+      expect(acknowledgeMonitorWake).toHaveBeenLastCalledWith(
+        "second-proc",
+        Date.parse(secondWake.createdAt),
+        secondWake.match?.throughOffset,
+        undefined
+      );
     } finally {
       await cleanup();
     }
