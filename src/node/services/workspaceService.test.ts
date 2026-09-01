@@ -49,6 +49,7 @@ import type {
 } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import type { BashMonitorProcessSnapshot } from "./bashMonitorWakeReconciler";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
@@ -248,7 +249,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ),
       backgroundProcessManager,
     });
-    return { config, service, events, cleanup };
+    return { config, historyService, service, events, backgroundProcessManager, cleanup };
   }
 
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
@@ -838,6 +839,136 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(queuedMode).toBe("tool-end");
       expect(queuedCancelState).toEqual({ canceledBeforeAcceptance: false });
       expect(afterIdle).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("defers a second wake while the accepted first wake waits to start", async () => {
+    const { config, service, backgroundProcessManager, cleanup } = await createWakeWiringService();
+    const workspaceId = "concurrent-wake-owner";
+    await config.addWorkspace("/tmp/concurrent-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "concurrent-wake-project",
+      projectPath: "/tmp/concurrent-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+
+    const firstWake: BashMonitorProcessSnapshot = {
+      processId: "first-proc",
+      taskId: "bash:first-proc",
+      ownerWorkspaceId: workspaceId,
+      displayName: "first monitor",
+      filter: "FIRST",
+      filterExclude: false,
+      script: "run-first",
+      createdAt: "2026-09-01T00:00:00.000Z",
+      match: { throughOffset: 5, lines: ["FIRST"], totalMatches: 1 },
+      retired: false,
+    };
+    const secondWake: BashMonitorProcessSnapshot = {
+      ...firstWake,
+      processId: "second-proc",
+      taskId: "bash:second-proc",
+      displayName: "second monitor",
+      filter: "SECOND",
+      script: "run-second",
+      match: { throughOffset: 6, lines: ["SECOND"], totalMatches: 1 },
+    };
+    let liveWakes = [firstWake];
+    backgroundProcessManager.pullMonitorWakeSignals = mock(() => liveWakes);
+    backgroundProcessManager.getMonitorWakeDeliveryState = mock(() =>
+      Promise.resolve({
+        status: "settled" as const,
+        shownThroughOffset: 0,
+        terminalStatusShown: false,
+      })
+    );
+
+    const idleGate = createDeferred<void>();
+    let queuedEntryCount = 0;
+    let preparing = false;
+    let busy = true;
+    let streaming = true;
+    let idleReleased = false;
+    const fakeSession = {
+      hasQueuedMessages: () => queuedEntryCount > 0,
+      isPreparingTurn: () => preparing,
+      hasPendingAutoRetry: () => false,
+      isBusy: () => busy,
+      waitForIdle: () => idleGate.promise,
+      onChatEvent: () => () => undefined,
+    } as unknown as AgentSession;
+
+    interface AcceptedCallbacks {
+      onAccepted?: () => Promise<void>;
+    }
+    let firstCallbacks: AcceptedCallbacks | undefined;
+    const queuedModes: string[] = [];
+    let secondStartedAfterIdle = false;
+    let sendCount = 0;
+    const sendMessage = mock(
+      (
+        _workspaceId: string,
+        _prompt: string,
+        options: { queueDispatchMode?: string },
+        callbacks?: AcceptedCallbacks
+      ) => {
+        sendCount++;
+        queuedModes.push(options.queueDispatchMode ?? "");
+        if (sendCount === 1) {
+          queuedEntryCount++;
+          firstCallbacks = callbacks;
+          return Promise.resolve(Ok(undefined));
+        }
+        secondStartedAfterIdle = idleReleased;
+        return (
+          callbacks?.onAccepted?.().then(() => Ok(undefined)) ?? Promise.resolve(Ok(undefined))
+        );
+      }
+    );
+
+    const internal = service as unknown as {
+      sessions: Map<string, AgentSession>;
+      aiService: { isStreaming(workspaceId: string): boolean };
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      bashMonitorWakeReconciler: { reconcile(workspaceId: string): Promise<void> };
+    };
+    try {
+      internal.sessions.set(workspaceId, fakeSession);
+      internal.aiService = { isStreaming: () => streaming };
+      internal.getDelegatedTurnContinuationSendOptions = () =>
+        Promise.resolve({ model: "anthropic:claude-sonnet-4-5", agentId: "exec" });
+      internal.sendMessage = sendMessage;
+
+      await internal.bashMonitorWakeReconciler.reconcile(workspaceId);
+      expect(queuedEntryCount).toBe(1);
+      expect(queuedModes).toEqual(["tool-end"]);
+
+      liveWakes = [firstWake, secondWake];
+      queuedEntryCount--;
+      preparing = true;
+      streaming = false;
+      await firstCallbacks?.onAccepted?.();
+      await internal.bashMonitorWakeReconciler.reconcile(workspaceId);
+
+      expect(sendCount).toBe(1);
+      expect(queuedModes).toEqual(["tool-end"]);
+      expect(secondStartedAfterIdle).toBe(false);
+
+      preparing = false;
+      streaming = true;
+      await Promise.resolve();
+      expect(sendCount).toBe(1);
+
+      busy = false;
+      streaming = false;
+      idleReleased = true;
+      idleGate.resolve();
+      await waitForCondition(() => sendCount === 2);
+      expect(secondStartedAfterIdle).toBe(true);
     } finally {
       await cleanup();
     }
