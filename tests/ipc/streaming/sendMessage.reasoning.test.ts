@@ -15,7 +15,17 @@ import {
   withSharedWorkspace,
   configureTestRetries,
 } from "../sendMessageTestHelpers";
-import { KNOWN_MODELS } from "../../../src/common/constants/knownModels";
+// These tests hit the live Anthropic API, and KNOWN_MODELS.SONNET.id now points at
+// claude-sonnet-5-1, which does not exist at the API until Anthropic announces it
+// (this PR is prepared ahead of the drop). Pin the last live Sonnet id so the tests
+// keep exercising real Sonnet-tier reasoning behavior in the meantime.
+//
+// TODO(sonnet-5-1-release): switch back to KNOWN_MODELS.SONNET.id as part of the
+// gated merge, once the id is live — otherwise the promoted production path
+// (adaptive thinking + effort + summarized display on claude-sonnet-5-1) is never
+// exercised by live integration coverage. This is an explicit release-day item in
+// the PR's merge gate.
+const LIVE_SONNET_MODEL = "anthropic:claude-sonnet-5";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -36,7 +46,7 @@ describeIntegration("Anthropic reasoning parameter tests", () => {
     async () => {
       await withSharedWorkspace("anthropic", async ({ env, workspaceId, collector }) => {
         const result = await sendMessage(env, workspaceId, "What is 2+2? Answer in one word.", {
-          model: KNOWN_MODELS.SONNET.id,
+          model: LIVE_SONNET_MODEL,
           thinkingLevel: "low",
         });
         expect(result.success).toBe(true);
@@ -56,7 +66,7 @@ describeIntegration("Anthropic reasoning parameter tests", () => {
     async () => {
       await withSharedWorkspace("anthropic", async ({ env, workspaceId, collector }) => {
         const result = await sendMessage(env, workspaceId, "What is 4+4? Answer in one word.", {
-          model: KNOWN_MODELS.SONNET.id,
+          model: LIVE_SONNET_MODEL,
           thinkingLevel: "low",
         });
         expect(result.success).toBe(true);
@@ -76,7 +86,7 @@ describeIntegration("Anthropic reasoning parameter tests", () => {
     async () => {
       await withSharedWorkspace("anthropic", async ({ env, workspaceId, collector }) => {
         const result = await sendMessage(env, workspaceId, "Explain briefly why 2+2=4", {
-          model: KNOWN_MODELS.SONNET.id,
+          model: LIVE_SONNET_MODEL,
           thinkingLevel: "medium",
         });
         expect(result.success).toBe(true);

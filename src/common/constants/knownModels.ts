@@ -69,18 +69,19 @@ const MODEL_DEFINITIONS = {
     // usage can run ~1.0-1.3x higher than this estimate (same situation as FABLE above).
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Sonnet 5 - released June 30, 2026. The most agentic Sonnet yet (native 1M context,
-  // 128K max output, adaptive thinking + effort including native xhigh). Standard pricing matches
-  // Sonnet 4.6 ($3/M in, $15/M out); introductory $2/$10 applies through Aug 31, 2026. API id
-  // `claude-sonnet-5`. The bare `sonnet` alias tracks the latest Sonnet tier.
+  // Claude Sonnet 5.1 - successor to Sonnet 5 (released June 30, 2026) with the same
+  // envelope (native 1M context, 128K max output, adaptive thinking + effort including
+  // native xhigh) at unchanged standard pricing ($3/M in, $15/M out). API id
+  // `claude-sonnet-5-1`; Sonnet 5 stays usable as the custom model string
+  // `anthropic:claude-sonnet-5`. The bare `sonnet` alias tracks the latest Sonnet tier.
   SONNET: {
     provider: "anthropic",
-    providerModelId: "claude-sonnet-5",
+    providerModelId: "claude-sonnet-5-1",
     aliases: ["sonnet"],
     warm: true,
-    // Sonnet 5 ships an updated tokenizer (same kind of change introduced with Opus 4.7) that
-    // isn't published upstream yet; reuse Sonnet 4.5 for approximate counting. Real usage can run
-    // ~1.0-1.35x higher than this estimate depending on content type.
+    // Sonnet 5/5.1 ship an updated tokenizer (same kind of change introduced with Opus 4.7)
+    // that isn't published upstream yet; reuse Sonnet 4.5 for approximate counting. Real usage
+    // can run ~1.0-1.35x higher than this estimate depending on content type.
     tokenizerOverride: "anthropic/claude-sonnet-4.5",
   },
   HAIKU: {
@@ -276,11 +277,12 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 );
 
 // Retired first-class models stay documented as custom model strings (see the
-// FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
+// FABLE/OPUS/SONNET comments); keep their approximate-tokenizer overrides so exact-id
 // lookup does not fall back to the generic per-provider tokenizer.
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {

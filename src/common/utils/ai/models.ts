@@ -186,6 +186,7 @@ const ANTHROPIC_NATIVE_1M_PATTERNS = [
   new RegExp(`^claude-opus-4-7${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-sonnet-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-sonnet-5-1${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-sonnet-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
 ];
 const ANTHROPIC_BETA_1M_PATTERNS = [

@@ -139,7 +139,14 @@ describe("buildProviderOptions - Anthropic", () => {
   // Native-xhigh models (Opus 4.7+ / Sonnet 5+): xhigh is a distinct native
   // effort and adaptive thinking requires `display: "summarized"` to return
   // thinking content.
-  for (const model of ["claude-opus-4-7", "claude-opus-5", "claude-sonnet-5"] as const) {
+  // Sonnet 5.1 rides the same Sonnet 5+ wildcard matcher; unlike Mythos-class
+  // models it still sends `thinking: { type: "disabled" }` when off.
+  for (const model of [
+    "claude-opus-4-7",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-sonnet-5-1",
+  ] as const) {
     describe(`${model} (native xhigh effort + summarized display)`, () => {
       for (const { thinking, expectedThinking, effort } of [
         {
@@ -2056,6 +2063,7 @@ describe("buildRequestHeaders", () => {
   test("does not emit any Xum-internal effort header for native-xhigh models", () => {
     expect(buildRequestHeaders("anthropic:claude-opus-4-7")).toBeUndefined();
     expect(buildRequestHeaders("anthropic:claude-sonnet-5")).toBeUndefined();
+    expect(buildRequestHeaders("anthropic:claude-sonnet-5-1")).toBeUndefined();
   });
 
   describe("openaiDirectProviderOptionsAvailable", () => {
