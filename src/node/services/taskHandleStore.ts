@@ -72,6 +72,11 @@ export interface WorkspaceTurnTaskHandleRecord {
     metadata: StreamEndEvent["metadata"];
   };
   deferredMessageIds?: string[];
+  /**
+   * True only for a terminal result from an uncorrelated synthetic wake stream-end.
+   * A later correlated stream-end can replace this provisional result.
+   */
+  provisionalOutcome?: boolean;
   error?: string;
   /**
    * How the owner workspace's stream-end treats this workspace turn while active.
@@ -118,6 +123,7 @@ const WorkspaceTurnTaskHandleRecordSchema = z
       .passthrough()
       .optional(),
     deferredMessageIds: z.array(z.string().min(1)).optional(),
+    provisionalOutcome: z.boolean().optional(),
     error: z.string().optional(),
     attentionPolicy: BackgroundWorkAttentionPolicySchema.optional(),
     directParentResultDeliveryRequiredAt: z.string().optional(),

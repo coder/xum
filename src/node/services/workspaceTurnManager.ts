@@ -281,6 +281,11 @@ const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after res
 const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
+/** A human-authored child input that redirects the delegated turn. */
+function isManualChildWorkspaceInput(message: MuxMessage): boolean {
+  return message.role === "user" && message.metadata?.synthetic !== true;
+}
+
 /**
  * Reason prefix persisted when the owner's OWN follow-up turn (task
  * kind="workspace", mode="existing", tool-end dispatch) cut its active
@@ -2147,11 +2152,12 @@ export class WorkspaceTurnManager {
         // error / stale restart interrupt — never an explicit user interrupt) may be
         // corrected once by an explicitly allowed resettle, but only when the new settlement
         // actually changes the outcome (duplicate stream-end replays must stay idempotent).
+        const currentIsProvisional = current.provisionalOutcome === true;
         const resettleStaleTerminal =
           params.allowTerminalResettle === true &&
           this.isTerminalWorkspaceTurnStatus(current.status) &&
-          current.status !== "completed" &&
-          isSelfHealEligibleSettledWorkspaceTurn(current) &&
+          (current.status !== "completed" || currentIsProvisional) &&
+          (currentIsProvisional || isSelfHealEligibleSettledWorkspaceTurn(current)) &&
           (params.next.status !== current.status || params.next.messageId !== current.messageId);
         if (this.isTerminalWorkspaceTurnStatus(current.status) && !resettleStaleTerminal) {
           const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(params.record.workspaceId);
@@ -2231,6 +2237,7 @@ export class WorkspaceTurnManager {
             nextStatus: nextRecord.status,
           });
           delete nextRecord.terminalAttentionNotifiedAt;
+          delete nextRecord.provisionalOutcome;
         }
         if (suppressedQuietSettlement) {
           // Downgrade-compatible suppression marker (upgrade↔downgrade rule):
@@ -3804,7 +3811,9 @@ export class WorkspaceTurnManager {
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     const hasRuntimeActivity =
       this.aiService.isStreaming(record.workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId);
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId) ||
+      this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
+      this.workspaceService.hasPendingBashMonitorWakeContinuation(record.workspaceId);
     if (hasRuntimeActivity) {
       return true;
     }
@@ -4065,6 +4074,26 @@ export class WorkspaceTurnManager {
     };
   }
 
+  /** Rebuild a deferred uncorrelated wake end after its continuation evidence clears. */
+  private buildDeferredWakeEndEventFromHistory(
+    record: WorkspaceTurnTaskHandleRecord,
+    message: MuxMessage
+  ): StreamEndEvent | null {
+    if (message.role !== "assistant" || message.metadata?.partial === true) {
+      return null;
+    }
+    return {
+      type: "stream-end",
+      workspaceId: record.workspaceId,
+      messageId: message.id,
+      metadata: {
+        ...message.metadata,
+        model: coerceNonEmptyString(message.metadata?.model) ?? record.modelString ?? defaultModel,
+      },
+      parts: message.parts as StreamEndEvent["parts"],
+    };
+  }
+
   private buildTerminalWorkspaceTurnRecordFromEvent(
     record: WorkspaceTurnTaskHandleRecord,
     event: StreamEndEvent,
@@ -4073,6 +4102,7 @@ export class WorkspaceTurnManager {
     const baseRecord = { ...record };
     delete baseRecord.error;
     delete baseRecord.deferredMessageIds;
+    delete baseRecord.provisionalOutcome;
     // A "tool-calls" finish on a delegated turn backed by queue-dispatch
     // evidence is a queue cut: some other queued input (a manual user message,
     // /compact, the owner's own follow-up turn) dispatched at the tool boundary
@@ -4159,10 +4189,13 @@ export class WorkspaceTurnManager {
 
     const allowDeferredMessages = !(await this.hasActiveWorkspaceTurnDeferredBlockers(record));
     for (const message of historyResult.data.toReversed()) {
-      if (this.isDeferredWorkspaceTurnMessage(record, message.id) && !allowDeferredMessages) {
+      const isDeferred = this.isDeferredWorkspaceTurnMessage(record, message.id);
+      if (isDeferred && !allowDeferredMessages) {
         continue;
       }
-      const event = this.buildWorkspaceTurnStreamEndEventFromHistory(record, message);
+      const event =
+        this.buildWorkspaceTurnStreamEndEventFromHistory(record, message) ??
+        (isDeferred ? this.buildDeferredWakeEndEventFromHistory(record, message) : null);
       if (event != null) {
         // History order alone cannot prove a queue cut (a later unrelated user
         // message is not causal evidence), so stale recovery conservatively
@@ -4217,39 +4250,6 @@ export class WorkspaceTurnManager {
     };
   }
 
-  private async isStreamEndBeforeWorkspaceTurnPrompt(
-    record: WorkspaceTurnTaskHandleRecord,
-    event: StreamEndEvent
-  ): Promise<boolean> {
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
-    if (!historyResult.success) {
-      log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
-        workspaceId: event.workspaceId,
-        handleId: record.handleId,
-        error: historyResult.error,
-      });
-      return false;
-    }
-
-    let streamEndIndex = -1;
-    let promptIndex = -1;
-    for (const [index, message] of historyResult.data.entries()) {
-      if (message.id === event.messageId) {
-        streamEndIndex = index;
-      }
-      const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
-      if (
-        metadata?.taskHandleId === record.handleId &&
-        metadata.ownerWorkspaceId === record.ownerWorkspaceId &&
-        metadata.turnId === record.turnId
-      ) {
-        promptIndex = index;
-      }
-    }
-
-    return streamEndIndex !== -1 && promptIndex !== -1 && streamEndIndex < promptIndex;
-  }
-
   private async interruptWorkspaceTurnFromUncorrelatedStreamEnd(
     event: StreamEndEvent
   ): Promise<boolean> {
@@ -4281,7 +4281,34 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    if (await this.isStreamEndBeforeWorkspaceTurnPrompt(record, event)) {
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+    if (!historyResult.success) {
+      log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
+        workspaceId: event.workspaceId,
+        handleId: record.handleId,
+        error: historyResult.error,
+      });
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+      return true;
+    }
+
+    let streamEndIndex = -1;
+    let promptIndex = -1;
+    for (const [index, message] of historyResult.data.entries()) {
+      if (message.id === event.messageId) {
+        streamEndIndex = index;
+      }
+      const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
+      if (
+        metadata?.taskHandleId === record.handleId &&
+        metadata.ownerWorkspaceId === record.ownerWorkspaceId &&
+        metadata.turnId === record.turnId
+      ) {
+        promptIndex = index;
+      }
+    }
+
+    if (streamEndIndex !== -1 && promptIndex !== -1 && streamEndIndex < promptIndex) {
       log.debug("Ignoring stale uncorrelated stream-end before queued workspace turn prompt", {
         workspaceId: event.workspaceId,
         taskHandleId: record.handleId,
@@ -4290,6 +4317,96 @@ export class WorkspaceTurnManager {
       return true;
     }
 
+    if (promptIndex !== -1) {
+      const scanEnd = streamEndIndex === -1 ? historyResult.data.length : streamEndIndex;
+      const hasManualSupersessionInput = historyResult.data
+        .slice(promptIndex + 1, scanEnd)
+        .some(isManualChildWorkspaceInput);
+      if (hasManualSupersessionInput) {
+        await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+        return true;
+      }
+
+      if (await this.hasLiveUncorrelatedWakeContinuationEvidence(event, record)) {
+        await this.persistDeferredUncorrelatedWakeEnd(record, event);
+        return true;
+      }
+
+      const next = this.buildTerminalWorkspaceTurnRecordFromEvent(record, event, {
+        supersedeEvidence: null,
+      });
+      next.provisionalOutcome = true;
+      await this.settleWorkspaceTurn({
+        record,
+        next,
+        waiterSettlement:
+          next.status === "completed"
+            ? { status: "completed", result: this.buildWorkspaceTurnWaitResult(next) }
+            : { status: "error", error: new Error(next.error ?? "Workspace turn failed") },
+        allowTerminalResettle: true,
+      });
+      return true;
+    }
+
+    await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event);
+    return true;
+  }
+
+  private async hasLiveUncorrelatedWakeContinuationEvidence(
+    event: StreamEndEvent,
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<boolean> {
+    if (await this.hasActiveWorkspaceTurnDeferredBlockers(record)) {
+      return true;
+    }
+    if (
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(event.workspaceId) ||
+      this.workspaceService.hasPendingAutoRetry(event.workspaceId) ||
+      this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)
+    ) {
+      return true;
+    }
+    if (
+      this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
+        type: "workspace-turn-task",
+        taskHandleId: record.handleId,
+        ownerWorkspaceId: record.ownerWorkspaceId,
+        turnId: record.turnId,
+      })
+    ) {
+      return true;
+    }
+    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
+    return activeStream != null && activeStream.messageId !== event.messageId;
+  }
+
+  private async persistDeferredUncorrelatedWakeEnd(
+    record: WorkspaceTurnTaskHandleRecord,
+    event: StreamEndEvent
+  ): Promise<void> {
+    await this.workspaceTurnSettlementLocks.withLock(record.handleId, async () => {
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        record.handleId
+      );
+      if (current == null || !isActiveWorkspaceTurnTaskStatus(current.status)) {
+        return;
+      }
+      if (this.isDeferredWorkspaceTurnMessage(current, event.messageId)) {
+        return;
+      }
+      await this.taskHandleStore.upsertWorkspaceTurn({
+        ...current,
+        updatedAt: getIsoNow(),
+        deferredMessageIds: [...(current.deferredMessageIds ?? []), event.messageId],
+      });
+    });
+  }
+
+  private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
+    record: WorkspaceTurnTaskHandleRecord,
+    event: StreamEndEvent
+  ): Promise<void> {
     const error = "Workspace turn superseded by an uncorrelated workspace stream-end";
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
@@ -4298,12 +4415,13 @@ export class WorkspaceTurnManager {
       messageId: event.messageId,
       error,
     };
+    delete next.provisionalOutcome;
+    delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
     });
-    return true;
   }
 
   /**

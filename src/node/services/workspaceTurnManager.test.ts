@@ -24,6 +24,7 @@ import type { AIService } from "@/node/services/aiService";
 import type {
   WorkspaceHost,
   BackgroundableForegroundWaiter,
+  QueueCutAttributionSnapshot,
   WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -359,6 +360,63 @@ describe("WorkspaceTurnManager", () => {
       aiMocks,
       historyService,
       created: created.data,
+    };
+  }
+
+  async function finalizeWorkspaceTurnStreamEndForTest(
+    taskService: WorkspaceTurnManager,
+    event: StreamEndEvent
+  ): Promise<boolean> {
+    const internal = taskService as unknown as {
+      captureQueueCutAttributionSnapshot: (workspaceId: string) => QueueCutAttributionSnapshot;
+      finalizeWorkspaceTurnFromStreamEnd: (
+        event: StreamEndEvent,
+        queueCutSnapshot: QueueCutAttributionSnapshot
+      ) => Promise<boolean>;
+    };
+    return await internal.finalizeWorkspaceTurnFromStreamEnd(
+      event,
+      internal.captureQueueCutAttributionSnapshot(event.workspaceId)
+    );
+  }
+
+  async function appendUncorrelatedWakeHistory(params: {
+    historyService: HistoryService;
+    parentId: string;
+    taskId: string;
+    workspaceId: string;
+    inputSynthetic: boolean;
+  }): Promise<StreamEndEvent> {
+    const prompt = createMuxMessage("turn-prompt", "user", "Summarize the repo", {
+      muxMetadata: workspaceTurnMuxMetadata(params.parentId, params.taskId),
+    });
+    expect((await params.historyService.appendToHistory(params.workspaceId, prompt)).success).toBe(
+      true
+    );
+    const input = createMuxMessage("wake-input", "user", "Continue after a wake", {
+      synthetic: params.inputSynthetic,
+    });
+    expect((await params.historyService.appendToHistory(params.workspaceId, input)).success).toBe(
+      true
+    );
+    const output = createMuxMessage("wake-output", "assistant", "Wake result", {
+      model: "anthropic:claude-opus-4-6",
+      agentId: "exec",
+      finishReason: "stop",
+    });
+    expect((await params.historyService.appendToHistory(params.workspaceId, output)).success).toBe(
+      true
+    );
+    return {
+      type: "stream-end",
+      workspaceId: params.workspaceId,
+      messageId: output.id,
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "stop",
+      },
+      parts: [{ type: "text", text: "Wake result" }],
     };
   }
 
@@ -3835,6 +3893,88 @@ describe("WorkspaceTurnManager", () => {
     expect(handled).toBe(true);
     const snapshot = await workspaceTurnSnapshot(taskService, parentId, created.taskId);
     expect(snapshot).toMatchObject({ status: "running", workspaceId: created.workspaceId });
+  });
+
+  test("uncorrelated synthetic wake end stays active while a continuation is live", async () => {
+    let monitorWakePending = true;
+    const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest({
+      hasPendingBashMonitorWakeContinuation: mock(() => monitorWakePending),
+    });
+    const event = await appendUncorrelatedWakeHistory({
+      historyService,
+      parentId,
+      taskId: created.taskId,
+      workspaceId: created.workspaceId,
+      inputSynthetic: true,
+    });
+
+    expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, event)).toBe(true);
+    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
+      status: "running",
+      deferredMessageIds: ["wake-output"],
+    });
+
+    monitorWakePending = false;
+    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
+      status: "completed",
+      messageId: "wake-output",
+      reportMarkdown: "Wake result",
+    });
+  });
+
+  test("idle uncorrelated synthetic wake end settles provisionally from the wake output", async () => {
+    const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest();
+    const event = await appendUncorrelatedWakeHistory({
+      historyService,
+      parentId,
+      taskId: created.taskId,
+      workspaceId: created.workspaceId,
+      inputSynthetic: true,
+    });
+
+    expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, event)).toBe(true);
+    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
+      status: "completed",
+      messageId: "wake-output",
+      reportMarkdown: "Wake result",
+      provisionalOutcome: true,
+    });
+
+    const correlatedFinal: StreamEndEvent = {
+      ...event,
+      messageId: "real-final",
+      metadata: {
+        ...event.metadata,
+        muxMetadata: workspaceTurnMuxMetadata(parentId, created.taskId),
+      },
+      parts: [{ type: "text", text: "Real final result" }],
+    };
+    expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, correlatedFinal)).toBe(true);
+    const corrected = await workspaceTurnSnapshot(taskService, parentId, created.taskId);
+    expect(corrected).toMatchObject({
+      status: "completed",
+      messageId: "real-final",
+      reportMarkdown: "Real final result",
+    });
+    expect(corrected?.provisionalOutcome).toBeUndefined();
+  });
+
+  test("manual user input still supersedes an active workspace turn on uncorrelated end", async () => {
+    const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest();
+    const event = await appendUncorrelatedWakeHistory({
+      historyService,
+      parentId,
+      taskId: created.taskId,
+      workspaceId: created.workspaceId,
+      inputSynthetic: false,
+    });
+
+    expect(await finalizeWorkspaceTurnStreamEndForTest(taskService, event)).toBe(true);
+    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
+      status: "interrupted",
+      messageId: "wake-output",
+      error: "Workspace turn superseded by an uncorrelated workspace stream-end",
+    });
   });
 
   test("getWorkspaceTurnSnapshot recovers stale completed handles from matching history", async () => {
