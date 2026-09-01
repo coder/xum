@@ -438,6 +438,65 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("keeps a provider-tool queue cut after monitor cancellation", async () => {
+    const workspaceId = "queue-dispatch-provider-tool-monitor-wake";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      const initialSend = await session.sendMessage("Start work", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(initialSend.success).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+
+      const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      const onCanceled = mock(() => undefined);
+      session.queueMessage(
+        "Background monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          queueDispatchMode: "tool-end",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelState,
+          cancelSignal: controller.signal,
+          onCanceled,
+        }
+      );
+
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(await waitForCondition(() => stopStream.mock.calls.length === 1)).toBe(true);
+
+      controller.abort("task_await returned the terminal output");
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(cancelState.canceledBeforeAcceptance).toBe(false);
+      expect(onCanceled).not.toHaveBeenCalled();
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("waits for every known sibling before stopping after a provider-executed result", async () => {
     const workspaceId = "queue-dispatch-provider-siblings";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({

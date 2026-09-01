@@ -6775,7 +6775,7 @@ export class AgentSession {
       this.turnPhase !== TurnPhase.STREAMING ||
       this.queuedProviderToolEndAbortInFlight ||
       this.activeToolCallIds.size > 0 ||
-      !this.hasQueuedMessages("tool-end")
+      !this.messageQueue.claimNextToolEndEntry()
     ) {
       return;
     }
