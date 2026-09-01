@@ -2457,6 +2457,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       let accepted = false;
+      // A queued wake can be superseded after dequeue. Share cancellation state so
+      // AgentSession can release PREPARING when cancellation wins before acceptance.
+      const cancelState = { canceledBeforeAcceptance: false };
       const sendResult = await this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
@@ -2469,6 +2472,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
+          cancelState,
           cancelSignal: dispatch.cancelSignal,
           queueDedupeKey: dispatch.dedupeKey,
           removableQueueDedupeKey: true,

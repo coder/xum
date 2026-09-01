@@ -784,9 +784,16 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       runtimeConfig: { type: "local" },
     });
     let queuedMode: string | undefined;
+    let queuedCancelState: { canceledBeforeAcceptance: boolean } | undefined;
     const sendMessage = mock(
-      (_workspaceId: string, _prompt: string, options: { queueDispatchMode?: string }) => {
+      (
+        _workspaceId: string,
+        _prompt: string,
+        options: { queueDispatchMode?: string },
+        internal?: { cancelState?: { canceledBeforeAcceptance: boolean } }
+      ) => {
         queuedMode = options.queueDispatchMode;
+        queuedCancelState = internal?.cancelState;
         return Promise.resolve(Ok(undefined));
       }
     );
@@ -829,6 +836,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(outcome).toBe("in-flight");
       expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(queuedMode).toBe("tool-end");
+      expect(queuedCancelState).toEqual({ canceledBeforeAcceptance: false });
       expect(afterIdle).not.toHaveBeenCalled();
     } finally {
       await cleanup();
