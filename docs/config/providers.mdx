@@ -282,9 +282,11 @@ custom-named provider instances that Xum cannot discover, declare them by hand i
 }
 ```
 
-Login is available from the desktop app or a locally hosted Xum server. On a remote Xum
-server the OAuth callback cannot reach your browser's machine (Coder does not support the
-device-authorization grant), so login is disabled there.
+Login works from the desktop app and from a browser connected to a Xum server, including a
+remote one: in the desktop app the OAuth callback lands on a loopback listener on your
+machine, while in the browser Xum registers a callback URL on the server's own origin
+(`/auth/coder/callback`) so the redirect reaches the server directly. A remote server must
+be reachable over HTTPS for Coder to accept that callback URL.
 
 ### Bedrock Authentication
 
