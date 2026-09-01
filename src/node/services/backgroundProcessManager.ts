@@ -875,14 +875,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
 
     const retainedMatch = monitor.retainedMatches[monitor.retainedMatches.length - 1];
+    const retainedMatchedThroughOffset = includeMatched
+      ? monitor.matchedThroughOffset
+      : retainedMatch?.matchedThroughOffset;
     monitor.settlementDisposition = {
       status: terminal.status,
       ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
       settledAt: new Date().toISOString(),
       wakeOnExit: monitor.wakeOnExit,
       terminalStatusShown: proc.terminalStatusShownToAgent,
-      ...(retainedMatch != null
-        ? { matchedThroughOffset: retainedMatch.matchedThroughOffset }
+      ...(retainedMatchedThroughOffset != null
+        ? { matchedThroughOffset: retainedMatchedThroughOffset }
         : {}),
       tailLines,
     };

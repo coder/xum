@@ -1841,6 +1841,8 @@ describe("BackgroundProcessManager", () => {
       it("wake_on_exit=false still flushes pending matched lines without terminal metadata", async () => {
         const matchEvents: MonitorMatchPayload[] = [];
         manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
         const result = await manager.spawn(
           runtime,
@@ -1869,6 +1871,10 @@ describe("BackgroundProcessManager", () => {
         expect(matchEvents[0].lines).toEqual(["ERR boom"]);
         expect(matchEvents[0].terminal).toBeUndefined();
         expect(matchEvents[0].matchedThroughOffset).toBeDefined();
+        expect(stoppedEvents).toHaveLength(1);
+        expect(stoppedEvents[0].terminal?.matchedThroughOffset).toBe(
+          matchEvents[0].matchedThroughOffset
+        );
       });
 
       it("does not settle after maxEvents retirement", async () => {
