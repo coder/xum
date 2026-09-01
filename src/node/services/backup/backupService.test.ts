@@ -79,10 +79,18 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
   return {
     exportTo: () => Promise.resolve({ redactions: [], secretFiles: [], secretApproval: "" }),
     previewRestore: () =>
-      Promise.resolve({ changes: [], localOnlyFiles: [], commandApprovals: [] }),
-    validateRestore: () => Promise.resolve(),
+      Promise.resolve({
+        changes: [],
+        localOnlyFiles: [],
+        commandApprovals: [],
+        projectImports: [],
+        projectBundleSkipped: false,
+      }),
+    validateRestore: () => Promise.resolve({ hasProjectBundle: false, projectImports: [] }),
     writeSafetySnapshot: () => Promise.resolve(),
-    restore: () => Promise.resolve({ changedFiles: [], localOnlyFiles: [] }),
+    restore: () =>
+      Promise.resolve({ changedFiles: [], localOnlyFiles: [], projectBundleSkipped: false }),
+    importProjectMemory: () => Promise.resolve({ writtenFiles: [], skippedFiles: [] }),
     ...overrides,
   };
 }
@@ -117,7 +125,7 @@ describe("BackupService", () => {
       payload: createPayload({
         validateRestore: () => {
           events.push("validate");
-          return Promise.resolve();
+          return Promise.resolve({ hasProjectBundle: false, projectImports: [] });
         },
         writeSafetySnapshot: async (snapshotRoot) => {
           events.push("snapshot");
@@ -128,6 +136,7 @@ describe("BackupService", () => {
           return Promise.resolve({
             changedFiles: ["AGENTS.md"],
             localOnlyFiles: ["skills/local/SKILL.md"],
+            projectBundleSkipped: false,
           });
         },
       }),
@@ -316,7 +325,13 @@ describe("BackupService", () => {
         previewRestore: async () => {
           activeEntered?.();
           await activeHeld;
-          return { changes: [], localOnlyFiles: [], commandApprovals: [] };
+          return {
+            changes: [],
+            localOnlyFiles: [],
+            commandApprovals: [],
+            projectImports: [],
+            projectBundleSkipped: false,
+          };
         },
       }),
     });
@@ -357,7 +372,7 @@ describe("BackupService", () => {
           restoreEntered?.();
           await restoreHeld;
           events.push("restore-end");
-          return { changedFiles: ["AGENTS.md"], localOnlyFiles: [] };
+          return { changedFiles: ["AGENTS.md"], localOnlyFiles: [], projectBundleSkipped: false };
         },
         exportTo: () => {
           events.push("export");
@@ -468,6 +483,8 @@ describe("BackupService", () => {
             changes: [{ path: "preferences.json", status: "M" }],
             localOnlyFiles: [],
             commandApprovals: [],
+            projectImports: [],
+            projectBundleSkipped: false,
           });
         },
         exportTo: () => {
@@ -498,7 +515,13 @@ describe("BackupService", () => {
       payload: createPayload({
         previewRestore: (options) => {
           recordManagedPath(options);
-          return Promise.resolve({ changes: [], localOnlyFiles: [], commandApprovals: [] });
+          return Promise.resolve({
+            changes: [],
+            localOnlyFiles: [],
+            commandApprovals: [],
+            projectImports: [],
+            projectBundleSkipped: false,
+          });
         },
         exportTo: (options) => {
           recordManagedPath(options);
@@ -506,11 +529,11 @@ describe("BackupService", () => {
         },
         validateRestore: (options) => {
           recordManagedPath(options);
-          return Promise.resolve();
+          return Promise.resolve({ hasProjectBundle: false, projectImports: [] });
         },
         restore: (options) => {
           recordManagedPath(options);
-          return Promise.resolve({ changedFiles: [], localOnlyFiles: [] });
+          return Promise.resolve({ changedFiles: [], localOnlyFiles: [], projectBundleSkipped: false });
         },
       }),
     });
@@ -953,7 +976,7 @@ describe("BackupService", () => {
           const tokens = [...(approvedCommandTokens ?? [])];
           seenTokens.push(tokens);
           return tokens.includes("approved-token")
-            ? Promise.resolve()
+            ? Promise.resolve({ hasProjectBundle: false, projectImports: [] })
             : Promise.reject(new BackupCommandApprovalRequiredError(approvals));
         },
       }),

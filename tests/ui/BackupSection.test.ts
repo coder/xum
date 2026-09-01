@@ -46,12 +46,16 @@ function renderBackupSection(
       localOnlyFiles: ["agents/local-only.md"],
       redactions: ["mcp.jsonc: github.headers.Authorization"],
       commandApprovals: [],
+      projectImports: [],
+      projectBundleSkipped: false,
     },
     backupRestore: {
       commit: "def5678",
       snapshotPath: "/tmp/mux-backup-snapshot",
       changedFiles: ["preferences.json"],
       localOnlyFiles: ["agents/local.md"],
+      projectImportResults: [],
+      projectBundleSkipped: false,
     },
     ...overrides,
   });
@@ -117,6 +121,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/other.git",
         branch: "release",
         path: "shared/",
+        includeProjects: false,
       })
     );
     await canvas.findByText("Backup to repository");
@@ -344,6 +349,7 @@ describe("BackupSection", () => {
         repoUrl: "git@github.com:example/new.git",
         branch: "main",
         path: "mux/",
+        includeProjects: false,
         approvedSecretDigest: undefined,
       })
     );
@@ -478,6 +484,8 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         redactions: [],
         commandApprovals: [approval],
+        projectImports: [],
+        projectBundleSkipped: false,
       },
     });
     const canvas = within(view.container);
@@ -539,6 +547,8 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         redactions: [],
         commandApprovals: [approval],
+        projectImports: [],
+        projectBundleSkipped: false,
       },
     });
     const canvas = within(view.container);
@@ -583,6 +593,8 @@ describe("BackupSection", () => {
         snapshotPath: "/tmp/mux-backup-snapshot",
         changedFiles: [],
         localOnlyFiles: [],
+        projectImportResults: [],
+        projectBundleSkipped: false,
       },
     });
 

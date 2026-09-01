@@ -84,6 +84,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   SETTINGS_BACKUP_RESTORE: "Restore settings backup",
   SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN: "Toggle secret scan override",
   SETTINGS_BACKUP_APPROVE_COMMANDS: "Toggle MCP command approval",
+  SETTINGS_BACKUP_TOGGLE_PROJECTS: "Toggle project backup",
   // Modal-only keybinds; intentionally omitted from KEYBIND_GROUPS.
   CONFIRM_DIALOG_YES: "Confirm dialog action",
   CONFIRM_DIALOG_NO: "Cancel dialog action",
@@ -231,6 +232,7 @@ const KEYBIND_GROUPS: Array<{
       "SETTINGS_BACKUP_RESTORE",
       "SETTINGS_BACKUP_OVERRIDE_SECRET_SCAN",
       "SETTINGS_BACKUP_APPROVE_COMMANDS",
+      "SETTINGS_BACKUP_TOGGLE_PROJECTS",
     ],
   },
   {

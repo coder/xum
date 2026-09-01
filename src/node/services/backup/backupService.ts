@@ -10,6 +10,8 @@ import {
   type BackupCredentialKind,
   type BackupFileChange,
   type BackupOperationError,
+  type BackupProjectImport,
+  type BackupProjectImportResult,
 } from "@/common/orpc/schemas/backup";
 import {
   SettingsBackupInputSchema,
@@ -23,7 +25,10 @@ import {
   isBackupCacheName,
   reapDiscardedBackupCaches,
 } from "./gitRepo";
-import { BackupCommandApprovalRequiredError } from "./payload";
+import {
+  BackupCommandApprovalRequiredError,
+  BackupProjectImportApprovalRequiredError,
+} from "./payload";
 
 export interface PreparedBackupRepository {
   rootDir: string;
@@ -61,23 +66,54 @@ export interface BackupPayloadStore {
   exportTo(options: {
     repositoryRoot: string;
     managedPath: string;
+    includeProjects: boolean;
   }): Promise<{ redactions: string[]; secretFiles: string[]; secretApproval: string }>;
-  previewRestore(options: { repositoryRoot: string; managedPath: string }): Promise<{
+  previewRestore(options: {
+    repositoryRoot: string;
+    managedPath: string;
+    includeProjects: boolean;
+  }): Promise<{
     changes: BackupFileChange[];
     localOnlyFiles: string[];
     commandApprovals: BackupCommandApproval[];
+    projectImports: BackupProjectImport[];
+    projectBundleSkipped: boolean;
   }>;
   validateRestore(options: {
     repositoryRoot: string;
     managedPath: string;
     approvedCommandTokens?: readonly string[];
-  }): Promise<void>;
-  writeSafetySnapshot(snapshotRoot: string): Promise<void>;
+    includeProjects: boolean;
+  }): Promise<{ hasProjectBundle: boolean; projectImports: BackupProjectImport[] }>;
+  writeSafetySnapshot(
+    snapshotRoot: string,
+    options: { includeProjectMemory: boolean }
+  ): Promise<void>;
   restore(options: {
     repositoryRoot: string;
     managedPath: string;
     approvedCommandTokens?: readonly string[];
-  }): Promise<{ changedFiles: string[]; localOnlyFiles: string[] }>;
+    includeProjects: boolean;
+  }): Promise<{ changedFiles: string[]; localOnlyFiles: string[]; projectBundleSkipped: boolean }>;
+  /**
+   * Writes one approved import's memory files, re-keyed to the target path's locally
+   * computed directory, add-only. Runs after the project was registered so no path ever
+   * holds the memory mutation lock while entering config edits.
+   */
+  importProjectMemory(options: {
+    repositoryRoot: string;
+    managedPath: string;
+    token: string;
+    targetPath: string;
+  }): Promise<{ writtenFiles: string[]; skippedFiles: string[] }>;
+}
+
+/**
+ * The slice of ProjectService a restore needs to register an approved import. Injected via
+ * setter because the container constructs BackupService before ProjectService.
+ */
+export interface BackupProjectRegistrar {
+  create(projectPath: string): Promise<Result<{ normalizedPath: string }, string>>;
 }
 
 export interface BackupServiceDependencies {
@@ -152,6 +188,16 @@ function toOperationError(error: unknown): BackupOperationError {
       code: error.code,
       message: error.message,
       commandApprovals: [...error.approvals],
+    };
+  }
+
+  // Same round trip for project imports: the error carries the candidates recomputed from
+  // the currently checked-out payload, so a stale approval can be re-made from fresh data.
+  if (error instanceof BackupProjectImportApprovalRequiredError) {
+    return {
+      code: error.code,
+      message: error.message,
+      projectImports: [...error.projectImports],
     };
   }
 
@@ -254,10 +300,17 @@ export class BackupService {
    */
   private snapshotSequence = 0;
 
+  /** Absent until the container wires ProjectService; imports fail per candidate without it. */
+  private projectRegistrar: BackupProjectRegistrar | null = null;
+
   constructor(
     private readonly config: Config,
     private readonly dependencies: BackupServiceDependencies
   ) {}
+
+  setProjectService(projectRegistrar: BackupProjectRegistrar): void {
+    this.projectRegistrar = projectRegistrar;
+  }
 
   getSettings(): SettingsBackup | null {
     return this.config.loadConfigOrDefault().settingsBackup ?? null;
@@ -300,11 +353,14 @@ export class BackupService {
         localOnlyFiles: string[];
         redactions: string[];
         commandApprovals: BackupCommandApproval[];
+        projectImports: BackupProjectImport[];
+        projectBundleSkipped: boolean;
       },
       BackupOperationError
     >
   > {
     return this.withRepoLock(settings, async (normalized) => {
+      const includeProjects = normalized.includeProjects === true;
       const repository = await this.prepareRepository(normalized);
       // One critical section: the reported restore plan and the exported payload must describe
       // the same local state, or the two halves of the preview disagree.
@@ -312,10 +368,12 @@ export class BackupService {
         restorePreview: await this.dependencies.payload.previewRestore({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
+          includeProjects,
         }),
         exported: await this.dependencies.payload.exportTo({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
+          includeProjects,
         }),
       }));
       const pushChanges = await this.dependencies.gitRepo.getPushChanges(repository);
@@ -325,6 +383,8 @@ export class BackupService {
         localOnlyFiles: restorePreview.localOnlyFiles,
         redactions: exported.redactions,
         commandApprovals: restorePreview.commandApprovals,
+        projectImports: restorePreview.projectImports,
+        projectBundleSkipped: restorePreview.projectBundleSkipped,
       });
     });
   }
@@ -335,10 +395,16 @@ export class BackupService {
   }
 
   restoreWithApproval(
-    input: SettingsBackupInput & { approvedCommandTokens?: readonly string[] | null }
+    input: SettingsBackupInput & {
+      approvedCommandTokens?: readonly string[] | null;
+      projectImports?: ReadonlyArray<{ token: string; targetPath: string }> | null;
+    }
   ) {
-    const { approvedCommandTokens, ...settings } = input;
-    return this.restore(settings, { approvedCommandTokens: approvedCommandTokens ?? undefined });
+    const { approvedCommandTokens, projectImports, ...settings } = input;
+    return this.restore(settings, {
+      approvedCommandTokens: approvedCommandTokens ?? undefined,
+      projectImports: projectImports ?? undefined,
+    });
   }
 
   async push(
@@ -362,6 +428,7 @@ export class BackupService {
         this.dependencies.payload.exportTo({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
+          includeProjects: normalized.includeProjects === true,
         })
       );
       // Approval is bound to the exact flagged bytes, so an override the user granted for
@@ -391,16 +458,28 @@ export class BackupService {
 
   async restore(
     settings: SettingsBackupInput,
-    options: { approvedCommandTokens?: readonly string[] } = {}
+    options: {
+      approvedCommandTokens?: readonly string[];
+      projectImports?: ReadonlyArray<{ token: string; targetPath: string }>;
+    } = {}
   ): Promise<
     Result<
-      { commit: string; snapshotPath: string; changedFiles: string[]; localOnlyFiles: string[] },
+      {
+        commit: string;
+        snapshotPath: string;
+        changedFiles: string[];
+        localOnlyFiles: string[];
+        projectImportResults: BackupProjectImportResult[];
+        projectBundleSkipped: boolean;
+      },
       BackupOperationError
     >
   > {
     const approvedCommandTokens =
       options.approvedCommandTokens == null ? undefined : [...options.approvedCommandTokens];
+    const requestedImports = options.projectImports == null ? [] : [...options.projectImports];
     return this.withRepoLock(settings, async (normalized) => {
+      const includeProjects = normalized.includeProjects === true;
       const repository = await this.prepareRepository(normalized);
       const remoteCommit = repository.remoteCommit;
       if (remoteCommit == null) {
@@ -413,14 +492,25 @@ export class BackupService {
       return await this.withLocalPayload(async () => {
         // Before the snapshot, so a restore blocked on command approval does not leave an
         // unredacted copy of the local settings on disk.
-        await this.dependencies.payload.validateRestore({
+        const validated = await this.dependencies.payload.validateRestore({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
           approvedCommandTokens,
+          includeProjects,
         });
+        // Import approvals are also checked before the snapshot and before any mutation: a
+        // stale token or an unusable target directory refuses the whole restore while
+        // nothing has changed yet. Runtime failures after this point are per-candidate.
+        const plannedImports = await this.planProjectImports(
+          requestedImports,
+          validated.projectImports,
+          includeProjects
+        );
         const snapshotPath = await this.createSnapshotPath();
         try {
-          await this.dependencies.payload.writeSafetySnapshot(snapshotPath);
+          await this.dependencies.payload.writeSafetySnapshot(snapshotPath, {
+            includeProjectMemory: includeProjects && validated.hasProjectBundle,
+          });
         } catch (error) {
           // Nothing has been restored yet, so a snapshot that did not finish is an empty or
           // partial unredacted copy that no recovery can use, and every retry would add one.
@@ -432,13 +522,17 @@ export class BackupService {
             repositoryRoot: repository.rootDir,
             managedPath: repository.managedPath,
             approvedCommandTokens,
+            includeProjects,
           });
+          const projectImportResults = await this.executeProjectImports(repository, plannedImports);
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
           return Ok({
             commit: remoteCommit,
             snapshotPath,
             changedFiles: restored.changedFiles,
             localOnlyFiles: restored.localOnlyFiles,
+            projectImportResults,
+            projectBundleSkipped: restored.projectBundleSkipped,
           });
         } catch (error) {
           // Past the snapshot, the restore may have overwritten files before failing, and
@@ -453,6 +547,131 @@ export class BackupService {
         }
       });
     });
+  }
+
+  /**
+   * Everything about an import request that can be refused while the restore has changed
+   * nothing yet: tokens must match the candidates recomputed from the currently checked-out
+   * payload, and each target must already be a real local directory — `ProjectService.create`
+   * would otherwise mkdir a typo into existence.
+   */
+  private async planProjectImports(
+    requested: ReadonlyArray<{ token: string; targetPath: string }>,
+    candidates: readonly BackupProjectImport[],
+    includeProjects: boolean
+  ): Promise<Array<{ candidate: BackupProjectImport; targetPath: string }>> {
+    if (requested.length === 0) return [];
+    if (!includeProjects) {
+      throw new BackupServiceError(
+        "IO_ERROR",
+        "Project imports require the project backup setting to be enabled"
+      );
+    }
+    const byToken = new Map(candidates.map((candidate) => [candidate.token, candidate]));
+    const planned: Array<{ candidate: BackupProjectImport; targetPath: string }> = [];
+    const claimedTargets = new Set<string>();
+    for (const request of requested) {
+      const candidate = byToken.get(request.token);
+      // Unknown and stale tokens are indistinguishable here; both mean the user approved
+      // something other than what the repository currently holds.
+      if (candidate === undefined) {
+        throw new BackupProjectImportApprovalRequiredError(candidates);
+      }
+      byToken.delete(request.token);
+      const targetPath = request.targetPath.trim();
+      if (!path.isAbsolute(targetPath)) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': the target path must be absolute`
+        );
+      }
+      const resolved = path.resolve(targetPath);
+      if (claimedTargets.has(resolved)) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': another import already targets '${resolved}'`
+        );
+      }
+      claimedTargets.add(resolved);
+      const stat = await fs.lstat(resolved).catch(() => null);
+      // A symlinked target would register the link's path while memory lands under a dir
+      // name derived from it; require the plain directory itself.
+      if (stat === null || !stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': '${resolved}' is not an existing directory`
+        );
+      }
+      planned.push({ candidate, targetPath: resolved });
+    }
+    return planned;
+  }
+
+  /**
+   * Registration before the memory write, per candidate: a crash between the two leaves a
+   * registered project without memory, which is benign, rather than orphaned live memory.
+   * Failures land in the result instead of aborting the restore or the other candidates —
+   * the safety snapshot cannot revert a project registration, so an abort here would not
+   * roll anything back anyway; the result is the user's undo list.
+   */
+  private async executeProjectImports(
+    repository: PreparedBackupRepository,
+    planned: ReadonlyArray<{ candidate: BackupProjectImport; targetPath: string }>
+  ): Promise<BackupProjectImportResult[]> {
+    const results: BackupProjectImportResult[] = [];
+    for (const { candidate, targetPath } of planned) {
+      const failed = (message: string): BackupProjectImportResult => ({
+        sourcePath: candidate.sourcePath,
+        targetPath,
+        name: candidate.name,
+        status: "failed",
+        message,
+        writtenFiles: [],
+        skippedFiles: [],
+      });
+      try {
+        if (this.projectRegistrar === null) {
+          results.push(failed("Project registration is unavailable"));
+          continue;
+        }
+        // Re-verify under the local payload lock: the preflight ran before the snapshot and
+        // the directory may have vanished since.
+        const stat = await fs.lstat(targetPath).catch(() => null);
+        if (stat === null || !stat.isDirectory()) {
+          results.push(failed(`'${targetPath}' is not an existing directory`));
+          continue;
+        }
+        const created = await this.projectRegistrar.create(targetPath);
+        let registeredPath: string;
+        if (created.success) {
+          registeredPath = created.data.normalizedPath;
+        } else if (created.error === "Project already exists") {
+          // Already registered at exactly this path is the idempotent case: the import
+          // then only adds the memory files.
+          registeredPath = path.resolve(targetPath);
+        } else {
+          results.push(failed(created.error));
+          continue;
+        }
+        const written = await this.dependencies.payload.importProjectMemory({
+          repositoryRoot: repository.rootDir,
+          managedPath: repository.managedPath,
+          token: candidate.token,
+          targetPath: registeredPath,
+        });
+        results.push({
+          sourcePath: candidate.sourcePath,
+          targetPath: registeredPath,
+          name: candidate.name,
+          status: "imported",
+          writtenFiles: written.writtenFiles,
+          skippedFiles: written.skippedFiles,
+        });
+      } catch (error) {
+        results.push(failed(error instanceof Error ? error.message : String(error)));
+      }
+    }
+    return results;
   }
 
   private async prepareRepository(
@@ -537,6 +756,7 @@ export class BackupService {
       stored?.repoUrl !== saved.repoUrl ||
       stored.branch !== saved.branch ||
       stored.path !== saved.path ||
+      stored.includeProjects !== saved.includeProjects ||
       stored.lastPushedCommit !== saved.lastPushedCommit ||
       stored.lastRestoredCommit !== saved.lastRestoredCommit
     ) {

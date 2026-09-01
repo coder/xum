@@ -263,6 +263,9 @@ export class ServiceContainer {
     this.projectService.setWorkspaceService(this.workspaceService);
     this.projectService.setWorkspaceMetadataRefresher(this.workspaceService);
     this.projectService.setMcpServerManager(this.mcpServerManager);
+    // Backup restores register approved project imports through the same create() path the
+    // UI uses; setter injection because BackupService is constructed before ProjectService.
+    this.backupService.setProjectService(this.projectService);
     this.desktopSessionManager = new DesktopSessionManager({
       config,
       experimentsService: this.experimentsService,

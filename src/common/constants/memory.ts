@@ -6,7 +6,9 @@
  * physical root:
  * - global    -> <xumHome>/memory/global/ (host-local, permanent, shared across projects)
  * - project   -> <xumHome>/memory/project/<project dir>/ (host-local, private
- *                per-project notes; never committed, survives workspaces)
+ *                per-project notes; never committed to the repo, survives
+ *                workspaces; carried by the settings backup only when the
+ *                user opts into the project bundle)
  * - workspace -> <sessionDir>/memory/ (host-local, deleted with the workspace)
  */
 

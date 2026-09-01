@@ -47,6 +47,16 @@ function renderBackupSection() {
                 token: "8d2e4787fcc88a36cbd9067997213f1a791ec3999af6e9bf2259f6f3a1a0337e",
               },
             ],
+            projectImports: [
+              {
+                sourcePath: "/home/dev/src/rocket",
+                name: "rocket",
+                gitRemote: "git@github.com:dev/rocket.git",
+                memoryFileCount: 3,
+                token: "1f4c9a2b8d6e0f31a5c7e9b2d4f6081a3c5e7f9b1d3f5a7c9e1b3d5f7a9c1e3b",
+              },
+            ],
+            projectBundleSkipped: false,
           },
         })
       }

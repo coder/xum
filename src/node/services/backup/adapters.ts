@@ -2,8 +2,22 @@ import * as path from "node:path";
 import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { VERSION } from "@/version";
 import type { Config } from "@/node/config";
-import type { BackupFileChange } from "@/common/orpc/schemas/backup";
+import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schemas/backup";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import {
+  sanitizeBackupGitRemote,
+  type BackupProjectBundleEntry,
+} from "@/common/config/schemas/settingsBackup";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import type { ProjectConfig } from "@/common/types/project";
+import { getProjectDisplayName } from "@/common/utils/subProjects";
+import { projectMemoryDirName } from "@/node/services/memoryService";
+import {
+  memoryMutationLockKey,
+  withTargetMutationLock,
+} from "@/node/services/refinement/targetMutationLocks";
+import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   BackupServiceError,
   type BackupGitRepo,
@@ -13,8 +27,18 @@ import {
 import { BACKUP_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { BackupRepoCache } from "./gitRepo";
 import {
+  PROJECT_BUNDLE_DIR,
   backupPayloadExists,
+  bundleEntryFiles,
+  collectProjectBundle,
+  planProjectBundleRestore,
+  projectBundleExists,
+  projectImportToken,
+  readProjectBundle,
+  rekeyProjectMemoryPath,
   resolveContainedPath,
+  writeProjectBundle,
+  writeProjectMemoryFiles,
   assertBackupCommandsApproved,
   collectMcpCommandApprovals,
   resolveRestoredContent,
@@ -31,6 +55,8 @@ import {
   serializeBackupPreferences,
   writeBackupPayload,
   type BackupFile,
+  type BackupProjectBundle,
+  type ProjectBundleRestorePlan,
 } from "./payload";
 
 /**
@@ -162,6 +188,21 @@ function describeMissingBackup(managedPath: string): string {
     : `No Xum backup found in '${managedPath}' or legacy ${fallbacks} on this branch`;
 }
 
+/** Best-effort: a missing origin, a non-git directory, or a hung git must never fail an export. */
+async function readProjectGitRemote(projectPath: string): Promise<string | undefined> {
+  try {
+    using gitProcess = execFileAsync("git", ["-C", projectPath, "remote", "get-url", "origin"], {
+      timeoutMs: 5_000,
+      maxOutputBytes: 64 * 1024,
+      killTreeOnTermination: true,
+    });
+    const { stdout } = await gitProcess.result;
+    return sanitizeBackupGitRemote(stdout.trim());
+  } catch {
+    return undefined;
+  }
+}
+
 export function createBackupPayloadStore(options: { config: Config }): BackupPayloadStore {
   const muxRoot = options.config.rootDir;
 
@@ -197,22 +238,132 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     });
   }
 
+  /**
+   * The same lock MemoryService mutations take (its project stores resolve to the shared
+   * `<muxRoot>/memory` key), so backup never becomes an uncoordinated memory writer.
+   */
+  function withMemoryLock<T>(operation: () => Promise<T>): Promise<T> {
+    return withTargetMutationLock(
+      muxRoot,
+      memoryMutationLockKey(muxRoot, path.join(muxRoot, "memory")),
+      operation
+    );
+  }
+
+  function isSystemProjectEntry(projectPath: string, projectConfig: ProjectConfig): boolean {
+    return (
+      projectPath === MULTI_PROJECT_CONFIG_KEY ||
+      projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+      projectConfig.projectKind === "system"
+    );
+  }
+
+  function userProjects(): Array<[string, ProjectConfig]> {
+    return [...options.config.loadConfigOrDefault().projects.entries()].filter(
+      ([projectPath, projectConfig]) => !isSystemProjectEntry(projectPath, projectConfig)
+    );
+  }
+
+  /**
+   * Every user project becomes an entry, including zero-memory ones: the project list is
+   * half the feature. `memoryDir` records this install's actual directory name, which is
+   * also what restore-side matching recomputes.
+   */
+  async function listProjectBundleEntries(entryOptions: {
+    withRemotes: boolean;
+  }): Promise<BackupProjectBundleEntry[]> {
+    const entries: BackupProjectBundleEntry[] = [];
+    for (const [projectPath, projectConfig] of userProjects()) {
+      const gitRemote = entryOptions.withRemotes
+        ? await readProjectGitRemote(projectPath)
+        : undefined;
+      entries.push({
+        path: projectPath,
+        name: getProjectDisplayName(projectPath, projectConfig),
+        ...(gitRemote !== undefined ? { gitRemote } : {}),
+        memoryDir: projectMemoryDirName(projectPath),
+      });
+    }
+    return entries;
+  }
+
+  function registeredProjectDirs(): Map<string, string> {
+    return new Map(
+      userProjects().map(([projectPath]) => [projectPath, projectMemoryDirName(projectPath)])
+    );
+  }
+
+  function toProjectImports(plan: ProjectBundleRestorePlan): BackupProjectImport[] {
+    return plan.imports.map(({ entry, files, token }) => ({
+      sourcePath: entry.path,
+      name: entry.name,
+      ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
+      memoryFileCount: files.length,
+      token,
+    }));
+  }
+
+  async function readBundleWithPlan(
+    sourceDir: string
+  ): Promise<{ bundle: BackupProjectBundle; plan: ProjectBundleRestorePlan } | null> {
+    const bundle = await readProjectBundle(sourceDir);
+    if (bundle === null) return null;
+    return { bundle, plan: planProjectBundleRestore(bundle, registeredProjectDirs()) };
+  }
+
+  /** Restore-preview statuses for matched entries, diffed against the local memory files. */
+  async function matchedProjectChanges(
+    plan: ProjectBundleRestorePlan
+  ): Promise<BackupFileChange[]> {
+    if (plan.matched.length === 0) return [];
+    const localBundle = await collectProjectBundle(
+      muxRoot,
+      plan.matched.map((match) => match.entry)
+    );
+    const localByPath = new Map(localBundle.files.map((file) => [file.path, file]));
+    const changes: BackupFileChange[] = [];
+    for (const match of plan.matched) {
+      for (const file of match.files) {
+        const existing = localByPath.get(file.path);
+        if (existing === undefined) {
+          changes.push({ status: "A", path: file.path });
+        } else if (!existing.content.equals(file.content)) {
+          changes.push({ status: "M", path: file.path });
+        }
+      }
+    }
+    return changes;
+  }
+
   return {
     async exportTo(exportOptions) {
       const payload = await buildPayload();
+      const destination = await managedDir(exportOptions.repositoryRoot, exportOptions.managedPath);
       // Owner-only like the safety snapshot: the export copies allowlisted sources that may
       // themselves be owner-only, and it lands here before the secret scan has said anything
       // about it. Git records only the exec bit, so the modes never reach the remote.
-      await writeBackupPayload(
-        await managedDir(exportOptions.repositoryRoot, exportOptions.managedPath),
-        payload,
-        { ownerOnly: true }
-      );
-      const secretFiles = scanBackupFilesForSecrets(payload.files);
+      await writeBackupPayload(destination, payload, { ownerOnly: true });
+      // The core write wiped the whole managed path, so with the toggle off a previously
+      // pushed bundle disappears from the next tree, and with it on the sidecar is written
+      // fresh after the core payload.
+      let scanFiles = payload.files;
+      if (exportOptions.includeProjects) {
+        const bundle = await collectProjectBundle(
+          muxRoot,
+          await listProjectBundleEntries({ withRemotes: true })
+        );
+        await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle, {
+          ownerOnly: true,
+        });
+        // One scan and one digest over core and bundle files together, so the secret gate
+        // and its approval bind the exact combined payload a push would publish.
+        scanFiles = [...payload.files, ...bundle.files];
+      }
+      const secretFiles = scanBackupFilesForSecrets(scanFiles);
       return {
         redactions: payload.redactions,
         secretFiles,
-        secretApproval: backupSecretApprovalDigest(payload.files, secretFiles),
+        secretApproval: backupSecretApprovalDigest(scanFiles, secretFiles),
       };
     },
 
@@ -222,7 +373,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // A repository with no backup yet is a normal first-run state, not an error:
       // nothing would be restored, and every local file is local-only.
       if (!(await backupPayloadExists(sourceDir))) {
-        return { changes: [], localOnlyFiles: [...local.keys()].sort(), commandApprovals: [] };
+        return {
+          changes: [],
+          localOnlyFiles: [...local.keys()].sort(),
+          commandApprovals: [],
+          projectImports: [],
+          projectBundleSkipped: false,
+        };
       }
 
       const payload = await readBackupPayload(sourceDir);
@@ -270,6 +427,20 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           changes.push({ status: "M", path: file.path });
         }
       }
+
+      let projectImports: BackupProjectImport[] = [];
+      let projectBundleSkipped = false;
+      if (!previewOptions.includeProjects) {
+        // Existence-only: with the toggle off the sidecar is never parsed, so a malformed
+        // bundle cannot block a core-only preview.
+        projectBundleSkipped = await projectBundleExists(sourceDir);
+      } else {
+        const bundlePlan = await readBundleWithPlan(sourceDir);
+        if (bundlePlan !== null) {
+          projectImports = toProjectImports(bundlePlan.plan);
+          changes.push(...(await matchedProjectChanges(bundlePlan.plan)));
+        }
+      }
       return {
         changes: changes.sort((a, b) => a.path.localeCompare(b.path)),
         localOnlyFiles: localOnly,
@@ -278,6 +449,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           payload.files,
           payload.manifest.mcpRedactions
         ),
+        projectImports,
+        projectBundleSkipped,
       };
     },
 
@@ -300,21 +473,42 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // The same preflight the restore runs, so a payload it would refuse is refused here,
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
+      if (!validateOptions.includeProjects) {
+        return { hasProjectBundle: false, projectImports: [] };
+      }
+      // A bundle the restore would refuse is refused here too, for the same reason.
+      const bundlePlan = await readBundleWithPlan(sourceDir);
+      if (bundlePlan === null) {
+        return { hasProjectBundle: false, projectImports: [] };
+      }
+      return { hasProjectBundle: true, projectImports: toProjectImports(bundlePlan.plan) };
     },
 
-    async writeSafetySnapshot(snapshotRoot) {
+    async writeSafetySnapshot(snapshotRoot, snapshotOptions) {
       // Unredacted: this copy never leaves the machine, and a redacted snapshot could
       // not restore a credential whose MCP server the restore removed.
       await writeBackupPayload(snapshotRoot, await buildPayload({ keepLocalSecrets: true }), {
         portable: false,
         ownerOnly: true,
       });
+      if (snapshotOptions.includeProjectMemory) {
+        // Registered projects only: an import that lands at a previously unregistered
+        // target writes add-only and reports every created file, so the snapshot's job is
+        // covering the memory a matched restore can overwrite.
+        const bundle = await collectProjectBundle(
+          muxRoot,
+          await listProjectBundleEntries({ withRemotes: false })
+        );
+        await writeProjectBundle(path.join(snapshotRoot, PROJECT_BUNDLE_DIR), bundle, {
+          portable: false,
+          ownerOnly: true,
+        });
+      }
     },
 
     async restore(restoreOptions) {
-      const payload = await readBackupPayload(
-        await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath)
-      );
+      const sourceDir = await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath);
+      const payload = await readBackupPayload(sourceDir);
       const before = await localFilesByPath();
       const result = await restoreBackupPayload({
         muxRoot,
@@ -354,9 +548,64 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           const previous = before.get(file);
           return !previous?.content.equals(current.content) || !sameMode(previous, current);
         })
-        .map(([file]) => file)
-        .sort();
-      return { changedFiles, localOnlyFiles: result.localOnlyFiles };
+        .map(([file]) => file);
+
+      let projectBundleSkipped = false;
+      if (!restoreOptions.includeProjects) {
+        // Existence-only, like the preview: a malformed sidecar must never block a
+        // core-only restore, but its presence is reported so the skip is visible.
+        projectBundleSkipped = await projectBundleExists(sourceDir);
+      } else {
+        const bundlePlan = await readBundleWithPlan(sourceDir);
+        if (bundlePlan !== null) {
+          // Matched entries restore verbatim, exactly what the preview promised. Imports
+          // are executed separately by the service, after project registration.
+          const writes = bundlePlan.plan.matched.flatMap((match) =>
+            match.files.map((file) => ({ path: file.path, content: file.content }))
+          );
+          const { written } = await withMemoryLock(() =>
+            writeProjectMemoryFiles(muxRoot, writes, { addOnly: false })
+          );
+          changedFiles.push(...written);
+        }
+      }
+      return {
+        changedFiles: changedFiles.sort(),
+        localOnlyFiles: result.localOnlyFiles,
+        projectBundleSkipped,
+      };
+    },
+
+    async importProjectMemory(importOptions) {
+      const sourceDir = await managedDir(importOptions.repositoryRoot, importOptions.managedPath);
+      const bundle = await readProjectBundle(sourceDir);
+      if (bundle === null) {
+        throw new BackupServiceError(
+          "INVALID_BACKUP",
+          "The backup no longer carries a project bundle"
+        );
+      }
+      // Token lookup rather than trusting any caller-named entry: the token binds the
+      // approval to the exact entry and content, and the repo lock has held the checkout
+      // stable since the service validated it, so a miss here is defensive only.
+      const entry = bundle.manifest.projects.find(
+        (candidate) => projectImportToken(candidate, bundle.files) === importOptions.token
+      );
+      if (entry === undefined) {
+        throw new BackupServiceError(
+          "INVALID_BACKUP",
+          "The approved project import no longer matches the backup"
+        );
+      }
+      const targetDir = projectMemoryDirName(importOptions.targetPath);
+      const writes = bundleEntryFiles(bundle.files, entry).map((file) => ({
+        path: rekeyProjectMemoryPath(file.path, targetDir),
+        content: file.content,
+      }));
+      const { written, skipped } = await withMemoryLock(() =>
+        writeProjectMemoryFiles(muxRoot, writes, { addOnly: true })
+      );
+      return { writtenFiles: written, skippedFiles: skipped };
     },
   };
 }
