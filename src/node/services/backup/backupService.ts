@@ -224,6 +224,21 @@ function toOperationError(error: unknown): BackupOperationError {
     };
   }
 
+  // A matched-memory write that failed midway may have created files no snapshot can
+  // remove (the snapshot holds only pre-existing destinations); the error lists them as
+  // the user's cleanup list.
+  if (error instanceof ProjectMemoryRestoreError) {
+    const written = error.restoredProjectMemory.flatMap((restored) => restored.files);
+    return {
+      code: "IO_ERROR",
+      message:
+        written.length === 0
+          ? error.message
+          : `${error.message}. Project memory written before the failure`,
+      ...(written.length === 0 ? {} : { files: written }),
+    };
+  }
+
   // Same round trip for project imports: the error carries the candidates recomputed from
   // the currently checked-out payload, so a stale approval can be re-made from fresh data.
   if (error instanceof BackupProjectImportApprovalRequiredError) {

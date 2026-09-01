@@ -3031,14 +3031,22 @@ export class ProjectMemoryRestoreError extends Error {
   }
 }
 
-/** Regular files under a directory, for the per-scope memory file-count cap. */
+/**
+ * Regular files under a directory as MemoryService counts them for its per-scope cap:
+ * dot-prefixed entries (and anything beneath one) are invisible to the memory store, so
+ * counting them here would refuse a note the store itself would still create.
+ */
 async function countFilesUnder(dirAbs: string): Promise<number> {
   // Recursive readdir does not follow directory symlinks, and a missing scope directory
   // counts as empty rather than failing the restore.
   const entries = await fs
     .readdir(dirAbs, { withFileTypes: true, recursive: true })
     .catch(() => []);
-  return entries.filter((entry) => entry.isFile()).length;
+  return entries.filter((entry) => {
+    if (!entry.isFile()) return false;
+    const relative = path.relative(dirAbs, path.join(entry.parentPath, entry.name));
+    return !relative.split(path.sep).some(isHiddenName);
+  }).length;
 }
 
 /**

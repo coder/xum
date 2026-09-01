@@ -1622,6 +1622,8 @@ describe("BackupService project imports", () => {
     if (!result.success) {
       expect(result.error.message).toContain("disk fault");
       expect(result.error.snapshotPath).toBeDefined();
+      // Newly created files are not in the snapshot; the error is the cleanup list.
+      expect(result.error.files).toEqual(["memory/project/alpha-abc/notes.md"]);
     }
     // Disk changed for alpha even though the restore failed on beta.
     expect(notified).toEqual(["/home/dev/src/alpha"]);

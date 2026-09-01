@@ -3601,6 +3601,24 @@ describe("project bundle", () => {
     expect((error as Error).message).toContain("memory directory");
   });
 
+  it("rejects an oversized bundle file path before it reaches the filesystem", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await rewriteBundleManifest(managedDir, {
+      schemaVersion: 1,
+      projects: [entry],
+      files: [
+        {
+          path: `memory/project/${entry.memoryDir}/${"n".repeat(1024)}.md`,
+          sha256: "0".repeat(64),
+        },
+      ],
+    });
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    // The schema refused it; no ENAMETOOLONG message echoing the path was produced.
+    expect((error as Error).message.length).toBeLessThan(200);
+  });
+
   it("rejects oversized repository-controlled project metadata", async () => {
     const oversized = [
       { name: "x".repeat(257) },
@@ -3943,6 +3961,9 @@ describe("project bundle", () => {
     for (let index = 0; index < MEMORY_MAX_FILES_PER_SCOPE - 1; index += 1) {
       await writeFixtureFile(muxRoot, `memory/project/${targetDir}/n${index}.md`, "x\n");
     }
+    // Hidden entries are invisible to MemoryService and must not count against its limit.
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/.DS_Store`, "junk\n");
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/.cache/index.md`, "junk\n");
     // Existing files rewritten in place do not count as growth.
     const rewrite = await writeProjectMemoryFiles(
       muxRoot,

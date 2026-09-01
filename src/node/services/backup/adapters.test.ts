@@ -1656,6 +1656,33 @@ describe("backup adapters project bundle", () => {
     ).toBe("local edit\n");
   });
 
+  it("previews matched memory without reading unrelated local-only notes", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryDir = projectMemoryDirName(project);
+    const { repository, payload } = await exportBundle();
+
+    // Past the backup file budget and never restored: a whole-directory read would fail
+    // the preview and lose the restore half with it.
+    await fs.writeFile(
+      path.join(muxRoot, "memory", "project", memoryDir, "huge-local.md"),
+      Buffer.alloc(MAX_BACKUP_FILE_BYTES + 1, "x")
+    );
+    await seedProjectMemory(project, "notes.md", "local edit\n");
+
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(preview.changes).toContainEqual({
+      status: "M",
+      path: `memory/project/${memoryDir}/notes.md`,
+    });
+  });
+
   it("refuses a matched entry that would break memory limits before the core restore", async () => {
     const project = path.join(tempDir, "projects", "alpha");
     registerProject(project);

@@ -246,7 +246,9 @@ export const BackupProjectBundleManifestSchema = z.object({
   projects: z.array(BackupProjectBundleEntrySchema).max(MAX_BACKUP_PROJECT_ENTRIES),
   files: z.array(
     z.object({
-      path: z.string().min(1),
+      // Capped like the entry fields: an unbounded path would reach lstat (whose error
+      // message echoes it) and the renderer before any shape validation ran.
+      path: z.string().min(1).max(1024),
       sha256: z.string().regex(/^[0-9a-f]{64}$/),
     })
   ),

@@ -344,13 +344,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     plan: ProjectBundleRestorePlan
   ): Promise<BackupFileChange[]> {
     if (plan.matched.length === 0) return [];
-    // Under the memory lock like every other backup read of project memory, so a
-    // concurrent memory edit cannot yield a torn diff or a failed identity check.
+    // Only the destinations the restore would write, under the memory lock like every
+    // other backup read of project memory: a whole-directory read would let an unrelated
+    // local-only note fail the preview, and a concurrent edit could tear the diff.
     const localBundle = await withMemoryLock(() =>
-      collectProjectBundle(
-        muxRoot,
-        plan.matched.map((match) => match.entry)
-      )
+      collectOverwritableProjectMemory(muxRoot, plan.matched)
     );
     const localByPath = new Map(localBundle.files.map((file) => [file.path, file]));
     const changes: BackupFileChange[] = [];
