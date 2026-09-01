@@ -334,6 +334,7 @@ describe("WorkspaceTurnManager", () => {
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
       hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
       hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
+      hasQueuedWorkspaceTurn?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
@@ -3652,6 +3653,7 @@ describe("WorkspaceTurnManager", () => {
         createdAt,
         updatedAt: createdAt,
         createdWorkspace: true,
+        disposableWorkspace: true,
         deferredMessageIds: ["assistant-deferred"],
       })
     );
@@ -3671,7 +3673,9 @@ describe("WorkspaceTurnManager", () => {
     expect(await workspaceTurnSnapshot(taskService, parentId, "wst_other")).toMatchObject({
       status: "interrupted",
       error: "Workspace turn interrupted after restart",
+      disposableWorkspace: false,
     });
+    expect(workspaceMocks.remove).not.toHaveBeenCalled();
   });
 
   test("createWorkspaceTurn counts active workspace turns across all owners", async () => {
@@ -3814,7 +3818,13 @@ describe("WorkspaceTurnManager", () => {
 
   test("active workspace turn count keeps correlated continuation activity live", async () => {
     let ownerWorkspaceId = "";
-    let activity: "stream" | "queued" | "auto-retry" | "monitor-wake" = "stream";
+    let activity:
+      | "stream"
+      | "compaction"
+      | "queued"
+      | "queued-behind"
+      | "auto-retry"
+      | "monitor-wake" = "stream";
     const hasPendingWorkspaceTurnContinuation = mock(
       (workspaceId: string, metadata: ReturnType<typeof workspaceTurnMuxMetadata>) =>
         activity === "queued" &&
@@ -3823,18 +3833,51 @@ describe("WorkspaceTurnManager", () => {
         metadata.ownerWorkspaceId === ownerWorkspaceId &&
         metadata.turnId === "turn"
     );
+    const hasQueuedWorkspaceTurn = mock(
+      (workspaceId: string, handleId: string) =>
+        activity === "queued-behind" &&
+        workspaceId === "childworkspace" &&
+        handleId === "wst_handle"
+    );
     const streamManager = {
-      getStreamInfo: mock((workspaceId: string) =>
-        activity === "stream" && workspaceId === "childworkspace"
-          ? activeStreamInfo(
-              workspaceTurnMuxMetadata(ownerWorkspaceId, "wst_handle", "turn"),
-              "correlated-message"
-            )
-          : undefined
-      ),
+      getStreamInfo: mock((workspaceId: string) => {
+        if (workspaceId !== "childworkspace") {
+          return undefined;
+        }
+        if (activity === "stream") {
+          return activeStreamInfo(
+            workspaceTurnMuxMetadata(ownerWorkspaceId, "wst_handle", "turn"),
+            "correlated-message"
+          );
+        }
+        if (activity === "compaction") {
+          return activeStreamInfo(
+            {
+              type: "compaction-request",
+              rawCommand: "/compact",
+              source: "auto-compaction",
+              parsed: {
+                followUpContent: {
+                  text: "Continue",
+                  model: "anthropic:claude-opus-4-6",
+                  agentId: "exec",
+                  workspaceTurnMetadata: workspaceTurnMuxMetadata(
+                    ownerWorkspaceId,
+                    "wst_handle",
+                    "turn"
+                  ),
+                },
+              },
+            },
+            "compaction-message"
+          );
+        }
+        return undefined;
+      }),
     } as unknown as StreamManager;
     const { parentId, taskService } = await startWorkspaceTurnForTest({
       hasPendingWorkspaceTurnContinuation,
+      hasQueuedWorkspaceTurn,
       hasPendingAutoRetry: mock(() => activity === "auto-retry"),
       hasPendingBashMonitorWakeContinuation: mock(() => activity === "monitor-wake"),
       streamManager,
@@ -3849,7 +3892,14 @@ describe("WorkspaceTurnManager", () => {
     };
 
     internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
-    for (const nextActivity of ["stream", "queued", "auto-retry", "monitor-wake"] as const) {
+    for (const nextActivity of [
+      "stream",
+      "compaction",
+      "queued",
+      "queued-behind",
+      "auto-retry",
+      "monitor-wake",
+    ] as const) {
       activity = nextActivity;
       expect(await internal.countActiveWorkspaceTurns()).toBe(1);
     }
@@ -3857,10 +3907,25 @@ describe("WorkspaceTurnManager", () => {
       "childworkspace",
       workspaceTurnMuxMetadata(parentId, "wst_handle", "turn")
     );
+    expect(hasQueuedWorkspaceTurn).toHaveBeenCalledWith("childworkspace", "wst_handle");
 
     const snapshot = await workspaceTurnSnapshot(taskService, parentId);
     expect(snapshot).toMatchObject({ status: "running", workspaceId: "childworkspace" });
     expect(snapshot?.error).toBeUndefined();
+  });
+
+  test("active workspace turn count preserves mock streams without StreamInfo", async () => {
+    const isStreaming = mock((workspaceId: string) => workspaceId === "childworkspace");
+    const { parentId, taskService } = await startWorkspaceTurnForTest({ isStreaming });
+    const internal = taskService as unknown as {
+      countActiveWorkspaceTurns: () => Promise<number>;
+    };
+
+    expect(await internal.countActiveWorkspaceTurns()).toBe(1);
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+      workspaceId: "childworkspace",
+    });
   });
 
   test("getWorkspaceTurnSnapshot settles stale active handles before returning", async () => {

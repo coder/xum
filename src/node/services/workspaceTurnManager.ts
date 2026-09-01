@@ -3800,15 +3800,41 @@ export class WorkspaceTurnManager {
     return (await this.listActiveWorkspaceTurnTaskIdsForOwner(record.workspaceId)).length > 0;
   }
 
+  private getRuntimeWorkspaceTurnMetadataFromValue(
+    value: unknown
+  ): { taskHandleId: string; ownerWorkspaceId: string; turnId: string } | undefined {
+    const direct = parseWorkspaceTurnTaskCorrelation(value);
+    if (direct != null) {
+      return direct;
+    }
+    if (value == null || typeof value !== "object") {
+      return undefined;
+    }
+    const compaction = value as {
+      type?: unknown;
+      parsed?: { followUpContent?: { workspaceTurnMetadata?: unknown } };
+    };
+    if (compaction.type !== "compaction-request") {
+      return undefined;
+    }
+    return (
+      parseWorkspaceTurnTaskCorrelation(
+        compaction.parsed?.followUpContent?.workspaceTurnMetadata
+      ) ?? undefined
+    );
+  }
+
   private getWorkspaceTurnRuntimeActivity(record: WorkspaceTurnTaskHandleRecord): {
     hasAnyActivity: boolean;
     hasCorrelatedActivity: boolean;
+    hasUncorrelatedActivity: boolean;
   } {
-    const activeStreamCorrelation = parseWorkspaceTurnTaskCorrelation(
-      this.streamManager?.getStreamInfo(record.workspaceId)?.muxMetadata
+    const activeStreamInfo = this.streamManager?.getStreamInfo(record.workspaceId);
+    const activeStreamCorrelation = this.getRuntimeWorkspaceTurnMetadataFromValue(
+      activeStreamInfo?.muxMetadata
     );
     const hasActiveStream =
-      this.aiService.isStreaming(record.workspaceId) || activeStreamCorrelation != null;
+      this.aiService.isStreaming(record.workspaceId) || activeStreamInfo != null;
     const hasPendingQueuedOrPreparingTurn = this.workspaceService.hasPendingQueuedOrPreparingTurn(
       record.workspaceId
     );
@@ -3821,7 +3847,7 @@ export class WorkspaceTurnManager {
       this.workspaceService.hasPendingWorkspaceTurnContinuation(
         record.workspaceId,
         this.buildWorkspaceTurnMuxMetadata(record)
-      );
+      ) || this.workspaceService.hasQueuedWorkspaceTurn(record.workspaceId, record.handleId);
     const hasPendingAutoRetry = this.workspaceService.hasPendingAutoRetry(record.workspaceId);
     const hasPendingBashMonitorWake = this.workspaceService.hasPendingBashMonitorWakeContinuation(
       record.workspaceId
@@ -3839,6 +3865,11 @@ export class WorkspaceTurnManager {
         hasCorrelatedQueuedOrPreparingTurn ||
         hasPendingAutoRetry ||
         hasPendingBashMonitorWake,
+      // A missing StreamInfo is ambiguous because MockAiStreamPlayer reports only through
+      // AIService.isStreaming. Preserve the active-map fallback for that test/runtime path.
+      hasUncorrelatedActivity:
+        (hasActiveStream && activeStreamInfo != null && !hasCorrelatedStream) ||
+        (hasPendingQueuedOrPreparingTurn && !hasCorrelatedQueuedOrPreparingTurn),
     };
   }
 
@@ -3847,8 +3878,9 @@ export class WorkspaceTurnManager {
     if (runtimeActivity.hasCorrelatedActivity) {
       return true;
     }
-    // Unrelated target activity cannot prove that this persisted handle still owns the workspace.
-    if (runtimeActivity.hasAnyActivity) {
+    // Only positive evidence of unrelated activity can invalidate the active-map fallback.
+    // Mock streams can report busy without exposing StreamInfo correlation.
+    if (runtimeActivity.hasUncorrelatedActivity) {
       return false;
     }
 
@@ -3873,29 +3905,35 @@ export class WorkspaceTurnManager {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
+    const runtimeActivity = this.getWorkspaceTurnRuntimeActivity(record);
+    const disposableOwnershipTransferred =
+      record.disposableWorkspace && runtimeActivity.hasUncorrelatedActivity;
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
+      const next = disposableOwnershipTransferred
+        ? { ...recovered, disposableWorkspace: false }
+        : recovered;
       await this.settleWorkspaceTurn({
         record,
-        next: recovered,
+        next,
         waiterSettlement:
-          recovered.status === "completed"
-            ? { status: "completed", result: this.buildWorkspaceTurnWaitResult(recovered) }
-            : { status: "error", error: new Error(recovered.error ?? "Workspace turn failed") },
+          next.status === "completed"
+            ? { status: "completed", result: this.buildWorkspaceTurnWaitResult(next) }
+            : { status: "error", error: new Error(next.error ?? "Workspace turn failed") },
+        disposableOwnershipTransferred,
       });
       return;
     }
 
     // Same-process deferred stream-ends can be observed before the final assistant message is
-    // readable from history. Keep the handle alive only while it still owns the runtime activity.
-    const runtimeActivity = this.getWorkspaceTurnRuntimeActivity(record);
+    // readable from history. Keep the handle alive unless unrelated activity owns the runtime.
     if (runtimeActivity.hasCorrelatedActivity) {
       return;
     }
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
     if (
       (record.deferredMessageIds?.length ?? 0) > 0 &&
-      !runtimeActivity.hasAnyActivity &&
+      !runtimeActivity.hasUncorrelatedActivity &&
       active?.handleId === record.handleId &&
       active.ownerWorkspaceId === record.ownerWorkspaceId
     ) {
@@ -3907,6 +3945,7 @@ export class WorkspaceTurnManager {
       status: "interrupted",
       updatedAt: getIsoNow(),
       error: WORKSPACE_TURN_STALE_RESTART_ERROR,
+      ...(disposableOwnershipTransferred ? { disposableWorkspace: false } : {}),
     };
     await this.settleWorkspaceTurn({
       record,
@@ -3915,6 +3954,7 @@ export class WorkspaceTurnManager {
         status: "error",
         error: new Error(WORKSPACE_TURN_STALE_RESTART_ERROR),
       },
+      disposableOwnershipTransferred,
     });
   }
 
