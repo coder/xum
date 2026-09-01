@@ -734,34 +734,48 @@ export const router = (authToken?: string) => {
       startDesktopFlow: t
         .input(schemas.coderOauth.startDesktopFlow.input)
         .output(schemas.coderOauth.startDesktopFlow.output)
-        .handler(({ context, input }) =>
-          context.coderOauthService.startDesktopFlow({
-            deploymentUrl: input.deploymentUrl,
-            flowId: input.flowId,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.coderOauthService.startDesktopFlowEffect({
+              deploymentUrl: input.deploymentUrl,
+              flowId: input.flowId,
+            });
           })
         ),
       waitForDesktopFlow: t
         .input(schemas.coderOauth.waitForDesktopFlow.input)
         .output(schemas.coderOauth.waitForDesktopFlow.output)
-        .handler(({ context, input }) =>
-          context.coderOauthService.waitForDesktopFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.coderOauthService.waitForDesktopFlowEffect(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
           })
         ),
       cancelDesktopFlow: t
         .input(schemas.coderOauth.cancelDesktopFlow.input)
         .output(schemas.coderOauth.cancelDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.coderOauthService.cancelDesktopFlow(input.flowId);
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* context.coderOauthService.cancelDesktopFlowEffect(input.flowId);
+          })
+        ),
       disconnect: t
         .input(schemas.coderOauth.disconnect.input)
         .output(schemas.coderOauth.disconnect.output)
-        .handler(({ context }) => context.coderOauthService.disconnect()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.coderOauthService.disconnectEffect();
+          })
+        ),
       refreshModels: t
         .input(schemas.coderOauth.refreshModels.input)
         .output(schemas.coderOauth.refreshModels.output)
-        .handler(({ context }) => context.coderOauthService.refreshModels()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.coderOauthService.refreshModelsEffect();
+          })
+        ),
     },
     general: {
       listDirectory: t

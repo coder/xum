@@ -1,4 +1,21 @@
+/**
+ * Coder deployment OAuth service.
+ *
+ * Internals are Effect-native (see codexOauthService.ts / muxGatewayOauthService.ts
+ * for the shape): fallible pipelines are `Effect.gen` programs whose error
+ * channel carries a single reason-carrying tagged error, and the public
+ * Promise methods are thin `Effect.runPromise` facades folding back into the
+ * wire `Result<_, string>` shape, so pre-Effect callers keep working
+ * unchanged. The cross-process file-lock critical sections
+ * (`withCoderOauthLoginCommitLock` / `withCoderOauthRefreshLock`) stay
+ * callback-owned Promise seams: their interiors — including the
+ * `desktopFlows.has(flowId)` liveness checks that must stay adjacent to the
+ * persist/commit writes — are unchanged, so the finish/persist sequencing
+ * contract (a cancelled flow must never commit a replacement login) is
+ * preserved structurally rather than re-derived.
+ */
 import * as crypto from "crypto";
+import { Duration, Effect, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import {
@@ -28,7 +45,7 @@ import {
   parseCoderOauthAuth,
   type CoderOauthAuth,
 } from "@/node/utils/coderOauthAuth";
-import { createDeferred } from "@/node/utils/oauthUtils";
+import { createDeferred, toWireResult } from "@/node/utils/oauthUtils";
 import { startLoopbackServer } from "@/node/utils/oauthLoopbackServer";
 import { OAuthFlowManager } from "@/node/utils/oauthFlowManager";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -215,6 +232,15 @@ function manualModelEntries(section: Record<string, unknown> | undefined): Provi
   });
 }
 
+/**
+ * Typed failure for Coder OAuth errors. `reason` carries the exact
+ * user-facing string the wire `Result` contract expects, so facades map it
+ * 1:1 onto `Err(reason)` without reformatting.
+ */
+export class CoderOauthError extends Schema.TaggedError<CoderOauthError>()("CoderOauthError", {
+  reason: Schema.String,
+}) {}
+
 export class CoderOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
   private readonly refreshMutex = new AsyncMutex();
@@ -299,109 +325,127 @@ export class CoderOauthService {
   }
 
   async disconnect(): Promise<Result<void, string>> {
-    // Cancel in-flight login flows FIRST: disconnect is authoritative. An
-    // outstanding flow could otherwise exchange its code and commit a
-    // replacement login right after the clear below — silently reconnecting
-    // the account the user just disconnected. Cancellation removes each flow
-    // from the manager before resolving, so the commit path's liveness
-    // checks (`desktopFlows.has`) reject those flows' persists/commits.
-    // The generation bump covers attempts cancelAll cannot see: ones still in
-    // their pre-registration probes. startDesktopFlow snapshots the
-    // generation at entry and re-checks it at every pre-registration
-    // checkpoint — the last check and register() run with no intervening
-    // await, so an attempt either observes this bump and aborts, or has
-    // already registered and is cancelled by cancelAll here.
-    this.disconnectGeneration++;
-    await this.desktopFlows.cancelAll();
-    this.cachedAuth = null;
+    return Effect.runPromise(this.disconnectEffect());
+  }
 
-    // Clear FIRST, revoke after: disconnect must be authoritative over
-    // concurrent refreshes, and awaiting (possibly slow) revocation first
-    // would let a refresh rotate + persist in the meantime. The predicate
-    // matches on the session lineage id — stable across rotations, re-minted
-    // by each login — so it clears the disconnected session even if it just
-    // rotated, while a genuinely newer login is preserved. Tokens and models
-    // are cleared in ONE locked mutation so racing observers see either the
-    // connected state or the fully disconnected state, never a mix.
-    //
-    // The clear runs under the cross-process login-commit lock: a commit in
-    // another Xum process persists its login and announces success as one
-    // critical section under that lock, so an unserialized disconnect could
-    // land between the foreign write and its announcement — clearing and
-    // revoking the just-persisted credential while the other process still
-    // reports the login as connected. Serialized, this disconnect either
-    // precedes the commit (the tombstone stamped below refuses it) or
-    // follows it entirely (the clear removes the freshly committed
-    // credential — a coherent login-then-disconnect history). Revocation
-    // stays OUTSIDE the lock: best-effort network I/O must not block other
-    // processes' commits.
-    let removed: CoderOauthAuth | null = null;
-    let clearOutcome: {
-      clearResult: Awaited<ReturnType<ProviderService["updateProviderSection"]>>;
-      auth: CoderOauthAuth | null;
-    };
-    try {
-      clearOutcome = await this.fileLeaseManager.withCoderOauthLoginCommitLock(async () => {
-        const auth = this.readStoredAuth();
-        const clearResult = await this.providerService.updateProviderSection("coder", (section) => {
-          const stored = parseCoderOauthAuth(section?.coderOauth);
-          if (stored && (!auth || stored.sessionId !== auth.sessionId)) {
-            return null; // A newer login landed since we captured `auth`; keep it.
-          }
-          // Capture the freshest rotation of the session so revocation below
-          // targets a token that is actually still alive server-side.
-          removed = stored;
-          const next = { ...(section ?? {}) };
-          delete next.coderOauth;
-          // Cross-process tombstone: cancelAll/disconnectGeneration above only
-          // reach flows in THIS process. A login flow in another Xum process
-          // sharing this file snapshots this counter at start and refuses to
-          // commit under the commit lock once it changed, so it cannot
-          // silently reconnect the account (see
-          // commitDesktopLoginCrossProcess). A monotonic counter, not a
-          // wall-clock stamp — clock skew must not reorder disconnects and
-          // flow starts. Kept in the section permanently — later logins
-          // snapshot the new value and commit normally.
-          next.coderDisconnectGeneration =
-            sanitizeGenerationCounter(section?.coderDisconnectGeneration) + 1;
-          // Discovered models/providers were fetched from the deployment's AI
-          // Gateway at login time; they are meaningless without credentials and
-          // are refetched on the next login. discoveredModels stays PRESENT
-          // (as []) so the catalog reads as authoritatively empty, while
-          // manually added entries (and additionalProviders) are user-managed
-          // data and survive the disconnect.
-          next.models = manualModelEntries(section);
-          next.discoveredModels = [];
-          next.discoveredProviders = [];
-          delete next.staleDiscoveredModels;
-          return { value: next };
-        });
-        this.cachedAuth = null;
-        return { clearResult, auth };
-      });
-    } catch (error) {
-      // Lock acquisition itself can fail (timeout, EACCES); surface it
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
+   * (mirrors disconnectEffect in codexOauthService.ts): disconnect is a
+   * cancel/teardown surface — a client abort must not stop it between the
+   * generation bump / flow cancellation and the persisted-credential clear,
+   * or a cancelled login flow could still commit against half-cleared state.
+   */
+  disconnectEffect(): Effect.Effect<Result<void, string>> {
+    return Effect.uninterruptible(toWireResult(this.disconnectPipeline()));
+  }
+
+  private disconnectPipeline(): Effect.Effect<void, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // Cancel in-flight login flows FIRST: disconnect is authoritative. An
+      // outstanding flow could otherwise exchange its code and commit a
+      // replacement login right after the clear below — silently reconnecting
+      // the account the user just disconnected. Cancellation removes each flow
+      // from the manager before resolving, so the commit path's liveness
+      // checks (`desktopFlows.has`) reject those flows' persists/commits.
+      // The generation bump covers attempts cancelAll cannot see: ones still in
+      // their pre-registration probes. startDesktopFlow snapshots the
+      // generation at entry and re-checks it at every pre-registration
+      // checkpoint — the last check and register() run with no intervening
+      // await, so an attempt either observes this bump and aborts, or has
+      // already registered and is cancelled by cancelAll here.
+      self.disconnectGeneration++;
+      yield* self.desktopFlows.cancelAllEffect();
+      self.cachedAuth = null;
+
+      // Clear FIRST, revoke after: disconnect must be authoritative over
+      // concurrent refreshes, and awaiting (possibly slow) revocation first
+      // would let a refresh rotate + persist in the meantime. The predicate
+      // matches on the session lineage id — stable across rotations, re-minted
+      // by each login — so it clears the disconnected session even if it just
+      // rotated, while a genuinely newer login is preserved. Tokens and models
+      // are cleared in ONE locked mutation so racing observers see either the
+      // connected state or the fully disconnected state, never a mix.
+      //
+      // The clear runs under the cross-process login-commit lock: a commit in
+      // another Xum process persists its login and announces success as one
+      // critical section under that lock, so an unserialized disconnect could
+      // land between the foreign write and its announcement — clearing and
+      // revoking the just-persisted credential while the other process still
+      // reports the login as connected. Serialized, this disconnect either
+      // precedes the commit (the tombstone stamped below refuses it) or
+      // follows it entirely (the clear removes the freshly committed
+      // credential — a coherent login-then-disconnect history). Revocation
+      // stays OUTSIDE the lock: best-effort network I/O must not block other
+      // processes' commits.
+      let removed: CoderOauthAuth | null = null;
+      // The lock acquisition itself can fail (timeout, EACCES); surface it
       // instead of pretending the account was disconnected.
-      return Err(`Failed to disconnect Coder: ${getErrorMessage(error)}`);
-    }
-    const { clearResult, auth } = clearOutcome;
-    if (!clearResult.success) {
-      return Err(clearResult.error);
-    }
-    if (!clearResult.data.applied) {
-      log.debug("[Coder OAuth] Disconnect raced a newer login; keeping the new credentials");
-    }
+      const clearOutcome = yield* Effect.tryPromise({
+        try: () =>
+          self.fileLeaseManager.withCoderOauthLoginCommitLock(async () => {
+            const auth = self.readStoredAuth();
+            const clearResult = await self.providerService.updateProviderSection(
+              "coder",
+              (section) => {
+                const stored = parseCoderOauthAuth(section?.coderOauth);
+                if (stored && (!auth || stored.sessionId !== auth.sessionId)) {
+                  return null; // A newer login landed since we captured `auth`; keep it.
+                }
+                // Capture the freshest rotation of the session so revocation below
+                // targets a token that is actually still alive server-side.
+                removed = stored;
+                const next = { ...(section ?? {}) };
+                delete next.coderOauth;
+                // Cross-process tombstone: cancelAll/disconnectGeneration above only
+                // reach flows in THIS process. A login flow in another Xum process
+                // sharing this file snapshots this counter at start and refuses to
+                // commit under the commit lock once it changed, so it cannot
+                // silently reconnect the account (see
+                // commitDesktopLoginCrossProcess). A monotonic counter, not a
+                // wall-clock stamp — clock skew must not reorder disconnects and
+                // flow starts. Kept in the section permanently — later logins
+                // snapshot the new value and commit normally.
+                next.coderDisconnectGeneration =
+                  sanitizeGenerationCounter(section?.coderDisconnectGeneration) + 1;
+                // Discovered models/providers were fetched from the deployment's AI
+                // Gateway at login time; they are meaningless without credentials and
+                // are refetched on the next login. discoveredModels stays PRESENT
+                // (as []) so the catalog reads as authoritatively empty, while
+                // manually added entries (and additionalProviders) are user-managed
+                // data and survive the disconnect.
+                next.models = manualModelEntries(section);
+                next.discoveredModels = [];
+                next.discoveredProviders = [];
+                delete next.staleDiscoveredModels;
+                return { value: next };
+              }
+            );
+            self.cachedAuth = null;
+            return { clearResult, auth };
+          }),
+        catch: (error) =>
+          new CoderOauthError({ reason: `Failed to disconnect Coder: ${getErrorMessage(error)}` }),
+      });
+      const { clearResult, auth } = clearOutcome;
+      if (!clearResult.success) {
+        return yield* Effect.fail(new CoderOauthError({ reason: clearResult.error }));
+      }
+      if (!clearResult.data.applied) {
+        log.debug("[Coder OAuth] Disconnect raced a newer login; keeping the new credentials");
+      }
 
-    // Best-effort RFC 7009 revocation so the Coder-side API key is invalidated.
-    // Revoke against the issuer stored in the blob (not the currently configured
-    // deployment URL) so tokens are revoked on the deployment that minted them
-    // even if the user changed the URL since logging in. Runs after the clear:
-    // even if revocation fails or hangs, the account is already disconnected.
-    const toRevoke = removed ?? auth;
-    if (toRevoke) {
-      await this.revokeTokens(toRevoke.deploymentUrl, toRevoke);
-    }
-    return Ok(undefined);
+      // Best-effort RFC 7009 revocation so the Coder-side API key is invalidated.
+      // Revoke against the issuer stored in the blob (not the currently configured
+      // deployment URL) so tokens are revoked on the deployment that minted them
+      // even if the user changed the URL since logging in. Runs after the clear:
+      // even if revocation fails or hangs, the account is already disconnected.
+      const toRevoke = removed ?? auth;
+      if (toRevoke) {
+        yield* self.revokeTokensEffect(toRevoke.deploymentUrl, toRevoke);
+      }
+    });
   }
 
   /**
@@ -410,26 +454,30 @@ export class CoderOauthService {
    * use, so they uniquely identify a credential generation). When `expected`
    * is null the clear is unconditional. Returns whether the clear applied.
    */
-  private async clearStoredAuthIfMatches(
+  private clearStoredAuthIfMatchesEffect(
     expected: CoderOauthAuth | null
-  ): Promise<Result<{ applied: boolean }, string>> {
-    this.cachedAuth = null;
-    const result = await this.providerService.updateConfigValue(
-      "coder",
-      ["coderOauth"],
-      (current) => {
-        if (expected) {
-          const stored = parseCoderOauthAuth(current);
-          if (stored && stored.refresh !== expected.refresh) {
-            return null; // A different (newer) credential landed; keep it.
+  ): Effect.Effect<Result<{ applied: boolean }, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      self.cachedAuth = null;
+      // updateConfigValue resolves with a wire Result; a rejection stays a
+      // defect (folded by refreshTokensEffect's whole-pipeline catchDefect).
+      const result = yield* Effect.promise(() =>
+        self.providerService.updateConfigValue("coder", ["coderOauth"], (current) => {
+          if (expected) {
+            const stored = parseCoderOauthAuth(current);
+            if (stored && stored.refresh !== expected.refresh) {
+              return null; // A different (newer) credential landed; keep it.
+            }
           }
-        }
-        return { value: undefined };
-      }
-    );
-    // Drop the cache again after the write so readers re-read the final state.
-    this.cachedAuth = null;
-    return result;
+          return { value: undefined };
+        })
+      );
+      // Drop the cache again after the write so readers re-read the final state.
+      self.cachedAuth = null;
+      return result;
+    });
   }
 
   async startDesktopFlow(input: {
@@ -442,224 +490,311 @@ export class CoderOauthService {
      */
     flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
-    if (input.flowId !== undefined && !/^[A-Za-z0-9_-]{16,128}$/.test(input.flowId)) {
-      return Err("Invalid flow ID");
-    }
-    const flowId = input.flowId ?? randomBase64Url();
-    // Snapshot before the first await: a disconnect() during any of the
-    // probes below must abort this attempt (see disconnectGeneration), and a
-    // disconnect in ANOTHER process must beat this flow's commit (compared
-    // against the persisted coderDisconnectGeneration counter under the
-    // commit lock — the in-memory generation cannot cross processes).
-    const initialDisconnectGeneration = this.disconnectGeneration;
-    const flowStartPersistedGeneration = this.readPersistedDisconnectGeneration();
+    return Effect.runPromise(this.startDesktopFlowEffect(input));
+  }
 
-    // Policy gate BEFORE any network I/O: a deny-all/provider-restricted (or
-    // blocked) policy must stop direct backend RPCs from registering OAuth
-    // clients or minting credentials, not just hide the login UI.
-    if (this.isCoderDeniedByPolicy()) {
-      return Err("The Coder provider is not allowed by the enforced policy");
-    }
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
+   * (mirrors startDesktopFlowEffect in muxGatewayOauthService.ts): a client
+   * abort between the loopback-server acquisition and `desktopFlows.register`
+   * would leak the server with nothing left to close it — user-initiated
+   * Cancel flows through the pre-registration checkpoints and the flow
+   * manager instead of fiber interruption. An abandoned flow still
+   * self-cleans via the registered timeout.
+   */
+  startDesktopFlowEffect(input: {
+    deploymentUrl: string;
+    flowId?: string;
+  }): Effect.Effect<Result<{ flowId: string; authorizeUrl: string }, string>> {
+    return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect(input)));
+  }
 
-    const requestedUrl = normalizeCoderDeploymentUrl(input.deploymentUrl);
-    if (!requestedUrl) {
-      return Err("Invalid Coder deployment URL (expected e.g. https://coder.example.com)");
-    }
-
-    // Policy override: login must target the policy-locked deployment so the
-    // minted tokens are issuer-bound to it (getValidAuth enforces the match).
-    const deploymentUrl = this.effectiveDeploymentUrl(requestedUrl);
-    if (!deploymentUrl) {
-      return Err("Policy-forced Coder base URL is not a valid deployment URL");
-    }
-    if (deploymentUrl !== requestedUrl) {
-      log.debug(
-        `[Coder OAuth] Deployment URL overridden by policy: ${requestedUrl} -> ${deploymentUrl}`
-      );
-    }
-
-    const buildinfoResult = await this.validateDeployment(deploymentUrl);
-    if (!buildinfoResult.success) {
-      return Err(buildinfoResult.error);
-    }
-
-    const endpointsResult = await this.discoverEndpoints(deploymentUrl);
-    if (!endpointsResult.success) {
-      return Err(endpointsResult.error);
-    }
-    const endpoints = endpointsResult.data;
-
-    // The deployment URL is intentionally NOT persisted here: flow start races
-    // other flows/logins, and an abandoned flow's early URL write could strand
-    // a completed login with a mismatched issuer. The exchange commits the URL
-    // atomically with the auth blob when this flow actually completes.
-    const codeVerifier = randomBase64Url();
-    const codeChallenge = sha256Base64Url(codeVerifier);
-
-    // Cancel or disconnect may have landed while the probes above were in
-    // flight — before the flow was registered. Honor it here instead of
-    // opening a listener for an attempt the caller already abandoned.
-    if (
-      this.consumePreCancelled(flowId) ||
-      this.disconnectGeneration !== initialDisconnectGeneration
-    ) {
-      return Err("Login was cancelled");
-    }
-
-    // Ephemeral port: Coder requires exact redirect URI matching (OAuth 2.1),
-    // so the freshly bound URI is (re-)registered on the client below.
-    let loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
-    try {
-      loopback = await startLoopbackServer({
-        port: 0,
-        host: "127.0.0.1",
-        callbackPath: CODER_OAUTH_CALLBACK_PATH,
-        validateLoopback: true,
-        expectedState: flowId,
-        deferSuccessResponse: true,
-      });
-    } catch (error) {
-      return Err(`Failed to start OAuth callback listener: ${getErrorMessage(error)}`);
-    }
-
-    // Last pre-registration checkpoint: this check and register() below run
-    // with no intervening await, so a cancel (or disconnect) is either
-    // observed here or finds the registered flow — no gap either way.
-    if (
-      this.consumePreCancelled(flowId) ||
-      this.disconnectGeneration !== initialDisconnectGeneration
-    ) {
-      await loopback.close();
-      return Err("Login was cancelled");
-    }
-
-    const resultDeferred = createDeferred<Result<void, string>>();
-
-    // The flow is registered BEFORE the client-registration round-trip: the
-    // loopback listener is already open, and this network await would
-    // otherwise be uncancellable (no flow ID exists yet, so neither Cancel
-    // nor a flow timeout can reach it) — a registration endpoint that accepts
-    // the connection but stalls its response would leave one listener and RPC
-    // alive per retry until the requests eventually returned. Registering
-    // first puts the whole window under the flow timeout, and finishing the
-    // flow (cancel/timeout/shutdown) aborts the in-flight RPC below.
-    this.desktopFlows.register(flowId, {
-      server: loopback.server,
-      resultDeferred,
-      // Keep server-side timeout tied to flow lifetime so abandoned flows
-      // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
-      timeoutHandle: setTimeout(() => {
-        void this.desktopFlows.finish(flowId, Err("Timed out waiting for OAuth callback"));
-      }, DEFAULT_DESKTOP_TIMEOUT_MS),
-    });
-
-    // Aborts every network round-trip owned by this flow (client
-    // registration, token exchange) when the flow finishes — Cancel, flow
-    // timeout, and shutdown all resolve the deferred.
-    const flowAbort = new AbortController();
-    void resultDeferred.promise.then(() => flowAbort.abort());
-
-    // Reserve the stored client's single redirect slot for this flow, or —
-    // when another active flow already owns it — fall back to registering a
-    // fresh client so the flows' redirect URIs cannot clobber each other. The
-    // lease is a filesystem lock shared by every Xum process using this
-    // providers file (desktop + CLI), because a concurrent flow in ANOTHER
-    // process would clobber the redirect just the same. A crashed holder's
-    // lease goes stale after the flow timeout.
-    let releaseClientLease: (() => void) | null = null;
-    try {
-      releaseClientLease = this.fileLeaseManager.tryAcquireCoderOauthClientLease(
-        DEFAULT_DESKTOP_TIMEOUT_MS
-      );
-    } catch (error) {
-      // Lease failures must not break login; degrade to a fresh client.
-      log.debug(`[Coder OAuth] Client lease unavailable: ${getErrorMessage(error)}`);
-    }
-    const ownsStoredClient = releaseClientLease !== null;
-
-    // Set (to the stored client's id) when its redirect PUT ended without a
-    // definitive server answer (timeout/network error before a response):
-    // the mutation may STILL land later, so that client generation must be
-    // quarantined before the lease can be released (below).
-    let uncertainClientId: string | null = null;
-    const ensureClientPromise = this.ensureClient(
-      deploymentUrl,
-      endpoints,
-      loopback.redirectUri,
-      flowAbort.signal,
-      ownsStoredClient,
-      (clientId) => {
-        uncertainClientId = clientId;
+  private launchDesktopFlowEffect(input: {
+    deploymentUrl: string;
+    flowId?: string;
+  }): Effect.Effect<{ flowId: string; authorizeUrl: string }, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (input.flowId !== undefined && !/^[A-Za-z0-9_-]{16,128}$/.test(input.flowId)) {
+        return yield* Effect.fail(new CoderOauthError({ reason: "Invalid flow ID" }));
       }
-    );
-    if (releaseClientLease !== null) {
-      const release = releaseClientLease;
-      // Release only after BOTH the flow finished (the flow manager resolves
-      // resultDeferred on every completion/cancel/timeout path) AND the
-      // stored-client mutation settled: Cancel can win while the RFC 7592 PUT
-      // is in flight, and releasing on flow completion alone would let a
-      // replacement flow write redirect B before the earlier PUT lands with
-      // redirect A, invalidating the replacement's authorization URL.
-      void Promise.allSettled([resultDeferred.promise, ensureClientPromise]).then(() => {
-        if (uncertainClientId !== null) {
-          // The PUT ended without a server answer and may land at ANY later
-          // time (a fully received request can stay queued server-side —
-          // elapsed time settles nothing). Quarantine that client generation
-          // in the persisted blob FIRST — after it, no flow in any process
-          // reuses or redirect-updates the client, so the lease is safe to
-          // release; without releasing, every re-login until Xum exits would
-          // register a fresh client (the stale-break path rightly refuses
-          // live-owner markers). If the quarantine cannot be persisted, keep
-          // the lease held as the fallback guard.
-          void this.quarantineStoredClient(uncertainClientId).then((quarantined) => {
-            if (quarantined) {
-              release();
-            }
-          });
-          return;
-        }
-        release();
+      const flowId = input.flowId ?? randomBase64Url();
+      // Snapshot before the first await: a disconnect() during any of the
+      // probes below must abort this attempt (see disconnectGeneration), and a
+      // disconnect in ANOTHER process must beat this flow's commit (compared
+      // against the persisted coderDisconnectGeneration counter under the
+      // commit lock — the in-memory generation cannot cross processes).
+      const initialDisconnectGeneration = self.disconnectGeneration;
+      const flowStartPersistedGeneration = self.readPersistedDisconnectGeneration();
+
+      // Policy gate BEFORE any network I/O: a deny-all/provider-restricted (or
+      // blocked) policy must stop direct backend RPCs from registering OAuth
+      // clients or minting credentials, not just hide the login UI.
+      if (self.isCoderDeniedByPolicy()) {
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: "The Coder provider is not allowed by the enforced policy",
+          })
+        );
+      }
+
+      const requestedUrl = normalizeCoderDeploymentUrl(input.deploymentUrl);
+      if (!requestedUrl) {
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: "Invalid Coder deployment URL (expected e.g. https://coder.example.com)",
+          })
+        );
+      }
+
+      // Policy override: login must target the policy-locked deployment so the
+      // minted tokens are issuer-bound to it (getValidAuth enforces the match).
+      const deploymentUrl = self.effectiveDeploymentUrl(requestedUrl);
+      if (!deploymentUrl) {
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: "Policy-forced Coder base URL is not a valid deployment URL",
+          })
+        );
+      }
+      if (deploymentUrl !== requestedUrl) {
+        log.debug(
+          `[Coder OAuth] Deployment URL overridden by policy: ${requestedUrl} -> ${deploymentUrl}`
+        );
+      }
+
+      yield* self.validateDeploymentEffect(deploymentUrl);
+
+      const endpoints = yield* self.discoverEndpointsEffect(deploymentUrl);
+
+      // The deployment URL is intentionally NOT persisted here: flow start races
+      // other flows/logins, and an abandoned flow's early URL write could strand
+      // a completed login with a mismatched issuer. The exchange commits the URL
+      // atomically with the auth blob when this flow actually completes.
+      const codeVerifier = randomBase64Url();
+      const codeChallenge = sha256Base64Url(codeVerifier);
+
+      // Cancel or disconnect may have landed while the probes above were in
+      // flight — before the flow was registered. Honor it here instead of
+      // opening a listener for an attempt the caller already abandoned.
+      if (
+        self.consumePreCancelled(flowId) ||
+        self.disconnectGeneration !== initialDisconnectGeneration
+      ) {
+        return yield* Effect.fail(new CoderOauthError({ reason: "Login was cancelled" }));
+      }
+
+      // Ephemeral port: Coder requires exact redirect URI matching (OAuth 2.1),
+      // so the freshly bound URI is (re-)registered on the client below.
+      const loopback = yield* Effect.tryPromise({
+        try: () =>
+          startLoopbackServer({
+            port: 0,
+            host: "127.0.0.1",
+            callbackPath: CODER_OAUTH_CALLBACK_PATH,
+            validateLoopback: true,
+            expectedState: flowId,
+            deferSuccessResponse: true,
+          }),
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Failed to start OAuth callback listener: ${getErrorMessage(error)}`,
+          }),
       });
-    }
 
-    const clientResult = await ensureClientPromise;
-    if (!clientResult.success) {
-      // No-op if the flow already ended (its cancel/timeout aborted the RPC);
-      // otherwise this closes the loopback listener too.
-      await this.desktopFlows.finish(flowId, Err(clientResult.error));
-      return Err(clientResult.error);
-    }
-    if (flowAbort.signal.aborted) {
-      // Cancel/flow-timeout won while the stored-client update settled (the
-      // PUT is deliberately not flow-aborted, see CLIENT_UPDATE_TIMEOUT_MS).
-      // The flow is already finished — don't hand out an authorize URL for it.
-      const finished = await resultDeferred.promise;
-      return Err(finished.success ? "Login was cancelled" : finished.error);
-    }
-    const client = clientResult.data;
+      // Last pre-registration checkpoint: this check and register() below run
+      // with no intervening await, so a cancel (or disconnect) is either
+      // observed here or finds the registered flow — no gap either way.
+      if (
+        self.consumePreCancelled(flowId) ||
+        self.disconnectGeneration !== initialDisconnectGeneration
+      ) {
+        yield* Effect.promise(() => loopback.close());
+        return yield* Effect.fail(new CoderOauthError({ reason: "Login was cancelled" }));
+      }
 
-    const authorizeUrl = buildCoderAuthorizeUrl({
-      authorizationEndpoint: endpoints.authorizationEndpoint,
-      clientId: client.clientId,
-      redirectUri: loopback.redirectUri,
-      state: flowId,
-      codeChallenge,
+      const resultDeferred = createDeferred<Result<void, string>>();
+
+      // The flow is registered BEFORE the client-registration round-trip: the
+      // loopback listener is already open, and this network await would
+      // otherwise be uncancellable (no flow ID exists yet, so neither Cancel
+      // nor a flow timeout can reach it) — a registration endpoint that accepts
+      // the connection but stalls its response would leave one listener and RPC
+      // alive per retry until the requests eventually returned. Registering
+      // first puts the whole window under the flow timeout, and finishing the
+      // flow (cancel/timeout/shutdown) aborts the in-flight RPC below.
+      self.desktopFlows.register(flowId, {
+        server: loopback.server,
+        resultDeferred,
+        // Keep server-side timeout tied to flow lifetime so abandoned flows
+        // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
+        timeoutHandle: setTimeout(() => {
+          Effect.runFork(
+            self.desktopFlows.finishEffect(flowId, Err("Timed out waiting for OAuth callback"))
+          );
+        }, DEFAULT_DESKTOP_TIMEOUT_MS),
+      });
+
+      // Aborts every network round-trip owned by this flow (client
+      // registration, token exchange) when the flow finishes — Cancel, flow
+      // timeout, and shutdown all resolve the deferred.
+      const flowAbort = new AbortController();
+      void resultDeferred.promise.then(() => flowAbort.abort());
+
+      // Reserve the stored client's single redirect slot for this flow, or —
+      // when another active flow already owns it — fall back to registering a
+      // fresh client so the flows' redirect URIs cannot clobber each other. The
+      // lease is a filesystem lock shared by every Xum process using this
+      // providers file (desktop + CLI), because a concurrent flow in ANOTHER
+      // process would clobber the redirect just the same. A crashed holder's
+      // lease goes stale after the flow timeout.
+      let releaseClientLease: (() => void) | null = null;
+      try {
+        releaseClientLease = self.fileLeaseManager.tryAcquireCoderOauthClientLease(
+          DEFAULT_DESKTOP_TIMEOUT_MS
+        );
+      } catch (error) {
+        // Lease failures must not break login; degrade to a fresh client.
+        log.debug(`[Coder OAuth] Client lease unavailable: ${getErrorMessage(error)}`);
+      }
+      const ownsStoredClient = releaseClientLease !== null;
+
+      // Set (to the stored client's id) when its redirect PUT ended without a
+      // definitive server answer (timeout/network error before a response):
+      // the mutation may STILL land later, so that client generation must be
+      // quarantined before the lease can be released (below).
+      let uncertainClientId: string | null = null;
+      // Started eagerly (runPromise) so the client round-trip proceeds while
+      // the lease-release pipeline below watches its settlement; toWireResult
+      // folds its typed failure so the shared promise never rejects.
+      const ensureClientPromise = Effect.runPromise(
+        toWireResult(
+          self.ensureClientEffect(
+            deploymentUrl,
+            endpoints,
+            loopback.redirectUri,
+            flowAbort.signal,
+            ownsStoredClient,
+            (clientId) => {
+              uncertainClientId = clientId;
+            }
+          )
+        )
+      );
+      if (releaseClientLease !== null) {
+        const release = releaseClientLease;
+        // Release only after BOTH the flow finished (the flow manager resolves
+        // resultDeferred on every completion/cancel/timeout path) AND the
+        // stored-client mutation settled: Cancel can win while the RFC 7592 PUT
+        // is in flight, and releasing on flow completion alone would let a
+        // replacement flow write redirect B before the earlier PUT lands with
+        // redirect A, invalidating the replacement's authorization URL.
+        Effect.runFork(
+          Effect.gen(function* () {
+            yield* Effect.promise(() =>
+              Promise.allSettled([resultDeferred.promise, ensureClientPromise])
+            );
+            if (uncertainClientId !== null) {
+              // The PUT ended without a server answer and may land at ANY later
+              // time (a fully received request can stay queued server-side —
+              // elapsed time settles nothing). Quarantine that client generation
+              // in the persisted blob FIRST — after it, no flow in any process
+              // reuses or redirect-updates the client, so the lease is safe to
+              // release; without releasing, every re-login until Xum exits would
+              // register a fresh client (the stale-break path rightly refuses
+              // live-owner markers). If the quarantine cannot be persisted, keep
+              // the lease held as the fallback guard.
+              const quarantined = yield* self.quarantineStoredClientEffect(uncertainClientId);
+              if (quarantined) {
+                release();
+              }
+              return;
+            }
+            release();
+          })
+        );
+      }
+
+      const clientResult = yield* Effect.promise(() => ensureClientPromise);
+      if (!clientResult.success) {
+        // No-op if the flow already ended (its cancel/timeout aborted the RPC);
+        // otherwise this closes the loopback listener too.
+        yield* self.desktopFlows.finishEffect(flowId, Err(clientResult.error));
+        return yield* Effect.fail(new CoderOauthError({ reason: clientResult.error }));
+      }
+      if (flowAbort.signal.aborted) {
+        // Cancel/flow-timeout won while the stored-client update settled (the
+        // PUT is deliberately not flow-aborted, see CLIENT_UPDATE_TIMEOUT_MS).
+        // The flow is already finished — don't hand out an authorize URL for it.
+        const finished = yield* Effect.promise(() => resultDeferred.promise);
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: finished.success ? "Login was cancelled" : finished.error })
+        );
+      }
+      const client = clientResult.data;
+
+      const authorizeUrl = buildCoderAuthorizeUrl({
+        authorizationEndpoint: endpoints.authorizationEndpoint,
+        clientId: client.clientId,
+        redirectUri: loopback.redirectUri,
+        state: flowId,
+        codeChallenge,
+      });
+
+      // Background fiber: wait for the loopback callback, exchange code for
+      // tokens, then commit the login. Races against resultDeferred (which
+      // resolves on cancel/timeout) so the fiber exits cleanly if the flow is
+      // cancelled.
+      Effect.runFork(
+        self.desktopCallbackPipeline({
+          flowId,
+          flowStartPersistedGeneration,
+          deploymentUrl,
+          tokenEndpoint: endpoints.tokenEndpoint,
+          client,
+          codeVerifier,
+          loopback,
+          resultDeferred,
+          flowAbortSignal: flowAbort.signal,
+        })
+      );
+
+      log.debug(`[Coder OAuth] Desktop flow started (flowId=${flowId})`);
+
+      return { flowId, authorizeUrl };
     });
+  }
 
-    // Background task: wait for the loopback callback, exchange code for tokens,
-    // then commit the login. Races against resultDeferred (which resolves on
-    // cancel/timeout) so the task exits cleanly if the flow is cancelled.
-    void (async () => {
-      const callbackResult = await Promise.race([
-        loopback.result,
-        resultDeferred.promise.then(() => null),
-      ]);
+  /**
+   * Desktop-flow completion pipeline, forked from `launchDesktopFlowEffect`.
+   * Races the loopback callback against resultDeferred so that if the flow is
+   * cancelled/timed out externally, this fiber exits cleanly instead of
+   * dangling on loopback.result.
+   */
+  private desktopCallbackPipeline(args: {
+    flowId: string;
+    flowStartPersistedGeneration: number;
+    deploymentUrl: string;
+    tokenEndpoint: string;
+    client: CoderOauthClient;
+    codeVerifier: string;
+    loopback: Awaited<ReturnType<typeof startLoopbackServer>>;
+    resultDeferred: ReturnType<typeof createDeferred<Result<void, string>>>;
+    flowAbortSignal: AbortSignal;
+  }): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const callbackResult = yield* Effect.promise(() =>
+        Promise.race([args.loopback.result, args.resultDeferred.promise.then((): null => null)])
+      );
 
       // null means the flow was finished externally (cancel/timeout).
       if (!callbackResult) return;
 
       if (!callbackResult.success) {
-        await this.desktopFlows.finish(flowId, Err(callbackResult.error));
+        yield* self.desktopFlows.finishEffect(args.flowId, Err(callbackResult.error));
         return;
       }
 
@@ -667,68 +802,94 @@ export class CoderOauthService {
       // network round-trip, and one stalled exchange must not block other
       // logins from committing. The flow's abort signal cancels it on
       // Cancel/flow-timeout (plus the request timeout inside requestTokens).
-      const tokenResult = await this.requestTokens(
-        endpoints.tokenEndpoint,
+      const tokenResult = yield* self.requestTokensEffect(
+        args.tokenEndpoint,
         {
           kind: "exchange",
-          deploymentUrl,
+          deploymentUrl: args.deploymentUrl,
           // Fresh session lineage: rotations preserve this id, a later login
           // mints a new one, letting disconnect tell rotations and re-logins
           // apart.
           sessionId: randomBase64Url(16),
-          client,
+          client: args.client,
           code: callbackResult.data.code,
-          redirectUri: loopback.redirectUri,
-          codeVerifier,
+          redirectUri: args.loopback.redirectUri,
+          codeVerifier: args.codeVerifier,
         },
-        flowAbort.signal
+        args.flowAbortSignal
       );
       if (!tokenResult.success) {
-        loopback.sendFailureResponse(tokenResult.error);
-        await this.desktopFlows.finish(flowId, Err(tokenResult.error));
+        args.loopback.sendFailureResponse(tokenResult.error);
+        yield* self.desktopFlows.finishEffect(args.flowId, Err(tokenResult.error));
         return;
       }
 
-      const committed = await this.commitDesktopLogin(
-        flowId,
-        flowStartPersistedGeneration,
-        deploymentUrl,
+      const committed = yield* self.commitDesktopLoginEffect(
+        args.flowId,
+        args.flowStartPersistedGeneration,
+        args.deploymentUrl,
         tokenResult.auth,
-        loopback
+        args.loopback
       );
 
       // Model discovery runs only after the flow is committed: Cancel is no
       // longer possible, so this network await cannot strand half-cancelled
-      // state (persisted auth with a cancelled flow).
+      // state (persisted auth with a cancelled flow). Its Result is folded
+      // and ignored like the pre-Effect fire-and-forget refresh.
       if (committed) {
-        await this.refreshBridgeModels(tokenResult.auth);
+        yield* toWireResult(self.refreshBridgeModelsEffect(tokenResult.auth));
       }
-    })();
-
-    log.debug(`[Coder OAuth] Desktop flow started (flowId=${flowId})`);
-
-    return Ok({ flowId, authorizeUrl });
+    });
   }
 
   async waitForDesktopFlow(
     flowId: string,
     opts?: { timeoutMs?: number }
   ): Promise<Result<void, string>> {
-    return this.desktopFlows.waitFor(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
+    return Effect.runPromise(this.waitForDesktopFlowEffect(flowId, opts));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers. Left
+   * interruptible: abandoning the wait does not affect the flow itself (the
+   * shared deferred and registered timeout keep the flow's lifecycle intact).
+   */
+  waitForDesktopFlowEffect(
+    flowId: string,
+    opts?: { timeoutMs?: number }
+  ): Effect.Effect<Result<void, string>> {
+    return this.desktopFlows.waitForEffect(flowId, opts?.timeoutMs ?? DEFAULT_DESKTOP_TIMEOUT_MS);
   }
 
   async cancelDesktopFlow(flowId: string): Promise<void> {
-    if (this.desktopFlows.has(flowId)) {
-      log.debug(`[Coder OAuth] Desktop flow cancelled (flowId=${flowId})`);
-      await this.desktopFlows.cancel(flowId);
-      return;
-    }
-    // The flow may still be starting (probes run before registration, and the
-    // caller generated this ID before startDesktopFlow returned): record the
-    // cancel so the start attempt aborts at its next checkpoint rather than
-    // living on as an orphan until the flow timeout.
-    this.prunePreCancelled();
-    this.preCancelledFlowIds.set(flowId, Date.now());
+    return Effect.runPromise(this.cancelDesktopFlowEffect(flowId));
+  }
+
+  /**
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the teardown must complete — a
+   * client abort mid-cancel must not leave the flow registered (its callback
+   * could still persist credentials after the user asked to cancel), and the
+   * pre-cancel bookkeeping for still-starting flows must land atomically.
+   */
+  cancelDesktopFlowEffect(flowId: string): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (self.desktopFlows.has(flowId)) {
+          log.debug(`[Coder OAuth] Desktop flow cancelled (flowId=${flowId})`);
+          yield* self.desktopFlows.cancelEffect(flowId);
+          return;
+        }
+        // The flow may still be starting (probes run before registration, and the
+        // caller generated this ID before startDesktopFlow returned): record the
+        // cancel so the start attempt aborts at its next checkpoint rather than
+        // living on as an orphan until the flow timeout.
+        self.prunePreCancelled();
+        self.preCancelledFlowIds.set(flowId, Date.now());
+      })
+    );
   }
 
   /**
@@ -765,70 +926,99 @@ export class CoderOauthService {
    * a mutex and the rotated tokens are persisted before this resolves.
    */
   async getValidAuth(): Promise<Result<CoderOauthAuth, string>> {
-    const stored = this.readStoredAuth();
-    if (!stored) {
-      return Err("Coder OAuth is not configured. Use 'Login with Coder' in Settings.");
-    }
+    return Effect.runPromise(this.getValidAuthEffect());
+  }
 
-    // Tokens are bound to the deployment (issuer) that minted them: never hand
-    // out a bearer token when the configured deployment URL has changed since
-    // login, or the old deployment's API key would be sent to the new host.
-    const deploymentUrl = this.getDeploymentUrl();
-    if (!deploymentUrl || stored.deploymentUrl !== deploymentUrl) {
-      return Err(
-        "Coder deployment URL changed since login. Use 'Login with Coder' in Settings to reconnect."
-      );
-    }
-
-    if (!isCoderOauthAuthExpired(stored)) {
-      return Ok(stored);
-    }
-
-    await using _lock = await this.refreshMutex.acquire();
-
-    // The refresh round-trip is additionally serialized ACROSS processes: a
-    // concurrent desktop/CLI process refreshing the same credential would
-    // otherwise race destructively — its invalid_grant compare-and-clear can
-    // land while our winning rotation is still in flight (not yet on disk),
-    // after which our persist CAS fails too and both processes discard the
-    // only valid token. Inside the lock the loser re-reads disk and adopts
-    // the winner's rotation without ever sending a doomed request.
-    return await this.fileLeaseManager.withCoderOauthRefreshLock(async () => {
-      // Re-read after acquiring both locks in case another caller (this
-      // process or another) refreshed first. Drop the in-memory cache so the
-      // read reflects cross-process writes.
-      this.cachedAuth = null;
-      const latest = this.readStoredAuth();
-      if (!latest) {
+  /** Wire-shaped Effect surface; never fails (defects fold into Err). */
+  getValidAuthEffect(): Effect.Effect<Result<CoderOauthAuth, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const stored = self.readStoredAuth();
+      if (!stored) {
         return Err("Coder OAuth is not configured. Use 'Login with Coder' in Settings.");
       }
 
-      // The configured deployment can change while this call waits for the
-      // locks (a Settings edit in this or another process). The pre-lock
-      // issuer check used the old URL — and long-lived model wrappers pinned
-      // that URL at creation — so re-validate against the CURRENT effective
-      // deployment before serving or refreshing, or the old deployment's
-      // bearer token would still be handed out after the user's change.
-      const currentDeploymentUrl = this.getDeploymentUrl();
-      if (!currentDeploymentUrl || latest.deploymentUrl !== currentDeploymentUrl) {
+      // Tokens are bound to the deployment (issuer) that minted them: never hand
+      // out a bearer token when the configured deployment URL has changed since
+      // login, or the old deployment's API key would be sent to the new host.
+      const deploymentUrl = self.getDeploymentUrl();
+      if (!deploymentUrl || stored.deploymentUrl !== deploymentUrl) {
         return Err(
           "Coder deployment URL changed since login. Use 'Login with Coder' in Settings to reconnect."
         );
       }
 
-      if (!isCoderOauthAuthExpired(latest)) {
-        return Ok(latest);
+      if (!isCoderOauthAuthExpired(stored)) {
+        return Ok(stored);
       }
 
-      // Await inside the mutex scope: a bare `return promise` would dispose the
-      // lock before the refresh finishes, letting concurrent callers refresh too.
-      const refreshed = await this.refreshTokens(latest);
-      if (!refreshed.success) {
-        return Err(refreshed.error);
-      }
+      // acquireUseRelease guarantees the mutex is released on every exit path
+      // (refresh success/failure, defects, interruption) — the Effect
+      // equivalent of the pre-Effect `await using` lock.
+      return yield* Effect.acquireUseRelease(
+        Effect.promise(() => self.refreshMutex.acquire()),
+        () =>
+          // The refresh round-trip is additionally serialized ACROSS processes: a
+          // concurrent desktop/CLI process refreshing the same credential would
+          // otherwise race destructively — its invalid_grant compare-and-clear can
+          // land while our winning rotation is still in flight (not yet on disk),
+          // after which our persist CAS fails too and both processes discard the
+          // only valid token. Inside the lock the loser re-reads disk and adopts
+          // the winner's rotation without ever sending a doomed request.
+          //
+          // The lock interior stays a callback-owned Promise seam; the refresh
+          // pipeline it runs folds its own failures and defects into the wire
+          // Result, so this promise can only reject when the lock itself fails.
+          Effect.promise(() =>
+            self.fileLeaseManager.withCoderOauthRefreshLock(
+              async (): Promise<Result<CoderOauthAuth, string>> => {
+                // Re-read after acquiring both locks in case another caller (this
+                // process or another) refreshed first. Drop the in-memory cache so the
+                // read reflects cross-process writes.
+                self.cachedAuth = null;
+                const latest = self.readStoredAuth();
+                if (!latest) {
+                  return Err("Coder OAuth is not configured. Use 'Login with Coder' in Settings.");
+                }
 
-      return Ok(refreshed.data);
-    });
+                // The configured deployment can change while this call waits for the
+                // locks (a Settings edit in this or another process). The pre-lock
+                // issuer check used the old URL — and long-lived model wrappers pinned
+                // that URL at creation — so re-validate against the CURRENT effective
+                // deployment before serving or refreshing, or the old deployment's
+                // bearer token would still be handed out after the user's change.
+                const currentDeploymentUrl = self.getDeploymentUrl();
+                if (!currentDeploymentUrl || latest.deploymentUrl !== currentDeploymentUrl) {
+                  return Err(
+                    "Coder deployment URL changed since login. Use 'Login with Coder' in Settings to reconnect."
+                  );
+                }
+
+                if (!isCoderOauthAuthExpired(latest)) {
+                  return Ok(latest);
+                }
+
+                // Await inside the lock callback: the rotation must be persisted
+                // before the lock is released, or concurrent callers could refresh too.
+                return await Effect.runPromise(toWireResult(self.refreshTokensEffect(latest)));
+              }
+            )
+          ),
+        (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
+      );
+    }).pipe(
+      // The cross-process lock acquisition itself can fail (timeout, EACCES);
+      // fold it into the wire error so the facade never rejects.
+      Effect.catchDefect((defect) =>
+        Effect.succeed(
+          Err(`Failed to refresh Coder OAuth tokens: ${getErrorMessage(defect)}`) as Result<
+            CoderOauthAuth,
+            string
+          >
+        )
+      )
+    );
   }
 
   getDeploymentUrl(): string | null {
@@ -848,46 +1038,77 @@ export class CoderOauthService {
   // Deployment validation + discovery
   // -------------------------------------------------------------------------
 
-  private async validateDeployment(deploymentUrl: string): Promise<Result<void, string>> {
-    try {
-      const response = await fetch(`${deploymentUrl}${CODER_BUILDINFO_PATH}`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(DEPLOYMENT_PROBE_TIMEOUT_MS),
+  private validateDeploymentEffect(deploymentUrl: string): Effect.Effect<void, CoderOauthError> {
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)`, which coerces
+        // non-Promise returns (e.g. a test's synchronous fetch mock).
+        try: async () =>
+          fetch(`${deploymentUrl}${CODER_BUILDINFO_PATH}`, {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(DEPLOYMENT_PROBE_TIMEOUT_MS),
+          }),
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Could not reach Coder deployment: ${getErrorMessage(error)}`,
+          }),
       });
       if (!response.ok) {
-        return Err(
-          `Could not reach Coder deployment at ${deploymentUrl} (buildinfo returned ${response.status})`
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: `Could not reach Coder deployment at ${deploymentUrl} (buildinfo returned ${response.status})`,
+          })
         );
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Could not reach Coder deployment: ${getErrorMessage(error)}`,
+          }),
+      });
       if (!isPlainObject(json) || typeof json.version !== "string") {
-        return Err(`${deploymentUrl} does not look like a Coder deployment (invalid buildinfo)`);
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: `${deploymentUrl} does not look like a Coder deployment (invalid buildinfo)`,
+          })
+        );
       }
-
-      return Ok(undefined);
-    } catch (error) {
-      return Err(`Could not reach Coder deployment: ${getErrorMessage(error)}`);
-    }
+    });
   }
 
-  private async discoverEndpoints(
+  private discoverEndpointsEffect(
     deploymentUrl: string
-  ): Promise<Result<CoderOauthEndpoints, string>> {
-    try {
-      const response = await fetch(`${deploymentUrl}${CODER_OAUTH_DISCOVERY_PATH}`, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(DEPLOYMENT_PROBE_TIMEOUT_MS),
+  ): Effect.Effect<CoderOauthEndpoints, CoderOauthError> {
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)` coercion (see above).
+        try: async () =>
+          fetch(`${deploymentUrl}${CODER_OAUTH_DISCOVERY_PATH}`, {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(DEPLOYMENT_PROBE_TIMEOUT_MS),
+          }),
+        catch: (error) =>
+          new CoderOauthError({ reason: `OAuth discovery failed: ${getErrorMessage(error)}` }),
       });
       if (!response.ok) {
-        return Err(
-          `OAuth discovery failed (${response.status}). Ensure the deployment runs with --experiments=oauth2.`
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: `OAuth discovery failed (${response.status}). Ensure the deployment runs with --experiments=oauth2.`,
+          })
         );
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CoderOauthError({ reason: `OAuth discovery failed: ${getErrorMessage(error)}` }),
+      });
       if (!isPlainObject(json)) {
-        return Err("OAuth discovery returned an invalid JSON payload");
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: "OAuth discovery returned an invalid JSON payload" })
+        );
       }
 
       const authorizationEndpoint = parseEndpointUrl(json.authorization_endpoint);
@@ -896,19 +1117,21 @@ export class CoderOauthService {
       const revocationEndpoint = parseEndpointUrl(json.revocation_endpoint) ?? undefined;
 
       if (!authorizationEndpoint || !tokenEndpoint || !registrationEndpoint) {
-        return Err("OAuth discovery response is missing required endpoints");
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: "OAuth discovery response is missing required endpoints" })
+        );
       }
 
       // Coder only supports S256; fail fast if a future deployment drops it.
       const methods = json.code_challenge_methods_supported;
       if (Array.isArray(methods) && !methods.includes("S256")) {
-        return Err("Coder deployment does not support PKCE S256");
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: "Coder deployment does not support PKCE S256" })
+        );
       }
 
-      return Ok({ authorizationEndpoint, tokenEndpoint, registrationEndpoint, revocationEndpoint });
-    } catch (error) {
-      return Err(`OAuth discovery failed: ${getErrorMessage(error)}`);
-    }
+      return { authorizationEndpoint, tokenEndpoint, registrationEndpoint, revocationEndpoint };
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -919,14 +1142,14 @@ export class CoderOauthService {
    * Reuse the stored client when possible by pointing its registered redirect
    * URI at the current loopback port; otherwise register a fresh client.
    */
-  private async ensureClient(
+  private ensureClientEffect(
     deploymentUrl: string,
     endpoints: CoderOauthEndpoints,
     redirectUri: string,
     // Aborted when the owning flow finishes (cancel/timeout/shutdown), so a
     // stalled registration endpoint cannot pin the RPC past the flow's life.
     // Applies to fresh registrations only — the stored-client redirect update
-    // is timeout-bounded instead (see updateClientRedirectUri).
+    // is timeout-bounded instead (see updateClientRedirectUriEffect).
     signal: AbortSignal,
     // Only the flow holding the stored-client lease may reuse (and
     // redirect-update) it; see the lease wiring in startDesktopFlow.
@@ -935,54 +1158,76 @@ export class CoderOauthService {
     // definitive server answer — the caller must then quarantine that client
     // generation before the lease may be released.
     onStoredClientUpdateUncertain: (clientId: string) => void
-  ): Promise<Result<CoderOauthClient, string>> {
-    const stored = this.readStoredAuth();
-    // Only reuse a client registered on the SAME deployment; a client from a
-    // different deployment is meaningless there (and its RFC 7592 endpoint
-    // would point at the old host).
-    if (
-      allowStoredClient &&
-      stored?.deploymentUrl === deploymentUrl &&
-      stored.registrationAccessToken &&
-      stored.registrationClientUri
-    ) {
-      const updated = await this.updateClientRedirectUri(
-        stored,
-        redirectUri,
-        onStoredClientUpdateUncertain
-      );
-      if (updated.success) {
-        return updated;
+  ): Effect.Effect<CoderOauthClient, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const stored = self.readStoredAuth();
+      // Only reuse a client registered on the SAME deployment; a client from a
+      // different deployment is meaningless there (and its RFC 7592 endpoint
+      // would point at the old host).
+      if (
+        allowStoredClient &&
+        stored?.deploymentUrl === deploymentUrl &&
+        stored.registrationAccessToken &&
+        stored.registrationClientUri
+      ) {
+        const updated: Result<CoderOauthClient, string> = yield* toWireResult(
+          self.updateClientRedirectUriEffect(stored, redirectUri, onStoredClientUpdateUncertain)
+        );
+        if (updated.success) {
+          return updated.data;
+        }
+        // Stored client may have been deleted server-side; fall through to re-register.
+        log.debug(`[Coder OAuth] Client update failed, re-registering: ${updated.error}`);
       }
-      // Stored client may have been deleted server-side; fall through to re-register.
-      log.debug(`[Coder OAuth] Client update failed, re-registering: ${updated.error}`);
-    }
 
-    return this.registerClient(endpoints.registrationEndpoint, redirectUri, signal);
+      return yield* self.registerClientEffect(endpoints.registrationEndpoint, redirectUri, signal);
+    });
   }
 
-  private async registerClient(
+  private registerClientEffect(
     registrationEndpoint: string,
     redirectUri: string,
     signal: AbortSignal
-  ): Promise<Result<CoderOauthClient, string>> {
-    try {
-      const response = await fetch(registrationEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify(buildCoderClientMetadata(redirectUri)),
-        signal,
+  ): Effect.Effect<CoderOauthClient, CoderOauthError> {
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)` coercion (see above).
+        try: async () =>
+          fetch(registrationEndpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify(buildCoderClientMetadata(redirectUri)),
+            signal,
+          }),
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Coder OAuth client registration failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Coder OAuth client registration failed (${response.status})`;
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Coder OAuth client registration failed: ${getErrorMessage(error)}`,
+          }),
+      });
       if (!isPlainObject(json)) {
-        return Err("Coder OAuth client registration returned an invalid JSON payload");
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: "Coder OAuth client registration returned an invalid JSON payload",
+          })
+        );
       }
 
       const clientId = typeof json.client_id === "string" ? json.client_id : null;
@@ -991,7 +1236,11 @@ export class CoderOauthService {
       const clientSecret = typeof json.client_secret === "string" ? json.client_secret : null;
 
       if (!clientId || !clientSecret) {
-        return Err("Coder OAuth client registration response missing client credentials");
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: "Coder OAuth client registration response missing client credentials",
+          })
+        );
       }
 
       const registrationAccessToken =
@@ -1003,69 +1252,81 @@ export class CoderOauthService {
           ? json.registration_client_uri
           : undefined;
 
-      return Ok({ clientId, clientSecret, registrationAccessToken, registrationClientUri });
-    } catch (error) {
-      return Err(`Coder OAuth client registration failed: ${getErrorMessage(error)}`);
-    }
+      return { clientId, clientSecret, registrationAccessToken, registrationClientUri };
+    });
   }
 
-  private async updateClientRedirectUri(
+  private updateClientRedirectUriEffect(
     stored: CoderOauthAuth,
     redirectUri: string,
     // Reports an outcome the server may still commit (no response received,
     // or an ambiguous 5xx response).
     onUncertainOutcome: (clientId: string) => void
-  ): Promise<Result<CoderOauthClient, string>> {
-    if (!stored.registrationAccessToken || !stored.registrationClientUri) {
-      return Err("No registration access token stored");
-    }
+  ): Effect.Effect<CoderOauthClient, CoderOauthError> {
+    return Effect.gen(function* () {
+      if (!stored.registrationAccessToken || !stored.registrationClientUri) {
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: "No registration access token stored" })
+        );
+      }
+      // Captured as consts so the narrowed types survive into the fetch thunk.
+      const registrationAccessToken = stored.registrationAccessToken;
+      const registrationClientUri = stored.registrationClientUri;
 
-    try {
       // RFC 7592 requires the full metadata set on update, not a partial patch.
       // Timeout-only bound, NOT the flow abort signal: aborting the fetch on
       // Cancel would not retract a mutation the deployment may still commit,
       // and the client lease is only released once this request settles.
-      const response = await fetch(stored.registrationClientUri, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          Authorization: `Bearer ${stored.registrationAccessToken}`,
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)` coercion (see above).
+        try: async () =>
+          fetch(registrationClientUri, {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              Authorization: `Bearer ${registrationAccessToken}`,
+            },
+            body: JSON.stringify({
+              ...buildCoderClientMetadata(redirectUri),
+              client_id: stored.clientId,
+            }),
+            signal: AbortSignal.timeout(CLIENT_UPDATE_TIMEOUT_MS),
+          }),
+        catch: (error) => {
+          // Thrown before any response arrived (timeout / connection error): the
+          // deployment may have received the request and could still commit it.
+          onUncertainOutcome(stored.clientId);
+          return new CoderOauthError({
+            reason: `Coder OAuth client update failed: ${getErrorMessage(error)}`,
+          });
         },
-        body: JSON.stringify({
-          ...buildCoderClientMetadata(redirectUri),
-          client_id: stored.clientId,
-        }),
-        signal: AbortSignal.timeout(CLIENT_UPDATE_TIMEOUT_MS),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Coder OAuth client update failed (${response.status})`;
         // 5xx is ambiguous, not authoritative: a reverse proxy can answer
         // 502/504 AFTER forwarding the PUT (and a server can fail after
         // committing), so the upstream mutation may still land at any later
-        // time — exactly like the no-response path below. Only a 4xx is a
+        // time — exactly like the no-response path above. Only a 4xx is a
         // definitive refusal that provably left the registration unchanged.
         if (response.status >= 500) {
           onUncertainOutcome(stored.clientId);
         }
-        return Err(errorText ? `${prefix}: ${errorText}` : prefix);
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: errorText ? `${prefix}: ${errorText}` : prefix })
+        );
       }
 
       // Coder keeps the existing client secret and registration token on update.
-      return Ok({
+      return {
         clientId: stored.clientId,
         clientSecret: stored.clientSecret,
         registrationAccessToken: stored.registrationAccessToken,
         registrationClientUri: stored.registrationClientUri,
-      });
-    } catch (error) {
-      // Thrown before any response arrived (timeout / connection error): the
-      // deployment may have received the request and could still commit it.
-      onUncertainOutcome(stored.clientId);
-      return Err(`Coder OAuth client update failed: ${getErrorMessage(error)}`);
-    }
+      };
+    });
   }
 
   /**
@@ -1084,33 +1345,45 @@ export class CoderOauthService {
    * client was already replaced/cleared) — only then may the caller release
    * the client lease.
    */
-  private async quarantineStoredClient(clientId: string): Promise<boolean> {
-    try {
-      const result = await this.fileLeaseManager.withCoderOauthRefreshLock(() =>
-        this.providerService.updateProviderSection("coder", (section) => {
-          const stored = parseCoderOauthAuth(section?.coderOauth);
-          if (stored?.clientId !== clientId) {
-            return null; // Already replaced or cleared; nothing to quarantine.
-          }
-          const next = { ...(section ?? {}) };
-          next.coderOauth = {
-            ...stored,
-            registrationAccessToken: undefined,
-            registrationClientUri: undefined,
-          };
-          return { value: next };
-        })
-      );
-      this.cachedAuth = null;
+  private quarantineStoredClientEffect(clientId: string): Effect.Effect<boolean> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const result = yield* Effect.tryPromise({
+        try: () =>
+          self.fileLeaseManager.withCoderOauthRefreshLock(() =>
+            self.providerService.updateProviderSection("coder", (section) => {
+              const stored = parseCoderOauthAuth(section?.coderOauth);
+              if (stored?.clientId !== clientId) {
+                return null; // Already replaced or cleared; nothing to quarantine.
+              }
+              const next = { ...(section ?? {}) };
+              next.coderOauth = {
+                ...stored,
+                registrationAccessToken: undefined,
+                registrationClientUri: undefined,
+              };
+              return { value: next };
+            })
+          ),
+        catch: getErrorMessage,
+      });
+      self.cachedAuth = null;
       if (!result.success) {
         log.warn(`[Coder OAuth] Failed to quarantine stored client: ${result.error}`);
         return false;
       }
       return true;
-    } catch (error) {
-      log.warn(`[Coder OAuth] Failed to quarantine stored client: ${getErrorMessage(error)}`);
-      return false;
-    }
+    }).pipe(
+      // Mirror the pre-Effect whole-body try/catch: lock/write rejections are
+      // logged and reported as "not quarantined" so the caller keeps the lease.
+      Effect.catch((message) =>
+        Effect.sync(() => {
+          log.warn(`[Coder OAuth] Failed to quarantine stored client: ${message}`);
+          return false;
+        })
+      )
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -1137,7 +1410,7 @@ export class CoderOauthService {
    *
    * Returns true when the login was committed (flow finished with Ok).
    */
-  private async commitDesktopLogin(
+  private commitDesktopLoginEffect(
     flowId: string,
     flowStartPersistedGeneration: number,
     deploymentUrl: string,
@@ -1146,47 +1419,57 @@ export class CoderOauthService {
       Awaited<ReturnType<typeof startLoopbackServer>>,
       "sendSuccessResponse" | "sendFailureResponse"
     >
-  ): Promise<boolean> {
-    const result = await this.commitDesktopLoginLocked(
-      flowId,
-      flowStartPersistedGeneration,
-      deploymentUrl,
-      auth,
-      loopback
+  ): Effect.Effect<boolean> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    // Uninterruptible: commit is the persist -> finish/rollback teardown
+    // primitive — once it begins, the critical section and the follow-up
+    // revocation bookkeeping must complete together (the pipeline fiber is
+    // detached, but the commit must not depend on that).
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        const result = yield* self.commitDesktopLoginLockedEffect(
+          flowId,
+          flowStartPersistedGeneration,
+          deploymentUrl,
+          auth,
+          loopback
+        );
+
+        // Revocation is best-effort network I/O against a possibly stalled
+        // endpoint: it runs AFTER the commit lock is released so one abandoned
+        // flow's cleanup can never block later logins from committing (the fetch
+        // is additionally time-bounded, see REVOKE_TIMEOUT_MS).
+        if (result.outcome !== "committed") {
+          // NOTE: no pending browser response can leak here. When cancellation or
+          // the flow timeout wins mid-commit, the flow manager closes the raw
+          // loopback server, whose patched close() ends the deferred callback
+          // response first (see startLoopbackServer) — so the awaited cancel RPC
+          // never hangs on server.close().
+
+          // Every non-committed outcome revokes the exchanged tokens: a failed
+          // persist (unwritable providers.jsonc, lock timeout) would otherwise
+          // leave them active and untracked on the deployment while the UI
+          // reports the login as failed. The one exception: a post-persist
+          // cancellation whose ROLLBACK write failed — the persisted section
+          // still holds these tokens, so revoking would leave Settings showing
+          // a connected account whose every request fails. Keep the working
+          // credential instead; the stored blob keeps it tracked (Disconnect or
+          // the next successful login revokes it).
+          if (!result.persistedAuthRetained) {
+            yield* self.revokeTokensEffect(deploymentUrl, auth);
+          }
+        } else if (result.replacedAuth && result.replacedAuth.refresh !== auth.refresh) {
+          // A successful re-login replaced a previous credential: revoke it, or
+          // the old full-privilege token would stay valid forever with nothing
+          // tracking it (Disconnect only knows the new blob). Revoked against its
+          // own issuer — the replaced blob may belong to a different deployment.
+          yield* self.revokeTokensEffect(result.replacedAuth.deploymentUrl, result.replacedAuth);
+        }
+
+        return result.outcome === "committed";
+      })
     );
-
-    // Revocation is best-effort network I/O against a possibly stalled
-    // endpoint: it runs AFTER the commit lock is released so one abandoned
-    // flow's cleanup can never block later logins from committing (the fetch
-    // is additionally time-bounded, see REVOKE_TIMEOUT_MS).
-    if (result.outcome !== "committed") {
-      // NOTE: no pending browser response can leak here. When cancellation or
-      // the flow timeout wins mid-commit, the flow manager closes the raw
-      // loopback server, whose patched close() ends the deferred callback
-      // response first (see startLoopbackServer) — so the awaited cancel RPC
-      // never hangs on server.close().
-
-      // Every non-committed outcome revokes the exchanged tokens: a failed
-      // persist (unwritable providers.jsonc, lock timeout) would otherwise
-      // leave them active and untracked on the deployment while the UI
-      // reports the login as failed. The one exception: a post-persist
-      // cancellation whose ROLLBACK write failed — the persisted section
-      // still holds these tokens, so revoking would leave Settings showing
-      // a connected account whose every request fails. Keep the working
-      // credential instead; the stored blob keeps it tracked (Disconnect or
-      // the next successful login revokes it).
-      if (!result.persistedAuthRetained) {
-        await this.revokeTokens(deploymentUrl, auth);
-      }
-    } else if (result.replacedAuth && result.replacedAuth.refresh !== auth.refresh) {
-      // A successful re-login replaced a previous credential: revoke it, or
-      // the old full-privilege token would stay valid forever with nothing
-      // tracking it (Disconnect only knows the new blob). Revoked against its
-      // own issuer — the replaced blob may belong to a different deployment.
-      await this.revokeTokens(result.replacedAuth.deploymentUrl, result.replacedAuth);
-    }
-
-    return result.outcome === "committed";
   }
 
   /**
@@ -1197,7 +1480,7 @@ export class CoderOauthService {
    * the auth blob it replaced (if any) so the caller can revoke the
    * superseded credential.
    */
-  private async commitDesktopLoginLocked(
+  private commitDesktopLoginLockedEffect(
     flowId: string,
     flowStartPersistedGeneration: number,
     deploymentUrl: string,
@@ -1206,31 +1489,55 @@ export class CoderOauthService {
       Awaited<ReturnType<typeof startLoopbackServer>>,
       "sendSuccessResponse" | "sendFailureResponse"
     >
-  ): Promise<CoderLoginCommitResult> {
-    await using _commitLock = await this.loginCommitMutex.acquire();
-
-    // The cross-process lock itself can fail (acquisition timeout, EACCES on
-    // the lock directory). That rejection must not escape this detached
-    // flow task: the flow would stay pending until its five-minute timeout
-    // while the exchanged tokens stayed active — finish the flow with the
-    // error and report "failed" so the caller's revocation still runs.
-    try {
-      return await this.commitDesktopLoginCrossProcess(
-        flowId,
-        flowStartPersistedGeneration,
-        deploymentUrl,
-        auth,
-        loopback
-      );
-    } catch (error) {
-      const message = `Failed to commit Coder login: ${getErrorMessage(error)}`;
-      log.warn(`[Coder OAuth] ${message}`);
-      loopback.sendFailureResponse(message);
-      await this.desktopFlows.finish(flowId, Err(message));
-      return { outcome: "failed" };
-    }
+  ): Effect.Effect<CoderLoginCommitResult> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    // acquireUseRelease guarantees the process-local commit mutex is released
+    // on every exit path — the Effect equivalent of the pre-Effect
+    // `await using` lock.
+    return Effect.acquireUseRelease(
+      Effect.promise(() => self.loginCommitMutex.acquire()),
+      () =>
+        // The cross-process lock itself can fail (acquisition timeout, EACCES on
+        // the lock directory). That rejection must not escape this detached
+        // flow fiber: the flow would stay pending until its five-minute timeout
+        // while the exchanged tokens stayed active — finish the flow with the
+        // error and report "failed" so the caller's revocation still runs.
+        Effect.tryPromise({
+          try: () =>
+            self.commitDesktopLoginCrossProcess(
+              flowId,
+              flowStartPersistedGeneration,
+              deploymentUrl,
+              auth,
+              loopback
+            ),
+          catch: getErrorMessage,
+        }).pipe(
+          Effect.catch((message) =>
+            Effect.gen(function* () {
+              const fullMessage = `Failed to commit Coder login: ${message}`;
+              log.warn(`[Coder OAuth] ${fullMessage}`);
+              loopback.sendFailureResponse(fullMessage);
+              yield* self.desktopFlows.finishEffect(flowId, Err(fullMessage));
+              const failed: CoderLoginCommitResult = { outcome: "failed" };
+              return failed;
+            })
+          )
+        ),
+      (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
+    );
   }
 
+  /**
+   * Deliberately left a Promise method: the interior is the
+   * withCoderOauthLoginCommitLock callback seam, and its
+   * `desktopFlows.has(flowId)` liveness checks must stay textually adjacent
+   * to the persist write and the `finish` calls (the cancelled-flow
+   * no-commit contract). Callers reach it through
+   * commitDesktopLoginLockedEffect, which owns the mutex and the
+   * rejection fold.
+   */
   private async commitDesktopLoginCrossProcess(
     flowId: string,
     flowStartPersistedGeneration: number,
@@ -1418,110 +1725,150 @@ export class CoderOauthService {
     return true;
   }
 
-  private async refreshTokens(current: CoderOauthAuth): Promise<Result<CoderOauthAuth, string>> {
-    // Refresh against the issuer the tokens came from (getValidAuth already
-    // guarantees it matches the configured deployment URL). Endpoints derive
-    // from the access URL; skip a discovery round-trip on the hot request path.
-    const tokenEndpoint = `${current.deploymentUrl}/oauth2/tokens`;
-    const result = await this.requestTokens(tokenEndpoint, {
-      kind: "refresh",
-      deploymentUrl: current.deploymentUrl,
-      // Rotations stay in the same login session (see CoderOauthAuth.sessionId).
-      sessionId: current.sessionId,
-      client: current,
-      refreshToken: current.refresh,
-    });
+  private refreshTokensEffect(
+    current: CoderOauthAuth
+  ): Effect.Effect<CoderOauthAuth, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // Refresh against the issuer the tokens came from (getValidAuth already
+      // guarantees it matches the configured deployment URL). Endpoints derive
+      // from the access URL; skip a discovery round-trip on the hot request path.
+      const tokenEndpoint = `${current.deploymentUrl}/oauth2/tokens`;
+      const result = yield* self.requestTokensEffect(tokenEndpoint, {
+        kind: "refresh",
+        deploymentUrl: current.deploymentUrl,
+        // Rotations stay in the same login session (see CoderOauthAuth.sessionId).
+        sessionId: current.sessionId,
+        client: current,
+        refreshToken: current.refresh,
+      });
 
-    if (!result.success) {
-      // When the refresh token is invalid/revoked (rotation means a reused token
-      // is dead), clear persisted auth so requests surface "reconnect" errors.
-      if (result.invalidGrant) {
-        // The refresh mutex is process-local: a concurrent desktop/CLI process
-        // sharing providers.jsonc may have consumed this refresh token and
-        // persisted the rotated one. Compare-and-clear: the stored blob is
-        // deleted only while it still holds the rejected refresh token, so a
-        // winner that persists concurrently is never erased (the predicate and
-        // the write run in one synchronous block; see updateConfigValue).
-        const clearResult = await this.clearStoredAuthIfMatches(current);
-        if (!clearResult.success) {
-          log.warn(
-            `[Coder OAuth] Failed to clear stored auth after refresh failure: ${clearResult.error}`
-          );
-          return Err(
-            "Coder OAuth session expired. Use 'Login with Coder' in Settings to reconnect."
-          );
-        }
-
-        if (!clearResult.data.applied) {
-          // A different credential is on disk: another process won the
-          // rotation race. Adopt the winner instead of failing.
-          const stored = this.readStoredAuth();
-          if (stored && stored.refresh !== current.refresh) {
-            log.debug("[Coder OAuth] Refresh lost a cross-process rotation race; adopting winner");
-            if (!isCoderOauthAuthExpired(stored)) {
-              return Ok(stored);
-            }
-            // Recursion is bounded: it only recurses when the on-disk token
-            // changed again since the last attempt.
-            return this.refreshTokens(stored);
+      if (!result.success) {
+        // When the refresh token is invalid/revoked (rotation means a reused token
+        // is dead), clear persisted auth so requests surface "reconnect" errors.
+        if (result.invalidGrant) {
+          // The refresh mutex is process-local: a concurrent desktop/CLI process
+          // sharing providers.jsonc may have consumed this refresh token and
+          // persisted the rotated one. Compare-and-clear: the stored blob is
+          // deleted only while it still holds the rejected refresh token, so a
+          // winner that persists concurrently is never erased (the predicate and
+          // the write run in one synchronous block; see updateConfigValue).
+          const clearResult = yield* self.clearStoredAuthIfMatchesEffect(current);
+          if (!clearResult.success) {
+            log.warn(
+              `[Coder OAuth] Failed to clear stored auth after refresh failure: ${clearResult.error}`
+            );
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason:
+                  "Coder OAuth session expired. Use 'Login with Coder' in Settings to reconnect.",
+              })
+            );
           }
+
+          if (!clearResult.data.applied) {
+            // A different credential is on disk: another process won the
+            // rotation race. Adopt the winner instead of failing.
+            const stored = self.readStoredAuth();
+            if (stored && stored.refresh !== current.refresh) {
+              log.debug(
+                "[Coder OAuth] Refresh lost a cross-process rotation race; adopting winner"
+              );
+              if (!isCoderOauthAuthExpired(stored)) {
+                return stored;
+              }
+              // Recursion is bounded: it only recurses when the on-disk token
+              // changed again since the last attempt.
+              return yield* self.refreshTokensEffect(stored);
+            }
+          }
+
+          log.debug("[Coder OAuth] Refresh token rejected; cleared stored auth");
+          return yield* Effect.fail(
+            new CoderOauthError({
+              reason:
+                "Coder OAuth session expired. Use 'Login with Coder' in Settings to reconnect.",
+            })
+          );
         }
 
-        log.debug("[Coder OAuth] Refresh token rejected; cleared stored auth");
-        return Err("Coder OAuth session expired. Use 'Login with Coder' in Settings to reconnect.");
+        return yield* Effect.fail(new CoderOauthError({ reason: result.error }));
       }
 
-      return Err(result.error);
-    }
+      // Coder rotates the refresh token on every use: persist the new tokens
+      // BEFORE handing them to the caller so a crash cannot strand us with a
+      // consumed (now invalid) refresh token on disk. The write is conditional:
+      // it lands only while the credential we consumed is still the stored one.
+      // If a re-login (possibly to another deployment) or a disconnect finished
+      // while the token endpoint round-trip was in flight, overwriting would
+      // clobber the newer state with a blob from the old generation.
+      const persistResult = yield* self.persistRotatedAuthEffect(result.auth, current.refresh);
+      if (!persistResult.success) {
+        // Persistence failed outright (providers.jsonc unwritable, lock
+        // timeout): persist-before-use means the rotation cannot be handed out,
+        // yet the exchange already consumed the stored refresh token. Like the
+        // CAS-lost path below, revoke the orphaned rotation (best-effort) so a
+        // full-privilege token no tracking references cannot stay alive.
+        yield* self.revokeTokensEffect(result.auth.deploymentUrl, result.auth);
+        return yield* Effect.fail(new CoderOauthError({ reason: persistResult.error }));
+      }
 
-    // Coder rotates the refresh token on every use: persist the new tokens
-    // BEFORE handing them to the caller so a crash cannot strand us with a
-    // consumed (now invalid) refresh token on disk. The write is conditional:
-    // it lands only while the credential we consumed is still the stored one.
-    // If a re-login (possibly to another deployment) or a disconnect finished
-    // while the token endpoint round-trip was in flight, overwriting would
-    // clobber the newer state with a blob from the old generation.
-    const persistResult = await this.persistRotatedAuth(result.auth, current.refresh);
-    if (!persistResult.success) {
-      // Persistence failed outright (providers.jsonc unwritable, lock
-      // timeout): persist-before-use means the rotation cannot be handed out,
-      // yet the exchange already consumed the stored refresh token. Like the
-      // CAS-lost path below, revoke the orphaned rotation (best-effort) so a
-      // full-privilege token no tracking references cannot stay alive.
-      await this.revokeTokens(result.auth.deploymentUrl, result.auth);
-      return Err(persistResult.error);
-    }
-
-    if (!persistResult.data.applied) {
-      // Our rotation lost: revoke the now-orphaned tokens (nothing references
-      // them) and defer to whatever credential replaced ours.
-      await this.revokeTokens(result.auth.deploymentUrl, result.auth);
-      const stored = this.readStoredAuth();
-      if (stored && stored.refresh === current.refresh) {
-        // The stored blob is unchanged — the persist was refused because the
-        // configured deployment URL changed mid-round-trip. The consumed
-        // credential cannot be served (issuer mismatch) or refreshed again
-        // (its refresh token was just rotated away), so surface reconnect
-        // guidance instead of recursing into a doomed request.
-        return Err(
-          "Coder deployment URL changed since login. Use 'Login with Coder' in Settings to reconnect."
+      if (!persistResult.data.applied) {
+        // Our rotation lost: revoke the now-orphaned tokens (nothing references
+        // them) and defer to whatever credential replaced ours.
+        yield* self.revokeTokensEffect(result.auth.deploymentUrl, result.auth);
+        const stored = self.readStoredAuth();
+        if (stored && stored.refresh === current.refresh) {
+          // The stored blob is unchanged — the persist was refused because the
+          // configured deployment URL changed mid-round-trip. The consumed
+          // credential cannot be served (issuer mismatch) or refreshed again
+          // (its refresh token was just rotated away), so surface reconnect
+          // guidance instead of recursing into a doomed request.
+          return yield* Effect.fail(
+            new CoderOauthError({
+              reason:
+                "Coder deployment URL changed since login. Use 'Login with Coder' in Settings to reconnect.",
+            })
+          );
+        }
+        if (stored) {
+          log.debug("[Coder OAuth] Refresh superseded by a newer login; adopting it");
+          if (!isCoderOauthAuthExpired(stored)) {
+            return stored;
+          }
+          // Bounded: recursion only happens when the on-disk credential changed.
+          return yield* self.refreshTokensEffect(stored);
+        }
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason:
+              "Coder OAuth was disconnected. Use 'Login with Coder' in Settings to reconnect.",
+          })
         );
       }
-      if (stored) {
-        log.debug("[Coder OAuth] Refresh superseded by a newer login; adopting it");
-        if (!isCoderOauthAuthExpired(stored)) {
-          return Ok(stored);
-        }
-        // Bounded: recursion only happens when the on-disk credential changed.
-        return this.refreshTokens(stored);
-      }
-      return Err("Coder OAuth was disconnected. Use 'Login with Coder' in Settings to reconnect.");
-    }
 
-    return Ok(result.auth);
+      return result.auth;
+    }).pipe(
+      // Whole-pipeline fold: an unexpected throw — e.g. a rejected
+      // updateConfigValue/updateProviderSection write inside the clear/persist
+      // helpers, which Effect.promise surfaces as a defect — must fold into
+      // the wire error so getValidAuth() keeps returning Err(...) instead of
+      // rejecting.
+      Effect.catchDefect((defect) =>
+        Effect.fail(
+          new CoderOauthError({ reason: `Coder OAuth refresh failed: ${getErrorMessage(defect)}` })
+        )
+      )
+    );
   }
 
-  private async requestTokens(
+  /**
+   * Token endpoint round-trip. The `CoderTokenRequestResult` union stays in
+   * the success channel (never the error channel): callers branch on
+   * `invalidGrant`, which a plain reason-carrying error could not express.
+   */
+  private requestTokensEffect(
     tokenEndpoint: string,
     input:
       | {
@@ -1543,50 +1890,67 @@ export class CoderOauthService {
     // Always time-bounded; exchanges additionally pass the flow's abort
     // signal so Cancel/flow-timeout kills the in-flight round-trip.
     signal?: AbortSignal
-  ): Promise<CoderTokenRequestResult> {
+  ): Effect.Effect<CoderTokenRequestResult> {
     const label = input.kind === "exchange" ? "exchange" : "refresh";
 
-    try {
-      const body =
-        input.kind === "exchange"
-          ? buildCoderTokenExchangeBody({
-              clientId: input.client.clientId,
-              clientSecret: input.client.clientSecret,
-              code: input.code,
-              redirectUri: input.redirectUri,
-              codeVerifier: input.codeVerifier,
-            })
-          : buildCoderRefreshBody({
-              clientId: input.client.clientId,
-              clientSecret: input.client.clientSecret,
-              refreshToken: input.refreshToken,
-            });
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: the body/signal construction and the fetch all sat
+        // inside the pre-Effect try/catch, so sync throws must take the same
+        // caught path (and mock fetches may return non-Promises).
+        try: async () => {
+          const body =
+            input.kind === "exchange"
+              ? buildCoderTokenExchangeBody({
+                  clientId: input.client.clientId,
+                  clientSecret: input.client.clientSecret,
+                  code: input.code,
+                  redirectUri: input.redirectUri,
+                  codeVerifier: input.codeVerifier,
+                })
+              : buildCoderRefreshBody({
+                  clientId: input.client.clientId,
+                  clientSecret: input.client.clientSecret,
+                  refreshToken: input.refreshToken,
+                });
 
-      const timeoutSignal = AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS);
-      const response = await fetch(tokenEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body,
-        signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+          const timeoutSignal = AbortSignal.timeout(TOKEN_REQUEST_TIMEOUT_MS);
+          return await fetch(tokenEndpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body,
+            signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+          });
+        },
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Coder OAuth ${label} failed: ${getErrorMessage(error)}`,
+          }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => "");
+        const errorText = yield* Effect.promise(() => response.text().catch(() => ""));
         const prefix = `Coder OAuth ${label} failed (${response.status})`;
         return {
           success: false,
           error: errorText ? `${prefix}: ${errorText}` : prefix,
           invalidGrant: isInvalidGrantError(errorText),
-        };
+        } satisfies CoderTokenRequestResult;
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: (error) =>
+          new CoderOauthError({
+            reason: `Coder OAuth ${label} failed: ${getErrorMessage(error)}`,
+          }),
+      });
       if (!isPlainObject(json)) {
         return {
           success: false,
           error: `Coder OAuth ${label} returned an invalid JSON payload`,
           invalidGrant: false,
-        };
+        } satisfies CoderTokenRequestResult;
       }
 
       const accessToken = typeof json.access_token === "string" ? json.access_token : null;
@@ -1598,7 +1962,7 @@ export class CoderOauthService {
           success: false,
           error: `Coder OAuth ${label} response missing access_token/refresh_token/expires_in`,
           invalidGrant: false,
-        };
+        } satisfies CoderTokenRequestResult;
       }
 
       return {
@@ -1615,35 +1979,48 @@ export class CoderOauthService {
           registrationAccessToken: input.client.registrationAccessToken,
           registrationClientUri: input.client.registrationClientUri,
         },
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: `Coder OAuth ${label} failed: ${getErrorMessage(error)}`,
-        invalidGrant: false,
-      };
-    }
+      } satisfies CoderTokenRequestResult;
+    }).pipe(
+      // Mirror the pre-Effect whole-body try/catch: every failure folds into
+      // the union's non-invalid_grant failure shape.
+      Effect.catch((error) =>
+        Effect.succeed<CoderTokenRequestResult>({
+          success: false,
+          error: error.reason,
+          invalidGrant: false,
+        })
+      )
+    );
   }
 
   /** Best-effort RFC 7009 revocation; failures are logged, never surfaced. */
-  private async revokeTokens(
+  private revokeTokensEffect(
     deploymentUrl: string,
     auth: Pick<CoderOauthAuth, "refresh" | "clientId" | "clientSecret">
-  ): Promise<void> {
-    try {
-      const body = new URLSearchParams();
-      body.set("token", auth.refresh);
-      body.set("client_id", auth.clientId);
-      body.set("client_secret", auth.clientSecret);
-      await fetch(`${deploymentUrl}/oauth2/revoke`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body,
-        signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
-      });
-    } catch (error) {
-      log.debug(`[Coder OAuth] Best-effort token revocation failed: ${getErrorMessage(error)}`);
-    }
+  ): Effect.Effect<void> {
+    return Effect.tryPromise({
+      // Whole pre-Effect try/catch body lives in the thunk so sync throws
+      // (URLSearchParams, AbortSignal) take the same caught path.
+      try: async () => {
+        const body = new URLSearchParams();
+        body.set("token", auth.refresh);
+        body.set("client_id", auth.clientId);
+        body.set("client_secret", auth.clientSecret);
+        await fetch(`${deploymentUrl}/oauth2/revoke`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
+          signal: AbortSignal.timeout(REVOKE_TIMEOUT_MS),
+        });
+      },
+      catch: getErrorMessage,
+    }).pipe(
+      Effect.catch((message) =>
+        Effect.sync(() => {
+          log.debug(`[Coder OAuth] Best-effort token revocation failed: ${message}`);
+        })
+      )
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -1658,31 +2035,39 @@ export class CoderOauthService {
    *   — fall back to probing default provider names.
    * - "error": transient failure; the provider set is unknown.
    */
-  private async fetchGatewayProviders(
+  private fetchGatewayProvidersEffect(
     auth: CoderOauthAuth
-  ): Promise<
+  ): Effect.Effect<
     { kind: "ok"; providers: CoderGatewayProvider[] } | { kind: "unavailable" } | { kind: "error" }
   > {
-    try {
-      const response = await fetch(`${auth.deploymentUrl}${CODER_AI_PROVIDERS_PATH}`, {
-        headers: {
-          Authorization: `Bearer ${auth.access}`,
-          Accept: "application/json",
-        },
-        signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: mirrors the old `await fetch(...)` coercion (see above).
+        try: async () =>
+          fetch(`${auth.deploymentUrl}${CODER_AI_PROVIDERS_PATH}`, {
+            headers: {
+              Authorization: `Bearer ${auth.access}`,
+              Accept: "application/json",
+            },
+            signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
+          }),
+        catch: getErrorMessage,
       });
       if (!response.ok) {
         if (response.status === 403 || response.status === 404) {
           log.debug(`[Coder OAuth] Provider listing unavailable (${response.status})`);
-          return { kind: "unavailable" };
+          return { kind: "unavailable" } as const;
         }
         log.debug(`[Coder OAuth] Provider listing failed transiently (${response.status})`);
-        return { kind: "error" };
+        return { kind: "error" } as const;
       }
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: getErrorMessage,
+      });
       if (!Array.isArray(json)) {
         log.debug("[Coder OAuth] Provider listing returned an invalid payload");
-        return { kind: "error" };
+        return { kind: "error" } as const;
       }
       const providers: CoderGatewayProvider[] = [];
       for (const entry of json) {
@@ -1697,11 +2082,17 @@ export class CoderOauthService {
         }
         providers.push({ name: entry.name, type });
       }
-      return { kind: "ok", providers };
-    } catch (error) {
-      log.debug(`[Coder OAuth] Failed to list gateway providers: ${getErrorMessage(error)}`);
-      return { kind: "error" };
-    }
+      return { kind: "ok", providers } as const;
+    }).pipe(
+      // Mirror the pre-Effect whole-body try/catch: network/parse rejections
+      // are logged and classified as transient.
+      Effect.catch((message) =>
+        Effect.sync(() => {
+          log.debug(`[Coder OAuth] Failed to list gateway providers: ${message}`);
+          return { kind: "error" } as const;
+        })
+      )
+    );
   }
 
   /**
@@ -1719,29 +2110,33 @@ export class CoderOauthService {
    *   without a real /models route (e.g. AWS Bedrock behind the passthrough)
    *   also land here and simply never contribute discovered entries.
    */
-  private async fetchProviderCatalog(
+  private fetchProviderCatalogEffect(
     auth: CoderOauthAuth,
     provider: CoderGatewayProvider
-  ): Promise<{ kind: "ok"; ids: string[] } | { kind: "unavailable" } | { kind: "error" }> {
+  ): Effect.Effect<{ kind: "ok"; ids: string[] } | { kind: "unavailable" } | { kind: "error" }> {
     const providerName = provider.name;
-    try {
-      const headers: Record<string, string> = {
-        Authorization: `Bearer ${auth.access}`,
-        Accept: "application/json",
-      };
-      // /v1/models is a passthrough: Anthropic-wire upstreams reject requests
-      // without the required anthropic-version header with a conclusive 400,
-      // which would read as "no models" and hide every Anthropic model.
-      if (coderGatewayWireProtocol(provider.type) === "anthropic") {
-        headers["anthropic-version"] = "2023-06-01";
-      }
-      const response = await fetch(
-        `${coderAibridgeBaseUrl(auth.deploymentUrl, providerName)}/models`,
-        {
-          headers,
-          signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
-        }
-      );
+    return Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        // async thunk: header construction sat inside the pre-Effect
+        // try/catch, so its sync throws take the same caught path.
+        try: async () => {
+          const headers: Record<string, string> = {
+            Authorization: `Bearer ${auth.access}`,
+            Accept: "application/json",
+          };
+          // /v1/models is a passthrough: Anthropic-wire upstreams reject requests
+          // without the required anthropic-version header with a conclusive 400,
+          // which would read as "no models" and hide every Anthropic model.
+          if (coderGatewayWireProtocol(provider.type) === "anthropic") {
+            headers["anthropic-version"] = "2023-06-01";
+          }
+          return await fetch(`${coderAibridgeBaseUrl(auth.deploymentUrl, providerName)}/models`, {
+            headers,
+            signal: AbortSignal.timeout(CATALOG_FETCH_TIMEOUT_MS),
+          });
+        },
+        catch: getErrorMessage,
+      });
 
       if (!response.ok) {
         if (
@@ -1754,16 +2149,19 @@ export class CoderOauthService {
           log.debug(
             `[Coder OAuth] ${providerName} model list failed transiently (${response.status})`
           );
-          return { kind: "error" };
+          return { kind: "error" } as const;
         }
         log.debug(`[Coder OAuth] ${providerName} model list unavailable (${response.status})`);
-        return { kind: "unavailable" };
+        return { kind: "unavailable" } as const;
       }
 
-      const json = (await response.json()) as unknown;
+      const json = yield* Effect.tryPromise({
+        try: async (): Promise<unknown> => response.json(),
+        catch: getErrorMessage,
+      });
       if (!isPlainObject(json) || !Array.isArray(json.data)) {
         log.debug(`[Coder OAuth] ${providerName} model list returned an invalid payload`);
-        return { kind: "error" };
+        return { kind: "error" } as const;
       }
       const ids: string[] = [];
       for (const entry of json.data) {
@@ -1771,24 +2169,32 @@ export class CoderOauthService {
           ids.push(`${providerName}/${entry.id}`);
         }
       }
-      return { kind: "ok", ids };
-    } catch (error) {
-      log.debug(`[Coder OAuth] Failed to fetch ${providerName} models: ${getErrorMessage(error)}`);
-      return { kind: "error" };
-    }
+      return { kind: "ok", ids } as const;
+    }).pipe(
+      // Mirror the pre-Effect whole-body try/catch: network/parse rejections
+      // are logged and classified as transient.
+      Effect.catch((message) =>
+        Effect.sync(() => {
+          log.debug(`[Coder OAuth] Failed to fetch ${providerName} models: ${message}`);
+          return { kind: "error" } as const;
+        })
+      )
+    );
   }
 
   /** Retry the transient ("error") outcomes of a discovery request. */
-  private async retryTransient<T extends { kind: string }>(
-    fetchOnce: () => Promise<T>
-  ): Promise<T> {
-    for (let attempt = 0; ; attempt++) {
-      const result = await fetchOnce();
-      if (result.kind !== "error" || attempt >= CATALOG_FETCH_RETRIES) {
-        return result;
+  private retryTransientEffect<T extends { kind: string }>(
+    fetchOnce: Effect.Effect<T>
+  ): Effect.Effect<T> {
+    return Effect.gen(function* () {
+      for (let attempt = 0; ; attempt++) {
+        const result = yield* fetchOnce;
+        if (result.kind !== "error" || attempt >= CATALOG_FETCH_RETRIES) {
+          return result;
+        }
+        yield* Effect.sleep(Duration.millis(CATALOG_RETRY_DELAY_MS));
       }
-      await new Promise((resolve) => setTimeout(resolve, CATALOG_RETRY_DELAY_MS));
-    }
+    });
   }
 
   /**
@@ -1798,335 +2204,387 @@ export class CoderOauthService {
    * require a re-login.
    */
   async refreshModels(): Promise<Result<void, string>> {
-    const authResult = await this.getValidAuth();
-    if (!authResult.success) {
-      return Err(authResult.error);
-    }
-    return this.refreshBridgeModels(authResult.data);
+    return Effect.runPromise(this.refreshModelsEffect());
   }
 
-  private async refreshBridgeModels(auth: CoderOauthAuth): Promise<Result<void, string>> {
-    await using _lock = await this.catalogRefreshMutex.acquire();
-    // `return await` is load-bearing: a bare `return` would run the lock
-    // disposal before the returned promise settles, releasing the mutex
-    // while the refresh is still in flight.
-    return await this.refreshBridgeModelsSerialized(auth);
+  /** Wire-shaped Effect surface for handlerGen router handlers; never fails
+   * (defects fold into Err). */
+  refreshModelsEffect(): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const authResult = yield* self.getValidAuthEffect();
+      if (!authResult.success) {
+        return Err(authResult.error);
+      }
+      return yield* toWireResult(self.refreshBridgeModelsEffect(authResult.data));
+    }).pipe(
+      // A rejected updateProviderSection write inside the catalog pipeline is
+      // a defect; fold it into the wire error so the facade never rejects.
+      Effect.catchDefect((defect) =>
+        Effect.succeed(
+          Err(`Failed to refresh Coder models: ${getErrorMessage(defect)}`) as Result<void, string>
+        )
+      )
+    );
   }
 
-  private async refreshBridgeModelsSerialized(auth: CoderOauthAuth): Promise<Result<void, string>> {
-    // Cross-process refresh ordering: catalogRefreshMutex serializes only
-    // THIS process's refreshes, but multiple Xum processes share
-    // providers.jsonc (Config.withProvidersFileLock exists for exactly that).
-    // Snapshot the persisted catalog generation BEFORE any fetch; the locked
-    // commit below refuses when it moved, so a refresh that captured an
-    // older provider list can never overwrite a catalog another process
-    // committed mid-flight. A stale snapshot read here is safe: it can only
-    // cause a conservative refusal, never a stale commit.
-    const refreshStartGeneration = sanitizeGenerationCounter(
-      (
-        this.providersConfigStore.loadProvidersConfig()?.coder as
-          | { coderCatalogGeneration?: unknown }
-          | undefined
-      )?.coderCatalogGeneration
+  private refreshBridgeModelsEffect(auth: CoderOauthAuth): Effect.Effect<void, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    // acquireUseRelease guarantees the mutex is released only after the
+    // serialized refresh settles — the Effect equivalent of the pre-Effect
+    // `await using` lock plus its load-bearing `return await`.
+    return Effect.acquireUseRelease(
+      Effect.promise(() => self.catalogRefreshMutex.acquire()),
+      () => self.refreshBridgeModelsSerializedEffect(auth),
+      (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
     );
-    // The deployment's configured provider instances decide which gateway
-    // routes exist (each is mounted at /<name>/...), so list them first.
-    const listing = await this.retryTransient(() => this.fetchGatewayProviders(auth));
-    if (listing.kind === "error") {
-      // The provider set is unknown; keep the catalog in its current state
-      // (fail-open after login) rather than guessing.
-      log.debug("[Coder OAuth] Skipping catalog write: provider listing failed");
-      return Err("Failed to list the deployment's AI Gateway providers");
-    }
+  }
 
-    // When the admin-only listing is unavailable (regular members, older
-    // coderd), probe instead: the default type-named routes plus every name
-    // already known from earlier discovery or user config. Absent routes 404
-    // conclusively, so probing converges on the configured set for
-    // default-named deployments; custom-named instances stay reachable via
-    // the user-managed additionalProviders escape hatch.
-    const authoritative = listing.kind === "ok";
-    let providers: CoderGatewayProvider[];
-    if (authoritative) {
-      providers = listing.providers;
-    } else {
-      const section = this.providersConfigStore.loadProvidersConfig()?.coder as
-        | Record<string, unknown>
-        | undefined;
-      const known = new Map<string, CoderGatewayProvider>();
-      for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
-        known.set(name, { name, type: name });
-      }
-      for (const provider of [
-        ...parseCoderGatewayProviders(section?.discoveredProviders),
-        ...parseCoderGatewayProviders(section?.additionalProviders),
-      ]) {
-        known.set(provider.name, provider);
-      }
-      providers = [...known.values()];
-    }
-
-    // Provider catalogs are independent: fetch them concurrently and bound
-    // each request, so one stalled provider can neither delay nor starve a
-    // healthy one. Transient failures are retried per provider.
-    const results = await Promise.all(
-      providers.map(async (provider) => ({
-        provider,
-        result: await this.retryTransient(() => this.fetchProviderCatalog(auth, provider)),
-      }))
-    );
-
-    const everyFetchFailed =
-      results.length > 0 && results.every(({ result }) => result.kind === "error");
-
-    // Discovery races logins/disconnects: the flow resolves before this runs,
-    // so a newer login (or a disconnect) may replace or clear the stored
-    // credential while catalogs are fetched. The credential check and the
-    // catalog write happen in ONE locked mutation, so only the login whose
-    // tokens are still current can commit — a stale discovery can never
-    // repopulate models over a disconnect or a newer deployment's catalog.
-    // The credential check also pins the deployment, so per-provider
-    // carry-forward below can only resurrect entries from THIS deployment.
-    // `models` stays the user-visible union: manually added entries (those
-    // not recorded in discoveredModels) are carried forward ahead of the
-    // fresh catalog, so discovery never clobbers user-managed data.
-    let catalogInconclusive = false;
-    let supersededByConcurrentRefresh = false;
-    const setResult = await this.providerService.updateProviderSection("coder", (section) => {
-      const stored = parseCoderOauthAuth(section?.coderOauth);
-      // Compare the stable login-session lineage, not the access token:
-      // ordinary requests rotate the token while catalogs are fetched
-      // (rotations preserve sessionId — see refreshTokens), and rejecting a
-      // same-session rotation would silently discard the fetched catalog.
-      // A new login mints a fresh sessionId, so stale discoveries still lose.
-      if (
-        !stored ||
-        stored.sessionId !== auth.sessionId ||
-        stored.deploymentUrl !== auth.deploymentUrl
-      ) {
-        return null;
-      }
-      // Same counter-comparison pattern as coderDisconnectGeneration, checked
-      // inside the providers-file lock so compare + increment are atomic
-      // ACROSS processes: a catalog commit anywhere since this refresh began
-      // means these results were fetched against a superseded provider
-      // list/catalog — refuse rather than let the older refresh win.
-      const currentCatalogGeneration = sanitizeGenerationCounter(section?.coderCatalogGeneration);
-      if (currentCatalogGeneration !== refreshStartGeneration) {
-        supersededByConcurrentRefresh = true;
-        return null;
-      }
-      // Prior catalog state must be read INSIDE the locked mutation (a
-      // concurrent login/refresh may have changed it since discovery began).
-      const previousKnown = Array.isArray(section?.discoveredModels);
-      const previousDiscovered = Array.isArray(section?.discoveredModels)
-        ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-        : [];
-      // Display state retained through an earlier inconclusive refresh (the
-      // authoritative catalog was deleted then; this marker is all that
-      // remains of it). Never authoritative prior state — it only keeps
-      // entries user-visible across consecutive failed refreshes.
-      const staleDiscovered = Array.isArray(section?.staleDiscoveredModels)
-        ? section.staleDiscoveredModels.filter((id): id is string => typeof id === "string")
-        : [];
-      const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
-
-      // Per-provider conclusiveness: "ok" replaces the provider's entries,
-      // "unavailable" (404) conclusively clears them, and a transient "error"
-      // carries the provider's previous entries forward — one provider whose
-      // upstream rejects /models (Bedrock) or merely flaked must not poison
-      // every other provider's refresh, and a recovered provider heals on the
-      // next refresh instead of the next login. Carry-forward requires PRIOR
-      // STATE for that provider (a prior catalog naming it, or prior entries
-      // under its prefix): an errored provider without prior state — fresh
-      // login, or an instance the admin just added — makes the whole catalog
-      // inconclusive, because persisting the other providers' lists would
-      // read as an authoritative catalog that blocks every model of the
-      // failed provider until a later successful refresh.
-      // The COMPLETE discovered catalog is persisted, deliberately without
-      // policy filtering: policies refresh remotely, so a temporarily
-      // restrictive policy must not carve models out of the durable catalog.
-      // Policy is applied at exposure time instead — getConfig() filters the
-      // reported lists, routing checks the current policy, and the factory
-      // enforces it per model at creation.
-      const modelIds: string[] = [];
-      const nextProviders: CoderGatewayProvider[] = [];
-      for (const { provider, result } of results) {
-        const previous = previousProviders.find((prev) => prev.name === provider.name);
-        // Prior state must also TYPE-match under an authoritative listing:
-        // when the admin changes an instance's type (same name), the old
-        // type's model IDs are not valid carry-forward state — the write
-        // persists the NEW type, so carried entries would stay selectable and
-        // be sent over the new wire protocol until a successful refresh.
-        // A name with no stored metadata previously resolved via the
-        // name === type default, so that default is its effective prior type.
-        // The probe path persists `previous` (not the probe default), so no
-        // type change can occur there and the check is skipped.
-        const previousType = previous?.type ?? provider.name;
-        const typeUnchanged = !authoritative || previousType === provider.type;
-        const hasPriorState =
-          previousKnown &&
-          typeUnchanged &&
-          (previous !== undefined ||
-            previousDiscovered.some((id) => id.startsWith(`${provider.name}/`)));
-        if (result.kind === "ok") {
-          modelIds.push(...result.ids);
-          if (!authoritative) {
-            // The probe confirmed the route exists; prefer previously stored
-            // metadata (its type may come from an earlier authoritative
-            // listing) over the probe-derived name === type default.
-            nextProviders.push(previous ?? provider);
-          }
-        } else if (result.kind === "error") {
-          if (!hasPriorState) {
-            catalogInconclusive = true;
-            // Consecutive failed refreshes: after an inconclusive refresh the
-            // authoritative catalog is gone (previousKnown false), so a
-            // transiently failing provider has no carry-forward state — but
-            // its stale display entries must stay user-visible instead of
-            // vanishing from Settings/the selector. The catalog stays
-            // inconclusive, so these IDs land back in models +
-            // staleDiscoveredModels, never in discoveredModels. Type-gated
-            // like authoritative carry-forward.
-            if (typeUnchanged) {
-              modelIds.push(...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
-            }
-            continue;
-          }
-          modelIds.push(...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
-          if (!authoritative && previous) {
-            nextProviders.push(previous);
-          }
-        } else if (!authoritative && previous !== undefined) {
-          // "unavailable" on the PROBE path for an instance recorded by an
-          // earlier authoritative listing: the 404 proves only that the
-          // upstream serves no /models route — not that the admin removed
-          // the gateway instance (only an authoritative listing can say
-          // that). Dropping it would leave manually configured
-          // coder:<custom>/<model> entries unresolvable until a listing
-          // succeeds again, so keep the metadata and carry prior entries
-          // forward like a transient error.
-          nextProviders.push(previous);
-          if (previousKnown) {
-            modelIds.push(...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
-          } else {
-            // No authoritative prior catalog: stale display entries must not
-            // be promoted into a conclusive write.
-            catalogInconclusive = true;
-            modelIds.push(...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`)));
-          }
-        }
-        // "unavailable" otherwise: the authoritative listing already names
-        // every existing instance (a listed instance whose /models 404s
-        // conclusively serves no catalog), and probe-default names carry no
-        // recorded metadata — the route is conclusively absent; drop it.
-      }
-
-      const manual = manualModelEntries(section);
-      const manualIds = new Set(manual.map((entry) => maybeGetProviderModelEntryId(entry)));
-      // User-removed discovered models (recorded by setModels) stay excluded:
-      // a catalog refresh or re-login must not resurrect entries the user
-      // deleted from the model list.
-      const removed = new Set(
-        Array.isArray(section?.removedModels)
-          ? section.removedModels.filter((id): id is string => typeof id === "string")
-          : []
+  private refreshBridgeModelsSerializedEffect(
+    auth: CoderOauthAuth
+  ): Effect.Effect<void, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // Cross-process refresh ordering: catalogRefreshMutex serializes only
+      // THIS process's refreshes, but multiple Xum processes share
+      // providers.jsonc (Config.withProvidersFileLock exists for exactly that).
+      // Snapshot the persisted catalog generation BEFORE any fetch; the locked
+      // commit below refuses when it moved, so a refresh that captured an
+      // older provider list can never overwrite a catalog another process
+      // committed mid-flight. A stale snapshot read here is safe: it can only
+      // cause a conservative refusal, never a stale commit.
+      const refreshStartGeneration = sanitizeGenerationCounter(
+        (
+          self.providersConfigStore.loadProvidersConfig()?.coder as
+            | { coderCatalogGeneration?: unknown }
+            | undefined
+        )?.coderCatalogGeneration
       );
-      // User-visible union: manual entries first, then discovered/carried IDs.
-      const retainedDiscovered = modelIds.filter((id) => !manualIds.has(id) && !removed.has(id));
-      const merged = [...manual, ...retainedDiscovered];
-
-      if (catalogInconclusive) {
-        // The catalog cannot be written as authoritative. Keep/flip it to
-        // UNKNOWN so routing fails open (the failed provider's models stay
-        // reachable), losing at worst one refresh's worth of catalog data —
-        // the next successful refresh rebuilds it. The healthy providers'
-        // fetched and carried-forward entries STAY user-visible in `models`
-        // (only the authoritative `discoveredModels` marker is dropped):
-        // wiping them would empty Settings and the model selector until a
-        // later fully successful refresh. The authoritative admin listing is
-        // conclusive independently of the catalog fetches, so it is still
-        // persisted: custom-named instances must stay resolvable (e.g. for
-        // manually added models). Probe-derived metadata is just the
-        // name === type default that resolveCoderGatewayProvider already
-        // applies without persistence, so the probe path persists nothing
-        // new and keeps any previously stored metadata.
-        const next = { ...(section ?? {}) };
-        if (merged.length > 0) {
-          next.models = merged;
-        } else {
-          delete next.models;
-        }
-        delete next.discoveredModels;
-        // Record which retained entries came from discovery so
-        // manualModelEntries keeps classifying them as catalog data (cleared
-        // by disconnect/login, excluded from manual carry-forward) while the
-        // authoritative marker is absent.
-        if (retainedDiscovered.length > 0) {
-          next.staleDiscoveredModels = retainedDiscovered;
-        } else {
-          delete next.staleDiscoveredModels;
-        }
-        if (authoritative) {
-          next.discoveredProviders = providers;
-        }
-        // Even an inconclusive write is a catalog commit: a slower concurrent
-        // refresh must re-fetch rather than overwrite the retained state.
-        next.coderCatalogGeneration = currentCatalogGeneration + 1;
-        return { value: next };
+      // The deployment's configured provider instances decide which gateway
+      // routes exist (each is mounted at /<name>/...), so list them first.
+      const listing = yield* self.retryTransientEffect(self.fetchGatewayProvidersEffect(auth));
+      if (listing.kind === "error") {
+        // The provider set is unknown; keep the catalog in its current state
+        // (fail-open after login) rather than guessing.
+        log.debug("[Coder OAuth] Skipping catalog write: provider listing failed");
+        return yield* Effect.fail(
+          new CoderOauthError({ reason: "Failed to list the deployment's AI Gateway providers" })
+        );
       }
 
+      // When the admin-only listing is unavailable (regular members, older
+      // coderd), probe instead: the default type-named routes plus every name
+      // already known from earlier discovery or user config. Absent routes 404
+      // conclusively, so probing converges on the configured set for
+      // default-named deployments; custom-named instances stay reachable via
+      // the user-managed additionalProviders escape hatch.
+      const authoritative = listing.kind === "ok";
+      let providers: CoderGatewayProvider[];
       if (authoritative) {
-        // The admin listing is authoritative metadata: every listed instance
-        // is persisted (routable for manually added models even when its
-        // catalog fetch failed), and deleted/disabled instances drop out.
-        nextProviders.length = 0;
-        nextProviders.push(...providers);
+        providers = listing.providers;
+      } else {
+        const section = self.providersConfigStore.loadProvidersConfig()?.coder as
+          | Record<string, unknown>
+          | undefined;
+        const known = new Map<string, CoderGatewayProvider>();
+        for (const name of CODER_GATEWAY_DEFAULT_PROVIDER_NAMES) {
+          known.set(name, { name, type: name });
+        }
+        for (const provider of [
+          ...parseCoderGatewayProviders(section?.discoveredProviders),
+          ...parseCoderGatewayProviders(section?.additionalProviders),
+        ]) {
+          known.set(provider.name, provider);
+        }
+        providers = [...known.values()];
       }
-      // Conclusive catalog: the stale marker's entries are either re-listed
-      // in discoveredModels or conclusively gone.
-      const conclusive: Record<string, unknown> = {
-        ...(section ?? {}),
-        models: merged,
-        discoveredModels: modelIds,
-        discoveredProviders: nextProviders,
-        coderCatalogGeneration: currentCatalogGeneration + 1,
-      };
-      delete conclusive.staleDiscoveredModels;
-      return { value: conclusive };
+
+      // Provider catalogs are independent: fetch them concurrently and bound
+      // each request, so one stalled provider can neither delay nor starve a
+      // healthy one. Transient failures are retried per provider.
+      const results = yield* Effect.all(
+        providers.map((provider) =>
+          self
+            .retryTransientEffect(self.fetchProviderCatalogEffect(auth, provider))
+            .pipe(Effect.map((result) => ({ provider, result })))
+        ),
+        { concurrency: "unbounded" }
+      );
+
+      const everyFetchFailed =
+        results.length > 0 && results.every(({ result }) => result.kind === "error");
+
+      // Discovery races logins/disconnects: the flow resolves before this runs,
+      // so a newer login (or a disconnect) may replace or clear the stored
+      // credential while catalogs are fetched. The credential check and the
+      // catalog write happen in ONE locked mutation, so only the login whose
+      // tokens are still current can commit — a stale discovery can never
+      // repopulate models over a disconnect or a newer deployment's catalog.
+      // The credential check also pins the deployment, so per-provider
+      // carry-forward below can only resurrect entries from THIS deployment.
+      // `models` stays the user-visible union: manually added entries (those
+      // not recorded in discoveredModels) are carried forward ahead of the
+      // fresh catalog, so discovery never clobbers user-managed data.
+      let catalogInconclusive = false;
+      let supersededByConcurrentRefresh = false;
+      const setResult = yield* Effect.promise(() =>
+        self.providerService.updateProviderSection("coder", (section) => {
+          const stored = parseCoderOauthAuth(section?.coderOauth);
+          // Compare the stable login-session lineage, not the access token:
+          // ordinary requests rotate the token while catalogs are fetched
+          // (rotations preserve sessionId — see refreshTokens), and rejecting a
+          // same-session rotation would silently discard the fetched catalog.
+          // A new login mints a fresh sessionId, so stale discoveries still lose.
+          if (
+            !stored ||
+            stored.sessionId !== auth.sessionId ||
+            stored.deploymentUrl !== auth.deploymentUrl
+          ) {
+            return null;
+          }
+          // Same counter-comparison pattern as coderDisconnectGeneration, checked
+          // inside the providers-file lock so compare + increment are atomic
+          // ACROSS processes: a catalog commit anywhere since this refresh began
+          // means these results were fetched against a superseded provider
+          // list/catalog — refuse rather than let the older refresh win.
+          const currentCatalogGeneration = sanitizeGenerationCounter(
+            section?.coderCatalogGeneration
+          );
+          if (currentCatalogGeneration !== refreshStartGeneration) {
+            supersededByConcurrentRefresh = true;
+            return null;
+          }
+          // Prior catalog state must be read INSIDE the locked mutation (a
+          // concurrent login/refresh may have changed it since discovery began).
+          const previousKnown = Array.isArray(section?.discoveredModels);
+          const previousDiscovered = Array.isArray(section?.discoveredModels)
+            ? section.discoveredModels.filter((id): id is string => typeof id === "string")
+            : [];
+          // Display state retained through an earlier inconclusive refresh (the
+          // authoritative catalog was deleted then; this marker is all that
+          // remains of it). Never authoritative prior state — it only keeps
+          // entries user-visible across consecutive failed refreshes.
+          const staleDiscovered = Array.isArray(section?.staleDiscoveredModels)
+            ? section.staleDiscoveredModels.filter((id): id is string => typeof id === "string")
+            : [];
+          const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
+
+          // Per-provider conclusiveness: "ok" replaces the provider's entries,
+          // "unavailable" (404) conclusively clears them, and a transient "error"
+          // carries the provider's previous entries forward — one provider whose
+          // upstream rejects /models (Bedrock) or merely flaked must not poison
+          // every other provider's refresh, and a recovered provider heals on the
+          // next refresh instead of the next login. Carry-forward requires PRIOR
+          // STATE for that provider (a prior catalog naming it, or prior entries
+          // under its prefix): an errored provider without prior state — fresh
+          // login, or an instance the admin just added — makes the whole catalog
+          // inconclusive, because persisting the other providers' lists would
+          // read as an authoritative catalog that blocks every model of the
+          // failed provider until a later successful refresh.
+          // The COMPLETE discovered catalog is persisted, deliberately without
+          // policy filtering: policies refresh remotely, so a temporarily
+          // restrictive policy must not carve models out of the durable catalog.
+          // Policy is applied at exposure time instead — getConfig() filters the
+          // reported lists, routing checks the current policy, and the factory
+          // enforces it per model at creation.
+          const modelIds: string[] = [];
+          const nextProviders: CoderGatewayProvider[] = [];
+          for (const { provider, result } of results) {
+            const previous = previousProviders.find((prev) => prev.name === provider.name);
+            // Prior state must also TYPE-match under an authoritative listing:
+            // when the admin changes an instance's type (same name), the old
+            // type's model IDs are not valid carry-forward state — the write
+            // persists the NEW type, so carried entries would stay selectable and
+            // be sent over the new wire protocol until a successful refresh.
+            // A name with no stored metadata previously resolved via the
+            // name === type default, so that default is its effective prior type.
+            // The probe path persists `previous` (not the probe default), so no
+            // type change can occur there and the check is skipped.
+            const previousType = previous?.type ?? provider.name;
+            const typeUnchanged = !authoritative || previousType === provider.type;
+            const hasPriorState =
+              previousKnown &&
+              typeUnchanged &&
+              (previous !== undefined ||
+                previousDiscovered.some((id) => id.startsWith(`${provider.name}/`)));
+            if (result.kind === "ok") {
+              modelIds.push(...result.ids);
+              if (!authoritative) {
+                // The probe confirmed the route exists; prefer previously stored
+                // metadata (its type may come from an earlier authoritative
+                // listing) over the probe-derived name === type default.
+                nextProviders.push(previous ?? provider);
+              }
+            } else if (result.kind === "error") {
+              if (!hasPriorState) {
+                catalogInconclusive = true;
+                // Consecutive failed refreshes: after an inconclusive refresh the
+                // authoritative catalog is gone (previousKnown false), so a
+                // transiently failing provider has no carry-forward state — but
+                // its stale display entries must stay user-visible instead of
+                // vanishing from Settings/the selector. The catalog stays
+                // inconclusive, so these IDs land back in models +
+                // staleDiscoveredModels, never in discoveredModels. Type-gated
+                // like authoritative carry-forward.
+                if (typeUnchanged) {
+                  modelIds.push(
+                    ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
+                  );
+                }
+                continue;
+              }
+              modelIds.push(
+                ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
+              );
+              if (!authoritative && previous) {
+                nextProviders.push(previous);
+              }
+            } else if (!authoritative && previous !== undefined) {
+              // "unavailable" on the PROBE path for an instance recorded by an
+              // earlier authoritative listing: the 404 proves only that the
+              // upstream serves no /models route — not that the admin removed
+              // the gateway instance (only an authoritative listing can say
+              // that). Dropping it would leave manually configured
+              // coder:<custom>/<model> entries unresolvable until a listing
+              // succeeds again, so keep the metadata and carry prior entries
+              // forward like a transient error.
+              nextProviders.push(previous);
+              if (previousKnown) {
+                modelIds.push(
+                  ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
+                );
+              } else {
+                // No authoritative prior catalog: stale display entries must not
+                // be promoted into a conclusive write.
+                catalogInconclusive = true;
+                modelIds.push(
+                  ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
+                );
+              }
+            }
+            // "unavailable" otherwise: the authoritative listing already names
+            // every existing instance (a listed instance whose /models 404s
+            // conclusively serves no catalog), and probe-default names carry no
+            // recorded metadata — the route is conclusively absent; drop it.
+          }
+
+          const manual = manualModelEntries(section);
+          const manualIds = new Set(manual.map((entry) => maybeGetProviderModelEntryId(entry)));
+          // User-removed discovered models (recorded by setModels) stay excluded:
+          // a catalog refresh or re-login must not resurrect entries the user
+          // deleted from the model list.
+          const removed = new Set(
+            Array.isArray(section?.removedModels)
+              ? section.removedModels.filter((id): id is string => typeof id === "string")
+              : []
+          );
+          // User-visible union: manual entries first, then discovered/carried IDs.
+          const retainedDiscovered = modelIds.filter(
+            (id) => !manualIds.has(id) && !removed.has(id)
+          );
+          const merged = [...manual, ...retainedDiscovered];
+
+          if (catalogInconclusive) {
+            // The catalog cannot be written as authoritative. Keep/flip it to
+            // UNKNOWN so routing fails open (the failed provider's models stay
+            // reachable), losing at worst one refresh's worth of catalog data —
+            // the next successful refresh rebuilds it. The healthy providers'
+            // fetched and carried-forward entries STAY user-visible in `models`
+            // (only the authoritative `discoveredModels` marker is dropped):
+            // wiping them would empty Settings and the model selector until a
+            // later fully successful refresh. The authoritative admin listing is
+            // conclusive independently of the catalog fetches, so it is still
+            // persisted: custom-named instances must stay resolvable (e.g. for
+            // manually added models). Probe-derived metadata is just the
+            // name === type default that resolveCoderGatewayProvider already
+            // applies without persistence, so the probe path persists nothing
+            // new and keeps any previously stored metadata.
+            const next = { ...(section ?? {}) };
+            if (merged.length > 0) {
+              next.models = merged;
+            } else {
+              delete next.models;
+            }
+            delete next.discoveredModels;
+            // Record which retained entries came from discovery so
+            // manualModelEntries keeps classifying them as catalog data (cleared
+            // by disconnect/login, excluded from manual carry-forward) while the
+            // authoritative marker is absent.
+            if (retainedDiscovered.length > 0) {
+              next.staleDiscoveredModels = retainedDiscovered;
+            } else {
+              delete next.staleDiscoveredModels;
+            }
+            if (authoritative) {
+              next.discoveredProviders = providers;
+            }
+            // Even an inconclusive write is a catalog commit: a slower concurrent
+            // refresh must re-fetch rather than overwrite the retained state.
+            next.coderCatalogGeneration = currentCatalogGeneration + 1;
+            return { value: next };
+          }
+
+          if (authoritative) {
+            // The admin listing is authoritative metadata: every listed instance
+            // is persisted (routable for manually added models even when its
+            // catalog fetch failed), and deleted/disabled instances drop out.
+            nextProviders.length = 0;
+            nextProviders.push(...providers);
+          }
+          // Conclusive catalog: the stale marker's entries are either re-listed
+          // in discoveredModels or conclusively gone.
+          const conclusive: Record<string, unknown> = {
+            ...(section ?? {}),
+            models: merged,
+            discoveredModels: modelIds,
+            discoveredProviders: nextProviders,
+            coderCatalogGeneration: currentCatalogGeneration + 1,
+          };
+          delete conclusive.staleDiscoveredModels;
+          return { value: conclusive };
+        })
+      );
+      if (!setResult.success) {
+        log.debug(`[Coder OAuth] Failed to persist bridge models: ${setResult.error}`);
+        return yield* Effect.fail(new CoderOauthError({ reason: setResult.error }));
+      }
+      if (catalogInconclusive || everyFetchFailed) {
+        // The catalog itself was not conclusively refreshed (at most provider
+        // metadata and carried-forward entries were persisted): surface the
+        // failure so the user knows to refresh again.
+        log.debug(
+          "[Coder OAuth] Catalog refresh inconclusive: provider fetches failed transiently"
+        );
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: everyFetchFailed
+              ? "Model discovery failed for every AI Gateway provider"
+              : "Model discovery failed for at least one AI Gateway provider; try refreshing again",
+          })
+        );
+      }
+      if (!setResult.data.applied) {
+        // Nothing was persisted — report failure so Settings/palette callers
+        // don't claim models were refreshed when the fetched catalog was
+        // discarded (login superseded, disconnected mid-refresh, or another
+        // process committed a newer catalog first).
+        log.debug(
+          supersededByConcurrentRefresh
+            ? "[Coder OAuth] Skipping stale model catalog write (concurrent refresh committed first)"
+            : "[Coder OAuth] Skipping stale model catalog write (login superseded)"
+        );
+        return yield* Effect.fail(
+          new CoderOauthError({
+            reason: supersededByConcurrentRefresh
+              ? "Model refresh superseded by a concurrent refresh; try again"
+              : "Model refresh superseded by a newer login; try again",
+          })
+        );
+      }
     });
-    if (!setResult.success) {
-      log.debug(`[Coder OAuth] Failed to persist bridge models: ${setResult.error}`);
-      return Err(setResult.error);
-    }
-    if (catalogInconclusive || everyFetchFailed) {
-      // The catalog itself was not conclusively refreshed (at most provider
-      // metadata and carried-forward entries were persisted): surface the
-      // failure so the user knows to refresh again.
-      log.debug("[Coder OAuth] Catalog refresh inconclusive: provider fetches failed transiently");
-      return Err(
-        everyFetchFailed
-          ? "Model discovery failed for every AI Gateway provider"
-          : "Model discovery failed for at least one AI Gateway provider; try refreshing again"
-      );
-    }
-    if (!setResult.data.applied) {
-      // Nothing was persisted — report failure so Settings/palette callers
-      // don't claim models were refreshed when the fetched catalog was
-      // discarded (login superseded, disconnected mid-refresh, or another
-      // process committed a newer catalog first).
-      log.debug(
-        supersededByConcurrentRefresh
-          ? "[Coder OAuth] Skipping stale model catalog write (concurrent refresh committed first)"
-          : "[Coder OAuth] Skipping stale model catalog write (login superseded)"
-      );
-      return Err(
-        supersededByConcurrentRefresh
-          ? "Model refresh superseded by a concurrent refresh; try again"
-          : "Model refresh superseded by a newer login; try again"
-      );
-    }
-    return Ok(undefined);
   }
 
   // -------------------------------------------------------------------------
@@ -2166,23 +2624,31 @@ export class CoderOauthService {
    * was in flight (persisting then would store a rotation the new
    * configuration can never serve, keeping it alive unrevoked forever).
    */
-  private async persistRotatedAuth(
+  private persistRotatedAuthEffect(
     auth: CoderOauthAuth,
     expectedRefresh: string
-  ): Promise<Result<{ applied: boolean }, string>> {
-    const result = await this.providerService.updateProviderSection("coder", (section) => {
-      const stored = parseCoderOauthAuth(section?.coderOauth);
-      if (stored?.refresh !== expectedRefresh) {
-        return null;
-      }
-      const raw = section?.deploymentUrl;
-      const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
-      if (this.effectiveDeploymentUrl(configured) !== auth.deploymentUrl) {
-        return null;
-      }
-      return { value: { ...(section ?? {}), coderOauth: auth } };
+  ): Effect.Effect<Result<{ applied: boolean }, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // updateProviderSection resolves with a wire Result; a rejection stays a
+      // defect (folded by refreshTokensEffect's whole-pipeline catchDefect).
+      const result = yield* Effect.promise(() =>
+        self.providerService.updateProviderSection("coder", (section) => {
+          const stored = parseCoderOauthAuth(section?.coderOauth);
+          if (stored?.refresh !== expectedRefresh) {
+            return null;
+          }
+          const raw = section?.deploymentUrl;
+          const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
+          if (self.effectiveDeploymentUrl(configured) !== auth.deploymentUrl) {
+            return null;
+          }
+          return { value: { ...(section ?? {}), coderOauth: auth } };
+        })
+      );
+      self.cachedAuth = null;
+      return result;
     });
-    this.cachedAuth = null;
-    return result;
   }
 }
