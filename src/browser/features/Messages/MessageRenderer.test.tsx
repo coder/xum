@@ -6,6 +6,7 @@ import type { DisplayedMessage } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import { buildWorkflowResultContextMessage } from "@/common/utils/workflowRunMessages";
 import { MessageRenderer } from "./MessageRenderer";
 import { parseSubagentReportEnvelope } from "./SubagentReportMessageContent";
 
@@ -486,6 +487,40 @@ describe("MessageRenderer background work wake rows", () => {
 
     expect(container.querySelector("[data-background-work-wake]")).toBeNull();
     expect(getByText(/Call task_await now/)).toBeDefined();
+  });
+
+  test("renders coalesced background workflow result wakes as a compact machine event", () => {
+    // The terminal-attention drain sends this prompt without workflow-result metadata,
+    // so the compact treatment must be recognized from the text alone.
+    const workflowWakePrompt = buildWorkflowResultContextMessage({
+      rawCommand: "workflow_run skill://phased-demo/workflow.js",
+      name: "skill://phased-demo/workflow.js",
+      runId: "wfr_test123",
+      status: "completed",
+      result: { reportMarkdown: "Demo complete with 2 fan-out results." },
+      run: null,
+    });
+    const message: DisplayedMessage = {
+      type: "user",
+      id: "workflow-result-wake",
+      historyId: "workflow-result-wake",
+      content: workflowWakePrompt,
+      historySequence: 31,
+      isSynthetic: true,
+    };
+
+    const { container, getByText, getByRole, queryByText } = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+
+    expect(getByText("Background workflow finished")).toBeDefined();
+    expect(container.querySelector("[data-background-work-wake]")).not.toBeNull();
+    expect(queryByText(/mux_workflow_result/)).toBeNull();
+
+    fireEvent.click(getByRole("button", { name: /show details/i }));
+    expect(queryByText(/wfr_test123/)).toBeDefined();
   });
 });
 

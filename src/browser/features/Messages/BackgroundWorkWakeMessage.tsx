@@ -2,6 +2,7 @@ import type { ReactElement } from "react";
 import { BellRing } from "lucide-react";
 import type { DisplayedMessage } from "@/common/types/message";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import { WORKFLOW_RESULT_MESSAGE_OPENING_SENTENCE } from "@/common/utils/workflowRunMessages";
 import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
 
 interface BackgroundWorkWakeMessageProps {
@@ -23,6 +24,12 @@ export function getBackgroundWorkWakeSummary(content: string): string | null {
   }
   if (normalized.startsWith(BACKGROUND_WORK_WAKE_OPENINGS.subagentsFailed)) {
     return "Background sub-agents failed";
+  }
+  // The terminal-attention drain delivers background workflow results as one coalesced
+  // synthetic prompt without workflow-result metadata, so recognize it by its opening
+  // sentence like the other machine-authored wakes above.
+  if (normalized.startsWith(WORKFLOW_RESULT_MESSAGE_OPENING_SENTENCE)) {
+    return "Background workflow finished";
   }
   return null;
 }

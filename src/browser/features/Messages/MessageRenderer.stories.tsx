@@ -20,6 +20,7 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
+  buildWorkflowResultContextMessage,
   buildWorkflowRunCardMessage,
 } from "@/common/utils/workflowRunMessages";
 import {
@@ -661,6 +662,23 @@ export const SyntheticAutoResumeMessages: AppStory = {
               {
                 historySequence: 9,
                 timestamp: STABLE_TIMESTAMP - 50000,
+              }
+            ),
+            // Coalesced background workflow result wake (terminal-attention drain, no metadata).
+            createUserMessage(
+              "msg-9",
+              buildWorkflowResultContextMessage({
+                rawCommand: "workflow_run skill://phased-demo/workflow.js",
+                name: "skill://phased-demo/workflow.js",
+                runId: "wfr_story123",
+                status: "completed",
+                result: { reportMarkdown: "Demo complete with 2 fan-out results." },
+                run: null,
+              }),
+              {
+                historySequence: 10,
+                timestamp: STABLE_TIMESTAMP - 40000,
+                synthetic: true,
               }
             ),
           ],
