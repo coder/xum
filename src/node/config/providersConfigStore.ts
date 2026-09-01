@@ -2,6 +2,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as jsonc from "jsonc-parser";
+import { Effect } from "effect";
 import writeFileAtomic from "write-file-atomic";
 import { getXumHome } from "@/common/constants/paths";
 import type {
@@ -23,16 +24,31 @@ export class ProvidersConfigStore {
   }
 
   loadProvidersConfig(): ProvidersConfig | null {
-    try {
-      if (fs.existsSync(this.providersFile)) {
-        const data = fs.readFileSync(this.providersFile, "utf-8");
-        return jsonc.parse(data) as ProvidersConfig;
-      }
-    } catch (error) {
-      log.error("Error loading providers config:", error);
-    }
+    return Effect.runSync(this.loadProvidersConfigEffect());
+  }
 
-    return null;
+  /**
+   * Total pre-Effect catch discipline: any read/parse failure folds to `null`
+   * (logged), matching the old whole-body try/catch.
+   */
+  private loadProvidersConfigEffect(): Effect.Effect<ProvidersConfig | null> {
+    return Effect.try({
+      try: (): ProvidersConfig | null => {
+        if (fs.existsSync(this.providersFile)) {
+          const data = fs.readFileSync(this.providersFile, "utf-8");
+          return jsonc.parse(data) as ProvidersConfig;
+        }
+        return null;
+      },
+      catch: (error) => error,
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          log.error("Error loading providers config:", error);
+          return null;
+        })
+      )
+    );
   }
 
   /**
@@ -50,12 +66,15 @@ export class ProvidersConfigStore {
    * write signal.
    */
   getProvidersFileFingerprint(): string | null {
-    try {
+    return Effect.runSync(this.getProvidersFileFingerprintEffect());
+  }
+
+  /** Total pre-Effect catch discipline: any read failure folds silently to `null`. */
+  private getProvidersFileFingerprintEffect(): Effect.Effect<string | null> {
+    return Effect.try((): string | null => {
       const contents = fs.readFileSync(this.providersFile);
       return crypto.createHash("sha256").update(contents).digest("hex");
-    } catch {
-      return null;
-    }
+    }).pipe(Effect.catch(() => Effect.succeed(null)));
   }
 
   /**
@@ -144,14 +163,25 @@ export class ProvidersConfigStore {
   }
 
   saveProvidersConfig(config: ProvidersConfig): void {
-    try {
-      if (!fs.existsSync(this.rootDir)) {
-        ensurePrivateDirSync(this.rootDir);
-      }
+    // runSync rethrows the raw typed failure, so callers observe the same throw as
+    // before the Effect conversion.
+    Effect.runSync(this.saveProvidersConfigEffect(config));
+  }
 
-      const jsonString = JSON.stringify(config, null, 2);
+  /**
+   * Log-then-rethrow pre-Effect catch discipline: failures are logged and pass
+   * through raw to the caller in the typed failure channel.
+   */
+  private saveProvidersConfigEffect(config: ProvidersConfig): Effect.Effect<void, unknown> {
+    return Effect.try({
+      try: () => {
+        if (!fs.existsSync(this.rootDir)) {
+          ensurePrivateDirSync(this.rootDir);
+        }
 
-      const contentWithComments = `// Providers configuration for xum
+        const jsonString = JSON.stringify(config, null, 2);
+
+        const contentWithComments = `// Providers configuration for xum
 // Configure your AI providers here
 // Example:
 // {
@@ -170,13 +200,16 @@ export class ProvidersConfigStore {
 // }
 ${jsonString}`;
 
-      writeFileAtomic.sync(this.providersFile, contentWithComments, {
-        encoding: "utf-8",
-        mode: 0o600,
-      });
-    } catch (error) {
-      log.error("Error saving providers config:", error);
-      throw error; // Re-throw to let caller handle
-    }
+        writeFileAtomic.sync(this.providersFile, contentWithComments, {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
+      },
+      catch: (error) => error,
+    }).pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => log.error("Error saving providers config:", error))
+      )
+    );
   }
 }

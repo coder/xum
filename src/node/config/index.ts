@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as crypto from "crypto";
 import { EventEmitter } from "events";
 import writeFileAtomic from "write-file-atomic";
+import { Effect, Semaphore } from "effect";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import { ProvidersConfigStore } from "./providersConfigStore";
@@ -906,8 +907,14 @@ export class Config {
    */
   private readonly legacyTaskVariantGroups = new Map<string, LegacyTaskVariantWorkspace>();
   private readonly legacyTaskVariantMetadataOnlyIds = new Set<string>();
-  /** Serializes editConfig calls; see editConfig for why. */
-  private editConfigQueue: Promise<void> = Promise.resolve();
+  /**
+   * Serializes editConfig calls; see editConfig for why. An Effect Semaphore (FIFO
+   * permits) replaces the old promise-chain queue 1:1: each edit holds the single
+   * permit for its whole read-modify-write cycle, and a failed edit releases its
+   * permit on the way out, which preserves the old queue-keep-alive behavior (one
+   * edit's failure never wedges later edits).
+   */
+  private readonly editSemaphore = Semaphore.makeUnsafe(1);
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
   private migrationPersist: Promise<void> | null = null;
 
@@ -1806,11 +1813,16 @@ export class Config {
    * removeWorkspace() and written after it resurrected the removed workspace entry
    * as a permanent sidebar ghost. All mutations must go through editConfig so each
    * write is derived from a fresh serialized read.
+   *
+   * Never fails: the whole pipeline folds every failure and defect into the same
+   * log-and-swallow the old try/catch applied (total catch discipline).
    */
-  private async saveConfig(config: ProjectsConfig): Promise<void> {
-    try {
-      if (!fs.existsSync(this.rootDir)) {
-        ensurePrivateDirSync(this.rootDir);
+  private saveConfig(config: ProjectsConfig): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (!fs.existsSync(self.rootDir)) {
+        ensurePrivateDirSync(self.rootDir);
       }
 
       const data: Partial<Record<keyof AppConfigOnDisk, unknown>> & {
@@ -1824,7 +1836,7 @@ export class Config {
           };
           for (const workspace of persistedProjectConfig.workspaces) {
             const workspaceId = parseOptionalNonEmptyString(workspace.id);
-            const legacy = workspaceId ? this.legacyTaskVariantGroups.get(workspaceId) : undefined;
+            const legacy = workspaceId ? self.legacyTaskVariantGroups.get(workspaceId) : undefined;
             if (legacy && workspace.bestOf == null) {
               // Keep downgrade-only metadata on disk without exposing it to current runtime types,
               // UI grouping, or provider-facing task schemas.
@@ -2084,22 +2096,29 @@ export class Config {
           }
         }
       }
-      await writeFileAtomic(this.configFile, JSON.stringify(data, null, 2), "utf-8");
-      for (const workspaceId of this.legacyTaskVariantGroups.keys()) {
+      yield* Effect.tryPromise({
+        try: async () => writeFileAtomic(self.configFile, JSON.stringify(data, null, 2), "utf-8"),
+        catch: (error) => error,
+      });
+      for (const workspaceId of self.legacyTaskVariantGroups.keys()) {
         if (!persistedWorkspaceIds.has(workspaceId)) {
           // A load-time settings migration can save before getAllWorkspaceMetadata's queued
           // identity migration adds this legacy workspace ID. Keep metadata-only entries alive
           // until a later save can attach them to the migrated config record.
-          if (!this.legacyTaskVariantMetadataOnlyIds.has(workspaceId)) {
-            this.legacyTaskVariantGroups.delete(workspaceId);
+          if (!self.legacyTaskVariantMetadataOnlyIds.has(workspaceId)) {
+            self.legacyTaskVariantGroups.delete(workspaceId);
           }
         } else {
-          this.legacyTaskVariantMetadataOnlyIds.delete(workspaceId);
+          self.legacyTaskVariantMetadataOnlyIds.delete(workspaceId);
         }
       }
-    } catch (error) {
-      log.error("Error saving config:", error);
-    }
+    }).pipe(
+      // Mirror the old whole-pipeline try/catch: fold both the typed write failure and
+      // any defect thrown by the synchronous serialization above into the same
+      // log-and-swallow, so this pipeline never fails.
+      Effect.catch((error) => Effect.sync(() => log.error("Error saving config:", error))),
+      Effect.catchDefect((error) => Effect.sync(() => log.error("Error saving config:", error)))
+    );
   }
 
   /**
@@ -2418,57 +2437,90 @@ export class Config {
    * detail rather than a caller-initiated mutation.
    */
   private enqueueConfigEdit(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
-    const run = this.editConfigQueue.then(async () => {
-      const config = this.loadConfigOrDefault();
-      const newConfig = fn(config);
-      // If that load failed, writing would replace the corrupt file with defaults. Only
-      // proceed when the bytes on disk right now are the ones with a confirmed sidecar:
-      // no confirmed backup, a concurrent replacement since the load, or an unreadable
-      // file all reject the edit so callers do not treat the mutation as durable (unlike
-      // saveConfig's log-and-swallow of unexpected I/O errors, this skip is deliberate).
-      // A missing file is safe to overwrite. This cannot fully close the cross-process
-      // race (that needs file locking, which editConfig has never had); it binds the
-      // approval to the current bytes and shrinks the window to the atomic write itself.
-      const failureState = configLoadFailureStates.get(this.configFile);
-      if (failureState) {
-        const rejectEdit = (reason: string): never => {
-          const message = `Skipping config write to ${this.configFile}: ${reason}`;
-          log.error(message);
-          throw new Error(message);
-        };
-        if (failureState.backupSignature === null) {
-          rejectEdit(
-            "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
-          );
-        }
-        let currentSignature: string | null = null;
-        try {
-          const currentBytes = fs.readFileSync(this.configFile);
-          currentSignature = crypto.createHash("sha256").update(currentBytes).digest("hex");
-        } catch (readError) {
-          if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
-            rejectEdit(
-              `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
-            );
-          }
-        }
-        if (currentSignature !== null && currentSignature !== failureState.backupSignature) {
-          rejectEdit(
-            "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
-          );
-        }
-      }
-      await this.saveConfig(newConfig);
-      // Backend-initiated config edits (for example gateway auth changes) use this signal
-      // so frontend subscribers can refresh derived state without polling.
-      this.notifyConfigChanged();
-    });
-    // Keep the queue alive when an edit fails; the failure still propagates to this caller.
-    this.editConfigQueue = run.then(
-      () => undefined,
-      () => undefined
+    // Defer the fiber start to a microtask: Effect.runPromise executes fibers
+    // synchronously on the caller's stack until the first async boundary, but the old
+    // promise-chain queue always ran edit bodies on a later microtask.
+    // loadConfigOrDefault's one-shot migrationPersist guard depends on that ordering:
+    // the edit body's own loadConfigOrDefault must observe the `this.migrationPersist`
+    // assignment, or a load-time migration would schedule its persist twice.
+    // Effect failures reject this promise with the raw error (v4 runPromise does not
+    // wrap causes), so callers observe the same rejections as before.
+    return Promise.resolve().then(() => Effect.runPromise(this.enqueueConfigEditEffect(fn)));
+  }
+
+  /**
+   * Semaphore(1)-serialized edit pipeline: FIFO permits guarantee each edit's read
+   * happens only after the previous edit's write has landed, replacing the old
+   * promise-chain queue 1:1. The body is uninterruptible so an interruption can never
+   * separate the corrupt-file gate from the write it approves, or drop the change
+   * notification after a write landed; waiting for the permit stays interruptible (a
+   * fiber cancelled while waiting never runs its edit).
+   */
+  private enqueueConfigEditEffect(
+    fn: (config: ProjectsConfig) => ProjectsConfig
+  ): Effect.Effect<void, unknown> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return this.editSemaphore.withPermits(1)(
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          // Effect.try keeps the pre-Effect contract: a throwing transform or a rejected
+          // corrupt-file gate reaches the caller as the raw original error.
+          const newConfig = yield* Effect.try({
+            try: () => {
+              const config = self.loadConfigOrDefault();
+              const newConfig = fn(config);
+              // If that load failed, writing would replace the corrupt file with defaults. Only
+              // proceed when the bytes on disk right now are the ones with a confirmed sidecar:
+              // no confirmed backup, a concurrent replacement since the load, or an unreadable
+              // file all reject the edit so callers do not treat the mutation as durable (unlike
+              // saveConfig's log-and-swallow of unexpected I/O errors, this skip is deliberate).
+              // A missing file is safe to overwrite. This cannot fully close the cross-process
+              // race (that needs file locking, which editConfig has never had); it binds the
+              // approval to the current bytes and shrinks the window to the atomic write itself.
+              const failureState = configLoadFailureStates.get(self.configFile);
+              if (failureState) {
+                const rejectEdit = (reason: string): never => {
+                  const message = `Skipping config write to ${self.configFile}: ${reason}`;
+                  log.error(message);
+                  throw new Error(message);
+                };
+                if (failureState.backupSignature === null) {
+                  rejectEdit(
+                    "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
+                  );
+                }
+                let currentSignature: string | null = null;
+                try {
+                  const currentBytes = fs.readFileSync(self.configFile);
+                  currentSignature = crypto.createHash("sha256").update(currentBytes).digest("hex");
+                } catch (readError) {
+                  if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
+                    rejectEdit(
+                      `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
+                    );
+                  }
+                }
+                if (
+                  currentSignature !== null &&
+                  currentSignature !== failureState.backupSignature
+                ) {
+                  rejectEdit(
+                    "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
+                  );
+                }
+              }
+              return newConfig;
+            },
+            catch: (error) => error,
+          });
+          yield* self.saveConfig(newConfig);
+          // Backend-initiated config edits (for example gateway auth changes) use this signal
+          // so frontend subscribers can refresh derived state without polling.
+          self.notifyConfigChanged();
+        })
+      )
     );
-    return run;
   }
 
   getUpdateChannel(): UpdateChannel {

@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { Effect } from "effect";
 import writeFileAtomic from "write-file-atomic";
 import { getXumHome } from "@/common/constants/paths";
 import { isSecretReferenceValue, type Secret, type SecretsConfig } from "@/common/types/secrets";
@@ -149,17 +150,32 @@ export class SecretsStore {
   }
 
   loadSecretsConfig(): SecretsConfig {
-    try {
-      if (fs.existsSync(this.secretsFile)) {
-        const data = fs.readFileSync(this.secretsFile, "utf-8");
-        const parsed = JSON.parse(data) as unknown;
-        return SecretsStore.normalizeSecretsConfig(parsed);
-      }
-    } catch (error) {
-      log.error("Error loading secrets config:", error);
-    }
+    return Effect.runSync(this.loadSecretsConfigEffect());
+  }
 
-    return {};
+  /**
+   * Total pre-Effect catch discipline: any read/parse failure folds to `{}` (logged),
+   * matching the old whole-body try/catch.
+   */
+  private loadSecretsConfigEffect(): Effect.Effect<SecretsConfig> {
+    return Effect.try({
+      try: (): SecretsConfig => {
+        if (fs.existsSync(this.secretsFile)) {
+          const data = fs.readFileSync(this.secretsFile, "utf-8");
+          const parsed = JSON.parse(data) as unknown;
+          return SecretsStore.normalizeSecretsConfig(parsed);
+        }
+        return {};
+      },
+      catch: (error) => error,
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          log.error("Error loading secrets config:", error);
+          return {};
+        })
+      )
+    );
   }
 
   /**
@@ -167,19 +183,27 @@ export class SecretsStore {
    * paths so unsupported legacy entries survive round-trips to disk instead of
    * being silently deleted when an unrelated secret is saved.
    */
-  private loadRawSecretsConfig(): Record<string, unknown> {
-    try {
-      if (fs.existsSync(this.secretsFile)) {
-        const parsed = JSON.parse(fs.readFileSync(this.secretsFile, "utf-8")) as unknown;
-        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return { ...(parsed as Record<string, unknown>) };
+  private loadRawSecretsConfigEffect(): Effect.Effect<Record<string, unknown>> {
+    return Effect.try({
+      try: (): Record<string, unknown> => {
+        if (fs.existsSync(this.secretsFile)) {
+          const parsed = JSON.parse(fs.readFileSync(this.secretsFile, "utf-8")) as unknown;
+          if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return { ...(parsed as Record<string, unknown>) };
+          }
         }
-      }
-    } catch (error) {
-      log.error("Error loading secrets config:", error);
-    }
-
-    return {};
+        return {};
+      },
+      catch: (error) => error,
+    }).pipe(
+      // Total pre-Effect catch discipline: any read/parse failure folds to `{}` (logged).
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          log.error("Error loading secrets config:", error);
+          return {};
+        })
+      )
+    );
   }
 
   /**
@@ -187,47 +211,72 @@ export class SecretsStore {
    * project path) while leaving every other bucket byte-for-byte intact and
    * preserving unsupported legacy entries within the target bucket.
    */
-  private async updateSecretsBucket(bucketKey: string, secrets: Secret[]): Promise<void> {
-    const raw = this.loadRawSecretsConfig();
+  private updateSecretsBucketEffect(
+    bucketKey: string,
+    secrets: Secret[]
+  ): Effect.Effect<void, unknown> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const raw = yield* self.loadRawSecretsConfigEffect();
 
-    // Project paths may be persisted with trailing slashes; fold every raw key
-    // that maps to this bucket so preserved entries aren't left in a shadowed
-    // duplicate bucket.
-    const rawBucketEntries: unknown[] = [];
-    for (const [rawKey, rawValue] of Object.entries(raw)) {
-      const mappedKey =
-        rawKey === SecretsStore.GLOBAL_SECRETS_KEY
-          ? rawKey
-          : SecretsStore.normalizeSecretsProjectPath(rawKey) || rawKey;
-      if (mappedKey !== bucketKey) {
-        continue;
+      // Project paths may be persisted with trailing slashes; fold every raw key
+      // that maps to this bucket so preserved entries aren't left in a shadowed
+      // duplicate bucket.
+      const rawBucketEntries: unknown[] = [];
+      for (const [rawKey, rawValue] of Object.entries(raw)) {
+        const mappedKey =
+          rawKey === SecretsStore.GLOBAL_SECRETS_KEY
+            ? rawKey
+            : SecretsStore.normalizeSecretsProjectPath(rawKey) || rawKey;
+        if (mappedKey !== bucketKey) {
+          continue;
+        }
+
+        if (Array.isArray(rawValue)) {
+          // Array.isArray narrows unknown to any[]; retype to unknown[] for safe handling.
+          rawBucketEntries.push(...(rawValue as unknown[]));
+        }
+        delete raw[rawKey];
       }
 
-      if (Array.isArray(rawValue)) {
-        // Array.isArray narrows unknown to any[]; retype to unknown[] for safe handling.
-        rawBucketEntries.push(...(rawValue as unknown[]));
-      }
-      delete raw[rawKey];
-    }
-
-    raw[bucketKey] = SecretsStore.mergeSecretsPreservingUnsupported(rawBucketEntries, secrets);
-    await this.saveSecretsConfig(raw);
+      raw[bucketKey] = SecretsStore.mergeSecretsPreservingUnsupported(rawBucketEntries, secrets);
+      yield* self.saveSecretsConfigEffect(raw);
+    });
   }
 
-  async saveSecretsConfig(config: SecretsConfig | Record<string, unknown>): Promise<void> {
-    try {
-      if (!fs.existsSync(this.rootDir)) {
-        ensurePrivateDirSync(this.rootDir);
-      }
+  saveSecretsConfig(config: SecretsConfig | Record<string, unknown>): Promise<void> {
+    // runPromise rejects with the raw typed failure, so callers observe the same
+    // rejection as before the Effect conversion.
+    return Effect.runPromise(this.saveSecretsConfigEffect(config));
+  }
 
-      await writeFileAtomic(this.secretsFile, JSON.stringify(config, null, 2), {
-        encoding: "utf-8",
-        mode: 0o600,
-      });
-    } catch (error) {
-      log.error("Error saving secrets config:", error);
-      throw error;
-    }
+  /**
+   * Log-then-rethrow pre-Effect catch discipline: failures are logged and pass
+   * through raw to the caller in the typed failure channel. The thunk is async so a
+   * synchronous throw (e.g. from ensurePrivateDirSync) follows the same rejection
+   * path the old `await`-based body produced.
+   */
+  private saveSecretsConfigEffect(
+    config: SecretsConfig | Record<string, unknown>
+  ): Effect.Effect<void, unknown> {
+    return Effect.tryPromise({
+      try: async () => {
+        if (!fs.existsSync(this.rootDir)) {
+          ensurePrivateDirSync(this.rootDir);
+        }
+
+        await writeFileAtomic(this.secretsFile, JSON.stringify(config, null, 2), {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
+      },
+      catch: (error) => error,
+    }).pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => log.error("Error saving secrets config:", error))
+      )
+    );
   }
 
   /**
@@ -241,8 +290,10 @@ export class SecretsStore {
   }
 
   /** Update global secrets (not project-scoped). */
-  async updateGlobalSecrets(secrets: Secret[]): Promise<void> {
-    await this.updateSecretsBucket(SecretsStore.GLOBAL_SECRETS_KEY, secrets);
+  updateGlobalSecrets(secrets: Secret[]): Promise<void> {
+    return Effect.runPromise(
+      this.updateSecretsBucketEffect(SecretsStore.GLOBAL_SECRETS_KEY, secrets)
+    );
   }
 
   /**
@@ -394,9 +445,9 @@ export class SecretsStore {
     return config[normalizedProjectPath] ?? [];
   }
 
-  async updateProjectSecrets(projectPath: string, secrets: Secret[]): Promise<void> {
+  updateProjectSecrets(projectPath: string, secrets: Secret[]): Promise<void> {
     const normalizedProjectPath =
       SecretsStore.normalizeSecretsProjectPath(projectPath) || projectPath;
-    await this.updateSecretsBucket(normalizedProjectPath, secrets);
+    return Effect.runPromise(this.updateSecretsBucketEffect(normalizedProjectPath, secrets));
   }
 }

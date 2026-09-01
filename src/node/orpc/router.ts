@@ -28,6 +28,7 @@ import {
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
 import { handlerGen } from "@orpc/experimental-effect";
+import { Effect } from "effect";
 import {
   assertMemoryEnabled,
   consolidateMemoryEffect,
@@ -189,18 +190,36 @@ export const router = (authToken?: string) => {
         .output(schemas.tokenizer.calculateStats.output)
         .handler(({ context, input }) => context.tokenizerService.calculateWorkspaceStats(input)),
     },
+    // Config-backed procedures ride handlerGen. Interruption posture (also applies to
+    // the `config` and `uiLayouts` namespaces below): reads are single Effect.sync
+    // steps (interruption is a don't-care); mutations wrap the whole pre-Effect
+    // handler body in one Effect.promise thunk, so they are uninterruptible by
+    // construction — a client abort interrupts the handler fiber, never the in-flight
+    // Semaphore(1)-serialized config edit, and multi-step bodies (mutate + notify)
+    // cannot be torn apart. Rejections become defects, surfacing as the same internal
+    // error the old async handlers produced.
     splashScreens: {
       getViewedSplashScreens: t
         .input(schemas.splashScreens.getViewedSplashScreens.input)
         .output(schemas.splashScreens.getViewedSplashScreens.output)
-        .handler(({ context }) => {
-          const config = context.config.loadConfigOrDefault();
-          return config.viewedSplashScreens ?? [];
-        }),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* Effect.sync(() => {
+              const config = context.config.loadConfigOrDefault();
+              return config.viewedSplashScreens ?? [];
+            });
+          })
+        ),
       markSplashScreenViewed: t
         .input(schemas.splashScreens.markSplashScreenViewed.input)
         .output(schemas.splashScreens.markSplashScreenViewed.output)
-        .handler(({ context, input }) => context.config.markSplashScreenViewed(input.splashId)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.markSplashScreenViewed(input.splashId)
+            );
+          })
+        ),
     },
     server: {
       getLaunchProject: t
@@ -253,7 +272,13 @@ export const router = (authToken?: string) => {
       getConfig: t
         .input(schemas.config.getConfig.input)
         .output(schemas.config.getConfig.output)
-        .handler(({ context }) => context.config.getClientConfig()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* Effect.sync(() => context.config.getClientConfig());
+          })
+        ),
+      // Event-iterator subscription: stays on the plain handler until the Effect
+      // Stream bridge phase converts event subscriptions wholesale.
       onConfigChanged: t
         .input(schemas.config.onConfigChanged.input)
         .output(schemas.config.onConfigChanged.output)
@@ -261,89 +286,155 @@ export const router = (authToken?: string) => {
       updateAgentAiDefaults: t
         .input(schemas.config.updateAgentAiDefaults.input)
         .output(schemas.config.updateAgentAiDefaults.output)
-        .handler(({ context, input }) =>
-          context.config.updateAgentAiDefaults(input.agentAiDefaults)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateAgentAiDefaults(input.agentAiDefaults)
+            );
+          })
         ),
 
       updateMuxGatewayPrefs: t
         .input(schemas.config.updateMuxGatewayPrefs.input)
         .output(schemas.config.updateMuxGatewayPrefs.output)
-        .handler(async ({ context, input }) => {
-          await context.config.updateMuxGatewayPrefs(input);
-          context.providerService.notifyConfigChanged();
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () => {
+              await context.config.updateMuxGatewayPrefs(input);
+              context.providerService.notifyConfigChanged();
+            });
+          })
+        ),
       updateRoutePreferences: t
         .input(schemas.config.updateRoutePreferences.input)
         .output(schemas.config.updateRoutePreferences.output)
-        .handler(({ context, input }) => context.providerService.updateRoutePreferences(input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.providerService.updateRoutePreferences(input)
+            );
+          })
+        ),
 
       updateMinThinkingLevels: t
         .input(schemas.config.updateMinThinkingLevels.input)
         .output(schemas.config.updateMinThinkingLevels.output)
-        .handler(({ context, input }) =>
-          context.config.updateMinThinkingLevels(input.minThinkingLevelByModel)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateMinThinkingLevels(input.minThinkingLevelByModel)
+            );
+          })
         ),
 
       updateModelFallbacks: t
         .input(schemas.config.updateModelFallbacks.input)
         .output(schemas.config.updateModelFallbacks.output)
-        .handler(({ context, input }) => context.config.updateModelFallbacks(input.modelFallbacks)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateModelFallbacks(input.modelFallbacks)
+            );
+          })
+        ),
 
       updateModelPreferences: t
         .input(schemas.config.updateModelPreferences.input)
         .output(schemas.config.updateModelPreferences.output)
-        .handler(({ context, input }) => context.config.updateModelPreferences(input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () => context.config.updateModelPreferences(input));
+          })
+        ),
 
       updateCoderPrefs: t
         .input(schemas.config.updateCoderPrefs.input)
         .output(schemas.config.updateCoderPrefs.output)
-        .handler(({ context, input }) => context.config.updateCoderPrefs(input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () => context.config.updateCoderPrefs(input));
+          })
+        ),
       updateRuntimeEnablement: t
         .input(schemas.config.updateRuntimeEnablement.input)
         .output(schemas.config.updateRuntimeEnablement.output)
-        .handler(({ context, input }) => context.config.updateRuntimeEnablement(input)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () => context.config.updateRuntimeEnablement(input));
+          })
+        ),
 
       saveConfig: t
         .input(schemas.config.saveConfig.input)
         .output(schemas.config.saveConfig.output)
-        .handler(async ({ context, input }) => {
-          await context.config.saveUserConfig(input);
-          await context.taskService.maybeStartQueuedTasks();
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () => {
+              await context.config.saveUserConfig(input);
+              await context.taskService.maybeStartQueuedTasks();
+            });
+          })
+        ),
 
       updateChatTranscriptFullWidth: t
         .input(schemas.config.updateChatTranscriptFullWidth.input)
         .output(schemas.config.updateChatTranscriptFullWidth.output)
-        .handler(({ context, input }) =>
-          context.config.updateChatTranscriptFullWidth(input.enabled)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateChatTranscriptFullWidth(input.enabled)
+            );
+          })
         ),
       updateLlmDebugLogs: t
         .input(schemas.config.updateLlmDebugLogs.input)
         .output(schemas.config.updateLlmDebugLogs.output)
-        .handler(({ context, input }) => context.config.updateLlmDebugLogs(input.enabled)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () => context.config.updateLlmDebugLogs(input.enabled));
+          })
+        ),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
-        .handler(({ context, input }) =>
-          context.config.updateHeartbeatDefaultPrompt(input.defaultPrompt)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateHeartbeatDefaultPrompt(input.defaultPrompt)
+            );
+          })
         ),
       updateHeartbeatDefaultIntervalMs: t
         .input(schemas.config.updateHeartbeatDefaultIntervalMs.input)
         .output(schemas.config.updateHeartbeatDefaultIntervalMs.output)
-        .handler(({ context, input }) =>
-          context.config.updateHeartbeatDefaultIntervalMs(input.intervalMs)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateHeartbeatDefaultIntervalMs(input.intervalMs)
+            );
+          })
         ),
       updateGoalDefaults: t
         .input(schemas.config.updateGoalDefaults.input)
         .output(schemas.config.updateGoalDefaults.output)
-        .handler(({ context, input }) => context.config.updateGoalDefaults(input.goalDefaults)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.updateGoalDefaults(input.goalDefaults)
+            );
+          })
+        ),
       unenrollMuxGovernor: t
         .input(schemas.config.unenrollMuxGovernor.input)
         .output(schemas.config.unenrollMuxGovernor.output)
-        .handler(async ({ context }) => {
-          await context.config.unenrollMuxGovernor();
-          await context.policyService.refreshNow();
-        }),
+        .handler(
+          handlerGen(function* ({ context }) {
+            yield* Effect.promise(async () => {
+              await context.config.unenrollMuxGovernor();
+              await context.policyService.refreshNow();
+            });
+          })
+        ),
     },
     devtools: {
       getRuns: t
@@ -404,14 +495,24 @@ export const router = (authToken?: string) => {
       getAll: t
         .input(schemas.uiLayouts.getAll.input)
         .output(schemas.uiLayouts.getAll.output)
-        .handler(({ context }) => {
-          const config = context.config.loadConfigOrDefault();
-          return config.layoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-        }),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* Effect.sync(() => {
+              const config = context.config.loadConfigOrDefault();
+              return config.layoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
+            });
+          })
+        ),
       saveAll: t
         .input(schemas.uiLayouts.saveAll.input)
         .output(schemas.uiLayouts.saveAll.output)
-        .handler(({ context, input }) => context.config.saveLayoutPresets(input.layoutPresets)),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* Effect.promise(async () =>
+              context.config.saveLayoutPresets(input.layoutPresets)
+            );
+          })
+        ),
     },
     agents: {
       list: t
