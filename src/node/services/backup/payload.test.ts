@@ -3627,6 +3627,26 @@ describe("project bundle", () => {
     }
   });
 
+  it("skips an oversized memory file without charging the backup budget", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/small.md`, "fine\n");
+    // Past the per-file backup budget outright: reading it would fail the whole collection.
+    await fs.writeFile(
+      path.join(muxRoot, "memory", "project", entry.memoryDir, "corrupt.md"),
+      Buffer.alloc(MAX_BACKUP_FILE_BYTES + 1, "x")
+    );
+
+    const exported = await collectProjectBundle(muxRoot, [entry], {
+      skipOversizedMemoryFiles: true,
+    });
+    expect(exported.files.map((file) => file.path)).toEqual([
+      `memory/project/${entry.memoryDir}/small.md`,
+    ]);
+    // Only the export path skips; a snapshot collection still surfaces the problem.
+    const error = await captureRejection(collectProjectBundle(muxRoot, [entry]));
+    expect((error as Error).message).toContain("corrupt.md");
+  });
+
   it("skips memory files past the memory read limit only when exporting", async () => {
     const entry = entryFor("/home/dev/src/alpha");
     await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/small.md`, "fine\n");
@@ -3698,6 +3718,9 @@ describe("project bundle", () => {
       `memory/project/${entry.memoryDir}/.env`,
       `memory/project/${entry.memoryDir}/memory-meta.json`,
       `memory/project/${entry.memoryDir}`,
+      // A case variant of the listed directory: a matched restore would write it verbatim
+      // into a directory the project's memory store never reads.
+      `memory/project/${entry.memoryDir.replace(/^alpha/, "Alpha")}/notes.md`,
     ]) {
       await rewriteBundleManifest(managedDir, {
         schemaVersion: 1,

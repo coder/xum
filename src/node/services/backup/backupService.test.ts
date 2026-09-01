@@ -6,7 +6,11 @@ import type { BackupProjectImport, SettingsBackupInput } from "@/common/orpc/sch
 import { Err, Ok } from "@/common/types/result";
 import { BackupNonFastForwardError, backupCachePath, isBackupCacheName } from "./gitRepo";
 import { BackupRemoteUnreachableError } from "./credentials";
-import { BackupCommandApprovalRequiredError, ProjectMemoryWriteError } from "./payload";
+import {
+  BackupCommandApprovalRequiredError,
+  ProjectMemoryRestoreError,
+  ProjectMemoryWriteError,
+} from "./payload";
 import {
   BackupService,
   BackupServiceError,
@@ -1474,6 +1478,41 @@ describe("BackupService project imports", () => {
       { projectPath: "/home/dev/src/matched", relPaths: ["deep/notes.md"] },
       { projectPath: target, relPaths: ["todo.md"] },
     ]);
+  });
+
+  test("announces memory a failed matched restore already wrote", async () => {
+    const notified: Array<{ projectPath: string; relPaths: readonly string[] }> = [];
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [],
+            matchedProjectPaths: ["/home/dev/src/alpha", "/home/dev/src/beta"],
+          }),
+        restore: () =>
+          Promise.reject(
+            new ProjectMemoryRestoreError("EIO: disk fault", [
+              { projectPath: "/home/dev/src/alpha", files: ["memory/project/alpha-abc/notes.md"] },
+            ])
+          ),
+      }),
+    });
+    service.setMemoryNotifier({
+      notifyExternalProjectChange: (projectPath, relPaths) => {
+        notified.push({ projectPath, relPaths });
+      },
+    });
+
+    const result = await service.restore({ ...SETTINGS, includeProjects: true });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toContain("disk fault");
+      expect(result.error.snapshotPath).toBeDefined();
+    }
+    // Disk changed for alpha even though the restore failed on beta.
+    expect(notified).toEqual([{ projectPath: "/home/dev/src/alpha", relPaths: ["notes.md"] }]);
   });
 
   test("keeps a concurrently saved project-backup toggle when recording a commit", async () => {

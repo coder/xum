@@ -6,7 +6,13 @@ import * as path from "node:path";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupNonFastForwardError, backupCachePath } from "./gitRepo";
+import { ProjectMemoryRestoreError } from "./payload";
 import { projectMemoryDirName } from "@/node/services/memoryService";
+import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
+import {
+  memoryMutationLockKey,
+  withTargetMutationLock,
+} from "@/node/services/refinement/targetMutationLocks";
 import { TestBackupConfig, captureRejection, runGit, writeFixtureFile } from "./testHelpers";
 
 describe("backup adapters", () => {
@@ -1550,6 +1556,46 @@ describe("backup adapters project bundle", () => {
     ).toBe("local edit\n");
   });
 
+  it("reports the memory a failed matched restore already wrote", async () => {
+    const first = path.join(tempDir, "projects", "alpha");
+    const second = path.join(tempDir, "projects", "beta");
+    registerProject(first);
+    registerProject(second);
+    await seedProjectMemory(first, "notes.md", "alpha backup\n");
+    await seedProjectMemory(second, "notes.md", "beta backup\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const firstMemoryPath = `memory/project/${projectMemoryDirName(first)}/notes.md`;
+    const { repository, payload } = await exportBundle();
+    await seedProjectMemory(first, "notes.md", "alpha local\n");
+    await seedProjectMemory(second, "notes.md", "beta local\n");
+
+    // The second project's live memory write fails after the first project's memory was
+    // restored. Scoped to the Xum root so the snapshot copy of the same directory is fine.
+    const secondLiveDir = path.join(muxRoot, "memory", "project", projectMemoryDirName(second));
+    const realMkdir = fs.mkdir.bind(fs);
+    const mkdir = spyOn(fs, "mkdir").mockImplementation(((target, options) =>
+      String(target).startsWith(secondLiveDir)
+        ? Promise.reject(new Error("EIO: disk fault"))
+        : realMkdir(target, options)) as typeof fs.mkdir);
+    try {
+      const error = await captureRejection(
+        payload.restore({
+          repositoryRoot: repository.rootDir,
+          managedPath: settings.path,
+          includeProjects: true,
+          snapshotPath: path.join(tempDir, "restore-snapshot"),
+          matchedProjectPaths: [first, second],
+        })
+      );
+      expect(error).toBeInstanceOf(ProjectMemoryRestoreError);
+      expect((error as ProjectMemoryRestoreError).restoredProjectMemory).toEqual([
+        { projectPath: first, files: [firstMemoryPath] },
+      ]);
+    } finally {
+      mkdir.mockRestore();
+    }
+  });
+
   it("does not overwrite a project that became matched only after validation", async () => {
     const project = path.join(tempDir, "projects", "alpha");
     registerProject(project);
@@ -1628,6 +1674,68 @@ describe("backup adapters project bundle", () => {
         () => false
       )
     ).toBe(false);
+  });
+
+  it("refuses an over-limit project list before probing any remote", async () => {
+    for (let index = 0; index <= MAX_BACKUP_PROJECT_ENTRIES; index += 1) {
+      registerProject(path.join(tempDir, "projects", `p${index}`));
+    }
+    const payload = createBackupPayloadStore({ config });
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+
+    const started = Date.now();
+    const error = await captureRejection(
+      payload.exportTo({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+      })
+    );
+    expect((error as Error).message).toContain(`${MAX_BACKUP_PROJECT_ENTRIES}`);
+    // Sequential probing of 257 directories would take far longer than the check itself.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("collects project memory for export under the memory mutation lock", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const payload = createBackupPayloadStore({ config });
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+
+    // Hold the lock MemoryService takes for mutations; the export must wait for it.
+    const held = Promise.withResolvers<void>();
+    const lockAcquired = Promise.withResolvers<void>();
+    const holding = withTargetMutationLock(
+      muxRoot,
+      memoryMutationLockKey(muxRoot, path.join(muxRoot, "memory")),
+      async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      }
+    );
+    await lockAcquired.promise;
+
+    const progress = { exported: false };
+    const exporting = payload
+      .exportTo({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+      })
+      .then(() => {
+        progress.exported = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(progress.exported).toBe(false);
+
+    held.resolve();
+    await holding;
+    await exporting;
+    expect(progress.exported).toBe(true);
   });
 
   it("re-sanitizes a repository-controlled remote before presenting a candidate", async () => {

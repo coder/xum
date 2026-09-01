@@ -665,7 +665,8 @@ export function BackupSection() {
           <span className="min-w-0">
             <span className="text-foreground block text-xs font-medium">
               Include project list &amp; project memories
-              <span className="text-muted ml-1 font-normal">
+              {/* Shortcut hint only; the shortcut itself stays bound on every viewport. */}
+              <span className="text-muted ml-1 hidden font-normal sm:inline">
                 ({formatKeybind(KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS)})
               </span>
             </span>

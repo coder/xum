@@ -28,6 +28,7 @@ import {
 import {
   BackupCommandApprovalRequiredError,
   BackupProjectImportApprovalRequiredError,
+  ProjectMemoryRestoreError,
   ProjectMemoryWriteError,
   projectMemoryRelPath,
 } from "./payload";
@@ -568,6 +569,11 @@ export class BackupService {
             projectBundleSkipped: restored.projectBundleSkipped,
           });
         } catch (error) {
+          // Memory the failed restore already overwrote is on disk; subscribers must
+          // hear about it even though the restore is being reported as failed.
+          if (error instanceof ProjectMemoryRestoreError) {
+            this.notifyProjectMemoryChanges(error.restoredProjectMemory, []);
+          }
           // Past the snapshot, the restore may have overwritten files before failing, and
           // the snapshot is the only recovery path, so the failure must carry it.
           return Err({ ...toOperationError(error), snapshotPath });

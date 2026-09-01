@@ -747,7 +747,8 @@ function createBackupFileCollector(root: BackupRoot) {
 
   async function collectDirectory(
     relativeRoot: string,
-    filter: (relativePath: string, entry: Dirent) => boolean
+    filter: (relativePath: string, entry: Dirent) => boolean,
+    collectOptions: { maxFileBytes?: number } = {}
   ): Promise<void> {
     const absoluteRoot = path.join(root.path, ...relativeRoot.split("/"));
     // A symlinked collection root would let readdir walk outside MUX_ROOT, and restore
@@ -769,8 +770,15 @@ function createBackupFileCollector(root: BackupRoot) {
       const relativePath = toPosixPath(relativeRoot, entry.name);
       if (!filter(relativePath, entry)) continue;
       if (entry.isDirectory()) {
-        await collectDirectory(relativePath, filter);
+        await collectDirectory(relativePath, filter, collectOptions);
       } else if (entry.isFile() && !isForbiddenBasename(entry.name)) {
+        // Skipped by size before anything is charged: a file the caller would drop must
+        // not consume the file count or the byte budget, or one corrupted memory file
+        // could block every export.
+        if (collectOptions.maxFileBytes !== undefined) {
+          const stat = await lstatOrNull(path.join(root.path, ...relativePath.split("/")));
+          if (stat !== null && stat.size > collectOptions.maxFileBytes) continue;
+        }
         assertBackupFileCount(files.length + 1);
         pathComplexity.recordFile(relativePath);
         files.push(await readBackupFile(root, relativePath, budget, links));
@@ -2628,17 +2636,20 @@ function assertValidBundleEntryDir(entry: BackupProjectBundleEntry): void {
   }
 }
 
-/** The collision-folded memory directory segment of a bundle file path. */
-function bundleFileDirKey(relativePath: string): string {
-  return collisionKey(relativePath.split("/")[2] ?? "");
+/** The memory directory segment of a bundle file path, exactly as spelled. */
+function bundleFileDirSegment(relativePath: string): string {
+  return relativePath.split("/")[2] ?? "";
 }
 
 export function bundleEntryFiles(
   files: readonly BackupFile[],
   entry: BackupProjectBundleEntry
 ): BackupFile[] {
-  const dirKey = collisionKey(entry.memoryDir);
-  return files.filter((file) => bundleFileDirKey(file.path) === dirKey);
+  // Exact spelling, not the collision-folded key: a matched restore writes these paths
+  // verbatim, so a case- or normalization-variant directory would land files where the
+  // project's memory store never reads them. Reading rejects such files outright.
+  const prefix = `${PROJECT_MEMORY_PATH_PREFIX}${entry.memoryDir}/`;
+  return files.filter((file) => file.path.startsWith(prefix));
 }
 
 /**
@@ -2675,19 +2686,19 @@ export async function collectProjectBundle(
   const collector = createBackupFileCollector(root);
   const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
   for (const entry of sorted) {
-    await collector.collectDirectory(`${PROJECT_MEMORY_PATH_PREFIX}${entry.memoryDir}`, () => true);
+    await collector.collectDirectory(
+      `${PROJECT_MEMORY_PATH_PREFIX}${entry.memoryDir}`,
+      () => true,
+      // Exports skip files the memory subsystem itself refuses to read: bundling them
+      // would produce a backup this build's own restore rejects. Snapshots keep full
+      // fidelity so an overwritten oversized local file stays recoverable.
+      options.skipOversizedMemoryFiles === true ? { maxFileBytes: MEMORY_MAX_FILE_BYTES } : {}
+    );
   }
   collector.assertHardLinksContained();
   // The executable bit is dropped on purpose: memory files are notes, and the bundle
   // manifest does not record modes, so restores always land them non-executable.
   const files = collector.files
-    // Exports skip files the memory subsystem itself refuses to read: bundling them would
-    // produce a backup this build's own restore rejects. Snapshots keep full fidelity so
-    // an overwritten oversized local file stays recoverable.
-    .filter(
-      (file) =>
-        options.skipOversizedMemoryFiles !== true || file.content.length <= MEMORY_MAX_FILE_BYTES
-    )
     .map((file) => ({ path: file.path, content: file.content }))
     .sort((a, b) => a.path.localeCompare(b.path));
   return {
@@ -2810,6 +2821,7 @@ async function readProjectBundleUnchecked(
   const manifest = parseProjectBundleManifest(manifestRaw.content.toString("utf-8"));
 
   const entryDirKeys = new Set<string>();
+  const entryDirs = new Set<string>();
   const entryPaths = new Set<string>();
   for (const entry of manifest.projects) {
     assertValidBundleEntryDir(entry);
@@ -2822,6 +2834,7 @@ async function readProjectBundleUnchecked(
       throw new Error(`Backup project bundle reuses memory directory '${entry.memoryDir}'`);
     }
     entryDirKeys.add(dirKey);
+    entryDirs.add(entry.memoryDir);
   }
 
   assertBackupFileCount(manifest.files.length);
@@ -2830,7 +2843,10 @@ async function readProjectBundleUnchecked(
   const seen = new Set<string>();
   for (const manifestFile of manifest.files) {
     assertAllowedBundleFilePath(manifestFile.path, { portable });
-    if (!entryDirKeys.has(bundleFileDirKey(manifestFile.path))) {
+    // Exact directory spelling: `bundleEntryFiles` associates by exact prefix, so a
+    // case- or normalization-variant of a listed directory would otherwise be a file no
+    // entry owns — accepted, never restored, and invisible to the import token.
+    if (!entryDirs.has(bundleFileDirSegment(manifestFile.path))) {
       throw new Error(
         `Backup project bundle file '${manifestFile.path}' does not belong to a listed project`
       );
@@ -2936,6 +2952,25 @@ export class ProjectMemoryWriteError extends Error {
     this.name = "ProjectMemoryWriteError";
     this.written = progress.written;
     this.skipped = progress.skipped;
+  }
+}
+
+/**
+ * A matched-memory restore that failed after some entries were written. The service's
+ * change notification runs on the success path, so the failure must carry the projects
+ * whose memory already changed or an open memory browser keeps showing stale contents.
+ */
+export class ProjectMemoryRestoreError extends Error {
+  readonly restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
+
+  constructor(
+    message: string,
+    restoredProjectMemory: Array<{ projectPath: string; files: string[] }>,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = "ProjectMemoryRestoreError";
+    this.restoredProjectMemory = restoredProjectMemory;
   }
 }
 

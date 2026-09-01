@@ -5,9 +5,11 @@ import type { Config } from "@/node/config";
 import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schemas/backup";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import {
+  MAX_BACKUP_PROJECT_ENTRIES,
   sanitizeBackupGitRemote,
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { ProjectConfig } from "@/common/types/project";
@@ -28,6 +30,8 @@ import { BACKUP_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { BackupRepoCache } from "./gitRepo";
 import {
   PROJECT_BUNDLE_DIR,
+  ProjectMemoryRestoreError,
+  ProjectMemoryWriteError,
   backupPayloadExists,
   bundleEntryFiles,
   collectProjectBundle,
@@ -188,6 +192,9 @@ function describeMissingBackup(managedPath: string): string {
     : `No Xum backup found in '${managedPath}' or legacy ${fallbacks} on this branch`;
 }
 
+/** Concurrent `git remote get-url` probes during bundle export. */
+const REMOTE_DISCOVERY_CONCURRENCY = 8;
+
 /** Best-effort: a missing origin, a non-git directory, or a hung git must never fail an export. */
 async function readProjectGitRemote(projectPath: string): Promise<string | undefined> {
   try {
@@ -270,19 +277,35 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * also what restore-side matching recomputes.
    */
   async function listProjectBundleEntries(): Promise<BackupProjectBundleEntry[]> {
-    const entries: BackupProjectBundleEntry[] = [];
-    for (const [projectPath, projectConfig] of userProjects()) {
-      const gitRemote = await readProjectGitRemote(projectPath);
-      entries.push({
-        path: projectPath,
-        // Clamped to the manifest schema's cap so a long custom title cannot produce a
-        // bundle this build's own restore would refuse.
-        name: getProjectDisplayName(projectPath, projectConfig).slice(0, 256),
-        ...(gitRemote !== undefined ? { gitRemote } : {}),
-        memoryDir: projectMemoryDirName(projectPath),
-      });
+    const projects = userProjects();
+    // Before any lookup: an over-limit config would otherwise run every remote probe
+    // only to be refused by the bundle collector afterwards.
+    if (projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
+      throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
     }
-    return entries;
+    // Each probe has its own timeout, so sequential discovery over many projects on slow
+    // filesystems could stall a preview or push for minutes; bounded parallelism keeps the
+    // worst case proportional to the limit, not the project count.
+    const probes = new AsyncSemaphore(REMOTE_DISCOVERY_CONCURRENCY);
+    return await Promise.all(
+      projects.map(async ([projectPath, projectConfig]) => {
+        const slot = await probes.acquire();
+        let gitRemote: string | undefined;
+        try {
+          gitRemote = await readProjectGitRemote(projectPath);
+        } finally {
+          slot.release();
+        }
+        return {
+          path: projectPath,
+          // Clamped to the manifest schema's cap so a long custom title cannot produce a
+          // bundle this build's own restore would refuse.
+          name: getProjectDisplayName(projectPath, projectConfig).slice(0, 256),
+          ...(gitRemote !== undefined ? { gitRemote } : {}),
+          memoryDir: projectMemoryDirName(projectPath),
+        };
+      })
+    );
   }
 
   function registeredProjectDirs(): Map<string, string> {
@@ -292,19 +315,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   }
 
   function toProjectImports(plan: ProjectBundleRestorePlan): BackupProjectImport[] {
-    return plan.imports.map(({ entry, files, token }) => {
-      // Re-sanitized on read, not just on export: the manifest is repository-controlled,
-      // so a crafted remote must pass the same filter before it reaches the UI.
-      const gitRemote =
-        entry.gitRemote === undefined ? undefined : sanitizeBackupGitRemote(entry.gitRemote);
-      return {
-        sourcePath: entry.path,
-        name: entry.name,
-        ...(gitRemote !== undefined ? { gitRemote } : {}),
-        memoryFileCount: files.length,
-        token,
-      };
-    });
+    // Remotes were already sanitized when the manifest was parsed, so a crafted checkout
+    // cannot reach the UI through this field.
+    return plan.imports.map(({ entry, files, token }) => ({
+      sourcePath: entry.path,
+      name: entry.name,
+      ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
+      memoryFileCount: files.length,
+      token,
+    }));
   }
 
   async function readBundleWithPlan(
@@ -320,9 +339,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     plan: ProjectBundleRestorePlan
   ): Promise<BackupFileChange[]> {
     if (plan.matched.length === 0) return [];
-    const localBundle = await collectProjectBundle(
-      muxRoot,
-      plan.matched.map((match) => match.entry)
+    // Under the memory lock like every other backup read of project memory, so a
+    // concurrent memory edit cannot yield a torn diff or a failed identity check.
+    const localBundle = await withMemoryLock(() =>
+      collectProjectBundle(
+        muxRoot,
+        plan.matched.map((match) => match.entry)
+      )
     );
     const localByPath = new Map(localBundle.files.map((file) => [file.path, file]));
     const changes: BackupFileChange[] = [];
@@ -352,12 +375,17 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // fresh after the core payload.
       let scanFiles = payload.files;
       if (exportOptions.includeProjects) {
-        const bundle = await collectProjectBundle(
-          muxRoot,
-          await listProjectBundleEntries(),
-          // Restore refuses files past the memory subsystem's read limit, so exporting
-          // them would only produce a backup no build can bring back.
-          { skipOversizedMemoryFiles: true }
+        const entries = await listProjectBundleEntries();
+        // Collected under the memory lock so an agent writing memory mid-export cannot
+        // produce a torn bundle or trip the collector's identity checks.
+        const bundle = await withMemoryLock(() =>
+          collectProjectBundle(
+            muxRoot,
+            entries,
+            // Restore refuses files past the memory subsystem's read limit, so exporting
+            // them would only produce a backup no build can bring back.
+            { skipOversizedMemoryFiles: true }
+          )
         );
         await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle, {
           ownerOnly: true,
@@ -591,11 +619,30 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // Matched entries restore verbatim, exactly what the preview promised. Imports
             // are executed separately by the service, after project registration.
             for (const match of matched) {
-              const { written } = await writeProjectMemoryFiles(
-                muxRoot,
-                match.files.map((file) => ({ path: file.path, content: file.content })),
-                { addOnly: false }
-              );
+              let written: string[];
+              try {
+                written = (
+                  await writeProjectMemoryFiles(
+                    muxRoot,
+                    match.files.map((file) => ({ path: file.path, content: file.content })),
+                    { addOnly: false }
+                  )
+                ).written;
+              } catch (error) {
+                // Files written so far — earlier entries and this one's partial progress —
+                // are on disk; the failure must still announce them.
+                if (error instanceof ProjectMemoryWriteError && error.written.length > 0) {
+                  restoredProjectMemory.push({
+                    projectPath: match.entry.path,
+                    files: error.written,
+                  });
+                }
+                throw new ProjectMemoryRestoreError(
+                  error instanceof Error ? error.message : String(error),
+                  restoredProjectMemory,
+                  { cause: error }
+                );
+              }
               if (written.length > 0) {
                 changedFiles.push(...written);
                 restoredProjectMemory.push({ projectPath: match.entry.path, files: written });
