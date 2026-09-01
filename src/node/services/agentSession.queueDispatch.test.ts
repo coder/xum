@@ -140,6 +140,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      const onCanceled = mock(() => undefined);
       session.queueMessage(
         "Canceled monitor wake",
         {
@@ -147,12 +149,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
           agentId: "exec",
           muxMetadata: { type: "bash-monitor-wake", records: [] },
         },
-        { cancelSignal: controller.signal }
+        { cancelSignal: controller.signal, cancelState, onCanceled }
       );
       controller.abort("monitor wake became stale");
 
       expect(session.hasQueuedMessages()).toBe(false);
       expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      session.sendQueuedMessages();
+      expect(session.isPreparingTurn()).toBe(false);
+      expect(cancelState.canceledBeforeAcceptance).toBe(true);
+      expect(await waitForCondition(() => onCanceled.mock.calls.length === 1)).toBe(true);
     } finally {
       session.dispose();
       await cleanup();
@@ -428,6 +434,53 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("restores an SDK queue claim before a hard user interrupt", async () => {
+    const workspaceId = "queue-dispatch-sdk-claim-hard-interrupt";
+    let claimQueuedToolEndMessage: (() => boolean) | undefined;
+    const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
+      claimQueuedToolEndMessage ??= options.claimQueuedToolEndMessage;
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      const initialSend = await session.sendMessage("Start work", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(initialSend.success).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+
+      const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      const onCanceled = mock(() => undefined);
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, cancelSignal: controller.signal, cancelState, onCanceled }
+      );
+
+      expect(claimQueuedToolEndMessage?.()).toBe(true);
+      expect((await session.interruptStream()).success).toBe(true);
+      controller.abort("hard interrupt canceled the monitor wake");
+      session.sendQueuedMessages();
+
+      expect(await waitForCondition(() => onCanceled.mock.calls.length === 1)).toBe(true);
+      expect(cancelState.canceledBeforeAcceptance).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("soft-stops after a provider-executed tool result and dispatches after abort", async () => {
     const workspaceId = "queue-dispatch-provider-tool";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -529,11 +582,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
     });
+    const commit = mock(() => true);
     const restoreCancellation = mock(() => undefined);
     const claimNextToolEndEntry = spyOn(
       MessageQueue.prototype,
       "claimNextToolEndEntry"
-    ).mockReturnValue({ restoreCancellation });
+    ).mockReturnValue({ commit, restoreCancellation });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(
       Err("injected provider-tool soft-stop failure")
     );
@@ -1269,11 +1323,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
       workspaceId,
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const commit = mock(() => true);
     const restoreCancellation = mock(() => undefined);
     const claimNextToolEndEntry = spyOn(
       MessageQueue.prototype,
       "claimNextToolEndEntry"
-    ).mockReturnValue({ restoreCancellation });
+    ).mockReturnValue({ commit, restoreCancellation });
     const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
       () => undefined
     );

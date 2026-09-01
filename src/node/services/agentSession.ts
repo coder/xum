@@ -693,7 +693,9 @@ export class AgentSession {
   // Provider-executed tools (for example native web_search/web_fetch) complete inside one
   // provider response, so the SDK's between-step stopWhen hook cannot preempt after them.
   // Track known siblings and reserve soft interruption for that native-only boundary.
-  private queuedProviderToolEndClaim: ToolEndQueueClaim | undefined;
+  private queuedToolEndClaim:
+    | { queueClaim: ToolEndQueueClaim; source: "sdk" | "provider" }
+    | undefined;
   private readonly activeToolCallIds = new Set<string>();
 
   private idleWaiters: Array<() => void> = [];
@@ -4870,7 +4872,7 @@ export class AgentSession {
     this.retryManager.cancel();
 
     if (options?.soft !== true) {
-      this.abandonQueuedProviderToolEndClaim();
+      this.abandonQueuedToolEndClaim();
       this.activeToolCallIds.clear();
     }
 
@@ -5210,7 +5212,7 @@ export class AgentSession {
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
-      claimQueuedToolEndMessage: () => this.messageQueue.claimNextToolEndEntry() != null,
+      claimQueuedToolEndMessage: () => this.claimQueuedToolEndMessage("sdk") != null,
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -5718,7 +5720,7 @@ export class AgentSession {
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
-    this.abandonQueuedProviderToolEndClaim();
+    this.abandonQueuedToolEndClaim();
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
@@ -5796,7 +5798,7 @@ export class AgentSession {
         // fast-path synchronously so a model set_goal in THIS stream queues
         // for its stream-end drain instead of writing goal.json mid-stream.
         this.workspaceGoalService?.recordStreamStarted(this.workspaceId);
-        this.queuedProviderToolEndClaim = undefined;
+        this.abandonQueuedToolEndClaim();
         this.activeToolCallIds.clear();
       }
       this.setTurnPhase(TurnPhase.STREAMING);
@@ -5958,7 +5960,7 @@ export class AgentSession {
           this.activeStreamUserMessageId
         );
 
-        this.abandonQueuedProviderToolEndClaim();
+        this.abandonQueuedToolEndClaim();
         this.activeToolCallIds.clear();
         this.emitChatEvent(payload);
         return;
@@ -5981,7 +5983,7 @@ export class AgentSession {
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
       const isQueuedProviderToolEndAbort =
-        this.queuedProviderToolEndClaim != null && abortReason !== "user";
+        this.queuedToolEndClaim?.source === "provider" && abortReason !== "user";
       if (abortReason === "user") {
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
@@ -6136,7 +6138,7 @@ export class AgentSession {
         // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
         const hadQueuedMessages = this.hasPendingManualFollowUp();
         if (this.deferQueuedFlushUntilAfterEdit) {
-          this.abandonQueuedProviderToolEndClaim();
+          this.abandonQueuedToolEndClaim();
           // Clear the queued-message signal while the edit flow owns the next dispatch.
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
@@ -6776,25 +6778,24 @@ export class AgentSession {
   private async requestQueuedProviderToolEndDispatch(): Promise<void> {
     if (
       this.turnPhase !== TurnPhase.STREAMING ||
-      this.queuedProviderToolEndClaim != null ||
+      this.queuedToolEndClaim != null ||
       this.activeToolCallIds.size > 0
     ) {
       return;
     }
 
-    const queueClaim = this.messageQueue.claimNextToolEndEntry();
-    if (queueClaim == null) {
+    const activeClaim = this.claimQueuedToolEndMessage("provider");
+    if (activeClaim == null) {
       return;
     }
 
-    this.queuedProviderToolEndClaim = queueClaim;
     const result = await this.streamManager.stopStream(this.workspaceId, {
       soft: true,
       abortReason: "system",
     });
     if (!result.success) {
-      if (this.queuedProviderToolEndClaim === queueClaim) {
-        this.abandonQueuedProviderToolEndClaim();
+      if (this.queuedToolEndClaim === activeClaim) {
+        this.abandonQueuedToolEndClaim();
       }
       log.warn("Failed to stop stream after provider-executed tool result", {
         workspaceId: this.workspaceId,
@@ -6806,7 +6807,11 @@ export class AgentSession {
   private dispatchQueuedProviderToolEndMessageAfterAbort(
     abortReason: StreamAbortReason | undefined
   ): boolean {
-    if (this.queuedProviderToolEndClaim == null) {
+    if (this.queuedToolEndClaim == null) {
+      return false;
+    }
+    if (this.queuedToolEndClaim.source !== "provider") {
+      this.abandonQueuedToolEndClaim();
       return false;
     }
 
@@ -6814,19 +6819,42 @@ export class AgentSession {
       abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
 
     if (!shouldDispatch) {
-      this.abandonQueuedProviderToolEndClaim();
+      this.abandonQueuedToolEndClaim();
       return false;
     }
 
-    this.queuedProviderToolEndClaim = undefined;
+    if (!this.commitQueuedToolEndClaim()) {
+      return false;
+    }
     this.sendQueuedMessages();
     return true;
   }
 
-  private abandonQueuedProviderToolEndClaim(): void {
-    const queueClaim = this.queuedProviderToolEndClaim;
-    this.queuedProviderToolEndClaim = undefined;
-    queueClaim?.restoreCancellation();
+  private claimQueuedToolEndMessage(
+    source: "sdk" | "provider"
+  ): { queueClaim: ToolEndQueueClaim; source: "sdk" | "provider" } | undefined {
+    if (this.queuedToolEndClaim != null) {
+      return undefined;
+    }
+    const queueClaim = this.messageQueue.claimNextToolEndEntry();
+    if (queueClaim == null) {
+      return undefined;
+    }
+    const activeClaim = { queueClaim, source };
+    this.queuedToolEndClaim = activeClaim;
+    return activeClaim;
+  }
+
+  private commitQueuedToolEndClaim(): boolean {
+    const activeClaim = this.queuedToolEndClaim;
+    this.queuedToolEndClaim = undefined;
+    return activeClaim?.queueClaim.commit() ?? false;
+  }
+
+  private abandonQueuedToolEndClaim(): void {
+    const activeClaim = this.queuedToolEndClaim;
+    this.queuedToolEndClaim = undefined;
+    activeClaim?.queueClaim.restoreCancellation();
   }
 
   async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
@@ -6966,9 +6994,17 @@ export class AgentSession {
       return;
     }
 
-    this.queuedProviderToolEndClaim = undefined;
+    this.commitQueuedToolEndClaim();
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+
+    const canceledEntries = this.messageQueue.discardCanceledEntries();
+    if (canceledEntries.length > 0) {
+      this.emitQueuedMessageChanged();
+      for (const canceledEntry of canceledEntries) {
+        this.notifyQueuedMessageCleared(canceledEntry, canceledEntry.cancelReason);
+      }
+    }
 
     if (!this.messageQueue.isEmpty()) {
       // Entries dispatch one at a time (FIFO): special sends (compaction, agent

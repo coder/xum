@@ -640,7 +640,30 @@ describe("MessageQueue", () => {
 
       expect(queue.hasLiveEntries()).toBe(false);
       expect(queue.isEmpty()).toBe(false);
+      expect(queue.entryCount()).toBe(0);
       expect(queue.claimNextToolEndEntry()).toBeUndefined();
+    });
+
+    it("commits the claimed entry ahead of a later user reordering", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, cancelSignal: controller.signal }
+      );
+      queue.add("User follow-up", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+
+      const claim = queue.claimNextToolEndEntry();
+      expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
+      expect(queue.getMessages()).toEqual(["User follow-up", "Monitor wake"]);
+      expect(claim?.commit()).toBe(true);
+
+      expect(queue.dequeueNext().message).toBe("Monitor wake");
+      expect(queue.dequeueNext().message).toBe("User follow-up");
     });
 
     it("claims the next live tool-end entry after a canceled head", () => {

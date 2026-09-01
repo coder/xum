@@ -95,6 +95,8 @@ export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMod
 
 /** Cancellation handoff for a claimed tool-end queue cut. */
 export interface ToolEndQueueClaim {
+  /** Move the claimed entry to the dispatch head and finalize the claim. */
+  commit(): boolean;
   /** Restore the entry's cancellation when the requested queue cut does not occur. */
   restoreCancellation(): void;
 }
@@ -293,8 +295,28 @@ export class MessageQueue {
 
     const cancelSignal = entry.cancelSignal;
     entry.cancelSignal = undefined;
+    let settled = false;
     return {
+      commit: () => {
+        if (settled) {
+          return false;
+        }
+        settled = true;
+        const index = this.entries.indexOf(entry);
+        if (index === -1) {
+          return false;
+        }
+        if (index > 0) {
+          this.entries.splice(index, 1);
+          this.entries.unshift(entry);
+        }
+        return true;
+      },
       restoreCancellation: () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         entry.cancelSignal = cancelSignal;
       },
     };
@@ -947,6 +969,32 @@ export class MessageQueue {
     this.entries = [];
   }
 
+  /** Remove entries whose cancellation fired before acceptance. */
+  discardCanceledEntries(): Array<QueueClearCallbacks & { cancelReason: string }> {
+    const canceledEntries: Array<QueueClearCallbacks & { cancelReason: string }> = [];
+    this.entries = this.entries.filter((entry) => {
+      if (entry.cancelSignal?.aborted !== true) {
+        return true;
+      }
+
+      if (entry.cancelState != null) {
+        entry.cancelState.canceledBeforeAcceptance = true;
+      }
+      canceledEntries.push({
+        ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+        ...(entry.onAcceptedPreStreamFailure != null
+          ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+          : {}),
+        cancelReason:
+          typeof entry.cancelSignal.reason === "string"
+            ? entry.cancelSignal.reason
+            : "Queued message canceled before acceptance.",
+      });
+      return false;
+    });
+    return canceledEntries;
+  }
+
   /**
    * Check if queue is empty (no pending entries).
    */
@@ -960,12 +1008,12 @@ export class MessageQueue {
   }
 
   /**
-   * Number of pending entries, including synthetic/internal ones. Archive admission uses
+   * Number of live pending entries, including synthetic/internal ones. Archive admission uses
    * this to compare the queue against the delegated turns it is about to interrupt, so it
    * must count every entry — a "visible" count could hide user work behind synthetic
    * entries.
    */
   entryCount(): number {
-    return this.entries.length;
+    return this.getLiveEntries().length;
   }
 }
