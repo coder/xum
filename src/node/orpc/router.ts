@@ -579,7 +579,7 @@ export const router = (authToken?: string) => {
       // startDesktopFlow rides handlerGen; its service pipeline is
       // uninterruptible (see startDesktopFlowEffect) so a client abort cannot
       // leak the loopback server. waitFor/cancel stay plain handlers until the
-      // promise-native OAuthFlowManager grows an Effect surface.
+      // batch OAuth-service conversion migrates the remaining procedures.
       startDesktopFlow: t
         .input(schemas.muxGatewayOauth.startDesktopFlow.input)
         .output(schemas.muxGatewayOauth.startDesktopFlow.output)

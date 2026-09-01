@@ -11,9 +11,9 @@
  * is already the exact user-facing string.
  *
  * Desktop flow bookkeeping (deferreds, loopback server lifetime, timeouts)
- * stays promise-based in `OAuthFlowManager`, which is shared with the other
- * OAuth services — converting that lifecycle to Effect `Scope` is deferred
- * until the shared manager itself migrates.
+ * lives in `OAuthFlowManager`, which is shared with the other OAuth services
+ * and is itself Effect-native (per-flow `Scope` lifecycle) — Effect callers
+ * here use its `*Effect` surface directly.
  */
 import * as crypto from "crypto";
 import { Effect, Schema } from "effect";
@@ -295,7 +295,9 @@ export class MuxGatewayOauthService {
         // Keep server-side timeout tied to flow lifetime so abandoned flows
         // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
         timeoutHandle: setTimeout(() => {
-          void self.desktopFlows.finish(flowId, Err("Timed out waiting for OAuth callback"));
+          Effect.runFork(
+            self.desktopFlows.finishEffect(flowId, Err("Timed out waiting for OAuth callback"))
+          );
         }, DEFAULT_DESKTOP_TIMEOUT_MS),
       });
 
@@ -353,7 +355,7 @@ export class MuxGatewayOauthService {
         result = Err(`Xum Gateway OAuth error: ${callbackOrDone.error}`);
       }
 
-      yield* Effect.promise(() => self.desktopFlows.finish(flowId, result));
+      yield* self.desktopFlows.finishEffect(flowId, result);
     });
   }
 
