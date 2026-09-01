@@ -3802,9 +3802,19 @@ export class WorkspaceTurnManager {
 
   private async isLiveWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<boolean> {
     const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
+    const activeStreamCorrelation = parseWorkspaceTurnTaskCorrelation(
+      this.streamManager?.getStreamInfo(record.workspaceId)?.muxMetadata
+    );
     const hasRuntimeActivity =
-      this.aiService.isStreaming(record.workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(record.workspaceId);
+      (activeStreamCorrelation?.taskHandleId === record.handleId &&
+        activeStreamCorrelation.ownerWorkspaceId === record.ownerWorkspaceId &&
+        activeStreamCorrelation.turnId === record.turnId) ||
+      this.workspaceService.hasPendingWorkspaceTurnContinuation(
+        record.workspaceId,
+        this.buildWorkspaceTurnMuxMetadata(record)
+      ) ||
+      this.workspaceService.hasPendingAutoRetry(record.workspaceId) ||
+      this.workspaceService.hasPendingBashMonitorWakeContinuation(record.workspaceId);
     if (hasRuntimeActivity) {
       return true;
     }

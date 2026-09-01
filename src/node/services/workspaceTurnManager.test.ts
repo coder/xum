@@ -21,6 +21,7 @@ import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { AIService } from "@/node/services/aiService";
+import type { StreamManager } from "@/node/services/streamManager";
 import type {
   WorkspaceHost,
   BackgroundableForegroundWaiter,
@@ -250,12 +251,25 @@ function createWorkspaceTurnManagerHost(
   };
 }
 
+function activeStreamInfo(muxMetadata: unknown, messageId: string) {
+  return {
+    messageId,
+    model: "test-model",
+    historySequence: 0,
+    startTime: 0,
+    parts: [],
+    toolCompletionTimestamps: new Map(),
+    muxMetadata,
+  };
+}
+
 function createWorkspaceTurnManagerHarness(
   config: Config,
   overrides?: {
     aiService?: AIService;
     workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
+    streamManager?: StreamManager;
   }
 ): {
   historyService: HistoryService;
@@ -284,7 +298,8 @@ function createWorkspaceTurnManagerHarness(
     workspaceService,
     initStateManager,
     taskHost,
-    terminalAttentionStore
+    terminalAttentionStore,
+    overrides?.streamManager
   );
 
   return {
@@ -322,6 +337,7 @@ describe("WorkspaceTurnManager", () => {
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
+      streamManager?: StreamManager;
     } = {}
   ) {
     const config = await createTestConfig(rootDir);
@@ -336,6 +352,7 @@ describe("WorkspaceTurnManager", () => {
     const { historyService, taskService, taskHost } = createWorkspaceTurnManagerHarness(config, {
       aiService: aiMocks.aiService,
       workspaceService: workspaceMocks.workspaceService,
+      streamManager: options.streamManager,
     });
 
     const created = await taskService.createWorkspaceTurn({
@@ -3560,7 +3577,7 @@ describe("WorkspaceTurnManager", () => {
     expect(aiMocks.stopStream).not.toHaveBeenCalled();
   });
 
-  test("createWorkspaceTurn reserves a slot before queueing a manually busy existing workspace", async () => {
+  test("createWorkspaceTurn repairs stale handles before parallel-slot accounting", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["queuedhandle", "queuedturn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
@@ -3591,13 +3608,27 @@ describe("WorkspaceTurnManager", () => {
     const workspaceMocks = createWorkspaceServiceMocks({
       sendMessage,
       isBusyForMessage: mock((workspaceId: string) => workspaceId === "childworkspace"),
+      hasPendingQueuedOrPreparingTurn: mock(
+        (workspaceId: string) => workspaceId === "otherworkspace"
+      ),
     });
     const aiMocks = createAIServiceMocks(config, {
       isStreaming: mock((workspaceId: string) => workspaceId === "otherworkspace"),
     });
+    const streamManager = {
+      getStreamInfo: mock((workspaceId: string) =>
+        workspaceId === "otherworkspace"
+          ? activeStreamInfo(
+              workspaceTurnMuxMetadata(parentId, "wst_unrelated", "unrelatedturn"),
+              "unrelated-message"
+            )
+          : undefined
+      ),
+    } as unknown as StreamManager;
     const { taskService } = createWorkspaceTurnManagerHarness(config, {
       aiService: aiMocks.aiService,
       workspaceService: workspaceMocks.workspaceService,
+      streamManager,
     });
     const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
       .taskHandleStore;
@@ -3610,6 +3641,7 @@ describe("WorkspaceTurnManager", () => {
         createdWorkspace: true,
       })
     );
+    // The target has unrelated activity. It must not reserve a slot for this stale handle.
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "otherworkspace", "wst_other", "running", {
         turnId: "otherturn",
@@ -3626,10 +3658,14 @@ describe("WorkspaceTurnManager", () => {
       workspace: { mode: "existing", workspaceId: "childworkspace" },
     });
 
-    expect(result.success).toBe(false);
-    if (result.success) return;
-    expect(result.error).toContain("maxParallelAgentTasks exceeded");
-    expect(sendMessage).not.toHaveBeenCalled();
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.taskId).toBe("wst_queuedhandle");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(await workspaceTurnSnapshot(taskService, parentId, "wst_other")).toMatchObject({
+      status: "interrupted",
+      error: "Workspace turn interrupted after restart",
+    });
   });
 
   test("createWorkspaceTurn counts active workspace turns across all owners", async () => {
@@ -3715,9 +3751,19 @@ describe("WorkspaceTurnManager", () => {
       );
       return cfg;
     });
-    const isStreaming = mock((workspaceId: string) => workspaceId === reawakenedTaskId);
-    const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { taskService, taskHost } = createWorkspaceTurnManagerHarness(config, { aiService });
+    const streamManager = {
+      getStreamInfo: mock((workspaceId: string) =>
+        workspaceId === reawakenedTaskId
+          ? activeStreamInfo(
+              workspaceTurnMuxMetadata(parentId, "wst_reawakened_quota", "turn-reawakened-quota"),
+              "reawakened-message"
+            )
+          : undefined
+      ),
+    } as unknown as StreamManager;
+    const { taskService, taskHost } = createWorkspaceTurnManagerHarness(config, {
+      streamManager,
+    });
     const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
       .taskHandleStore;
     await taskHandleStore.upsertWorkspaceTurn(
@@ -3760,13 +3806,34 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
-  test("active workspace turn count keeps startup-retrying handles live", async () => {
-    const hasPendingQueuedOrPreparingTurn = mock(
-      (workspaceId: string) => workspaceId === "childworkspace"
+  test("active workspace turn count keeps correlated continuation activity live", async () => {
+    let ownerWorkspaceId = "";
+    let activity: "stream" | "queued" | "auto-retry" | "monitor-wake" = "stream";
+    const hasPendingWorkspaceTurnContinuation = mock(
+      (workspaceId: string, metadata: ReturnType<typeof workspaceTurnMuxMetadata>) =>
+        activity === "queued" &&
+        workspaceId === "childworkspace" &&
+        metadata.taskHandleId === "wst_handle" &&
+        metadata.ownerWorkspaceId === ownerWorkspaceId &&
+        metadata.turnId === "turn"
     );
+    const streamManager = {
+      getStreamInfo: mock((workspaceId: string) =>
+        activity === "stream" && workspaceId === "childworkspace"
+          ? activeStreamInfo(
+              workspaceTurnMuxMetadata(ownerWorkspaceId, "wst_handle", "turn"),
+              "correlated-message"
+            )
+          : undefined
+      ),
+    } as unknown as StreamManager;
     const { parentId, taskService } = await startWorkspaceTurnForTest({
-      hasPendingQueuedOrPreparingTurn,
+      hasPendingWorkspaceTurnContinuation,
+      hasPendingAutoRetry: mock(() => activity === "auto-retry"),
+      hasPendingBashMonitorWakeContinuation: mock(() => activity === "monitor-wake"),
+      streamManager,
     });
+    ownerWorkspaceId = parentId;
     const internal = taskService as unknown as {
       activeWorkspaceTurnHandleByWorkspaceId: Map<
         string,
@@ -3776,8 +3843,14 @@ describe("WorkspaceTurnManager", () => {
     };
 
     internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
-    expect(await internal.countActiveWorkspaceTurns()).toBe(1);
-    expect(hasPendingQueuedOrPreparingTurn).toHaveBeenCalledWith("childworkspace");
+    for (const nextActivity of ["stream", "queued", "auto-retry", "monitor-wake"] as const) {
+      activity = nextActivity;
+      expect(await internal.countActiveWorkspaceTurns()).toBe(1);
+    }
+    expect(hasPendingWorkspaceTurnContinuation).toHaveBeenCalledWith(
+      "childworkspace",
+      workspaceTurnMuxMetadata(parentId, "wst_handle", "turn")
+    );
 
     const snapshot = await workspaceTurnSnapshot(taskService, parentId);
     expect(snapshot).toMatchObject({ status: "running", workspaceId: "childworkspace" });
