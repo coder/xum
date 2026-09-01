@@ -32,6 +32,7 @@ export interface BashMonitorTerminalSummary {
   settledAt: string;
   wakeOnExit: boolean;
   terminalStatusShown: boolean;
+  matchedThroughOffset?: number;
 }
 
 export interface BashMonitorLostSummary {
@@ -72,6 +73,7 @@ const BashMonitorRegistryRecordSchema = z
         settledAt: z.string().min(1),
         wakeOnExit: z.boolean(),
         terminalStatusShown: z.boolean(),
+        matchedThroughOffset: z.number().nonnegative().optional(),
       })
       .optional(),
     lost: z
@@ -308,8 +310,13 @@ export class BashMonitorRegistryStore {
     const records: BashMonitorRegistryRecord[] = [];
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
-      const raw = await fsPromises.readFile(path.join(dir, entry), "utf-8").catch(() => null);
-      if (raw == null) continue;
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(path.join(dir, entry), "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) continue;
+        throw error;
+      }
       const parsed = this.parse(raw);
       if (parsed != null) records.push({ ...parsed, ownerWorkspaceId });
     }

@@ -698,9 +698,15 @@ export class BashMonitorWakeReconciler {
       snapshot.match.throughOffset > (watermark?.matchedThroughOffset ?? -1);
     const terminalNew =
       snapshot.terminal != null && snapshot.terminal.settledAt !== watermark?.terminalSettledAt;
+    const optedOutMatchLost =
+      deadRegistryRow &&
+      snapshot.terminal?.wakeOnExit === false &&
+      snapshot.terminal.matchedThroughOffset != null &&
+      snapshot.terminal.matchedThroughOffset > (watermark?.matchedThroughOffset ?? -1);
     const lostNew =
       watermark?.lost !== true &&
       (snapshot.lost != null ||
+        optedOutMatchLost ||
         (deadRegistryRow && snapshot.terminal == null && snapshot.lost == null));
     if (!matchNew && !terminalNew && !lostNew) {
       if (deadRegistryRow || snapshot.retired) {
@@ -788,18 +794,19 @@ export class BashMonitorWakeReconciler {
       createdAt: snapshot.createdAt,
       kind: "match",
       ...this.composeLines(snapshot, deliveredMatchedThroughOffset, shownThroughOffset),
-      ...(snapshot.lost?.failedMatch?.matchedThroughOffset != null || snapshot.match != null
+      ...(snapshot.lost?.failedMatch?.matchedThroughOffset != null ||
+      snapshot.match != null ||
+      snapshot.terminal?.matchedThroughOffset != null
         ? {
             matchOffset: Math.max(
               snapshot.lost?.failedMatch?.matchedThroughOffset ?? -1,
-              snapshot.match?.throughOffset ?? -1
+              snapshot.match?.throughOffset ?? -1,
+              snapshot.terminal?.matchedThroughOffset ?? -1
             ),
           }
         : {}),
       matchedOutputAlreadyShown,
-      ...(snapshot.terminal != null && (snapshot.terminal.wakeOnExit || snapshot.match == null)
-        ? { terminal: snapshot.terminal }
-        : {}),
+      ...(snapshot.terminal?.wakeOnExit === true ? { terminal: snapshot.terminal } : {}),
       ...(snapshot.lost != null ? { lost: snapshot.lost } : {}),
       taskAwaitable,
       deadRegistryRow,

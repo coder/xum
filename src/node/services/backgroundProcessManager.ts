@@ -725,6 +725,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
                 settledAt: monitor.settlementDisposition.settledAt,
                 wakeOnExit: monitor.settlementDisposition.wakeOnExit,
                 terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                ...(monitor.settlementDisposition.matchedThroughOffset != null
+                  ? { matchedThroughOffset: monitor.settlementDisposition.matchedThroughOffset }
+                  : {}),
               },
             }
           : {}),
@@ -871,12 +874,16 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const includeMatched =
       pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
 
+    const retainedMatch = monitor.retainedMatches[monitor.retainedMatches.length - 1];
     monitor.settlementDisposition = {
       status: terminal.status,
       ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
       settledAt: new Date().toISOString(),
       wakeOnExit: monitor.wakeOnExit,
       terminalStatusShown: proc.terminalStatusShownToAgent,
+      ...(retainedMatch != null
+        ? { matchedThroughOffset: retainedMatch.matchedThroughOffset }
+        : {}),
       tailLines,
     };
 
@@ -1887,6 +1894,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
                 settledAt: monitor.settlementDisposition.settledAt,
                 wakeOnExit: monitor.settlementDisposition.wakeOnExit,
                 terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                ...(monitor.settlementDisposition.matchedThroughOffset != null
+                  ? { matchedThroughOffset: monitor.settlementDisposition.matchedThroughOffset }
+                  : {}),
                 tailLines: monitor.settlementDisposition.tailLines.map((entry) => ({ ...entry })),
               },
             }

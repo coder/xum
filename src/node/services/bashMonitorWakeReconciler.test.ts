@@ -875,6 +875,30 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(1);
   });
 
+  test("restart converts an opted-out undelivered match into a content-free lost wake", async () => {
+    rows = [
+      registryRecord({
+        status: "exited",
+        exitCode: 0,
+        settledAt: "2026-09-01T00:02:00.000Z",
+        wakeOnExit: false,
+        terminalStatusShown: false,
+        matchedThroughOffset: 12,
+      }),
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records[0]).toMatchObject({
+      processId: "dead",
+      kind: "monitor-lost",
+      lostReason: "restart",
+    });
+    expect(dispatches[0].prompt).not.toContain("READY");
+    expect(dispatches[0].muxMetadata.records[0]).not.toHaveProperty("terminal");
+  });
+
   test("snapshot supplies pending kinds without dispatching and removes the legacy wake directory", async () => {
     rows = [
       registryRecord({

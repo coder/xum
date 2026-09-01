@@ -145,6 +145,19 @@ describe("BashMonitorRegistryStore", () => {
     expect(records.map((record) => record.processId)).toEqual(["proc-1"]);
   });
 
+  test("listAll propagates transient record read failures", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload());
+    await fsPromises.mkdir(
+      path.join(config.sessionsDir, "owner-1", BASH_MONITOR_REGISTRY_DIR, "unreadable.json")
+    );
+
+    const result = await store.listAll("owner-1").catch((error: unknown) => error);
+
+    expect(result).toMatchObject({ code: "EISDIR" });
+  });
+
   test("listOwnerWorkspaceIds returns only owners with records", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorRegistryStore(config);

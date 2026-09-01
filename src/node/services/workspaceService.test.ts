@@ -304,6 +304,80 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("workspace removal drain waits for armed and failed-monitor registry writes", async () => {
+    const { service, events, cleanup } = await createWakeWiringService();
+    let releaseArmed: (() => void) | undefined;
+    let releaseLost: (() => void) | undefined;
+    const armedGate = new Promise<void>((resolve) => {
+      releaseArmed = resolve;
+    });
+    const lostGate = new Promise<void>((resolve) => {
+      releaseLost = resolve;
+    });
+    const upsert = mock((payload: { processId: string }) =>
+      payload.processId === "armed-proc" ? armedGate : Promise.resolve()
+    );
+    const recordLost = mock(() => lostGate);
+    const internal = service as unknown as {
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: { scheduleReconcile(workspaceId: string): void };
+      bashMonitorRegistryStore: {
+        upsert: typeof upsert;
+        recordTerminal(): Promise<void>;
+        recordLost: typeof recordLost;
+      };
+      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+    };
+    try {
+      await internal.bashMonitorRecoveryPromise;
+      internal.bashMonitorWakeReconciler = { scheduleReconcile: () => undefined };
+      internal.bashMonitorRegistryStore = {
+        upsert,
+        recordTerminal: () => Promise.resolve(),
+        recordLost,
+      };
+      const armed = {
+        processId: "armed-proc",
+        taskId: "bash:armed-proc",
+        workspaceId: "owner",
+        filter: "READY",
+        filterExclude: false,
+        script: "run",
+        createdAt: "2026-09-01T00:01:00.000Z",
+      };
+      events.emit("monitor:armed", "owner", armed);
+      let armedDrained = false;
+      const armedDrain = internal.drainBashMonitorPersistence("owner").then(() => {
+        armedDrained = true;
+      });
+      await Promise.resolve();
+      expect(armedDrained).toBe(false);
+      releaseArmed?.();
+      await armedDrain;
+
+      const failed = { ...armed, processId: "failed-proc", taskId: "bash:failed-proc" };
+      events.emit("monitor:stopped", "owner", {
+        processId: failed.processId,
+        reason: "failed",
+        armMetadata: failed,
+        failureMessage: "transport unavailable",
+      });
+      for (let attempt = 0; attempt < 20 && recordLost.mock.calls.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      let failureDrained = false;
+      const failureDrain = internal.drainBashMonitorPersistence("owner").then(() => {
+        failureDrained = true;
+      });
+      await Promise.resolve();
+      expect(failureDrained).toBe(false);
+      releaseLost?.();
+      await failureDrain;
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("runtime failure recreates missing registry evidence from arm metadata", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);

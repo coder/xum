@@ -1841,6 +1841,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
+  private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
   // Failed-persistence chains active per process, so a later cancellation (task_stop after a
   // runtime failure) can invalidate in-flight persists and scheduled retries by generation.
   // "failed" can never follow "canceled" for one generation (stopMonitor guards on
@@ -1850,6 +1851,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     string,
     { createdAt: string; canceled: boolean }
   >();
+
+  private trackBashMonitorPersistence(workspaceId: string, promise: Promise<void>): Promise<void> {
+    const pending =
+      this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId) ?? new Set<Promise<void>>();
+    this.pendingBashMonitorPersistenceByWorkspace.set(workspaceId, pending);
+    const tracked = promise.finally(() => {
+      pending.delete(tracked);
+      if (pending.size === 0) this.pendingBashMonitorPersistenceByWorkspace.delete(workspaceId);
+    });
+    pending.add(tracked);
+    return tracked;
+  }
+
+  private async drainBashMonitorPersistence(workspaceId: string): Promise<void> {
+    const pending = this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId);
+    if (pending != null) await Promise.allSettled([...pending]);
+  }
   private readonly bashOutputShownListener = (
     workspaceId: string,
     _payload: OutputShownPayload
@@ -1866,15 +1884,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     _workspaceId: string,
     payload: MonitorArmedPayload
   ): void => {
-    void this.bashMonitorRegistryStore
+    if (this.removingWorkspaces.has(payload.workspaceId)) return;
+    const persistence = this.bashMonitorRegistryStore
       .upsert(payload)
-      .then(() => this.scheduleBashMonitorWakeReconcile(payload.workspaceId))
-      .catch((error: unknown) => {
+      .then(() => this.scheduleBashMonitorWakeReconcile(payload.workspaceId));
+    void this.trackBashMonitorPersistence(payload.workspaceId, persistence).catch(
+      (error: unknown) => {
         log.error("Failed to persist armed bash monitor", {
           workspaceId: payload.workspaceId,
           error,
         });
-      });
+      }
+    );
   };
   private readonly bashMonitorStoppedListener = (
     workspaceId: string,
@@ -1949,35 +1970,42 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       return true;
     };
-    let retryIndex = 0;
-    const run = (): void => {
-      if (this.removingWorkspaces.has(workspaceId) || wasCanceled()) {
+    const persistence = new Promise<void>((resolve) => {
+      let retryIndex = 0;
+      const finish = (): void => {
         settleFailurePersist();
-        return;
-      }
-      void persist()
-        .then((persisted) => {
-          settleFailurePersist();
-          if (persisted && !wasCanceled()) {
-            this.scheduleBashMonitorWakeReconcile(workspaceId);
-          }
-        })
-        .catch((error: unknown) => {
-          if (wasCanceled()) {
-            settleFailurePersist();
-            return;
-          }
-          const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
-          if (delay == null) {
-            settleFailurePersist();
-            log.error("Failed to retire bash monitor state", { workspaceId, error });
-            return;
-          }
-          const timer = setTimeout(run, delay);
-          timer.unref();
-        });
-    };
-    run();
+        resolve();
+      };
+      const run = (): void => {
+        if (this.removingWorkspaces.has(workspaceId) || wasCanceled()) {
+          finish();
+          return;
+        }
+        void persist()
+          .then((persisted) => {
+            if (persisted && !wasCanceled()) {
+              this.scheduleBashMonitorWakeReconcile(workspaceId);
+            }
+            finish();
+          })
+          .catch((error: unknown) => {
+            if (wasCanceled()) {
+              finish();
+              return;
+            }
+            const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
+            if (delay == null) {
+              log.error("Failed to retire bash monitor state", { workspaceId, error });
+              finish();
+              return;
+            }
+            const timer = setTimeout(run, delay);
+            timer.unref();
+          });
+      };
+      run();
+    });
+    void this.trackBashMonitorPersistence(workspaceId, persistence);
   };
   // Last armed-monitor count successfully broadcast per workspace, so background process
   // churn that doesn't change the count (e.g. a monitorless bash exiting) skips the
@@ -5836,6 +5864,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
       }
 
+      await this.drainBashMonitorPersistence(workspaceId);
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
         this.bashMonitorWakeReconciler.dispose(workspaceId)
       );
