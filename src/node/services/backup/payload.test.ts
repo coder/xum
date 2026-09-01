@@ -3637,7 +3637,7 @@ describe("project bundle", () => {
     );
 
     const exported = await collectProjectBundle(muxRoot, [entry], {
-      skipOversizedMemoryFiles: true,
+      portableMemoryOnly: true,
     });
     expect(exported.files.map((file) => file.path)).toEqual([
       `memory/project/${entry.memoryDir}/small.md`,
@@ -3645,6 +3645,28 @@ describe("project bundle", () => {
     // Only the export path skips; a snapshot collection still surfaces the problem.
     const error = await captureRejection(collectProjectBundle(muxRoot, [entry]));
     expect((error as Error).message).toContain("corrupt.md");
+  });
+
+  it("caps exported memory files per project at the memory scope limit", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    for (let index = 0; index <= MEMORY_MAX_FILES_PER_SCOPE; index += 1) {
+      await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/n${index}.md`, "x\n");
+    }
+
+    // Deterministic: the sorted prefix, so repeated exports agree and the bundle stays
+    // importable into a fresh target.
+    const exported = await collectProjectBundle(muxRoot, [entry], { portableMemoryOnly: true });
+    expect(exported.files).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
+    const snapshot = await collectProjectBundle(muxRoot, [entry]);
+    expect(snapshot.files).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE + 1);
+  });
+
+  it("refuses to write a bundle whose generated manifest no reader would accept", async () => {
+    const longPath = `/home/${"p".repeat(1024)}`;
+    const bundle = await collectProjectBundle(muxRoot, [entryFor(longPath, "alpha")]);
+    const error = await captureRejection(writeBundleTo(managedDir, bundle));
+    expect((error as Error).message).toContain("Cannot back up the project list");
+    expect(await projectBundleExists(managedDir)).toBe(false);
   });
 
   it("skips memory files past the memory read limit only when exporting", async () => {
@@ -3656,7 +3678,7 @@ describe("project bundle", () => {
     );
 
     const exported = await collectProjectBundle(muxRoot, [entry], {
-      skipOversizedMemoryFiles: true,
+      portableMemoryOnly: true,
     });
     expect(exported.files.map((file) => file.path)).toEqual([
       `memory/project/${entry.memoryDir}/small.md`,

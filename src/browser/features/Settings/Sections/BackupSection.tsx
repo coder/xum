@@ -113,11 +113,15 @@ function ChangeList(props: {
   title: string;
   emptyLabel: string;
   changes: BackupPreview["pushChanges"];
+  /** Replaces the list when this half of the preview could not be computed. */
+  error?: string | null;
 }) {
   return (
     <div className="border-border-light min-w-0 rounded-md border p-3">
       <h4 className="text-foreground text-xs font-medium">{props.title}</h4>
-      {props.changes.length === 0 ? (
+      {props.error != null ? (
+        <p className="text-error mt-2 text-xs break-words">{props.error}</p>
+      ) : props.changes.length === 0 ? (
         <p className="text-muted mt-2 text-xs">{props.emptyLabel}</p>
       ) : (
         <ul className="mt-2 space-y-1.5">
@@ -780,6 +784,7 @@ export function BackupSection() {
                 title="Backup to repository"
                 emptyLabel="No repository changes."
                 changes={preview.pushChanges}
+                error={preview.pushError}
               />
               <ChangeList
                 title="Restore to this device"

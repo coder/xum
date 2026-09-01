@@ -745,10 +745,25 @@ function createBackupFileCollector(root: BackupRoot) {
   const links = createHardLinkTracker();
   const pathComplexity = createBackupPathComplexityTracker();
 
+  /**
+   * `maxFileBytes` and `maxFiles` skip what the caller would drop anyway, before the file
+   * count or byte budget is charged and before any read, so a directory with oversized or
+   * surplus files can never block a collection that means to leave them out.
+   */
   async function collectDirectory(
     relativeRoot: string,
     filter: (relativePath: string, entry: Dirent) => boolean,
-    collectOptions: { maxFileBytes?: number } = {}
+    collectOptions: { maxFileBytes?: number; maxFiles?: number } = {}
+  ): Promise<void> {
+    const progress = { collected: 0 };
+    await walkDirectory(relativeRoot, filter, collectOptions, progress);
+  }
+
+  async function walkDirectory(
+    relativeRoot: string,
+    filter: (relativePath: string, entry: Dirent) => boolean,
+    collectOptions: { maxFileBytes?: number; maxFiles?: number },
+    progress: { collected: number }
   ): Promise<void> {
     const absoluteRoot = path.join(root.path, ...relativeRoot.split("/"));
     // A symlinked collection root would let readdir walk outside MUX_ROOT, and restore
@@ -770,11 +785,14 @@ function createBackupFileCollector(root: BackupRoot) {
       const relativePath = toPosixPath(relativeRoot, entry.name);
       if (!filter(relativePath, entry)) continue;
       if (entry.isDirectory()) {
-        await collectDirectory(relativePath, filter, collectOptions);
+        await walkDirectory(relativePath, filter, collectOptions, progress);
       } else if (entry.isFile() && !isForbiddenBasename(entry.name)) {
-        // Skipped by size before anything is charged: a file the caller would drop must
-        // not consume the file count or the byte budget, or one corrupted memory file
-        // could block every export.
+        if (
+          collectOptions.maxFiles !== undefined &&
+          progress.collected >= collectOptions.maxFiles
+        ) {
+          continue;
+        }
         if (collectOptions.maxFileBytes !== undefined) {
           const stat = await lstatOrNull(path.join(root.path, ...relativePath.split("/")));
           if (stat !== null && stat.size > collectOptions.maxFileBytes) continue;
@@ -782,6 +800,7 @@ function createBackupFileCollector(root: BackupRoot) {
         assertBackupFileCount(files.length + 1);
         pathComplexity.recordFile(relativePath);
         files.push(await readBackupFile(root, relativePath, budget, links));
+        progress.collected += 1;
       }
     }
   }
@@ -2660,7 +2679,7 @@ export function bundleEntryFiles(
 export async function collectProjectBundle(
   muxRoot: string,
   entries: readonly BackupProjectBundleEntry[],
-  options: { skipOversizedMemoryFiles?: boolean } = {}
+  options: { portableMemoryOnly?: boolean } = {}
 ): Promise<BackupProjectBundle> {
   if (entries.length > MAX_BACKUP_PROJECT_ENTRIES) {
     throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
@@ -2689,10 +2708,13 @@ export async function collectProjectBundle(
     await collector.collectDirectory(
       `${PROJECT_MEMORY_PATH_PREFIX}${entry.memoryDir}`,
       () => true,
-      // Exports skip files the memory subsystem itself refuses to read: bundling them
-      // would produce a backup this build's own restore rejects. Snapshots keep full
-      // fidelity so an overwritten oversized local file stays recoverable.
-      options.skipOversizedMemoryFiles === true ? { maxFileBytes: MEMORY_MAX_FILE_BYTES } : {}
+      // Exports skip what the memory subsystem itself could not have produced or cannot
+      // read — files past its size limit and files beyond its per-scope count: bundling
+      // them would produce a backup this build's own restore rejects. Snapshots keep
+      // full fidelity so an overwritten oversized local file stays recoverable.
+      options.portableMemoryOnly === true
+        ? { maxFileBytes: MEMORY_MAX_FILE_BYTES, maxFiles: MEMORY_MAX_FILES_PER_SCOPE }
+        : {}
     );
   }
   collector.assertHardLinksContained();
@@ -2728,6 +2750,17 @@ export async function writeProjectBundle(
 ): Promise<void> {
   const portable = options.portable !== false;
   const ownerOnly = options.ownerOnly === true;
+  // The same schema the reader enforces, so an entry this install generated but no build
+  // can read back (a registered path past the manifest's cap) fails the export here, not
+  // the next restore.
+  const manifestCheck = BackupProjectBundleManifestSchema.safeParse(bundle.manifest);
+  if (!manifestCheck.success) {
+    throw new Error(
+      `Cannot back up the project list: ${manifestCheck.error.issues
+        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+        .join("; ")}`
+    );
+  }
   assertBackupFileCount(bundle.files.length);
   assertBackupPathComplexity(bundle.files.map((file) => file.path));
   for (const file of bundle.files) assertAllowedBundleFilePath(file.path, { portable });

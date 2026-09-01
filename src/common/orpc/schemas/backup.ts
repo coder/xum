@@ -120,6 +120,12 @@ export const backup = {
         projectImports: z.array(BackupProjectImportSchema),
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
+        /**
+         * Why the push half could not be computed, if it could not. The restore half is
+         * still reported so a local export problem never blocks reviewing or approving
+         * what a restore would bring in.
+         */
+        pushError: z.string().nullable(),
       })
     ),
   },

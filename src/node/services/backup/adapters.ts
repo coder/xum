@@ -384,7 +384,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             entries,
             // Restore refuses files past the memory subsystem's read limit, so exporting
             // them would only produce a backup no build can bring back.
-            { skipOversizedMemoryFiles: true }
+            { portableMemoryOnly: true }
           )
         );
         await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle, {
@@ -659,8 +659,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       };
     },
 
-    async importProjectMemory(importOptions) {
-      const sourceDir = await managedDir(importOptions.repositoryRoot, importOptions.managedPath);
+    async prepareProjectImports(prepareOptions) {
+      const sourceDir = await managedDir(prepareOptions.repositoryRoot, prepareOptions.managedPath);
       const bundle = await readProjectBundle(sourceDir);
       if (bundle === null) {
         throw new BackupServiceError(
@@ -668,27 +668,34 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           "The backup no longer carries a project bundle"
         );
       }
-      // Token lookup rather than trusting any caller-named entry: the token binds the
-      // approval to the exact entry and content, and the repo lock has held the checkout
-      // stable since the service validated it, so a miss here is defensive only.
-      const entry = bundle.manifest.projects.find(
-        (candidate) => projectImportToken(candidate, bundle.files) === importOptions.token
+      // Tokens computed once for the parsed bundle: the repo lock has held the checkout
+      // stable since the service validated it, so per-import rehashing would only repeat
+      // this work.
+      const entriesByToken = new Map(
+        bundle.manifest.projects.map((entry) => [projectImportToken(entry, bundle.files), entry])
       );
-      if (entry === undefined) {
-        throw new BackupServiceError(
-          "INVALID_BACKUP",
-          "The approved project import no longer matches the backup"
-        );
-      }
-      const targetDir = projectMemoryDirName(importOptions.targetPath);
-      const writes = bundleEntryFiles(bundle.files, entry).map((file) => ({
-        path: rekeyProjectMemoryPath(file.path, targetDir),
-        content: file.content,
-      }));
-      const { written, skipped } = await withMemoryLock(() =>
-        writeProjectMemoryFiles(muxRoot, writes, { addOnly: true })
-      );
-      return { writtenFiles: written, skippedFiles: skipped };
+      return {
+        async importProjectMemory(importOptions) {
+          // Token lookup rather than trusting any caller-named entry: the token binds the
+          // approval to the exact entry and content, so a miss here is defensive only.
+          const entry = entriesByToken.get(importOptions.token);
+          if (entry === undefined) {
+            throw new BackupServiceError(
+              "INVALID_BACKUP",
+              "The approved project import no longer matches the backup"
+            );
+          }
+          const targetDir = projectMemoryDirName(importOptions.targetPath);
+          const writes = bundleEntryFiles(bundle.files, entry).map((file) => ({
+            path: rekeyProjectMemoryPath(file.path, targetDir),
+            content: file.content,
+          }));
+          const { written, skipped } = await withMemoryLock(() =>
+            writeProjectMemoryFiles(muxRoot, writes, { addOnly: true })
+          );
+          return { writtenFiles: written, skippedFiles: skipped };
+        },
+      };
     },
   };
 }

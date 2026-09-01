@@ -1793,12 +1793,11 @@ describe("backup adapters project bundle", () => {
     const targetDir = projectMemoryDirName(targetPath);
     await writeFixtureFile(muxRoot, `memory/project/${targetDir}/conflict.md`, "local wins\n");
 
-    const imported = await payload.importProjectMemory({
+    const importer = await payload.prepareProjectImports({
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
-      token,
-      targetPath,
     });
+    const imported = await importer.importProjectMemory({ token, targetPath });
 
     expect(imported.writtenFiles).toEqual([`memory/project/${targetDir}/notes.md`]);
     expect(imported.skippedFiles).toEqual([`memory/project/${targetDir}/conflict.md`]);

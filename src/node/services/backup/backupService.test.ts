@@ -13,6 +13,7 @@ import {
 } from "./payload";
 import {
   BackupService,
+  type BackupProjectImporter,
   BackupServiceError,
   type BackupGitRepo,
   type BackupPayloadStore,
@@ -101,10 +102,18 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         projectBundleSkipped: false,
         restoredProjectMemory: [],
       }),
-    importProjectMemory: () => Promise.resolve({ writtenFiles: [], skippedFiles: [] }),
+    prepareProjectImports: () =>
+      Promise.resolve(importsWith(() => Promise.resolve({ writtenFiles: [], skippedFiles: [] }))),
     ...overrides,
   };
 }
+/** A payload store slice whose single prepared importer runs the given import implementation. */
+function importsWith(
+  importProjectMemory: BackupProjectImporter["importProjectMemory"]
+): BackupProjectImporter {
+  return { importProjectMemory };
+}
+
 function createService(
   rootDir: string,
   overrides: {
@@ -1173,13 +1182,16 @@ describe("BackupService project imports", () => {
             projectImports: candidates,
             matchedProjectPaths: [],
           }),
-        importProjectMemory: (options) => {
-          events.push(`import:${options.targetPath}`);
-          return Promise.resolve({
-            writtenFiles: ["memory/project/good-abc/notes.md"],
-            skippedFiles: [],
-          });
-        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              events.push(`import:${options.targetPath}`);
+              return Promise.resolve({
+                writtenFiles: ["memory/project/good-abc/notes.md"],
+                skippedFiles: [],
+              });
+            })
+          ),
       }),
     });
     service.setProjectService({
@@ -1243,10 +1255,13 @@ describe("BackupService project imports", () => {
             projectImports: [candidate()],
             matchedProjectPaths: [],
           }),
-        importProjectMemory: (options) => {
-          importedTo.push(options.targetPath);
-          return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
-        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
       }),
     });
     service.setProjectService({
@@ -1285,10 +1300,13 @@ describe("BackupService project imports", () => {
             projectImports: [candidate()],
             matchedProjectPaths: [],
           }),
-        importProjectMemory: (options) => {
-          importedTo.push(options.targetPath);
-          return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
-        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
       }),
     });
     // ProjectService resolves the alias to the registered project and reports a duplicate.
@@ -1313,6 +1331,47 @@ describe("BackupService project imports", () => {
     expect(importedTo).toEqual([registered]);
   });
 
+  test("refuses two imports whose targets are aliases of one directory", async () => {
+    const realParent = path.join(tempDir, "real");
+    const target = path.join(realParent, "proj");
+    await fs.mkdir(target, { recursive: true });
+    const aliasParent = path.join(tempDir, "alias");
+    await fs.symlink(realParent, aliasParent, "dir");
+    const aliasTarget = path.join(aliasParent, "proj");
+    let snapshots = 0;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate(), candidate({ name: "beta", token: "beta-token" })],
+            matchedProjectPaths: [],
+          }),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      {
+        projectImports: [
+          { token: "candidate-token", targetPath: target },
+          { token: "beta-token", targetPath: aliasTarget },
+        ],
+      }
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toContain("another import already targets");
+    }
+    // Refused during planning: two backed-up projects would otherwise merge into one.
+    expect(snapshots).toBe(0);
+  });
+
   test("fails an import whose duplicate registration cannot be resolved to a path", async () => {
     const target = path.join(tempDir, "unresolved");
     await fs.mkdir(target);
@@ -1325,10 +1384,13 @@ describe("BackupService project imports", () => {
             projectImports: [candidate()],
             matchedProjectPaths: [],
           }),
-        importProjectMemory: () => {
-          imports += 1;
-          return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
-        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() => {
+              imports += 1;
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
       }),
     });
     // Duplicate reported, but nothing in config matches the target or its real path.
@@ -1361,12 +1423,16 @@ describe("BackupService project imports", () => {
             projectImports: [candidate()],
             matchedProjectPaths: [],
           }),
-        importProjectMemory: () =>
-          Promise.reject(
-            new ProjectMemoryWriteError("disk full", {
-              written: ["memory/project/alpha-abc/first.md"],
-              skipped: ["memory/project/alpha-abc/kept.md"],
-            })
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() =>
+              Promise.reject(
+                new ProjectMemoryWriteError("disk full", {
+                  written: ["memory/project/alpha-abc/first.md"],
+                  skipped: ["memory/project/alpha-abc/kept.md"],
+                })
+              )
+            )
           ),
       }),
     });
@@ -1451,11 +1517,15 @@ describe("BackupService project imports", () => {
               },
             ],
           }),
-        importProjectMemory: () =>
-          Promise.resolve({
-            writtenFiles: ["memory/project/imported-def/todo.md"],
-            skippedFiles: [],
-          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() =>
+              Promise.resolve({
+                writtenFiles: ["memory/project/imported-def/todo.md"],
+                skippedFiles: [],
+              })
+            )
+          ),
       }),
     });
     service.setProjectService({
@@ -1513,6 +1583,43 @@ describe("BackupService project imports", () => {
     }
     // Disk changed for alpha even though the restore failed on beta.
     expect(notified).toEqual([{ projectPath: "/home/dev/src/alpha", relPaths: ["notes.md"] }]);
+  });
+
+  test("keeps the restore half of a preview when the export half fails", async () => {
+    const fresh = candidate();
+    let pushChangeLookups = 0;
+    const service = createService(tempDir, {
+      gitRepo: createGitRepo({
+        getPushChanges: () => {
+          pushChangeLookups += 1;
+          return Promise.resolve([]);
+        },
+      }),
+      payload: createPayload({
+        previewRestore: () =>
+          Promise.resolve({
+            changes: [{ status: "M", path: "AGENTS.md" }],
+            localOnlyFiles: [],
+            commandApprovals: [],
+            projectImports: [fresh],
+            projectBundleSkipped: false,
+          }),
+        exportTo: () => Promise.reject(new Error("Backup has more than 256 projects")),
+      }),
+    });
+
+    const result = await service.preview({ ...SETTINGS, includeProjects: true });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      // The import tokens a cross-machine restore needs survive a local export problem.
+      expect(result.data.projectImports).toEqual([fresh]);
+      expect(result.data.restoreChanges).toEqual([{ status: "M", path: "AGENTS.md" }]);
+      expect(result.data.pushError).toContain("more than 256 projects");
+      expect(result.data.pushChanges).toEqual([]);
+    }
+    // No export landed in the checkout, so there is nothing to diff.
+    expect(pushChangeLookups).toBe(0);
   });
 
   test("keeps a concurrently saved project-backup toggle when recording a commit", async () => {

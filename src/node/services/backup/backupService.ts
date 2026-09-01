@@ -111,13 +111,23 @@ export interface BackupPayloadStore {
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
   /**
+   * Reads and validates the checked-out bundle once for a whole restore's approved
+   * imports; the returned importer then writes each one from that parsed copy. Per-import
+   * rereads would hash the entire bundle once per candidate.
+   */
+  prepareProjectImports(options: {
+    repositoryRoot: string;
+    managedPath: string;
+  }): Promise<BackupProjectImporter>;
+}
+
+export interface BackupProjectImporter {
+  /**
    * Writes one approved import's memory files, re-keyed to the target path's locally
    * computed directory, add-only. Runs after the project was registered so no path ever
    * holds the memory mutation lock while entering config edits.
    */
   importProjectMemory(options: {
-    repositoryRoot: string;
-    managedPath: string;
     token: string;
     targetPath: string;
   }): Promise<{ writtenFiles: string[]; skippedFiles: string[] }>;
@@ -388,6 +398,7 @@ export class BackupService {
         commandApprovals: BackupCommandApproval[];
         projectImports: BackupProjectImport[];
         projectBundleSkipped: boolean;
+        pushError: string | null;
       },
       BackupOperationError
     >
@@ -397,27 +408,38 @@ export class BackupService {
       const repository = await this.prepareRepository(normalized);
       // One critical section: the reported restore plan and the exported payload must describe
       // the same local state, or the two halves of the preview disagree.
-      const { restorePreview, exported } = await this.withLocalPayload(async () => ({
-        restorePreview: await this.dependencies.payload.previewRestore({
+      const { restorePreview, exported } = await this.withLocalPayload(async () => {
+        const restorePreview = await this.dependencies.payload.previewRestore({
           repositoryRoot: repository.rootDir,
           managedPath: repository.managedPath,
           includeProjects,
-        }),
-        exported: await this.dependencies.payload.exportTo({
-          repositoryRoot: repository.rootDir,
-          managedPath: repository.managedPath,
-          includeProjects,
-        }),
-      }));
-      const pushChanges = await this.dependencies.gitRepo.getPushChanges(repository);
+        });
+        // The push half fails on local state alone (an over-limit project list, an
+        // unexportable path); that must not hide the restore half, which is the only
+        // way to obtain the import approvals a cross-machine restore needs.
+        let exported: { redactions: string[] } | { pushError: string };
+        try {
+          exported = await this.dependencies.payload.exportTo({
+            repositoryRoot: repository.rootDir,
+            managedPath: repository.managedPath,
+            includeProjects,
+          });
+        } catch (error) {
+          exported = { pushError: toOperationError(error).message };
+        }
+        return { restorePreview, exported };
+      });
+      const pushChanges =
+        "pushError" in exported ? [] : await this.dependencies.gitRepo.getPushChanges(repository);
       return Ok({
         pushChanges,
         restoreChanges: restorePreview.changes,
         localOnlyFiles: restorePreview.localOnlyFiles,
-        redactions: exported.redactions,
+        redactions: "pushError" in exported ? [] : exported.redactions,
         commandApprovals: restorePreview.commandApprovals,
         projectImports: restorePreview.projectImports,
         projectBundleSkipped: restorePreview.projectBundleSkipped,
+        pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
   }
@@ -625,13 +647,6 @@ export class BackupService {
         );
       }
       const resolved = path.resolve(targetPath);
-      if (claimedTargets.has(resolved)) {
-        throw new BackupServiceError(
-          "IO_ERROR",
-          `Cannot import '${candidate.name}': another import already targets '${resolved}'`
-        );
-      }
-      claimedTargets.add(resolved);
       const stat = await fs.lstat(resolved).catch(() => null);
       // A symlinked target would register the link's path while memory lands under a dir
       // name derived from it; require the plain directory itself.
@@ -641,6 +656,17 @@ export class BackupService {
           `Cannot import '${candidate.name}': '${resolved}' is not an existing directory`
         );
       }
+      // Claimed by real path: two lexically different targets that reach one directory
+      // through a symlinked parent would otherwise both register/resolve to the same
+      // project and merge two backed-up projects' memories into it.
+      const canonical = (await realpathOrNull(resolved)) ?? resolved;
+      if (claimedTargets.has(canonical)) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': another import already targets '${resolved}'`
+        );
+      }
+      claimedTargets.add(canonical);
       planned.push({ candidate, targetPath: resolved });
     }
     return planned;
@@ -658,6 +684,11 @@ export class BackupService {
     planned: ReadonlyArray<{ candidate: BackupProjectImport; targetPath: string }>
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
+    if (planned.length === 0) return results;
+    const importer = await this.dependencies.payload.prepareProjectImports({
+      repositoryRoot: repository.rootDir,
+      managedPath: repository.managedPath,
+    });
     for (const { candidate, targetPath } of planned) {
       // Once registration resolves the project identity, failures report that path: it is
       // where any partially written memory actually lives.
@@ -702,9 +733,7 @@ export class BackupService {
           results.push(failed(created.error));
           continue;
         }
-        const written = await this.dependencies.payload.importProjectMemory({
-          repositoryRoot: repository.rootDir,
-          managedPath: repository.managedPath,
+        const written = await importer.importProjectMemory({
           token: candidate.token,
           targetPath: registeredPath,
         });

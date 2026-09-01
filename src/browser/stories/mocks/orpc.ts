@@ -626,6 +626,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     commandApprovals: [],
     projectImports: [],
     projectBundleSkipped: false,
+    pushError: null,
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",

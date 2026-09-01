@@ -48,6 +48,7 @@ function renderBackupSection(
       commandApprovals: [],
       projectImports: [],
       projectBundleSkipped: false,
+      pushError: null,
     },
     backupRestore: {
       commit: "def5678",
@@ -486,6 +487,7 @@ describe("BackupSection", () => {
         commandApprovals: [approval],
         projectImports: [],
         projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -549,6 +551,7 @@ describe("BackupSection", () => {
         commandApprovals: [approval],
         projectImports: [],
         projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -647,6 +650,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [candidate, unapproved],
         projectBundleSkipped: false,
+        pushError: null,
       },
       backupRestore: {
         commit: "def5678",
@@ -709,6 +713,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [staleCandidate],
         projectBundleSkipped: false,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
@@ -750,6 +755,7 @@ describe("BackupSection", () => {
         commandApprovals: [],
         projectImports: [],
         projectBundleSkipped: true,
+        pushError: null,
       },
     });
     const canvas = within(view.container);
