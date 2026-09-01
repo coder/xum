@@ -1412,6 +1412,82 @@ describe("BackupService project imports", () => {
     expect(registrations).toBe(0);
   });
 
+  test("preflights an alias target against the registered project it imports into", async () => {
+    const realParent = path.join(tempDir, "real");
+    const registered = path.join(realParent, "proj");
+    await fs.mkdir(registered, { recursive: true });
+    const aliasParent = path.join(tempDir, "alias");
+    await fs.symlink(realParent, aliasParent, "dir");
+    const aliasTarget = path.join(aliasParent, "proj");
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(registered, { workspaces: [] });
+    const preflighted: string[] = [];
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjectPaths: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(
+              () => Promise.resolve({ writtenFiles: [], skippedFiles: [] }),
+              (options) => {
+                preflighted.push(options.targetPath);
+                return Promise.resolve();
+              }
+            )
+          ),
+      }),
+    });
+    service.setProjectService({
+      create: () => Promise.resolve(Err("Project already exists")),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: aliasTarget }] }
+    );
+
+    expect(result.success).toBe(true);
+    // The memory scope actually written is the registered project's, not the alias's.
+    expect(preflighted).toEqual([registered]);
+  });
+
+  test("keeps a candidate on offer when its import fails per-candidate", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const failing = candidate();
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [failing],
+            matchedProjectPaths: [],
+          }),
+      }),
+    });
+    service.setProjectService({
+      create: () => Promise.resolve(Err("registration failed")),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]?.status).toBe("failed");
+      // Retryable without another preview: the token is still current.
+      expect(result.data.unapprovedProjectImports).toEqual([failing]);
+    }
+  });
+
   test("refuses two imports whose targets are aliases of one directory", async () => {
     const realParent = path.join(tempDir, "real");
     const target = path.join(realParent, "proj");

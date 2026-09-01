@@ -155,6 +155,13 @@ export interface BackupMemoryNotifier {
   notifyExternalProjectChange(projectPath: string): void;
 }
 
+/** One approved import after planning: its resolved target and, if already registered, its identity. */
+interface PlannedProjectImport {
+  candidate: BackupProjectImport;
+  targetPath: string;
+  registeredPath: string | null;
+}
+
 export interface BackupServiceDependencies {
   gitRepo: BackupGitRepo;
   payload: BackupPayloadStore;
@@ -600,7 +607,9 @@ export class BackupService {
         for (const planned of plannedImports) {
           await importer?.assertProjectMemoryAllowed({
             token: planned.candidate.token,
-            targetPath: planned.targetPath,
+            // Against the identity the import will actually write to: a target that is an
+            // alias of an already registered project imports into that project.
+            targetPath: planned.registeredPath ?? planned.targetPath,
           });
         }
         const plannedTokens = new Set(plannedImports.map((planned) => planned.candidate.token));
@@ -635,6 +644,13 @@ export class BackupService {
           const projectImportResults =
             importer === null ? [] : await this.executeProjectImports(importer, plannedImports);
           this.notifyProjectMemoryChanges([], projectImportResults);
+          // A candidate whose import failed per-candidate stays on offer so the user can fix
+          // the target and retry without another preview; its token is still current.
+          const failedTokens = new Set(
+            projectImportResults.flatMap((result, index) =>
+              result.status === "failed" ? [plannedImports[index]?.candidate.token] : []
+            )
+          );
           return Ok({
             commit: remoteCommit,
             snapshotPath,
@@ -642,7 +658,10 @@ export class BackupService {
             localOnlyFiles: restored.localOnlyFiles,
             projectImportResults,
             projectBundleSkipped: restored.projectBundleSkipped,
-            unapprovedProjectImports,
+            unapprovedProjectImports: [
+              ...unapprovedProjectImports,
+              ...validated.projectImports.filter((candidate) => failedTokens.has(candidate.token)),
+            ],
           });
         } catch (error) {
           // Memory the failed restore already overwrote is on disk; subscribers must
@@ -674,7 +693,7 @@ export class BackupService {
     requested: ReadonlyArray<{ token: string; targetPath: string }>,
     candidates: readonly BackupProjectImport[],
     includeProjects: boolean
-  ): Promise<Array<{ candidate: BackupProjectImport; targetPath: string }>> {
+  ): Promise<PlannedProjectImport[]> {
     if (requested.length === 0) return [];
     if (!includeProjects) {
       throw new BackupServiceError(
@@ -683,7 +702,7 @@ export class BackupService {
       );
     }
     const byToken = new Map(candidates.map((candidate) => [candidate.token, candidate]));
-    const planned: Array<{ candidate: BackupProjectImport; targetPath: string }> = [];
+    const planned: PlannedProjectImport[] = [];
     const claimedTargets = new Set<string>();
     for (const request of requested) {
       const candidate = byToken.get(request.token);
@@ -721,7 +740,13 @@ export class BackupService {
         );
       }
       claimedTargets.add(canonical);
-      planned.push({ candidate, targetPath: resolved });
+      planned.push({
+        candidate,
+        targetPath: resolved,
+        // Known up front when the target is already registered (directly or as an alias),
+        // so the preflight checks the memory scope the import will really write to.
+        registeredPath: this.resolveRegisteredProjectPath(resolved, canonical),
+      });
     }
     return planned;
   }
@@ -735,7 +760,7 @@ export class BackupService {
    */
   private async executeProjectImports(
     importer: BackupProjectImporter,
-    planned: ReadonlyArray<{ candidate: BackupProjectImport; targetPath: string }>
+    planned: readonly PlannedProjectImport[]
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
     for (const { candidate, targetPath } of planned) {
