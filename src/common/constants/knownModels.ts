@@ -28,9 +28,10 @@ interface KnownModel extends KnownModelDefinition {
 // of the community.
 const MODEL_DEFINITIONS = {
   // Claude Fable 5.1 - Mythos-class model (a tier above Opus), successor to Fable 5
-  // (released June 9, 2026) as the generally-available safeguarded variant, at unchanged
-  // pricing ($10/M input, $50/M output). API id `claude-fable-5-1`; Fable 5 stays usable
-  // as the custom model string `anthropic:claude-fable-5`.
+  // (released June 9, 2026) as the generally-available safeguarded variant, at the same
+  // pricing ($10/M input, $50/M output) except cheaper cache reads (0.025x input).
+  // API id `claude-fable-5-1`; Fable 5 stays usable as the custom model string
+  // `anthropic:claude-fable-5`.
   FABLE: {
     provider: "anthropic",
     providerModelId: "claude-fable-5-1",
@@ -43,10 +44,11 @@ const MODEL_DEFINITIONS = {
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
   // Claude Mythos 5.1 - successor to Mythos 5 (released June 9, 2026 alongside Fable 5)
-  // as the restricted-access, safeguards-lifted twin of Fable 5.1, assumed at unchanged
-  // pricing ($10/M input, $50/M output) and availability (approved Project Glasswing /
-  // trusted-access customers, no self-serve sign-up). API id `claude-mythos-5-1`;
-  // Mythos 5 stays usable as the custom model string `anthropic:claude-mythos-5`.
+  // as the restricted-access, safeguards-lifted twin of Fable 5.1, with identical specs
+  // and pricing ($10/M input, $50/M output, 0.025x-input cache reads) and unchanged
+  // availability (approved Project Glasswing customers only, no self-serve sign-up).
+  // API id `claude-mythos-5-1`; Mythos 5 stays usable as the custom model string
+  // `anthropic:claude-mythos-5`.
   // Not warmed: most users cannot access it, and its tokenizer override is already
   // warmed via FABLE.
   MYTHOS: {
