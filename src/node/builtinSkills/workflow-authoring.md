@@ -57,6 +57,29 @@ also allowed; `export {...}` lists are not. The export keywords are stripped lex
 sandbox evaluation, so never start a line inside a template literal with `export ` — it would be
 silently rewritten.
 
+### Declaring phases up front (`meta.phases`)
+
+Declare the workflow's phase manifest statically so Xum can render the full phase rail before and during execution (pre-run preview, live progress, "phase 2/5" summaries):
+
+```js
+export const meta = {
+  description: "Multi-angle research with adversarial verification",
+  phases: [
+    { name: "scope", label: "Scope", description: "Pick research angles" },
+    { name: "search-fetch", label: "Search & Fetch", parallel: true },
+    { name: "verify", label: "Adversarial verification", parallel: true },
+    { name: "synthesize", label: "Synthesize" },
+  ],
+};
+```
+
+Rules:
+
+- `name` (required) must match the string passed to `phase(name)` at runtime; names must be unique and non-empty (max 120 chars, max 64 phases). `label` and `description` are optional display metadata; `parallel: true` renders a fan-out badge. Unknown keys are rejected.
+- Invalid declarations fail run creation with every issue enumerated; omitting `meta.phases` changes nothing.
+- Reconciliation is lenient: phases the script visits but did not declare still render (inserted chronologically), declared-but-unvisited phases show as skipped/not-reached once the run settles, and revisiting a phase (loops) is fine.
+- Workflows without `meta.phases` whose `phase()` calls are all static string literals get a best-effort inferred rail; dynamic phase names (`"implement-" + key`) cannot be inferred — declare them instead.
+
 Packaged reusable workflows should live inside skill directories and be invoked with `skill://<skill-name>/<file.js>`. Explicit workspace workflow files require Project Trust.
 
 ## Running workflows

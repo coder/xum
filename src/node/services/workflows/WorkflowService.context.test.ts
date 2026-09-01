@@ -15,6 +15,7 @@ import {
   type WorkflowServiceContext,
 } from "./WorkflowService";
 import { WorkflowArgsValidationError } from "./workflowArgs";
+import { WorkflowDeclaredPhasesValidationError } from "./workflowMetadata";
 
 interface TestWorkspaceService {
   emitWorkflowRunActivity: ReturnType<typeof mock>;
@@ -237,6 +238,131 @@ describe("WorkflowService request orchestration", () => {
       }
     }
   });
+
+  test("hydrates declared phase manifests on read paths without persisting them", async () => {
+    const { context } = createContext();
+    fs.writeFileSync(
+      path.join(projectPath, "workflows", "phased.js"),
+      'export const meta = { description: "Phased", phases: [{ name: "scope" }, { name: "verify", parallel: true }] };\n' +
+        'export default function workflow({ phase }) { phase("scope"); return { reportMarkdown: "ok" }; }\n'
+    );
+    await startWorkflowRun(context, {
+      workspaceId: "workspace-1",
+      scriptPath: "./workflows/phased.js",
+      args: {},
+    });
+
+    const runs = await listWorkflowRuns(context, "workspace-1");
+    const phased = runs.find((run) => run.workflow.name === "phased");
+    expect(phased?.workflow.phaseManifest).toEqual({
+      provenance: "declared",
+      phases: [{ name: "scope" }, { name: "verify", parallel: true }],
+    });
+
+    // run.json stays manifest-free: hydration happens on outbound copies only.
+    const rawRunFile = fs.readFileSync(
+      path.join(config.sessionsDir, "workspace-1", "workflows", phased!.id, "run.json"),
+      "utf-8"
+    );
+    expect(rawRunFile).not.toContain("phaseManifest");
+  });
+
+  test("legacy runs hydrate inferred manifests; dynamic-name runs hydrate none", async () => {
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
+    const baseRun = {
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo", scope: "built-in" as const, executable: true },
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    };
+    await runStore.createRun({
+      ...baseRun,
+      id: "wfr_legacy_static",
+      source:
+        'export default function workflow({ phase }) { phase("a"); phase("b"); return {}; }\n',
+    });
+    await runStore.createRun({
+      ...baseRun,
+      id: "wfr_legacy_dynamic",
+      source:
+        'export default function workflow({ phase, args }) { phase("x-" + args.key); return {}; }\n',
+    });
+
+    const { context } = createContext();
+    const runs = await listWorkflowRuns(context, "workspace-1");
+    expect(runs.find((run) => run.id === "wfr_legacy_static")?.workflow.phaseManifest).toEqual({
+      provenance: "inferred",
+      phases: [{ name: "a" }, { name: "b" }],
+    });
+    expect(
+      runs.find((run) => run.id === "wfr_legacy_dynamic")?.workflow.phaseManifest
+    ).toBeUndefined();
+  });
+
+  test("rejects run creation when meta.phases is invalid, enumerating every issue", async () => {
+    const { context } = createContext();
+    fs.writeFileSync(
+      path.join(projectPath, "workflows", "bad-phases.js"),
+      'export const meta = { description: "Bad", phases: [{ name: "" }, { name: "dup" }, { name: "dup", extra: 1 }] };\n' +
+        "export default function workflow() { return {}; }\n"
+    );
+    try {
+      await startWorkflowRun(context, {
+        workspaceId: "workspace-1",
+        scriptPath: "./workflows/bad-phases.js",
+        args: {},
+      });
+      expect.unreachable("invalid meta.phases must fail run creation");
+    } catch (error) {
+      expect(error).toBeInstanceOf(WorkflowDeclaredPhasesValidationError);
+      const message = String(error);
+      expect(message).toContain("meta.phases[0].name must be a non-empty string");
+      expect(message).toContain('duplicates phase name "dup"');
+      expect(message).toContain('unknown key "extra"');
+    }
+    // No durable run record may exist for the refused start.
+    const runs = await listWorkflowRuns(context, "workspace-1");
+    expect(runs.some((run) => run.workflow.name === "bad-phases")).toBe(false);
+  });
+
+  test("discovery surfaces phase previews and never fails on invalid declarations", async () => {
+    const writeSkillWorkflow = (skillName: string, workflowSource: string) => {
+      const skillDir = path.join(projectPath, ".mux", "skills", skillName);
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillDir, "SKILL.md"),
+        `---\nname: ${skillName}\ndescription: ${skillName} workflow\n---\nRun it.\n`
+      );
+      fs.writeFileSync(path.join(skillDir, "workflow.js"), workflowSource);
+    };
+    writeSkillWorkflow(
+      "declared-flow",
+      'export const meta = { description: "Declared", phases: [{ name: "scope", parallel: true }] };\n' +
+        "export default function workflow() { return {}; }\n"
+    );
+    writeSkillWorkflow(
+      "broken-flow",
+      'export const meta = { description: "Broken", phases: [{ name: "" }] };\n' +
+        "export default function workflow() { return {}; }\n"
+    );
+    const { context } = createContext();
+
+    const scripts = await listWorkflowScripts(context, "workspace-1");
+    const declared = scripts.find((s) => s.scriptPath === "skill://declared-flow/workflow.js");
+    expect(declared?.descriptor.phaseManifest).toEqual({
+      provenance: "declared",
+      phases: [{ name: "scope", parallel: true }],
+    });
+    expect(declared?.phaseManifestWarning).toBeUndefined();
+
+    // Invalid declaration: script stays listed with a warning and no preview.
+    const broken = scripts.find((s) => s.scriptPath === "skill://broken-flow/workflow.js");
+    expect(broken).toBeDefined();
+    expect(broken?.descriptor.phaseManifest).toBeUndefined();
+    expect(broken?.phaseManifestWarning).toContain("meta.phases[0].name");
+  }, 60_000);
 
   test("crash-resumed background runs note terminal attention on settle", async () => {
     const runStore = new WorkflowRunStore({

@@ -60,6 +60,38 @@ export const WorkflowArgSummarySchema = z
   })
   .strict();
 
+// Limits for statically-declared workflow phases (meta.phases). Enforced both by
+// parseDeclaredPhases (run-start validation) and by this wire schema so the two
+// validators cannot drift.
+export const WORKFLOW_DECLARED_PHASES_MAX = 64;
+export const WORKFLOW_PHASE_NAME_MAX_LENGTH = 120;
+export const WORKFLOW_PHASE_DESCRIPTION_MAX_LENGTH = 500;
+
+export const WorkflowDeclaredPhaseSchema = z
+  .object({
+    /** Must match the string passed to phase(name) at runtime. */
+    name: z.string().min(1).max(WORKFLOW_PHASE_NAME_MAX_LENGTH),
+    label: z.string().min(1).max(WORKFLOW_PHASE_NAME_MAX_LENGTH).optional(),
+    description: z.string().min(1).max(WORKFLOW_PHASE_DESCRIPTION_MAX_LENGTH).optional(),
+    /** Renders a fan-out badge; purely presentational in v1. */
+    parallel: z.boolean().optional(),
+  })
+  // Unknown keys are errors to keep the namespace free for future flow metadata.
+  .strict();
+
+/**
+ * Derived phase manifest hydrated onto outbound workflow payloads at the API
+ * boundary (never persisted to run.json — see WorkflowRunStore.writeRunFile).
+ * "declared" comes from meta.phases; "inferred" from best-effort static analysis
+ * of phase() callsites in legacy scripts without a declaration.
+ */
+export const WorkflowPhaseManifestSchema = z
+  .object({
+    provenance: z.enum(["declared", "inferred"]),
+    phases: z.array(WorkflowDeclaredPhaseSchema).min(1).max(WORKFLOW_DECLARED_PHASES_MAX),
+  })
+  .strict();
+
 export const WorkflowScriptDescriptorSchema = z
   .object({
     name: WorkflowNameSchema,
@@ -72,6 +104,8 @@ export const WorkflowScriptDescriptorSchema = z
     sourceHash: z.string().min(1).optional(),
     executable: z.boolean(),
     blockedReason: z.string().min(1).optional(),
+    /** Hydrated on read; never written to disk. */
+    phaseManifest: WorkflowPhaseManifestSchema.optional(),
   })
   .refine((value) => value.executable || value.blockedReason != null, {
     message: "Non-executable workflow scripts must include a blocked reason",
@@ -309,4 +343,10 @@ export const AvailableWorkflowSchema = z.object({
   descriptor: WorkflowScriptDescriptorSchema,
   scriptPath: z.string().min(1),
   args: z.array(WorkflowArgSummarySchema),
+  /**
+   * Present when the script declares meta.phases but the declaration is invalid.
+   * Discovery never fails for this; the launcher shows the warning and no phase
+   * preview (run creation will reject with the same issues).
+   */
+  phaseManifestWarning: z.string().min(1).optional(),
 });

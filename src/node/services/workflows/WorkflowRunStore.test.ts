@@ -48,6 +48,32 @@ describe("WorkflowRunStore", () => {
     expect(run.events.map((event) => event.sequence)).toEqual([1]);
   });
 
+  test("never persists a hydrated phaseManifest into run.json (store boundary)", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-phase-manifest-boundary");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path, staleLeaseMs: 10 });
+    // Simulate a hydrated outbound descriptor accidentally fed back into a write.
+    await store.createRun({
+      id: "wfr_manifest",
+      workspaceId: "workspace-1",
+      workflow: {
+        ...definition,
+        phaseManifest: { provenance: "declared", phases: [{ name: "scope" }] },
+      },
+      source,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+
+    const rawRunFile = await fs.readFile(
+      path.join(tmp.path, "workflows", "wfr_manifest", "run.json"),
+      "utf-8"
+    );
+    expect(rawRunFile).not.toContain("phaseManifest");
+    // Reads return the stored (non-hydrated) descriptor.
+    const run = await store.getRun("wfr_manifest");
+    expect(run.workflow.phaseManifest).toBeUndefined();
+  });
+
   test("loads legacy workflow source snapshot filenames", async () => {
     using tmp = new DisposableTempDir("workflow-runs-legacy-source-filename");
     const store = await createStore(tmp.path);

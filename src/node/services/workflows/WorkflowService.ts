@@ -55,6 +55,8 @@ import {
   registerInProcessWorkflowRun,
 } from "./workflowArchiveAdmission";
 import { normalizeWorkflowArgsForSource } from "./workflowArgs";
+import { parseDeclaredPhases, parseWorkflowMetadata } from "./workflowMetadata";
+import { hydrateWorkflowRunPhaseManifest } from "./workflowPhaseManifest";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
 import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
@@ -743,6 +745,9 @@ export class WorkflowService {
     const normalized = normalizeWorkflowArgsForSource(input.script.source, input.args, {
       defaultArgs: input.defaultArgs,
     });
+    // Fail fast on invalid meta.phases before the durable run record exists,
+    // mirroring argsSchema validation above (all issues enumerated at once).
+    parseDeclaredPhases(parseWorkflowMetadata(input.script.source));
     return await this.runStore.createRun({
       id: runId,
       workspaceId: input.workspaceId,
@@ -901,6 +906,8 @@ export class WorkflowService {
     );
     const script = await resolveScript(input.spec.scriptPath);
     const normalized = normalizeWorkflowArgsForSource(script.source, input.spec.args);
+    // Same fail-fast declared-phase gate as top-level run creation.
+    parseDeclaredPhases(parseWorkflowMetadata(script.source));
     return await this.runStore.createRunIfAbsent({
       id: childRunId,
       workspaceId: parentRun.workspaceId,
@@ -1115,7 +1122,8 @@ export async function resolveWorkflowContext(
 export async function listWorkflowRuns(context: WorkflowServiceContext, workspaceId: string) {
   const { service, projectTrusted } = await resolveWorkflowContext(context, workspaceId);
   await service.resumeCrashedRuns({ workspaceId, projectTrusted });
-  return service.listRuns({ workspaceId });
+  // Phase manifests are hydrated on outbound copies only (never persisted).
+  return (await service.listRuns({ workspaceId })).map(hydrateWorkflowRunPhaseManifest);
 }
 
 export async function getWorkflowRun(
@@ -1123,7 +1131,8 @@ export async function getWorkflowRun(
   input: { workspaceId: string; runId: string }
 ) {
   const { service } = await resolveWorkflowContext(context, input.workspaceId);
-  return service.getRun(input);
+  const run = await service.getRun(input);
+  return run == null ? null : hydrateWorkflowRunPhaseManifest(run);
 }
 
 export async function interruptWorkflowRun(
@@ -1164,7 +1173,8 @@ export function subscribeWorkflowRuns(
     },
     subscribe: (push) =>
       workflowRunStreamHub.subscribe(workspaceId, (run) => {
-        if (run.parentWorkflow == null) push({ type: "run-changed", run });
+        if (run.parentWorkflow == null)
+          push({ type: "run-changed", run: hydrateWorkflowRunPhaseManifest(run) });
       }),
     initial: async () => ({
       type: "snapshot" as const,

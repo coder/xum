@@ -3,6 +3,8 @@ import type {
   AvailableWorkflowSchema,
   StructuredTaskOutputSchema,
   WorkflowArgSummarySchema,
+  WorkflowDeclaredPhaseSchema,
+  WorkflowPhaseManifestSchema,
   WorkflowScriptDescriptorSchema,
   WorkflowMetadataSchema,
   WorkflowScriptScopeSchema,
@@ -21,6 +23,8 @@ export type WorkflowMetadata = z.infer<typeof WorkflowMetadataSchema>;
 export type WorkflowScriptScope = z.infer<typeof WorkflowScriptScopeSchema>;
 export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusSchema>;
 export type WorkflowStepStatus = z.infer<typeof WorkflowStepStatusSchema>;
+export type WorkflowDeclaredPhase = z.infer<typeof WorkflowDeclaredPhaseSchema>;
+export type WorkflowPhaseManifest = z.infer<typeof WorkflowPhaseManifestSchema>;
 export type WorkflowScriptDescriptor = z.infer<typeof WorkflowScriptDescriptorSchema>;
 export type WorkflowResult = z.infer<typeof WorkflowResultSchema>;
 export type StructuredTaskOutput = z.infer<typeof StructuredTaskOutputSchema>;

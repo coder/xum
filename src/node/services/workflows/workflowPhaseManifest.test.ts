@@ -1,0 +1,246 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+import { describe, expect, test } from "bun:test";
+
+import type { WorkflowRunRecord } from "@/common/types/workflow";
+import {
+  hydrateWorkflowRunPhaseManifest,
+  inferPhaseManifest,
+  resolveWorkflowPhaseManifest,
+} from "./workflowPhaseManifest";
+
+let hashCounter = 0;
+/** Unique per call so the memoization cache never couples unrelated assertions. */
+function freshHash(): string {
+  hashCounter += 1;
+  return `sha256:test-${hashCounter}`;
+}
+
+function phaseNames(source: string): string[] | undefined {
+  return inferPhaseManifest(source)?.map((phase) => phase.name);
+}
+
+/** Canonical legacy workflow (no meta.phases) wrapping `body` in the workflow function. */
+function legacyWorkflow(body: string): string {
+  return `export const meta = { description: "Legacy" };
+export default function workflow({ args, phase, log, agent, parallel }) {
+${body}
+  return { reportMarkdown: "done" };
+}
+`;
+}
+
+describe("inferPhaseManifest", () => {
+  test("collects static literal phases in first-occurrence order with dedup", () => {
+    const source = legacyWorkflow(`
+  phase("plan", { detail: "planning" });
+  for (let i = 0; i < 3; i++) {
+    phase("implement");
+    if (i === 2) break;
+    phase("verify");
+  }
+  phase(\`finalize\`);
+  phase("implement");
+`);
+    expect(phaseNames(source)).toEqual(["plan", "implement", "verify", "finalize"]);
+  });
+
+  test("supports arrow-function and indirection default exports", () => {
+    expect(
+      phaseNames(`export default async ({ phase }) => { phase("only"); return {}; };\n`)
+    ).toEqual(["only"]);
+    expect(
+      phaseNames(
+        `async function run({ phase }) { phase("named"); return {}; }\nexport default run;\n`
+      )
+    ).toEqual(["named"]);
+    expect(
+      phaseNames(
+        `const run = async ({ phase }) => { phase("const-arrow"); return {}; };\nexport default run;\n`
+      )
+    ).toEqual(["const-arrow"]);
+  });
+
+  test("ignores non-references: strings, comments, ctx.phase, phases identifiers, object keys", () => {
+    const source = legacyWorkflow(`
+  // phase("comment") must not count
+  const note = 'call phase("in-string") later';
+  const phases = ["not", "these"];
+  const ctx = { phase: (name) => name };
+  ctx.phase("member-call");
+  const config = { phase: "object-key-value" };
+  log(note, phases, config);
+  phase("real");
+`);
+    expect(phaseNames(source)).toEqual(["real"]);
+  });
+
+  test("bails on dynamic names (concatenation and template interpolation)", () => {
+    expect(phaseNames(legacyWorkflow(`phase("implement-" + args.key);`))).toBeUndefined();
+    // eslint-disable-next-line no-template-curly-in-string
+    expect(phaseNames(legacyWorkflow("phase(`implement-${args.key}`);"))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase(args.name);`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase();`))).toBeUndefined();
+  });
+
+  test("bails when phase escapes as a value (helper argument, return, alias, shorthand)", () => {
+    expect(phaseNames(legacyWorkflow(`phase("ok"); runPhase(phase, "helper");`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`return { phase };`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`const p = phase; p("aliased");`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase.call(null, "bound");`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase?.("optional");`))).toBeUndefined();
+  });
+
+  test("bails on destructuring rename and non-canonical bindings", () => {
+    expect(
+      phaseNames(`export default function workflow({ phase: p }) { p("renamed"); return {}; }\n`)
+    ).toBeUndefined();
+    expect(
+      phaseNames(`export default function workflow(ctx) { ctx.phase("member"); return {}; }\n`)
+    ).toBeUndefined();
+    expect(
+      phaseNames(`export default function workflow({ other: phase }) { phase("x"); return {}; }\n`)
+    ).toBeUndefined();
+  });
+
+  test("bails on shadowing declarations", () => {
+    expect(
+      phaseNames(legacyWorkflow(`{ const phase = () => {}; phase("shadowed"); }`))
+    ).toBeUndefined();
+  });
+
+  test("bails on phase references inside nested function bodies", () => {
+    expect(
+      phaseNames(legacyWorkflow(`const helper = () => phase("nested"); helper();`))
+    ).toBeUndefined();
+    // A nested arrow that never touches phase is fine.
+    expect(
+      phaseNames(
+        legacyWorkflow(`phase("outer"); const results = [1, 2].map((x) => agent("do " + x));`)
+      )
+    ).toEqual(["outer"]);
+  });
+
+  test("bails with zero callsites or invalid inferred names", () => {
+    expect(phaseNames(legacyWorkflow(`log("no phases");`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase("");`))).toBeUndefined();
+    expect(phaseNames(legacyWorkflow(`phase("${"x".repeat(121)}");`))).toBeUndefined();
+  });
+
+  test("real corpus: deep-research phase alphabet infers from its callsites", async () => {
+    // Strip the meta declaration so inference (not the declaration) is exercised.
+    const source = await fs.readFile(
+      path.join(import.meta.dir, "..", "..", "builtinSkills", "deep-research", "workflow.js"),
+      "utf-8"
+    );
+    const withoutMeta = source.replace(/^export const meta = \{[\s\S]*?\n\};/u, "");
+    expect(phaseNames(withoutMeta)).toEqual(["scope", "search-fetch", "verify", "synthesize"]);
+  });
+
+  test("real corpus pattern: dynamic per-track conductors bail", () => {
+    // track1/track2-style: dynamic names + phase passed into a helper.
+    const source = `export default async function workflow({ args, phase, agent }) {
+  const tracks = [{ key: "a" }, { key: "b" }];
+  for (const track of tracks) {
+    phase("implement-" + track.key);
+    await agent("implement " + track.key);
+  }
+  return { reportMarkdown: "done" };
+}
+`;
+    expect(phaseNames(source)).toBeUndefined();
+  });
+});
+
+describe("resolveWorkflowPhaseManifest", () => {
+  test("explicit meta.phases wins over inference", () => {
+    const source = `export const meta = {
+  description: "Declared",
+  phases: [{ name: "declared-only", label: "Declared" }],
+};
+export default function workflow({ phase }) { phase("declared-only"); phase("extra"); return {}; }
+`;
+    const outcome = resolveWorkflowPhaseManifest(source, freshHash());
+    expect(outcome).toEqual({
+      kind: "manifest",
+      manifest: {
+        provenance: "declared",
+        phases: [{ name: "declared-only", label: "Declared" }],
+      },
+    });
+  });
+
+  test("absent declaration falls back to inference with inferred provenance", () => {
+    const outcome = resolveWorkflowPhaseManifest(legacyWorkflow(`phase("solo");`), freshHash());
+    expect(outcome).toEqual({
+      kind: "manifest",
+      manifest: { provenance: "inferred", phases: [{ name: "solo" }] },
+    });
+  });
+
+  test("invalid declaration reports a warning instead of throwing (read-path fail-safe)", () => {
+    const source = `export const meta = { phases: [{ name: "" }] };
+export default function workflow({ phase }) { phase("x"); return {}; }
+`;
+    const outcome = resolveWorkflowPhaseManifest(source, freshHash());
+    expect(outcome.kind).toBe("invalid");
+    if (outcome.kind === "invalid") {
+      expect(outcome.warning).toContain("meta.phases[0].name");
+    }
+  });
+
+  test("unparseable source degrades to none without throwing", () => {
+    const outcome = resolveWorkflowPhaseManifest("this is not (valid js", freshHash());
+    expect(outcome).toEqual({ kind: "none" });
+  });
+
+  test("memoizes by sourceHash", () => {
+    const hash = freshHash();
+    const first = resolveWorkflowPhaseManifest(legacyWorkflow(`phase("memo");`), freshHash());
+    const a = resolveWorkflowPhaseManifest(legacyWorkflow(`phase("memo");`), hash);
+    // Same hash returns the cached object even for different source text.
+    const b = resolveWorkflowPhaseManifest("completely different", hash);
+    expect(a).toBe(b);
+    expect(first).toEqual(a);
+  });
+});
+
+describe("hydrateWorkflowRunPhaseManifest", () => {
+  function makeRun(source: string): WorkflowRunRecord {
+    return {
+      id: "wfr_hydrate_test",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "demo",
+        description: "Demo workflow",
+        scope: "project",
+        executable: true,
+      },
+      source,
+      sourceHash: freshHash(),
+      args: {},
+      status: "running",
+      createdAt: "2026-05-29T00:00:00.000Z",
+      updatedAt: "2026-05-29T00:00:00.000Z",
+      events: [],
+      steps: [],
+    };
+  }
+
+  test("returns a hydrated copy without mutating the input run", () => {
+    const run = makeRun(legacyWorkflow(`phase("one"); phase("two");`));
+    const hydrated = hydrateWorkflowRunPhaseManifest(run);
+    expect(hydrated).not.toBe(run);
+    expect(run.workflow.phaseManifest).toBeUndefined();
+    expect(hydrated.workflow.phaseManifest).toEqual({
+      provenance: "inferred",
+      phases: [{ name: "one" }, { name: "two" }],
+    });
+  });
+
+  test("returns the run unchanged when no manifest resolves", () => {
+    const run = makeRun(`export default function workflow(ctx) { return {}; }\n`);
+    expect(hydrateWorkflowRunPhaseManifest(run)).toBe(run);
+  });
+});

@@ -1172,7 +1172,12 @@ export class WorkflowRunStore {
   }
 
   private async writeRunFile(runId: string, run: WorkflowRunRecord): Promise<void> {
-    const runForDisk = WorkflowRunRecordSchema.parse(run);
+    // workflow.phaseManifest is derived, hydrated-on-read data (see
+    // workflowPhaseManifest.ts). Strip it defensively so a hydrated outbound
+    // copy accidentally fed back into the store can never reach run.json —
+    // disk records must stay byte-compatible with older builds.
+    const { phaseManifest: _hydratedOnly, ...workflowForDisk } = run.workflow;
+    const runForDisk = WorkflowRunRecordSchema.parse({ ...run, workflow: workflowForDisk });
     await writeJsonAtomic(this.runFile(runId), runForDisk);
     // Notify live subscribers (workflows.subscribe) after the durable write. The hub is a
     // module-level bus, so any store instance — regardless of which flow constructed it —
