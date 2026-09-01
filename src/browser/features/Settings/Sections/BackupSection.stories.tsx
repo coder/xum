@@ -82,6 +82,7 @@ export const Configured: Story = {
     await canvas.findByText(/github\.headers\.Authorization/i);
     await canvas.findByText("agents/local-only.md");
     await canvas.findByRole("checkbox", { name: "Approve MCP command changes" });
+    await canvas.findByText("Projects to reimport");
   },
 };
 
@@ -95,4 +96,14 @@ export const Phone: Story = {
     },
   },
   render: renderBackupSection,
+  // The import cards only exist after a preview, so the pinned phone snapshot must open
+  // one or it never exercises the narrow card layout and its long repository-controlled
+  // strings.
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Settings backup");
+    await userEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    await canvas.findByRole("checkbox", { name: /Import project/ });
+  },
 };

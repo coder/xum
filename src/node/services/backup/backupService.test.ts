@@ -109,9 +109,11 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
 }
 /** A payload store slice whose single prepared importer runs the given import implementation. */
 function importsWith(
-  importProjectMemory: BackupProjectImporter["importProjectMemory"]
+  importProjectMemory: BackupProjectImporter["importProjectMemory"],
+  assertProjectMemoryAllowed: BackupProjectImporter["assertProjectMemoryAllowed"] = () =>
+    Promise.resolve()
 ): BackupProjectImporter {
-  return { importProjectMemory };
+  return { assertProjectMemoryAllowed, importProjectMemory };
 }
 
 function createService(
@@ -1329,6 +1331,85 @@ describe("BackupService project imports", () => {
       });
     }
     expect(importedTo).toEqual([registered]);
+  });
+
+  test("reports candidates a restore left unimported for lack of approval", async () => {
+    const target = path.join(tempDir, "approved");
+    await fs.mkdir(target);
+    const approved = candidate();
+    const skipped = candidate({ name: "beta", token: "beta-token", sourcePath: "/src/beta" });
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [approved, skipped],
+            matchedProjectPaths: [],
+          }),
+      }),
+    });
+    service.setProjectService({
+      create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults.map((item) => item.status)).toEqual(["imported"]);
+      // A "completed" restore never silently omits backed-up projects.
+      expect(result.data.unapprovedProjectImports).toEqual([skipped]);
+    }
+  });
+
+  test("refuses an approved import whose memory cannot land before taking a snapshot", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    let snapshots = 0;
+    let registrations = 0;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjectPaths: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(
+              () => Promise.resolve({ writtenFiles: [], skippedFiles: [] }),
+              () => Promise.reject(new Error("larger than the memory file limit"))
+            )
+          ),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+    service.setProjectService({
+      create: (projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      },
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toContain("memory file limit");
+    }
+    // Refused while nothing had changed: no snapshot, no registered project left behind.
+    expect(snapshots).toBe(0);
+    expect(registrations).toBe(0);
   });
 
   test("refuses two imports whose targets are aliases of one directory", async () => {

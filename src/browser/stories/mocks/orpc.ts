@@ -641,6 +641,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     localOnlyFiles: [],
     projectImportResults: [],
     projectBundleSkipped: false,
+    unapprovedProjectImports: [],
   };
 
   let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;

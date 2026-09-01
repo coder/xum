@@ -57,6 +57,7 @@ function renderBackupSection(
       localOnlyFiles: ["agents/local.md"],
       projectImportResults: [],
       projectBundleSkipped: false,
+      unapprovedProjectImports: [],
     },
     ...overrides,
   });
@@ -598,6 +599,7 @@ describe("BackupSection", () => {
         localOnlyFiles: [],
         projectImportResults: [],
         projectBundleSkipped: false,
+        unapprovedProjectImports: [],
       },
     });
 
@@ -668,6 +670,7 @@ describe("BackupSection", () => {
           },
         ],
         projectBundleSkipped: false,
+        unapprovedProjectImports: [],
       },
     });
     const canvas = within(view.container);

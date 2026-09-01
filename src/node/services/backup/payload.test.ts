@@ -3601,6 +3601,21 @@ describe("project bundle", () => {
     expect((error as Error).message).toContain("memory directory");
   });
 
+  it("rejects an over-long file list before validating its entries", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await rewriteBundleManifest(managedDir, {
+      schemaVersion: 1,
+      projects: [entry],
+      files: Array.from({ length: MAX_BACKUP_FILE_COUNT + 1 }, (_, index) => ({
+        path: `memory/project/${entry.memoryDir}/n${index}.md`,
+        sha256: "0".repeat(64),
+      })),
+    });
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    expect((error as Error).message).toContain(`${MAX_BACKUP_FILE_COUNT}`);
+  });
+
   it("rejects an oversized bundle file path before it reaches the filesystem", async () => {
     const entry = entryFor("/home/dev/src/alpha");
     await rewriteBundleManifest(managedDir, {

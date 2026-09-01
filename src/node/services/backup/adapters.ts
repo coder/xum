@@ -701,24 +701,29 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const entriesByToken = new Map(
         bundle.manifest.projects.map((entry) => [projectImportToken(entry, bundle.files), entry])
       );
+      // Token lookup rather than trusting any caller-named entry: the token binds the
+      // approval to the exact entry and content, so a miss here is defensive only.
+      const rekeyedWrites = (importOptions: { token: string; targetPath: string }) => {
+        const entry = entriesByToken.get(importOptions.token);
+        if (entry === undefined) {
+          throw new BackupServiceError(
+            "INVALID_BACKUP",
+            "The approved project import no longer matches the backup"
+          );
+        }
+        const targetDir = projectMemoryDirName(importOptions.targetPath);
+        return bundleEntryFiles(bundle.files, entry).map((file) => ({
+          path: rekeyProjectMemoryPath(file.path, targetDir),
+          content: file.content,
+        }));
+      };
       return {
+        async assertProjectMemoryAllowed(importOptions) {
+          await assertProjectMemoryWritesAllowed(muxRoot, rekeyedWrites(importOptions));
+        },
         async importProjectMemory(importOptions) {
-          // Token lookup rather than trusting any caller-named entry: the token binds the
-          // approval to the exact entry and content, so a miss here is defensive only.
-          const entry = entriesByToken.get(importOptions.token);
-          if (entry === undefined) {
-            throw new BackupServiceError(
-              "INVALID_BACKUP",
-              "The approved project import no longer matches the backup"
-            );
-          }
-          const targetDir = projectMemoryDirName(importOptions.targetPath);
-          const writes = bundleEntryFiles(bundle.files, entry).map((file) => ({
-            path: rekeyProjectMemoryPath(file.path, targetDir),
-            content: file.content,
-          }));
           const { written, skipped } = await withMemoryLock(() =>
-            writeProjectMemoryFiles(muxRoot, writes, { addOnly: true })
+            writeProjectMemoryFiles(muxRoot, rekeyedWrites(importOptions), { addOnly: true })
           );
           return { writtenFiles: written, skippedFiles: skipped };
         },

@@ -539,12 +539,26 @@ export function BackupSection() {
       setSecretScanBlocked(false);
       setCommandApprovals([]);
       setApproveCommands(false);
-      setProjectImports([]);
-      setProjectImportSelections({});
+      // Candidates the restore left out for lack of approval stay on offer with their fresh
+      // tokens, so a restore run without a preview never hides backed-up projects.
+      const unapproved = result.data.unapprovedProjectImports;
+      setProjectImports(unapproved);
+      setProjectImportSelections(
+        Object.fromEntries(
+          unapproved.map((candidate) => [
+            candidate.token,
+            { approved: false, targetPath: candidate.sourcePath },
+          ])
+        )
+      );
       setProjectImportResults(result.data.projectImportResults);
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setStatusMessage(
-        `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}`
+        `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
+          unapproved.length === 0
+            ? ""
+            : ` ${unapproved.length} backed-up ${unapproved.length === 1 ? "project was" : "projects were"} not imported; approve them below to import.`
+        }`
       );
       setRestoreConfirmationOpen(false);
     } catch (error) {

@@ -122,6 +122,12 @@ export interface BackupPayloadStore {
 
 export interface BackupProjectImporter {
   /**
+   * The write-side refusals for one approved import against its target — memory size and
+   * count limits, non-file destinations — without writing. Run before the snapshot so a
+   * predictably impossible import never leaves a registered project behind.
+   */
+  assertProjectMemoryAllowed(options: { token: string; targetPath: string }): Promise<void>;
+  /**
    * Writes one approved import's memory files, re-keyed to the target path's locally
    * computed directory, add-only. Runs after the project was registered so no path ever
    * holds the memory mutation lock while entering config edits.
@@ -540,6 +546,12 @@ export class BackupService {
         localOnlyFiles: string[];
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
+        /**
+         * Candidates the restore did not import because no approval was given — a restore
+         * run without a preview, or with candidates left unchecked. Reported so a
+         * "completed" restore never silently omits backed-up projects.
+         */
+        unapprovedProjectImports: BackupProjectImport[];
       },
       BackupOperationError
     >
@@ -575,6 +587,26 @@ export class BackupService {
           validated.projectImports,
           includeProjects
         );
+        // The bundle is read once for every approved import, and each import's write-side
+        // refusals run now: an import that cannot land must fail while nothing has changed
+        // yet, not after the core restore and its project registration.
+        const importer =
+          plannedImports.length === 0
+            ? null
+            : await this.dependencies.payload.prepareProjectImports({
+                repositoryRoot: repository.rootDir,
+                managedPath: repository.managedPath,
+              });
+        for (const planned of plannedImports) {
+          await importer?.assertProjectMemoryAllowed({
+            token: planned.candidate.token,
+            targetPath: planned.targetPath,
+          });
+        }
+        const plannedTokens = new Set(plannedImports.map((planned) => planned.candidate.token));
+        const unapprovedProjectImports = validated.projectImports.filter(
+          (candidate) => !plannedTokens.has(candidate.token)
+        );
         const snapshotPath = await this.createSnapshotPath();
         try {
           await this.dependencies.payload.writeSafetySnapshot(snapshotPath);
@@ -600,7 +632,8 @@ export class BackupService {
           // does not cover, and their per-candidate results are the user's only undo list, so
           // nothing that can fail may run after them and discard those results.
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
-          const projectImportResults = await this.executeProjectImports(repository, plannedImports);
+          const projectImportResults =
+            importer === null ? [] : await this.executeProjectImports(importer, plannedImports);
           this.notifyProjectMemoryChanges([], projectImportResults);
           return Ok({
             commit: remoteCommit,
@@ -609,6 +642,7 @@ export class BackupService {
             localOnlyFiles: restored.localOnlyFiles,
             projectImportResults,
             projectBundleSkipped: restored.projectBundleSkipped,
+            unapprovedProjectImports,
           });
         } catch (error) {
           // Memory the failed restore already overwrote is on disk; subscribers must
@@ -700,15 +734,10 @@ export class BackupService {
    * roll anything back anyway; the result is the user's undo list.
    */
   private async executeProjectImports(
-    repository: PreparedBackupRepository,
+    importer: BackupProjectImporter,
     planned: ReadonlyArray<{ candidate: BackupProjectImport; targetPath: string }>
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
-    if (planned.length === 0) return results;
-    const importer = await this.dependencies.payload.prepareProjectImports({
-      repositoryRoot: repository.rootDir,
-      managedPath: repository.managedPath,
-    });
     for (const { candidate, targetPath } of planned) {
       // Once registration resolves the project identity, failures report that path: it is
       // where any partially written memory actually lives.

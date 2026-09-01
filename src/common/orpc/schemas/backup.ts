@@ -161,6 +161,11 @@ export const backup = {
         projectImportResults: z.array(BackupProjectImportResultSchema),
         /** The backup carries a project bundle but `includeProjects` is off, so it is skipped. */
         projectBundleSkipped: z.boolean(),
+        /**
+         * Candidates left unimported for lack of approval (no preview, or unchecked). Fresh
+         * tokens, so the UI can offer them for approval right away.
+         */
+        unapprovedProjectImports: z.array(BackupProjectImportSchema),
       })
     ),
   },

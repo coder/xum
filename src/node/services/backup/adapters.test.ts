@@ -1984,6 +1984,15 @@ describe("backup adapters project bundle", () => {
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
     });
+    // The preflight sees the re-keyed destination: a conflicting file is not a refusal
+    // (it is skipped add-only), whereas a non-file in the way would be.
+    await importer.assertProjectMemoryAllowed({ token, targetPath });
+    await fs.mkdir(path.join(muxRoot, "memory", "project", targetDir, "notes.md"));
+    const blocked = await captureRejection(
+      importer.assertProjectMemoryAllowed({ token, targetPath })
+    );
+    expect((blocked as Error).message).toContain("non-file");
+    await fs.rmdir(path.join(muxRoot, "memory", "project", targetDir, "notes.md"));
     const imported = await importer.importProjectMemory({ token, targetPath });
 
     expect(imported.writtenFiles).toEqual([`memory/project/${targetDir}/notes.md`]);

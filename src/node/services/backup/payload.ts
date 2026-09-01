@@ -2830,7 +2830,18 @@ function parseProjectBundleManifest(raw: string): BackupProjectBundleManifest {
   const tree = jsonc.parseTree(raw);
   if (!tree) throw new Error("Invalid backup project bundle manifest");
   assertNoDuplicateKeys(tree, "backup project bundle manifest");
-  const parsed = BackupProjectBundleManifestSchema.safeParse(JSON.parse(raw));
+  const value: unknown = JSON.parse(raw);
+  // Array lengths are bounded before the per-entry schema runs, as the core manifest parser
+  // does: a manifest-sized array of tiny valid entries would otherwise be fully validated
+  // and copied before the file-count check ever ran.
+  if (!isPlainObject(value) || !Array.isArray(value.files) || !Array.isArray(value.projects)) {
+    throw new Error("Invalid backup project bundle manifest");
+  }
+  assertBackupFileCount(value.files.length);
+  if (value.projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
+    throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
+  }
+  const parsed = BackupProjectBundleManifestSchema.safeParse(value);
   if (!parsed.success) throw new Error("Invalid backup project bundle manifest");
   return {
     ...parsed.data,
