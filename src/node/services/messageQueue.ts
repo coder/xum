@@ -954,6 +954,11 @@ export class MessageQueue {
     return this.entries.length === 0;
   }
 
+  /** Whether the queue contains an entry that cancellation did not retract. */
+  hasLiveEntries(): boolean {
+    return this.getNextLiveEntry() != null;
+  }
+
   /**
    * Number of pending entries, including synthetic/internal ones. Archive admission uses
    * this to compare the queue against the delegated turns it is about to interrupt, so it

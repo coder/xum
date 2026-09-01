@@ -638,6 +638,8 @@ describe("MessageQueue", () => {
       );
       controller.abort("task output consumed the wake");
 
+      expect(queue.hasLiveEntries()).toBe(false);
+      expect(queue.isEmpty()).toBe(false);
       expect(queue.claimNextToolEndEntry()).toBeUndefined();
     });
 

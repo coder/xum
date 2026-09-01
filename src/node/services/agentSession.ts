@@ -114,7 +114,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue } from "./messageQueue";
-import type { QueueCutCutter } from "./messageQueue";
+import type { QueueCutCutter, ToolEndQueueClaim } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -693,7 +693,7 @@ export class AgentSession {
   // Provider-executed tools (for example native web_search/web_fetch) complete inside one
   // provider response, so the SDK's between-step stopWhen hook cannot preempt after them.
   // Track known siblings and reserve soft interruption for that native-only boundary.
-  private queuedProviderToolEndAbortInFlight = false;
+  private queuedProviderToolEndClaim: ToolEndQueueClaim | undefined;
   private readonly activeToolCallIds = new Set<string>();
 
   private idleWaiters: Array<() => void> = [];
@@ -2876,7 +2876,7 @@ export class AgentSession {
         message: {
           type: "queued-message-changed",
           workspaceId: this.workspaceId,
-          hasQueuedMessages: !this.messageQueue.isEmpty(),
+          hasQueuedMessages: this.messageQueue.hasLiveEntries(),
           queuedMessages: this.messageQueue.getVisibleMessages(),
           displayText: this.messageQueue.getVisibleDisplayText(),
           fileParts: this.messageQueue.getVisibleFileParts(),
@@ -4870,7 +4870,7 @@ export class AgentSession {
     this.retryManager.cancel();
 
     if (options?.soft !== true) {
-      this.queuedProviderToolEndAbortInFlight = false;
+      this.abandonQueuedProviderToolEndClaim();
       this.activeToolCallIds.clear();
     }
 
@@ -5718,7 +5718,7 @@ export class AgentSession {
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
-    this.queuedProviderToolEndAbortInFlight = false;
+    this.abandonQueuedProviderToolEndClaim();
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
@@ -5796,7 +5796,7 @@ export class AgentSession {
         // fast-path synchronously so a model set_goal in THIS stream queues
         // for its stream-end drain instead of writing goal.json mid-stream.
         this.workspaceGoalService?.recordStreamStarted(this.workspaceId);
-        this.queuedProviderToolEndAbortInFlight = false;
+        this.queuedProviderToolEndClaim = undefined;
         this.activeToolCallIds.clear();
       }
       this.setTurnPhase(TurnPhase.STREAMING);
@@ -5958,7 +5958,7 @@ export class AgentSession {
           this.activeStreamUserMessageId
         );
 
-        this.queuedProviderToolEndAbortInFlight = false;
+        this.abandonQueuedProviderToolEndClaim();
         this.activeToolCallIds.clear();
         this.emitChatEvent(payload);
         return;
@@ -5981,7 +5981,7 @@ export class AgentSession {
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
       const isQueuedProviderToolEndAbort =
-        this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
+        this.queuedProviderToolEndClaim != null && abortReason !== "user";
       if (abortReason === "user") {
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
@@ -6136,7 +6136,7 @@ export class AgentSession {
         // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
         const hadQueuedMessages = this.hasPendingManualFollowUp();
         if (this.deferQueuedFlushUntilAfterEdit) {
-          this.queuedProviderToolEndAbortInFlight = false;
+          this.abandonQueuedProviderToolEndClaim();
           // Clear the queued-message signal while the edit flow owns the next dispatch.
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
@@ -6557,7 +6557,8 @@ export class AgentSession {
     // user-authored turn-end entry forward to a step boundary.
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     return true;
   }
@@ -6594,7 +6595,8 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
@@ -6622,7 +6624,8 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
@@ -6630,7 +6633,7 @@ export class AgentSession {
 
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
     return (
-      !this.messageQueue.isEmpty() &&
+      this.messageQueue.hasLiveEntries() &&
       (dispatchMode == null || this.messageQueue.getNextQueueDispatchMode() === dispatchMode)
     );
   }
@@ -6663,7 +6666,7 @@ export class AgentSession {
       }
     }
 
-    if (!this.messageQueue.isEmpty()) {
+    if (this.messageQueue.hasLiveEntries()) {
       if (continuationMetadata == null) {
         return true;
       }
@@ -6773,7 +6776,7 @@ export class AgentSession {
   private async requestQueuedProviderToolEndDispatch(): Promise<void> {
     if (
       this.turnPhase !== TurnPhase.STREAMING ||
-      this.queuedProviderToolEndAbortInFlight ||
+      this.queuedProviderToolEndClaim != null ||
       this.activeToolCallIds.size > 0
     ) {
       return;
@@ -6784,14 +6787,15 @@ export class AgentSession {
       return;
     }
 
-    this.queuedProviderToolEndAbortInFlight = true;
+    this.queuedProviderToolEndClaim = queueClaim;
     const result = await this.streamManager.stopStream(this.workspaceId, {
       soft: true,
       abortReason: "system",
     });
     if (!result.success) {
-      queueClaim.restoreCancellation();
-      this.queuedProviderToolEndAbortInFlight = false;
+      if (this.queuedProviderToolEndClaim === queueClaim) {
+        this.abandonQueuedProviderToolEndClaim();
+      }
       log.warn("Failed to stop stream after provider-executed tool result", {
         workspaceId: this.workspaceId,
         error: result.error,
@@ -6802,20 +6806,27 @@ export class AgentSession {
   private dispatchQueuedProviderToolEndMessageAfterAbort(
     abortReason: StreamAbortReason | undefined
   ): boolean {
-    if (!this.queuedProviderToolEndAbortInFlight) {
+    if (this.queuedProviderToolEndClaim == null) {
       return false;
     }
 
     const shouldDispatch =
       abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
-    this.queuedProviderToolEndAbortInFlight = false;
 
     if (!shouldDispatch) {
+      this.abandonQueuedProviderToolEndClaim();
       return false;
     }
 
+    this.queuedProviderToolEndClaim = undefined;
     this.sendQueuedMessages();
     return true;
+  }
+
+  private abandonQueuedProviderToolEndClaim(): void {
+    const queueClaim = this.queuedProviderToolEndClaim;
+    this.queuedProviderToolEndClaim = undefined;
+    queueClaim?.restoreCancellation();
   }
 
   async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
@@ -6851,7 +6862,7 @@ export class AgentSession {
   }
 
   hasPendingManualFollowUp(): boolean {
-    return !this.messageQueue.isEmpty() || this.pendingExternalManualFollowUps > 0;
+    return this.messageQueue.hasLiveEntries() || this.pendingExternalManualFollowUps > 0;
   }
 
   /**
@@ -6891,7 +6902,7 @@ export class AgentSession {
     this.emitChatEvent({
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
-      hasQueuedMessages: !this.messageQueue.isEmpty(),
+      hasQueuedMessages: this.messageQueue.hasLiveEntries(),
       queuedMessages: this.messageQueue.getVisibleMessages(),
       displayText: this.messageQueue.getVisibleDisplayText(),
       fileParts: this.messageQueue.getVisibleFileParts(),
@@ -6955,7 +6966,7 @@ export class AgentSession {
       return;
     }
 
-    this.queuedProviderToolEndAbortInFlight = false;
+    this.queuedProviderToolEndClaim = undefined;
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
 

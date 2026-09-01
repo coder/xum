@@ -133,6 +133,32 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("does not treat a canceled-only queue as a continuation predecessor", async () => {
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-dispatch-canceled-only-predecessor",
+    });
+
+    try {
+      const controller = new AbortController();
+      session.queueMessage(
+        "Canceled monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { cancelSignal: controller.signal }
+      );
+      controller.abort("monitor wake became stale");
+
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(session.hasQueuedOrDispatchingEntry(WORKSPACE_TURN_CORRELATION)).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("preserves correlation for same-turn queued and dequeued predecessors", async () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "queue-dispatch-same-turn-predecessor",
@@ -1243,6 +1269,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
       workspaceId,
     });
     const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const restoreCancellation = mock(() => undefined);
+    const claimNextToolEndEntry = spyOn(
+      MessageQueue.prototype,
+      "claimNextToolEndEntry"
+    ).mockReturnValue({ restoreCancellation });
     const sendQueuedMessages = spyOn(session, "sendQueuedMessages").mockImplementation(
       () => undefined
     );
@@ -1259,6 +1290,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
+      expect(restoreCancellation).toHaveBeenCalledTimes(1);
       // The native soft-stop can still win the event race after the hard user interrupt.
       aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
 
@@ -1266,6 +1298,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(sendQueuedMessages).not.toHaveBeenCalled();
     } finally {
       sendQueuedMessages.mockRestore();
+      claimNextToolEndEntry.mockRestore();
       stopStream.mockRestore();
       session.dispose();
       await cleanup();
