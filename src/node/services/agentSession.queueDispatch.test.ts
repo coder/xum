@@ -5,6 +5,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
+import { MessageQueue } from "./messageQueue";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 const WORKSPACE_TURN_CORRELATION = {
@@ -492,6 +493,40 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(onCanceled).not.toHaveBeenCalled();
     } finally {
       stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("restores the provider-tool queue claim when the soft stop fails", async () => {
+    const workspaceId = "queue-dispatch-provider-tool-stop-failure";
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+    });
+    const restoreCancellation = mock(() => undefined);
+    const claimNextToolEndEntry = spyOn(
+      MessageQueue.prototype,
+      "claimNextToolEndEntry"
+    ).mockReturnValue({ restoreCancellation });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(
+      Err("injected provider-tool soft-stop failure")
+    );
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage("follow up", { model: TEST_MODEL, agentId: "exec" });
+
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+
+      expect(await waitForCondition(() => restoreCancellation.mock.calls.length === 1)).toBe(true);
+      expect(stopStream).toHaveBeenCalledTimes(1);
+    } finally {
+      stopStream.mockRestore();
+      claimNextToolEndEntry.mockRestore();
       session.dispose();
       await cleanup();
     }

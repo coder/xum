@@ -93,6 +93,12 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 
+/** Cancellation handoff for a claimed tool-end queue cut. */
+export interface ToolEndQueueClaim {
+  /** Restore the entry's cancellation when the requested queue cut does not occur. */
+  restoreCancellation(): void;
+}
+
 /**
  * Input poised to take over a session at a queue cut (see
  * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
@@ -265,20 +271,25 @@ export class MessageQueue {
   }
 
   /**
-   * Claim the head entry as the continuation for a tool-end queue cut.
+   * Claim the next live entry as the continuation for a tool-end queue cut.
    *
    * Once this claim stops the current model step, a later cancellation must not
-   * retract the continuation and leave the session idle. Reject already-canceled
-   * entries, then detach cancellation synchronously before returning true.
+   * retract the continuation and leave the session idle. Skip canceled entries,
+   * then detach cancellation synchronously before returning the claim.
    */
-  claimNextToolEndEntry(): boolean {
-    const entry = this.entries[0];
-    if (entry?.dispatchMode !== "tool-end" || entry.cancelSignal?.aborted === true) {
-      return false;
+  claimNextToolEndEntry(): ToolEndQueueClaim | undefined {
+    const entry = this.entries.find((candidate) => candidate.cancelSignal?.aborted !== true);
+    if (entry?.dispatchMode !== "tool-end") {
+      return undefined;
     }
 
+    const cancelSignal = entry.cancelSignal;
     entry.cancelSignal = undefined;
-    return true;
+    return {
+      restoreCancellation: () => {
+        entry.cancelSignal = cancelSignal;
+      },
+    };
   }
 
   /**

@@ -608,10 +608,25 @@ describe("MessageQueue", () => {
         { cancelSignal: controller.signal }
       );
 
-      expect(queue.claimNextToolEndEntry()).toBe(true);
+      expect(queue.claimNextToolEndEntry()).toBeDefined();
       controller.abort("task output consumed the wake");
 
       expect(queue.dequeueNext().internal?.cancelSignal).toBeUndefined();
+    });
+
+    it("restores cancellation when a claimed tool-end queue cut fails", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal }
+      );
+
+      const claim = queue.claimNextToolEndEntry();
+      controller.abort("task output consumed the wake");
+      claim?.restoreCancellation();
+
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(controller.signal);
     });
 
     it("does not claim a tool-end entry that cancellation already retracted", () => {
@@ -623,7 +638,27 @@ describe("MessageQueue", () => {
       );
       controller.abort("task output consumed the wake");
 
-      expect(queue.claimNextToolEndEntry()).toBe(false);
+      expect(queue.claimNextToolEndEntry()).toBeUndefined();
+    });
+
+    it("claims the next live tool-end entry after a canceled head", () => {
+      const canceledController = new AbortController();
+      const liveController = new AbortController();
+      queue.add(
+        "Canceled monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: canceledController.signal }
+      );
+      queue.add(
+        "Live follow-up",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: liveController.signal }
+      );
+      canceledController.abort("task output consumed the first wake");
+
+      expect(queue.claimNextToolEndEntry()).toBeDefined();
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(canceledController.signal);
+      expect(queue.dequeueNext().internal?.cancelSignal).toBeUndefined();
     });
 
     it("never batches a user message into a sealed workspace-turn entry", () => {

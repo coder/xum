@@ -5210,7 +5210,7 @@ export class AgentSession {
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
-      claimQueuedToolEndMessage: this.messageQueue.claimNextToolEndEntry.bind(this.messageQueue),
+      claimQueuedToolEndMessage: () => this.messageQueue.claimNextToolEndEntry() != null,
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -6774,9 +6774,13 @@ export class AgentSession {
     if (
       this.turnPhase !== TurnPhase.STREAMING ||
       this.queuedProviderToolEndAbortInFlight ||
-      this.activeToolCallIds.size > 0 ||
-      !this.messageQueue.claimNextToolEndEntry()
+      this.activeToolCallIds.size > 0
     ) {
+      return;
+    }
+
+    const queueClaim = this.messageQueue.claimNextToolEndEntry();
+    if (queueClaim == null) {
       return;
     }
 
@@ -6786,6 +6790,7 @@ export class AgentSession {
       abortReason: "system",
     });
     if (!result.success) {
+      queueClaim.restoreCancellation();
       this.queuedProviderToolEndAbortInFlight = false;
       log.warn("Failed to stop stream after provider-executed tool result", {
         workspaceId: this.workspaceId,
