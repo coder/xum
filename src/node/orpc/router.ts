@@ -575,11 +575,14 @@ export const router = (authToken?: string) => {
         ),
     },
 
+    // OAuth procedures (gateway/copilot/governor/codex) run Effect generators
+    // via handlerGen; the wire contracts are unchanged. Flow-starting
+    // mutations are uninterruptible in the services (see the respective
+    // startDesktopFlowEffect/startDeviceFlowEffect), so a client abort cannot
+    // leak a loopback server or strand a flow record; waits are interruptible
+    // (abandoning a wait leaves the flow's own lifecycle intact) and cancels
+    // run guaranteed-finalizer cleanup.
     muxGatewayOauth: {
-      // startDesktopFlow rides handlerGen; its service pipeline is
-      // uninterruptible (see startDesktopFlowEffect) so a client abort cannot
-      // leak the loopback server. waitFor/cancel stay plain handlers until the
-      // batch OAuth-service conversion migrates the remaining procedures.
       startDesktopFlow: t
         .input(schemas.muxGatewayOauth.startDesktopFlow.input)
         .output(schemas.muxGatewayOauth.startDesktopFlow.output)
@@ -591,103 +594,141 @@ export const router = (authToken?: string) => {
       waitForDesktopFlow: t
         .input(schemas.muxGatewayOauth.waitForDesktopFlow.input)
         .output(schemas.muxGatewayOauth.waitForDesktopFlow.output)
-        .handler(({ context, input }) =>
-          context.muxGatewayOauthService.waitForDesktopFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.muxGatewayOauthService.waitForDesktopFlowEffect(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
           })
         ),
       cancelDesktopFlow: t
         .input(schemas.muxGatewayOauth.cancelDesktopFlow.input)
         .output(schemas.muxGatewayOauth.cancelDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.muxGatewayOauthService.cancelDesktopFlow(input.flowId);
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* context.muxGatewayOauthService.cancelDesktopFlowEffect(input.flowId);
+          })
+        ),
     },
     copilotOauth: {
       startDeviceFlow: t
         .input(schemas.copilotOauth.startDeviceFlow.input)
         .output(schemas.copilotOauth.startDeviceFlow.output)
-        .handler(({ context }) => context.copilotOauthService.startDeviceFlow()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.copilotOauthService.startDeviceFlowEffect();
+          })
+        ),
       waitForDeviceFlow: t
         .input(schemas.copilotOauth.waitForDeviceFlow.input)
         .output(schemas.copilotOauth.waitForDeviceFlow.output)
-        .handler(({ context, input }) =>
-          context.copilotOauthService.waitForDeviceFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.copilotOauthService.waitForDeviceFlowEffect(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
           })
         ),
       cancelDeviceFlow: t
         .input(schemas.copilotOauth.cancelDeviceFlow.input)
         .output(schemas.copilotOauth.cancelDeviceFlow.output)
-        .handler(({ context, input }) => {
-          context.copilotOauthService.cancelDeviceFlow(input.flowId);
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* context.copilotOauthService.cancelDeviceFlowEffect(input.flowId);
+          })
+        ),
     },
     muxGovernorOauth: {
       startDesktopFlow: t
         .input(schemas.muxGovernorOauth.startDesktopFlow.input)
         .output(schemas.muxGovernorOauth.startDesktopFlow.output)
-        .handler(({ context, input }) =>
-          context.muxGovernorOauthService.startDesktopFlow({
-            governorOrigin: input.governorOrigin,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.muxGovernorOauthService.startDesktopFlowEffect({
+              governorOrigin: input.governorOrigin,
+            });
           })
         ),
       waitForDesktopFlow: t
         .input(schemas.muxGovernorOauth.waitForDesktopFlow.input)
         .output(schemas.muxGovernorOauth.waitForDesktopFlow.output)
-        .handler(({ context, input }) =>
-          context.muxGovernorOauthService.waitForDesktopFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.muxGovernorOauthService.waitForDesktopFlowEffect(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
           })
         ),
       cancelDesktopFlow: t
         .input(schemas.muxGovernorOauth.cancelDesktopFlow.input)
         .output(schemas.muxGovernorOauth.cancelDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.muxGovernorOauthService.cancelDesktopFlow(input.flowId);
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* context.muxGovernorOauthService.cancelDesktopFlowEffect(input.flowId);
+          })
+        ),
     },
     codexOauth: {
       startDesktopFlow: t
         .input(schemas.codexOauth.startDesktopFlow.input)
         .output(schemas.codexOauth.startDesktopFlow.output)
-        .handler(({ context }) => context.codexOauthService.startDesktopFlow()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.codexOauthService.startDesktopFlowEffect();
+          })
+        ),
       waitForDesktopFlow: t
         .input(schemas.codexOauth.waitForDesktopFlow.input)
         .output(schemas.codexOauth.waitForDesktopFlow.output)
-        .handler(({ context, input }) =>
-          context.codexOauthService.waitForDesktopFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.waitForDesktopFlowEffect(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
           })
         ),
       cancelDesktopFlow: t
         .input(schemas.codexOauth.cancelDesktopFlow.input)
         .output(schemas.codexOauth.cancelDesktopFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.codexOauthService.cancelDesktopFlow(input.flowId);
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* context.codexOauthService.cancelDesktopFlowEffect(input.flowId);
+          })
+        ),
       startDeviceFlow: t
         .input(schemas.codexOauth.startDeviceFlow.input)
         .output(schemas.codexOauth.startDeviceFlow.output)
-        .handler(({ context }) => context.codexOauthService.startDeviceFlow()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.codexOauthService.startDeviceFlowEffect();
+          })
+        ),
       waitForDeviceFlow: t
         .input(schemas.codexOauth.waitForDeviceFlow.input)
         .output(schemas.codexOauth.waitForDeviceFlow.output)
-        .handler(({ context, input }) =>
-          context.codexOauthService.waitForDeviceFlow(input.flowId, {
-            timeoutMs: input.timeoutMs,
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            return yield* context.codexOauthService.waitForDeviceFlowEffect(input.flowId, {
+              timeoutMs: input.timeoutMs,
+            });
           })
         ),
       cancelDeviceFlow: t
         .input(schemas.codexOauth.cancelDeviceFlow.input)
         .output(schemas.codexOauth.cancelDeviceFlow.output)
-        .handler(async ({ context, input }) => {
-          await context.codexOauthService.cancelDeviceFlow(input.flowId);
-        }),
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* context.codexOauthService.cancelDeviceFlowEffect(input.flowId);
+          })
+        ),
       disconnect: t
         .input(schemas.codexOauth.disconnect.input)
         .output(schemas.codexOauth.disconnect.output)
-        .handler(({ context }) => context.codexOauthService.disconnect()),
+        .handler(
+          handlerGen(function* ({ context }) {
+            return yield* context.codexOauthService.disconnectEffect();
+          })
+        ),
     },
     coderOauth: {
       startDesktopFlow: t
