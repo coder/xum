@@ -1400,8 +1400,8 @@ export const router = (authToken?: string) => {
           })
         ),
       // Subscription, not a unary call: the handler returns an event iterator,
-      // which handlerGen cannot produce. Streams stay Promise/AsyncGenerator
-      // until an Effect Stream bridge exists (later migration phase).
+      // which handlerGen cannot produce. Rides the Effect Stream bridge
+      // (streamBridge.ts) via subscribeMemoryChanges.
       onChange: t
         .input(schemas.memory.onChange.input)
         .output(schemas.memory.onChange.output)
