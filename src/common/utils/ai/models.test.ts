@@ -143,9 +143,15 @@ describe("Anthropic 1M context classification", () => {
     expect(hasNative1MContext("anthropic:claude-sonnet-4-5")).toBe(false);
   });
 
-  it("treats Opus 4.6 to 4.8, Opus 5, and Sonnet 4.6 as native 1M models", () => {
+  it("treats Opus 4.6 to 4.8, Opus 5, Opus 5.1, and Sonnet 4.6 as native 1M models", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-opus-5")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-opus-5-20260724")).toBe("native");
+    // The claude-opus-5 pattern only tolerates date suffixes, so the 5.1 id
+    // needs (and has) its own pattern.
+    expect(getAnthropic1MContextMode("anthropic:claude-opus-5-1")).toBe("native");
+    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-opus-5-1")).toBe("native");
+    expect(hasNative1MContext("anthropic:claude-opus-5-1")).toBe(true);
+    expect(supports1MContext("anthropic:claude-opus-5-1")).toBe(false);
     expect(getAnthropic1MContextMode("anthropic:claude-opus-4-8")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-opus-4-8-20260528")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-opus-4-6")).toBe("native");

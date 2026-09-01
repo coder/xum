@@ -3,7 +3,11 @@
  */
 
 import { describe, test, expect } from "@jest/globals";
-import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
+import {
+  KNOWN_MODELS,
+  MODEL_ABBREVIATIONS,
+  TOKENIZER_MODEL_OVERRIDES,
+} from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
 import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
@@ -17,6 +21,16 @@ describe("Known Models Integration", () => {
           `Run 'make update-models' to refresh models.json from LiteLLM.`
       );
     }
+  });
+
+  test("opus alias tracks Opus 5.1 and retired ids keep tokenizer overrides", () => {
+    expect(MODEL_ABBREVIATIONS.opus).toBe("anthropic:claude-opus-5-1");
+    expect(KNOWN_MODELS.OPUS.id).toBe("anthropic:claude-opus-5-1");
+    // Exact-id lookup for retired-but-documented custom model strings must keep
+    // resolving to the Opus 4.5 approximation instead of falling back (with a
+    // warning) to the generic per-provider tokenizer.
+    expect(TOKENIZER_MODEL_OVERRIDES["anthropic:claude-opus-5"]).toBe("anthropic/claude-opus-4.5");
+    expect(TOKENIZER_MODEL_OVERRIDES[KNOWN_MODELS.OPUS.id]).toBe("anthropic/claude-opus-4.5");
   });
 
   test("gemini-flash resolves to the stable Gemini 3.7 Flash model", () => {

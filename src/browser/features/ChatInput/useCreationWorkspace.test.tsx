@@ -1360,7 +1360,7 @@ describe("useCreationWorkspace", () => {
     });
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5",
+      pendingStreamModel: "anthropic:claude-opus-5-1",
       markPendingInitialSend: false,
     });
   });
@@ -1838,7 +1838,7 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5",
+      pendingStreamModel: "anthropic:claude-opus-5-1",
       markPendingInitialSend: true,
     });
   });
