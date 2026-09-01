@@ -1814,10 +1814,18 @@ export class Config {
    * as a permanent sidebar ghost. All mutations must go through editConfig so each
    * write is derived from a fresh serialized read.
    *
+   * Kept as a Promise facade (tests spy on it with Promise mocks to simulate
+   * swallowed writes); saveConfigEffect below holds the actual pipeline.
+   */
+  private saveConfig(config: ProjectsConfig): Promise<void> {
+    return Effect.runPromise(this.saveConfigEffect(config));
+  }
+
+  /**
    * Never fails: the whole pipeline folds every failure and defect into the same
    * log-and-swallow the old try/catch applied (total catch discipline).
    */
-  private saveConfig(config: ProjectsConfig): Effect.Effect<void> {
+  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2514,7 +2522,9 @@ export class Config {
             },
             catch: (error) => error,
           });
-          yield* self.saveConfig(newConfig);
+          // Route through the saveConfig Promise facade (not saveConfigEffect) so test
+          // spies on saveConfig keep intercepting the serialized write.
+          yield* Effect.promise(async () => self.saveConfig(newConfig));
           // Backend-initiated config edits (for example gateway auth changes) use this signal
           // so frontend subscribers can refresh derived state without polling.
           self.notifyConfigChanged();
