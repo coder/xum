@@ -59,6 +59,7 @@ describe("BashMonitorWakeReconciler", () => {
   let removed: string[];
   let removedOwners: string[];
   let dropped: string[];
+  let droppedGenerations: Array<string | undefined>;
   let reconciler: BashMonitorWakeReconciler;
 
   beforeEach(async () => {
@@ -72,6 +73,7 @@ describe("BashMonitorWakeReconciler", () => {
     removed = [];
     removedOwners = [];
     dropped = [];
+    droppedGenerations = [];
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
@@ -84,6 +86,7 @@ describe("BashMonitorWakeReconciler", () => {
           });
         },
         dropRetiredMonitor: (processId, createdAt) => {
+          droppedGenerations.push(createdAt);
           const current = live.find((snapshot) => snapshot.processId === processId);
           if (current?.createdAt === createdAt && current.retired) {
             dropped.push(processId);
@@ -697,6 +700,7 @@ describe("BashMonitorWakeReconciler", () => {
 
     await dispatches[0].onAccepted();
 
+    expect(droppedGenerations).toEqual([CREATED_AT]);
     expect(live).toHaveLength(1);
     expect(live[0].match?.lines).toEqual(["NEW MATCH"]);
   });
