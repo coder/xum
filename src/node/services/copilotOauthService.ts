@@ -115,13 +115,20 @@ export class CopilotOauthService {
           }
 
           const data = yield* Effect.tryPromise({
-            try: async () =>
-              (await res.json()) as {
+            try: async () => {
+              const json = (await res.json()) as unknown;
+              // Validate inside the caught region: a null/non-object JSON
+              // body folds into the wire error instead of a defect.
+              if (json === null || typeof json !== "object") {
+                throw new TypeError("GitHub device code response was not a JSON object");
+              }
+              return json as {
                 verification_uri?: string;
                 user_code?: string;
                 device_code?: string;
                 interval?: number;
-              },
+              };
+            },
             catch: (error) =>
               new CopilotOauthError({
                 reason: `Failed to start device flow: ${getErrorMessage(error)}`,
@@ -220,13 +227,18 @@ export class CopilotOauthService {
   }
 
   /**
-   * Wire-shaped Effect surface for handlerGen router handlers. Safe under
-   * interruption: the finish bookkeeping is a single sync step.
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the finish bookkeeping must
+   * complete — a client abort mid-cancel must not leave the flow polling (it
+   * could still persist credentials after the user asked to cancel). The
+   * bookkeeping itself is a single sync step.
    */
   cancelDeviceFlowEffect(flowId: string): Effect.Effect<void> {
-    return Effect.sync(() => {
-      this.cancelDeviceFlow(flowId);
-    });
+    return Effect.uninterruptible(
+      Effect.sync(() => {
+        this.cancelDeviceFlow(flowId);
+      })
+    );
   }
 
   cancelDeviceFlow(flowId: string): void {
@@ -307,7 +319,14 @@ export class CopilotOauthService {
             }),
           });
 
-          return (await res.json()) as {
+          const json = (await res.json()) as unknown;
+          // Validate inside the caught region: a null/non-object JSON body
+          // takes the transient-retry path (like the pre-Effect try/catch)
+          // instead of killing the polling fiber with a defect.
+          if (json === null || typeof json !== "object") {
+            throw new TypeError("GitHub token response was not a JSON object");
+          }
+          return json as {
             access_token?: string;
             error?: string;
             interval?: number;

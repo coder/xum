@@ -225,18 +225,21 @@ export class MuxGovernorOauthService {
   }
 
   /**
-   * Wire-shaped Effect surface for handlerGen router handlers. Safe under
-   * interruption: the manager's finish path unregisters the flow
-   * synchronously and its scope release runs as guaranteed finalizers.
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the teardown must complete — a
+   * client abort mid-cancel must not leave the flow registered (its callback
+   * could still persist credentials after the user asked to cancel).
    */
   cancelDesktopFlowEffect(flowId: string): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    return Effect.gen(function* () {
-      if (!self.desktopFlows.has(flowId)) return;
-      log.debug(`Xum Governor OAuth desktop flow cancelled (flowId=${flowId})`);
-      yield* self.desktopFlows.cancelEffect(flowId);
-    });
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (!self.desktopFlows.has(flowId)) return;
+        log.debug(`Xum Governor OAuth desktop flow cancelled (flowId=${flowId})`);
+        yield* self.desktopFlows.cancelEffect(flowId);
+      })
+    );
   }
 
   startServerFlow(input: {
@@ -414,7 +417,15 @@ export class MuxGovernorOauthService {
       }
 
       const json = yield* Effect.tryPromise({
-        try: async () => (await response.json()) as { access_token?: unknown },
+        try: async () => {
+          const parsed = (await response.json()) as unknown;
+          // Validate inside the caught region: a null/non-object JSON body
+          // folds into the wire error instead of a defect.
+          if (parsed === null || typeof parsed !== "object") {
+            throw new TypeError("Response was not a JSON object");
+          }
+          return parsed as { access_token?: unknown };
+        },
         catch: (error) =>
           new MuxGovernorOAuthError({
             reason: `Xum Governor exchange failed: ${getErrorMessage(error)}`,

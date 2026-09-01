@@ -320,19 +320,22 @@ export class CodexOauthService {
   }
 
   /**
-   * Wire-shaped Effect surface for handlerGen router handlers. Safe under
-   * interruption: the manager's finish path unregisters the flow
-   * synchronously and its scope release runs as guaranteed finalizers.
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the teardown must complete — a
+   * client abort mid-cancel must not leave the flow registered (its callback
+   * could still persist credentials after the user asked to cancel).
    */
   cancelDesktopFlowEffect(flowId: string): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    return Effect.gen(function* () {
-      if (self.desktopFlows.has(flowId)) {
-        log.debug(`[Codex OAuth] Desktop flow cancelled (flowId=${flowId})`);
-      }
-      yield* self.desktopFlows.cancelEffect(flowId);
-    });
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (self.desktopFlows.has(flowId)) {
+          log.debug(`[Codex OAuth] Desktop flow cancelled (flowId=${flowId})`);
+        }
+        yield* self.desktopFlows.cancelEffect(flowId);
+      })
+    );
   }
 
   async startDeviceFlow(): Promise<
@@ -481,19 +484,23 @@ export class CodexOauthService {
   }
 
   /**
-   * Wire-shaped Effect surface for handlerGen router handlers. Safe under
-   * interruption: the finish bookkeeping is a single sync step.
+   * Wire-shaped Effect surface for handlerGen router handlers.
+   * Uninterruptible: once the cancel begins, the finish bookkeeping must
+   * complete — a client abort mid-cancel must not leave the flow polling (it
+   * could still persist credentials after the user asked to cancel).
    */
   cancelDeviceFlowEffect(flowId: string): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    return Effect.gen(function* () {
-      const flow = self.deviceFlows.get(flowId);
-      if (!flow) return;
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        const flow = self.deviceFlows.get(flowId);
+        if (!flow) return;
 
-      log.debug(`[Codex OAuth] Device flow cancelled (flowId=${flowId})`);
-      yield* self.finishDeviceFlowEffect(flowId, Err("OAuth flow cancelled"));
-    });
+        log.debug(`[Codex OAuth] Device flow cancelled (flowId=${flowId})`);
+        yield* self.finishDeviceFlowEffect(flowId, Err("OAuth flow cancelled"));
+      })
+    );
   }
 
   async getValidAuth(): Promise<Result<CodexOauthAuth, string>> {

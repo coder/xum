@@ -279,10 +279,20 @@ export class OAuthFlowManager {
         // up by the server close — same fire-and-forget shape as the
         // pre-Effect `void this.finish(...)`, but as a supervised fiber that
         // survives this effect's completion.
-        const release = self.beginFinish(flowId, result);
-        if (release !== null) {
-          yield* Effect.forkDetach(release);
-        }
+        //
+        // Uninterruptible: waitForEffect now runs on interruptible handler
+        // fibers (handlerGen), and an interrupt landing between beginFinish
+        // (sync unregister) and the release fork would strand a flow that is
+        // no longer in the map but whose scope release (timeout clear,
+        // deferred settle, server close) never runs.
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const release = self.beginFinish(flowId, result);
+            if (release !== null) {
+              yield* Effect.forkDetach(release);
+            }
+          })
+        );
       }
 
       return result;
@@ -318,16 +328,23 @@ export class OAuthFlowManager {
    *
    * Idempotent — no-op if the flow was already removed. Mirrors the
    * `finishDesktopFlow` pattern. Never fails: release defects are logged.
+   *
+   * Uninterruptible: finish is the atomic teardown primitive — once it
+   * begins, the sync unregister and the scope release must complete together,
+   * even when run on an interruptible handler fiber (a client abort mid-finish
+   * must not strand an unregistered flow with live resources).
    */
   finishEffect(flowId: string, result: Result<void, string>): Effect.Effect<void> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    return Effect.gen(function* () {
-      const release = self.beginFinish(flowId, result);
-      if (release !== null) {
-        yield* release;
-      }
-    });
+    return Effect.uninterruptible(
+      Effect.gen(function* () {
+        const release = self.beginFinish(flowId, result);
+        if (release !== null) {
+          yield* release;
+        }
+      })
+    );
   }
 
   async finish(flowId: string, result: Result<void, string>): Promise<void> {
