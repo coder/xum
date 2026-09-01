@@ -900,6 +900,28 @@ export class MemoryService extends EventEmitter {
     this.emit("change", event);
   }
 
+  /**
+   * Announces project-scope files mutated outside this service. The settings-backup
+   * restore writes memory files directly (under the shared memory mutation lock), and
+   * subscribers only refresh from disk on change events, so without this an open memory
+   * browser keeps showing pre-restore contents. `relPaths` are scope-relative, as a
+   * project store sees them.
+   */
+  notifyExternalProjectChange(projectPath: string, relPaths: readonly string[]): void {
+    for (const relPath of relPaths) {
+      const event: MemoryChangeEvent = {
+        scope: "project",
+        path: toVirtualPath("project", relPath),
+        actor: "user",
+        // No originating workspace; the change filter only consults workspaceId for
+        // workspace-scope events.
+        workspaceId: "",
+        projectPath,
+      };
+      this.emit("change", event);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Commands
   // -------------------------------------------------------------------------

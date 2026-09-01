@@ -28,6 +28,8 @@ import {
 import {
   BackupCommandApprovalRequiredError,
   BackupProjectImportApprovalRequiredError,
+  ProjectMemoryWriteError,
+  projectMemoryRelPath,
 } from "./payload";
 
 export interface PreparedBackupRepository {
@@ -84,17 +86,29 @@ export interface BackupPayloadStore {
     managedPath: string;
     approvedCommandTokens?: readonly string[];
     includeProjects: boolean;
-  }): Promise<{ hasProjectBundle: boolean; projectImports: BackupProjectImport[] }>;
-  writeSafetySnapshot(
-    snapshotRoot: string,
-    options: { includeProjectMemory: boolean }
-  ): Promise<void>;
+  }): Promise<{
+    hasProjectBundle: boolean;
+    projectImports: BackupProjectImport[];
+    /** Bundle entries classified as matched; restore writes only these, never a newer match. */
+    matchedProjectPaths: string[];
+  }>;
+  /** Core settings only; matched project memory is snapshotted by `restore` under its lock. */
+  writeSafetySnapshot(snapshotRoot: string): Promise<void>;
   restore(options: {
     repositoryRoot: string;
     managedPath: string;
     approvedCommandTokens?: readonly string[];
     includeProjects: boolean;
-  }): Promise<{ changedFiles: string[]; localOnlyFiles: string[]; projectBundleSkipped: boolean }>;
+    /** Receives the matched project memory snapshot, taken in the write's lock window. */
+    snapshotPath: string;
+    matchedProjectPaths: readonly string[];
+  }): Promise<{
+    changedFiles: string[];
+    localOnlyFiles: string[];
+    projectBundleSkipped: boolean;
+    /** Matched memory actually written, per registered project, for change notification. */
+    restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
+  }>;
   /**
    * Writes one approved import's memory files, re-keyed to the target path's locally
    * computed directory, add-only. Runs after the project was registered so no path ever
@@ -114,6 +128,15 @@ export interface BackupPayloadStore {
  */
 export interface BackupProjectRegistrar {
   create(projectPath: string): Promise<Result<{ normalizedPath: string }, string>>;
+}
+
+/**
+ * The slice of MemoryService a restore needs to announce the project memory it wrote
+ * directly. Memory subscribers refresh from disk only on change events, so a silent
+ * external writer would leave an open memory browser showing pre-restore contents.
+ */
+export interface BackupMemoryNotifier {
+  notifyExternalProjectChange(projectPath: string, relPaths: readonly string[]): void;
 }
 
 export interface BackupServiceDependencies {
@@ -219,6 +242,10 @@ function toOperationError(error: unknown): BackupOperationError {
   return { code: "IO_ERROR", message: "Settings backup failed" };
 }
 
+async function realpathOrNull(target: string): Promise<string | null> {
+  return fs.realpath(target).catch(() => null);
+}
+
 function repoLockKey(settings: SettingsBackupInput): string {
   return `${settings.repoUrl}\0${settings.branch}`;
 }
@@ -302,6 +329,7 @@ export class BackupService {
 
   /** Absent until the container wires ProjectService; imports fail per candidate without it. */
   private projectRegistrar: BackupProjectRegistrar | null = null;
+  private memoryNotifier: BackupMemoryNotifier | null = null;
 
   constructor(
     private readonly config: Config,
@@ -310,6 +338,10 @@ export class BackupService {
 
   setProjectService(projectRegistrar: BackupProjectRegistrar): void {
     this.projectRegistrar = projectRegistrar;
+  }
+
+  setMemoryNotifier(memoryNotifier: BackupMemoryNotifier): void {
+    this.memoryNotifier = memoryNotifier;
   }
 
   getSettings(): SettingsBackup | null {
@@ -508,9 +540,7 @@ export class BackupService {
         );
         const snapshotPath = await this.createSnapshotPath();
         try {
-          await this.dependencies.payload.writeSafetySnapshot(snapshotPath, {
-            includeProjectMemory: includeProjects && validated.hasProjectBundle,
-          });
+          await this.dependencies.payload.writeSafetySnapshot(snapshotPath);
         } catch (error) {
           // Nothing has been restored yet, so a snapshot that did not finish is an empty or
           // partial unredacted copy that no recovery can use, and every retry would add one.
@@ -523,8 +553,11 @@ export class BackupService {
             managedPath: repository.managedPath,
             approvedCommandTokens,
             includeProjects,
+            snapshotPath,
+            matchedProjectPaths: validated.matchedProjectPaths,
           });
           const projectImportResults = await this.executeProjectImports(repository, plannedImports);
+          this.notifyProjectMemoryChanges(restored.restoredProjectMemory, projectImportResults);
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
           return Ok({
             commit: remoteCommit,
@@ -620,14 +653,20 @@ export class BackupService {
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
     for (const { candidate, targetPath } of planned) {
-      const failed = (message: string): BackupProjectImportResult => ({
+      // Once registration resolves the project identity, failures report that path: it is
+      // where any partially written memory actually lives.
+      let registeredPath: string | null = null;
+      const failed = (
+        message: string,
+        progress: { written: string[]; skipped: string[] } = { written: [], skipped: [] }
+      ): BackupProjectImportResult => ({
         sourcePath: candidate.sourcePath,
-        targetPath,
+        targetPath: registeredPath ?? targetPath,
         name: candidate.name,
         status: "failed",
         message,
-        writtenFiles: [],
-        skippedFiles: [],
+        writtenFiles: progress.written,
+        skippedFiles: progress.skipped,
       });
       try {
         if (this.projectRegistrar === null) {
@@ -642,13 +681,17 @@ export class BackupService {
           continue;
         }
         const created = await this.projectRegistrar.create(targetPath);
-        let registeredPath: string;
         if (created.success) {
           registeredPath = created.data.normalizedPath;
         } else if (created.error === "Project already exists") {
-          // Already registered at exactly this path is the idempotent case: the import
-          // then only adds the memory files.
-          registeredPath = path.resolve(targetPath);
+          registeredPath = this.resolveRegisteredProjectPath(
+            targetPath,
+            await realpathOrNull(targetPath)
+          );
+          if (registeredPath === null) {
+            results.push(failed(`'${targetPath}' is already registered under a different path`));
+            continue;
+          }
         } else {
           results.push(failed(created.error));
           continue;
@@ -668,10 +711,49 @@ export class BackupService {
           skippedFiles: written.skippedFiles,
         });
       } catch (error) {
-        results.push(failed(error instanceof Error ? error.message : String(error)));
+        // A write that failed midway already created files; the result must list them or
+        // the user has nothing to clean up by.
+        results.push(
+          error instanceof ProjectMemoryWriteError
+            ? failed(error.message, error)
+            : failed(error instanceof Error ? error.message : String(error))
+        );
       }
     }
     return results;
+  }
+
+  /**
+   * `ProjectService.create` reports "already exists" both for the exact registered path
+   * and for a target that only reaches a registered project through a symlinked parent.
+   * Memory is keyed by the registered path's hash, so an alias must import to the
+   * registered identity — writing under the alias would land files the project never
+   * reads while reporting them as imported. Null when neither spelling is registered.
+   */
+  private resolveRegisteredProjectPath(targetPath: string, canonicalPath: string | null) {
+    const projects = this.config.loadConfigOrDefault().projects;
+    const resolved = path.resolve(targetPath);
+    if (projects.has(resolved)) return resolved;
+    if (canonicalPath !== null && projects.has(canonicalPath)) return canonicalPath;
+    return null;
+  }
+
+  private notifyProjectMemoryChanges(
+    restoredProjectMemory: ReadonlyArray<{ projectPath: string; files: string[] }>,
+    importResults: readonly BackupProjectImportResult[]
+  ): void {
+    if (this.memoryNotifier === null) return;
+    for (const { projectPath, files } of restoredProjectMemory) {
+      this.memoryNotifier.notifyExternalProjectChange(projectPath, files.map(projectMemoryRelPath));
+    }
+    // Failed imports included: their partial writes are on disk too.
+    for (const result of importResults) {
+      if (result.writtenFiles.length === 0) continue;
+      this.memoryNotifier.notifyExternalProjectChange(
+        result.targetPath,
+        result.writtenFiles.map(projectMemoryRelPath)
+      );
+    }
   }
 
   private async prepareRepository(
@@ -725,14 +807,18 @@ export class BackupService {
         previous?.repoUrl === settings.repoUrl &&
         previous.branch === settings.branch &&
         previous.path === settings.path;
+      const isCommitUpdate = Object.keys(commitUpdate).length > 0;
       // Commit metadata must not rewrite the repository settings tuple. Another window can
       // save a different repository while a push or restore is in flight.
-      if (previous !== undefined && !sameRepository && Object.keys(commitUpdate).length > 0) {
+      if (previous !== undefined && !sameRepository && isCommitUpdate) {
         saved = previous;
         return current;
       }
       saved = {
-        ...settings,
+        // Recording a commit re-applies on top of the settings currently saved, not the
+        // ones the operation started with: same repository, but another window may have
+        // toggled includeProjects meanwhile, and that save must survive.
+        ...(sameRepository && isCommitUpdate ? previous : settings),
         ...(sameRepository
           ? {
               lastPushedCommit: previous.lastPushedCommit,

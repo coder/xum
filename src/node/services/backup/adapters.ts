@@ -269,17 +269,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * half the feature. `memoryDir` records this install's actual directory name, which is
    * also what restore-side matching recomputes.
    */
-  async function listProjectBundleEntries(entryOptions: {
-    withRemotes: boolean;
-  }): Promise<BackupProjectBundleEntry[]> {
+  async function listProjectBundleEntries(): Promise<BackupProjectBundleEntry[]> {
     const entries: BackupProjectBundleEntry[] = [];
     for (const [projectPath, projectConfig] of userProjects()) {
-      const gitRemote = entryOptions.withRemotes
-        ? await readProjectGitRemote(projectPath)
-        : undefined;
+      const gitRemote = await readProjectGitRemote(projectPath);
       entries.push({
         path: projectPath,
-        name: getProjectDisplayName(projectPath, projectConfig),
+        // Clamped to the manifest schema's cap so a long custom title cannot produce a
+        // bundle this build's own restore would refuse.
+        name: getProjectDisplayName(projectPath, projectConfig).slice(0, 256),
         ...(gitRemote !== undefined ? { gitRemote } : {}),
         memoryDir: projectMemoryDirName(projectPath),
       });
@@ -294,13 +292,19 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   }
 
   function toProjectImports(plan: ProjectBundleRestorePlan): BackupProjectImport[] {
-    return plan.imports.map(({ entry, files, token }) => ({
-      sourcePath: entry.path,
-      name: entry.name,
-      ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
-      memoryFileCount: files.length,
-      token,
-    }));
+    return plan.imports.map(({ entry, files, token }) => {
+      // Re-sanitized on read, not just on export: the manifest is repository-controlled,
+      // so a crafted remote must pass the same filter before it reaches the UI.
+      const gitRemote =
+        entry.gitRemote === undefined ? undefined : sanitizeBackupGitRemote(entry.gitRemote);
+      return {
+        sourcePath: entry.path,
+        name: entry.name,
+        ...(gitRemote !== undefined ? { gitRemote } : {}),
+        memoryFileCount: files.length,
+        token,
+      };
+    });
   }
 
   async function readBundleWithPlan(
@@ -350,7 +354,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       if (exportOptions.includeProjects) {
         const bundle = await collectProjectBundle(
           muxRoot,
-          await listProjectBundleEntries({ withRemotes: true })
+          await listProjectBundleEntries(),
+          // Restore refuses files past the memory subsystem's read limit, so exporting
+          // them would only produce a backup no build can bring back.
+          { skipOversizedMemoryFiles: true }
         );
         await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle, {
           ownerOnly: true,
@@ -474,36 +481,34 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
       if (!validateOptions.includeProjects) {
-        return { hasProjectBundle: false, projectImports: [] };
+        return { hasProjectBundle: false, projectImports: [], matchedProjectPaths: [] };
       }
       // A bundle the restore would refuse is refused here too, for the same reason.
       const bundlePlan = await readBundleWithPlan(sourceDir);
       if (bundlePlan === null) {
-        return { hasProjectBundle: false, projectImports: [] };
+        return { hasProjectBundle: false, projectImports: [], matchedProjectPaths: [] };
       }
-      return { hasProjectBundle: true, projectImports: toProjectImports(bundlePlan.plan) };
+      return {
+        hasProjectBundle: true,
+        projectImports: toProjectImports(bundlePlan.plan),
+        // The classification the caller validated against. Restore re-partitions the
+        // bundle, but only writes matched entries that were also matched here, so a
+        // project registered mid-restore cannot be overwritten outside the plan the
+        // snapshot covered.
+        matchedProjectPaths: bundlePlan.plan.matched.map((match) => match.entry.path),
+      };
     },
 
-    async writeSafetySnapshot(snapshotRoot, snapshotOptions) {
+    async writeSafetySnapshot(snapshotRoot) {
       // Unredacted: this copy never leaves the machine, and a redacted snapshot could
       // not restore a credential whose MCP server the restore removed.
+      // Project memory is intentionally absent here: restore snapshots exactly the
+      // matched entries it will overwrite, inside the same memory-lock window as the
+      // write, so nothing can edit a file between its snapshot bytes and its overwrite.
       await writeBackupPayload(snapshotRoot, await buildPayload({ keepLocalSecrets: true }), {
         portable: false,
         ownerOnly: true,
       });
-      if (snapshotOptions.includeProjectMemory) {
-        // Registered projects only: an import that lands at a previously unregistered
-        // target writes add-only and reports every created file, so the snapshot's job is
-        // covering the memory a matched restore can overwrite.
-        const bundle = await collectProjectBundle(
-          muxRoot,
-          await listProjectBundleEntries({ withRemotes: false })
-        );
-        await writeProjectBundle(path.join(snapshotRoot, PROJECT_BUNDLE_DIR), bundle, {
-          portable: false,
-          ownerOnly: true,
-        });
-      }
     },
 
     async restore(restoreOptions) {
@@ -551,6 +556,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         .map(([file]) => file);
 
       let projectBundleSkipped = false;
+      const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       if (!restoreOptions.includeProjects) {
         // Existence-only, like the preview: a malformed sidecar must never block a
         // core-only restore, but its presence is reported so the skip is visible.
@@ -558,21 +564,51 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       } else {
         const bundlePlan = await readBundleWithPlan(sourceDir);
         if (bundlePlan !== null) {
-          // Matched entries restore verbatim, exactly what the preview promised. Imports
-          // are executed separately by the service, after project registration.
-          const writes = bundlePlan.plan.matched.flatMap((match) =>
-            match.files.map((file) => ({ path: file.path, content: file.content }))
+          // Only entries the caller validated as matched. A project registered at its
+          // recorded path since validation was previewed as an import and is not covered
+          // by the snapshot, so it must not be overwritten here; one unregistered since
+          // validation drops out of the recomputed plan on its own.
+          const validatedMatched = new Set(restoreOptions.matchedProjectPaths);
+          const matched = bundlePlan.plan.matched.filter((match) =>
+            validatedMatched.has(match.entry.path)
           );
-          const { written } = await withMemoryLock(() =>
-            writeProjectMemoryFiles(muxRoot, writes, { addOnly: false })
-          );
-          changedFiles.push(...written);
+          // One lock window for the snapshot and the overwrite: a memory edit landing
+          // between them would otherwise be destroyed with a snapshot that predates it.
+          await withMemoryLock(async () => {
+            if (matched.length > 0) {
+              // Exactly the memory these writes can overwrite — unrelated registered
+              // projects neither need covering nor may count against the bundle limits.
+              const localBundle = await collectProjectBundle(
+                muxRoot,
+                matched.map((match) => match.entry)
+              );
+              await writeProjectBundle(
+                path.join(restoreOptions.snapshotPath, PROJECT_BUNDLE_DIR),
+                localBundle,
+                { portable: false, ownerOnly: true }
+              );
+            }
+            // Matched entries restore verbatim, exactly what the preview promised. Imports
+            // are executed separately by the service, after project registration.
+            for (const match of matched) {
+              const { written } = await writeProjectMemoryFiles(
+                muxRoot,
+                match.files.map((file) => ({ path: file.path, content: file.content })),
+                { addOnly: false }
+              );
+              if (written.length > 0) {
+                changedFiles.push(...written);
+                restoredProjectMemory.push({ projectPath: match.entry.path, files: written });
+              }
+            }
+          });
         }
       }
       return {
         changedFiles: changedFiles.sort(),
         localOnlyFiles: result.localOnlyFiles,
         projectBundleSkipped,
+        restoredProjectMemory,
       };
     },
 

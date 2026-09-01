@@ -19,6 +19,7 @@ import {
   type BackupProjectBundleManifest,
 } from "@/common/config/schemas/settingsBackup";
 import { projectPathHashSuffix } from "@/node/services/memoryService";
+import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
@@ -2647,7 +2648,8 @@ export function bundleEntryFiles(
  */
 export async function collectProjectBundle(
   muxRoot: string,
-  entries: readonly BackupProjectBundleEntry[]
+  entries: readonly BackupProjectBundleEntry[],
+  options: { skipOversizedMemoryFiles?: boolean } = {}
 ): Promise<BackupProjectBundle> {
   if (entries.length > MAX_BACKUP_PROJECT_ENTRIES) {
     throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
@@ -2679,6 +2681,13 @@ export async function collectProjectBundle(
   // The executable bit is dropped on purpose: memory files are notes, and the bundle
   // manifest does not record modes, so restores always land them non-executable.
   const files = collector.files
+    // Exports skip files the memory subsystem itself refuses to read: bundling them would
+    // produce a backup this build's own restore rejects. Snapshots keep full fidelity so
+    // an overwritten oversized local file stays recoverable.
+    .filter(
+      (file) =>
+        options.skipOversizedMemoryFiles !== true || file.content.length <= MEMORY_MAX_FILE_BYTES
+    )
     .map((file) => ({ path: file.path, content: file.content }))
     .sort((a, b) => a.path.localeCompare(b.path));
   return {
@@ -2904,6 +2913,42 @@ export function rekeyProjectMemoryPath(bundlePath: string, targetDirName: string
   return [segments[0], segments[1], targetDirName, ...segments.slice(3)].join("/");
 }
 
+/** `memory/project/<dir>/rest` → `rest`, the path a project-scope memory store uses. */
+export function projectMemoryRelPath(bundlePath: string): string {
+  return bundlePath.split("/").slice(3).join("/");
+}
+
+/**
+ * Carries the files a failed project-memory write had already created: the writes are
+ * sequential without rollback, so the caller's failure report must include the partial
+ * progress as the user's cleanup list instead of claiming nothing was written.
+ */
+export class ProjectMemoryWriteError extends Error {
+  readonly written: string[];
+  readonly skipped: string[];
+
+  constructor(
+    message: string,
+    progress: { written: string[]; skipped: string[] },
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = "ProjectMemoryWriteError";
+    this.written = progress.written;
+    this.skipped = progress.skipped;
+  }
+}
+
+/** Regular files under a directory, for the per-scope memory file-count cap. */
+async function countFilesUnder(dirAbs: string): Promise<number> {
+  // Recursive readdir does not follow directory symlinks, and a missing scope directory
+  // counts as empty rather than failing the restore.
+  const entries = await fs
+    .readdir(dirAbs, { withFileTypes: true, recursive: true })
+    .catch(() => []);
+  return entries.filter((entry) => entry.isFile()).length;
+}
+
 /**
  * Writes project memory files into the local Xum root. `addOnly: true` is the import mode:
  * an identical existing file is fine, a differing one is skipped and reported as a conflict
@@ -2920,29 +2965,70 @@ export async function writeProjectMemoryFiles(
   writes: ReadonlyArray<{ path: string; content: Buffer }>,
   options: { addOnly: boolean }
 ): Promise<{ written: string[]; skipped: string[] }> {
-  for (const write of writes) assertAllowedBundleFilePath(write.path);
   const root = await resolveRoot(muxRoot);
-  const written: string[] = [];
-  const skipped: string[] = [];
   // Charged so a marker-thin bundle cannot expand past the same bound reads enforce.
   const budget = createByteBudget();
+  // Everything refusable is refused before the first write, so a rejected bundle
+  // changes nothing on disk.
+  const planned: Array<{ path: string; content: Buffer; exists: boolean }> = [];
   for (const write of writes) {
+    assertAllowedBundleFilePath(write.path);
+    // The memory subsystem's own read limit: a restored file larger than this would be
+    // persisted but permanently unreadable through memory commands, so it is refused
+    // here rather than written as unusable state.
+    if (write.content.length > MEMORY_MAX_FILE_BYTES) {
+      throw new Error(
+        `Cannot restore '${write.path}': larger than the ${MEMORY_MAX_FILE_BYTES}-byte memory file limit`
+      );
+    }
     budget(write.path, write.content.length);
     const destination = await resolveContainedPath(root.path, write.path);
     const existing = await lstatOrNull(destination);
     if (existing !== null && !existing.isFile()) {
       throw new Error(`Cannot restore '${write.path}': a non-file already exists there`);
     }
-    if (existing !== null) {
-      const current = await readCheckedFile(root, write.path, () => undefined);
-      if (current.content.equals(write.content)) continue;
-      if (options.addOnly) {
-        skipped.push(write.path);
-        continue;
-      }
+    planned.push({ path: write.path, content: write.content, exists: existing !== null });
+  }
+  // Per-scope file-count cap, mirrored from MemoryService. Only growth past the limit is
+  // refused: a store that already exceeds it (hand-placed files) can still be restored
+  // in place as long as this restore does not add to the overflow.
+  const addsByDir = new Map<string, number>();
+  for (const write of planned) {
+    if (write.exists) continue;
+    const scopeDir = write.path.split("/").slice(0, 3).join("/");
+    addsByDir.set(scopeDir, (addsByDir.get(scopeDir) ?? 0) + 1);
+  }
+  for (const [scopeDir, adds] of addsByDir) {
+    const existingCount = await countFilesUnder(path.join(root.path, scopeDir));
+    if (existingCount + adds > MEMORY_MAX_FILES_PER_SCOPE && adds > 0) {
+      throw new Error(
+        `Cannot restore '${scopeDir}': it would exceed the ${MEMORY_MAX_FILES_PER_SCOPE}-file memory limit`
+      );
     }
-    await writeCheckedFile(root, write.path, write.content, false);
-    written.push(write.path);
+  }
+  const written: string[] = [];
+  const skipped: string[] = [];
+  try {
+    for (const write of planned) {
+      if (write.exists) {
+        const current = await readCheckedFile(root, write.path, () => undefined);
+        if (current.content.equals(write.content)) continue;
+        if (options.addOnly) {
+          skipped.push(write.path);
+          continue;
+        }
+      }
+      await writeCheckedFile(root, write.path, write.content, false);
+      written.push(write.path);
+    }
+  } catch (error) {
+    // Sequential writes without rollback: report what already landed so the caller's
+    // failure result can double as the cleanup list.
+    throw new ProjectMemoryWriteError(
+      error instanceof Error ? error.message : String(error),
+      { written, skipped },
+      { cause: error }
+    );
   }
   return { written, skipped };
 }

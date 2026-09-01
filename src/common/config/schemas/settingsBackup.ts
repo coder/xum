@@ -230,10 +230,14 @@ export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
  * one. `memoryDir` records the actual memory directory name of the source install;
  * restore destinations are always recomputed locally from the target path.
  */
+// Per-field caps because the manifest is repository-controlled: without them a crafted,
+// otherwise valid manifest could put megabytes into one name or path and push that through
+// hashing, IPC, and renderer text nodes. The bounds are generous for real values — paths
+// beat every platform default and the remote cap matches sanitizeBackupGitRemote's.
 export const BackupProjectBundleEntrySchema = z.object({
-  path: z.string().min(1),
-  name: z.string().min(1),
-  gitRemote: z.string().optional(),
+  path: z.string().min(1).max(1024),
+  name: z.string().min(1).max(256),
+  gitRemote: z.string().max(2048).optional(),
   memoryDir: z.string().min(1),
 });
 

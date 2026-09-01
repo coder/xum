@@ -19,6 +19,7 @@ import {
   MAX_BACKUP_PATH_DEPTH,
   MAX_BACKUP_TOTAL_BYTES,
   PROJECT_BUNDLE_DIR,
+  ProjectMemoryWriteError,
   REDACTED_BACKUP_VALUE,
   backupCommandApprovalToken,
   backupSecretApprovalDigest,
@@ -32,6 +33,7 @@ import {
   planRestoreWrites,
   projectBundleExists,
   projectImportToken,
+  projectMemoryRelPath,
   readProjectBundle,
   rekeyProjectMemoryPath,
   serializeBackupPreferences,
@@ -51,6 +53,7 @@ import {
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
 import { captureRejection, writeFixtureFile } from "./testHelpers";
+import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 
 async function isExecutable(filePath: string): Promise<boolean> {
   return ((await fs.stat(filePath)).mode & 0o111) !== 0;
@@ -3599,6 +3602,57 @@ describe("project bundle", () => {
     expect((error as Error).message).toContain("memory directory");
   });
 
+  it("rejects oversized repository-controlled project metadata", async () => {
+    const oversized = [
+      { name: "x".repeat(257) },
+      { path: `/home/${"p".repeat(1024)}` },
+      { gitRemote: `https://example.com/${"r".repeat(2048)}` },
+    ];
+    for (const override of oversized) {
+      const projectPath = override.path ?? "/home/dev/src/alpha";
+      await rewriteBundleManifest(managedDir, {
+        schemaVersion: 1,
+        projects: [
+          {
+            path: projectPath,
+            name: "alpha",
+            memoryDir: projectMemoryDirName(projectPath),
+            ...override,
+          },
+        ],
+        files: [],
+      });
+      const error = await captureRejection(readProjectBundle(managedDir));
+      expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    }
+  });
+
+  it("skips memory files past the memory read limit only when exporting", async () => {
+    const entry = entryFor("/home/dev/src/alpha");
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/small.md`, "fine\n");
+    await fs.writeFile(
+      path.join(muxRoot, "memory", "project", entry.memoryDir, "huge.md"),
+      Buffer.alloc(MEMORY_MAX_FILE_BYTES + 1, "x")
+    );
+
+    const exported = await collectProjectBundle(muxRoot, [entry], {
+      skipOversizedMemoryFiles: true,
+    });
+    expect(exported.files.map((file) => file.path)).toEqual([
+      `memory/project/${entry.memoryDir}/small.md`,
+    ]);
+    expect(exported.manifest.files.map((file) => file.path)).toEqual([
+      `memory/project/${entry.memoryDir}/small.md`,
+    ]);
+    // Snapshots keep everything: an oversized local file a restore overwrites must stay
+    // recoverable.
+    const snapshot = await collectProjectBundle(muxRoot, [entry]);
+    expect(snapshot.files.map((file) => file.path)).toEqual([
+      `memory/project/${entry.memoryDir}/huge.md`,
+      `memory/project/${entry.memoryDir}/small.md`,
+    ]);
+  });
+
   it("rejects unsafe memory directory segments", async () => {
     for (const memoryDir of ["..", "evil/../../up", "nul", ".hidden-abcdef123456"]) {
       await rewriteBundleManifest(managedDir, {
@@ -3812,6 +3866,102 @@ describe("project bundle", () => {
     expect(
       await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "existing.md"), "utf-8")
     ).toBe("backup version\n");
+  });
+
+  it("refuses a memory file past the memory read limit before writing anything", async () => {
+    const targetDir = projectMemoryDirName("/home/dev/target");
+    const error = await captureRejection(
+      writeProjectMemoryFiles(
+        muxRoot,
+        [
+          { path: `memory/project/${targetDir}/small.md`, content: Buffer.from("fine\n") },
+          {
+            path: `memory/project/${targetDir}/huge.md`,
+            content: Buffer.alloc(MEMORY_MAX_FILE_BYTES + 1, "x"),
+          },
+        ],
+        { addOnly: false }
+      )
+    );
+    expect((error as Error).message).toContain("memory file limit");
+    expect(error).not.toBeInstanceOf(ProjectMemoryWriteError);
+    // Validation runs before the first write: the acceptable file did not land either.
+    expect(
+      await fs.stat(path.join(muxRoot, "memory", "project", targetDir, "small.md")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("refuses growing a project scope past the memory file-count limit", async () => {
+    const targetDir = projectMemoryDirName("/home/dev/target");
+    for (let index = 0; index < MEMORY_MAX_FILES_PER_SCOPE - 1; index += 1) {
+      await writeFixtureFile(muxRoot, `memory/project/${targetDir}/n${index}.md`, "x\n");
+    }
+    // Existing files rewritten in place do not count as growth.
+    const rewrite = await writeProjectMemoryFiles(
+      muxRoot,
+      [{ path: `memory/project/${targetDir}/n0.md`, content: Buffer.from("y\n") }],
+      { addOnly: false }
+    );
+    expect(rewrite.written).toEqual([`memory/project/${targetDir}/n0.md`]);
+    // One more fits exactly; two more would exceed the scope limit.
+    const error = await captureRejection(
+      writeProjectMemoryFiles(
+        muxRoot,
+        [
+          { path: `memory/project/${targetDir}/new-a.md`, content: Buffer.from("a\n") },
+          { path: `memory/project/${targetDir}/new-b.md`, content: Buffer.from("b\n") },
+        ],
+        { addOnly: true }
+      )
+    );
+    expect((error as Error).message).toContain("file memory limit");
+    expect(
+      await fs.stat(path.join(muxRoot, "memory", "project", targetDir, "new-a.md")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("reports partial progress when a write fails midway", async () => {
+    const targetDir = projectMemoryDirName("/home/dev/target");
+    await writeFixtureFile(muxRoot, `memory/project/${targetDir}/kept.md`, "local\n");
+    // The third write's directory creation fails, after "first.md" already landed and
+    // "kept.md" was skipped as a conflict.
+    const realMkdir = fs.mkdir.bind(fs);
+    const mkdir = spyOn(fs, "mkdir").mockImplementation(((target, options) =>
+      String(target).endsWith(`${path.sep}faulty`)
+        ? Promise.reject(new Error("EIO: disk fault"))
+        : realMkdir(target, options)) as typeof fs.mkdir);
+    try {
+      const error = await captureRejection(
+        writeProjectMemoryFiles(
+          muxRoot,
+          [
+            { path: `memory/project/${targetDir}/first.md`, content: Buffer.from("one\n") },
+            { path: `memory/project/${targetDir}/kept.md`, content: Buffer.from("backup\n") },
+            { path: `memory/project/${targetDir}/faulty/inner.md`, content: Buffer.from("x\n") },
+          ],
+          { addOnly: true }
+        )
+      );
+      expect(error).toBeInstanceOf(ProjectMemoryWriteError);
+      const writeError = error as ProjectMemoryWriteError;
+      expect(writeError.message).toContain("disk fault");
+      expect(writeError.written).toEqual([`memory/project/${targetDir}/first.md`]);
+      expect(writeError.skipped).toEqual([`memory/project/${targetDir}/kept.md`]);
+    } finally {
+      mkdir.mockRestore();
+    }
+  });
+
+  it("maps bundle paths to scope-relative memory paths", () => {
+    expect(projectMemoryRelPath("memory/project/alpha-123456789abc/deep/notes.md")).toBe(
+      "deep/notes.md"
+    );
   });
 
   it("refuses memory writes outside the project memory tree", async () => {
