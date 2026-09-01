@@ -147,6 +147,21 @@ const UNRESOLVED_DELTA_PUSH_PATTERNS = [
   "remote unpack failed",
 ] as const;
 
+/**
+ * Shared "caller already gave up" guard for the long-running SSH maintenance and
+ * project-sync steps, each of which repeated this same precondition check.
+ *
+ * Deliberately throws a plain `Error(OPERATION_ABORTED_ERROR)` instead of
+ * delegating to `AbortSignal.prototype.throwIfAborted()`: call sites compare the
+ * message against that exact string (see OPERATION_ABORTED_ERROR above), whereas
+ * `throwIfAborted()` surfaces the signal's `reason` — a `DOMException` by default.
+ */
+function throwIfAborted(abortSignal?: AbortSignal): void {
+  if (abortSignal?.aborted) {
+    throw new Error(OPERATION_ABORTED_ERROR);
+  }
+}
+
 function isUnresolvedDeltaPushFailure(errorMsg: string): boolean {
   return UNRESOLVED_DELTA_PUSH_PATTERNS.some((pattern) => errorMsg.includes(pattern));
 }
@@ -198,9 +213,7 @@ async function enqueueProjectSync(
 
   try {
     await waitForTurn;
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
     await fn();
   } finally {
     if (onAbort) {
@@ -665,9 +678,7 @@ export class SSHRuntime extends RemoteRuntime {
     baseRepoPathArg: string,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     // `git config --unset-all` exits 0 (removed) or 5 (key/section absent);
     // both are idempotent successes. Anything else is a real failure we
@@ -706,9 +717,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal,
     options: { waitForGc?: boolean } = {}
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     log.info(repairContext);
 
@@ -827,9 +836,7 @@ export class SSHRuntime extends RemoteRuntime {
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     try {
       const { packCount } = await this.probeBaseRepoHealth(baseRepoPathArg, abortSignal);
@@ -916,18 +923,14 @@ export class SSHRuntime extends RemoteRuntime {
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     await this.transport.acquireConnection({
       abortSignal,
       onWait: (waitMs) => logSSHBackoffWait(initLogger, waitMs),
     });
 
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     initLogger.logStep("Repairing shared base repository object cache...");
     const remoteAbortController = createAbortController(
@@ -982,9 +985,7 @@ export class SSHRuntime extends RemoteRuntime {
         );
       }
 
-      if (abortSignal?.aborted) {
-        throw new Error(OPERATION_ABORTED_ERROR);
-      }
+      throwIfAborted(abortSignal);
 
       if (gitExitCode !== 0) {
         throw new Error(
@@ -1060,9 +1061,7 @@ export class SSHRuntime extends RemoteRuntime {
     maxAttempts: number,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     try {
       await this.repairBaseRepoForSync(
@@ -2254,9 +2253,7 @@ export class SSHRuntime extends RemoteRuntime {
     initLogger: InitLogger,
     abortSignal?: AbortSignal
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     const layout = this.getProjectLayout(projectPath);
     const projectKey = this.getProjectSyncKey(layout.projectId);
@@ -2271,9 +2268,7 @@ export class SSHRuntime extends RemoteRuntime {
       // those don't benefit from forcing a larger pack.
       let forceNoThinNextAttempt = false;
       for (let attempt = 1; attempt <= PROJECT_SYNC_MAX_ATTEMPTS; attempt++) {
-        if (abortSignal?.aborted) {
-          throw new Error(OPERATION_ABORTED_ERROR);
-        }
+        throwIfAborted(abortSignal);
 
         try {
           await this.syncProjectToRemoteOnce(projectPath, layout, initLogger, abortSignal, {
@@ -2305,9 +2300,7 @@ export class SSHRuntime extends RemoteRuntime {
             PROJECT_SYNC_MAX_ATTEMPTS,
             abortSignal
           );
-          if (abortSignal?.aborted) {
-            throw new Error(OPERATION_ABORTED_ERROR);
-          }
+          throwIfAborted(abortSignal);
           initLogger.logStep(
             `Sync failed, retrying (attempt ${attempt + 1}/${PROJECT_SYNC_MAX_ATTEMPTS})...`
           );
@@ -2324,9 +2317,7 @@ export class SSHRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal,
     options: { forceNoThin?: boolean } = {}
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(OPERATION_ABORTED_ERROR);
-    }
+    throwIfAborted(abortSignal);
 
     const currentSnapshotPath = layout.currentSnapshotPath;
     const useNativeGitPush = this.transport instanceof OpenSSHTransport;
