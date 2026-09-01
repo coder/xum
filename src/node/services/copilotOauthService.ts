@@ -399,10 +399,18 @@ export class CopilotOauthService {
       if (!modelsRes.ok) return;
 
       const modelsData = yield* Effect.tryPromise({
-        try: async () => (await modelsRes.json()) as { data?: Array<{ id: string }> },
+        try: async () => {
+          const json = (await modelsRes.json()) as unknown;
+          // Validate inside the caught region: a null/non-object JSON body
+          // must stay best-effort instead of becoming a defect.
+          if (json === null || typeof json !== "object") {
+            throw new TypeError("Copilot models response was not a JSON object");
+          }
+          return json as { data?: Array<{ id: string }> };
+        },
         catch: (error) => error,
       });
-      if (!modelsData.data || modelsData.data.length === 0) return;
+      if (!Array.isArray(modelsData.data) || modelsData.data.length === 0) return;
 
       const modelIds = modelsData.data
         .map((m) => m.id)
@@ -417,6 +425,16 @@ export class CopilotOauthService {
       Effect.catch((error) =>
         Effect.sync(() => {
           log.debug("Failed to fetch Copilot models after login", error);
+        })
+      ),
+      // Defensive: any unexpected throw outside the caught thunks (e.g. a
+      // surprising payload item shape in the map/filter above) must also stay
+      // best-effort — the pre-Effect code ran this whole block inside one
+      // try/catch, and a defect here would kill the polling fiber after the
+      // token was persisted but before finishFlow reports success.
+      Effect.catchDefect((defect) =>
+        Effect.sync(() => {
+          log.debug("Failed to fetch Copilot models after login", defect);
         })
       )
     );
