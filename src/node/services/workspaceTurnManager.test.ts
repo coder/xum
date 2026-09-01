@@ -3994,6 +3994,58 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  test("user-triggered auto-compaction still supersedes an active workspace turn", async () => {
+    const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest();
+    const prompt = createMuxMessage("turn-prompt", "user", "Summarize the repo", {
+      muxMetadata: workspaceTurnMuxMetadata(parentId, created.taskId),
+    });
+    expect((await historyService.appendToHistory(created.workspaceId, prompt)).success).toBe(true);
+    const compactionRequest = createMuxMessage(
+      "auto-compaction",
+      "user",
+      "Compacting before a new user prompt",
+      {
+        synthetic: true,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: {},
+          source: "auto-compaction",
+        },
+      }
+    );
+    expect(
+      (await historyService.appendToHistory(created.workspaceId, compactionRequest)).success
+    ).toBe(true);
+    const wakeOutput = createMuxMessage("wake-output", "assistant", "Wake result", {
+      model: "anthropic:claude-opus-4-6",
+      agentId: "exec",
+      finishReason: "stop",
+    });
+    expect((await historyService.appendToHistory(created.workspaceId, wakeOutput)).success).toBe(
+      true
+    );
+
+    expect(
+      await finalizeWorkspaceTurnStreamEndForTest(taskService, {
+        type: "stream-end",
+        workspaceId: created.workspaceId,
+        messageId: wakeOutput.id,
+        metadata: {
+          model: "anthropic:claude-opus-4-6",
+          agentId: "exec",
+          finishReason: "stop",
+        },
+        parts: [{ type: "text", text: "Wake result" }],
+      })
+    ).toBe(true);
+    expect(await workspaceTurnSnapshot(taskService, parentId, created.taskId)).toMatchObject({
+      status: "interrupted",
+      messageId: wakeOutput.id,
+      error: "Workspace turn superseded by an uncorrelated workspace stream-end",
+    });
+  });
+
   test("getWorkspaceTurnSnapshot recovers stale completed handles from matching history", async () => {
     const { parentId, taskService, historyService, created } = await startWorkspaceTurnForTest();
     const appendResult = await historyService.appendToHistory(

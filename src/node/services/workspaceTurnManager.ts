@@ -283,7 +283,18 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
 
 /** A human-authored child input that redirects the delegated turn. */
 function isManualChildWorkspaceInput(message: MuxMessage): boolean {
-  return message.role === "user" && message.metadata?.synthetic !== true;
+  if (message.role !== "user") {
+    return false;
+  }
+  if (message.metadata?.synthetic !== true) {
+    return true;
+  }
+  const muxMetadata = message.metadata.muxMetadata;
+  return (
+    muxMetadata?.type === "compaction-request" &&
+    muxMetadata.source === "auto-compaction" &&
+    muxMetadata.parsed.followUpContent?.dispatchOptions?.source !== "internal-resume"
+  );
 }
 
 /**
