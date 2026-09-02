@@ -2223,6 +2223,112 @@ describe("BackupService project imports", () => {
     }
   }, 20_000);
 
+  test("imports an entry registered here under another memory directory name", async () => {
+    // The entry's recorded path is registered on this machine, but its recorded memory
+    // directory name is not the one this host computes (a path from another OS), so it is
+    // offered as an import into its own registered path — which must stay importable rather
+    // than being refused as "registered since the preview" every time.
+    const registered = path.join(tempDir, "alpha");
+    await fs.mkdir(registered);
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(registered, { workspaces: [] });
+    let registrations = 0;
+    let imports = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate({ sourcePath: registered })],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() => {
+              imports += 1;
+              return Promise.resolve({ writtenFiles: ["notes.md"], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar(() => {
+        registrations += 1;
+        return Promise.resolve(Err("Project already exists"));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: registered }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "imported",
+        targetPath: registered,
+        registered: false,
+      });
+      expect(result.data.unapprovedProjectImports).toEqual([]);
+    }
+    expect(imports).toBe(1);
+    expect(registrations).toBe(0);
+  });
+
+  test("does not register a target while a registered path failed to resolve", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const denied = path.join(tempDir, "denied");
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(denied, { workspaces: [] });
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() => Promise.resolve({ writtenFiles: [], skippedFiles: [] }))
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+    const realRealpath = fs.realpath.bind(fs);
+    const realpath = spyOn(fs, "realpath").mockImplementation(((probed: string) =>
+      // Not a stall, an immediate refusal: what the path leads to is as unknown either way.
+      probed === denied
+        ? Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }))
+        : realRealpath(probed)) as unknown as typeof fs.realpath);
+    try {
+      const result = await service.restore(
+        { ...SETTINGS, includeProjects: true },
+        { projectImports: [{ token: "candidate-token", targetPath: target }] }
+      );
+      expect(result.success).toBe(true);
+      expect(registrations).toBe(0);
+      if (result.success) {
+        expect(result.data.projectImportResults[0]).toMatchObject({
+          status: "failed",
+          message: expect.stringContaining("could not be checked against 1 registered") as string,
+        });
+      }
+    } finally {
+      realpath.mockRestore();
+    }
+  });
+
   test("refuses an import into a directory at another backed-up project's recorded path", async () => {
     // Local directories at two other entries' recorded paths: one still on offer, one matched.
     const otherCandidatePath = path.join(tempDir, "beta");

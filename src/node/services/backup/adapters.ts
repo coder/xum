@@ -278,10 +278,42 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     );
   }
 
+  /**
+   * The registered projects the bundle can carry: user projects (system entries keep no
+   * memory) whose path fits the manifest schema — registration itself caps nothing, and a
+   * path past the cap has no valid manifest entry; such a project stays local rather than
+   * failing every push for all the others, and counts toward nothing here (the entry cap,
+   * remote discovery) since it will not be in the bundle.
+   */
   function userProjects(): Array<[string, ProjectConfig]> {
     return [...options.config.loadConfigOrDefault().projects.entries()].filter(
-      ([projectPath, projectConfig]) => !isSystemProjectEntry(projectPath, projectConfig)
+      ([projectPath, projectConfig]) =>
+        !isSystemProjectEntry(projectPath, projectConfig) &&
+        projectPath.length <= MAX_BACKUP_PROJECT_PATH_CHARS
     );
+  }
+
+  /** The user projects userProjects leaves out, for saying so once per export. */
+  function unsupportedUserProjects(): string[] {
+    return [...options.config.loadConfigOrDefault().projects.entries()]
+      .filter(
+        ([projectPath, projectConfig]) =>
+          !isSystemProjectEntry(projectPath, projectConfig) &&
+          projectPath.length > MAX_BACKUP_PROJECT_PATH_CHARS
+      )
+      .map(([projectPath]) => projectPath);
+  }
+
+  /**
+   * The registry as a remote-discovery pass saw it. Remote hints are keyed by path and found
+   * outside the registration lock; a project removed and another registered at the same path
+   * during discovery would otherwise carry the removed project's remote into the new
+   * project's entry. The listing under the lock uses the hints only if the registry has not
+   * changed since — conservatively, since config records no registration identity: churn
+   * anywhere in the project set costs this export its hints, never gives an entry a wrong one.
+   */
+  function registrySnapshot(): string {
+    return JSON.stringify(userProjects());
   }
 
   /**
@@ -291,7 +323,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * whole pass caps the wait regardless of the project count. Projects probed after the
    * deadline simply record no remote.
    */
-  async function discoverProjectRemotes(): Promise<Map<string, string | undefined>> {
+  async function discoverProjectRemotes(): Promise<{
+    remotes: Map<string, string | undefined>;
+    registry: string;
+  }> {
+    for (const projectPath of unsupportedUserProjects()) {
+      log.warn(
+        `Settings backup: not backing up project '${projectPath.slice(0, 80)}…': its path is longer than ${MAX_BACKUP_PROJECT_PATH_CHARS} characters`
+      );
+    }
+    const registry = registrySnapshot();
     const projects = userProjects();
     // Before any lookup: an over-limit config would otherwise run every remote probe
     // only to be refused by the bundle collector afterwards.
@@ -317,7 +358,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         }
       })
     );
-    return remotes;
+    return { remotes, registry };
   }
 
   /**
@@ -329,24 +370,21 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * discovery began; a project added since carries no remote hint, one removed since is
    * gone along with its memory.
    */
-  function listProjectBundleEntries(
-    remotes: ReadonlyMap<string, string | undefined>
-  ): BackupProjectBundleEntry[] {
-    // A registered path past the manifest schema's cap — registration itself caps nothing —
-    // has no valid manifest entry, and one such project must not fail every push for all
-    // the others; it stays local, logged, exactly as an import of it would be refused.
-    const projects = userProjects().filter(([projectPath]) => {
-      if (projectPath.length <= MAX_BACKUP_PROJECT_PATH_CHARS) return true;
-      log.warn(
-        `Settings backup: not backing up project '${projectPath.slice(0, 80)}…': its path is longer than ${MAX_BACKUP_PROJECT_PATH_CHARS} characters`
-      );
-      return false;
-    });
+  function listProjectBundleEntries(discovered: {
+    remotes: ReadonlyMap<string, string | undefined>;
+    registry: string;
+  }): BackupProjectBundleEntry[] {
+    const projects = userProjects();
     if (projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
       throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
     }
+    // See registrySnapshot: hints found for a registry that has since changed are dropped.
+    const remotes = discovered.registry === registrySnapshot() ? discovered.remotes : null;
+    if (remotes === null) {
+      log.debug("Settings backup: projects changed during remote discovery; omitting remote hints");
+    }
     return projects.map(([projectPath, projectConfig]) => {
-      const gitRemote = remotes.get(projectPath);
+      const gitRemote = remotes?.get(projectPath);
       return {
         path: projectPath,
         // Clamped to the manifest schema's cap so a long custom title cannot produce a
@@ -437,7 +475,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // fresh after the core payload.
       let scanFiles = payload.files;
       if (exportOptions.includeProjects) {
-        const remotes = await discoverProjectRemotes();
+        const discovered = await discoverProjectRemotes();
         // The project list is read, the memory collected, and the bundle written under the
         // registration lock (taken before the memory lock, the fixed order), so a project
         // registered or removed during the seconds of remote discovery above is reflected
@@ -445,7 +483,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // is collected under the memory lock so an agent writing memory mid-export cannot
         // produce a torn bundle or trip the collector's identity checks.
         const bundle = await withProjectRegistrationLock(muxRoot, async (registration) => {
-          const entries = listProjectBundleEntries(remotes);
+          const entries = listProjectBundleEntries(discovered);
           const collected = await withMemoryLock(() =>
             collectProjectBundle(
               muxRoot,

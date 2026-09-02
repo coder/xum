@@ -265,7 +265,6 @@ export function BackupSection() {
           setApproveCommands(false);
           setProjectImports([]);
           setProjectImportSelections({});
-          setProjectImportResults([]);
           setProjectBundleSkipped(false);
           setRestoreConfirmationOpen(false);
           setActionError(null);
@@ -375,11 +374,13 @@ export function BackupSection() {
       setPreview(null);
       // With the preview: they describe the repository that was previewed, and carrying
       // them past a save would show, and resend on restore, another repository's approvals.
+      // Import results are not among them: they describe files added and projects
+      // registered on this machine, which changing a setting does not undo, and are the only
+      // record of what undoing an import means removing.
       setCommandApprovals([]);
       setApproveCommands(false);
       setProjectImports([]);
       setProjectImportSelections({});
-      setProjectImportResults([]);
       setProjectBundleSkipped(false);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);

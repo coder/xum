@@ -3146,6 +3146,17 @@ export async function writeProjectMemoryOrigin(
   // first, and no crash-recovery rule on the source's record can tell an incomplete write
   // from a completed association that another import into the same project superseded.
   // The project's record was the half the import's memory write had already committed to.
+  //
+  // What such a crash does cost is the project's own previous association, if it had one:
+  // its record now names the new source, so its previous source is re-offered as an import
+  // on the next restore, its files intact in the project (an add-only re-import restores the
+  // association). That is deliberate. Recording the previous source for recovery would need
+  // a reader to tell "the new pair never committed" from "it committed and the source later
+  // moved on", and the two files cannot say which — a crash after the commit but before any
+  // cleanup of that recovery state looks identical — so the recovered association could be
+  // one a completed import had superseded, and a matched restore would then overwrite the
+  // project's memory without approval. The records fail toward an explicit re-import, never
+  // toward a match nobody approved.
   const targetRecord = projectMemoryOriginTargetPath(localMemoryDir);
   const previousTarget = await readProjectMemoryOriginRecordBytes(root, targetRecord);
   await writeProjectMemoryOriginRecord(root, targetRecord, content);

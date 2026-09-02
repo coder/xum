@@ -857,6 +857,18 @@ describe("BackupSection", () => {
     ).toBeTruthy();
     expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
     expect(canvas.getByText(/remove the projects marked as newly registered/)).toBeTruthy();
+
+    // Saving different settings drops the preview and its approvals, not this: the files and
+    // the registration are still there to undo.
+    fireEvent.change(canvas.getByLabelText("Repository URL"), {
+      target: { value: "git@github.com:example/other.git" },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Save settings" }));
+    await canvas.findByText("Backup settings saved.");
+    expect(
+      canvas.getByText(/Added memory files: memory\/project\/rocket-abc\/notes\.md/)
+    ).toBeTruthy();
+    expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
   });
 
   test("re-presents fresh candidates when import approval goes stale", async () => {

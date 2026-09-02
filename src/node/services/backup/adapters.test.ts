@@ -1512,6 +1512,51 @@ describe("backup adapters project bundle", () => {
     expect(byPath.get(credentialedProject)?.gitRemote).toBeUndefined();
   });
 
+  it("drops remote hints when the project set changed during discovery", async () => {
+    const project = path.join(tempDir, "projects", "replaced");
+    await fs.mkdir(project, { recursive: true });
+    await runGit(["-C", project, "init"]);
+    await runGit(["-C", project, "remote", "add", "origin", "git@github.com:dev/old.git"]);
+    registerProject(project);
+    const payload = createBackupPayloadStore({ config });
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+
+    // Remotes are discovered outside the registration lock; the listing waits for it. While
+    // it waits, the project is removed and another checkout registered at the same path.
+    const held = Promise.withResolvers<void>();
+    const lockAcquired = Promise.withResolvers<void>();
+    const holding = withProjectRegistrationLock(muxRoot, async () => {
+      lockAcquired.resolve();
+      await held.promise;
+      config.state.projects.delete(project);
+      config.state.projects.set(project, { workspaces: [], displayName: "replacement" });
+    });
+    await lockAcquired.promise;
+    const exporting = payload.exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    held.resolve();
+    await holding;
+    await exporting;
+
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(repository.rootDir, settings.path, "project-bundle", "manifest.json"),
+        "utf-8"
+      )
+    ) as { projects: Array<{ path: string; name: string; gitRemote?: string }> };
+    // The entry is the new registration's; the removed project's remote does not travel
+    // with it.
+    expect(
+      manifest.projects.map(({ path: entryPath, name }) => ({ path: entryPath, name }))
+    ).toEqual([{ path: project, name: "replacement" }]);
+    expect(manifest.projects[0]?.gitRemote).toBeUndefined();
+  });
+
   it("flags a token published through a project remote's path in the secret scan", async () => {
     const project = path.join(tempDir, "projects", "leaky");
     await fs.mkdir(project, { recursive: true });
@@ -1995,13 +2040,16 @@ describe("backup adapters project bundle", () => {
   });
 
   it("leaves a project whose registered path exceeds the manifest cap out of the bundle", async () => {
-    const project = path.join(tempDir, "projects", "alpha");
-    registerProject(project);
     // Registration caps nothing; the manifest schema does. One such project must not fail
-    // every push for all the others.
+    // every push for all the others — and does not count toward the entry cap either: a
+    // full complement of exportable projects plus it is still exportable.
+    const projects = Array.from({ length: MAX_BACKUP_PROJECT_ENTRIES }, (_, index) =>
+      path.join(tempDir, "projects", `p${index}`)
+    );
+    for (const project of projects) registerProject(project);
     const overlong = path.join(tempDir, "p".repeat(MAX_BACKUP_PROJECT_PATH_CHARS));
     registerProject(overlong);
-    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await seedProjectMemory(projects[0], "notes.md", "alpha notes\n");
     await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
 
     const { repository } = await exportBundle();
@@ -2012,7 +2060,7 @@ describe("backup adapters project bundle", () => {
         "utf-8"
       )
     ) as { projects: Array<{ path: string }> };
-    expect(manifest.projects.map((entry) => entry.path)).toEqual([project]);
+    expect(manifest.projects.map((entry) => entry.path).sort()).toEqual([...projects].sort());
   });
 
   it("collects project memory for export under the memory mutation lock", async () => {

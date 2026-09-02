@@ -222,6 +222,13 @@ interface PlannedProjectImport {
   targetPath: string;
   targetIdentity: { dev: number; ino: number };
   registeredPath: string | null;
+  /**
+   * Whether the candidate's recorded source path was already registered when it was offered.
+   * It can be: an entry registered here whose recorded memory directory name is not the one
+   * this host computes (a path from another OS) is offered as an import on purpose, and
+   * stays importable. Only a registration that appears after planning reclassifies it.
+   */
+  sourceRegisteredAtPlanning: boolean;
 }
 
 /** planProjectImports' result: the imports and the registry lookup they were resolved against. */
@@ -358,24 +365,32 @@ async function realpathOrNull(target: string): Promise<string | null> {
 }
 
 /**
- * `realpathOrNull` bounded by `timeoutMs`; `stalled` when the time ran out first. A
- * resolution still blocked on an unavailable mount then finishes on its own in the
- * threadpool; nothing waits for it (see REGISTRY_MAX_STALLED_PROBES).
+ * A registered path's real path, bounded by `timeoutMs`. `unknown` when the probe says nothing
+ * about what the path is: the time ran out first (the resolution, still blocked on an
+ * unavailable mount, then finishes on its own in the threadpool; nothing waits for it — see
+ * REGISTRY_MAX_STALLED_PROBES), or it failed for a reason other than the path not existing
+ * (EACCES, EIO): such a path may still be another spelling of a reachable directory. Only a
+ * path that provably leads nowhere resolves to a known null.
  */
-async function realpathWithin(
+async function registeredRealpathWithin(
   target: string,
   timeoutMs: number
-): Promise<{ canonical: string | null; stalled: boolean }> {
-  if (timeoutMs <= 0) return { canonical: null, stalled: false };
+): Promise<{ canonical: string | null; unknown: boolean; stalled: boolean }> {
+  if (timeoutMs <= 0) return { canonical: null, unknown: true, stalled: false };
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<{ canonical: null; stalled: true }>((resolve) => {
-    timer = setTimeout(() => resolve({ canonical: null, stalled: true }), timeoutMs);
+  const expired = new Promise<{ canonical: null; unknown: true; stalled: true }>((resolve) => {
+    timer = setTimeout(() => resolve({ canonical: null, unknown: true, stalled: true }), timeoutMs);
   });
+  const probe = fs.realpath(target).then(
+    (canonical) => ({ canonical, unknown: false, stalled: false }),
+    (error: NodeJS.ErrnoException) => ({
+      canonical: null,
+      unknown: error.code !== "ENOENT" && error.code !== "ENOTDIR",
+      stalled: false,
+    })
+  );
   try {
-    return await Promise.race([
-      realpathOrNull(target).then((canonical) => ({ canonical, stalled: false })),
-      expired,
-    ]);
+    return await Promise.race([probe, expired]);
   } finally {
     clearTimeout(timer);
   }
@@ -904,6 +919,7 @@ export class BackupService {
         // that has since taken this path (the checkout moved away, another created here).
         targetIdentity: { dev: stat.dev, ino: stat.ino },
         registeredPath,
+        sourceRegisteredAtPlanning: registry.keys.has(candidate.sourcePath),
       });
     }
     return { imports: planned, registry };
@@ -960,6 +976,7 @@ export class BackupService {
         targetPath,
         targetIdentity,
         registeredPath: plannedRegisteredPath,
+        sourceRegisteredAtPlanning,
       } of planned) {
         // The identity the preflight checked (memory limits, non-file destinations,
         // permissions) is the only one this import may write to. A different identity now —
@@ -991,13 +1008,17 @@ export class BackupService {
             `'${targetPath}' is now registered as '${registered}', which this import was not checked against; approve it again`
           );
         try {
-          // Reclassified since validation: the candidate's recorded source path is registered
-          // on this machine now, so every later restore writes the entry directly into that
-          // project — memory imported into the approved target would be orphaned there and
-          // its origin record overridden by the exact-path match. Refused under the
-          // registration lock, where this cannot change again before the write; the next
-          // preview shows the entry as matched.
-          if (registry.keys.has(candidate.sourcePath) || registeredHere.has(candidate.sourcePath)) {
+          // Reclassified since validation: the candidate's recorded source path was registered
+          // on this machine after it was offered, so the next restore may write the entry
+          // directly into that project — memory imported into the approved target would be
+          // orphaned there and its origin record overridden by the exact-path match. Refused
+          // under the registration lock, where this cannot change again before the write; the
+          // next preview shows the entry as matched, or offers it again if it still cannot
+          // be (see sourceRegisteredAtPlanning).
+          if (
+            !sourceRegisteredAtPlanning &&
+            (registry.keys.has(candidate.sourcePath) || registeredHere.has(candidate.sourcePath))
+          ) {
             reclassified.add(candidate.token);
             results.push(
               failed(
@@ -1205,16 +1226,9 @@ export class BackupService {
               ? Math.ceil((deadline - Date.now()) / unprobed)
               : 0;
           unprobed -= 1;
-          if (budget <= 0) {
-            unresolved.add(key);
-            canonicalByKey.set(key, null);
-            return;
-          }
-          const probe = await realpathWithin(key, budget);
-          if (probe.stalled) {
-            stalled += 1;
-            unresolved.add(key);
-          }
+          const probe = await registeredRealpathWithin(key, budget);
+          if (probe.stalled) stalled += 1;
+          if (probe.unknown) unresolved.add(key);
           canonicalByKey.set(key, probe.canonical);
         } finally {
           slot.release();
