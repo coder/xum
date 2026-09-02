@@ -3693,6 +3693,24 @@ describe("project bundle", () => {
     expect(planProjectBundleRestore(bundle, new Map(), origins).imports).toHaveLength(1);
   });
 
+  it("lets one local project receive at most one bundle entry", async () => {
+    // Source A was imported to local path B earlier; a later bundle also records B itself.
+    const sourceA = entryFor("/home/dev/src/alpha");
+    const localB = "/home/other/checkouts/beta";
+    const entryB = entryFor(localB);
+    await writeFixtureFile(muxRoot, `memory/project/${sourceA.memoryDir}/a.md`, "a\n");
+    await writeFixtureFile(muxRoot, `memory/project/${entryB.memoryDir}/b.md`, "b\n");
+    const bundle = await collectProjectBundle(muxRoot, [sourceA, entryB]);
+    const registered = new Map([[localB, entryB.memoryDir]]);
+    const origins = new Map([[sourceA.path, { projectPath: localB, memoryDir: entryB.memoryDir }]]);
+
+    const plan = planProjectBundleRestore(bundle, registered, origins);
+    // The exact-path entry keeps the project; the imported-origin entry is re-offered rather
+    // than merged into the same memory scope.
+    expect(plan.matched.map((match) => match.entry.path)).toEqual([localB]);
+    expect(plan.imports.map((item) => item.entry.path)).toEqual([sourceA.path]);
+  });
+
   it("ignores origin markers that are unreadable or claim a source twice", async () => {
     const first = "/home/other/a";
     const second = "/home/other/b";

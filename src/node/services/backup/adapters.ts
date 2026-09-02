@@ -766,7 +766,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // From now on this project is the local identity of the recorded source: later
             // restores match it and can update its memory instead of re-offering an
             // add-only import that can never change an existing file.
-            await writeProjectMemoryOrigin(muxRoot, targetDir, entry.path);
+            try {
+              await writeProjectMemoryOrigin(muxRoot, targetDir, entry.path);
+            } catch (error) {
+              // The memory files are already on disk; the failure must keep reporting them.
+              throw new ProjectMemoryWriteError(
+                error instanceof Error ? error.message : String(error),
+                result,
+                { cause: error }
+              );
+            }
             return result;
           });
           return { writtenFiles: written, skippedFiles: skipped };

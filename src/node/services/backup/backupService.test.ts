@@ -1581,6 +1581,45 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("refuses network and device import targets before probing them", async () => {
+    let probes = 0;
+    const realLstat = fs.lstat.bind(fs);
+    const lstat = spyOn(fs, "lstat").mockImplementation(((target, options) => {
+      probes += 1;
+      return realLstat(target, options);
+    }) as typeof fs.lstat);
+    try {
+      const service = createService(tempDir, {
+        payload: createPayload({
+          validateRestore: () =>
+            Promise.resolve({
+              hasProjectBundle: true,
+              projectImports: [candidate()],
+              matchedProjectPaths: [],
+            }),
+        }),
+      });
+      for (const targetPath of [
+        "\\\\attacker\\share\\repo",
+        "//attacker/share/repo",
+        "\\\\?\\C:\\x",
+      ]) {
+        const result = await service.restore(
+          { ...SETTINGS, includeProjects: true },
+          { projectImports: [{ token: "candidate-token", targetPath }] }
+        );
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error.message).toContain("network or device path");
+        }
+      }
+      // A stat of a UNC path would already start SMB authentication.
+      expect(probes).toBe(0);
+    } finally {
+      lstat.mockRestore();
+    }
+  });
+
   test("refuses two imports whose targets are aliases of one directory", async () => {
     const realParent = path.join(tempDir, "real");
     const target = path.join(realParent, "proj");

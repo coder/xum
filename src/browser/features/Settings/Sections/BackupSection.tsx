@@ -424,7 +424,7 @@ export function BackupSection() {
         for (const candidate of nextImports) {
           next[candidate.token] = current[candidate.token] ?? {
             approved: false,
-            targetPath: candidate.sourcePath,
+            targetPath: "",
           };
         }
         return next;
@@ -525,10 +525,7 @@ export function BackupSection() {
           setProjectImports(nextImports);
           setProjectImportSelections(
             Object.fromEntries(
-              nextImports.map((candidate) => [
-                candidate.token,
-                { approved: false, targetPath: candidate.sourcePath },
-              ])
+              nextImports.map((candidate) => [candidate.token, { approved: false, targetPath: "" }])
             )
           );
         }
@@ -545,10 +542,7 @@ export function BackupSection() {
       setProjectImports(unapproved);
       setProjectImportSelections(
         Object.fromEntries(
-          unapproved.map((candidate) => [
-            candidate.token,
-            { approved: false, targetPath: candidate.sourcePath },
-          ])
+          unapproved.map((candidate) => [candidate.token, { approved: false, targetPath: "" }])
         )
       );
       setProjectImportResults(result.data.projectImportResults);
@@ -951,7 +945,7 @@ export function BackupSection() {
             {projectImports.map((candidate) => {
               const selection = projectImportSelections[candidate.token] ?? {
                 approved: false,
-                targetPath: candidate.sourcePath,
+                targetPath: "",
               };
               return (
                 <li key={candidate.token} className="border-border-light rounded-md border p-3">
@@ -1000,7 +994,10 @@ export function BackupSection() {
                           [candidate.token]: { ...selection, targetPath: event.target.value },
                         }))
                       }
-                      placeholder={candidate.sourcePath}
+                      // Never prefilled from the backup: the recorded path is repository-
+                      // controlled, and on Windows a UNC path merely probed by the restore
+                      // would start SMB authentication. The user names a local directory.
+                      placeholder="Absolute path of the local checkout"
                       disabled={busy}
                     />
                   </label>

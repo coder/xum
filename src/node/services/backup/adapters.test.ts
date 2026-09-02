@@ -6,7 +6,12 @@ import * as path from "node:path";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { BackupNonFastForwardError, backupCachePath } from "./gitRepo";
-import { MAX_BACKUP_FILE_BYTES, MAX_BACKUP_FILE_COUNT, ProjectMemoryRestoreError } from "./payload";
+import {
+  MAX_BACKUP_FILE_BYTES,
+  MAX_BACKUP_FILE_COUNT,
+  ProjectMemoryRestoreError,
+  ProjectMemoryWriteError,
+} from "./payload";
 import { MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
@@ -2032,6 +2037,42 @@ describe("backup adapters project bundle", () => {
     expect(
       await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "conflict.md"), "utf-8")
     ).toBe("local wins\n");
+  });
+
+  it("keeps reporting written files when the origin marker cannot be written", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const { repository, payload } = await exportBundle();
+    config.state.projects.delete(project);
+    await fs.rm(path.join(muxRoot, "memory", "project", projectMemoryDirName(project)), {
+      recursive: true,
+      force: true,
+    });
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    const targetPath = path.join(tempDir, "projects", "alpha-moved");
+    const targetDir = projectMemoryDirName(targetPath);
+    // A directory squats on the marker's name, so the marker write fails after the notes landed.
+    await fs.mkdir(path.join(muxRoot, "memory", "project", targetDir, ".backup-origin.json"), {
+      recursive: true,
+    });
+
+    const importer = await payload.prepareProjectImports({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+    });
+    const error = await captureRejection(
+      importer.importProjectMemory({ token: preview.projectImports[0].token, targetPath })
+    );
+    expect(error).toBeInstanceOf(ProjectMemoryWriteError);
+    expect((error as ProjectMemoryWriteError).written).toEqual([
+      `memory/project/${targetDir}/notes.md`,
+    ]);
   });
 
   it("updates an imported project's memory on later restores instead of re-offering it", async () => {

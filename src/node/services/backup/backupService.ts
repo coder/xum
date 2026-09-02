@@ -290,6 +290,11 @@ function toOperationError(error: unknown): BackupOperationError {
   return { code: "IO_ERROR", message: "Settings backup failed" };
 }
 
+/** `\\server\share`, `//server/share`, and `\\?\` / `\\.\` device namespaces. */
+function isNetworkOrDevicePath(targetPath: string): boolean {
+  return /^(?:\\\\|\/\/)/.test(targetPath);
+}
+
 async function realpathOrNull(target: string): Promise<string | null> {
   return fs.realpath(target).catch(() => null);
 }
@@ -724,6 +729,16 @@ export class BackupService {
       }
       byToken.delete(request.token);
       const targetPath = request.targetPath.trim();
+      // Refused before any filesystem probe: merely stat-ing a UNC or device path on
+      // Windows starts SMB authentication against whatever host it names, and a target
+      // is meant to be a local checkout in any case. Checked before the absolute-path rule
+      // so the refusal reads the same on every platform.
+      if (isNetworkOrDevicePath(targetPath)) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': the target must be a local directory, not a network or device path`
+        );
+      }
       if (!path.isAbsolute(targetPath)) {
         throw new BackupServiceError(
           "IO_ERROR",

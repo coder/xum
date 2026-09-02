@@ -3007,26 +3007,35 @@ export function planProjectBundleRestore(
   origins: ReadonlyMap<string, ProjectMemoryOrigin> = new Map()
 ): ProjectBundleRestorePlan {
   const plan: ProjectBundleRestorePlan = { matched: [], imports: [] };
-  for (const entry of bundle.manifest.projects) {
-    const files = bundleEntryFiles(bundle.files, entry);
+  // One local project receives at most one entry: a project recorded directly at a path
+  // that an earlier import also targets would otherwise merge two entries' notes into one
+  // memory scope. The exact-path match wins; the colliding entry is re-offered as an import.
+  const claimed = new Set<string>();
+  const localIdentity = (entry: BackupProjectBundleEntry): ProjectMemoryOrigin | null => {
     if (registeredDirByPath.get(entry.path) === entry.memoryDir) {
-      plan.matched.push({
-        entry,
-        files,
-        projectPath: entry.path,
-        localMemoryDir: entry.memoryDir,
-      });
-      continue;
+      return { projectPath: entry.path, memoryDir: entry.memoryDir };
     }
     const origin = origins.get(entry.path);
     // The origin's project must still be registered with the dir name this host computes;
     // a stale marker under an unregistered or renamed directory falls back to an import.
-    if (origin !== undefined && registeredDirByPath.get(origin.projectPath) === origin.memoryDir) {
+    return origin !== undefined && registeredDirByPath.get(origin.projectPath) === origin.memoryDir
+      ? origin
+      : null;
+  };
+  const entries = bundle.manifest.projects.map((entry) => ({ entry, local: localIdentity(entry) }));
+  for (const { entry, local } of entries) {
+    if (local !== null && local.projectPath === entry.path) claimed.add(local.projectPath);
+  }
+  for (const { entry, local } of entries) {
+    const files = bundleEntryFiles(bundle.files, entry);
+    const viaOrigin = local !== null && local.projectPath !== entry.path;
+    if (local !== null && (!viaOrigin || !claimed.has(local.projectPath))) {
+      claimed.add(local.projectPath);
       plan.matched.push({
         entry,
         files,
-        projectPath: origin.projectPath,
-        localMemoryDir: origin.memoryDir,
+        projectPath: local.projectPath,
+        localMemoryDir: local.memoryDir,
       });
       continue;
     }
