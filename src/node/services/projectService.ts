@@ -437,18 +437,14 @@ export class ProjectService {
     projectPath: string,
     options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
-    // Config.editConfig would take the registration lock for the registering write anyway;
-    // taken here, around the whole operation, so withRegistrationLock can hand out a create
-    // that registers inside a window the caller already holds.
-    // The lock itself can fail (a wait on another process timing out, an unwritable locks
-    // directory): converted like every other failure, so create() keeps its Result contract.
-    try {
-      return await withProjectRegistrationLock(this.config.rootDir, (lock) =>
-        this.createUnlocked(projectPath, options, lock)
-      );
-    } catch (error) {
-      return Err(`Failed to create project: ${getErrorMessage(error)}`);
-    }
+    // No registration lock around the validation: it stats, resolves, and runs git against
+    // the new path, which on a slow or unavailable filesystem can take as long as the lock's
+    // wait bound — and every config save in every process waits for that lock, so holding it
+    // here would stall unrelated workspace, task, and settings saves behind one stuck create.
+    // The registering write below takes the lock itself, through editConfig, and re-validates
+    // against the config as it is under that hold; only withRegistrationLock callers, which
+    // already hold a window, register inside it.
+    return this.createUnlocked(projectPath, options, null);
   }
 
   /**
@@ -472,10 +468,11 @@ export class ProjectService {
     );
   }
 
+  /** `lock`: the caller's registration window, or null when editConfig is to take its own. */
   private async createUnlocked(
     projectPath: string,
     options: { initGit?: boolean; displayName?: string } | undefined,
-    lock: ProjectRegistrationLockHandle
+    lock: ProjectRegistrationLockHandle | null
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
     let gitInitClaimKey: string | null = null;
     try {
@@ -757,9 +754,12 @@ export class ProjectService {
           freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
           createResult = Ok({ projectConfig, normalizedPath });
           return freshConfig;
-          // create() (or a withRegistrationLock caller) already holds the registration lock.
         },
-        { withinRegistrationLock: lock }
+        // A withRegistrationLock caller already holds the registration lock; create() lets
+        // this edit take it. Either way a lock failure (a wait on another process timing
+        // out, an unwritable locks directory) is caught below like every other failure, so
+        // the Result contract holds.
+        lock === null ? {} : { withinRegistrationLock: lock }
       );
 
       // Do NOT clean up the created directory when a concurrent registration claims

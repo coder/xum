@@ -761,6 +761,104 @@ describe("BackupSection", () => {
     expect(canvas.getByRole("checkbox", { name: "Import project rocket" })).toBeTruthy();
   });
 
+  test("keeps an earlier attempt's added files and registration on a retry", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const attempt = (attemptResult: {
+      writtenFiles: string[];
+      skippedFiles: string[];
+      registered: boolean;
+    }) => ({
+      commit: "def5678",
+      snapshotPath: "/tmp/mux-backup-snapshot",
+      changedFiles: [],
+      localOnlyFiles: [],
+      projectImportResults: [
+        {
+          sourcePath: candidate.sourcePath,
+          targetPath: "/home/other/rocket",
+          name: candidate.name,
+          status: "imported" as const,
+          ...attemptResult,
+        },
+      ],
+      projectBundleSkipped: false,
+      unapprovedProjectImports: attemptResult.skippedFiles.length > 0 ? [candidate] : [],
+    });
+    const { view } = renderBackupSection(
+      {
+        backupPreview: {
+          pushChanges: [],
+          restoreChanges: [],
+          localOnlyFiles: [],
+          redactions: [],
+          commandApprovals: [],
+          projectImports: [candidate],
+          projectBundleSkipped: false,
+          pushError: null,
+        },
+      },
+      (client) => {
+        // The first attempt registers the project and adds one file before a conflict; the
+        // retry finds that file in place and reports only what it added itself.
+        jest
+          .spyOn(client.backup, "restore")
+          .mockResolvedValueOnce({
+            success: true,
+            data: attempt({
+              writtenFiles: ["memory/project/rocket-abc/notes.md"],
+              skippedFiles: ["memory/project/rocket-abc/conflict.md"],
+              registered: true,
+            }),
+          })
+          .mockResolvedValueOnce({
+            success: true,
+            data: attempt({
+              writtenFiles: ["memory/project/rocket-abc/conflict.md"],
+              skippedFiles: [],
+              registered: false,
+            }),
+          });
+      }
+    );
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+    await canvas.findByText(/Partially imported: rocket/);
+    // The undo list names the files, not a count.
+    expect(
+      canvas.getByText(/Added memory file: memory\/project\/rocket-abc\/notes\.md/)
+    ).toBeTruthy();
+
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+    await canvas.findByText(/^Imported: rocket/);
+    // One card for the import, listing both attempts' files and the registration the first
+    // attempt made — the retry alone would say nothing was registered.
+    expect(canvas.queryByText(/Partially imported: rocket/)).toBeNull();
+    expect(
+      canvas.getByText(
+        /Added memory files: memory\/project\/rocket-abc\/notes\.md, memory\/project\/rocket-abc\/conflict\.md/
+      )
+    ).toBeTruthy();
+    expect(canvas.getByText(/Newly registered project/)).toBeTruthy();
+    expect(canvas.getByText(/remove the projects marked as newly registered/)).toBeTruthy();
+  });
+
   test("re-presents fresh candidates when import approval goes stale", async () => {
     const staleCandidate = {
       sourcePath: "/home/dev/src/rocket",

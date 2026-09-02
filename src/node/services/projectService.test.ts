@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import { execSync } from "child_process";
@@ -2874,6 +2874,32 @@ exit 1
       const projects = config.loadConfigOrDefault().projects;
       expect(projects.has("/fake/from-this-process")).toBe(true);
       expect(projects.has("/fake/from-other-process")).toBe(true);
+    });
+
+    it("validates a new project without holding the registration lock", async () => {
+      const target = path.join(tempDir, "validated-unlocked");
+      await fs.mkdir(target);
+      // Another process holds the lock throughout the validation. Every config save waits
+      // for that lock, so a create that took it around its stats, realpath, and git probes
+      // would hold up unrelated saves for as long as a slow filesystem keeps it busy.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const editConfig = spyOn(config, "editConfig");
+      const creating = service.create(target);
+      // The validation reaches the registering write while the lock is still held elsewhere.
+      const deadline = Date.now() + 2_000;
+      while (editConfig.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(editConfig).toHaveBeenCalledTimes(1);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+
+      await otherProcess[Symbol.asyncDispose]();
+      expect((await creating).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
     });
 
     it("refuses to register once another process has displaced the registration lock", async () => {

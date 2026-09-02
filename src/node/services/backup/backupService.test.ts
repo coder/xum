@@ -2092,6 +2092,52 @@ describe("BackupService project imports", () => {
     expect(snapshots).toBe(0);
   });
 
+  test("refuses an import into a directory at another backed-up project's recorded path", async () => {
+    // Local directories at two other entries' recorded paths: one still on offer, one matched.
+    const otherCandidatePath = path.join(tempDir, "beta");
+    const matchedSourcePath = path.join(tempDir, "gamma-source");
+    await fs.mkdir(otherCandidatePath);
+    await fs.mkdir(matchedSourcePath);
+    let snapshots = 0;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [
+              candidate(),
+              candidate({ sourcePath: otherCandidatePath, name: "beta", token: "beta-token" }),
+            ],
+            matchedProjects: [
+              {
+                sourcePath: matchedSourcePath,
+                projectPath: path.join(tempDir, "gamma-local"),
+                localMemoryDir: "g-abc",
+              },
+            ],
+          }),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+
+    for (const targetPath of [otherCandidatePath, matchedSourcePath]) {
+      // Registering it would make every later restore match the other entry there by exact
+      // path, writing that entry's memory into this candidate's scope.
+      const result = await service.restore(
+        { ...SETTINGS, includeProjects: true },
+        { projectImports: [{ token: "candidate-token", targetPath }] }
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.message).toContain("recorded path of another backed-up project");
+      }
+    }
+    expect(snapshots).toBe(0);
+  });
+
   test("refuses network and device import targets before probing them", async () => {
     let probes = 0;
     const realLstat = fs.lstat.bind(fs);

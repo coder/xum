@@ -799,6 +799,8 @@ export class BackupService {
     const claimedTargets = new Set<string>();
     const registry = await this.registeredProjectLookup();
     const matchedProjectPaths = new Set(matched.map((match) => match.projectPath));
+    // Every source path the bundle records, whichever entry recorded it.
+    const recordedSources = new Set([...candidates, ...matched].map((entry) => entry.sourcePath));
     for (const request of requested) {
       const candidate = byToken.get(request.token);
       // Unknown and stale tokens are indistinguishable here; both mean the user approved
@@ -866,6 +868,19 @@ export class BackupService {
           `Cannot import '${candidate.name}': '${resolved}' already receives a backed-up project's memory in this restore`
         );
       }
+      // Nor a directory at another backed-up project's recorded path: registering it would
+      // make every later restore match that other entry there directly, by exact path — over
+      // an origin record and ahead of anywhere its memory was imported — so the other entry's
+      // notes would be written into this candidate's scope. Its own recorded path is fine:
+      // that is the entry being restored where it came from.
+      for (const spelling of new Set([resolved, canonical, registeredPath ?? resolved])) {
+        if (recordedSources.has(spelling) && spelling !== candidate.sourcePath) {
+          throw new BackupServiceError(
+            "IO_ERROR",
+            `Cannot import '${candidate.name}': '${resolved}' is the recorded path of another backed-up project`
+          );
+        }
+      }
       planned.push({
         candidate,
         targetPath: resolved,
@@ -920,6 +935,10 @@ export class BackupService {
       // Real paths resolved during planning are reused; only projects registered since are
       // probed, so a slow mount is waited on once per restore, not again under this lock.
       const registry = await this.registeredProjectLookup(planningRegistry ?? undefined);
+      // Paths this very loop registers: the lookup above predates them, and a later
+      // candidate's recorded source may be one of them (planning refuses the case it can
+      // see; this is the check under the lock).
+      const registeredHere = new Set<string>();
       for (const {
         candidate,
         targetPath,
@@ -962,7 +981,7 @@ export class BackupService {
           // its origin record overridden by the exact-path match. Refused under the
           // registration lock, where this cannot change again before the write; the next
           // preview shows the entry as matched.
-          if (registry.keys.has(candidate.sourcePath)) {
+          if (registry.keys.has(candidate.sourcePath) || registeredHere.has(candidate.sourcePath)) {
             reclassified.add(candidate.token);
             results.push(
               failed(
@@ -1022,6 +1041,7 @@ export class BackupService {
           if (created.success) {
             registeredPath = created.data.normalizedPath;
             registered = true;
+            registeredHere.add(registeredPath);
           } else if (created.error === "Project already exists") {
             // Resolved above, or registered by an earlier candidate of this very loop (the
             // lock excludes everyone else): the lookup built inside the window predates that.

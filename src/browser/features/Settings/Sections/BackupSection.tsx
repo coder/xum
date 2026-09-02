@@ -119,6 +119,34 @@ function importResultTone(result: BackupProjectImportResult): string {
   return result.skippedFiles.length > 0 ? "text-warning" : "text-success";
 }
 
+/**
+ * Results of a later restore run merged over the earlier ones, per import. The files an
+ * earlier attempt added stay listed — a retry finds them in place and reports only what it
+ * added itself — and a registration the earlier attempt made stays marked, since neither is
+ * covered by the safety snapshot and both are what undoing the import means removing.
+ */
+function mergeImportResults(
+  previous: readonly BackupProjectImportResult[],
+  next: readonly BackupProjectImportResult[]
+): BackupProjectImportResult[] {
+  const key = (result: BackupProjectImportResult) => `${result.sourcePath}\0${result.targetPath}`;
+  const merged = new Map(previous.map((result) => [key(result), result]));
+  for (const result of next) {
+    const earlier = merged.get(key(result));
+    merged.set(
+      key(result),
+      earlier === undefined
+        ? result
+        : {
+            ...result,
+            writtenFiles: [...new Set([...earlier.writtenFiles, ...result.writtenFiles])],
+            registered: earlier.registered || result.registered,
+          }
+    );
+  }
+  return [...merged.values()];
+}
+
 function describeRestoredFiles(count: number): string {
   if (count === 0) return "settings; no files changed";
   return `${count} file${count === 1 ? "" : "s"}`;
@@ -415,9 +443,11 @@ export function BackupSection() {
     setOverrideSecretScan(false);
     // The project half of the preview is cleared with the rest of it: left standing through
     // a failed preview, the old cards would offer a plan the repository no longer describes.
+    // Import results are not part of the preview and stay: they list what earlier restores
+    // wrote and registered, which the user needs to undo an import and a preview does not
+    // change.
     setProjectImports([]);
     setProjectBundleSkipped(false);
-    setProjectImportResults([]);
 
     try {
       const result = await api.backup.preview(savedDraft);
@@ -450,7 +480,6 @@ export function BackupSection() {
         return next;
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
-      setProjectImportResults([]);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -565,7 +594,9 @@ export function BackupSection() {
           unapproved.map((candidate) => [candidate.token, { approved: false, targetPath: "" }])
         )
       );
-      setProjectImportResults(result.data.projectImportResults);
+      setProjectImportResults((previous) =>
+        mergeImportResults(previous, result.data.projectImportResults)
+      );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
@@ -1045,8 +1076,8 @@ export function BackupSection() {
                 ) : null}
                 {importResult.writtenFiles.length > 0 ? (
                   <span className="text-muted block break-all">
-                    Added {importResult.writtenFiles.length} memory{" "}
-                    {importResult.writtenFiles.length === 1 ? "file" : "files"}
+                    Added memory {importResult.writtenFiles.length === 1 ? "file" : "files"}:{" "}
+                    {importResult.writtenFiles.join(", ")}
                   </span>
                 ) : null}
                 {importResult.registered ? (
