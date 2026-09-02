@@ -38,6 +38,12 @@ export const TIMELINE_FILE_NAME = "timeline.jsonl";
 export const CHAT_ARCHIVE_FILE_NAME = "chat-archive.jsonl";
 
 /**
+ * Per-workspace tombstones for synthetic history rows that must stay out of
+ * provider requests when the primary history rewrite fails.
+ */
+export const PROVIDER_EXCLUDED_MESSAGE_IDS_FILE_NAME = "provider-excluded-message-ids.jsonl";
+
+/**
  * Per-workspace sidecar recording headless AI usage (status generation,
  * memory consolidation/harvest) that produces no chat.jsonl assistant row.
  * Appended by SessionUsageService.recordHeadlessUsage and ingested into the

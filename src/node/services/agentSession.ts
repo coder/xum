@@ -6102,6 +6102,11 @@ export class AgentSession {
           abortTurnGeneration,
           preparingTurnGeneration: this.preparingTurnGeneration,
         });
+        // The renderer still needs the old terminal event to clear that exact stream.
+        this.emitChatEvent({
+          ...payload,
+          rendererCleanupOnly: true,
+        });
         return;
       }
 
@@ -7173,6 +7178,23 @@ export class AgentSession {
       return;
     }
 
+    // Persist the exclusion before producer settlement. A crash must never expose
+    // the synthetic row after its producer watermark says that the wake was consumed.
+    const tombstoneResult = await this.historyService.addProviderExclusionTombstones(
+      this.workspaceId,
+      messageIds
+    );
+    if (!tombstoneResult.success) {
+      log.error("Failed to persist a provider exclusion tombstone", {
+        workspaceId: this.workspaceId,
+        messageIds,
+        exclusionError: exclusionResult.error,
+        tombstoneError: tombstoneResult.error,
+      });
+      return;
+    }
+    this.onProviderExcludedHistoryChange?.();
+
     const wakeRecords = activeClaim.providerExcludedWakeRecords;
     if (wakeRecords.length > 0) {
       if (this.settleProviderExcludedWakeRecords == null) {
@@ -7184,7 +7206,7 @@ export class AgentSession {
         return;
       }
       try {
-        // Deletion removes the recovery record. Persist the producer watermark first.
+        // The tombstone keeps the recovery record excluded while this watermark advances.
         await this.settleProviderExcludedWakeRecords(wakeRecords);
       } catch (error) {
         log.error("Failed to settle a canceled wake before provider-exclusion deletion", {

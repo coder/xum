@@ -2402,13 +2402,16 @@ export class StreamingMessageAggregator {
   }
 
   handleStreamAbort(data: StreamAbortEvent): void {
-    // Abort can arrive before stream-start. Clear pending lifecycle UI immediately.
-    this.clearPendingStreamLifecycleState();
-    this.clearInFlightStreamLifecycle();
-    this.lastAbortReason = {
-      reason: data.abortReason ?? "system",
-      at: Date.now(),
-    };
+    const rendererCleanupOnly = data.rendererCleanupOnly === true;
+    if (!rendererCleanupOnly) {
+      // Abort can arrive before stream-start. Clear pending lifecycle UI immediately.
+      this.clearPendingStreamLifecycleState();
+      this.clearInFlightStreamLifecycle();
+      this.lastAbortReason = {
+        reason: data.abortReason ?? "system",
+        at: Date.now(),
+      };
+    }
 
     // Clear "interrupting" state - stream is now fully "interrupted"
     if (this.interruptingMessageId === data.messageId) {

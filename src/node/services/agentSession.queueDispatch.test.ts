@@ -1516,7 +1516,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       expect(recordUserStoppedStream).not.toHaveBeenCalled();
       expect(updateStartupAutoRetryAbandonFromAbort).not.toHaveBeenCalled();
-      expect(events.some((event) => event.type === "stream-abort")).toBe(false);
+      const abortEvent = events.find((event) => event.type === "stream-abort");
+      expect(abortEvent?.type).toBe("stream-abort");
+      if (abortEvent?.type === "stream-abort") {
+        expect(abortEvent.rendererCleanupOnly).toBe(true);
+      }
     } finally {
       session.dispose();
       await cleanup();
@@ -1590,6 +1594,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const exclusion = internalSession.excludeCanceledIrreversibleClaim(activeClaim);
       await settlementStarted;
       expect(deleteMessages).not.toHaveBeenCalled();
+      const durableHistory = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(durableHistory.success).toBe(true);
+      if (durableHistory.success) {
+        expect(durableHistory.data[0]?.metadata?.providerExcluded).toBe(true);
+      }
 
       releaseSettlement();
       await exclusion;

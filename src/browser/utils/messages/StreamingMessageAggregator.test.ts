@@ -3932,6 +3932,47 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("abort reason tracking", () => {
+    test("cleanup-only abort preserves a replacement stream", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId: "test-workspace",
+        messageId: "old-stream",
+        historySequence: 1,
+        model: "claude-3-5-sonnet-20241022",
+        startTime: 1,
+      });
+      aggregator.setInterrupting();
+      aggregator.handleStreamStart({
+        type: "stream-start",
+        workspaceId: "test-workspace",
+        messageId: "replacement-stream",
+        historySequence: 2,
+        model: "claude-3-5-sonnet-20241022",
+        startTime: 2,
+      });
+      aggregator.handleStreamLifecycle({
+        type: "stream-lifecycle",
+        workspaceId: "test-workspace",
+        phase: "streaming",
+        hadAnyOutput: false,
+      });
+
+      aggregator.handleStreamAbort({
+        type: "stream-abort",
+        workspaceId: "test-workspace",
+        messageId: "old-stream",
+        abortReason: "user",
+        rendererCleanupOnly: true,
+      });
+
+      expect(aggregator.isStreamActive("old-stream")).toBe(false);
+      expect(aggregator.isStreamActive("replacement-stream")).toBe(true);
+      expect(aggregator.hasInterruptingStream()).toBe(false);
+      expect(aggregator.getStreamLifecycle()?.phase).toBe("streaming");
+      expect(aggregator.getLastAbortReason()).toBeNull();
+    });
+
     test("stores last abort reason and clears on stream-start", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 

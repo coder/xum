@@ -2230,6 +2230,75 @@ describe("WorkspaceStore", () => {
       expect(store.getStreamingMessage(workspaceId, secondRow.id, secondMessageId)).not.toBeNull();
     });
 
+    it("keeps the replacement channel for a cleanup-only abort", async () => {
+      const workspaceId = "cleanup-only-abort-channel";
+      const oldMessageId = "old-stream";
+      const replacementMessageId = "replacement-stream";
+      createAndAddWorkspace(store, workspaceId);
+      const rawStore = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
+        processStreamEvent: (
+          id: string,
+          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
+          event: WorkspaceChatMessage
+        ) => void;
+      }>(store);
+      const dispatch = (event: WorkspaceChatMessage) =>
+        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
+
+      rawStore.handleChatMessage(workspaceId, {
+        type: "stream-start",
+        workspaceId,
+        messageId: oldMessageId,
+        historySequence: 1,
+        model: TEST_MODEL,
+        startTime: 1,
+      });
+      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
+      dispatch({
+        type: "stream-start",
+        workspaceId,
+        messageId: replacementMessageId,
+        historySequence: 2,
+        model: TEST_MODEL,
+        startTime: 2,
+      });
+      for (const [delta, timestamp] of [
+        ["hello", 3],
+        [" world", 4],
+      ] as const) {
+        dispatch({
+          type: "stream-delta",
+          workspaceId,
+          messageId: replacementMessageId,
+          delta,
+          tokens: 1,
+          timestamp,
+        });
+      }
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+      const replacementRow = store
+        .getAggregator(workspaceId)!
+        .getDisplayedMessages()
+        .find((message) => "historyId" in message && message.historyId === replacementMessageId)!;
+      const replacementKey = `${workspaceId}\u0000${replacementRow.id}`;
+      expect(rawStore.streamingMessageStore.has(replacementKey)).toBe(true);
+
+      dispatch({
+        type: "stream-abort",
+        workspaceId,
+        messageId: oldMessageId,
+        abortReason: "user",
+        rendererCleanupOnly: true,
+      });
+
+      expect(rawStore.streamingMessageStore.has(replacementKey)).toBe(true);
+      expect(store.getAggregator(workspaceId)!.isStreamActive(oldMessageId)).toBe(false);
+      expect(store.getAggregator(workspaceId)!.isStreamActive(replacementMessageId)).toBe(true);
+    });
+
     it("releases the keyed channel when a background activity stop clears the stream", async () => {
       const workspaceId = "keyed-channel-background-stop";
       createAndAddWorkspace(store, workspaceId);

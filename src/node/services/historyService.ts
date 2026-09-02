@@ -31,7 +31,11 @@ import {
   isDurableContextBoundaryMarker,
 } from "@/common/utils/messages/compactionBoundary";
 import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
-import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import {
+  CHAT_FILE_NAME,
+  CHAT_ARCHIVE_FILE_NAME,
+  PROVIDER_EXCLUDED_MESSAGE_IDS_FILE_NAME,
+} from "@/common/constants/paths";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   readSubagentTranscriptArtifactsFile,
@@ -497,6 +501,91 @@ export class HistoryService {
 
   private getChatArchivePath(workspaceId: string): string {
     return path.join(this.getSessionDir(workspaceId), this.CHAT_ARCHIVE_FILE);
+  }
+
+  private getProviderExcludedMessageIdsPath(workspaceId: string): string {
+    return path.join(this.getSessionDir(workspaceId), PROVIDER_EXCLUDED_MESSAGE_IDS_FILE_NAME);
+  }
+
+  private async readProviderExcludedMessageIds(workspaceId: string): Promise<Set<string>> {
+    const contents = await this.readExistingFile(
+      this.getProviderExcludedMessageIdsPath(workspaceId)
+    );
+    const messageIds = new Set<string>();
+    if (contents === null) {
+      return messageIds;
+    }
+
+    for (const line of contents.split("\n")) {
+      if (line.trim().length === 0) continue;
+      try {
+        const messageId: unknown = JSON.parse(line);
+        if (typeof messageId === "string" && messageId.length > 0) {
+          messageIds.add(messageId);
+        }
+      } catch {
+        // A malformed tombstone must not hide the remaining valid exclusions.
+      }
+    }
+    return messageIds;
+  }
+
+  private applyProviderExclusionTombstones(
+    messages: MuxMessage[],
+    messageIds: ReadonlySet<string>
+  ): MuxMessage[] {
+    if (messageIds.size === 0) return messages;
+
+    return messages.map((message) => {
+      if (
+        !messageIds.has(message.id) ||
+        message.metadata?.synthetic !== true ||
+        message.metadata.contextBoundaryKind != null ||
+        message.metadata.compactionBoundary === true ||
+        message.metadata.providerExcluded === true
+      ) {
+        return message;
+      }
+      return {
+        ...message,
+        metadata: { ...message.metadata, providerExcluded: true },
+      };
+    });
+  }
+
+  /**
+   * Durably exclude synthetic rows before their producer watermark advances.
+   * Tombstones remain after row deletion because removal would create a cross-file read race.
+   */
+  async addProviderExclusionTombstones(
+    workspaceId: string,
+    messageIds: readonly string[]
+  ): Promise<Result<void>> {
+    assert(messageIds.length > 0, "addProviderExclusionTombstones requires message IDs");
+    const ids = new Set(messageIds);
+    assert(ids.size === messageIds.length, "addProviderExclusionTombstones requires unique IDs");
+
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to add provider exclusion tombstones",
+      async () => {
+        try {
+          const persistedIds = await this.readProviderExcludedMessageIds(workspaceId);
+          for (const messageId of ids) persistedIds.add(messageId);
+          const contents = [...persistedIds]
+            .sort()
+            .map((messageId) => JSON.stringify(messageId))
+            .join("\n");
+          await writeFileAtomic(
+            this.getProviderExcludedMessageIdsPath(workspaceId),
+            `${contents}\n`
+          );
+          return Ok(undefined);
+        } catch (error) {
+          return Err(`Failed to add provider exclusion tombstones: ${getErrorMessage(error)}`);
+        }
+      }
+    );
   }
 
   private getTruncateTransactionPath(workspaceId: string): string {
@@ -1301,6 +1390,9 @@ export class HistoryService {
         Ok({
           archive: await this.readExistingFile(this.getChatArchivePath(sourceWorkspaceId)),
           chat: await this.readExistingFile(this.getChatHistoryPath(sourceWorkspaceId)),
+          providerExclusions: await this.readExistingFile(
+            this.getProviderExcludedMessageIdsPath(sourceWorkspaceId)
+          ),
         })
     );
     if (!snapshot.success) {
@@ -1312,6 +1404,10 @@ export class HistoryService {
       for (const [targetPath, contents] of [
         [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
         [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
+        [
+          this.getProviderExcludedMessageIdsPath(targetWorkspaceId),
+          snapshot.data.providerExclusions,
+        ],
       ] as const) {
         if (contents === null) {
           await fs.rm(targetPath, { force: true });
@@ -1333,16 +1429,19 @@ export class HistoryService {
     const chatPath = this.getChatHistoryPath(workspaceId);
     const archivePath = this.getChatArchivePath(workspaceId);
     try {
+      const providerExcludedMessageIds = await this.readProviderExcludedMessageIds(workspaceId);
+      const visitWithExclusions = (messages: MuxMessage[]) =>
+        visitor(this.applyProviderExclusionTombstones(messages, providerExcludedMessageIds));
       if (direction === "forward") {
         // Archived rows are strictly older than active rows.
-        const completed = await this.iterateForward(archivePath, visitor);
+        const completed = await this.iterateForward(archivePath, visitWithExclusions);
         if (completed) {
-          await this.iterateForward(chatPath, visitor);
+          await this.iterateForward(chatPath, visitWithExclusions);
         }
       } else {
-        const completed = await this.iterateBackward(chatPath, visitor);
+        const completed = await this.iterateBackward(chatPath, visitWithExclusions);
         if (completed) {
-          await this.iterateBackward(archivePath, visitor);
+          await this.iterateBackward(archivePath, visitWithExclusions);
         }
       }
       return Ok(undefined);
@@ -1644,6 +1743,9 @@ export class HistoryService {
 
       const chatPath = this.getChatHistoryPath(workspaceId);
       const archivePath = this.getChatArchivePath(workspaceId);
+      const providerExcludedMessageIds = await this.readProviderExcludedMessageIds(workspaceId);
+      const complete = (messages: MuxMessage[]): Result<MuxMessage[]> =>
+        Ok(this.applyProviderExclusionTombstones(messages, providerExcludedMessageIds));
 
       // Try the requested boundary in chat.jsonl, falling back to less-skipped boundaries.
       let chatBoundaryCount = 0;
@@ -1652,7 +1754,7 @@ export class HistoryService {
         const offset = await this.findLastBoundaryByteOffset(chatPath, s);
         if (offset !== null) {
           if (s === skip) {
-            return Ok(await this.readHistoryFromOffset(chatPath, offset));
+            return complete(await this.readHistoryFromOffset(chatPath, offset));
           }
           // chat.jsonl has fewer boundaries than requested; remember its oldest
           // boundary as a fallback and keep counting into the archive.
@@ -1669,18 +1771,18 @@ export class HistoryService {
         if (offset !== null) {
           const archived = await this.readHistoryFromOffset(archivePath, offset);
           const active = await this.readChatHistory(workspaceId);
-          return Ok([...archived, ...active]);
+          return complete([...archived, ...active]);
         }
       }
 
       if (chatFallbackOffset !== null) {
-        return Ok(await this.readHistoryFromOffset(chatPath, chatFallbackOffset));
+        return complete(await this.readHistoryFromOffset(chatPath, chatFallbackOffset));
       }
 
       // No boundaries at all — workspace is uncompacted, full read is the only option
       const archived = await this.readArchivedHistory(workspaceId);
       const active = await this.readChatHistory(workspaceId);
-      return Ok([...archived, ...active]);
+      return complete([...archived, ...active]);
     };
 
     try {
@@ -1811,9 +1913,17 @@ export class HistoryService {
               this.getChatArchivePath(workspaceId),
               n - messages.length
             );
-            return Ok([...archived, ...messages]);
+            const providerExcludedMessageIds =
+              await this.readProviderExcludedMessageIds(workspaceId);
+            return Ok(
+              this.applyProviderExclusionTombstones(
+                [...archived, ...messages],
+                providerExcludedMessageIds
+              )
+            );
           }
-          return Ok(messages);
+          const providerExcludedMessageIds = await this.readProviderExcludedMessageIds(workspaceId);
+          return Ok(this.applyProviderExclusionTombstones(messages, providerExcludedMessageIds));
         } catch (error) {
           const message = getErrorMessage(error);
           return Err(`Failed to read last ${n} messages: ${message}`);
