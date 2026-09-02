@@ -7,7 +7,6 @@ import {
   ConfigTag,
   DevTools,
   Experiments,
-  MemoryMeta,
   Policy,
   SessionTiming,
   Telemetry,
@@ -60,19 +59,21 @@ export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
     })
   );
 
-/** The desktop's core graph options: every optional cross-cutting service present. */
+/**
+ * The desktop's core graph options: every optional cross-cutting service
+ * present. (`MemoryMeta` and `WorkspaceMcpOverrides` are core graph inputs in
+ * their own right, read from their tags by the core layers.)
+ */
 export const CoreOptionsFromDesktopLive: Layer.Layer<
   CoreOptionsTag,
   never,
-  ConfigTag | MemoryMeta | CrossCuttingTags
+  ConfigTag | CrossCuttingTags
 > = Layer.effect(
   CoreOptionsTag,
   Effect.gen(function* () {
     const config = yield* ConfigTag;
     return {
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
-      workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
-      memoryMetaService: yield* MemoryMeta,
       policyService: yield* Policy,
       telemetryService: yield* Telemetry,
       analyticsService: yield* Analytics,

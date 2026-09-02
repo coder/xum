@@ -7,9 +7,13 @@ import { createConfigStores, type ConfigStores } from "@/node/config";
 import * as coreServices from "@/node/services/coreServices";
 import type { CoreServices } from "@/node/services/coreServices";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
-import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
+import {
+  closeScopeBounded,
+  disposeAppRuntime,
+  makeAppRuntime,
+} from "@/node/services/di/appRuntime";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
-import { CoreOptionsTag } from "@/node/services/di/layers/core";
+import { CoreLive, CoreOptionsTag } from "@/node/services/di/layers/core";
 import {
   AI,
   BackgroundProcessManagerTag,
@@ -31,13 +35,16 @@ import {
   SessionUsage,
   StreamManagerTag,
   Task,
+  TerminalAttentionStoreTag,
   TurnRequestBuilderBindingsTag,
   Workspace,
   WorkspaceGoal,
+  WorkspaceMcpOverrides,
   WorkspaceTurnManagerTag,
   type CoreRootTags,
   type CoreTags,
 } from "@/node/services/di/tags";
+import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { createCoreServices, type CoreServicesRoot } from "./coreServicesRoot";
 
 /**
@@ -151,7 +158,7 @@ describe("createCoreServices", () => {
   });
 
   it("surfaces a throwing graph body as a synchronous throw", () => {
-    const buildSpy = spyOn(coreServices, "buildCoreGraph").mockImplementation(() => {
+    const buildSpy = spyOn(coreServices, "buildCoreTail").mockImplementation(() => {
       throw new Error("core boom");
     });
     try {
@@ -166,5 +173,90 @@ describe("createCoreServices", () => {
     } finally {
       buildSpy.mockRestore();
     }
+  });
+
+  it("provides the CLI defaults for the desktop-built inputs and the graph-internal store", () => {
+    root = createCoreServices({
+      ...stores,
+      extensionMetadataPath: path.join(tempDir, "extensionMetadata.json"),
+    });
+
+    expect(root.runtime.get(WorkspaceMcpOverrides)).toBeDefined();
+    expect(root.runtime.get(TerminalAttentionStoreTag)).toBeDefined();
+    expect(root.memoryMetaService).toBe(root.runtime.get(MemoryMeta));
+  });
+
+  it("wires the graph like the construction body did (each line has an observable effect)", async () => {
+    root = createCoreServices({
+      ...stores,
+      extensionMetadataPath: path.join(tempDir, "extensionMetadata.json"),
+    });
+
+    // turnRequestBuilderBindings: every collaborator the core wiring binds
+    // (the desktop container adds analyticsService and the OAuth services).
+    const expectedBindings: Pick<
+      Required<TurnRequestBuilderBindings>,
+      | "memoryService"
+      | "mcpServerManager"
+      | "workspaceHeartbeatService"
+      | "workflowResultContinuationSender"
+      | "taskService"
+      | "workspaceTurnManager"
+    > = {
+      memoryService: root.memoryService,
+      mcpServerManager: root.mcpServerManager,
+      workspaceHeartbeatService: root.workspaceService,
+      workflowResultContinuationSender: root.workspaceService,
+      taskService: root.taskService,
+      workspaceTurnManager: root.workspaceTurnManager,
+    };
+    for (const [key, expected] of Object.entries(expectedBindings)) {
+      expect(root.turnRequestBuilderBindings[key as keyof typeof expectedBindings]).toBe(expected);
+    }
+    const emitSpy = spyOn(root.workspaceService, "emitWorkflowRunActivity").mockResolvedValue(
+      undefined
+    );
+    const event = { workspaceId: "ws-1", runId: "run-1", status: "completed" as const };
+    await root.turnRequestBuilderBindings.onWorkflowRunStatusChanged?.(event);
+    expect(emitSpy).toHaveBeenCalledWith(event);
+
+    // Goal continuation consumer registered on the shared idle dispatcher: the
+    // goal service refuses a second registration.
+    const { workspaceGoalService, idleDispatcher } = root;
+    expect(() =>
+      workspaceGoalService.registerGoalContinuationConsumer(idleDispatcher, {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: () => {
+          throw new Error("unused");
+        },
+        executeGoalContinuation: () => Promise.resolve(false),
+        getKickoffSendOptions: () => {
+          throw new Error("unused");
+        },
+      })
+    ).toThrow("already registered");
+
+    // streamManager knows the MCP manager (lease acquire/release per stream).
+    const streamManagerInternals = root.streamManager as unknown as {
+      mcpServerManager?: unknown;
+    };
+    expect(streamManagerInternals.mcpServerManager).toBe(root.mcpServerManager);
+
+    // Registration probe installed on the extension metadata store and bound to
+    // this config: an unknown id is reported as not registered.
+    const extensionMetadataInternals = root.extensionMetadata as unknown as {
+      registrationProbe: ((workspaceId: string) => Promise<boolean>) | null;
+    };
+    expect(extensionMetadataInternals.registrationProbe).not.toBeNull();
+    const probe = extensionMetadataInternals.registrationProbe!;
+    expect(await probe("no-such-workspace")).toBe(false);
+  });
+
+  it("rejects a core graph whose inputs are missing at compile time", () => {
+    // `makeAppRuntime` accepts only fully provided graphs (R = never); `CoreLive`
+    // alone still requires its inputs (stores, options, MemoryMeta, overrides).
+    // @ts-expect-error CoreLive requires CoreInputTags
+    const build = () => makeAppRuntime(CoreLive);
+    expect(typeof build).toBe("function");
   });
 });

@@ -319,8 +319,6 @@ describe("ServiceContainer", () => {
     const coreOptions = services.runtime.get(CoreOptionsTag);
     expect(coreOptions.policyService).toBe(services.policyService);
     expect(coreOptions.experimentsService).toBe(services.experimentsService);
-    expect(coreOptions.workspaceMcpOverridesService).toBe(services.workspaceMcpOverridesService);
-    expect(coreOptions.memoryMetaService).toBe(services.memoryMetaService);
   });
 
   it("surfaces a throwing layer as a synchronous constructor throw", () => {

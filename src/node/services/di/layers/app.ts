@@ -3,7 +3,7 @@ import type { ConfigStores } from "@/node/config";
 import { AppFiberScopeLive } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive } from "@/node/services/di/effectRunner";
 import type { AppTags } from "@/node/services/di/tags";
-import { CoreProjectionLive, MemoryMetaLive } from "./core";
+import { CoreLive, MemoryMetaLive } from "./core";
 import { CoreOptionsFromDesktopLive, CrossCuttingLive } from "./desktop";
 import { StoresLive } from "./stores";
 
@@ -20,13 +20,14 @@ import { StoresLive } from "./stores";
  * captures its building context, so placing it there keeps that context to the
  * stores plus references (`Clock`, …). Above them the graph replays the
  * constructor's former order: memory metadata, the cross-cutting services, the
- * core options derived from them, then the core graph.
+ * core options derived from them, then the staged core graph (which reads
+ * `MemoryMeta` and `WorkspaceMcpOverrides` from those layers directly).
  */
 export function AppLive(stores: ConfigStores): Layer.Layer<AppTags> {
   const runtimeSeams = AppFiberScopeLive.pipe(
     Layer.provideMerge(EffectRunnerLive.pipe(Layer.provideMerge(StoresLive(stores))))
   );
-  return CoreProjectionLive.pipe(
+  return CoreLive.pipe(
     Layer.provideMerge(CoreOptionsFromDesktopLive),
     Layer.provideMerge(CrossCuttingLive),
     Layer.provideMerge(MemoryMetaLive),

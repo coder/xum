@@ -234,7 +234,7 @@ export class ServiceContainer {
     this.workspaceMcpOverridesService = this.runtime.get(WorkspaceMcpOverrides);
 
     // The core graph (shared with the `xum run`/`xum workflow` roots) is built by
-    // `CoreProjectionLive`; read it back as the plain object the wiring below uses.
+    // `CoreLive`; read it back as the plain object the wiring below uses.
     const core = coreServicesFromContext(this.runtime.context);
 
     // Spread core services into class fields

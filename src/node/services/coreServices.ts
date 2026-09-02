@@ -2,37 +2,39 @@
  * Core service graph shared by `xum run`/`xum workflow` (CLI) and
  * `ServiceContainer` (desktop).
  *
- * `buildCoreGraph` is the imperative construction body. Both roots reach it
- * through the Effect Layer graph — `CoreProjectionLive` in `di/layers/core.ts`
- * wraps it as a single coarse layer (Effect migration Phase 11) — so the roots
- * are `createCoreServices` (`./coreServicesRoot.ts`, CLI) and `AppLive`
- * (`di/layers/app.ts`, desktop). Construction order and wiring here are the
- * behavioral contract the per-service layers of the next phase must replay.
+ * The graph is built by the Effect Layer graph in `di/layers/core.ts`
+ * (`CoreLive`, Effect migration Phase 11): the head — every service up to and
+ * including `AIService` — as staged per-service layers, and the remainder
+ * through `buildCoreTail` below, today's imperative construction of the
+ * remaining services plus all setter/listener wiring, unchanged in order. The
+ * roots are `createCoreServices` (`./coreServicesRoot.ts`, CLI) and `AppLive`
+ * (`di/layers/app.ts`, desktop). The tail's construction order and wiring are
+ * the behavioral contract the next PR's stages and wiring layer must replay.
  */
 
-import * as os from "os";
 import * as path from "path";
-import type { Config } from "@/node/config";
-import {
+import type {
+  Config,
+  ConfigStores,
   FileLeaseManager,
   ProvidersConfigStore,
   SecretsStore,
   WorkspaceSessionLocator,
 } from "@/node/config";
-import { HistoryService } from "@/node/services/historyService";
-import { IdleDispatcher } from "@/node/services/idleDispatcher";
-import { InitStateManager } from "@/node/services/initStateManager";
-import { ProviderService } from "@/node/services/providerService";
-import { AIService } from "@/node/services/aiService";
+import type { HistoryService } from "@/node/services/historyService";
+import type { IdleDispatcher } from "@/node/services/idleDispatcher";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { ProviderService } from "@/node/services/providerService";
+import type { AIService } from "@/node/services/aiService";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
-import { StreamManager } from "@/node/services/streamManager";
-import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { StreamManager } from "@/node/services/streamManager";
+import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import { log } from "@/node/services/log";
-import {
+import type {
   WorkspaceGoalService,
-  type GoalLifecycleAnalyticsSink,
-  type WorkspaceGoalServiceOptions,
+  GoalLifecycleAnalyticsSink,
+  WorkspaceGoalServiceOptions,
 } from "@/node/services/workspaceGoalService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { STAGING_DIR_NAME, readMutationEpochToken } from "@/node/services/agentPlugins/journals";
@@ -45,18 +47,18 @@ import { MCPServerManager, type MCPServerManagerOptions } from "@/node/services/
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { secretsToRecord } from "@/common/types/secrets";
-import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
+import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { TaskService } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
-import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
-import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { MemoryService } from "@/node/services/memoryService";
+import type { MemoryService } from "@/node/services/memoryService";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
-import { MemoryMetaService } from "@/node/services/memoryMeta";
+import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 
@@ -70,12 +72,6 @@ export interface CoreServicesOptions {
   /** Overrides config for MCPConfigService; CLI passes its persistent realConfig. */
   mcpConfig?: Config;
   mcpServerManagerOptions?: MCPServerManagerOptions;
-  workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
-  /**
-   * Layer-provided instance (desktop `ServiceContainer` builds it from its
-   * Effect graph, see `di/layers/core.ts`); default-constructed when absent.
-   */
-  memoryMetaService?: MemoryMetaService;
   /** Optional cross-cutting services (desktop creates before core services). */
   policyService?: PolicyService;
   telemetryService?: TelemetryService;
@@ -85,6 +81,14 @@ export interface CoreServicesOptions {
   sessionTimingService?: SessionTimingService;
   devToolsService?: DevToolsService;
 }
+
+/**
+ * The graph's inputs other than the stores (`CoreOptionsTag` in
+ * `di/layers/core.ts`). The optional cross-cutting services stay optional here
+ * (present in the desktop graph, absent in CLI roots), so core constructors
+ * see exactly the arguments they saw before.
+ */
+export type CoreOptions = Omit<CoreServicesOptions, keyof ConfigStores>;
 
 export interface CoreServices {
   historyService: HistoryService;
@@ -113,31 +117,71 @@ export interface CoreServices {
   turnRequestBuilderBindings: TurnRequestBuilderBindings;
 }
 
-export function buildCoreGraph(opts: CoreServicesOptions): CoreServices {
-  const { config, extensionMetadataPath } = opts;
+/** The layer-built head of the graph (stages S1–S3 in `di/layers/core.ts`) plus what the tail reads. */
+export interface CoreGraphHead extends Pick<
+  CoreServices,
+  | "historyService"
+  | "initStateManager"
+  | "backgroundProcessManager"
+  | "sessionUsageService"
+  | "extensionMetadata"
+  | "workspaceGoalService"
+  | "idleDispatcher"
+  | "streamManager"
+  | "aiService"
+  | "memoryService"
+  | "memoryMetaService"
+  | "turnRequestBuilderBindings"
+> {
+  config: Config;
+  secretsStore: SecretsStore;
+  providersConfigStore: ProvidersConfigStore;
+  options: CoreOptions;
+  workspaceMcpOverridesService: WorkspaceMcpOverridesService;
+  terminalAttentionStore: TerminalAttentionStore;
+}
 
-  const sessionLocator = opts.sessionLocator ?? new WorkspaceSessionLocator(config.rootDir);
-  const historyService = new HistoryService(sessionLocator);
-  const initStateManager = new InitStateManager(config);
-  const providersConfigStore =
-    opts.providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
-  const secretsStore = opts.secretsStore ?? new SecretsStore(config.rootDir);
-  const fileLeaseManager = opts.fileLeaseManager ?? new FileLeaseManager(config.rootDir);
-  const providerService = new ProviderService(
+/** The services the tail constructs (the rest of `CoreServices` comes from the head). */
+export type CoreGraphTail = Pick<
+  CoreServices,
+  | "memoryConsolidationService"
+  | "mcpConfigService"
+  | "mcpServerManager"
+  | "workspaceService"
+  | "taskService"
+  | "workspaceTurnManager"
+>;
+
+/**
+ * Today's imperative construction of the services after `AIService`, and all
+ * of the graph's setter/listener wiring, in the original order. Transitional:
+ * the next PR replays this as staged layers + a wiring layer; until then the
+ * wiring lines that only need head services (the registration probe, the
+ * memory binding) simply run first here — nothing constructed in between
+ * observes them (verified per constructor, see the PR's I6 audit).
+ */
+export function buildCoreTail(head: CoreGraphHead): CoreGraphTail {
+  const {
     config,
-    opts.policyService,
+    secretsStore,
     providersConfigStore,
-    fileLeaseManager
-  );
-  const backgroundProcessManager = new BackgroundProcessManager(
-    path.join(os.tmpdir(), "mux-bashes")
-  );
-  // Providers config accessor enables mappedToModel alias resolution for
-  // headless usage pricing (status generation and memory sweeps).
-  const sessionUsageService = new SessionUsageService(config, historyService, () =>
-    providerService.getConfig()
-  );
-  const extensionMetadata = new ExtensionMetadataService(extensionMetadataPath);
+    options: opts,
+    historyService,
+    initStateManager,
+    backgroundProcessManager,
+    sessionUsageService,
+    extensionMetadata,
+    workspaceGoalService,
+    idleDispatcher,
+    streamManager,
+    aiService,
+    memoryService,
+    memoryMetaService,
+    turnRequestBuilderBindings,
+    workspaceMcpOverridesService,
+    terminalAttentionStore,
+  } = head;
+
   // Write tombstones are process-local removal knowledge; the shared config
   // is the authority (with XUM_ALLOW_MULTIPLE_INSTANCES a downgraded backend
   // can legitimately re-register a deterministic legacy id this process
@@ -177,49 +221,6 @@ export function buildCoreGraph(opts: CoreServicesOptions): CoreServices {
     ).some((metadata) => metadata.id === workspaceId);
     return registered || legacyAliasIds.has(workspaceId);
   });
-  const workspaceGoalService = new WorkspaceGoalService(
-    config,
-    historyService,
-    extensionMetadata,
-    opts.analyticsService,
-    opts.goalServiceOptions,
-    providersConfigStore
-  );
-
-  // Default-construct when the caller (CLI) does not pass one: workspace MCP
-  // override reads AND registration-time plugin-override sanitization must
-  // work in every process that can register workspaces, not just desktop.
-  const workspaceMcpOverridesService =
-    opts.workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
-
-  const turnRequestBuilderBindings: TurnRequestBuilderBindings = {};
-  const streamManager = new StreamManager(historyService, sessionUsageService, () =>
-    providerService.getConfig()
-  );
-
-  const aiService = new AIService(
-    config,
-    historyService,
-    initStateManager,
-    providerService,
-    backgroundProcessManager,
-    sessionUsageService,
-    workspaceMcpOverridesService,
-    opts.policyService,
-    opts.telemetryService,
-    opts.devToolsService,
-    opts.experimentsService,
-    streamManager,
-    turnRequestBuilderBindings,
-    providersConfigStore,
-    secretsStore
-  );
-
-  // Agent memory (memory experiment): scope roots derive from Config (xum home
-  // + session dirs); experiment gating happens per stream in AIService.
-  // Host-local sidecar for user-owned memory metadata (pins + usage stats).
-  const memoryMetaService = opts.memoryMetaService ?? new MemoryMetaService(config.rootDir);
-  const memoryService = new MemoryService(config, memoryMetaService);
   turnRequestBuilderBindings.memoryService = memoryService;
 
   // Background dream consolidation (memory-consolidation experiment). Without
@@ -337,7 +338,6 @@ export function buildCoreGraph(opts: CoreServicesOptions): CoreServices {
     }
   });
 
-  const terminalAttentionStore = new TerminalAttentionStore(config);
   const taskService = new TaskService(
     config,
     historyService,
@@ -367,9 +367,7 @@ export function buildCoreGraph(opts: CoreServicesOptions): CoreServices {
   // Goal continuation bridge lives at the core scope so every codepath that
   // uses the core graph (xum run, xum server via ServiceContainer, tests)
   // gets a working dispatcher. Without this, requestContinuationAfterStreamEnd
-  // is a no-op and the auto-continuation loop never fires. The dispatcher is
-  // also exposed so ServiceContainer can share it with HeartbeatService.
-  const idleDispatcher = new IdleDispatcher();
+  // is a no-op and the auto-continuation loop never fires.
   workspaceGoalService.registerGoalContinuationConsumer(idleDispatcher, {
     hasActiveDescendantTasks: (workspaceId) =>
       taskService.hasActiveDescendantAgentTasksForWorkspace(workspaceId),
@@ -380,24 +378,11 @@ export function buildCoreGraph(opts: CoreServicesOptions): CoreServices {
   });
 
   return {
-    historyService,
-    initStateManager,
-    providerService,
-    backgroundProcessManager,
-    sessionUsageService,
-    workspaceGoalService,
-    idleDispatcher,
-    aiService,
-    streamManager,
+    memoryConsolidationService,
     mcpConfigService,
     mcpServerManager,
-    extensionMetadata,
     workspaceService,
     taskService,
     workspaceTurnManager,
-    memoryService,
-    memoryMetaService,
-    memoryConsolidationService,
-    turnRequestBuilderBindings,
   };
 }

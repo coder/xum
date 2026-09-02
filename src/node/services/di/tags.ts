@@ -40,6 +40,7 @@ import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { StreamManager } from "@/node/services/streamManager";
 import type { TaskService } from "@/node/services/taskService";
 import type { TelemetryService } from "@/node/services/telemetryService";
+import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -113,6 +114,11 @@ export class MemoryConsolidation extends Context.Service<
   MemoryConsolidation,
   MemoryConsolidationService
 >()("xum/MemoryConsolidation") {}
+/** Terminal attention records; built by the core graph for Task/TurnManager (not a `CoreServices` field). */
+export class TerminalAttentionStoreTag extends Context.Service<
+  TerminalAttentionStoreTag,
+  TerminalAttentionStore
+>()("xum/TerminalAttentionStore") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -150,7 +156,10 @@ export type StoreTags =
  */
 export type RuntimeSeamTags = EffectRunnerTag | AppFiberScopeTag;
 
-/** Every `CoreServices` field, as provided by `CoreProjectionLive` (./layers/core.ts). */
+/**
+ * Everything `CoreLive` (./layers/core.ts) provides: every `CoreServices`
+ * field plus the graph-internal `TerminalAttentionStore`.
+ */
 export type CoreTags =
   | History
   | InitStateManagerTag
@@ -170,10 +179,19 @@ export type CoreTags =
   | Memory
   | MemoryMeta
   | MemoryConsolidation
+  | TerminalAttentionStoreTag
   | TurnRequestBuilderBindingsTag;
 
-/** Everything a headless CLI root (`createCoreServices`) provides. */
-export type CoreRootTags = StoreTags | RuntimeSeamTags | CoreOptionsTag | CoreTags;
+/**
+ * Everything a headless CLI root (`createCoreServices`) provides; the CLI
+ * default `WorkspaceMcpOverrides` stands in for the desktop's cross-cutting one.
+ */
+export type CoreRootTags =
+  | StoreTags
+  | RuntimeSeamTags
+  | CoreOptionsTag
+  | WorkspaceMcpOverrides
+  | CoreTags;
 
 /** The desktop cross-cutting services provided by `CrossCuttingLive`. */
 export type CrossCuttingTags =
