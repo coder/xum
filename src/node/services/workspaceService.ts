@@ -2130,60 +2130,79 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * a follow-up redispatched from within the originating send's own turn
    * (e.g. its on-send compaction completing) must not veto itself, and once
    * handed off the session's own queue/turn-phase state governs visibility.
-   * Tickets are kept in arrival order so a send can tell whether an EARLIER
-   * send is still in preflight (sendMessage queues behind it) without two
-   * simultaneous arrivals each deferring to the other.
+   * Tickets are kept in arrival order (ticket -> supersedable) so a send can tell
+   * whether an EARLIER send is still in preflight (sendMessage queues behind it)
+   * without two simultaneous arrivals each deferring to the other. Supersedable
+   * tickets are requireIdle maintenance sends (heartbeats, continuations): manual
+   * input never waits behind them, and they yield to it through preflightSendCounts.
    */
-  private readonly sessionInvisiblePreflights = new Map<string, Set<number>>();
+  private readonly sessionInvisiblePreflights = new Map<string, Map<number, boolean>>();
   private nextSessionInvisiblePreflightTicket = 0;
 
   private hasSessionInvisiblePreflight(workspaceId: string): boolean {
     return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
   }
 
-  /** See sessionInvisiblePreflights. Release is idempotent. */
+  /**
+   * See sessionInvisiblePreflights. Release is idempotent. Disposal (scope exit of the
+   * service call) also drains messages queued behind this preflight when it was the head
+   * of the arrival line: those entries have no stream end to drain them if this send
+   * settled without a turn (refused, rejected, startup failed). A younger send that
+   * settles first must not drain, or it would dispatch entries ahead of the older
+   * still-live preflight; the older send drains when it settles, and the drain is a
+   * no-op when a turn was handed off (the session is busy).
+   */
   private armSessionInvisiblePreflight(
-    workspaceId: string
+    workspaceId: string,
+    options?: { supersedable?: boolean }
   ): { release: () => void; hasEarlierPreflight: () => boolean } & Disposable {
     const ticket = this.nextSessionInvisiblePreflightTicket++;
     let tickets = this.sessionInvisiblePreflights.get(workspaceId);
     if (tickets == null) {
-      tickets = new Set();
+      tickets = new Map();
       this.sessionInvisiblePreflights.set(workspaceId, tickets);
     }
-    tickets.add(ticket);
+    tickets.set(ticket, options?.supersedable === true);
     let released = false;
+    let releasedAsOldest = false;
+    // Map iteration follows insertion order, so the first live ticket is the oldest.
+    const isOldest = () =>
+      this.sessionInvisiblePreflights.get(workspaceId)?.keys().next().value === ticket;
     const release = () => {
       if (released) {
         return;
       }
       released = true;
+      releasedAsOldest = isOldest();
       const live = this.sessionInvisiblePreflights.get(workspaceId);
       live?.delete(ticket);
       if (live?.size === 0) {
         this.sessionInvisiblePreflights.delete(workspaceId);
       }
     };
-    // Set iteration follows insertion order, so the first live ticket is the oldest.
-    const hasEarlierPreflight = () =>
-      !released &&
-      this.sessionInvisiblePreflights.get(workspaceId)?.values().next().value !== ticket;
-    return { release, hasEarlierPreflight, [Symbol.dispose]: release };
-  }
-
-  /**
-   * Messages queued behind a send's preflight (sendMessage's hasEarlierPreflight) have no
-   * stream end to drain them when that send settles without a turn: refused, rejected, or
-   * startup failed. Declare BEFORE armSessionInvisiblePreflight so it disposes after the
-   * ticket is released and only the last live preflight drains.
-   */
-  private armQueuedBehindPreflightDrain(workspaceId: string): Disposable {
-    return {
-      [Symbol.dispose]: () => {
-        if (this.hasSessionInvisiblePreflight(workspaceId)) {
-          return;
+    const hasEarlierPreflight = () => {
+      if (released) {
+        return false;
+      }
+      for (const [liveTicket, supersedable] of this.sessionInvisiblePreflights.get(workspaceId) ??
+        []) {
+        if (liveTicket === ticket) {
+          return false;
         }
-        this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
+        if (!supersedable) {
+          return true;
+        }
+      }
+      return false;
+    };
+    return {
+      release,
+      hasEarlierPreflight,
+      [Symbol.dispose]: () => {
+        release();
+        if (releasedAsOldest) {
+          this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
+        }
       },
     };
   }
@@ -10551,7 +10570,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
-      using _drainQueuedBehindPreflight = this.armQueuedBehindPreflightDrain(workspaceId);
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
       // (context mutations instead refuse the send itself via the epoch
@@ -10571,7 +10589,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
         },
       };
-      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
+      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
+        supersedable: internal?.requireIdle === true,
+      });
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -10717,7 +10737,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // isBusy(). A later send admitted against that idle snapshot reaches StreamManager
       // while the earlier turn is streaming, and ensureStreamSafety aborts the earlier turn
       // to start the later one. Queue behind the earlier in-preflight send instead.
-      // requireIdle callers keep their skip semantics below; edits bypass the queue by design.
+      // requireIdle callers keep their skip semantics below (and are never waited on, see
+      // sessionInvisiblePreflights); edits bypass the queue by design.
       const shouldQueue =
         !normalizedOptions?.editMessageId &&
         (session.isBusy() ||
@@ -11105,7 +11126,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // (mirrors sendMessage): the archive gate refuses while a resume that already passed
       // these guards is still doing pre-admission work, so neither side can slip past the
       // other's snapshot.
-      using _drainQueuedBehindPreflight = this.armQueuedBehindPreflightDrain(workspaceId);
       this.preflightSendCounts.set(
         workspaceId,
         (this.preflightSendCounts.get(workspaceId) ?? 0) + 1

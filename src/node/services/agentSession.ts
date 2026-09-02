@@ -6901,12 +6901,13 @@ export class AgentSession {
    * Drain the queue when no turn owns the next dispatch. For callers whose
    * reservation kept a send invisible to isBusy() (WorkspaceService preflight)
    * and that settled without a turn, so no stream end will drain what queued
-   * behind them. A pending auto-retry or the edit flow still owns the next
+   * behind them. A turn in flight, a mid-stream compaction about to dispatch its
+   * request, a pending auto-retry, or the edit flow still owns the next
    * dispatch, so the queue keeps waiting for them.
    */
   drainQueuedMessagesIfIdle(): void {
     if (
-      this.isBusy() ||
+      this.hasActiveOrPendingTurnWork() ||
       this.hasPendingAutoRetry() ||
       this.deferQueuedFlushUntilAfterEdit ||
       this.messageQueue.isEmpty()

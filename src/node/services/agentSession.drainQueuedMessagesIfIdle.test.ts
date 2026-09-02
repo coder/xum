@@ -1,0 +1,126 @@
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "events";
+import * as path from "node:path";
+
+import type { Config } from "@/node/config";
+
+import type { AIService } from "./aiService";
+import { AgentSession } from "./agentSession";
+import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import type { InitStateManager } from "./initStateManager";
+import { createTestHistoryService } from "./testHistoryService";
+
+/**
+ * drainQueuedMessagesIfIdle is the release valve for messages queued behind a
+ * WorkspaceService preflight that never became a turn. It must defer to every
+ * owner of the next dispatch, not just an active turn phase.
+ */
+
+const WORKSPACE_ID = "workspace-drain-if-idle-test";
+
+interface PrivateSessionAccess {
+  midStreamCompactionPending: boolean;
+  autoRetryStarting: boolean;
+}
+
+describe("AgentSession.drainQueuedMessagesIfIdle", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  let session: AgentSession | undefined;
+
+  afterEach(async () => {
+    session?.dispose();
+    session = undefined;
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  async function createSession(): Promise<AgentSession> {
+    const created = await createTestHistoryService();
+    cleanup = created.cleanup;
+    const aiEmitter = new EventEmitter();
+    const aiService: AIService = {
+      ...createStreamLifecycleMocks(),
+      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
+        aiEmitter.on(String(eventName), listener);
+        return this;
+      },
+      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
+        aiEmitter.off(String(eventName), listener);
+        return this;
+      },
+      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+    } as unknown as AIService;
+    const initStateManager: InitStateManager = {
+      on() {
+        return this;
+      },
+      off() {
+        return this;
+      },
+    } as unknown as InitStateManager;
+    const backgroundProcessManager: BackgroundProcessManager = {
+      setMessageQueued: mock(() => undefined),
+      cleanup: mock(() => Promise.resolve()),
+    } as unknown as BackgroundProcessManager;
+    const config: Config = {
+      rootDir: created.config.rootDir,
+      sessionsDir: created.config.sessionsDir,
+      srcDir: path.join(created.config.rootDir, "src"),
+      loadConfigOrDefault: mock(() => ({})),
+    } as unknown as Config;
+    session = new AgentSession({
+      workspaceId: WORKSPACE_ID,
+      config,
+      historyService: created.historyService,
+      aiService,
+      initStateManager,
+      backgroundProcessManager,
+    });
+    return session;
+  }
+
+  const cases: Array<[string, (s: PrivateSessionAccess) => void, number]> = [
+    ["an idle session drains", () => undefined, 1],
+    // Codex P1 (PRRT_kwDOPxxmWM6eaers): between interruptForCompaction stopping the original
+    // stream and dispatching the compaction request, the turn phase is IDLE while the
+    // compaction still owns the next dispatch.
+    [
+      "a pending mid-stream compaction owns the next dispatch",
+      (s) => {
+        s.midStreamCompactionPending = true;
+      },
+      0,
+    ],
+    [
+      "a pending auto-retry owns the next dispatch",
+      (s) => {
+        s.autoRetryStarting = true;
+      },
+      0,
+    ],
+  ];
+
+  test.each(cases)("%s", async (_name, arrange, expectedDispatches) => {
+    const agentSession = await createSession();
+    const dispatch = spyOn(agentSession, "sendQueuedMessages").mockImplementation(() => undefined);
+    agentSession.queueMessage("queued behind a failed preflight", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    arrange(agentSession as unknown as PrivateSessionAccess);
+
+    agentSession.drainQueuedMessagesIfIdle();
+
+    expect(dispatch).toHaveBeenCalledTimes(expectedDispatches);
+  });
+
+  test("an empty queue never dispatches", async () => {
+    const agentSession = await createSession();
+    const dispatch = spyOn(agentSession, "sendQueuedMessages").mockImplementation(() => undefined);
+
+    agentSession.drainQueuedMessagesIfIdle();
+
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});
