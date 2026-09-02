@@ -420,9 +420,13 @@ describe("mux_config_write", () => {
 
     const configDocument = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
       defaultModel?: string;
+      writeId?: string;
     };
     // Repaired to an object carrying the mutation and the per-save write stamp, nothing else.
-    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o", writeId: expect.any(String) });
+    expect(configDocument).toEqual({
+      defaultModel: "openai:gpt-4o",
+      writeId: expect.any(String) as string,
+    });
   });
 
   it("repairs primitive providers.jsonc root during write", async () => {
@@ -475,9 +479,13 @@ describe("mux_config_write", () => {
 
     const configDocument = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
       defaultModel?: string;
+      writeId?: string;
     };
     // Repaired to an object carrying the mutation and the per-save write stamp, nothing else.
-    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o", writeId: expect.any(String) });
+    expect(configDocument).toEqual({
+      defaultModel: "openai:gpt-4o",
+      writeId: expect.any(String) as string,
+    });
   });
 
   it("repairs array providers.jsonc root during write", async () => {
