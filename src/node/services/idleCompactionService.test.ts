@@ -32,6 +32,7 @@ describe("IdleCompactionService", () => {
   let historyService: HistoryService;
   let mockExtensionMetadata: ExtensionMetadataService;
   let executeIdleCompactionMock: ReturnType<typeof mock<(workspaceId: string) => Promise<void>>>;
+  let loadConfigMock: ReturnType<typeof mock<() => ProjectsConfig>>;
   let service: IdleCompactionService;
   let cleanup: () => Promise<void>;
 
@@ -43,8 +44,8 @@ describe("IdleCompactionService", () => {
 
   beforeEach(async () => {
     // Create mock config
-    mockConfig = {
-      loadConfigOrDefault: mock(() => ({
+    loadConfigMock = mock(
+      (): ProjectsConfig => ({
         projects: new Map<string, ProjectConfig>([
           [
             testProjectPath,
@@ -54,8 +55,9 @@ describe("IdleCompactionService", () => {
             },
           ],
         ]),
-      })),
-    } as unknown as Config;
+      })
+    );
+    mockConfig = { loadConfigOrDefault: loadConfigMock } as unknown as Config;
 
     // Create real history service and seed default idle messages (25 hours ago)
     ({ historyService, cleanup } = await createTestHistoryService());
@@ -108,7 +110,7 @@ describe("IdleCompactionService", () => {
 
       await new Promise((resolve) => setTimeout(resolve, 20));
 
-      expect(mockConfig.loadConfigOrDefault).not.toHaveBeenCalled();
+      expect(loadConfigMock).not.toHaveBeenCalled();
       expect(executeIdleCompactionMock).not.toHaveBeenCalled();
       service.stop();
     });
