@@ -241,6 +241,42 @@ describe("createCoreServices", () => {
       })
     ).toThrow("already registered");
 
+    // Setter-provided collaborators (the former body's `set*` lines).
+    const workspaceInternals = root.workspaceService as unknown as {
+      mcpServerManager?: unknown;
+      workspaceGoalService?: unknown;
+      agentTaskIntegration?: unknown;
+      memoryConsolidationService?: unknown;
+      workspaceMcpOverridesService?: unknown;
+    };
+    expect(workspaceInternals.mcpServerManager).toBe(root.mcpServerManager);
+    expect(workspaceInternals.workspaceGoalService).toBe(root.workspaceGoalService);
+    expect(workspaceInternals.agentTaskIntegration).toBe(root.taskService);
+    expect(workspaceInternals.memoryConsolidationService).toBe(root.memoryConsolidationService);
+    expect(workspaceInternals.workspaceMcpOverridesService).toBe(
+      root.runtime.get(WorkspaceMcpOverrides)
+    );
+    const taskInternals = root.taskService as unknown as { workspaceTurnManager?: unknown };
+    expect(taskInternals.workspaceTurnManager).toBe(root.workspaceTurnManager);
+
+    // Goal service hooks: activity changes fan out to the workspace service and
+    // a promote interrupts the workspace's stream.
+    const goalInternals = root.workspaceGoalService as unknown as {
+      onActivityChange?: (workspaceId: string, snapshot: unknown) => void;
+      streamInterrupter?: (workspaceId: string) => Promise<void>;
+    };
+    const activitySpy = spyOn(root.workspaceService, "emitWorkspaceActivity").mockImplementation(
+      () => undefined
+    );
+    goalInternals.onActivityChange?.("ws-1", null);
+    expect(activitySpy).toHaveBeenCalledWith("ws-1", null);
+    const interruptSpy = spyOn(root.workspaceService, "interruptStream").mockResolvedValue({
+      success: true,
+      data: undefined,
+    });
+    await goalInternals.streamInterrupter?.("ws-1");
+    expect(interruptSpy).toHaveBeenCalledWith("ws-1");
+
     // streamManager knows the MCP manager (lease acquire/release per stream).
     const streamManagerInternals = root.streamManager as unknown as {
       mcpServerManager?: unknown;
