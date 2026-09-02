@@ -2206,6 +2206,74 @@ describe("backup adapters project bundle", () => {
     expect(await fs.readFile(path.join(muxRoot, ...localPath.split("/")), "utf-8")).toBe("v2\n");
   });
 
+  it("re-reads origin markers at the write boundary, inside the memory lock", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "alpha backup\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local instructions\n");
+    const { repository, payload } = await exportBundle();
+
+    // The project lives here under another path, imported earlier from this source.
+    config.state.projects.delete(project);
+    await fs.rm(path.join(muxRoot, "memory", "project", projectMemoryDirName(project)), {
+      recursive: true,
+      force: true,
+    });
+    const targetPath = path.join(tempDir, "projects", "alpha-here");
+    const targetDir = projectMemoryDirName(targetPath);
+    registerProject(targetPath);
+    const marker = `memory/.backup-origins/${targetDir}.json`;
+    await writeFixtureFile(muxRoot, marker, JSON.stringify({ sourcePath: project }));
+    const validated = await payload.validateRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(validated.matchedProjects).toEqual([
+      { sourcePath: project, projectPath: targetPath, localMemoryDir: targetDir },
+    ]);
+
+    // While the restore waits for the memory lock, another import (which writes under that
+    // lock) re-points the project at a different source. The plan validated against the old
+    // marker must not be written: it would overwrite this project with the old source's
+    // notes while its marker names the new one.
+    const held = Promise.withResolvers<void>();
+    const lockAcquired = Promise.withResolvers<void>();
+    const holding = withTargetMutationLock(
+      muxRoot,
+      memoryMutationLockKey(muxRoot, path.join(muxRoot, "memory")),
+      async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      }
+    );
+    await lockAcquired.promise;
+    const restoring = captureRejection(
+      payload.restore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+        snapshotPath: path.join(tempDir, "restore-snapshot"),
+        matchedProjects: validated.matchedProjects,
+      })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await writeFixtureFile(muxRoot, marker, JSON.stringify({ sourcePath: "/elsewhere/other" }));
+    held.resolve();
+    await holding;
+
+    const error = await restoring;
+    expect((error as Error).message).toContain("changed since the restore was validated");
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "local instructions\n"
+    );
+    expect(
+      await fs
+        .lstat(path.join(muxRoot, "memory", "project", targetDir, "notes.md"))
+        .catch(() => null)
+    ).toBeNull();
+  });
+
   it("skips a malformed sidecar when the toggle is off but refuses it when on", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
     const gitRepo = createBackupGitRepo({ cacheRoot });

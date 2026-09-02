@@ -813,10 +813,16 @@ export class BackupService {
     // with this restore, so the registry may have changed in between. A target unregistered
     // since must be registered again, not written into on its stale identity; one registered
     // meanwhile — possibly through a different symlinked spelling of the same directory,
-    // which create()'s own duplicate check does not resolve — must import into that
-    // registration instead of adding a second one and splitting the project identity.
+    // which create()'s own duplicate check does not resolve — must not be registered a
+    // second time, which would split the project identity.
     const registry = await this.registeredProjectLookup();
-    for (const { candidate, targetPath } of planned) {
+    for (const { candidate, targetPath, registeredPath: plannedRegisteredPath } of planned) {
+      // The identity the preflight checked (memory limits, non-file destinations,
+      // permissions) is the only one this import may write to. A different identity now —
+      // the checkout registered under another alias since planning — names a memory scope
+      // nothing has checked, so the candidate fails without a write and stays on offer;
+      // the next preview resolves the new registration and preflights it.
+      const preflightedPath = plannedRegisteredPath ?? targetPath;
       // Once registration resolves the project identity, failures report that path: it is
       // where any partially written memory actually lives.
       let registeredPath: string | null = null;
@@ -832,6 +838,10 @@ export class BackupService {
         writtenFiles: progress.written,
         skippedFiles: progress.skipped,
       });
+      const unchecked = (registered: string): BackupProjectImportResult =>
+        failed(
+          `'${targetPath}' is now registered as '${registered}', which this import was not checked against; approve it again`
+        );
       try {
         if (this.projectRegistrar === null) {
           results.push(failed("Project registration is unavailable"));
@@ -852,6 +862,11 @@ export class BackupService {
           await realpathOrNull(targetPath),
           registry
         );
+        // Checked before create() so a refused candidate leaves no registration behind.
+        if ((registeredIdentity ?? targetPath) !== preflightedPath) {
+          results.push(unchecked(registeredIdentity ?? targetPath));
+          continue;
+        }
         // The backed-up name travels with a newly registered project (in the same config
         // write as the registration); an already registered target keeps its local name.
         const created =
@@ -877,6 +892,10 @@ export class BackupService {
             );
           if (registeredPath === null) {
             results.push(failed(`'${targetPath}' is already registered under a different path`));
+            continue;
+          }
+          if (registeredPath !== preflightedPath) {
+            results.push(unchecked(registeredPath));
             continue;
           }
         } else {

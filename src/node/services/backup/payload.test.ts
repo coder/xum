@@ -21,6 +21,7 @@ import {
   PROJECT_BUNDLE_DIR,
   ProjectMemoryWriteError,
   REDACTED_BACKUP_VALUE,
+  assertProjectMemoryWritesAllowed,
   backupCommandApprovalToken,
   backupSecretApprovalDigest,
   collectAllowlistedFiles,
@@ -4208,6 +4209,70 @@ describe("project bundle", () => {
         })
       );
       expect((error as Error).message).toContain("disallowed path");
+    }
+  });
+
+  it("preflights the permission each memory write will actually need", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const scope = `memory/project/${projectMemoryDirName("/home/dev/target")}`;
+    await writeFixtureFile(muxRoot, `${scope}/same.md`, "same\n");
+    await writeFixtureFile(muxRoot, `${scope}/differs.md`, "local\n");
+    const scopeAbs = path.join(muxRoot, ...scope.split("/"));
+    const sameAbs = path.join(scopeAbs, "same.md");
+    const differsAbs = path.join(scopeAbs, "differs.md");
+    await fs.chmod(sameAbs, 0o444);
+    await fs.chmod(differsAbs, 0o444);
+    const identical = { path: `${scope}/same.md`, content: Buffer.from("same\n") };
+    const differing = { path: `${scope}/differs.md`, content: Buffer.from("backup\n") };
+    try {
+      // Never opened for writing in either mode, so a read-only identical file is fine.
+      await assertProjectMemoryWritesAllowed(muxRoot, [identical], { addOnly: false });
+      // Add-only skips a differing destination as a conflict; its permissions are moot.
+      await assertProjectMemoryWritesAllowed(muxRoot, [differing], { addOnly: true });
+      // Matched mode overwrites it, so the refusal belongs to the preflight, not the write.
+      const readOnly = await captureRejection(
+        assertProjectMemoryWritesAllowed(muxRoot, [differing], { addOnly: false })
+      );
+      expect((readOnly as Error).message).toContain("not writable");
+      // A new file needs a directory that accepts entries.
+      await fs.chmod(scopeAbs, 0o555);
+      try {
+        const parent = await captureRejection(
+          assertProjectMemoryWritesAllowed(
+            muxRoot,
+            [{ path: `${scope}/new.md`, content: Buffer.from("x\n") }],
+            { addOnly: true }
+          )
+        );
+        expect((parent as Error).message).toContain("not writable");
+      } finally {
+        await fs.chmod(scopeAbs, 0o755);
+      }
+    } finally {
+      await fs.chmod(sameAbs, 0o644);
+      await fs.chmod(differsAbs, 0o644);
+    }
+  });
+
+  it("propagates an unreadable memory scope instead of treating it as empty", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const scope = `memory/project/${projectMemoryDirName("/home/dev/target")}`;
+    await writeFixtureFile(muxRoot, `${scope}/notes.md`, "local\n");
+    const scopeAbs = path.join(muxRoot, ...scope.split("/"));
+    await fs.chmod(scopeAbs, 0o000);
+    try {
+      // Read as "empty", the scope would pass the count cap and the write would fail
+      // only after the core settings had changed.
+      const error = await captureRejection(
+        assertProjectMemoryWritesAllowed(
+          muxRoot,
+          [{ path: `${scope}/new.md`, content: Buffer.from("x\n") }],
+          { addOnly: true }
+        )
+      );
+      expect((error as NodeJS.ErrnoException).code).toBe("EACCES");
+    } finally {
+      await fs.chmod(scopeAbs, 0o755);
     }
   });
 

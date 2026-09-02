@@ -561,7 +561,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // destinations) belong to the preflight too: found only inside the restore, they
       // would surface after the core settings were already overwritten.
       for (const match of bundlePlan.plan.matched) {
-        await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match));
+        await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match), {
+          addOnly: false,
+        });
       }
       // So does the recovery copy: a destination that cannot be snapshotted (a local file
       // past the backup budgets) refuses the restore here, not after the core writes. The
@@ -642,10 +644,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
       let core: { localOnlyFiles: string[] };
-      const bundlePlan = restoreOptions.includeProjects
-        ? await readBundleWithPlan(sourceDir)
-        : null;
-      if (bundlePlan === null) {
+      // The bundle itself is read here — the repo lock holds the checkout stable — but its
+      // plan is computed inside the memory lock below, where the inputs it depends on are.
+      const bundle = restoreOptions.includeProjects ? await readProjectBundle(sourceDir) : null;
+      if (bundle === null) {
         // Existence-only, like the preview: a malformed sidecar must never block a
         // core-only restore, but its presence is reported so the skip is visible.
         projectBundleSkipped =
@@ -670,17 +672,19 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // discovered only after the core files were already overwritten, and nothing can
         // edit a file between its snapshot bytes and its overwrite.
         core = await withMemoryLock(async () => {
-          // Registration is re-read at the write boundary so a project unregistered since
-          // the plan was computed is left alone. Project registration is not serialized
-          // with memory writes (config edits take no memory lock), so this is the
-          // narrowest check available, not a guarantee against a concurrent edit landing
-          // between this read and the write.
+          // The plan is recomputed at the write boundary, from registration and the origin
+          // markers as they are now. Origin markers are written under this same lock (by an
+          // import), so a project re-pointed at another source since validation no longer
+          // matches the old entry here. Project registration is not serialized with memory
+          // writes (config edits take no memory lock), so for it this is the narrowest check
+          // available, not a guarantee against a concurrent edit landing before the write.
           const registered = registeredProjectDirs();
-          const matched = bundlePlan.plan.matched.filter(
-            (match) =>
-              validatedMatched.has(planKey(match)) &&
-              registered.get(match.projectPath) === match.localMemoryDir
+          const plan = planProjectBundleRestore(
+            bundle,
+            registered,
+            await readProjectMemoryOrigins(muxRoot, registered)
           );
+          const matched = plan.matched.filter((match) => validatedMatched.has(planKey(match)));
           // A validated match that no longer writes — its project unregistered since, or
           // resolved to a different local project now — is refused rather than dropped:
           // the caller reports unapproved candidates from its validation, so a silently
@@ -699,7 +703,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           }
           if (matched.length > 0) {
             for (const match of matched) {
-              await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match));
+              await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match), {
+                addOnly: false,
+              });
             }
             // Exactly the files these writes can overwrite: not whole project directories,
             // whose unrelated local-only notes neither need covering nor may fail the
@@ -798,7 +804,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       };
       return {
         async assertProjectMemoryAllowed(importOptions) {
-          await assertProjectMemoryWritesAllowed(muxRoot, rekeyedWrites(importOptions));
+          await assertProjectMemoryWritesAllowed(muxRoot, rekeyedWrites(importOptions), {
+            addOnly: true,
+          });
         },
         async importProjectMemory(importOptions) {
           const entry = entryFor(importOptions.token);

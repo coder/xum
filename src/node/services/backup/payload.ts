@@ -265,6 +265,20 @@ async function lstatOrNull(target: string) {
   }
 }
 
+/**
+ * `null` only when the path does not exist. Any other failure (`EACCES` on an unreadable
+ * parent, `EIO`) propagates: a preflight that read it as "missing" would accept a write the
+ * filesystem is about to refuse, after the point where refusing changes nothing.
+ */
+async function lstatIfExists(target: string): Promise<Stats | null> {
+  try {
+    return await fs.lstat(target);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return null;
+    throw error;
+  }
+}
+
 /** Filesystem identity detects aliases across hard links, case folding, and normalization. */
 async function localFilesOverwrittenByPayload(
   muxRoot: string,
@@ -3203,8 +3217,13 @@ async function countFilesUnder(dirAbs: string, limit: number): Promise<number> {
   while (pending.length > 0) {
     const dir = pending.pop();
     if (dir === undefined) break;
-    // A missing scope directory counts as empty rather than failing the restore.
-    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    // A missing scope directory counts as empty rather than failing the restore. Nothing
+    // else does: a directory that exists but cannot be read (permissions changed) would
+    // otherwise pass the preflight and fail the write after the core settings changed.
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error: unknown) => {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return [];
+      throw error;
+    });
     for (const entry of entries) {
       if (isHiddenName(entry.name)) continue;
       // Dirent reports a symlink as neither file nor directory, so links are not followed.
@@ -3238,24 +3257,15 @@ export async function writeProjectMemoryFiles(
   const root = await resolveRoot(muxRoot);
   // Re-run under the lock even when the caller already ran it as a preflight: the
   // destinations may have changed since, and these checks are what make the write safe.
-  const planned = await planProjectMemoryWrites(root, writes);
+  const planned = await planProjectMemoryWrites(root, writes, options);
   const written: string[] = [];
   const skipped: string[] = [];
   try {
     for (const write of planned) {
-      if (write.existingSize !== null) {
-        // Sizes first, from the planning lstat: an existing file of a different size can
-        // never be identical, so it is never read — an externally bloated destination would
-        // otherwise be buffered whole just to detect a conflict. Equal sizes are bounded by
-        // the incoming file's own memory limit.
-        if (write.existingSize === write.content.length) {
-          const current = await readCheckedFile(root, write.path, () => undefined);
-          if (current.content.equals(write.content)) continue;
-        }
-        if (options.addOnly) {
-          skipped.push(write.path);
-          continue;
-        }
+      if (write.action === "identical") continue;
+      if (write.action === "conflict") {
+        skipped.push(write.path);
+        continue;
       }
       // Recorded before the mutating call: a write that fails midway (ENOSPC after the
       // destination was created or truncated) must still appear in the cleanup list.
@@ -3276,26 +3286,41 @@ export async function writeProjectMemoryFiles(
 
 /**
  * Everything about a set of project-memory writes that can be refused without touching the
- * disk: path shape, the memory subsystem's per-file size and per-scope count limits, and
- * destinations that are not plain files. Exposed so the restore preflight can refuse a
- * bundle that would fail here before the core restore has overwritten anything.
+ * disk: path shape, the memory subsystem's per-file size and per-scope count limits,
+ * destinations that are not plain files, and destinations the write could not open.
+ * Exposed so the restore preflight can refuse a bundle that would fail here before the
+ * core restore has overwritten anything. `addOnly` must match the write it stands in for:
+ * it decides which existing destinations are skipped and therefore need no permission.
  */
 export async function assertProjectMemoryWritesAllowed(
   muxRoot: string,
-  writes: ReadonlyArray<{ path: string; content: Buffer }>
+  writes: ReadonlyArray<{ path: string; content: Buffer }>,
+  options: { addOnly: boolean }
 ): Promise<void> {
-  await planProjectMemoryWrites(await resolveRoot(muxRoot), writes);
+  await planProjectMemoryWrites(await resolveRoot(muxRoot), writes, options);
+}
+
+interface PlannedProjectMemoryWrite {
+  path: string;
+  content: Buffer;
+  /**
+   * `write`: lands (new file, or an existing one this mode overwrites). `identical`: the
+   * destination already holds these bytes. `conflict`: differs and add-only mode skips it.
+   */
+  action: "write" | "identical" | "conflict";
+  isNew: boolean;
 }
 
 async function planProjectMemoryWrites(
   root: BackupRoot,
-  writes: ReadonlyArray<{ path: string; content: Buffer }>
-): Promise<Array<{ path: string; content: Buffer; existingSize: number | null }>> {
+  writes: ReadonlyArray<{ path: string; content: Buffer }>,
+  options: { addOnly: boolean }
+): Promise<PlannedProjectMemoryWrite[]> {
   // Charged so a marker-thin bundle cannot expand past the same bound reads enforce.
   const budget = createByteBudget();
   // Everything refusable is refused before the first write, so a rejected bundle
   // changes nothing on disk.
-  const planned: Array<{ path: string; content: Buffer; existingSize: number | null }> = [];
+  const planned: PlannedProjectMemoryWrite[] = [];
   for (const write of writes) {
     assertAllowedBundleFilePath(write.path);
     // The memory subsystem's own read limit: a restored file larger than this would be
@@ -3308,22 +3333,39 @@ async function planProjectMemoryWrites(
     }
     budget(write.path, write.content.length);
     const destination = await resolveContainedPath(root.path, write.path);
-    const existing = await lstatOrNull(destination);
+    const existing = await lstatIfExists(destination);
     if (existing !== null && !existing.isFile()) {
       throw new Error(`Cannot restore '${write.path}': a non-file already exists there`);
     }
-    planned.push({
-      path: write.path,
-      content: write.content,
-      existingSize: existing === null ? null : existing.size,
-    });
+    let action: PlannedProjectMemoryWrite["action"] = "write";
+    if (existing !== null) {
+      // Sizes first, from the lstat: an existing file of a different size can never be
+      // identical, so it is never read — an externally bloated destination would otherwise
+      // be buffered whole just to detect a conflict. Equal sizes are bounded by the incoming
+      // file's own memory limit. Decided here, once, so the writability probe below covers
+      // exactly the destinations the write will open.
+      if (
+        existing.size === write.content.length &&
+        (await readCheckedFile(root, write.path, () => undefined)).content.equals(write.content)
+      ) {
+        action = "identical";
+      } else if (options.addOnly) {
+        action = "conflict";
+      }
+    }
+    // The same probe as the core restore's planner: a read-only destination or an
+    // unwritable parent fails `writeCheckedFile` with the core settings already changed,
+    // so the permission the write will need is checked while nothing has changed yet.
+    if (action === "write")
+      await assertRestoreDestinationWritable(destination, existing, write.path);
+    planned.push({ path: write.path, content: write.content, action, isNew: existing === null });
   }
   // Per-scope file-count cap, mirrored from MemoryService. Only growth past the limit is
   // refused: a store that already exceeds it (hand-placed files) can still be restored
   // in place as long as this restore does not add to the overflow.
   const addsByDir = new Map<string, number>();
   for (const write of planned) {
-    if (write.existingSize !== null) continue;
+    if (!write.isNew) continue;
     const scopeDir = write.path.split("/").slice(0, 3).join("/");
     addsByDir.set(scopeDir, (addsByDir.get(scopeDir) ?? 0) + 1);
   }

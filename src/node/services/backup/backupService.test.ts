@@ -1634,7 +1634,7 @@ describe("BackupService project imports", () => {
     expect(registrations).toBe(1);
   });
 
-  test("imports into a project registered through another alias after planning", async () => {
+  test("refuses an import whose target was registered under another alias after planning", async () => {
     const realParent = path.join(tempDir, "real");
     await fs.mkdir(path.join(realParent, "repo"), { recursive: true });
     const aliasA = path.join(tempDir, "alias-a");
@@ -1685,7 +1685,18 @@ describe("BackupService project imports", () => {
 
     expect(result.success).toBe(true);
     expect(registrations).toBe(0);
-    expect(importedTo).toEqual([registeredAlias]);
+    // Nor may it write into the alias's memory scope: the preflight checked the target's,
+    // so the candidate fails without a write and is re-offered for a checked retry.
+    expect(importedTo).toEqual([]);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "failed",
+        message: expect.stringContaining(registeredAlias) as string,
+      });
+      expect(result.data.unapprovedProjectImports.map((item) => item.token)).toEqual([
+        "candidate-token",
+      ]);
+    }
   });
 
   test("refuses an import into a project that a matched entry restores in the same run", async () => {
