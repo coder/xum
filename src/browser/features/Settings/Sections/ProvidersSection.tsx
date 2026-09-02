@@ -123,6 +123,18 @@ function getServerAuthToken(): string | null {
 }
 
 /**
+ * Flow ID for a Coder login. It doubles as the OAuth `state` (CSRF token), so
+ * it must be unguessable: derived from getRandomValues, which — unlike
+ * Crypto.randomUUID — is available outside secure contexts too (Xum's browser
+ * UI can be served from a plain-HTTP remote origin, where randomUUID is
+ * undefined and would throw before the login even started).
+ */
+function createCoderLoginFlowId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
  * Browser/server-mode "Login with Coder": the Xum server registers the flow
  * with a redirect URI on its own origin (built server-side from the request
  * host, so the OAuth callback reaches the server no matter where the browser
@@ -1259,7 +1271,7 @@ export function ProvidersSection() {
     // startDesktopFlow can stall on backend network calls, and Cancel must be
     // able to reach the attempt (the backend pre-cancels IDs it hasn't
     // registered yet) instead of abandoning only the frontend state.
-    const flowId = crypto.randomUUID();
+    const flowId = createCoderLoginFlowId();
     setCoderFlowId(flowId);
 
     try {
@@ -2434,8 +2446,11 @@ export function ProvidersSection() {
                                   size="sm"
                                   aria-label="Copy and open Coder authorization page"
                                   onClick={() => {
-                                    void navigator.clipboard.writeText(coderAuthorizeUrl);
+                                    // Open first: navigator.clipboard is undefined outside
+                                    // secure contexts (plain-HTTP remote origins), and a throw
+                                    // there must not swallow the navigation.
                                     window.open(coderAuthorizeUrl, "_blank", "noopener");
+                                    void navigator.clipboard?.writeText(coderAuthorizeUrl);
                                   }}
                                   className="h-8 px-3 text-xs"
                                 >
