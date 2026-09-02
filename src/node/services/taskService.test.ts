@@ -3641,6 +3641,87 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, staleTaskId)).toBeUndefined();
   });
 
+  test("startup cleanup continues from the parent the live confirmation saw after a re-parent", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "parent-cleanup-reparent-root";
+    const oldParentId = "child-workflow-reparent-old-parent";
+    const newParentId = "child-workflow-reparent-new-parent";
+    const leafTaskId = "child-workflow-reparent-leaf";
+    const workflowTask = (stepId: string, parentWorkspaceId: string) => ({
+      parentWorkspaceId,
+      agentId: "exec",
+      agentType: "exec",
+      taskStatus: "reported" as const,
+      reportedAt: "2026-08-10T00:00:00.000Z",
+      taskModelString: "openai:gpt-5.2",
+      workflowTask: { runId: "wfr_cleanup_reparent", stepId },
+    });
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootWorkspaceId),
+        projectWorkspace(
+          projectPath,
+          "old-parent",
+          oldParentId,
+          workflowTask("old", rootWorkspaceId)
+        ),
+        projectWorkspace(
+          projectPath,
+          "new-parent",
+          newParentId,
+          workflowTask("new", rootWorkspaceId)
+        ),
+        projectWorkspace(projectPath, "leaf", leafTaskId, workflowTask("leaf", oldParentId)),
+      ],
+      testTaskSettings()
+    );
+    const snapshot = config.loadConfigOrDefault();
+
+    // A client re-parents the leaf after the snapshot screen, before remove() takes the lifecycle
+    // lock; the live confirmation inside remove() sees the new parent.
+    const remove = mock(
+      async (
+        workspaceId: string,
+        _force?: boolean,
+        options?: { beforeRemove?: () => Promise<boolean> }
+      ): Promise<Result<void>> => {
+        if (workspaceId === leafTaskId) {
+          await config.editConfig((cfg) => {
+            const leaf = cfg.projects
+              .get(projectPath)
+              ?.workspaces.find((workspace) => workspace.id === leafTaskId);
+            if (leaf) leaf.parentWorkspaceId = newParentId;
+            return cfg;
+          });
+        }
+        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+          return Ok(undefined);
+        }
+        await removeWorkspaceFromTestConfig(config, workspaceId);
+        return Ok(undefined);
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internals = taskService as unknown as {
+      cleanupReportedLeafTask: (
+        workspaceId: string,
+        options?: { config?: ProjectsConfig }
+      ) => Promise<number>;
+    };
+
+    // Removing the leaf makes its live parent a structural leaf, so cleanup prunes that one
+    // next; the former parent had nothing removed under it and stays.
+    expect(await internals.cleanupReportedLeafTask(leafTaskId, { config: snapshot })).toBe(2);
+    expect(findWorkspaceInConfig(config, leafTaskId)).toBeUndefined();
+    expect(findWorkspaceInConfig(config, newParentId)).toBeUndefined();
+    expect(findWorkspaceInConfig(config, oldParentId)).toBeDefined();
+  });
+
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

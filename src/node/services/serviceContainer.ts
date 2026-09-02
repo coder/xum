@@ -378,7 +378,7 @@ export class ServiceContainer {
     // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.
     try {
       await this.recordStartupStep("workspaceService.initialize", () =>
-        this.workspaceService.initialize()
+        this.workspaceService.initialize({ signal })
       );
     } catch (error: unknown) {
       log.error("[startup] WorkspaceService recovery failed", { error });
@@ -578,6 +578,11 @@ export class ServiceContainer {
         }
       });
     }
+    // Chat recovery sessions that housekeeping scheduled run past its own promise; stop them
+    // before the provider/runtime services they would dispatch through go away.
+    shutdownStep("workspaceService.disposeStartupRecoverySessions", () =>
+      this.workspaceService.disposeStartupRecoverySessions()
+    );
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.

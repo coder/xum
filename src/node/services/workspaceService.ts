@@ -3164,7 +3164,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Best-effort startup recovery for non-task chats so restart auto-retry can resume
    * interrupted turns before the user explicitly opens each workspace.
    */
-  async initialize(): Promise<void> {
+  async initialize(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
 
     try {
@@ -3182,6 +3182,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let skippedTaskCount = 0;
       let skippedArchivedCount = 0;
 
+      // Shutdown may have started during the cleanups above; the (synchronous) loop below must
+      // not spawn recovery sessions that disposeStartupRecoverySessions() has already swept.
+      if (options?.signal?.aborted === true) {
+        log.info("[startup] WorkspaceService.initialize cancelled before scheduling recovery");
+        return;
+      }
       // This can run while the server is already serving clients, and the cleanups above took
       // time: re-read config right before the (synchronous) scheduling loop so a workspace archived
       // or removed since `allMetadata` was read does not get a hidden recovery stream.
@@ -3924,6 +3930,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return (
       message.type === "message" && message.role === "user" && message.metadata?.synthetic !== true
     );
+  }
+
+  /**
+   * Shutdown: stop startup chat recovery that has not started a stream yet. Their recovery chains
+   * re-check `disposed` before every dispatch, so nothing they still have in flight reaches the
+   * provider or the services being torn down.
+   */
+  disposeStartupRecoverySessions(): void {
+    for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
+      this.transientStartupRecoverySessions.delete(workspaceId);
+      session.dispose();
+    }
   }
 
   /**

@@ -8320,6 +8320,52 @@ describe("WorkspaceService initialize", () => {
     expect(removeWorkspaceData).toHaveBeenCalledWith("archived-ws");
   });
 
+  test("initialize schedules no recovery once shutdown has aborted it", async () => {
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "Live Workspace" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          { workspaces: [{ id: "live-ws", name: "live-ws", path: "/tmp/live-ws" }] },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+    const startupAccess = workspaceService as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    const startStartupRecoverySpy = spyOn(startupAccess, "startStartupRecovery").mockImplementation(
+      () => undefined
+    );
+    const shutdown = new AbortController();
+
+    await workspaceService.initialize({ signal: shutdown.signal });
+    expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
+
+    shutdown.abort();
+    await workspaceService.initialize({ signal: shutdown.signal });
+    expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("disposeStartupRecoverySessions stops every transient startup-recovery session", () => {
+    const dispose = mock(() => undefined);
+    const startupAccess = workspaceService as unknown as {
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+    };
+    startupAccess.transientStartupRecoverySessions.set("ws-a", {
+      dispose,
+    } as unknown as AgentSession);
+    startupAccess.transientStartupRecoverySessions.set("ws-b", {
+      dispose,
+    } as unknown as AgentSession);
+
+    workspaceService.disposeStartupRecoverySessions();
+
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(startupAccess.transientStartupRecoverySessions.size).toBe(0);
+  });
+
   test("disposes transient startup-recovery sessions that go idle", async () => {
     const dispose = mock(() => undefined);
     const fakeSession = {

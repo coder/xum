@@ -270,6 +270,7 @@ describe("ServiceContainer", () => {
 
     await services.runStartupHousekeeping();
     expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping"]);
+    expect(workspaceInitializeSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(taskHousekeepingSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
   });
 
@@ -299,6 +300,10 @@ describe("ServiceContainer", () => {
         .backgroundProcessManager,
       "beginShutdown"
     );
+    const disposeRecoverySessions = spyOn(
+      services.workspaceService,
+      "disposeStartupRecoverySessions"
+    );
 
     await services.initializeCore();
     const housekeeping = services.runStartupHousekeeping();
@@ -309,10 +314,13 @@ describe("ServiceContainer", () => {
     // Teardown of the services housekeeping is using waits for the in-flight step to settle
     // (without the join, this first teardown step runs synchronously inside dispose()).
     expect(beginShutdown).not.toHaveBeenCalled();
+    expect(disposeRecoverySessions).not.toHaveBeenCalled();
     releaseTaskHousekeeping?.();
     await housekeeping;
     await disposed;
 
+    // Recovery sessions housekeeping scheduled are stopped once it has settled, before teardown.
+    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
     expect(beginShutdown).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).not.toHaveBeenCalled();
     expect(idleCompactionStart).not.toHaveBeenCalled();

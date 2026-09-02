@@ -13326,11 +13326,12 @@ export class TaskService implements AgentTaskIntegration {
       // acquisition on this path: runtime callers reach it under the workspace event lock
       // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the inverse of
       // the send path's task-tree -> event. That nesting predates the live recheck.
-      let confirmed = false;
+      let confirmed: { ok: true; parentWorkspaceId: string } | undefined;
       const removeResult = await this.workspaceService.remove(targetWorkspaceId, true, {
         beforeRemove: async () => {
-          confirmed = (await this.canCleanupReportedTask(targetWorkspaceId)).ok;
-          return confirmed;
+          const live = await this.canCleanupReportedTask(targetWorkspaceId);
+          confirmed = live.ok ? live : undefined;
+          return live.ok;
         },
       });
       if (!removeResult.success) {
@@ -13340,12 +13341,14 @@ export class TaskService implements AgentTaskIntegration {
         });
         return removedCount;
       }
-      if (!confirmed) {
+      if (confirmed == null) {
         return removedCount;
       }
       removedCount += 1;
 
-      currentWorkspaceId = screened.parentWorkspaceId;
+      // The removal just made this parent a candidate, so follow the parent the live check saw
+      // (a client may have re-parented the task since the screen).
+      currentWorkspaceId = confirmed.parentWorkspaceId;
     }
 
     log.error("cleanupReportedLeafTask: exceeded max parent traversal depth", {
