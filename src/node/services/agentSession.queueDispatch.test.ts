@@ -1165,6 +1165,103 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("settles an irreversible synthetic claim before blocking startup", async () => {
+    const workspaceId = "queue-dispatch-irrevocable-synthetic-stop";
+    let claimQueuedToolEndMessage: (() => boolean) | undefined;
+    const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
+      claimQueuedToolEndMessage ??= options.claimQueuedToolEndMessage;
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    let markSyncStarted: () => void = () => undefined;
+    const syncStarted = new Promise<void>((resolve) => {
+      markSyncStarted = resolve;
+    });
+    let releaseSync: () => void = () => undefined;
+    const syncRelease = new Promise<void>((resolve) => {
+      releaseSync = resolve;
+    });
+    let syncCalls = 0;
+    const syncGoalModeWithChatTail = mock(async () => {
+      syncCalls += 1;
+      if (syncCalls === 2) {
+        markSyncStarted();
+        await syncRelease;
+      }
+      return null;
+    });
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail,
+      recordStreamStarted: mock(() => undefined),
+    } as unknown as WorkspaceGoalService;
+    const { session, cleanup, aiEmitter, aiService, historyService } =
+      await createAgentSessionHarness({
+        workspaceId,
+        workspaceGoalService,
+        aiServiceOverrides: {
+          streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        },
+      });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      expect(
+        (
+          await session.sendMessage(
+            "Start work",
+            {
+              model: TEST_MODEL,
+              agentId: "exec",
+            },
+            { synthetic: true, agentInitiated: true }
+          )
+        ).success
+      ).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      let accepted = false;
+      session.queueMessage(
+        "Background monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          queueDispatchMode: "tool-end",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          onAccepted: () => {
+            accepted = true;
+          },
+        }
+      );
+
+      expect(claimQueuedToolEndMessage?.()).toBe(true);
+      session.sendQueuedMessages();
+      await syncStarted;
+
+      expect((await session.interruptStream()).success).toBe(true);
+      releaseSync();
+
+      expect(await waitForCondition(() => accepted)).toBe(true);
+      expect(await waitForCondition(() => !session.isPreparingTurn())).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        const text = history.data
+          .flatMap((message) => message.parts)
+          .map((part) => (part.type === "text" ? part.text : ""));
+        expect(text).toContain("Background monitor wake");
+      }
+    } finally {
+      releaseSync();
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("restores the provider-tool queue claim when the soft stop fails", async () => {
     const workspaceId = "queue-dispatch-provider-tool-stop-failure";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({

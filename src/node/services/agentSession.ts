@@ -7263,6 +7263,11 @@ export class AgentSession {
                 await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
                 if (dispatchClaim.queueClaim.admissionSignal.aborted) {
                   const reason: unknown = dispatchClaim.queueClaim.admissionSignal.reason;
+                  this.releaseQueuedToolEndClaim(dispatchClaim);
+                  if (dispatchClaim.admissionIrreversible) {
+                    // The row is durable. Settle its producer before refusing provider startup.
+                    await internal?.onAccepted?.();
+                  }
                   throw new Error(
                     typeof reason === "string"
                       ? reason
