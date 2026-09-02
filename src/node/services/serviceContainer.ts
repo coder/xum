@@ -320,9 +320,9 @@ export class ServiceContainer {
   /**
    * Everything request handling depends on, plus agent-task restart recovery. The server entry
    * point awaits this before binding its listener: task recovery must finish before any client
-   * can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and it is
-   * bounded by the number of active tasks rather than by deployment size. The per-workspace
-   * housekeeping lives in runStartupHousekeeping().
+   * can stop, resume, or send to a task or its parent (see TaskService.recoverInterruptedTasks),
+   * and it is bounded by the number of active tasks and best-of parents rather than by deployment
+   * size. The per-workspace housekeeping lives in runStartupHousekeeping().
    */
   async initializeCore(): Promise<void> {
     this.startupStartedAt = Date.now();

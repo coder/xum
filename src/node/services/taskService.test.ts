@@ -20077,7 +20077,7 @@ describe("TaskService", () => {
     ).toHaveLength(1);
   });
 
-  test("initialize finalizes ready best-of partials before cleanup rechecks", async () => {
+  test("pre-listen recovery, not housekeeping, finalizes ready best-of partials before cleanup rechecks", async () => {
     const config = await createTestConfig(rootDir);
 
     const projectPath = path.join(rootDir, "repo");
@@ -20170,12 +20170,10 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
 
-    await taskService.initialize();
-
-    const updatedParentPartial = await partialService.readPartial(parentId);
-    expect(updatedParentPartial).not.toBeNull();
-    if (updatedParentPartial) {
-      const toolPart = updatedParentPartial.parts.find(
+    const readParentTaskToolPart = async () => {
+      const parentPartial = await partialService.readPartial(parentId);
+      expect(parentPartial).not.toBeNull();
+      return parentPartial?.parts.find(
         (p) =>
           p &&
           typeof p === "object" &&
@@ -20188,14 +20186,23 @@ describe("TaskService", () => {
             output?: unknown;
           }
         | undefined;
-      expect(toolPart?.toolName).toBe("task");
-      expect(toolPart?.state).toBe("output-available");
-      const outputJson = JSON.stringify(toolPart?.output);
-      expect(outputJson).toContain(childOneId);
-      expect(outputJson).toContain(childTwoId);
-      expect(outputJson).toContain("Report from child one");
-      expect(outputJson).toContain("Report from child two");
-    }
+    };
+
+    // Rewriting a parent's partial races any parent turn a client starts once the listener is
+    // open, so the post-listen housekeeping phase must leave it alone.
+    await taskService.runStartupHousekeeping();
+    expect((await readParentTaskToolPart())?.state).toBe("input-available");
+
+    await taskService.recoverInterruptedTasks();
+
+    const toolPart = await readParentTaskToolPart();
+    expect(toolPart?.toolName).toBe("task");
+    expect(toolPart?.state).toBe("output-available");
+    const outputJson = JSON.stringify(toolPart?.output);
+    expect(outputJson).toContain(childOneId);
+    expect(outputJson).toContain(childTwoId);
+    expect(outputJson).toContain("Report from child one");
+    expect(outputJson).toContain("Report from child two");
 
     const remainingTaskIds = Array.from(config.loadConfigOrDefault().projects.values())
       .flatMap((project) => project.workspaces)

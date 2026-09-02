@@ -2272,11 +2272,12 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Re-establishes the tasks that were active when the process last exited: execution-handle
-   * mirrors, stale `starting` tasks, the queue drain, and the restart prompts for
-   * `awaiting_report`/`running` tasks. Bounded by the number of active tasks, not by deployment
-   * size. Must finish before any client can act on tasks: a stop, resume, or send racing these
-   * transitions would be overwritten or would resurrect a task the client just stopped, so the
-   * server binds its listener only after this resolves.
+   * mirrors, stale `starting` tasks, the queue drain, the restart prompts for
+   * `awaiting_report`/`running` tasks, and pending best-of task tool calls in crashed parents'
+   * partials. Bounded by the number of active tasks plus one partial read per best-of parent,
+   * not by deployment size. Must finish before any client can act on tasks or parents: a stop,
+   * resume, or send racing these transitions would be overwritten or would resurrect a task the
+   * client just stopped, so the server binds its listener only after this resolves.
    */
   async recoverInterruptedTasks(): Promise<void> {
     const startupStartedAt = Date.now();
@@ -2565,9 +2566,40 @@ export class TaskService implements AgentTaskIntegration {
       await this.maybeStartQueuedTasks();
     }
 
+    // Restart-safety for grouped best-of completion: if child report artifacts already exist
+    // on disk after a restart, there may be no later child stream-end to finalize the pending
+    // parent task tool call, and reported-task cleanup stays blocked behind the stale
+    // input-available partial. Finalizing rewrites the parent's partial.json, which a parent
+    // turn started by a client would race (commit the old partial, then have its own overwritten),
+    // so this runs before the listener rather than in housekeeping. Cost: one partial read per
+    // parent of reported best-of children.
+    const bestOfRecoveryStartedAt = Date.now();
+    const bestOfParentWorkspaceIds = new Set<string>();
+    for (const task of this.listAgentTaskWorkspaces(config)) {
+      const parentWorkspaceId = coerceNonEmptyString(task.parentWorkspaceId);
+      const taskId = coerceNonEmptyString(task.id);
+      if (!parentWorkspaceId || !taskId || !hasCompletedAgentReport(task)) {
+        continue;
+      }
+      if ((this.getEffectiveTaskGroup(taskId, task)?.total ?? 1) <= 1) {
+        continue;
+      }
+      bestOfParentWorkspaceIds.add(parentWorkspaceId);
+    }
+    for (const parentWorkspaceId of bestOfParentWorkspaceIds) {
+      // A parent the prompts above resumed is streaming; its own stream-end reruns this pass.
+      if (this.aiService.isStreaming(parentWorkspaceId)) {
+        continue;
+      }
+      await this.deliverDeferredBestOfReportsForParent(parentWorkspaceId);
+    }
+    const bestOfRecoveryMs = Date.now() - bestOfRecoveryStartedAt;
+
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
       totalMs: Date.now() - startupStartedAt,
       maybeStartQueuedTasksMs,
+      bestOfParentRecoveryCount: bestOfParentWorkspaceIds.size,
+      bestOfRecoveryMs,
       awaitingReportTaskCount: awaitingReportTasks.length,
       resumedAwaitingReportCount,
       skippedAwaitingReportDueToActiveDescendants,
@@ -2627,32 +2659,9 @@ export class TaskService implements AgentTaskIntegration {
     }
     const patchGenerationRecoveryMs = Date.now() - patchGenerationRecoveryStartedAt;
 
-    // Restart-safety for grouped best-of completion: if child report artifacts already exist
-    // on disk after a restart, there may be no later child stream-end to finalize the pending
-    // parent task tool call. Re-run the deferred parent delivery/finalization pass first so
-    // cleanup rechecks do not stay blocked forever behind a stale input-available partial.
-    if (cancelled()) return;
-    const bestOfRecoveryStartedAt = Date.now();
-    const bestOfParentWorkspaceIds = new Set<string>();
-    for (const task of completedReportTasks) {
-      const parentWorkspaceId = coerceNonEmptyString(task.parentWorkspaceId);
-      const taskId = coerceNonEmptyString(task.id);
-      const bestOf = taskId ? this.getEffectiveTaskGroup(taskId, task) : undefined;
-      if (!parentWorkspaceId || (bestOf?.total ?? 1) <= 1) {
-        continue;
-      }
-      if (this.aiService.isStreaming(parentWorkspaceId)) {
-        continue;
-      }
-      bestOfParentWorkspaceIds.add(parentWorkspaceId);
-    }
-    for (const parentWorkspaceId of bestOfParentWorkspaceIds) {
-      if (cancelled()) return;
-      await this.deliverDeferredBestOfReportsForParent(parentWorkspaceId);
-    }
-    const bestOfRecoveryMs = Date.now() - bestOfRecoveryStartedAt;
-
-    // Best-effort completed-report ancestor recheck after restart.
+    // Best-effort completed-report ancestor recheck after restart. Pending best-of parent
+    // partials were already finalized by recoverInterruptedTasks, so cleanup does not stay
+    // blocked behind a stale input-available task tool call.
     const cleanupReportedTasksStartedAt = Date.now();
     // Reuse one config snapshot across tasks to screen out the (usual) ineligible majority without
     // a config parse each; reload it only after a removal changed the tree. The snapshot never
@@ -2713,8 +2722,6 @@ export class TaskService implements AgentTaskIntegration {
       totalMs,
       completedReportTaskCount: completedReportTasks.length,
       patchGenerationRecoveryMs,
-      bestOfParentRecoveryCount: bestOfParentWorkspaceIds.size,
-      bestOfRecoveryMs,
       queuedTerminalWorkflowRunAttentionCount,
       recoveredTerminalWorkspaceTurnNotificationCount,
       pendingTerminalAttentionOwnerWorkspaceCount,
