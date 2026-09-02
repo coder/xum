@@ -152,6 +152,12 @@ async function main(): Promise<void> {
 
   const context = serviceContainer.toORPCContext();
 
+  // Snapshot config before the listener opens: startServer() is already accepting requests while
+  // it awaits the lockfile and mDNS, so a snapshot taken after it resolves could already contain
+  // a task a freshly connected client is legitimately starting, and recovery would misjudge it
+  // as stale. Everything recovery must judge as pre-existing is on disk at this point.
+  const startupRecoveryConfig = config.loadConfigOrDefault();
+
   // Start server via ServerService (handles lockfile, mDNS, network URLs)
   const serverInfo = await serviceContainer.serverService.startServer({
     xumHome: serviceContainer.config.rootDir,
@@ -163,11 +169,8 @@ async function main(): Promise<void> {
     allowHttpOrigin: ALLOW_HTTP_ORIGIN,
   });
 
-  // Start recovery in the same synchronous continuation as startServer resolving, before any
-  // further await: runStartupRecovery snapshots config before its first await, and that
-  // snapshot must predate anything a freshly connected client can create. Recovery is
-  // best-effort background work; a failure must not take the listening server down.
-  void serviceContainer.runStartupRecovery().catch((error: unknown) => {
+  // Recovery is best-effort background work; a failure must not take the listening server down.
+  void serviceContainer.runStartupRecovery(startupRecoveryConfig).catch((error: unknown) => {
     log.error("[startup] Background startup recovery failed", { error });
   });
 

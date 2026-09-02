@@ -2,7 +2,7 @@ import * as path from "path";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { log } from "@/node/services/log";
-import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
+import type { Config, ConfigStores, ProjectsConfig, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import type { CoreServices } from "@/node/services/coreServices";
@@ -661,22 +661,33 @@ export class ServiceContainer {
    * Workspace/task restart recovery plus background housekeeping. On large deployments this
    * scales with the number of workspaces, so the server entry point runs it after the
    * listener is bound instead of on the critical path to accepting connections.
+   *
+   * @param startupConfig - config snapshot from before the listener opened. TaskService's
+   *   stale-`starting` recovery must only judge tasks that were `starting` when the process
+   *   started, never a task a freshly connected client is legitimately starting, so a caller
+   *   that accepts connections before recovery must capture the snapshot before listening.
    */
-  async runStartupRecovery(): Promise<void> {
-    // Snapshot config synchronously, before the first await. server.ts calls this in the same
-    // tick that startServer resolves, so a snapshot taken here cannot contain tasks created by
-    // clients that connect after listen. TaskService's stale-`starting` recovery must only judge
-    // tasks that were `starting` when the process started, never a task a freshly connected
-    // client is legitimately starting.
-    const startupConfig = this.config.loadConfigOrDefault();
-
+  async runStartupRecovery(
+    startupConfig: ProjectsConfig = this.config.loadConfigOrDefault()
+  ): Promise<void> {
+    // Recovery is best-effort and runs while the server may already be serving requests: a
+    // failing recovery step must not skip the periodic services below (startup-time rule:
+    // never let background housekeeping take the app down).
     // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.initialize().
-    await this.recordStartupStep("workspaceService.initialize", () =>
-      this.workspaceService.initialize()
-    );
-    await this.recordStartupStep("taskService.initialize", () =>
-      this.taskService.initialize(startupConfig)
-    );
+    try {
+      await this.recordStartupStep("workspaceService.initialize", () =>
+        this.workspaceService.initialize()
+      );
+    } catch (error: unknown) {
+      log.error("[startup] WorkspaceService recovery failed", { error });
+    }
+    try {
+      await this.recordStartupStep("taskService.initialize", () =>
+        this.taskService.initialize(startupConfig)
+      );
+    } catch (error: unknown) {
+      log.error("[startup] TaskService recovery failed", { error });
+    }
 
     const idleCompactionStartedAt = Date.now();
     // Start idle compaction checker

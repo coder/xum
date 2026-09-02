@@ -143,24 +143,42 @@ describe("ServiceContainer", () => {
       taskInitCalled?.();
       return taskInitGate;
     });
+    // The server entry point snapshots config before its listener opens and hands that exact
+    // snapshot to task recovery; recovery must not substitute a fresh load.
+    const preListenSnapshot = config.loadConfigOrDefault();
     loadConfigSpy.mockClear();
 
     let recoverySettled = false;
-    const recovery = services.runStartupRecovery().then(() => {
+    const recovery = services.runStartupRecovery(preListenSnapshot).then(() => {
       recoverySettled = true;
     });
     await taskInitCalledPromise;
     expect(callOrder).toEqual(["workspace", "task"]);
     expect(recoverySettled).toBe(false);
-
-    // The snapshot handed to TaskService is the one loaded synchronously at recovery start.
-    const snapshot = loadConfigSpy.mock.results[0]?.value;
-    expect(snapshot).toBeDefined();
-    expect(taskInitializeSpy).toHaveBeenCalledWith(snapshot);
+    expect(taskInitializeSpy).toHaveBeenCalledWith(preListenSnapshot);
+    expect(loadConfigSpy).not.toHaveBeenCalled();
 
     releaseTaskInit?.();
     await recovery;
     expect(recoverySettled).toBe(true);
+  });
+
+  it("runStartupRecovery starts the periodic services even when task recovery rejects", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    spyOn(services.taskService, "initialize").mockImplementation(() =>
+      Promise.reject(new Error("terminal-attention store unreadable"))
+    );
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const agentStatusStart = spyOn(services.agentStatusService, "start");
+
+    await services.initializeCore();
+    await services.runStartupRecovery();
+
+    expect(idleCompactionStart).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+    expect(agentStatusStart).toHaveBeenCalledTimes(1);
   });
 
   it("exposes desktopSessionManager in the ORPC context", () => {

@@ -8042,6 +8042,70 @@ describe("WorkspaceService initialize", () => {
     }
   });
 
+  test("removes stale orphaned scratch workdirs but keeps referenced and recent ones", async () => {
+    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
+    const scratchDirFor = (id: string) => path.join(realConfig.rootDir, "scratch", id);
+    const referencedDir = scratchDirFor("referenced-scratch");
+    const staleOrphanDir = scratchDirFor("stale-orphan-scratch");
+    // A scratch chat created while the sweep runs has a fresh workdir and, briefly, no
+    // config entry yet (createScratch persists config after mkdir).
+    const freshOrphanDir = scratchDirFor("fresh-orphan-scratch");
+    for (const dir of [referencedDir, staleOrphanDir, freshOrphanDir]) {
+      await fsPromises.mkdir(dir, { recursive: true });
+    }
+    const staleTime = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    for (const dir of [referencedDir, staleOrphanDir]) {
+      await fsPromises.utimes(dir, staleTime, staleTime);
+    }
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            kind: "scratch",
+            path: referencedDir,
+            id: "referenced-scratch",
+            name: "scratch-referenced-scratch",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+        projectKind: "system",
+        trusted: true,
+      });
+      return cfg;
+    });
+
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+    const service = createWorkspaceServiceForTest({
+      config: realConfig,
+      historyService,
+      aiService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const startupAccess = service as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
+
+    const exists = (dir: string) =>
+      fsPromises.stat(dir).then(
+        () => true,
+        () => false
+      );
+
+    try {
+      await service.initialize();
+      expect(await exists(referencedDir)).toBe(true);
+      expect(await exists(freshOrphanDir)).toBe(true);
+      expect(await exists(staleOrphanDir)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("removes stale orphaned session directories but keeps referenced and recent ones", async () => {
     const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
     await realConfig.editConfig((cfg) => {

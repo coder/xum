@@ -4370,19 +4370,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return false;
   }
 
-  private async cleanupOrphanScratchWorkdirs(): Promise<void> {
-    const scratchRoot = this.getScratchRoot();
-    await ensurePrivateDir(scratchRoot);
-
-    // Never interpret a config read failure as an empty reference set, because that would
-    // turn best-effort orphan cleanup into deletion of valid scratch chats.
+  /**
+   * Scratch workdirs referenced by config. Throws on unreadable config: never interpret a
+   * config read failure as an empty reference set, because that would turn best-effort
+   * orphan cleanup into deletion of valid scratch chats.
+   */
+  private listReferencedScratchPaths(): Set<string> {
     const config = this.config.loadConfigOrDefault({ throwOnError: true });
-    const referencedScratchPaths = new Set(
+    return new Set(
       (config.projects.get(SCRATCH_PROJECT_CONFIG_KEY)?.workspaces ?? [])
         .filter((workspace) => workspace.kind === "scratch")
         .map((workspace) => path.resolve(workspace.path))
     );
+  }
 
+  private async cleanupOrphanScratchWorkdirs(): Promise<void> {
+    const scratchRoot = this.getScratchRoot();
+    await ensurePrivateDir(scratchRoot);
+
+    const referencedScratchPaths = this.listReferencedScratchPaths();
+
+    const nowMs = Date.now();
     for (const entry of await fsPromises.readdir(scratchRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
 
@@ -4390,6 +4398,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (referencedScratchPaths.has(candidatePath)) continue;
 
       try {
+        // This sweep can run while the server is already accepting requests, and createScratch
+        // creates the workdir before persisting its config entry. Same guards as the session
+        // sweep: skip recently touched directories, then re-check fresh config right before
+        // deleting so a scratch chat created after the snapshot above is never reaped.
+        const stat = await fsPromises.stat(candidatePath);
+        if (nowMs - stat.mtimeMs < ORPHAN_SESSION_DIR_GRACE_MS) continue;
+        if (this.listReferencedScratchPaths().has(candidatePath)) continue;
+
         await fsPromises.rm(candidatePath, { recursive: true, force: true });
       } catch (error: unknown) {
         log.debug("Failed to clean orphaned scratch workdir", { candidatePath, error });
