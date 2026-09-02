@@ -1227,6 +1227,7 @@ describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
   type BuildStopWhenCondition = (request: {
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    onQueuedMessageStop?: () => void;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
 
@@ -1264,6 +1265,36 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(requiredToolCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
       false
     );
+  });
+
+  test("queued-message stop reports itself only when no required tool completed", () => {
+    let queued = false;
+    let stopsForQueuedMessage = 0;
+    const [, queuedMessageCondition] = buildStopWhenForTests()({
+      hasQueuedMessages: () => queued,
+      onQueuedMessageStop: () => {
+        stopsForQueuedMessage += 1;
+      },
+      toolPolicy: [{ regex_match: "agent_report", action: "require" }],
+    });
+    const bashStep = stepsWithToolResult("bash", { success: true });
+
+    expect(queuedMessageCondition(bashStep)).toBe(false);
+    expect(stopsForQueuedMessage).toBe(0);
+
+    queued = true;
+    expect(queuedMessageCondition(bashStep)).toBe(true);
+    expect(stopsForQueuedMessage).toBe(1);
+
+    expect(queuedMessageCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
+      true
+    );
+    expect(stopsForQueuedMessage).toBe(1);
+
+    expect(queuedMessageCondition(stepsWithToolResult("agent_report", { success: false }))).toBe(
+      true
+    );
+    expect(stopsForQueuedMessage).toBe(2);
   });
 
   const requiredToolCases: Array<{

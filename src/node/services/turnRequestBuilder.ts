@@ -273,6 +273,8 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /** Fires when the model loop stops solely on behalf of a queued tool-end message. */
+  onQueuedMessageStop?: () => void;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -737,6 +739,7 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      onQueuedMessageStop,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -2857,6 +2860,7 @@ export class TurnRequestBuilder {
       toolPolicy: effectiveToolPolicy,
       providedStreamToken: streamToken,
       hasQueuedMessages,
+      onQueuedMessageStop,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

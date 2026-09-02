@@ -365,6 +365,21 @@ function getWorkspaceTurnMuxMetadata(muxMetadata: unknown): WorkspaceTurnMuxMeta
   return metadata?.type === "workspace-turn-task" ? metadata : undefined;
 }
 
+/**
+ * Options for resuming a turn stranded by a withdrawn queued message: the ended stream's
+ * settings minus anything that would replay its dispatch (edit target, queue dispatch mode)
+ * or re-stamp per-message metadata (compaction, skill, wake). Only the workspace-turn
+ * correlation survives because the delegating owner still waits on this continuation.
+ */
+function buildStrandedTurnResumeOptions(options: SendMessageOptions): SendMessageOptions {
+  const {
+    editMessageId: _editMessageId,
+    queueDispatchMode: _queueDispatchMode,
+    ...resumeOptions
+  } = options;
+  return { ...resumeOptions, muxMetadata: getWorkspaceTurnMuxMetadata(options.muxMetadata) };
+}
+
 function hasSameWorkspaceTurnCorrelation(
   first: WorkspaceTurnMuxMetadata | undefined,
   second: WorkspaceTurnMuxMetadata | undefined
@@ -518,6 +533,11 @@ export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
+/**
+ * Runaway guard for pathological queue flapping (stop for a queued message, withdraw it,
+ * repeat): after this many back-to-back stranded resumes the turn is left idle.
+ */
+const MAX_CONSECUTIVE_STRANDED_TURN_RESUMES = 3;
 
 export interface AgentSessionChatEvent {
   workspaceId: string;
@@ -695,6 +715,13 @@ export class AgentSession {
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedProviderToolEndAbortInFlight = false;
   private readonly activeToolCallIds = new Set<string>();
+  // The model loop stops at a tool boundary on behalf of a queued tool-end message. If that
+  // message never starts a turn (canceled wake, cleared queue, pre-stream failure), the stop
+  // would strand the turn on an unanswered tool result, so the continuation is owed here until
+  // a stream actually starts (setTurnPhase STREAMING) or the sweep resumes it.
+  private strandedTurnResume?: SendMessageOptions;
+  private activeStreamStoppedForQueuedMessage = false;
+  private consecutiveStrandedResumes = 0;
 
   private idleWaiters: Array<() => void> = [];
   private pendingExternalManualFollowUps = 0;
@@ -4028,6 +4055,9 @@ export class AgentSession {
     // Synthetic/system sends (mid-stream compaction, task recovery prompts, etc.)
     // must not silently opt users back into auto-retry after they've disabled it.
     if (isManualUserMessage) {
+      // The user's own message supersedes any continuation owed to a stranded turn.
+      this.strandedTurnResume = undefined;
+      this.consecutiveStrandedResumes = 0;
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
       await this.clearStartupAutoRetryAbandon();
@@ -5002,6 +5032,7 @@ export class AgentSession {
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
+    this.activeStreamStoppedForQueuedMessage = false;
 
     const commitResult = await this.historyService.commitPartial(this.workspaceId);
     if (!commitResult.success) {
@@ -5211,6 +5242,9 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      onQueuedMessageStop: () => {
+        this.activeStreamStoppedForQueuedMessage = true;
+      },
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -5979,6 +6013,7 @@ export class AgentSession {
 
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
+      const abortedStreamOptions = this.activeStreamContext?.options;
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
       const isQueuedProviderToolEndAbort =
         this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
@@ -6018,10 +6053,13 @@ export class AgentSession {
       }
       await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
-      const dispatchedQueuedMessage =
-        this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
+      const dispatchedQueuedMessage = this.dispatchQueuedProviderToolEndMessageAfterAbort(
+        abortReason,
+        abortedStreamOptions
+      );
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
+        this.resumeStrandedTurnIfIdle();
       }
     });
     forward("runtime-status", (payload) => {
@@ -6044,6 +6082,7 @@ export class AgentSession {
       const streamEndPayload = payload;
       const activeStreamGoalKind = this.activeStreamContext?.goalKind;
       const activeStreamOptions = this.activeStreamContext?.options;
+      const stoppedForQueuedMessage = this.activeStreamStoppedForQueuedMessage;
 
       let goalContinuationRequest: {
         sendOptions: SendMessageOptions;
@@ -6142,10 +6181,29 @@ export class AgentSession {
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
           // for IDLE; truncation must run before any synthetic turn resumes.
         } else {
+          if (!handled) {
+            if (stoppedForQueuedMessage) {
+              // The queued dispatch below normally consumes this; it stays owed only when
+              // that message does not start a turn.
+              this.strandedTurnResume = buildStrandedTurnResumeOptions(
+                activeStreamOptions ?? {
+                  model: streamEndPayload.metadata.model,
+                  agentId: WORKSPACE_DEFAULTS.agentId,
+                }
+              );
+            } else {
+              this.consecutiveStrandedResumes = 0;
+            }
+          }
           this.sendQueuedMessages();
         }
 
-        if (!handled && !this.deferQueuedFlushUntilAfterEdit && !hadQueuedMessages) {
+        if (
+          !handled &&
+          !this.deferQueuedFlushUntilAfterEdit &&
+          !hadQueuedMessages &&
+          this.strandedTurnResume == null
+        ) {
           const sendOptions = activeStreamOptions ?? {
             model: streamEndPayload.metadata.model,
             agentId: WORKSPACE_DEFAULTS.agentId,
@@ -6201,6 +6259,7 @@ export class AgentSession {
         if (this.turnPhase === TurnPhase.COMPLETING) {
           this.resetActiveStreamState();
           this.setTurnPhase(TurnPhase.IDLE);
+          this.resumeStrandedTurnIfIdle();
           if (goalContinuationRequest != null) {
             await this.workspaceGoalService?.requestContinuationAfterStreamEnd({
               workspaceId: this.workspaceId,
@@ -6284,6 +6343,12 @@ export class AgentSession {
 
     this.emitStreamLifecycleIfChanged();
 
+    if (next === TurnPhase.STREAMING) {
+      // Any stream that actually starts is the continuation the stranded turn was waiting
+      // for. PREPARING is not enough: a dequeued entry can still be canceled before acceptance.
+      this.strandedTurnResume = undefined;
+    }
+
     if (next === TurnPhase.IDLE) {
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
@@ -6344,6 +6409,7 @@ export class AgentSession {
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
+    this.strandedTurnResume = undefined;
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
     if (!deleteResult.success) {
       return Err(deleteResult.error);
@@ -6381,14 +6447,14 @@ export class AgentSession {
         // Entries left queued while the block was held have no stream-end
         // drain to dispatch them (the session stayed idle throughout) —
         // drain now, mirroring the edit-admission release. Only when entries
-        // exist: releases from a session that never queued must stay
-        // side-effect free.
-        if (
-          this.turnAdmissionBlocks === 0 &&
-          this.turnPhase === TurnPhase.IDLE &&
-          !this.messageQueue.isEmpty()
-        ) {
-          this.sendQueuedMessages();
+        // (or an owed stranded resume) exist: releases from a session that
+        // never queued must stay side-effect free.
+        if (this.turnAdmissionBlocks === 0 && this.turnPhase === TurnPhase.IDLE) {
+          if (!this.messageQueue.isEmpty()) {
+            this.sendQueuedMessages();
+          } else {
+            this.resumeStrandedTurnIfIdle();
+          }
         }
       },
     };
@@ -6543,6 +6609,7 @@ export class AgentSession {
     for (const callbacks of callbackSets) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
+    this.resumeStrandedTurnIfIdle();
   }
 
   setQueuedMessageDispatchMode(mode: "tool-end" | "turn-end"): boolean {
@@ -6599,6 +6666,7 @@ export class AgentSession {
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
+    this.resumeStrandedTurnIfIdle();
     return removal.removedCount;
   }
 
@@ -6625,6 +6693,7 @@ export class AgentSession {
       !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    this.resumeStrandedTurnIfIdle();
     return true;
   }
 
@@ -6795,22 +6864,80 @@ export class AgentSession {
   }
 
   private dispatchQueuedProviderToolEndMessageAfterAbort(
-    abortReason: StreamAbortReason | undefined
+    abortReason: StreamAbortReason | undefined,
+    abortedStreamOptions: SendMessageOptions | undefined
   ): boolean {
     if (!this.queuedProviderToolEndAbortInFlight) {
       return false;
     }
-
-    const shouldDispatch =
-      abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
     this.queuedProviderToolEndAbortInFlight = false;
 
-    if (!shouldDispatch) {
+    if (abortReason === "user" || this.deferQueuedFlushUntilAfterEdit) {
+      return false;
+    }
+
+    // The soft stop was made on behalf of the queued message; if that message has been
+    // withdrawn (or is withdrawn after dequeue), the interrupted turn must resume instead.
+    if (abortedStreamOptions != null) {
+      this.strandedTurnResume = buildStrandedTurnResumeOptions(abortedStreamOptions);
+    }
+    if (!this.hasQueuedMessages()) {
       return false;
     }
 
     this.sendQueuedMessages();
     return true;
+  }
+
+  /**
+   * One idempotent sweep for the owed continuation (see strandedTurnResume). Cheap enough to
+   * run from every idle transition and queue removal; only the first eligible call acts.
+   */
+  private resumeStrandedTurnIfIdle(): void {
+    const options = this.strandedTurnResume;
+    if (
+      options == null ||
+      this.disposed ||
+      this.turnAdmissionBlocks > 0 ||
+      this.hasActiveOrPendingTurnWork() ||
+      !this.messageQueue.isEmpty() ||
+      this.hasPendingAutoRetry() ||
+      this.deferQueuedFlushUntilAfterEdit
+    ) {
+      return;
+    }
+    this.strandedTurnResume = undefined;
+
+    if (this.consecutiveStrandedResumes >= MAX_CONSECUTIVE_STRANDED_TURN_RESUMES) {
+      log.warn("Leaving stranded turn idle: consecutive resume cap reached", {
+        workspaceId: this.workspaceId,
+        cap: MAX_CONSECUTIVE_STRANDED_TURN_RESUMES,
+      });
+      return;
+    }
+    this.consecutiveStrandedResumes += 1;
+    log.info("Resuming turn stranded by a withdrawn queued message", {
+      workspaceId: this.workspaceId,
+      attempt: this.consecutiveStrandedResumes,
+    });
+
+    this.resumeStream(options, { agentInitiated: true })
+      .then((result) => {
+        if (!result.success) {
+          log.warn("Stranded turn resume failed", {
+            workspaceId: this.workspaceId,
+            error: result.error,
+          });
+        } else if (!result.data.started) {
+          log.warn("Stranded turn resume did not start", { workspaceId: this.workspaceId });
+        }
+      })
+      .catch((error: unknown) => {
+        log.warn("Stranded turn resume threw", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
   }
 
   async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
@@ -6921,6 +7048,7 @@ export class AgentSession {
    * failed-startup drains elsewhere in this file.
    */
   drainQueuedMessagesIfIdle(): void {
+    this.resumeStrandedTurnIfIdle();
     if (
       this.hasActiveOrPendingTurnWork() ||
       this.deferQueuedFlushUntilAfterEdit ||
@@ -7027,6 +7155,8 @@ export class AgentSession {
           }
           this.sendQueuedMessages();
         });
+    } else {
+      this.resumeStrandedTurnIfIdle();
     }
   }
 

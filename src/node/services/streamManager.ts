@@ -245,6 +245,7 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  onQueuedMessageStop?: () => void;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -290,6 +291,12 @@ interface StreamRequestConfig {
   maxOutputTokens?: number;
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /**
+   * Invoked when the loop stops on behalf of a queued tool-end message (and not
+   * because a required tool completed). The session uses it to resume the turn
+   * if that queued message is later withdrawn instead of starting a turn.
+   */
+  onQueuedMessageStop?: () => void;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2069,6 +2076,7 @@ export class StreamManager {
       callSettingsOverrides,
       toolPolicy,
       hasQueuedMessages,
+      onQueuedMessageStop,
       headers,
       onChunk,
       onStepMessages,
@@ -2119,6 +2127,7 @@ export class StreamManager {
       streamCallSettings:
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
+      onQueuedMessageStop,
       onChunk,
       onStepMessages,
       toolPolicy,
@@ -2131,7 +2140,7 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "toolPolicy">
+    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "onQueuedMessageStop" | "toolPolicy">
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2172,14 +2181,22 @@ export class StreamManager {
       );
     };
 
-    return [
-      stepCountIs(100000),
-      // The SDK evaluates stop conditions only after every sibling tool result in the
-      // model's current step settles. Do not move this to individual tool-call-end events:
-      // that would abort the remaining calls the model emitted in the same batch.
-      () => request.hasQueuedMessages?.("tool-end") ?? false,
-      hasSuccessfulRequiredToolResult,
-    ];
+    // The SDK evaluates stop conditions only after every sibling tool result in the
+    // model's current step settles. Do not move this to individual tool-call-end events:
+    // that would abort the remaining calls the model emitted in the same batch.
+    const hasQueuedToolEndMessage: ReturnType<typeof stepCountIs> = (state) => {
+      if (!(request.hasQueuedMessages?.("tool-end") ?? false)) {
+        return false;
+      }
+      // A successful required tool result is a legitimate end of turn on its own;
+      // only a stop made purely for the queued message may need resuming later.
+      if (!hasSuccessfulRequiredToolResult(state)) {
+        request.onQueuedMessageStop?.();
+      }
+      return true;
+    };
+
+    return [stepCountIs(100000), hasQueuedToolEndMessage, hasSuccessfulRequiredToolResult];
   }
 
   /**
@@ -3156,6 +3173,7 @@ export class StreamManager {
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      onQueuedMessageStop: streamInfo.request.onQueuedMessageStop,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
