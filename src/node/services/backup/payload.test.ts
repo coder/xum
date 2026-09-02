@@ -3786,83 +3786,90 @@ describe("project bundle", () => {
     );
   });
 
-  it("puts the source's previous record back when the project-side write fails", async () => {
-    const source = "/home/dev/src/alpha";
+  it("puts the project's previous record back when the source-side write fails", async () => {
+    const a = "/home/dev/src/alpha";
+    const c = "/home/dev/src/gamma";
     const fresh = "/home/dev/src/epsilon";
     const b = "/home/other/b";
     const d = "/home/other/d";
-    const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
-    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), source);
-    // A directory squats on D's record, so only the second of the two writes can fail.
-    await fs.mkdir(originTargetPath(projectMemoryDirName(d)), { recursive: true });
+    const f = "/home/other/f";
+    const registered = new Map(
+      [b, d, f].map((project) => [project, projectMemoryDirName(project)])
+    );
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), a);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), c);
+    // A directory squats where the source's record is staged, so only the second of the two
+    // writes can fail.
+    for (const source of [a, fresh]) {
+      await fs.mkdir(`${originMarkerPath(source)}.tmp`, { recursive: true });
+    }
 
-    // Moving the source from B to D fails halfway: the source's record had already been
-    // replaced, and without being put back neither A→B nor A→D would have two agreeing
-    // halves — a failed import would have cost the project its association.
+    // Moving A from B to D fails halfway: D's record had already been replaced, and without
+    // being put back a failed import would have cost D the association it had with C.
     const moved = await captureRejection(
-      writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), source)
+      writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), a)
     );
     expect(moved).toBeInstanceOf(Error);
-    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
-      projectPath: b,
-      memoryDir: projectMemoryDirName(b),
-    });
+    expect([...(await readProjectMemoryOrigins(muxRoot, registered, [a, c])).entries()]).toEqual([
+      [a, { projectPath: b, memoryDir: projectMemoryDirName(b) }],
+      [c, { projectPath: d, memoryDir: projectMemoryDirName(d) }],
+    ]);
 
     // A first-ever association that fails the same way leaves no half record behind.
-    await captureRejection(writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), fresh));
-    expect(await fs.lstat(originMarkerPath(fresh)).catch(() => null)).toBeNull();
-    const leftovers = (await fs.readdir(path.join(muxRoot, "memory", ".backup-origins"))).filter(
-      (name) => name.endsWith(".tmp")
+    await captureRejection(writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(f), fresh));
+    expect(await fs.lstat(originTargetPath(projectMemoryDirName(f))).catch(() => null)).toBeNull();
+    const originsDir = path.join(muxRoot, "memory", ".backup-origins");
+    const leftovers = (await fs.readdir(originsDir, { withFileTypes: true })).filter(
+      (entry) => entry.isFile() && entry.name.endsWith(".tmp")
     );
     expect(leftovers).toEqual([]);
   });
 
   it("keeps the previous association when a re-import was interrupted between its two writes", async () => {
-    const source = "/home/dev/src/alpha";
-    const b = "/home/other/b";
-    const d = "/home/other/d";
-    const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
-    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), source);
-    // A crash after the source's record was replaced but before D's record landed: the
-    // source names D (and B as where it came from), D's record does not exist, B's still
-    // names the source.
-    await fs.writeFile(
-      originMarkerPath(source),
-      JSON.stringify({
-        sourcePath: source,
-        memoryDir: projectMemoryDirName(d),
-        previousMemoryDir: projectMemoryDirName(b),
-      }),
-      "utf-8"
-    );
-
-    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
-      projectPath: b,
-      memoryDir: projectMemoryDirName(b),
-    });
-    // Completing the pair (the retry) moves the association to D.
-    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), source);
-    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
-      projectPath: d,
-      memoryDir: projectMemoryDirName(d),
-    });
-  });
-
-  it("does not bring a superseded association back through the crash fallback", async () => {
     const a = "/home/dev/src/alpha";
     const c = "/home/dev/src/gamma";
     const b = "/home/other/b";
     const d = "/home/other/d";
     const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
-    // A moves from B to D (completed), then C is imported into D. A's record still names B
-    // as where it came from, and B's stale record still names A.
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), a);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), c);
+    // A crash while moving A from B to D, after D's record was replaced but before A's was:
+    // D names A, while A's record and B's both still name each other.
+    await fs.writeFile(
+      originTargetPath(projectMemoryDirName(d)),
+      JSON.stringify({ sourcePath: a, memoryDir: projectMemoryDirName(d) }),
+      "utf-8"
+    );
+
+    // A keeps B — whether or not D had an association of its own before, which is what a
+    // fallback rule keyed on the source's record could not tell from a superseded one. C's
+    // claim on D is void, as the completed import would have made it.
+    expect([...(await readProjectMemoryOrigins(muxRoot, registered, [a, c])).entries()]).toEqual([
+      [a, { projectPath: b, memoryDir: projectMemoryDirName(b) }],
+    ]);
+    // Completing the pair (the retry) moves the association to D.
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), a);
+    expect((await readProjectMemoryOrigins(muxRoot, registered, [a])).get(a)).toEqual({
+      projectPath: d,
+      memoryDir: projectMemoryDirName(d),
+    });
+  });
+
+  it("does not match a source back to a project it was moved out of", async () => {
+    const a = "/home/dev/src/alpha";
+    const c = "/home/dev/src/gamma";
+    const b = "/home/other/b";
+    const d = "/home/other/d";
+    const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
+    // A moves from B to D (completed), then C is imported into D. B's stale record still
+    // names A.
     await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), a);
     await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), a);
     await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), c);
 
-    // D's record exists and names C, so A's pair was completed and then superseded: A is
-    // unmatched, and in particular not matched back to B, whose memory a matched restore
-    // would otherwise overwrite without approval.
+    // A's pair was completed and then superseded: A is unmatched, and in particular not
+    // matched back to B, whose memory a matched restore would otherwise overwrite without
+    // approval.
     const origins = await readProjectMemoryOrigins(muxRoot, registered, [a, c]);
     expect([...origins.entries()]).toEqual([
       [c, { projectPath: d, memoryDir: projectMemoryDirName(d) }],

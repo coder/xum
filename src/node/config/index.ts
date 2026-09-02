@@ -911,10 +911,14 @@ type RegistrationLockState =
   | { kind: "held"; lock: ProjectRegistrationLockHandle }
   | { kind: "none" };
 
-/** Thrown inside the edit queue when another process holds the registration file lock. */
+/**
+ * Thrown inside the edit queue when the edit could not take the registration file lock in
+ * its slot; `rerun` is the edit's re-run under the lock, already queued behind the edits
+ * waiting for it (see Config.lockWaiters).
+ */
 class ProjectRegistrationLockContended extends Error {
-  constructor() {
-    super("project registration lock held by another process");
+  constructor(readonly rerun: Promise<void>) {
+    super("project registration lock held elsewhere");
     this.name = "ProjectRegistrationLockContended";
   }
 }
@@ -951,6 +955,17 @@ export class Config {
    * edit's failure never wedges later edits).
    */
   private readonly editSemaphore = Semaphore.makeUnsafe(1);
+  /**
+   * The edits that left their queue slot to wait for the registration file lock, as a chain
+   * in slot order; null while none is waiting. The file lock is not fair — waiters poll it,
+   * and two polling independently would acquire in arbitrary order, so the later of two
+   * edits could write first and the earlier one then overwrite it, reversing the order
+   * editConfig promises. Waiting edits therefore re-run one after another off this chain,
+   * and while it is non-empty every edit reaching its slot joins the tail instead of trying
+   * the lock: it would otherwise take a lock that had just been released ahead of an edit
+   * that has been waiting for it since before the later edit was issued.
+   */
+  private lockWaiters: Promise<void> | null = null;
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
   private migrationPersist: Promise<void> | null = null;
 
@@ -2220,17 +2235,40 @@ export class Config {
     // Straight into the queue, in call order: the edit takes its own hold of the file lock
     // inside its slot, at write time. When the lock is held elsewhere — another process, or
     // a restore, import, or create window in this one — the edit fails the slot before
-    // writing and is re-run here once it has waited for the lock, outside the queue, so no
-    // other edit is held up behind its wait. Its first run was discarded: nothing it mutated
-    // survives, since loadConfigOrDefault parses fresh bytes on every call.
+    // writing and is re-run once it has waited for the lock, outside the queue (so an edit
+    // issued inside the window is not held up behind its wait) but behind the edits already
+    // waiting (see lockWaiters). Its first run was discarded: nothing it mutated survives,
+    // since loadConfigOrDefault parses fresh bytes on every call.
     try {
       return await this.enqueueConfigEdit(fn, { kind: "none" });
     } catch (error) {
       if (!(error instanceof ProjectRegistrationLockContended)) throw error;
-      return withProjectRegistrationFileLock(this.rootDir, (lock) =>
-        this.enqueueConfigEdit(fn, { kind: "held", lock })
-      );
+      return error.rerun;
     }
+  }
+
+  /**
+   * Queues `fn` to re-run under the registration file lock after every edit already waiting
+   * for it, and records the chain's new tail. Called synchronously from the edit's queue
+   * slot, so the chain order is the slot order.
+   */
+  private joinLockWaiters(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+    const rerun = (this.lockWaiters ?? Promise.resolve()).then(() =>
+      withProjectRegistrationFileLock(this.rootDir, (lock) =>
+        this.enqueueConfigEdit(fn, { kind: "held", lock })
+      )
+    );
+    // The tail settles either way, so one edit's failure never wedges the ones behind it.
+    const tail: Promise<void> = rerun.then(
+      () => this.leaveLockWaiters(tail),
+      () => this.leaveLockWaiters(tail)
+    );
+    this.lockWaiters = tail;
+    return rerun;
+  }
+
+  private leaveLockWaiters(tail: Promise<void>): void {
+    if (this.lockWaiters === tail) this.lockWaiters = null;
   }
 
   getClientConfig() {
@@ -2619,13 +2657,19 @@ export class Config {
           }
           // The file lock is tried here, inside the queue slot so the edit keeps its order.
           // Held elsewhere — by another process, or by a window in this one — the edit fails
-          // the slot and editConfig waits for the lock outside the queue. Under the lock the
-          // transform runs again on the bytes as they are: whoever held it may have written
-          // config.json since the first run, and a snapshot from before would clobber that.
+          // the slot and editConfig waits for the lock outside the queue, behind any edit
+          // already waiting; while one is, the lock is not even tried, since taking it would
+          // put this edit ahead of that one. Under the lock the transform runs again on the
+          // bytes as they are: whoever held it may have written config.json since the first
+          // run, and a snapshot from before would clobber that.
           yield* Effect.tryPromise({
             try: async () => {
+              if (self.lockWaiters !== null) {
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
+              }
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
-              if (lock === null) throw new ProjectRegistrationLockContended();
+              if (lock === null)
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
               const fresh = transform();
               await Effect.runPromise(write(fresh.newConfig, lock));
             },

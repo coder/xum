@@ -3128,23 +3128,8 @@ export async function writeProjectMemoryOrigin(
   sourcePath: string
 ): Promise<void> {
   const root = await resolveRoot(muxRoot);
-  const sourceRecord = projectMemoryOriginPath(sourcePath);
-  const previous = await readProjectMemoryOriginRecordBytes(root, sourceRecord);
-  // The source's new record names the project it is leaving, if any: two files cannot change
-  // atomically, and a crash between the two writes is not an exception the rollback below
-  // can catch. With the previous project on record, the reader can still confirm the old
-  // association through that project's own record until the new pair is complete.
-  const previousMemoryDir = Buffer.isBuffer(previous)
-    ? parseProjectMemoryOriginRecord(previous)?.memoryDir
-    : undefined;
   const content = Buffer.from(
-    `${JSON.stringify({
-      sourcePath,
-      memoryDir: localMemoryDir,
-      ...(previousMemoryDir !== undefined && previousMemoryDir !== localMemoryDir
-        ? { previousMemoryDir }
-        : {}),
-    })}\n`,
+    `${JSON.stringify({ sourcePath, memoryDir: localMemoryDir })}\n`,
     "utf-8"
   );
   // The reader's cap, checked before writing: an import must not report success with a
@@ -3152,25 +3137,30 @@ export async function writeProjectMemoryOrigin(
   if (content.length > MAX_PROJECT_MEMORY_ORIGIN_BYTES) {
     throw new Error("Cannot record the imported project's origin: the marker is too large");
   }
-  // The source's record goes first and is put back the way it was if the project's record
-  // then cannot be written: otherwise a failed re-import of a source elsewhere would leave
-  // neither its old association nor its new one with two agreeing halves. Best effort under
-  // the same I/O conditions that failed the write; if it fails too, `previousMemoryDir`
-  // above still lets the reader confirm the old association.
-  await writeProjectMemoryOriginRecord(root, sourceRecord, content);
+  // Two files cannot change atomically, so the order decides what a crash between the two
+  // writes leaves behind. The project's record goes first and the source's record is the
+  // commit point: until it is replaced, the source's previous association (if any) still has
+  // both of its halves untouched and stays confirmed, and the project's new record names a
+  // source that does not point back — a claim nothing confirms, exactly like a project whose
+  // source was imported elsewhere. The other order would void the previous association
+  // first, and no crash-recovery rule on the source's record can tell an incomplete write
+  // from a completed association that another import into the same project superseded.
+  // The project's record was the half the import's memory write had already committed to.
+  const targetRecord = projectMemoryOriginTargetPath(localMemoryDir);
+  const previousTarget = await readProjectMemoryOriginRecordBytes(root, targetRecord);
+  await writeProjectMemoryOriginRecord(root, targetRecord, content);
   try {
-    await writeProjectMemoryOriginRecord(
-      root,
-      projectMemoryOriginTargetPath(localMemoryDir),
-      // The project's record names only the source; a project has no "previous source" to
-      // fall back to, since a source moving in is what voids its old association.
-      Buffer.from(`${JSON.stringify({ sourcePath, memoryDir: localMemoryDir })}\n`, "utf-8")
-    );
+    await writeProjectMemoryOriginRecord(root, projectMemoryOriginPath(sourcePath), content);
   } catch (error) {
-    if (previous === "absent") {
-      await fs.rm(absolutePathOf(root.path, sourceRecord), { force: true }).catch(() => undefined);
-    } else if (previous !== "unreadable") {
-      await writeProjectMemoryOriginRecord(root, sourceRecord, previous).catch(() => undefined);
+    // Put the project's record back so a failed import does not void the association the
+    // project had before it. Best effort under the same I/O conditions that failed the write;
+    // if it fails too, the reader confirms neither half rather than a wrong one.
+    if (previousTarget === "absent") {
+      await fs.rm(absolutePathOf(root.path, targetRecord), { force: true }).catch(() => undefined);
+    } else if (previousTarget !== "unreadable") {
+      await writeProjectMemoryOriginRecord(root, targetRecord, previousTarget).catch(
+        () => undefined
+      );
     }
     throw error;
   }
@@ -3223,8 +3213,6 @@ async function writeProjectMemoryOriginRecord(
 interface ProjectMemoryOriginRecord {
   sourcePath: string;
   memoryDir: string;
-  /** On a source's record: the project it was associated with before this one, if any. */
-  previousMemoryDir?: string;
 }
 
 function parseProjectMemoryOriginRecord(content: Buffer): ProjectMemoryOriginRecord | null {
@@ -3235,7 +3223,7 @@ function parseProjectMemoryOriginRecord(content: Buffer): ProjectMemoryOriginRec
     return null;
   }
   if (!isPlainObject(parsed)) return null;
-  const { sourcePath, memoryDir, previousMemoryDir } = parsed;
+  const { sourcePath, memoryDir } = parsed;
   if (
     typeof sourcePath !== "string" ||
     sourcePath === "" ||
@@ -3244,13 +3232,7 @@ function parseProjectMemoryOriginRecord(content: Buffer): ProjectMemoryOriginRec
   ) {
     return null;
   }
-  return {
-    sourcePath,
-    memoryDir,
-    ...(typeof previousMemoryDir === "string" && previousMemoryDir !== ""
-      ? { previousMemoryDir }
-      : {}),
-  };
+  return { sourcePath, memoryDir };
 }
 
 /** A record's fields, or null for a missing, unreadable, refused, or malformed one. */
@@ -3297,37 +3279,18 @@ export async function readProjectMemoryOrigins(
     if (claim?.sourcePath !== sourcePath) continue;
     // The project's own record must name this source back: a project imported into again
     // from another source names that source now, and the older claim on it is void even
-    // though the older source's record still exists.
-    const targetBytes = await readProjectMemoryOriginRecordBytes(
+    // though the older source's record still exists. There is no fallback from an
+    // unconfirmed claim to an earlier association: the writer's order (see
+    // writeProjectMemoryOrigin) keeps an earlier association's own two halves intact until
+    // the new pair is complete, so it is found here directly or not at all.
+    const target = await readProjectMemoryOriginRecord(
       root,
       projectMemoryOriginTargetPath(claim.memoryDir)
     );
-    let memoryDir: string | undefined;
-    if (targetBytes === "absent") {
-      // No record at all for the new project: the re-import that wrote this claim was
-      // interrupted between its two writes, so the pair is provably incomplete and the
-      // project the source came from — whose record a crash leaves intact — still confirms
-      // the association. Only then: a record that exists but names another source means the
-      // pair was completed and later superseded (or the project was imported into meanwhile),
-      // and the previous project's stale record must not bring the old association back.
-      const previousDir = claim.previousMemoryDir;
-      const previous =
-        previousDir === undefined
-          ? null
-          : await readProjectMemoryOriginRecord(root, projectMemoryOriginTargetPath(previousDir));
-      if (previous?.sourcePath === sourcePath && previous.memoryDir === previousDir) {
-        memoryDir = previousDir;
-      }
-    } else if (Buffer.isBuffer(targetBytes)) {
-      const target = parseProjectMemoryOriginRecord(targetBytes);
-      if (target?.sourcePath === sourcePath && target.memoryDir === claim.memoryDir) {
-        memoryDir = claim.memoryDir;
-      }
-    }
-    if (memoryDir === undefined) continue;
-    const projectPath = projectByDir.get(memoryDir);
+    if (target?.sourcePath !== sourcePath || target.memoryDir !== claim.memoryDir) continue;
+    const projectPath = projectByDir.get(claim.memoryDir);
     if (projectPath == null) continue;
-    origins.set(sourcePath, { projectPath, memoryDir });
+    origins.set(sourcePath, { projectPath, memoryDir: claim.memoryDir });
   }
   return origins;
 }
