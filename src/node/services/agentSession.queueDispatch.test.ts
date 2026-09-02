@@ -1419,17 +1419,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("a delayed pre-stream abort does not settle a replacement claim", async () => {
+  test("binds a hard interrupt to the claim present before stopStream yields", async () => {
     const workspaceId = "queue-dispatch-delayed-abort-claim";
-    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({ workspaceId });
-    let markAbortUpdateStarted: () => void = () => undefined;
-    const abortUpdateStarted = new Promise<void>((resolve) => {
-      markAbortUpdateStarted = resolve;
-    });
-    let releaseAbortUpdate: () => void = () => undefined;
-    const abortUpdateRelease = new Promise<void>((resolve) => {
-      releaseAbortUpdate = resolve;
-    });
+    const { session, cleanup, aiService } = await createAgentSessionHarness({ workspaceId });
     const makeQueueClaim = (): ToolEndQueueClaim => {
       const controller = new AbortController();
       return {
@@ -1444,46 +1436,49 @@ describe("AgentSession queued message tool-call dispatch", () => {
     };
     const interruptedQueueClaim = makeQueueClaim();
     const replacementQueueClaim = makeQueueClaim();
-    const claimNextToolEndEntry = spyOn(MessageQueue.prototype, "claimNextToolEndEntry")
-      .mockReturnValueOnce(interruptedQueueClaim)
-      .mockReturnValueOnce(replacementQueueClaim);
+    const claimNextToolEndEntry = spyOn(
+      MessageQueue.prototype,
+      "claimNextToolEndEntry"
+    ).mockReturnValueOnce(interruptedQueueClaim);
     interface TestQueuedClaim {
       queueClaim: ToolEndQueueClaim;
+      source: "sdk";
+      dispatchStarted: false;
+      dispatchDeferredByHardInterrupt: false;
+      admissionIrreversible: false;
+      persistedMessageIds: string[];
+      retryAfterCancellation: false;
     }
     const internalSession = session as unknown as {
       queuedToolEndClaim?: TestQueuedClaim;
       setTurnPhase(phase: "preparing"): void;
       claimQueuedToolEndMessage(source: "sdk" | "provider"): TestQueuedClaim | undefined;
-      releaseQueuedToolEndClaim(activeClaim: TestQueuedClaim): void;
-      updateStartupAutoRetryAbandonFromAbort(
-        abortReason: "system" | "user" | undefined,
-        userMessageId?: string
-      ): Promise<void>;
     };
-    internalSession.updateStartupAutoRetryAbandonFromAbort = async () => {
-      markAbortUpdateStarted();
-      await abortUpdateRelease;
+    const replacementClaim: TestQueuedClaim = {
+      queueClaim: replacementQueueClaim,
+      source: "sdk",
+      dispatchStarted: false,
+      dispatchDeferredByHardInterrupt: false,
+      admissionIrreversible: false,
+      persistedMessageIds: [],
+      retryAfterCancellation: false,
     };
+    const stopStream = spyOn(aiService, "stopStream").mockImplementation(() => {
+      interruptedQueueClaim.cancelAdmission("old Stop completed");
+      internalSession.queuedToolEndClaim = replacementClaim;
+      return Promise.resolve(Ok(undefined));
+    });
 
     try {
       internalSession.setTurnPhase("preparing");
       const interruptedClaim = internalSession.claimQueuedToolEndMessage("sdk");
       expect(interruptedClaim).toBeDefined();
-
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "user"));
-      await abortUpdateStarted;
-
-      internalSession.releaseQueuedToolEndClaim(interruptedClaim!);
-      const replacementClaim = internalSession.claimQueuedToolEndMessage("sdk");
-      expect(replacementClaim).toBeDefined();
-
-      releaseAbortUpdate();
-      expect(
-        await waitForCondition(() => internalSession.queuedToolEndClaim === replacementClaim)
-      ).toBe(true);
+      expect((await session.interruptStream()).success).toBe(true);
+      expect(interruptedQueueClaim.admissionSignal.aborted).toBe(true);
+      expect(internalSession.queuedToolEndClaim).toBe(replacementClaim);
       expect(replacementQueueClaim.admissionSignal.aborted).toBe(false);
     } finally {
-      releaseAbortUpdate();
+      stopStream.mockRestore();
       claimNextToolEndEntry.mockRestore();
       session.dispose();
       await cleanup();

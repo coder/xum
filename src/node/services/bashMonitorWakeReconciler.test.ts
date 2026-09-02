@@ -119,6 +119,7 @@ describe("BashMonitorWakeReconciler", () => {
   });
 
   afterEach(async () => {
+    await reconciler.dispose(OWNER);
     await fsPromises.rm(root, { recursive: true, force: true });
   });
 
@@ -196,6 +197,40 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].muxMetadata.records[0]?.processId).toBe("fresh");
     expect(dispatches[0].prompt).toContain("FRESH");
     expect(dispatches[0].prompt).not.toContain("> READY");
+  });
+
+  test("settles an excluded match offset before deriving a newer batch", async () => {
+    live = [
+      liveSnapshot({
+        match: {
+          throughOffset: 20,
+          lines: ["READY old", "READY new"],
+          totalMatches: 2,
+          batches: [
+            { throughOffset: 12, lines: ["READY old"], totalMatches: 1, droppedLines: 0 },
+            { throughOffset: 20, lines: ["READY new"], totalMatches: 1, droppedLines: 0 },
+          ],
+        },
+      }),
+    ];
+    providerExcludedWakeRecords = [
+      {
+        processId: "proc",
+        wakeUpdatedAt: CREATED_AT + ":12",
+        kind: "match",
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      },
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records[0]?.wakeUpdatedAt).toBe(CREATED_AT + ":20");
+    expect(dispatches[0].prompt).toContain("READY new");
+    expect(dispatches[0].prompt).not.toContain("READY old");
   });
 
   test("superseding a queued wake uses a distinct queue key", async () => {

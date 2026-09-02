@@ -128,6 +128,12 @@ interface WatermarkEntry {
   lost?: true;
 }
 
+interface ProviderExcludedWakeSettlement {
+  matchedThroughOffset?: number;
+  terminalSettledAt?: string;
+  lost?: true;
+}
+
 interface DerivedSignal {
   key: string;
   ownerWorkspaceId: string;
@@ -169,19 +175,61 @@ function signalKey(processId: string, createdAt: string): string {
   return processId + "\u0000" + createdAt;
 }
 
-function wakeRecordKey(record: BashMonitorWakeDisplayRecord): string | undefined {
-  if (record.processId == null || record.wakeUpdatedAt == null) {
-    return undefined;
-  }
-  return record.processId + "\u0000" + record.wakeUpdatedAt;
-}
+function getProviderExcludedWakeSettlement(
+  snapshot: BashMonitorProcessSnapshot,
+  records: readonly BashMonitorWakeDisplayRecord[]
+): ProviderExcludedWakeSettlement | undefined {
+  const maximumKnownMatchOffset = Math.max(
+    snapshot.match?.throughOffset ?? -1,
+    snapshot.terminal?.matchedThroughOffset ?? -1,
+    snapshot.lost?.failedMatch?.matchedThroughOffset ?? -1
+  );
+  let matchedThroughOffset = -1;
+  let terminalSettledAt: string | undefined;
+  let lost = false;
+  let matchedRecord = false;
 
-function signalWakeRecordKey(signal: DerivedSignal): string {
-  const wakeUpdatedAt =
-    signal.lost?.failedAt ??
-    signal.terminal?.settledAt ??
-    (signal.matchOffset != null ? signal.createdAt + ":" + signal.matchOffset : signal.createdAt);
-  return signal.processId + "\u0000" + wakeUpdatedAt;
+  for (const record of records) {
+    if (record.wakeUpdatedAt == null) continue;
+    if (
+      record.terminal != null &&
+      snapshot.terminal != null &&
+      record.wakeUpdatedAt === snapshot.terminal.settledAt
+    ) {
+      terminalSettledAt = snapshot.terminal.settledAt;
+      matchedThroughOffset = maximumKnownMatchOffset;
+      matchedRecord = true;
+      continue;
+    }
+    if (
+      record.kind === "monitor-lost" &&
+      (record.wakeUpdatedAt === snapshot.createdAt ||
+        record.wakeUpdatedAt === snapshot.lost?.failedAt)
+    ) {
+      lost = true;
+      matchedThroughOffset = maximumKnownMatchOffset;
+      matchedRecord = true;
+      continue;
+    }
+
+    const matchPrefix = snapshot.createdAt + ":";
+    if (record.kind !== "match" || !record.wakeUpdatedAt.startsWith(matchPrefix)) continue;
+    const excludedOffset = Number(record.wakeUpdatedAt.slice(matchPrefix.length));
+    if (
+      Number.isSafeInteger(excludedOffset) &&
+      excludedOffset >= 0 &&
+      excludedOffset <= maximumKnownMatchOffset
+    ) {
+      matchedThroughOffset = Math.max(matchedThroughOffset, excludedOffset);
+      matchedRecord = true;
+    }
+  }
+  if (!matchedRecord) return undefined;
+  return {
+    ...(matchedThroughOffset >= 0 ? { matchedThroughOffset } : {}),
+    ...(terminalSettledAt != null ? { terminalSettledAt } : {}),
+    ...(lost ? { lost: true as const } : {}),
+  };
 }
 
 function normalizedTerminalStatus(
@@ -531,35 +579,15 @@ export class BashMonitorWakeReconciler {
       await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, collected.autoConsumed);
       await this.cleanup(collected.autoConsumed);
 
-      // A hard Stop can persist provider exclusion before the wake producer advances its
-      // watermark. Treat that durable row as settlement after restart, so the same process
-      // output cannot return in a new provider turn. Match records independently because a
-      // later reconciliation can batch the stopped wake with newer output.
-      const providerExcludedRecords =
-        collected.signals.length > 0
-          ? await this.args.listProviderExcludedWakeRecords(ownerWorkspaceId)
-          : [];
-      const providerExcludedRecordKeys = new Set(
-        providerExcludedRecords.map(wakeRecordKey).filter((key): key is string => key != null)
-      );
-      const providerExcludedSignals = collected.signals.filter((signal) =>
-        providerExcludedRecordKeys.has(signalWakeRecordKey(signal))
-      );
-      await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, providerExcludedSignals);
-      await this.cleanup(providerExcludedSignals);
-      const pendingSignals = collected.signals.filter(
-        (signal) => !providerExcludedRecordKeys.has(signalWakeRecordKey(signal))
-      );
-
       const state = this.state(ownerWorkspaceId);
-      if (pendingSignals.length === 0) {
+      if (collected.signals.length === 0) {
         state.dispatch?.controller.abort();
         state.dispatch = undefined;
         return undefined;
       }
 
       const signature = JSON.stringify(
-        pendingSignals.map((signal) => [
+        collected.signals.map((signal) => [
           signal.key,
           signal.kind,
           signal.matchOffset,
@@ -575,7 +603,7 @@ export class BashMonitorWakeReconciler {
         id: randomUUID(),
         signature,
         controller: new AbortController(),
-        signals: pendingSignals,
+        signals: collected.signals,
         accepted: false,
       };
       state.dispatch = next;
@@ -693,6 +721,9 @@ export class BashMonitorWakeReconciler {
       }
     }
     if (pruned) await this.writeWatermarks(ownerWorkspaceId, watermarks);
+    if (applyFrontier) {
+      await this.applyProviderExcludedWakeRecords(ownerWorkspaceId, candidates, watermarks);
+    }
 
     const signals: DerivedSignal[] = [];
     const autoConsumed: DerivedSignal[] = [];
@@ -713,6 +744,90 @@ export class BashMonitorWakeReconciler {
       (a, b) => a.createdAt.localeCompare(b.createdAt) || a.processId.localeCompare(b.processId)
     );
     return { signals, autoConsumed, deferredReads, watermarks };
+  }
+
+  private async applyProviderExcludedWakeRecords(
+    ownerWorkspaceId: string,
+    candidates: ReadonlyArray<{
+      snapshot: BashMonitorProcessSnapshot;
+      deadRegistryRow: boolean;
+    }>,
+    watermarks: Map<string, WatermarkEntry>
+  ): Promise<void> {
+    if (candidates.length === 0) return;
+
+    const records = await this.args.listProviderExcludedWakeRecords(ownerWorkspaceId);
+    if (records.length === 0) return;
+    const recordsByProcess = new Map<string, BashMonitorWakeDisplayRecord[]>();
+    for (const record of records) {
+      if (record.processId == null) continue;
+      const processRecords = recordsByProcess.get(record.processId) ?? [];
+      processRecords.push(record);
+      recordsByProcess.set(record.processId, processRecords);
+    }
+
+    let watermarksChanged = false;
+    const acknowledgements: Array<{
+      snapshot: BashMonitorProcessSnapshot;
+      matchedThroughOffset?: number;
+      terminalSettledAt?: string;
+    }> = [];
+    for (const candidate of candidates) {
+      const snapshot = candidate.snapshot;
+      const excluded = getProviderExcludedWakeSettlement(
+        snapshot,
+        recordsByProcess.get(snapshot.processId) ?? []
+      );
+      if (excluded == null) continue;
+
+      const key = signalKey(snapshot.processId, snapshot.createdAt);
+      const previous = watermarks.get(key);
+      const next: WatermarkEntry = {
+        processId: snapshot.processId,
+        createdAt: snapshot.createdAt,
+        ...(excluded.matchedThroughOffset != null || previous?.matchedThroughOffset != null
+          ? {
+              matchedThroughOffset: Math.max(
+                excluded.matchedThroughOffset ?? -1,
+                previous?.matchedThroughOffset ?? -1
+              ),
+            }
+          : {}),
+        ...(excluded.terminalSettledAt != null || previous?.terminalSettledAt != null
+          ? { terminalSettledAt: excluded.terminalSettledAt ?? previous?.terminalSettledAt }
+          : {}),
+        ...(excluded.lost === true || previous?.lost === true ? { lost: true } : {}),
+      };
+      if (
+        next.matchedThroughOffset !== previous?.matchedThroughOffset ||
+        next.terminalSettledAt !== previous?.terminalSettledAt ||
+        next.lost !== previous?.lost
+      ) {
+        watermarks.set(key, next);
+        watermarksChanged = true;
+      }
+      if (!candidate.deadRegistryRow) {
+        acknowledgements.push({
+          snapshot,
+          ...(next.matchedThroughOffset != null
+            ? { matchedThroughOffset: next.matchedThroughOffset }
+            : {}),
+          ...(next.terminalSettledAt != null ? { terminalSettledAt: next.terminalSettledAt } : {}),
+        });
+      }
+    }
+
+    if (watermarksChanged) {
+      await this.writeWatermarks(ownerWorkspaceId, watermarks);
+    }
+    for (const acknowledgement of acknowledgements) {
+      await this.args.processManager.acknowledgeMonitorWake(
+        acknowledgement.snapshot.processId,
+        Date.parse(acknowledgement.snapshot.createdAt),
+        acknowledgement.matchedThroughOffset,
+        acknowledgement.terminalSettledAt
+      );
+    }
   }
 
   private async derive(
@@ -860,8 +975,9 @@ export class BashMonitorWakeReconciler {
     lines: readonly string[];
     droppedLines: number;
   } {
+    const visibleAfterOffset = Math.max(deliveredMatchedThroughOffset, shownThroughOffset);
     const visibleMatchBatches = snapshot.match?.batches?.filter(
-      (batch) => batch.throughOffset > shownThroughOffset
+      (batch) => batch.throughOffset > visibleAfterOffset
     );
     const retained =
       visibleMatchBatches != null

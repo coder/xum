@@ -617,6 +617,8 @@ interface AgentSessionOptions {
   onIdleCompactionOutcome?: (success: boolean) => void;
   /** Called when post-compaction context state may have changed (plan/file edits) */
   onPostCompactionStateChange?: () => void;
+  /** Called after a canceled synthetic turn changes its durable provider exclusion. */
+  onProviderExcludedHistoryChange?: () => void;
   /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRJD-): true while a service-level send is in
    * its preflight (counted in WorkspaceService.preflightSendCounts but not
@@ -679,6 +681,7 @@ export class AgentSession {
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
+  private readonly onProviderExcludedHistoryChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -926,6 +929,7 @@ export class AgentSession {
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
+      onProviderExcludedHistoryChange,
       hasExternalSendPreflight,
     } = options;
 
@@ -954,6 +958,7 @@ export class AgentSession {
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
+    this.onProviderExcludedHistoryChange = onProviderExcludedHistoryChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
 
     this.compactionHandler = new CompactionHandler({
@@ -4942,6 +4947,8 @@ export class AgentSession {
     this.retryManager.cancel();
 
     const isHardInterrupt = options?.soft !== true;
+    // Bind Stop to the current claim before partial cleanup or abort delivery can yield.
+    const interruptedClaim = isHardInterrupt ? this.queuedToolEndClaim : undefined;
     if (isHardInterrupt) {
       this.hardInterruptPendingStreamStart = true;
       this.hardInterruptClaimSettlementPending = true;
@@ -4988,7 +4995,6 @@ export class AgentSession {
 
     if (isHardInterrupt) {
       this.hardInterruptClaimSettlementPending = false;
-      const interruptedClaim = this.queuedToolEndClaim;
       this.settleQueuedToolEndClaimAfterUserInterrupt(interruptedClaim);
       if (
         interruptedClaim?.admissionIrreversible === true &&
@@ -6078,7 +6084,6 @@ export class AgentSession {
         });
 
         const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
-        const interruptedClaim = this.queuedToolEndClaim;
         if (this.turnPhase === TurnPhase.PREPARING) {
           this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
@@ -6094,11 +6099,9 @@ export class AgentSession {
           this.activeStreamUserMessageId
         );
 
-        if (preStreamAbortReason === "user") {
-          // The awaits above can let Send now start a replacement claim. Settle only the
-          // claim that this abort observed, so the old event cannot cancel the new entry.
-          this.settleQueuedToolEndClaimAfterUserInterrupt(interruptedClaim);
-        } else {
+        // interruptStream owns user claim settlement. StreamManager can deliver this event
+        // after a replacement admission starts, so the event must not inspect queue state.
+        if (preStreamAbortReason !== "user") {
           this.restoreQueuedToolEndClaim();
         }
         this.activeToolCallIds.clear();
@@ -7124,12 +7127,15 @@ export class AgentSession {
       messageIds
     );
     if (exclusionResult.success) {
+      this.onProviderExcludedHistoryChange?.();
       return;
     }
 
     // Keep the hard Stop fail-closed. Deletion is a safe fallback when the marker rewrite fails.
     const deleteResult = await this.historyService.deleteMessages(this.workspaceId, messageIds);
-    if (!deleteResult.success) {
+    if (deleteResult.success) {
+      this.onProviderExcludedHistoryChange?.();
+    } else {
       log.error("Failed to persist provider exclusion for a canceled synthetic admission", {
         workspaceId: this.workspaceId,
         messageIds,

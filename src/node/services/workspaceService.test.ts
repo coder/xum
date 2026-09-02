@@ -248,7 +248,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ),
       backgroundProcessManager,
     });
-    return { config, service, events, cleanup };
+    return { config, service, events, historyService, cleanup };
   }
 
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
@@ -300,6 +300,54 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
+      await cleanup();
+    }
+  });
+
+  test("provider-excluded wake reads use a per-workspace cache", async () => {
+    const { service, historyService, cleanup } = await createWakeWiringService();
+    const ownerWorkspaceId = "cache-owner";
+    const internal = service as unknown as {
+      providerExcludedBashMonitorWakeRecordsByWorkspace: Map<string, Promise<unknown>>;
+      listProviderExcludedBashMonitorWakeRecords(
+        workspaceId: string
+      ): Promise<ReadonlyArray<{ processId?: string }>>;
+    };
+    await historyService.appendToHistory(
+      ownerWorkspaceId,
+      createMuxMessage("excluded-wake", "user", "monitor wake", {
+        synthetic: true,
+        providerExcluded: true,
+        muxMetadata: {
+          type: "bash-monitor-wake",
+          records: [
+            {
+              processId: "proc",
+              wakeUpdatedAt: "2026-08-31T12:00:00.000Z:12",
+              kind: "match",
+              displayName: "CI watcher",
+              filter: "READY",
+              filterExclude: false,
+            },
+          ],
+        },
+      })
+    );
+    const iterateFullHistory = spyOn(historyService, "iterateFullHistory");
+
+    try {
+      const first = await internal.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
+      const second = await internal.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
+
+      expect(first).toEqual(second);
+      expect(first[0]?.processId).toBe("proc");
+      expect(iterateFullHistory).toHaveBeenCalledTimes(1);
+
+      internal.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(ownerWorkspaceId);
+      await internal.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
+      expect(iterateFullHistory).toHaveBeenCalledTimes(2);
+    } finally {
+      iterateFullHistory.mockRestore();
       await cleanup();
     }
   });

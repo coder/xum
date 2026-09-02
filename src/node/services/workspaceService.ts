@@ -1841,6 +1841,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
+  private readonly providerExcludedBashMonitorWakeRecordsByWorkspace = new Map<
+    string,
+    Promise<readonly BashMonitorWakeDisplayRecord[]>
+  >();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
   // Failed-persistence chains active per process, so a later cancellation (task_stop after a
@@ -2506,7 +2510,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
   }
 
-  private async listProviderExcludedBashMonitorWakeRecords(
+  private async readProviderExcludedBashMonitorWakeRecords(
     ownerWorkspaceId: string
   ): Promise<BashMonitorWakeDisplayRecord[]> {
     const records: BashMonitorWakeDisplayRecord[] = [];
@@ -2531,6 +2535,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       );
     }
     return records;
+  }
+
+  private async listProviderExcludedBashMonitorWakeRecords(
+    ownerWorkspaceId: string
+  ): Promise<readonly BashMonitorWakeDisplayRecord[]> {
+    const cached = this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId);
+    if (cached != null) return cached;
+
+    const pending = this.readProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
+    this.providerExcludedBashMonitorWakeRecordsByWorkspace.set(ownerWorkspaceId, pending);
+    try {
+      return await pending;
+    } catch (error) {
+      if (
+        this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId) === pending
+      ) {
+        this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(ownerWorkspaceId);
+      }
+      throw error;
+    }
   }
 
   private async dispatchBashMonitorWake(
@@ -4033,6 +4057,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
       onPostCompactionStateChange: () => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
+      },
+      onProviderExcludedHistoryChange: () => {
+        // The next reconciliation reads the new durable exclusion once, then reuses it.
+        this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
+        this.scheduleBashMonitorWakeReconcile(workspaceId);
       },
       // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
       // preflights (manual sends counted but not yet queued or busy) to the
@@ -5977,6 +6006,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
         this.bashMonitorWakeReconciler.dispose(workspaceId)
       );
+      this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
 
       // Remove session data
       const sessionDir = path.join(this.config.sessionsDir, workspaceId);
@@ -11996,7 +12026,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     clear: () => Promise<Result<T>>,
     options?: { discardUnacceptedOnSuccess?: boolean }
   ): Promise<Result<T>> {
-    if (options?.discardUnacceptedOnSuccess !== true) return clear();
+    if (options?.discardUnacceptedOnSuccess !== true) {
+      return clear().then((result) => {
+        if (result.success) {
+          this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
+        }
+        return result;
+      });
+    }
     return this.bashMonitorRecoveryPromise.then(() =>
       this.bashMonitorHistoryLocks.withLock(workspaceId, async () => {
         if (this.removingWorkspaces.has(workspaceId)) {
@@ -12006,6 +12043,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.notifyBashMonitorWakeStateChanged(workspaceId);
         const result = await clear();
         if (result.success) {
+          this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
           await this.bashMonitorWakeReconciler.finishFullHistoryClear(clearToken);
           this.notifyBashMonitorWakeStateChanged(workspaceId);
         }
