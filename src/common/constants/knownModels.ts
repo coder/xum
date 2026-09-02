@@ -180,11 +180,12 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini", "gemini-pro"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
-  // Gemini Flash alias tracks the latest stable Flash tier (3.7 Flash, GA August 13, 2026).
-  // Older Flash tiers stay usable as custom model strings (e.g. `google:gemini-3.6-flash`).
+  // Gemini Flash alias tracks the latest stable Flash tier (3.8 Flash; model ID
+  // `gemini-3.8-flash` prepared ahead of Google's official release announcement).
+  // Older Flash tiers stay usable as custom model strings (e.g. `google:gemini-3.7-flash`).
   GEMINI_FLASH: {
     provider: "google",
-    providerModelId: "gemini-3.7-flash",
+    providerModelId: "gemini-3.8-flash",
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },

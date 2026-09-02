@@ -644,6 +644,17 @@ describe("getThinkingPolicyForModel", () => {
     }
   });
 
+  test("returns off/low/medium/high for stable Gemini 3.8 Flash", () => {
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "mux-gateway:google/gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
+      "google:gemini-3.8-flash-001",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
+    }
+  });
+
   test("returns off/low/medium/high for stable Gemini 3.5 Flash behind OpenRouter", () => {
     expect(getThinkingPolicyForModel("openrouter:google/gemini-3.5-flash")).toEqual([
       "off",
@@ -711,6 +722,13 @@ describe("isGeminiFlashThinkingLevelModelName", () => {
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.5-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.6-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.7-flash-lite")).toBe(false);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-lite")).toBe(false);
+  });
+
+  test("classifies stable Gemini 3.8 Flash IDs as Flash thinking-level chat models", () => {
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-001")).toBe(true);
   });
 });
 
