@@ -569,6 +569,51 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("restores an SDK queue claim when the hard interrupt fails", async () => {
+    const workspaceId = "queue-dispatch-sdk-claim-hard-interrupt-failure";
+    let claimQueuedToolEndMessage: (() => boolean) | undefined;
+    const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
+      claimQueuedToolEndMessage ??= options.claimQueuedToolEndMessage;
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(
+      Err("injected hard-interrupt failure")
+    );
+
+    try {
+      expect(
+        (
+          await session.sendMessage("Start work", {
+            model: TEST_MODEL,
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage("User follow-up", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+
+      expect(claimQueuedToolEndMessage?.()).toBe(true);
+      expect((await session.interruptStream()).success).toBe(false);
+
+      expect(session.hasQueuedMessages()).toBe(true);
+      expect(claimQueuedToolEndMessage?.()).toBe(true);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("soft-stops after a provider-executed tool result and dispatches after abort", async () => {
     const workspaceId = "queue-dispatch-provider-tool";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -725,7 +770,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("keeps a provider claim until preparing admission settles", async () => {
+  test("allows a provider dispatch to finish after acceptance starts", async () => {
     const workspaceId = "queue-dispatch-provider-claim-preparing-stop";
     const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -784,11 +829,91 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect((await session.interruptStream()).success).toBe(true);
       releaseAcceptance();
 
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
       expect(session.isPreparingTurn()).toBe(false);
     } finally {
       releaseAcceptance();
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("cancels a claimed provider dispatch before acceptance starts", async () => {
+    const workspaceId = "queue-dispatch-provider-claim-pre-acceptance-stop";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, cleanup, aiEmitter, aiService, historyService } =
+      await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        },
+      });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      expect(
+        (
+          await session.sendMessage("Start work", {
+            model: TEST_MODEL,
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+
+      let markAppendStarted: () => void = () => undefined;
+      const appendStarted = new Promise<void>((resolve) => {
+        markAppendStarted = resolve;
+      });
+      let releaseAppend: () => void = () => undefined;
+      const appendRelease = new Promise<void>((resolve) => {
+        releaseAppend = resolve;
+      });
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendToHistory = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args) => {
+          markAppendStarted();
+          await appendRelease;
+          return originalAppend(...args);
+        }
+      );
+      try {
+        const cancelState = { canceledBeforeAcceptance: false };
+        const onCanceled = mock(() => undefined);
+        session.queueMessage(
+          "Background monitor wake",
+          {
+            model: TEST_MODEL,
+            agentId: "exec",
+            queueDispatchMode: "tool-end",
+            muxMetadata: { type: "bash-monitor-wake", records: [] },
+          },
+          { synthetic: true, agentInitiated: true, cancelState, onCanceled }
+        );
+
+        aiEmitter.emit("tool-call-end", {
+          ...toolCallEndEvent(workspaceId),
+          toolName: "web_search",
+          providerExecuted: true,
+        });
+        expect(await waitForCondition(() => stopStream.mock.calls.length === 1)).toBe(true);
+        aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+        await appendStarted;
+
+        expect((await session.interruptStream()).success).toBe(true);
+        releaseAppend();
+
+        expect(await waitForCondition(() => onCanceled.mock.calls.length === 1)).toBe(true);
+        expect(cancelState.canceledBeforeAcceptance).toBe(true);
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+        expect(session.hasPendingBashMonitorWakeContinuation()).toBe(false);
+        expect(session.isPreparingTurn()).toBe(false);
+      } finally {
+        releaseAppend();
+        appendToHistory.mockRestore();
+      }
+    } finally {
       stopStream.mockRestore();
       session.dispose();
       await cleanup();
@@ -828,6 +953,58 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       stopStream.mockRestore();
       claimNextToolEndEntry.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("emits the restored canceled state when a provider soft stop fails", async () => {
+    const workspaceId = "queue-dispatch-provider-stop-failure-snapshot";
+    const { session, cleanup, aiEmitter, aiService, events } = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+    });
+    let markStopStarted: () => void = () => undefined;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop: () => void = () => undefined;
+    const stopRelease = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockImplementationOnce(async () => {
+      markStopStarted();
+      await stopRelease;
+      return Err("injected provider-tool soft-stop failure");
+    });
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, cancelSignal: controller.signal }
+      );
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      await stopStarted;
+
+      controller.abort("monitor wake became stale");
+      releaseStop();
+
+      expect(
+        await waitForCondition(() => {
+          const queueEvents = events.filter((event) => event.type === "queued-message-changed");
+          return queueEvents.at(-1)?.hasQueuedMessages === false;
+        })
+      ).toBe(true);
+    } finally {
+      releaseStop();
+      stopStream.mockRestore();
       session.dispose();
       await cleanup();
     }

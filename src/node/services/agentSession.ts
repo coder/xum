@@ -4880,7 +4880,6 @@ export class AgentSession {
     const isHardInterrupt = options?.soft !== true;
     if (isHardInterrupt) {
       this.hardInterruptPendingStreamStart = true;
-      this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
       this.activeToolCallIds.clear();
     }
 
@@ -4891,6 +4890,7 @@ export class AgentSession {
       const deleteResult = await this.historyService.deletePartial(this.workspaceId);
       if (!deleteResult.success) {
         this.hardInterruptPendingStreamStart = false;
+        this.restoreQueuedToolEndClaim();
         return Err(deleteResult.error);
       }
     }
@@ -4902,8 +4902,13 @@ export class AgentSession {
     if (!stopResult.success) {
       if (isHardInterrupt) {
         this.hardInterruptPendingStreamStart = false;
+        this.restoreQueuedToolEndClaim();
       }
       return Err(stopResult.error);
+    }
+
+    if (isHardInterrupt) {
+      this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
     }
 
     return Ok(undefined);
@@ -6898,6 +6903,9 @@ export class AgentSession {
     const activeClaim = this.queuedToolEndClaim;
     this.queuedToolEndClaim = undefined;
     activeClaim?.queueClaim.restoreCancellation();
+    if (activeClaim != null) {
+      this.emitQueuedMessageChanged();
+    }
     this.syncBackgroundQueuedMessageSignal();
   }
 
@@ -6905,6 +6913,9 @@ export class AgentSession {
     const activeClaim = this.queuedToolEndClaim;
     this.queuedToolEndClaim = undefined;
     activeClaim?.queueClaim.cancelAdmission(reason);
+    if (activeClaim != null) {
+      this.emitQueuedMessageChanged();
+    }
     this.syncBackgroundQueuedMessageSignal();
   }
 
@@ -7088,19 +7099,18 @@ export class AgentSession {
                 dispatchClaim.queueClaim.admissionSignal.aborted ||
                 internal?.admissionStale?.() === true,
               onAccepted: async () => {
-                try {
-                  await internal?.onAccepted?.();
-                  if (dispatchClaim.queueClaim.admissionSignal.aborted) {
-                    const reason: unknown = dispatchClaim.queueClaim.admissionSignal.reason;
-                    throw new Error(
-                      typeof reason === "string"
-                        ? reason
-                        : "Queue dispatch canceled by user interrupt."
-                    );
-                  }
-                } finally {
-                  this.releaseQueuedToolEndClaim(dispatchClaim);
+                if (dispatchClaim.queueClaim.admissionSignal.aborted) {
+                  const reason: unknown = dispatchClaim.queueClaim.admissionSignal.reason;
+                  throw new Error(
+                    typeof reason === "string"
+                      ? reason
+                      : "Queue dispatch canceled by user interrupt."
+                  );
                 }
+                // The callback makes monitor acceptance irreversible. Release first so a
+                // concurrent Stop lets the accepted dispatch finish instead of losing output.
+                this.releaseQueuedToolEndClaim(dispatchClaim);
+                await internal?.onAccepted?.();
               },
             };
       this.dispatchingQueuedEntry = true;
@@ -7132,6 +7142,8 @@ export class AgentSession {
             if (dispatchClaim != null) {
               this.releaseQueuedToolEndClaim(dispatchClaim);
             }
+            this.dispatchingQueuedEntry = false;
+            this.dispatchingQueuedEntryMuxMetadata = undefined;
             await internal?.onAcceptedPreStreamFailure?.(result.error);
             if (this.turnPhase === TurnPhase.PREPARING) {
               this.setTurnPhase(TurnPhase.IDLE);
@@ -7146,6 +7158,8 @@ export class AgentSession {
             if (dispatchClaim != null) {
               this.releaseQueuedToolEndClaim(dispatchClaim);
             }
+            this.dispatchingQueuedEntry = false;
+            this.dispatchingQueuedEntryMuxMetadata = undefined;
             // Cancellation can arrive after dequeue while sendMessage is validating or writing
             // history. No stream will start, so release PREPARING and continue with later entries.
             if (this.turnPhase === TurnPhase.PREPARING) {
