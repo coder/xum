@@ -216,6 +216,9 @@ export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
   // injection into a later shell paste would start.
   // eslint-disable-next-line no-control-regex
   if (/[\s\u0000-\u001f\u007f]/.test(url)) return undefined;
+  // Percent-escapes would let a credential pattern hide from the publish-time secret scan
+  // (which sees the manifest text, not its decoded form); real remotes do not need them.
+  if (/%[0-9A-Fa-f]{2}/.test(url)) return undefined;
   if (hasUrlCredentials(url)) return undefined;
   if (/^(?:https?|ssh):\/\/[^/]+/i.test(url)) return url;
   // scp-like `user@host:path`. A scheme prefix was handled above, and a single-letter

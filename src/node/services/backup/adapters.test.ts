@@ -647,7 +647,7 @@ describe("backup adapters", () => {
       managedPath: settings.path,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).toEqual(["skills/demo/run.sh"]);
     const mode = (await fs.stat(path.join(muxRoot, "skills/demo/run.sh"))).mode;
@@ -691,7 +691,7 @@ describe("backup adapters", () => {
       managedPath: prepared.managedPath,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
@@ -778,7 +778,7 @@ describe("backup adapters", () => {
       managedPath: prepared.managedPath,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
@@ -835,7 +835,7 @@ describe("backup adapters", () => {
       managedPath: prepared.managedPath,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
@@ -894,7 +894,7 @@ describe("backup adapters", () => {
       managedPath: prepared.managedPath,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
@@ -946,7 +946,7 @@ describe("backup adapters", () => {
       managedPath: prepared.managedPath,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).toEqual(["AGENTS.md"]);
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
@@ -1142,7 +1142,7 @@ describe("backup adapters", () => {
       managedPath: settings.path,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
 
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("backed up\n");
@@ -1183,7 +1183,7 @@ describe("backup adapters", () => {
         managedPath: settings.path,
         includeProjects: false,
         snapshotPath: path.join(tempDir, "restore-snapshot"),
-        matchedProjectPaths: [],
+        matchedProjects: [],
       });
       throw new Error("Expected the lost preferences write to be reported");
     } catch (error) {
@@ -1221,7 +1221,7 @@ describe("backup adapters", () => {
       managedPath: settings.path,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
 
     expect(config.state.userPreferences?.appearance?.theme).toBe("dark");
@@ -1398,6 +1398,15 @@ describe("backup adapters project bundle", () => {
 
   function registerProject(projectPath: string): void {
     config.state.projects.set(projectPath, { workspaces: [] });
+  }
+
+  /** The validated identity of an entry registered at its own recorded path. */
+  function matchedAt(projectPath: string) {
+    return {
+      sourcePath: projectPath,
+      projectPath,
+      localMemoryDir: projectMemoryDirName(projectPath),
+    };
   }
 
   async function seedProjectMemory(
@@ -1598,7 +1607,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
     });
-    expect(validated.matchedProjectPaths).toEqual([project]);
+    expect(validated.matchedProjects).toEqual([matchedAt(project)]);
 
     const snapshotPath = path.join(tempDir, "restore-snapshot");
     const restored = await payload.restore({
@@ -1606,7 +1615,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath,
-      matchedProjectPaths: validated.matchedProjectPaths,
+      matchedProjects: validated.matchedProjects,
     });
     expect(restored.changedFiles).toContain(memoryPath);
     expect(restored.restoredProjectMemory).toEqual([{ projectPath: project, files: [memoryPath] }]);
@@ -1644,7 +1653,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath,
-      matchedProjectPaths: [project],
+      matchedProjects: [matchedAt(project)],
     });
     expect(restored.changedFiles).toContain(`memory/project/${memoryDir}/notes.md`);
     const snapshotBundle = JSON.parse(
@@ -1767,7 +1776,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [project],
+      matchedProjects: [matchedAt(project)],
     });
     expect(restored.changedFiles).not.toContain(memoryPath);
     expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
@@ -1803,7 +1812,7 @@ describe("backup adapters project bundle", () => {
           managedPath: settings.path,
           includeProjects: true,
           snapshotPath: path.join(tempDir, "restore-snapshot"),
-          matchedProjectPaths: [first, second],
+          matchedProjects: [matchedAt(first), matchedAt(second)],
         })
       );
       expect(error).toBeInstanceOf(ProjectMemoryRestoreError);
@@ -1835,7 +1844,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles).not.toContain(memoryPath);
     expect(restored.restoredProjectMemory).toEqual([]);
@@ -1886,7 +1895,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.changedFiles.some((file) => file.startsWith("memory/project"))).toBe(false);
     expect(
@@ -2058,7 +2067,7 @@ describe("backup adapters project bundle", () => {
     const targetPath = path.join(tempDir, "projects", "alpha-moved");
     const targetDir = projectMemoryDirName(targetPath);
     // A directory squats on the marker's name, so the marker write fails after the notes landed.
-    await fs.mkdir(path.join(muxRoot, "memory", "project", targetDir, ".backup-origin.json"), {
+    await fs.mkdir(path.join(muxRoot, "memory", ".backup-origins", `${targetDir}.json`), {
       recursive: true,
     });
 
@@ -2136,13 +2145,16 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
     });
-    expect(validated.matchedProjectPaths).toEqual([project]);
+    // Matched through the origin: recorded source, local destination.
+    expect(validated.matchedProjects).toEqual([
+      { sourcePath: project, projectPath: targetPath, localMemoryDir: targetDir },
+    ]);
     const restored = await payload.restore({
       repositoryRoot: checkout.rootDir,
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: validated.matchedProjectPaths,
+      matchedProjects: validated.matchedProjects,
     });
     expect(restored.changedFiles).toContain(localPath);
     expect(restored.restoredProjectMemory).toEqual([
@@ -2179,7 +2191,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: false,
       snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjectPaths: [],
+      matchedProjects: [],
     });
     expect(restored.projectBundleSkipped).toBe(true);
 
@@ -2221,7 +2233,7 @@ describe("backup adapters project bundle", () => {
       managedPath: settings.path,
       includeProjects: true,
       snapshotPath,
-      matchedProjectPaths: [matchedProject],
+      matchedProjects: [matchedAt(matchedProject)],
     });
     const snapshotBundle = JSON.parse(
       await fs.readFile(path.join(snapshotPath, "project-bundle", "manifest.json"), "utf-8")

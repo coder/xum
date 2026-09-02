@@ -90,8 +90,11 @@ export interface BackupPayloadStore {
   }): Promise<{
     hasProjectBundle: boolean;
     projectImports: BackupProjectImport[];
-    /** Bundle entries classified as matched; restore writes only these, never a newer match. */
-    matchedProjectPaths: string[];
+    /**
+     * Bundle entries classified as matched, with the local destination each one resolved
+     * to; restore writes only these exact pairs, never a newer or different match.
+     */
+    matchedProjects: BackupMatchedProject[];
   }>;
   /** Core settings only; matched project memory is snapshotted by `restore` under its lock. */
   writeSafetySnapshot(snapshotRoot: string): Promise<void>;
@@ -102,7 +105,7 @@ export interface BackupPayloadStore {
     includeProjects: boolean;
     /** Receives the matched project memory snapshot, taken in the write's lock window. */
     snapshotPath: string;
-    matchedProjectPaths: readonly string[];
+    matchedProjects: readonly BackupMatchedProject[];
   }): Promise<{
     changedFiles: string[];
     localOnlyFiles: string[];
@@ -119,6 +122,13 @@ export interface BackupPayloadStore {
     repositoryRoot: string;
     managedPath: string;
   }): Promise<BackupProjectImporter>;
+}
+
+/** A validated matched entry: the recorded source and the local project it restores into. */
+export interface BackupMatchedProject {
+  sourcePath: string;
+  projectPath: string;
+  localMemoryDir: string;
 }
 
 export interface BackupProjectImporter {
@@ -647,7 +657,7 @@ export class BackupService {
             approvedCommandTokens,
             includeProjects,
             snapshotPath,
-            matchedProjectPaths: validated.matchedProjectPaths,
+            matchedProjects: validated.matchedProjects,
           });
           // Announced as soon as the memory is on disk: a failure recording the commit below
           // must not leave subscribers showing pre-restore contents.

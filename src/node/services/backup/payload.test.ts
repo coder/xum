@@ -3722,7 +3722,7 @@ describe("project bundle", () => {
     await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(second), "/home/dev/src/alpha");
     await writeFixtureFile(
       muxRoot,
-      `memory/project/${projectMemoryDirName(broken)}/.backup-origin.json`,
+      `memory/.backup-origins/${projectMemoryDirName(broken)}.json`,
       "{ not json"
     );
 
@@ -3799,6 +3799,46 @@ describe("project bundle", () => {
       `memory/project/${entry.memoryDir}/huge.md`,
       `memory/project/${entry.memoryDir}/small.md`,
     ]);
+  });
+
+  it("round-trips a project whose basename starts with a dot", async () => {
+    // `~/.dotfiles` legitimately yields `.dotfiles-<hash>`; the hidden-name rule applies to
+    // memory files, not to this project-derived directory segment.
+    const entry = entryFor("/home/dev/.dotfiles");
+    expect(entry.memoryDir.startsWith(".dotfiles-")).toBe(true);
+    await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/notes.md`, "dots\n");
+
+    const bundle = await collectProjectBundle(muxRoot, [entry], { portableMemoryOnly: true });
+    expect(bundle.files.map((file) => file.path)).toEqual([
+      `memory/project/${entry.memoryDir}/notes.md`,
+    ]);
+    await writeBundleTo(managedDir, bundle);
+    const read = await readProjectBundle(managedDir);
+    expect(read?.files[0]?.content.toString("utf-8")).toBe("dots\n");
+    // Hidden files inside the project stay excluded; the directory itself is fine.
+    const restored = await writeProjectMemoryFiles(
+      muxRoot,
+      [{ path: `memory/project/${entry.memoryDir}/other.md`, content: Buffer.from("x\n") }],
+      { addOnly: true }
+    );
+    expect(restored.written).toEqual([`memory/project/${entry.memoryDir}/other.md`]);
+    const hidden = await captureRejection(
+      writeProjectMemoryFiles(
+        muxRoot,
+        [{ path: `memory/project/${entry.memoryDir}/.env`, content: Buffer.from("x\n") }],
+        { addOnly: true }
+      )
+    );
+    expect((hidden as Error).message).toContain("disallowed path");
+  });
+
+  it("treats a symlinked sidecar manifest as absent without following it", async () => {
+    await fs.mkdir(path.join(managedDir, PROJECT_BUNDLE_DIR), { recursive: true });
+    const outside = path.join(tempDir, "outside-manifest.json");
+    await fs.writeFile(outside, "{}", "utf-8");
+    await fs.symlink(outside, path.join(managedDir, PROJECT_BUNDLE_DIR, "manifest.json"));
+    expect(await projectBundleExists(managedDir)).toBe(false);
+    expect(await readProjectBundle(managedDir)).toBeNull();
   });
 
   it("rejects unsafe memory directory segments", async () => {
@@ -4159,6 +4199,8 @@ describe("sanitizeBackupGitRemote", () => {
       "../relative/repo",
       "git@github.com:dev/repo.git --upload-pack=evil",
       "https://github.com/dev/repo.git?token=abc",
+      // A percent-encoded token would evade the publish-time pattern scan of the manifest.
+      `https://example.com/%67hp_${"a".repeat(24)}/repo.git`,
     ]) {
       expect(sanitizeBackupGitRemote(remote)).toBeUndefined();
     }

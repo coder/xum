@@ -549,12 +549,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // before the caller takes a safety snapshot it would have no use for.
       await planRestoreWrites(muxRoot, payload);
       if (!validateOptions.includeProjects) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjectPaths: [] };
+        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
       }
       // A bundle the restore would refuse is refused here too, for the same reason.
       const bundlePlan = await readBundleWithPlan(sourceDir);
       if (bundlePlan === null) {
-        return { hasProjectBundle: false, projectImports: [], matchedProjectPaths: [] };
+        return { hasProjectBundle: false, projectImports: [], matchedProjects: [] };
       }
       // The matched writes' own refusals (memory size and count limits, non-file
       // destinations) belong to the preflight too: found only inside the restore, they
@@ -573,11 +573,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       return {
         hasProjectBundle: true,
         projectImports: toProjectImports(bundlePlan.plan),
-        // The classification the caller validated against. Restore re-partitions the
-        // bundle, but only writes matched entries that were also matched here, so a
-        // project registered mid-restore cannot be overwritten outside the plan the
-        // snapshot covered.
-        matchedProjectPaths: bundlePlan.plan.matched.map((match) => match.entry.path),
+        // The classification the caller validated against, destination included. Restore
+        // re-partitions the bundle but only writes entries that resolve to the very same
+        // local project here, so neither a project registered mid-restore nor a fallback
+        // to a different origin can be written outside the plan the snapshot covered.
+        matchedProjects: bundlePlan.plan.matched.map((match) => ({
+          sourcePath: match.entry.path,
+          projectPath: match.projectPath,
+          localMemoryDir: match.localMemoryDir,
+        })),
       };
     },
 
@@ -650,7 +654,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           // recorded path since validation was previewed as an import and is not covered
           // by the snapshot, so it must not be overwritten here; one unregistered since
           // validation drops out of the recomputed plan on its own.
-          const validatedMatched = new Set(restoreOptions.matchedProjectPaths);
+          const validatedMatched = new Set(
+            restoreOptions.matchedProjects.map(
+              (match) => `${match.sourcePath}\0${match.projectPath}\0${match.localMemoryDir}`
+            )
+          );
           // One lock window for the snapshot and the overwrite: a memory edit landing
           // between them would otherwise be destroyed with a snapshot that predates it.
           await withMemoryLock(async () => {
@@ -662,8 +670,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             const registered = registeredProjectDirs();
             const matched = bundlePlan.plan.matched.filter(
               (match) =>
-                validatedMatched.has(match.entry.path) &&
-                registered.get(match.projectPath) === match.localMemoryDir
+                validatedMatched.has(
+                  `${match.entry.path}\0${match.projectPath}\0${match.localMemoryDir}`
+                ) && registered.get(match.projectPath) === match.localMemoryDir
             );
             if (matched.length > 0) {
               // Exactly the files these writes can overwrite: not whole project directories,

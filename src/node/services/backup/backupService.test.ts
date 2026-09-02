@@ -13,6 +13,7 @@ import {
 } from "./payload";
 import {
   BackupService,
+  type BackupMatchedProject,
   type BackupProjectImporter,
   type BackupProjectRegistrar,
   BackupServiceError,
@@ -94,7 +95,7 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         projectBundleSkipped: false,
       }),
     validateRestore: () =>
-      Promise.resolve({ hasProjectBundle: false, projectImports: [], matchedProjectPaths: [] }),
+      Promise.resolve({ hasProjectBundle: false, projectImports: [], matchedProjects: [] }),
     writeSafetySnapshot: () => Promise.resolve(),
     restore: () =>
       Promise.resolve({
@@ -115,6 +116,15 @@ function importsWith(
     Promise.resolve()
 ): BackupProjectImporter {
   return { assertProjectMemoryAllowed, importProjectMemory };
+}
+
+/** The validated identity of an entry registered at its own recorded path. */
+function matchedIdentity(projectPath: string): BackupMatchedProject {
+  return {
+    sourcePath: projectPath,
+    projectPath,
+    localMemoryDir: `${path.basename(projectPath)}-abc`,
+  };
 }
 
 /** A registrar mock around the given create(). */
@@ -156,7 +166,7 @@ describe("BackupService", () => {
           return Promise.resolve({
             hasProjectBundle: false,
             projectImports: [],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           });
         },
         writeSafetySnapshot: async (snapshotRoot) => {
@@ -570,7 +580,7 @@ describe("BackupService", () => {
           return Promise.resolve({
             hasProjectBundle: false,
             projectImports: [],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           });
         },
         restore: (options) => {
@@ -1026,7 +1036,7 @@ describe("BackupService", () => {
             ? Promise.resolve({
                 hasProjectBundle: false,
                 projectImports: [],
-                matchedProjectPaths: [],
+                matchedProjects: [],
               })
             : Promise.reject(new BackupCommandApprovalRequiredError(approvals));
         },
@@ -1118,7 +1128,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [fresh],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         writeSafetySnapshot: () => {
           snapshots += 1;
@@ -1149,7 +1159,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         writeSafetySnapshot: () => {
           snapshots += 1;
@@ -1188,7 +1198,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: candidates,
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1261,7 +1271,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1304,7 +1314,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1346,7 +1356,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [approved, skipped],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
       }),
     });
@@ -1378,7 +1388,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1431,7 +1441,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1476,7 +1486,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1524,7 +1534,7 @@ describe("BackupService project imports", () => {
               candidate({ name: "Rocket Science" }),
               candidate({ name: "Probe", token: "probe-token", sourcePath: "/src/probe" }),
             ],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
       }),
     });
@@ -1562,7 +1572,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [failing],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
       }),
     });
@@ -1594,7 +1604,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         // Another window unregisters the project while the snapshot is being written —
         // after planning resolved the target as already registered.
@@ -1638,7 +1648,7 @@ describe("BackupService project imports", () => {
             Promise.resolve({
               hasProjectBundle: true,
               projectImports: [candidate()],
-              matchedProjectPaths: [],
+              matchedProjects: [],
             }),
         }),
       });
@@ -1677,7 +1687,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate(), candidate({ name: "beta", token: "beta-token" })],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         writeSafetySnapshot: () => {
           snapshots += 1;
@@ -1714,7 +1724,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1751,7 +1761,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1789,7 +1799,7 @@ describe("BackupService project imports", () => {
   });
 
   test("carries the validated match set and the snapshot path into the restore", async () => {
-    const seen: Array<{ snapshotPath: string; matched: readonly string[] }> = [];
+    const seen: Array<{ snapshotPath: string; matched: readonly BackupMatchedProject[] }> = [];
     const snapshot = { root: null as string | null };
     const service = createService(tempDir, {
       payload: createPayload({
@@ -1797,14 +1807,14 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [],
-            matchedProjectPaths: ["/home/dev/src/alpha"],
+            matchedProjects: [matchedIdentity("/home/dev/src/alpha")],
           }),
         writeSafetySnapshot: (root) => {
           snapshot.root = root;
           return Promise.resolve();
         },
         restore: (options) => {
-          seen.push({ snapshotPath: options.snapshotPath, matched: options.matchedProjectPaths });
+          seen.push({ snapshotPath: options.snapshotPath, matched: options.matchedProjects });
           return Promise.resolve({
             changedFiles: [],
             localOnlyFiles: [],
@@ -1820,7 +1830,9 @@ describe("BackupService project imports", () => {
     // therefore the snapshot) covered, into the same snapshot directory.
     const snapshotRoot = snapshot.root;
     if (snapshotRoot === null) throw new Error("Expected the safety snapshot to be written");
-    expect(seen).toEqual([{ snapshotPath: snapshotRoot, matched: ["/home/dev/src/alpha"] }]);
+    expect(seen).toEqual([
+      { snapshotPath: snapshotRoot, matched: [matchedIdentity("/home/dev/src/alpha")] },
+    ]);
   });
 
   test("announces restored and imported project memory to the memory notifier", async () => {
@@ -1833,7 +1845,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: ["/home/dev/src/matched"],
+            matchedProjects: [matchedIdentity("/home/dev/src/matched")],
           }),
         restore: () =>
           Promise.resolve({
@@ -1889,7 +1901,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [candidate()],
-            matchedProjectPaths: [],
+            matchedProjects: [],
           }),
         prepareProjectImports: () =>
           Promise.resolve(
@@ -1932,7 +1944,7 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [],
-            matchedProjectPaths: ["/home/dev/src/alpha"],
+            matchedProjects: [matchedIdentity("/home/dev/src/alpha")],
           }),
         restore: () =>
           Promise.resolve({
@@ -1973,7 +1985,10 @@ describe("BackupService project imports", () => {
           Promise.resolve({
             hasProjectBundle: true,
             projectImports: [],
-            matchedProjectPaths: ["/home/dev/src/alpha", "/home/dev/src/beta"],
+            matchedProjects: [
+              matchedIdentity("/home/dev/src/alpha"),
+              matchedIdentity("/home/dev/src/beta"),
+            ],
           }),
         restore: () =>
           Promise.reject(

@@ -2622,10 +2622,21 @@ function assertAllowedBundleFilePath(
   relativePath: string,
   options: { portable: boolean } = { portable: true }
 ): void {
+  const segments = relativePath.split("/");
+  // The memory directory segment is derived from the project's basename, which may itself
+  // start with a dot (`~/.dotfiles` → `.dotfiles-<hash>`), so the hidden-name rule does not
+  // apply to it; it is held to its own charset and hash rules by assertValidBundleEntryDir
+  // and must equal a listed entry's directory exactly. `.`/`..` still fail the shape check.
+  const memoryDir = segments[2] ?? "";
+  const shapeChecked = [
+    ...segments.slice(0, 2),
+    /^\.{1,2}$/.test(memoryDir) ? memoryDir : memoryDir.replace(/^\./, "_"),
+    ...segments.slice(3),
+  ].join("/");
   if (
     !relativePath.startsWith(PROJECT_MEMORY_PATH_PREFIX) ||
-    relativePath.split("/").length < 4 ||
-    hasDisallowedPathShape(relativePath, options)
+    segments.length < 4 ||
+    hasDisallowedPathShape(shapeChecked, options)
   ) {
     throw new Error(`Backup project bundle contains disallowed path '${relativePath}'`);
   }
@@ -2641,9 +2652,10 @@ function assertAllowedBundleFilePath(
  */
 function assertValidBundleEntryDir(entry: BackupProjectBundleEntry): void {
   const { memoryDir } = entry;
+  // A leading dot is legitimate here (a `.dotfiles` project); `.` and `..` cannot pass the
+  // hash-suffix rule below.
   if (
     !/^[A-Za-z0-9._-]{1,64}$/.test(memoryDir) ||
-    isHiddenName(memoryDir) ||
     isForbiddenBasename(memoryDir) ||
     isWindowsUnusableSegment(memoryDir) ||
     !memoryDir.endsWith(`-${projectPathHashSuffix(entry.path)}`) ||
@@ -2823,7 +2835,12 @@ export async function assertManagedTreeWithinLimits(destinationDir: string): Pro
  * while `includeProjects` is off without ever blocking a core-only restore on its contents.
  */
 export async function projectBundleExists(sourceDir: string): Promise<boolean> {
-  return await fileExists(path.join(sourceDir, PROJECT_BUNDLE_DIR, BACKUP_MANIFEST_FILE));
+  // lstat, never stat: on hosts where git materializes symlinks, a crafted sidecar manifest
+  // pointing at a UNC path would otherwise be followed here — reached even with project
+  // backup off — and Windows would start SMB authentication. A symlinked manifest is
+  // treated as absent; the full read refuses it anyway.
+  const stat = await lstatOrNull(path.join(sourceDir, PROJECT_BUNDLE_DIR, BACKUP_MANIFEST_FILE));
+  return stat?.isFile() === true;
 }
 
 function parseProjectBundleManifest(raw: string): BackupProjectBundleManifest {
@@ -3055,12 +3072,18 @@ export function matchedProjectWrites(
 }
 
 /**
- * Hidden marker inside an imported project's memory directory recording which backed-up
- * project it came from. Dot-prefixed so MemoryService never lists or counts it and exports
- * never collect it; it travels with the memory directory and needs no config schema.
+ * Marker recording which backed-up project an imported memory directory came from, keyed by
+ * the local memory directory name. Kept in `memory/.backup-origins/` — beside, not inside,
+ * the project scopes — so no memory path a user or agent can address through MemoryService
+ * collides with it, and the core allowlist (which collects only `memory/global`) never
+ * exports it. Needs no config schema.
  */
-const PROJECT_MEMORY_ORIGIN_FILE = ".backup-origin.json";
+const PROJECT_MEMORY_ORIGINS_DIR = "memory/.backup-origins";
 const MAX_PROJECT_MEMORY_ORIGIN_BYTES = 4096;
+
+function projectMemoryOriginPath(rootPath: string, localMemoryDir: string): string {
+  return path.join(rootPath, ...PROJECT_MEMORY_ORIGINS_DIR.split("/"), `${localMemoryDir}.json`);
+}
 
 export async function writeProjectMemoryOrigin(
   muxRoot: string,
@@ -3068,16 +3091,9 @@ export async function writeProjectMemoryOrigin(
   sourcePath: string
 ): Promise<void> {
   const root = await resolveRoot(muxRoot);
-  const directory = await resolveContainedPath(
-    root.path,
-    `${PROJECT_MEMORY_PATH_PREFIX}${localMemoryDir}`
-  );
-  await fs.mkdir(directory, { recursive: true });
-  await fs.writeFile(
-    path.join(directory, PROJECT_MEMORY_ORIGIN_FILE),
-    `${JSON.stringify({ sourcePath })}\n`,
-    "utf-8"
-  );
+  const marker = projectMemoryOriginPath(root.path, localMemoryDir);
+  await fs.mkdir(path.dirname(marker), { recursive: true });
+  await fs.writeFile(marker, `${JSON.stringify({ sourcePath })}\n`, "utf-8");
 }
 
 /**
@@ -3093,7 +3109,7 @@ export async function readProjectMemoryOrigins(
   const origins = new Map<string, ProjectMemoryOrigin>();
   const registered = [...registeredDirByPath.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [projectPath, memoryDir] of registered) {
-    const marker = path.join(root.path, "memory", "project", memoryDir, PROJECT_MEMORY_ORIGIN_FILE);
+    const marker = projectMemoryOriginPath(root.path, memoryDir);
     const stat = await lstatOrNull(marker);
     if (stat?.isFile() !== true || stat.size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) continue;
     let sourcePath: unknown;
@@ -3208,9 +3224,15 @@ export async function writeProjectMemoryFiles(
   const skipped: string[] = [];
   try {
     for (const write of planned) {
-      if (write.exists) {
-        const current = await readCheckedFile(root, write.path, () => undefined);
-        if (current.content.equals(write.content)) continue;
+      if (write.existingSize !== null) {
+        // Sizes first, from the planning lstat: an existing file of a different size can
+        // never be identical, so it is never read — an externally bloated destination would
+        // otherwise be buffered whole just to detect a conflict. Equal sizes are bounded by
+        // the incoming file's own memory limit.
+        if (write.existingSize === write.content.length) {
+          const current = await readCheckedFile(root, write.path, () => undefined);
+          if (current.content.equals(write.content)) continue;
+        }
         if (options.addOnly) {
           skipped.push(write.path);
           continue;
@@ -3249,12 +3271,12 @@ export async function assertProjectMemoryWritesAllowed(
 async function planProjectMemoryWrites(
   root: BackupRoot,
   writes: ReadonlyArray<{ path: string; content: Buffer }>
-): Promise<Array<{ path: string; content: Buffer; exists: boolean }>> {
+): Promise<Array<{ path: string; content: Buffer; existingSize: number | null }>> {
   // Charged so a marker-thin bundle cannot expand past the same bound reads enforce.
   const budget = createByteBudget();
   // Everything refusable is refused before the first write, so a rejected bundle
   // changes nothing on disk.
-  const planned: Array<{ path: string; content: Buffer; exists: boolean }> = [];
+  const planned: Array<{ path: string; content: Buffer; existingSize: number | null }> = [];
   for (const write of writes) {
     assertAllowedBundleFilePath(write.path);
     // The memory subsystem's own read limit: a restored file larger than this would be
@@ -3271,14 +3293,18 @@ async function planProjectMemoryWrites(
     if (existing !== null && !existing.isFile()) {
       throw new Error(`Cannot restore '${write.path}': a non-file already exists there`);
     }
-    planned.push({ path: write.path, content: write.content, exists: existing !== null });
+    planned.push({
+      path: write.path,
+      content: write.content,
+      existingSize: existing === null ? null : existing.size,
+    });
   }
   // Per-scope file-count cap, mirrored from MemoryService. Only growth past the limit is
   // refused: a store that already exceeds it (hand-placed files) can still be restored
   // in place as long as this restore does not add to the overflow.
   const addsByDir = new Map<string, number>();
   for (const write of planned) {
-    if (write.exists) continue;
+    if (write.existingSize !== null) continue;
     const scopeDir = write.path.split("/").slice(0, 3).join("/");
     addsByDir.set(scopeDir, (addsByDir.get(scopeDir) ?? 0) + 1);
   }
