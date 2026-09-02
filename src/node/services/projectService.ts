@@ -437,13 +437,13 @@ export class ProjectService {
     projectPath: string,
     options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
-    // No registration lock around the validation: it stats, resolves, and runs git against
-    // the new path, which on a slow or unavailable filesystem can take as long as the lock's
-    // wait bound — and every config save in every process waits for that lock, so holding it
-    // here would stall unrelated workspace, task, and settings saves behind one stuck create.
-    // The registering write below takes the lock itself, through editConfig, and re-validates
-    // against the config as it is under that hold; only withRegistrationLock callers, which
-    // already hold a window, register inside it.
+    // No registration lock around the validation: it stats, resolves, and reads git roots
+    // along the new path, which on a slow or unavailable filesystem can take as long as the
+    // lock's wait bound — and every config save in every process waits for that lock, so
+    // holding it here would stall unrelated workspace, task, and settings saves behind one
+    // stuck create. createUnlocked takes the lock itself around what mutates state (a git
+    // init, the registering write) and re-validates under it; withRegistrationLock callers
+    // pass the window they already hold.
     return this.createUnlocked(projectPath, options, null);
   }
 
@@ -468,7 +468,7 @@ export class ProjectService {
     );
   }
 
-  /** `lock`: the caller's registration window, or null when editConfig is to take its own. */
+  /** `lock`: the caller's registration window, or null to open one for the mutating steps. */
   private async createUnlocked(
     projectPath: string,
     options: { initGit?: boolean; displayName?: string } | undefined,
@@ -656,142 +656,167 @@ export class ProjectService {
         }
       }
 
-      if (options?.initGit) {
-        // Exclusive per-canonical-path claim: two initGit creates targeting the same
-        // pre-existing empty directory would otherwise interleave git init and failure
-        // rollback, letting one call delete the .git the other just initialized.
-        if (this.activeGitInits.has(canonicalPath)) {
-          return Err("Another project creation is already initializing this directory");
-        }
-        this.activeGitInits.add(canonicalPath);
-        gitInitClaimKey = canonicalPath;
+      // From here on the request mutates state — a git init into the directory, the
+      // registering write — so it runs under the registration lock: the window a
+      // withRegistrationLock caller holds, or one opened here. The read-only validation above
+      // stayed outside it (see create).
+      const register = async (
+        lock: ProjectRegistrationLockHandle
+      ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> => {
+        if (options?.initGit) {
+          // The project set as it is under the lock, before anything is written into the
+          // directory: registered meanwhile — a settings-backup import into this same empty
+          // directory, say — it is the winner's now, and this request fails as the duplicate
+          // it is without having initialized a repository inside the winner's checkout only
+          // to roll it back again.
+          const current = this.config.loadConfigOrDefault();
+          if (current.projects.has(normalizedPath) || current.projects.has(canonicalPath)) {
+            return Err("Project already exists");
+          }
+          // Exclusive per-canonical-path claim: two initGit creates targeting the same
+          // pre-existing empty directory would otherwise interleave git init and failure
+          // rollback, letting one call delete the .git the other just initialized.
+          if (this.activeGitInits.has(canonicalPath)) {
+            return Err("Another project creation is already initializing this directory");
+          }
+          this.activeGitInits.add(canonicalPath);
+          gitInitClaimKey = canonicalPath;
 
-        const gitInitResult = await this.initializeGitRepository(normalizedPath);
-        if (!gitInitResult.success) {
+          const gitInitResult = await this.initializeGitRepository(normalizedPath);
+          if (!gitInitResult.success) {
+            await cleanupCreatedDirectory();
+            return gitInitResult;
+          }
+          initializedGitDir = gitInitResult.data.initializedGitDir;
+        }
+
+        // Register the project inside the serialized editConfig transform, re-checking for
+        // duplicates and re-deriving the hierarchy from FRESH config: persisting the pre-read
+        // snapshot would clobber concurrent config edits (lost-update race). The async
+        // validations above (git roots, sub-project depth) ran against the snapshot; the
+        // transform only re-resolves state that a concurrent edit could have changed.
+        let createResult: Result<{ projectConfig: ProjectConfig; normalizedPath: string }> =
+          Err("Project already exists");
+        // Distinguishes in-transform failures for directory cleanup: when a concurrent
+        // call registered this same path ("duplicate"), the directory belongs to that
+        // winner and must not be deleted; other rejections leave the directory ours.
+        let transformFailure:
+          | "duplicate"
+          | "depth"
+          | "hierarchy-changed"
+          | "hierarchy-changed-descendant"
+          | null = null;
+        await this.config.editConfig(
+          (freshConfig) => {
+            if (
+              freshConfig.projects.has(normalizedPath) ||
+              freshConfig.projects.has(canonicalPath)
+            ) {
+              transformFailure = "duplicate";
+              createResult = Err("Project already exists");
+              return freshConfig;
+            }
+            freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+            // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
+            // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
+            // can introduce a sub-project ancestor that the snapshot-time check missed,
+            // which would persist a second-level sub-project.
+            if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
+              transformFailure = "depth";
+              createResult = Err("Sub-projects can only be one level deep");
+              return freshConfig;
+            }
+            const freshParentProjectPath = findDeepestTopLevelParentProject(
+              normalizedPath,
+              freshConfig.projects
+            );
+            // The same-git-repository validations above ran against the snapshot hierarchy
+            // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
+            // If a concurrent edit introduced a different parent or new descendants, those
+            // were never git-validated — reject instead of persisting an unvalidated
+            // hierarchy (e.g. a sub-project from a different git repository).
+            const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
+              (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
+            );
+            const hasNewDescendantProject = freshDescendantProjectPaths.some(
+              (candidatePath) => !descendantProjectPaths.includes(candidatePath)
+            );
+            // Re-check the canonical parent for initGit: the snapshot-time rejection above
+            // can miss a parent registered concurrently, and the lexical freshParent check
+            // below cannot see it when this path reaches the checkout through a symlink.
+            if (
+              options?.initGit &&
+              findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
+            ) {
+              transformFailure = "hierarchy-changed";
+              createResult = Err("Project hierarchy changed concurrently; please retry");
+              return freshConfig;
+            }
+            if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
+              // A new descendant registered under this path claims the directory tree we
+              // created: recursive cleanup would delete that project's checkout, so treat
+              // it like the duplicate case and leave the directory alone.
+              transformFailure = hasNewDescendantProject
+                ? "hierarchy-changed-descendant"
+                : "hierarchy-changed";
+              createResult = Err("Project hierarchy changed concurrently; please retry");
+              return freshConfig;
+            }
+            const projectConfig: ProjectConfig = {
+              workspaces: [],
+              parentProjectPath: freshParentProjectPath ?? undefined,
+              // Set in the same config write as the registration (a backup restore names
+              // imported projects) rather than as a second write and notification.
+              ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
+            };
+            freshConfig.projects.set(normalizedPath, projectConfig);
+            freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+            createResult = Ok({ projectConfig, normalizedPath });
+            return freshConfig;
+          },
+          { withinRegistrationLock: lock }
+        );
+
+        // Do NOT clean up the created directory when a concurrent registration claims
+        // it: a duplicate owns this exact path, and a new descendant project lives
+        // inside the tree we created — recursive removal would destroy the winner's
+        // checkout either way (including files created after its call returned). Only
+        // depth and parent-only hierarchy rejections leave the directory ours to remove.
+        if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
           await cleanupCreatedDirectory();
-          return gitInitResult;
+        } else if (
+          (transformFailure === "hierarchy-changed-descendant" ||
+            transformFailure === "duplicate") &&
+          initializedGitDir
+        ) {
+          // The winning registration owns the files (a duplicate winner registered this
+          // exact pre-existing directory; a descendant winner lives inside it), but the
+          // .git this losing request created would silently turn the winner's project
+          // into a repository it never asked for, or wrap its checkout in an
+          // unregistered outer repository that changes git discovery.
+          await fsPromises
+            .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+            .catch((cleanupError: unknown) => {
+              log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+            });
         }
-        initializedGitDir = gitInitResult.data.initializedGitDir;
-      }
-
-      // Register the project inside the serialized editConfig transform, re-checking for
-      // duplicates and re-deriving the hierarchy from FRESH config: persisting the pre-read
-      // snapshot would clobber concurrent config edits (lost-update race). The async
-      // validations above (git roots, sub-project depth) ran against the snapshot; the
-      // transform only re-resolves state that a concurrent edit could have changed.
-      let createResult: Result<{ projectConfig: ProjectConfig; normalizedPath: string }> =
-        Err("Project already exists");
-      // Distinguishes in-transform failures for directory cleanup: when a concurrent
-      // call registered this same path ("duplicate"), the directory belongs to that
-      // winner and must not be deleted; other rejections leave the directory ours.
-      let transformFailure:
-        | "duplicate"
-        | "depth"
-        | "hierarchy-changed"
-        | "hierarchy-changed-descendant"
-        | null = null;
-      await this.config.editConfig(
-        (freshConfig) => {
-          if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
-            transformFailure = "duplicate";
-            createResult = Err("Project already exists");
-            return freshConfig;
-          }
-          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-          // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
-          // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
-          // can introduce a sub-project ancestor that the snapshot-time check missed,
-          // which would persist a second-level sub-project.
-          if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
-            transformFailure = "depth";
-            createResult = Err("Sub-projects can only be one level deep");
-            return freshConfig;
-          }
-          const freshParentProjectPath = findDeepestTopLevelParentProject(
-            normalizedPath,
-            freshConfig.projects
-          );
-          // The same-git-repository validations above ran against the snapshot hierarchy
-          // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
-          // If a concurrent edit introduced a different parent or new descendants, those
-          // were never git-validated — reject instead of persisting an unvalidated
-          // hierarchy (e.g. a sub-project from a different git repository).
-          const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
-            (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
-          );
-          const hasNewDescendantProject = freshDescendantProjectPaths.some(
-            (candidatePath) => !descendantProjectPaths.includes(candidatePath)
-          );
-          // Re-check the canonical parent for initGit: the snapshot-time rejection above
-          // can miss a parent registered concurrently, and the lexical freshParent check
-          // below cannot see it when this path reaches the checkout through a symlink.
-          if (
-            options?.initGit &&
-            findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
-          ) {
-            transformFailure = "hierarchy-changed";
-            createResult = Err("Project hierarchy changed concurrently; please retry");
-            return freshConfig;
-          }
-          if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
-            // A new descendant registered under this path claims the directory tree we
-            // created: recursive cleanup would delete that project's checkout, so treat
-            // it like the duplicate case and leave the directory alone.
-            transformFailure = hasNewDescendantProject
-              ? "hierarchy-changed-descendant"
-              : "hierarchy-changed";
-            createResult = Err("Project hierarchy changed concurrently; please retry");
-            return freshConfig;
-          }
-          const projectConfig: ProjectConfig = {
-            workspaces: [],
-            parentProjectPath: freshParentProjectPath ?? undefined,
-            // Set in the same config write as the registration (a backup restore names
-            // imported projects) rather than as a second write and notification.
-            ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
-          };
-          freshConfig.projects.set(normalizedPath, projectConfig);
-          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-          createResult = Ok({ projectConfig, normalizedPath });
-          return freshConfig;
-        },
-        // A withRegistrationLock caller already holds the registration lock; create() lets
-        // this edit take it. Either way a lock failure (a wait on another process timing
-        // out, an unwritable locks directory) is caught below like every other failure, so
-        // the Result contract holds.
-        lock === null ? {} : { withinRegistrationLock: lock }
-      );
-
-      // Do NOT clean up the created directory when a concurrent registration claims
-      // it: a duplicate owns this exact path, and a new descendant project lives
-      // inside the tree we created — recursive removal would destroy the winner's
-      // checkout either way (including files created after its call returned). Only
-      // depth and parent-only hierarchy rejections leave the directory ours to remove.
-      if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
-        await cleanupCreatedDirectory();
-      } else if (
-        (transformFailure === "hierarchy-changed-descendant" || transformFailure === "duplicate") &&
-        initializedGitDir
-      ) {
-        // The winning registration owns the files (a duplicate winner registered this
-        // exact pre-existing directory; a descendant winner lives inside it), but the
-        // .git this losing request created would silently turn the winner's project
-        // into a repository it never asked for, or wrap its checkout in an
-        // unregistered outer repository that changes git discovery.
-        await fsPromises
-          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
-          .catch((cleanupError: unknown) => {
-            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
-          });
-      }
-      if (createResult.success && !this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on
-        // write failures. Without this check a git-initialized project would report
-        // success, vanish after restart, and block retries on the leftover .git.
-        await cleanupCreatedDirectory();
-        return Err("Failed to save project configuration");
-      }
-      return createResult;
+        if (
+          createResult.success &&
+          !this.config.loadConfigOrDefault().projects.has(normalizedPath)
+        ) {
+          // Config persistence (editConfig → private saveConfig) logs-and-continues on
+          // write failures. Without this check a git-initialized project would report
+          // success, vanish after restart, and block retries on the leftover .git.
+          await cleanupCreatedDirectory();
+          return Err("Failed to save project configuration");
+        }
+        return createResult;
+      };
+      // A lock failure (a wait on another process timing out, an unwritable locks
+      // directory) is caught below like every other failure, so the Result contract holds.
+      return lock === null
+        ? await withProjectRegistrationLock(this.config.rootDir, register)
+        : await register(lock);
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to create project: ${message}`);

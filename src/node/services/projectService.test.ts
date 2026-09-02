@@ -2887,18 +2887,56 @@ exit 1
         timeoutMs: 5_000,
         label: "test holder",
       });
+      // The path resolution is the last filesystem probe of the validation; the registering
+      // write is the first thing the lock covers.
+      const realpath = spyOn(fs, "realpath");
       const editConfig = spyOn(config, "editConfig");
       const creating = service.create(target);
-      // The validation reaches the registering write while the lock is still held elsewhere.
       const deadline = Date.now() + 2_000;
-      while (editConfig.mock.calls.length === 0 && Date.now() < deadline) {
+      while (realpath.mock.calls.length === 0 && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
-      expect(editConfig).toHaveBeenCalledTimes(1);
+      // Validated while the lock is still held elsewhere, but not yet registering.
+      expect(realpath).toHaveBeenCalledWith(target);
+      expect(editConfig).not.toHaveBeenCalled();
       expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
 
       await otherProcess[Symbol.asyncDispose]();
       expect((await creating).success).toBe(true);
+      expect(editConfig).toHaveBeenCalledTimes(1);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+      realpath.mockRestore();
+    });
+
+    it("does not git-initialize a directory an import registers while it waits for the lock", async () => {
+      const target = path.join(tempDir, "imported-empty");
+      await fs.mkdir(target);
+      const initializeGit = spyOn(
+        service as unknown as { initializeGitRepository: () => unknown },
+        "initializeGitRepository"
+      );
+      // A restore window registers the same empty directory as an import target while an
+      // initGit create of it waits for the lock. The create must fail as a duplicate without
+      // having run `git init` there: initializing and rolling back inside a directory that
+      // is the import's by then would touch the imported project's checkout.
+      const windowOpen = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      const window = service.withRegistrationLock(async ({ create }) => {
+        windowOpen.resolve();
+        await proceed.promise;
+        expect((await create(target)).success).toBe(true);
+      });
+      await windowOpen.promise;
+      const creating = service.create(target, { initGit: true });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      proceed.resolve();
+      await window;
+
+      const result = await creating;
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toBe("Project already exists");
+      expect(initializeGit).not.toHaveBeenCalled();
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
       expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
     });
 
