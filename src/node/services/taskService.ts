@@ -187,7 +187,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { hasInProcessWorkflowWork } from "@/node/services/workflows/workflowArchiveAdmission";
+import { hasInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   isActiveWorkspaceTurnTaskStatus,
   isWorkspaceTurnTaskId,
@@ -684,8 +684,6 @@ interface WorkflowTaskOwner {
 interface InactiveWorkflowTaskOwner {
   ownerTaskId: string;
   runId: string;
-  /** Workspace hosting the run; undefined when the owner has no parent workspace. */
-  runWorkspaceId?: string;
   status?: WorkflowRunStatus;
   reason: string;
 }
@@ -1549,7 +1547,6 @@ export class TaskService implements AgentTaskIntegration {
         return {
           ownerTaskId: owner.taskId,
           runId: workflowTask.runId,
-          runWorkspaceId: parentWorkspaceId,
           status: run.status,
           reason: `workflow run belongs to ${run.workspaceId}, not ${parentWorkspaceId}`,
         };
@@ -1560,7 +1557,6 @@ export class TaskService implements AgentTaskIntegration {
       return {
         ownerTaskId: owner.taskId,
         runId: workflowTask.runId,
-        runWorkspaceId: parentWorkspaceId,
         status: run.status,
         reason: `workflow run is ${run.status}`,
       };
@@ -1568,7 +1564,6 @@ export class TaskService implements AgentTaskIntegration {
       return {
         ownerTaskId: owner.taskId,
         runId: workflowTask.runId,
-        runWorkspaceId: parentWorkspaceId,
         reason: `workflow run is unavailable: ${getErrorMessage(error)}`,
       };
     }
@@ -1739,14 +1734,11 @@ export class TaskService implements AgentTaskIntegration {
       taskId,
       (ws) => {
         // Startup recovery can run while clients are connected, and the run-store read above
-        // awaited. A workflow resume admitted since then owns this child's fate: it holds a
-        // workflow admission (see workflowArchiveAdmission) from its synchronous entry until the
-        // run settles, so checking it inside this synchronous edit cannot miss an in-flight
-        // resume. Leave the entry untouched in that case.
-        if (
-          inactiveOwner.runWorkspaceId != null &&
-          hasInProcessWorkflowWork(inactiveOwner.runWorkspaceId)
-        ) {
+        // awaited. A resume of this run admitted since then owns this child's fate: it holds a
+        // run-keyed workflow admission (see workflowArchiveAdmission) from its synchronous entry
+        // until the run settles, so checking it inside this synchronous edit cannot miss an
+        // in-flight resume, and unrelated runs in the same workspace do not match.
+        if (hasInProcessWorkflowRun(inactiveOwner.runId)) {
           resumeInFlight = true;
           return;
         }
@@ -2656,10 +2648,10 @@ export class TaskService implements AgentTaskIntegration {
 
     // Best-effort completed-report ancestor recheck after restart.
     const cleanupReportedTasksStartedAt = Date.now();
-    // Reuse one config snapshot across tasks and reload only after a removal changed the tree.
-    // A stale snapshot is conservative here: it can only show more workspaces than exist, so the
-    // structural-leaf gate errs toward skipping. Concurrent removals from patch-generation
-    // onComplete callbacks are re-evaluated on fresh config by those callbacks.
+    // Reuse one config snapshot across tasks to screen out the (usual) ineligible majority without
+    // a config parse each; reload it only after a removal changed the tree. The snapshot never
+    // decides a deletion: canCleanupReportedTask re-evaluates any positive verdict on fresh config,
+    // since clients may have reactivated or re-parented a task since the snapshot.
     let cleanupConfig = config;
     for (const task of completedReportTasks) {
       if (!task.id) continue;
@@ -13199,9 +13191,27 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
+  /**
+   * @param snapshot - optional config snapshot that only screens out ineligible tasks cheaply.
+   *   A positive verdict is always re-evaluated on freshly loaded config, because the snapshot
+   *   can predate a client reactivating or re-parenting the task.
+   */
   private async canCleanupReportedTask(
     workspaceId: string,
-    config: ProjectsConfig = this.config.loadConfigOrDefault()
+    snapshot?: ProjectsConfig
+  ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
+    if (snapshot != null) {
+      const screened = await this.evaluateReportedTaskCleanup(workspaceId, snapshot);
+      if (!screened.ok) {
+        return screened;
+      }
+    }
+    return await this.evaluateReportedTaskCleanup(workspaceId, this.config.loadConfigOrDefault());
+  }
+
+  private async evaluateReportedTaskCleanup(
+    workspaceId: string,
+    config: ProjectsConfig
   ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
     assert(workspaceId.length > 0, "canCleanupReportedTask: workspaceId must be non-empty");
 
@@ -13269,8 +13279,9 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * @param options.config - config snapshot for the first (depth 0) eligibility check only; every
-   *   later depth re-evaluates the parent on fresh config because a removal just changed the tree.
+   * @param options.config - config snapshot used to screen the first (depth 0) eligibility check
+   *   only; a positive verdict is still confirmed on fresh config, and every later depth
+   *   re-evaluates the parent on fresh config because a removal just changed the tree.
    * @returns the number of workspaces removed.
    */
   private async cleanupReportedLeafTask(

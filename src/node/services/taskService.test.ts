@@ -9,7 +9,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import {
@@ -3838,6 +3838,64 @@ describe("TaskService", () => {
     const loadsWithTwoTasks = await countConfigLoadsDuringInitialize(2);
     const loadsWithSixTasks = await countConfigLoadsDuringInitialize(6);
     expect(loadsWithSixTasks).toBe(loadsWithTwoTasks);
+  });
+
+  test("startup cleanup confirms a snapshot-eligible task on fresh config before removing it", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-cleanup-live";
+    const reactivatedTaskId = "child-workflow-reactivated";
+    const staleTaskId = "child-workflow-stale";
+    const workflowTask = (stepId: string) => ({
+      parentWorkspaceId,
+      agentId: "exec",
+      agentType: "exec",
+      taskStatus: "reported" as const,
+      reportedAt: "2026-08-10T00:00:00.000Z",
+      taskModelString: "openai:gpt-5.2",
+      workflowTask: { runId: "wfr_cleanup_live", stepId },
+    });
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "reactivated", reactivatedTaskId, workflowTask("a")),
+        projectWorkspace(projectPath, "stale", staleTaskId, workflowTask("b")),
+      ],
+      testTaskSettings()
+    );
+    const snapshot = config.loadConfigOrDefault();
+    // A client reactivated one child after the startup snapshot was taken.
+    await config.editConfig((cfg) => {
+      const entry = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((workspace) => workspace.id === reactivatedTaskId);
+      if (entry) {
+        entry.taskStatus = "running";
+        entry.reportedAt = undefined;
+      }
+      return cfg;
+    });
+
+    const { workspaceService, remove } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internals = taskService as unknown as {
+      cleanupReportedLeafTask: (
+        workspaceId: string,
+        options?: { config?: ProjectsConfig }
+      ) => Promise<number>;
+    };
+
+    expect(await internals.cleanupReportedLeafTask(reactivatedTaskId, { config: snapshot })).toBe(
+      0
+    );
+    expect(await internals.cleanupReportedLeafTask(staleTaskId, { config: snapshot })).toBe(1);
+    const removedWorkspaceIds = (
+      remove as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(removedWorkspaceIds).toEqual([staleTaskId]);
   });
 
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
@@ -13745,12 +13803,21 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     // A client resumed the owning run while recovery was reading it as interrupted: the resume
-    // holds a workflow admission until the run settles, and recovery must neither interrupt the
-    // child (the resumed run owns it) nor nudge it as an orphaned running task.
-    using _resumeAdmission = acquireWorkflowArchiveAdmission(parentId);
-    await taskService.initialize();
-
+    // holds a run-keyed workflow admission until the run settles, and recovery must neither
+    // interrupt the child (the resumed run owns it) nor nudge it as an orphaned running task.
+    {
+      using _resumeAdmission = acquireWorkflowArchiveAdmission(parentId, workflowRunId);
+      await taskService.initialize();
+    }
     expect(findWorkspaceInConfig(config, runningChildId)?.taskStatus).toBe("running");
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // An unrelated run active in the same workspace must not shield the stale child.
+    {
+      using _otherRunAdmission = acquireWorkflowArchiveAdmission(parentId, "wfr_unrelated_run");
+      await taskService.initialize();
+    }
+    expect(findWorkspaceInConfig(config, runningChildId)?.taskStatus).toBe("interrupted");
     expect(sendMessage).not.toHaveBeenCalled();
   });
 

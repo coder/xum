@@ -17,6 +17,9 @@ import assert from "node:assert/strict";
 let admissionGuard: ((workspaceId: string) => string | null) | null = null;
 
 const inProcessWorkflowWorkByWorkspace = new Map<string, number>();
+// Per-run view of the same admissions, for callers that must not confuse unrelated runs in one
+// workspace (startup recovery of a terminal run's children while another run is active).
+const inProcessWorkflowWorkByRun = new Map<string, number>();
 
 /** Register the archive-side guard. Returns a refusal message or null when admission is allowed. */
 export function setWorkflowArchiveAdmissionGuard(
@@ -25,22 +28,28 @@ export function setWorkflowArchiveAdmissionGuard(
   admissionGuard = guard;
 }
 
-function incrementInProcessWorkflowWork(workspaceId: string): () => void {
-  assert(workspaceId.length > 0, "workflowArchiveAdmission: workspaceId is required");
-  inProcessWorkflowWorkByWorkspace.set(
-    workspaceId,
-    (inProcessWorkflowWorkByWorkspace.get(workspaceId) ?? 0) + 1
-  );
+function incrementCount(counts: Map<string, number>, key: string): () => void {
+  counts.set(key, (counts.get(key) ?? 0) + 1);
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    const remaining = (inProcessWorkflowWorkByWorkspace.get(workspaceId) ?? 1) - 1;
+    const remaining = (counts.get(key) ?? 1) - 1;
     if (remaining <= 0) {
-      inProcessWorkflowWorkByWorkspace.delete(workspaceId);
+      counts.delete(key);
     } else {
-      inProcessWorkflowWorkByWorkspace.set(workspaceId, remaining);
+      counts.set(key, remaining);
     }
+  };
+}
+
+function incrementInProcessWorkflowWork(workspaceId: string, runId?: string): () => void {
+  assert(workspaceId.length > 0, "workflowArchiveAdmission: workspaceId is required");
+  const releaseWorkspace = incrementCount(inProcessWorkflowWorkByWorkspace, workspaceId);
+  const releaseRun = runId != null ? incrementCount(inProcessWorkflowWorkByRun, runId) : null;
+  return () => {
+    releaseWorkspace();
+    releaseRun?.();
   };
 }
 
@@ -50,12 +59,12 @@ function incrementInProcessWorkflowWork(workspaceId: string): () => void {
  * work until disposed. Entry points hold the admission across the whole method so the
  * archive sink observes work that has not yet produced a durably active run record.
  */
-export function acquireWorkflowArchiveAdmission(workspaceId: string): Disposable {
+export function acquireWorkflowArchiveAdmission(workspaceId: string, runId?: string): Disposable {
   const refusal = admissionGuard?.(workspaceId) ?? null;
   if (refusal != null) {
     throw new Error(refusal);
   }
-  const release = incrementInProcessWorkflowWork(workspaceId);
+  const release = incrementInProcessWorkflowWork(workspaceId, runId);
   return { [Symbol.dispose]: release };
 }
 
@@ -65,11 +74,16 @@ export function acquireWorkflowArchiveAdmission(workspaceId: string): Disposable
  * admission is still held), so coverage is continuous from admission entry to terminal
  * settlement even before the runner durably appends its "running" status.
  */
-export function registerInProcessWorkflowRun(workspaceId: string): () => void {
-  return incrementInProcessWorkflowWork(workspaceId);
+export function registerInProcessWorkflowRun(workspaceId: string, runId?: string): () => void {
+  return incrementInProcessWorkflowWork(workspaceId, runId);
 }
 
 /** Whether any workflow admission or in-process runner exists for this workspace. */
 export function hasInProcessWorkflowWork(workspaceId: string): boolean {
   return (inProcessWorkflowWorkByWorkspace.get(workspaceId) ?? 0) > 0;
+}
+
+/** Whether an admission (resume/retry) or in-process runner exists for this specific run. */
+export function hasInProcessWorkflowRun(runId: string): boolean {
+  return (inProcessWorkflowWorkByRun.get(runId) ?? 0) > 0;
 }
