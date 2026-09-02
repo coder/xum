@@ -95,10 +95,16 @@ export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMod
 
 /** Cancellation handoff for a claimed tool-end queue cut. */
 export interface ToolEndQueueClaim {
-  /** Move the claimed entry to the dispatch head and finalize the claim. */
+  /** Signal used to stop this exact entry during dispatch admission. */
+  readonly admissionSignal: AbortSignal;
+  /** Move the claimed entry to the dispatch head. */
   commit(): boolean;
   /** Restore the entry's cancellation when the requested queue cut does not occur. */
   restoreCancellation(): void;
+  /** Stop the claimed entry during queue or preparing admission. */
+  cancelAdmission(reason: string): void;
+  /** Release claim ownership after the entry crosses admission. */
+  release(): void;
 }
 
 /**
@@ -283,9 +289,9 @@ export class MessageQueue {
   /**
    * Claim the next live entry as the continuation for a tool-end queue cut.
    *
-   * Once this claim stops the current model step, a later cancellation must not
-   * retract the continuation and leave the session idle. Skip canceled entries,
-   * then detach cancellation synchronously before returning the claim.
+   * Once this claim stops the current model step, the original cancellation must not
+   * retract the continuation. A separate admission signal lets a later user Stop
+   * cancel the exact claimed entry through its PREPARING gates.
    */
   claimNextToolEndEntry(): ToolEndQueueClaim | undefined {
     const entry = this.getNextLiveEntry();
@@ -294,14 +300,17 @@ export class MessageQueue {
     }
 
     const cancelSignal = entry.cancelSignal;
-    entry.cancelSignal = undefined;
+    const admissionController = new AbortController();
+    entry.cancelSignal = admissionController.signal;
     let settled = false;
+    let committed = false;
     return {
+      admissionSignal: admissionController.signal,
       commit: () => {
-        if (settled) {
+        if (settled || committed) {
           return false;
         }
-        settled = true;
+        committed = true;
         const index = this.entries.indexOf(entry);
         if (index === -1) {
           return false;
@@ -318,6 +327,16 @@ export class MessageQueue {
         }
         settled = true;
         entry.cancelSignal = cancelSignal;
+      },
+      cancelAdmission: (reason) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        admissionController.abort(reason);
+      },
+      release: () => {
+        settled = true;
       },
     };
   }

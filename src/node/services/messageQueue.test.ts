@@ -608,10 +608,11 @@ describe("MessageQueue", () => {
         { cancelSignal: controller.signal }
       );
 
-      expect(queue.claimNextToolEndEntry()).toBeDefined();
+      const claim = queue.claimNextToolEndEntry();
       controller.abort("task output consumed the wake");
 
-      expect(queue.dequeueNext().internal?.cancelSignal).toBeUndefined();
+      expect(claim).toBeDefined();
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(claim?.admissionSignal);
     });
 
     it("restores cancellation when a claimed tool-end queue cut fails", () => {
@@ -627,6 +628,23 @@ describe("MessageQueue", () => {
       claim?.restoreCancellation();
 
       expect(queue.dequeueNext().internal?.cancelSignal).toBe(controller.signal);
+    });
+
+    it("cancels the claimed entry through its admission signal after commit", () => {
+      queue.add("Monitor wake", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+
+      const claim = queue.claimNextToolEndEntry();
+      expect(claim?.commit()).toBe(true);
+      const cancelSignal = queue.dequeueNext().internal?.cancelSignal;
+
+      claim?.cancelAdmission("user stopped the queue dispatch");
+
+      expect(cancelSignal?.aborted).toBe(true);
+      expect(cancelSignal?.reason).toBe("user stopped the queue dispatch");
     });
 
     it("does not claim a tool-end entry that cancellation already retracted", () => {
@@ -689,9 +707,9 @@ describe("MessageQueue", () => {
       expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
       expect(queue.isNextEntryBashMonitorWake()).toBe(false);
       expect(queue.getNextQueueCutCandidate()?.muxMetadata).toBeUndefined();
-      expect(queue.claimNextToolEndEntry()).toBeDefined();
+      const claim = queue.claimNextToolEndEntry();
       expect(queue.dequeueNext().internal?.cancelSignal).toBe(canceledController.signal);
-      expect(queue.dequeueNext().internal?.cancelSignal).toBeUndefined();
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(claim?.admissionSignal);
     });
 
     it("finds a live workspace-turn continuation after a canceled predecessor", () => {
