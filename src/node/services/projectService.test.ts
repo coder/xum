@@ -2886,6 +2886,54 @@ exit 1
       expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
     });
 
+    it("covers an edit that leaves the project set alone against another process's write", async () => {
+      // Every edit persists the whole config from the bytes it read, so a registration made
+      // by another process between this edit's read and its write would be dropped unless
+      // the edit, too, runs under the cross-process lock.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let saved = false;
+      const saving = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          saved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(saved).toBe(false);
+
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/registered-meanwhile", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await saving;
+
+      const after = config.loadConfigOrDefault();
+      expect(after.llmDebugLogs).toBe(true);
+      expect(after.projects.has("/fake/registered-meanwhile")).toBe(true);
+    });
+
+    it("returns an Err when the registration lock cannot be taken", async () => {
+      const target = path.join(tempDir, "locked-out");
+      await fs.mkdir(target);
+      // The lock directory is a file, so the cross-process leg cannot be created.
+      await fs.mkdir(path.dirname(projectRegistrationLockFilePath(tempDir)), { recursive: true });
+      await fs.rm(path.dirname(projectRegistrationLockFilePath(tempDir)), { recursive: true });
+      await fs.writeFile(path.dirname(projectRegistrationLockFilePath(tempDir)), "file", "utf-8");
+
+      const result = await service.create(target);
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("Failed to create project");
+    });
+
     it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/api";

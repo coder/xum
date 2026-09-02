@@ -13,14 +13,14 @@ import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concu
  * Two legs. The in-process mutex serializes this process's own windows and edits and has a
  * synchronous free path — `Config.editConfig` relies on that so an edit taken under it keeps
  * its place in the config edit queue relative to edits issued around it. The cross-process
- * file lock excludes other processes' registration writers: config.json is edited by the
- * desktop or server process, but also by standalone CLIs (`mux trust` creates a project entry
- * when the project was never added), each through its own `Config`. Every registration change
- * reaches config.json through `Config.editConfig`, which takes both legs itself whenever a
- * transform adds or removes a project key — so no writer has to know about them, whichever
- * process or service the write comes from. Restore and import windows hold both legs; edits
- * issued inside such a window pass `withinRegistrationLock` and take neither, since neither
- * leg is reentrant.
+ * file lock excludes other processes: config.json is edited by the desktop or server process,
+ * but also by standalone CLIs (`mux trust` creates a project entry when the project was never
+ * added), each through its own `Config`, and every edit persists the whole file from the bytes
+ * it read — so an edit that never touched the project set would still drop a registration
+ * another process made in between. `Config.editConfig` therefore takes both legs itself for
+ * every edit's read and write, whichever process or service the write comes from. Restore and
+ * import windows hold both legs; edits issued inside such a window pass
+ * `withinRegistrationLock` and take neither, since neither leg is reentrant.
  *
  * Registration takes no memory lock and the restore takes this before the memory lock, so
  * the order is fixed.

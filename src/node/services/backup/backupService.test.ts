@@ -1247,6 +1247,7 @@ describe("BackupService project imports", () => {
           status: "imported",
           writtenFiles: ["memory/project/good-abc/notes.md"],
           skippedFiles: [],
+          registered: true,
         },
         {
           sourcePath: "/src/bad",
@@ -1256,6 +1257,7 @@ describe("BackupService project imports", () => {
           message: "registration failed",
           writtenFiles: [],
           skippedFiles: [],
+          registered: false,
         },
       ]);
     }

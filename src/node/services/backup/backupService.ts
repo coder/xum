@@ -900,6 +900,7 @@ export class BackupService {
         message: "Project registration is unavailable",
         writtenFiles: [],
         skippedFiles: [],
+        registered: false,
       }));
     }
     // One registration window for the imports: registration is re-read inside it — so a
@@ -925,8 +926,11 @@ export class BackupService {
         // the next preview resolves the new registration and preflights it.
         const preflightedPath = plannedRegisteredPath ?? targetPath;
         // Once registration resolves the project identity, failures report that path: it is
-        // where any partially written memory actually lives.
+        // where any partially written memory actually lives. Whether this import registered
+        // it is reported either way: a registration is the one effect the snapshot cannot
+        // undo, so the result must say when there is one to remove.
         let registeredPath: string | null = null;
+        let registered = false;
         const failed = (
           message: string,
           progress: { written: string[]; skipped: string[] } = { written: [], skipped: [] }
@@ -938,6 +942,7 @@ export class BackupService {
           message,
           writtenFiles: progress.written,
           skippedFiles: progress.skipped,
+          registered,
         });
         const unchecked = (registered: string): BackupProjectImportResult =>
           failed(
@@ -1008,6 +1013,7 @@ export class BackupService {
               : Err("Project already exists");
           if (created.success) {
             registeredPath = created.data.normalizedPath;
+            registered = true;
           } else if (created.error === "Project already exists") {
             // Resolved above, or registered by an earlier candidate of this very loop (the
             // lock excludes everyone else): the lookup built inside the window predates that.
@@ -1054,6 +1060,7 @@ export class BackupService {
             status: "imported",
             writtenFiles: written.writtenFiles,
             skippedFiles: written.skippedFiles,
+            registered,
           });
         } catch (error) {
           // A write that failed midway already created files; the result must list them or

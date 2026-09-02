@@ -2220,19 +2220,21 @@ export class Config {
   }
 
   /**
-   * The registration gate for an edit issued outside any registration window; shared by
+   * The cross-process gate for an edit issued outside any registration window; shared by
    * editConfig and the load-time migration persist (which must not call the public, commonly
-   * spied editConfig).
+   * spied editConfig). Every edit persists the whole config, project map included, from the
+   * bytes its transform read, so every edit's read and write have to happen under the
+   * cross-process lock or a registration another process makes in between is silently
+   * dropped by this process's save — even by an edit that never touched the project set.
    */
   private async enqueueGatedConfigEdit(
     fn: (config: ProjectsConfig) => ProjectsConfig
   ): Promise<void> {
-    // Mutex free: taken now, around this one edit, whether or not it turns out to change the
-    // project set. Its free path runs synchronously, so the edit keeps its place in the
-    // queue relative to edits issued around it. The cross-process leg is tried inside the
-    // queue slot once the transform has shown it changes the project set; only when another
-    // process holds it does the edit step out of the queue to wait, so no other edit is
-    // held up behind a wait on another process.
+    // Mutex free: taken now, around this one edit. Its free path runs synchronously, so the
+    // edit keeps its place in the queue relative to edits issued around it. The cross-process
+    // leg is tried inside the queue slot; only when another process holds it does the edit
+    // step out of the queue to wait, so no other edit is held up behind a wait on another
+    // process.
     if (!isProjectRegistrationMutexHeld(this.rootDir)) {
       return withProjectRegistrationMutex(this.rootDir, async () => {
         try {
@@ -2245,11 +2247,13 @@ export class Config {
         }
       });
     }
-    // Mutex held (a restore or an import window is running in this process): edits that
-    // leave the project set alone go ahead; one that would change it is refused by the queue
-    // before writing and re-run under the full lock once the window ends. Its first run was
-    // discarded — nothing it mutated survives, since loadConfigOrDefault parses fresh bytes
-    // on every call — and it waits outside the queue, so no other edit is held up behind it.
+    // Mutex held (a restore or an import window is running in this process, and with it the
+    // cross-process lock, so other processes are excluded already): edits that leave the
+    // project set alone go ahead under that hold; one that would change it is refused by the
+    // queue before writing and re-run under the full lock once the window ends. Its first run
+    // was discarded — nothing it mutated survives, since loadConfigOrDefault parses fresh
+    // bytes on every call — and it waits outside the queue, so no other edit is held up
+    // behind it.
     try {
       return await this.enqueueConfigEdit(fn, { kind: "none" });
     } catch (error) {
@@ -2615,7 +2619,10 @@ export class Config {
         catch: (error) => error,
       });
       // A project-set change commits under the registration lock: immediately before the
-      // write, confirm this process still holds it (see ProjectRegistrationLockHandle).
+      // write, confirm this process still holds it (see ProjectRegistrationLockHandle). Other
+      // edits under the lock are covered against concurrent writers by holding it; a lost
+      // hold would cost them at most the same overwrite the lock exists to prevent for
+      // registrations, and re-verifying every edit is not worth a lockfile read each.
       if (lock !== null) {
         yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
       }
@@ -2641,29 +2648,34 @@ export class Config {
             },
             catch: (error) => error,
           });
-          if (!first.changesProjects) {
-            return yield* write(first.newConfig, null);
-          }
           if (registrationLock.kind === "held") {
-            return yield* write(first.newConfig, registrationLock.lock);
+            return yield* write(
+              first.newConfig,
+              first.changesProjects ? registrationLock.lock : null
+            );
           }
-          // The project set changes. Before the write, so the permit is released and
-          // editConfig retries this edit under the full lock; see editConfig.
           if (registrationLock.kind === "none") {
-            return yield* Effect.fail(new ProjectRegistrationLockRequired());
+            // Issued while a window runs in this process: the window's hold covers this edit
+            // against other processes. Changing the project set under it is not allowed, so
+            // that edit fails the slot before writing and editConfig re-runs it under the
+            // full lock once the window ends; see editConfig.
+            if (first.changesProjects) {
+              return yield* Effect.fail(new ProjectRegistrationLockRequired());
+            }
+            return yield* write(first.newConfig, null);
           }
           // The in-process mutex is held; the cross-process leg is tried here, inside the
           // queue slot so the edit keeps its order. Held by another process, the edit fails
           // the slot and editConfig waits for the lock outside the queue. Under the lock the
           // transform runs again on the bytes as they are: another process may have written
           // config.json between the first run and the acquisition, and a snapshot from before
-          // it would clobber whatever that process registered.
+          // it would clobber whatever that process wrote.
           yield* Effect.tryPromise({
             try: async () => {
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null) throw new ProjectRegistrationLockContended();
               const fresh = transform();
-              await Effect.runPromise(write(fresh.newConfig, lock));
+              await Effect.runPromise(write(fresh.newConfig, fresh.changesProjects ? lock : null));
             },
             catch: (error) => error,
           });

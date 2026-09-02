@@ -440,9 +440,15 @@ export class ProjectService {
     // Config.editConfig would take the registration lock for the registering write anyway;
     // taken here, around the whole operation, so withRegistrationLock can hand out a create
     // that registers inside a window the caller already holds.
-    return withProjectRegistrationLock(this.config.rootDir, (lock) =>
-      this.createUnlocked(projectPath, options, lock)
-    );
+    // The lock itself can fail (a wait on another process timing out, an unwritable locks
+    // directory): converted like every other failure, so create() keeps its Result contract.
+    try {
+      return await withProjectRegistrationLock(this.config.rootDir, (lock) =>
+        this.createUnlocked(projectPath, options, lock)
+      );
+    } catch (error) {
+      return Err(`Failed to create project: ${getErrorMessage(error)}`);
+    }
   }
 
   /**

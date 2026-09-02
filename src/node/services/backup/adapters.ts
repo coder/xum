@@ -280,45 +280,68 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   }
 
   /**
-   * Every user project becomes an entry, including zero-memory ones: the project list is
-   * half the feature. `memoryDir` records this install's actual directory name, which is
-   * also what restore-side matching recomputes.
+   * Remote hints for the registered user projects, discovered outside any lock: each probe
+   * has its own timeout, so sequential discovery over many projects on slow filesystems
+   * could stall a preview or push for minutes; bounded parallelism plus one deadline for the
+   * whole pass caps the wait regardless of the project count. Projects probed after the
+   * deadline simply record no remote.
    */
-  async function listProjectBundleEntries(): Promise<BackupProjectBundleEntry[]> {
+  async function discoverProjectRemotes(): Promise<Map<string, string | undefined>> {
     const projects = userProjects();
     // Before any lookup: an over-limit config would otherwise run every remote probe
     // only to be refused by the bundle collector afterwards.
     if (projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
       throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
     }
-    // Each probe has its own timeout, so sequential discovery over many projects on slow
-    // filesystems could stall a preview or push for minutes; bounded parallelism plus one
-    // deadline for the whole pass caps the wait regardless of the project count. Projects
-    // probed after the deadline simply record no remote.
     const probes = new AsyncSemaphore(REMOTE_DISCOVERY_CONCURRENCY);
     const deadline = Date.now() + REMOTE_DISCOVERY_DEADLINE_MS;
-    return await Promise.all(
-      projects.map(async ([projectPath, projectConfig]) => {
+    const remotes = new Map<string, string | undefined>();
+    await Promise.all(
+      projects.map(async ([projectPath]) => {
         const slot = await probes.acquire();
-        let gitRemote: string | undefined;
         try {
-          gitRemote = await readProjectGitRemote(
+          remotes.set(
             projectPath,
-            Math.min(REMOTE_PROBE_TIMEOUT_MS, deadline - Date.now())
+            await readProjectGitRemote(
+              projectPath,
+              Math.min(REMOTE_PROBE_TIMEOUT_MS, deadline - Date.now())
+            )
           );
         } finally {
           slot.release();
         }
-        return {
-          path: projectPath,
-          // Clamped to the manifest schema's cap so a long custom title cannot produce a
-          // bundle this build's own restore would refuse.
-          name: getProjectDisplayName(projectPath, projectConfig).slice(0, 256),
-          ...(gitRemote !== undefined ? { gitRemote } : {}),
-          memoryDir: projectMemoryDirName(projectPath),
-        };
       })
     );
+    return remotes;
+  }
+
+  /**
+   * Every user project becomes an entry, including zero-memory ones: the project list is
+   * half the feature. `memoryDir` records this install's actual directory name, which is
+   * also what restore-side matching recomputes. Listed from the registry as it is now —
+   * the caller holds the registration lock — so the bundle names exactly the projects
+   * registered when it is written, not the ones registered when the (long) remote
+   * discovery began; a project added since carries no remote hint, one removed since is
+   * gone along with its memory.
+   */
+  function listProjectBundleEntries(
+    remotes: ReadonlyMap<string, string | undefined>
+  ): BackupProjectBundleEntry[] {
+    const projects = userProjects();
+    if (projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
+      throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
+    }
+    return projects.map(([projectPath, projectConfig]) => {
+      const gitRemote = remotes.get(projectPath);
+      return {
+        path: projectPath,
+        // Clamped to the manifest schema's cap so a long custom title cannot produce a
+        // bundle this build's own restore would refuse.
+        name: getProjectDisplayName(projectPath, projectConfig).slice(0, 256),
+        ...(gitRemote !== undefined ? { gitRemote } : {}),
+        memoryDir: projectMemoryDirName(projectPath),
+      };
+    });
   }
 
   function registeredProjectDirs(): Map<string, string> {
@@ -400,20 +423,28 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // fresh after the core payload.
       let scanFiles = payload.files;
       if (exportOptions.includeProjects) {
-        const entries = await listProjectBundleEntries();
-        // Collected under the memory lock so an agent writing memory mid-export cannot
+        const remotes = await discoverProjectRemotes();
+        // The project list is read, the memory collected, and the bundle written under the
+        // registration lock (taken before the memory lock, the fixed order), so a project
+        // registered or removed during the seconds of remote discovery above is reflected
+        // and none can change between the listing and the bundle that publishes it. Memory
+        // is collected under the memory lock so an agent writing memory mid-export cannot
         // produce a torn bundle or trip the collector's identity checks.
-        const bundle = await withMemoryLock(() =>
-          collectProjectBundle(
-            muxRoot,
-            entries,
-            // Restore refuses files past the memory subsystem's read limit, so exporting
-            // them would only produce a backup no build can bring back.
-            { portableMemoryOnly: true }
-          )
-        );
-        await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), bundle, {
-          ownerOnly: true,
+        const bundle = await withProjectRegistrationLock(muxRoot, async () => {
+          const entries = listProjectBundleEntries(remotes);
+          const collected = await withMemoryLock(() =>
+            collectProjectBundle(
+              muxRoot,
+              entries,
+              // Restore refuses files past the memory subsystem's read limit, so exporting
+              // them would only produce a backup no build can bring back.
+              { portableMemoryOnly: true }
+            )
+          );
+          await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), collected, {
+            ownerOnly: true,
+          });
+          return collected;
         });
         // Core and bundle were budgeted separately; the next checkout will bound them as
         // one tree, so refuse here what it would refuse there.

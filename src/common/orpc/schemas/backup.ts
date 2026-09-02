@@ -41,6 +41,12 @@ export const BackupProjectImportResultSchema = z.object({
   writtenFiles: z.array(z.string()),
   /** Existing target files with different content: kept, reported, never overwritten. */
   skippedFiles: z.array(z.string()),
+  /**
+   * True when this import registered the target as a new project. The safety snapshot does
+   * not cover registrations, so undoing the import means unregistering it — but only then:
+   * an import into an already registered project must not tell the user to remove it.
+   */
+  registered: z.boolean(),
 });
 
 export const BackupOperationErrorSchema = z.object({

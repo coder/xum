@@ -104,6 +104,21 @@ function getCredentialLabel(credential: BackupValidation["credential"]): string 
  * Preferences restore through config rather than a file, so a run that only changed
  * preferences reports zero files. Saying "no files changed" avoids reading as a no-op.
  */
+/**
+ * An import that skipped conflicting files is not a success: no origin was recorded for it and
+ * the candidate is offered again, so the same screen must not call it imported in green while
+ * asking for another approval.
+ */
+function importResultLabel(result: BackupProjectImportResult): string {
+  if (result.status === "failed") return "Failed";
+  return result.skippedFiles.length > 0 ? "Partially imported" : "Imported";
+}
+
+function importResultTone(result: BackupProjectImportResult): string {
+  if (result.status === "failed") return "text-error";
+  return result.skippedFiles.length > 0 ? "text-warning" : "text-success";
+}
+
 function describeRestoredFiles(count: number): string {
   if (count === 0) return "settings; no files changed";
   return `${count} file${count === 1 ? "" : "s"}`;
@@ -1017,11 +1032,8 @@ export function BackupSection() {
                 key={`${importResult.sourcePath}:${importResult.targetPath}`}
                 className="min-w-0 text-xs"
               >
-                <span
-                  className={`${importResult.status === "imported" ? "text-success" : "text-error"} block break-all`}
-                >
-                  {importResult.status === "imported" ? "Imported" : "Failed"}: {importResult.name}{" "}
-                  → {importResult.targetPath}
+                <span className={`${importResultTone(importResult)} block break-all`}>
+                  {importResultLabel(importResult)}: {importResult.name} → {importResult.targetPath}
                 </span>
                 {importResult.message != null ? (
                   <span className="text-muted block break-all">{importResult.message}</span>
@@ -1031,6 +1043,9 @@ export function BackupSection() {
                     Added {importResult.writtenFiles.length} memory{" "}
                     {importResult.writtenFiles.length === 1 ? "file" : "files"}
                   </span>
+                ) : null}
+                {importResult.registered ? (
+                  <span className="text-muted block break-all">Newly registered project</span>
                 ) : null}
                 {importResult.skippedFiles.length > 0 ? (
                   <span className="text-warning block break-all">
@@ -1042,8 +1057,12 @@ export function BackupSection() {
             ))}
           </ul>
           <p className="text-muted text-xs">
-            Project registrations are not covered by the safety snapshot; remove imported projects
-            manually to undo them.
+            The safety snapshot does not cover imported memory files or project registrations. To
+            undo an import, delete the added files
+            {projectImportResults.some((importResult) => importResult.registered)
+              ? " and remove the projects marked as newly registered"
+              : ""}
+            .
           </p>
         </div>
       ) : null}

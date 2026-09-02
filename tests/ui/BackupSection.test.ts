@@ -667,6 +667,7 @@ describe("BackupSection", () => {
             status: "imported",
             writtenFiles: ["memory/project/rocket-abc/notes.md"],
             skippedFiles: [],
+            registered: true,
           },
         ],
         projectBundleSkipped: false,
@@ -697,6 +698,67 @@ describe("BackupSection", () => {
     );
     await canvas.findByText("Project import results");
     expect(canvas.getByText(/Imported: rocket/)).toBeTruthy();
+  });
+
+  test("reports a conflicted import as partial and keeps its candidate on offer", async () => {
+    const candidate = {
+      sourcePath: "/home/dev/src/rocket",
+      name: "rocket",
+      memoryFileCount: 2,
+      token: "rocket-token",
+    };
+    const { view } = renderBackupSection({
+      backupPreview: {
+        pushChanges: [],
+        restoreChanges: [],
+        localOnlyFiles: [],
+        redactions: [],
+        commandApprovals: [],
+        projectImports: [candidate],
+        projectBundleSkipped: false,
+        pushError: null,
+      },
+      backupRestore: {
+        commit: "def5678",
+        snapshotPath: "/tmp/mux-backup-snapshot",
+        changedFiles: [],
+        localOnlyFiles: [],
+        projectImportResults: [
+          {
+            sourcePath: candidate.sourcePath,
+            targetPath: "/home/other/rocket",
+            name: candidate.name,
+            status: "imported",
+            writtenFiles: ["memory/project/rocket-abc/notes.md"],
+            skippedFiles: ["memory/project/rocket-abc/conflict.md"],
+            // Imported into a project that already existed: nothing to unregister.
+            registered: false,
+          },
+        ],
+        projectBundleSkipped: false,
+        // The backend re-offers a conflicted import; the UI must not call it done.
+        unapprovedProjectImports: [candidate],
+      },
+    });
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText("Projects to reimport");
+    fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+      target: { value: "/home/other/rocket" },
+    });
+    await confirmRestore(canvas);
+
+    await canvas.findByText("Project import results");
+    expect(canvas.getByText(/Partially imported: rocket/)).toBeTruthy();
+    expect(canvas.queryByText(/^Imported: rocket/)).toBeNull();
+    // The undo guidance names only what this run created: files, not a registration.
+    expect(canvas.queryByText(/Newly registered project/)).toBeNull();
+    expect(canvas.queryByText(/remove the projects marked as newly registered/)).toBeNull();
+    // Still offered for a retry after the conflicts are resolved.
+    expect(canvas.getByRole("checkbox", { name: "Import project rocket" })).toBeTruthy();
   });
 
   test("re-presents fresh candidates when import approval goes stale", async () => {
