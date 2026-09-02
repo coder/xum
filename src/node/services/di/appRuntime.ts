@@ -105,9 +105,12 @@
  *    re-closes `AppFiberScope` idempotently as a backstop.
  * Both bounded teardowns share `boundedTeardown` below: `Effect.uninterruptible`
  * shell, detached close fiber, `Effect.interruptible` join + `Effect.timeout`,
- * defects folded into `log.warn`, never rejects. Budget: 2 s + 2 s inside the
- * callers' 5 s outer bounds (`desktop/main.ts` race, `cli/server.ts` force
- * exit). The CLI roots (`xum run`/`xum workflow`) mirror steps 1, 2 and 4 in
+ * defects folded into `log.warn`, never rejects. Budget: the two bounds
+ * (`APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS` + `APP_RUNTIME_DISPOSE_TIMEOUT_MS`,
+ * `src/constants/terminationTimeouts.ts`) must add up to less than the callers'
+ * outer quit budgets (`desktop/main.ts` before-quit race, `cli/server.ts`
+ * force-exit timer), which stay the last line of defense. The CLI roots
+ * (`xum run`/`xum workflow`) mirror steps 1, 2 and 4 in
  * their best-effort cleanup lists (`cli/runCleanup.ts`). `shutdown()` never
  * touches the runtime or `AppFiberScope`. Crash paths (`uncaughtException`,
  * SIGKILL) run no finalizers; durable state must stay crash-safe without them.
