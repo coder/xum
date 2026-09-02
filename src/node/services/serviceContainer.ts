@@ -4,7 +4,7 @@ import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchi
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
-import { createCoreServices, type CoreServices } from "@/node/services/coreServices";
+import type { CoreServices } from "@/node/services/coreServices";
 import { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import { ProjectService } from "@/node/services/projectService";
@@ -24,7 +24,7 @@ import { InstructionsService } from "@/node/services/instructionsService";
 import { ServerService } from "@/node/services/serverService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { VoiceService } from "@/node/services/voiceService";
-import { TelemetryService } from "@/node/services/telemetryService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import type {
   ErrorEvent,
   ReasoningDeltaEvent,
@@ -41,15 +41,15 @@ import { AgentBrowserSessionDiscoveryService } from "@/node/services/browser/Age
 import { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserBridgeTokenManager";
 import { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
-import { DevToolsService } from "@/node/services/devToolsService";
-import { SessionTimingService } from "@/node/services/sessionTimingService";
+import type { DevToolsService } from "@/node/services/devToolsService";
+import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import { TimelineService } from "@/node/services/timelineService";
-import {
+import type {
   AnalyticsService,
-  type IngestWorkspaceMeta,
+  IngestWorkspaceMeta,
 } from "@/node/services/analytics/analyticsService";
-import { ExperimentsService } from "@/node/services/experimentsService";
-import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { McpOauthService } from "@/node/services/mcpOauthService";
@@ -75,7 +75,7 @@ import {
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
-import { PolicyService } from "@/node/services/policyService";
+import type { PolicyService } from "@/node/services/policyService";
 import { ServerAuthService } from "@/node/services/serverAuthService";
 import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -91,17 +91,28 @@ import {
 } from "@/node/services/di/appRuntime";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { AppLive } from "@/node/services/di/layers/app";
-import { MemoryMeta, type AppTags } from "@/node/services/di/tags";
+import { coreServicesFromContext } from "@/node/services/di/layers/core";
+import {
+  Analytics,
+  DevTools,
+  Experiments,
+  Policy,
+  SessionTiming,
+  Telemetry,
+  WorkspaceMcpOverrides,
+  type AppTags,
+} from "@/node/services/di/tags";
 /**
  * ServiceContainer - Central dependency container for all backend services.
  *
  * This class instantiates and wires together all services needed by the ORPC router.
  * Services are accessed via the ORPC context object.
  *
- * Services provided by the Effect Layer graph (`di/layers/app.ts`) are built
- * first by `runtime` and handed to the constructor-wired remainder; the
- * migration moves services into the graph incrementally (see the DI contract in
- * `di/appRuntime.ts`).
+ * Services provided by the Effect Layer graph (`di/layers/app.ts`: the stores,
+ * the runtime seams, the cross-cutting services and the whole core graph) are
+ * built first by `runtime` and handed to the constructor-wired desktop
+ * remainder; the migration moves services into the graph incrementally (see
+ * the DI contract in `di/appRuntime.ts`).
  */
 export class ServiceContainer {
   public readonly runtime: AppRuntime<AppTags>;
@@ -116,7 +127,8 @@ export class ServiceContainer {
   public readonly providersConfigStore: ProvidersConfigStore;
   public readonly secretsStore: SecretsStore;
   public readonly fileLeaseManager: FileLeaseManager;
-  // Core services — instantiated by createCoreServices (shared with `xum run` CLI)
+  // Core services — built by the shared core graph layer (`di/layers/core.ts`;
+  // the same definitions back the `xum run`/`xum workflow` roots)
   private readonly historyService: CoreServices["historyService"];
   public readonly aiService: CoreServices["aiService"];
   public readonly streamManager: CoreServices["streamManager"];
@@ -204,41 +216,26 @@ export class ServiceContainer {
     this.secretsStore = stores.secretsStore;
     this.fileLeaseManager = stores.fileLeaseManager;
 
-    // Cross-cutting services: created first so they can be passed to core
-    // services via constructor params (no setter injection needed).
-    this.policyService = new PolicyService(config);
-    this.telemetryService = new TelemetryService(config.rootDir);
-    this.experimentsService = new ExperimentsService({
-      telemetryService: this.telemetryService,
-      xumHome: config.rootDir,
-    });
+    // Cross-cutting services: layer-built (`CrossCuttingLive`) ahead of the
+    // core graph, whose options derive from them (`CoreOptionsFromDesktopLive`).
+    this.policyService = this.runtime.get(Policy);
+    this.telemetryService = this.runtime.get(Telemetry);
+    this.experimentsService = this.runtime.get(Experiments);
     this.backupService = new BackupService(config, {
       gitRepo: createBackupGitRepo({
         cacheRoot: path.join(config.rootDir, "backup-cache"),
       }),
       payload: createBackupPayloadStore({ config }),
     });
-    this.sessionTimingService = new SessionTimingService(config, this.telemetryService);
-    this.analyticsService = new AnalyticsService(config);
-    this.devToolsService = new DevToolsService(config);
+    this.sessionTimingService = this.runtime.get(SessionTiming);
+    this.analyticsService = this.runtime.get(Analytics);
+    this.devToolsService = this.runtime.get(DevTools);
     this.browserBridgeTokenManager = new BrowserBridgeTokenManager();
+    this.workspaceMcpOverridesService = this.runtime.get(WorkspaceMcpOverrides);
 
-    // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
-    // the persistent config rather than creating a default with an ephemeral one.
-    this.workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
-
-    const core = createCoreServices({
-      ...stores,
-      extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
-      workspaceMcpOverridesService: this.workspaceMcpOverridesService,
-      memoryMetaService: this.runtime.get(MemoryMeta),
-      policyService: this.policyService,
-      telemetryService: this.telemetryService,
-      analyticsService: this.analyticsService,
-      experimentsService: this.experimentsService,
-      sessionTimingService: this.sessionTimingService,
-      devToolsService: this.devToolsService,
-    });
+    // The core graph (shared with the `xum run`/`xum workflow` roots) is built by
+    // `CoreProjectionLive`; read it back as the plain object the wiring below uses.
+    const core = coreServicesFromContext(this.runtime.context);
 
     // Spread core services into class fields
     this.historyService = core.historyService;
@@ -328,7 +325,7 @@ export class ServiceContainer {
     this.workspaceService.setIdleCompactionOutcomeListener((workspaceId, outcome) =>
       this.idleCompactionService.recordOutcome(workspaceId, outcome)
     );
-    // IdleDispatcher + goal continuation bridge are owned by createCoreServices
+    // IdleDispatcher + goal continuation bridge are owned by the core graph
     // so the wiring works for `xum run` too. Share the same dispatcher with
     // HeartbeatService — its priority ordering ensures an active goal
     // suppresses background heartbeats.
@@ -421,7 +418,7 @@ export class ServiceContainer {
     // Wire terminal service to workspace service for cleanup on removal
     this.workspaceService.setTerminalService(this.terminalService);
     this.workspaceService.setDesktopSessionManager(this.desktopSessionManager);
-    // Plugin-override pruning is wired inside createCoreServices (shared with
+    // Plugin-override pruning is wired inside the core graph (shared with
     // headless CLI registration), using this.workspaceMcpOverridesService.
     // Editor service for opening workspaces in code editors
     this.editorService = new EditorService(config, this.workspaceService);

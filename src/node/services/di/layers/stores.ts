@@ -1,5 +1,12 @@
 import { Layer } from "effect";
-import type { ConfigStores } from "@/node/config";
+import {
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+  type ConfigStores,
+} from "@/node/config";
+import type { CoreServicesOptions } from "@/node/services/coreServices";
 import {
   ConfigTag,
   FileLeaseManagerTag,
@@ -23,4 +30,22 @@ export function StoresLive(stores: ConfigStores): Layer.Layer<StoreTags> {
     Layer.succeed(SecretsStoreTag)(stores.secretsStore),
     Layer.succeed(FileLeaseManagerTag)(stores.fileLeaseManager)
   );
+}
+
+/**
+ * Stores for a headless CLI root (`createCoreServices`): the caller's stores
+ * when given, otherwise the same per-store defaults rooted at
+ * `config.rootDir` that the core graph body applied before the stores became
+ * layer inputs. Store constructors only compute paths, so building them ahead
+ * of the graph changes nothing observable.
+ */
+export function StoresFromCoreOptionsLive(opts: CoreServicesOptions): Layer.Layer<StoreTags> {
+  const { config } = opts;
+  return StoresLive({
+    config,
+    sessionLocator: opts.sessionLocator ?? new WorkspaceSessionLocator(config.rootDir),
+    providersConfigStore: opts.providersConfigStore ?? new ProvidersConfigStore(config.rootDir),
+    secretsStore: opts.secretsStore ?? new SecretsStore(config.rootDir),
+    fileLeaseManager: opts.fileLeaseManager ?? new FileLeaseManager(config.rootDir),
+  });
 }

@@ -78,6 +78,40 @@ describe("xum workflow CLI helpers", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  // The CLI root owns an Effect runtime (createCoreServices). Its cleanup must
+  // close the supervised fiber scope before the session-level disposers and
+  // release the runtime after the background processes are terminated, mirroring
+  // ServiceContainer.dispose(); the debug shutdown lines pin that order.
+  test("CLI run closes the AppFiberScope first and disposes the AppRuntime last", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-runtime");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(repo, "workflows", "echo.js"),
+      `export default function workflow() { return { reportMarkdown: "ok" }; }
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+
+    const result =
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo.js --dir ${repo}`
+        .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
+        .nothrow()
+        .quiet();
+
+    expect(result.exitCode).toBe(0);
+    const output = result.stdout.toString() + result.stderr.toString();
+    const scopeClosedAt = output.indexOf("[shutdown] AppFiberScope closed");
+    const terminateAllAt = output.indexOf("BackgroundProcessManager.terminateAll() called");
+    const runtimeDisposedAt = output.indexOf("[shutdown] AppRuntime disposed");
+    expect(scopeClosedAt).toBeGreaterThan(output.indexOf("[startup] AppRuntime built"));
+    expect(terminateAllAt).toBeGreaterThan(scopeClosedAt);
+    expect(runtimeDisposedAt).toBeGreaterThan(terminateAllAt);
+  });
+
   // Regression: headless `xum workflow` must initialize PolicyService and thread
   // it through the core service graph like the desktop wiring. Without it, a
   // stored credential for a provider that MUX_POLICY_FILE / Xum Governor now

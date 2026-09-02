@@ -30,7 +30,8 @@ import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
 import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "@/node/services/providerService";
-import { createCoreServices } from "@/node/services/coreServices";
+import { createCoreServices } from "@/node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -269,6 +270,11 @@ async function disposeWorkflowResources(input: {
   // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
   // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
   input.services?.backgroundProcessManager.beginShutdown();
+  // Interrupt + await the runtime's supervised fibers while their dependencies
+  // are still alive (same slot as ServiceContainer.dispose); never rejects.
+  if (input.services) {
+    await closeScopeBounded(input.services.appFiberScope);
+  }
   try {
     input.session?.dispose();
   } catch (error) {
@@ -315,6 +321,10 @@ async function disposeWorkflowResources(input: {
     log.warn("xum workflow: failed to terminate background processes", {
       error: getErrorMessage(error),
     });
+  }
+  // Last: release the Effect runtime that owns the core graph; never rejects.
+  if (input.services) {
+    await disposeAppRuntime(input.services.runtime.managed);
   }
   input.tempDir[Symbol.dispose]();
 }

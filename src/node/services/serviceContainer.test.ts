@@ -9,7 +9,32 @@ import { createConfigStores, type Config, type ConfigStores } from "@/node/confi
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
-import { MemoryMeta } from "@/node/services/di/tags";
+import { CoreOptionsTag } from "@/node/services/di/layers/core";
+import {
+  AI,
+  Analytics,
+  DevTools,
+  Experiments,
+  IdleDispatcherTag,
+  InitStateManagerTag,
+  MCPConfig,
+  MCPServerManagerTag,
+  Memory,
+  MemoryConsolidation,
+  MemoryMeta,
+  Policy,
+  Provider,
+  SessionTiming,
+  SessionUsage,
+  StreamManagerTag,
+  Task,
+  Telemetry,
+  Workspace,
+  WorkspaceGoal,
+  WorkspaceMcpOverrides,
+  WorkspaceTurnManagerTag,
+  type AppTags,
+} from "@/node/services/di/tags";
 import { ServiceContainer } from "./serviceContainer";
 
 describe("ServiceContainer", () => {
@@ -256,6 +281,46 @@ describe("ServiceContainer", () => {
 
     services.heartbeatService.stop();
     services.idleCompactionService.stop();
+  });
+
+  it("serves the layer-built core and cross-cutting services through the fields and the Effect context", () => {
+    services = new ServiceContainer(stores);
+    const effectContext = services.toORPCContext()["effect/context"];
+
+    const fieldTags: Array<[keyof ServiceContainer, Context.Key<AppTags, unknown>]> = [
+      ["aiService", AI],
+      ["streamManager", StreamManagerTag],
+      ["initStateManager", InitStateManagerTag],
+      ["workspaceService", Workspace],
+      ["taskService", Task],
+      ["workspaceTurnManager", WorkspaceTurnManagerTag],
+      ["providerService", Provider],
+      ["mcpConfigService", MCPConfig],
+      ["mcpServerManager", MCPServerManagerTag],
+      ["sessionUsageService", SessionUsage],
+      ["workspaceGoalService", WorkspaceGoal],
+      ["memoryService", Memory],
+      ["memoryMetaService", MemoryMeta],
+      ["memoryConsolidationService", MemoryConsolidation],
+      ["idleDispatcher", IdleDispatcherTag],
+      ["policyService", Policy],
+      ["telemetryService", Telemetry],
+      ["experimentsService", Experiments],
+      ["sessionTimingService", SessionTiming],
+      ["analyticsService", Analytics],
+      ["devToolsService", DevTools],
+      ["workspaceMcpOverridesService", WorkspaceMcpOverrides],
+    ];
+    for (const [field, tag] of fieldTags) {
+      expect(Context.get(effectContext, tag)).toBe(services[field]);
+    }
+    // The core graph's options are derived from the layer-built cross-cutting
+    // instances, so core constructors received the same objects the fields expose.
+    const coreOptions = services.runtime.get(CoreOptionsTag);
+    expect(coreOptions.policyService).toBe(services.policyService);
+    expect(coreOptions.experimentsService).toBe(services.experimentsService);
+    expect(coreOptions.workspaceMcpOverridesService).toBe(services.workspaceMcpOverridesService);
+    expect(coreOptions.memoryMetaService).toBe(services.memoryMetaService);
   });
 
   it("surfaces a throwing layer as a synchronous constructor throw", () => {

@@ -23,7 +23,8 @@ import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
 import { PolicyService } from "../node/services/policyService";
 import { ProviderService } from "../node/services/providerService";
-import { createCoreServices } from "../node/services/coreServices";
+import { createCoreServices } from "../node/services/coreServicesRoot";
+import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
 import {
   isCaughtUpMessage,
   isReasoningDelta,
@@ -658,6 +659,8 @@ async function main(): Promise<number> {
     idleDispatcher,
     streamManager,
     turnRequestBuilderBindings,
+    runtime: coreRuntime,
+    appFiberScope,
   } = createCoreServices({
     ...runStores,
     policyService,
@@ -1571,6 +1574,9 @@ async function main(): Promise<number> {
           name: "backgroundProcessManager.beginShutdown",
           run: () => backgroundProcessManager.beginShutdown(),
         },
+        // Interrupt + await the runtime's supervised fibers while their
+        // dependencies are still alive (same slot as ServiceContainer.dispose).
+        { name: "appFiberScope.close", run: () => closeScopeBounded(appFiberScope) },
         { name: "session.dispose", run: () => session.dispose() },
         { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
         { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
@@ -1585,6 +1591,8 @@ async function main(): Promise<number> {
                 run: () => backgroundProcessManager.terminateAll(),
               },
             ]),
+        // Last: release the Effect runtime that owns the core graph.
+        { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
       ],
       (stepName, error) => {
         const message = getErrorMessage(error);
