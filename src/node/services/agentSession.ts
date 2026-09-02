@@ -7159,16 +7159,18 @@ export class AgentSession {
   sendNextUserQueuedMessage(): boolean {
     this.assertNotDisposed("sendNextUserQueuedMessage");
     const activeClaim = this.queuedToolEndClaim;
+    const didPrioritizeUserEntry = this.messageQueue.prioritizeNextUserEntry();
     if (
       activeClaim?.dispatchStarted === true &&
-      activeClaim.queueClaim.userAuthored &&
-      activeClaim.admissionHold != null
+      activeClaim.admissionHold != null &&
+      (activeClaim.queueClaim.userAuthored || activeClaim.admissionIrreversible)
     ) {
-      // WorkspaceService calls this after descendant cleanup. Admission can now continue.
+      // WorkspaceService calls this after descendant cleanup. An irreversible synthetic turn
+      // must finish before the prioritized user entry can start, so release either held turn.
       this.resumeQueuedToolEndClaimAdmission(activeClaim);
-      return true;
+      return activeClaim.queueClaim.userAuthored || didPrioritizeUserEntry;
     }
-    if (!this.messageQueue.prioritizeNextUserEntry()) {
+    if (!didPrioritizeUserEntry) {
       return false;
     }
     this.sendQueuedMessages();
@@ -7257,8 +7259,9 @@ export class AgentSession {
               cancelState: dispatchCancelState,
               cancelSignal: dispatchClaim.queueClaim.admissionSignal,
               admissionStale: () =>
-                dispatchClaim.queueClaim.admissionSignal.aborted ||
-                internal?.admissionStale?.() === true,
+                !dispatchClaim.admissionIrreversible &&
+                (dispatchClaim.queueClaim.admissionSignal.aborted ||
+                  internal?.admissionStale?.() === true),
               waitForAdmissionRelease: () => this.waitForQueuedToolEndClaimAdmission(dispatchClaim),
               onAdmissionIrreversible: () => {
                 dispatchClaim.admissionIrreversible = true;
