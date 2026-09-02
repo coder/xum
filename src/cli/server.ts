@@ -11,6 +11,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
 import { ServerLockfile } from "@/node/services/serverLockfile";
 import { log } from "@/node/services/log";
+import { shutdownStep } from "@/node/services/shutdownStep";
 import type { BrowserWindow } from "electron";
 import { Command } from "commander";
 import { validateProjectPath } from "@/node/utils/pathUtils";
@@ -229,6 +230,7 @@ async function main(): Promise<void> {
     cleanupInProgress = true;
 
     console.log("Shutting down server...");
+    const shutdownStartedAt = performance.now();
 
     // Force exit after timeout if cleanup hangs
     const forceExitTimer = setTimeout(() => {
@@ -242,15 +244,25 @@ async function main(): Promise<void> {
 
     try {
       // Close all PTY sessions first
-      serviceContainer.terminalService.closeAllSessions();
+      shutdownStep("terminalService.closeAllSessions", () =>
+        serviceContainer.terminalService.closeAllSessions()
+      );
 
-      // Dispose background processes
+      // Dispose background processes (writes its own per-step [shutdown] lines)
       await serviceContainer.dispose();
 
       // Stop server (releases lockfile, stops mDNS, closes HTTP server)
-      await serviceContainer.serverService.stopServer();
+      await shutdownStep("serverService.stopServer", () =>
+        serviceContainer.serverService.stopServer()
+      );
 
       clearTimeout(forceExitTimer);
+      // Last JS-side line: anything the process still spends after this is
+      // outside the teardown lists (e.g. a worker thread mid-module-evaluation
+      // that process.exit has to wait out).
+      log.debug("[shutdown] exiting", {
+        totalMs: Math.round(performance.now() - shutdownStartedAt),
+      });
       process.exit(0);
     } catch (err) {
       appendServerCrashLogSync({

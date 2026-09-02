@@ -56,6 +56,7 @@ import {
   type AppRuntime,
 } from "@/node/services/di/appRuntime";
 import { AppLive } from "@/node/services/di/layers/app";
+import { shutdownStep } from "@/node/services/shutdownStep";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -468,47 +469,70 @@ export class ServiceContainer {
     return this.disposePromise;
   }
 
+  /**
+   * The §5 teardown order (di/appRuntime.ts). Every step reports its duration
+   * as a `[shutdown]` debug line via `shutdownStep` (synchronous steps without
+   * a suspension point), so a quit transcript localizes a slow or hung step;
+   * `closeScopeBounded`/`disposeAppRuntime` write their own lines.
+   */
   private async disposeOnce(): Promise<void> {
+    const disposeStartedAt = performance.now();
+    log.debug("[shutdown] ServiceContainer.dispose starting");
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.
-    this.backgroundProcessManager.beginShutdown();
+    shutdownStep("backgroundProcessManager.beginShutdown", () =>
+      this.backgroundProcessManager.beginShutdown()
+    );
     // Interrupt and await the runtime's supervised fibers while every dependency
     // they might touch during finalization is still alive. Fixed here (before
     // the explicit teardown) so later occupants do not re-derive the position;
     // bounded and idempotent, and never rejects (di/appRuntime.ts).
     await closeScopeBounded(this.appFiberScope);
     // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
-    await this.desktopBridgeServer.stop();
-    this.desktopTokenManager.dispose();
-    await this.desktopSessionManager.closeAll();
+    await shutdownStep("desktopBridgeServer.stop", () => this.desktopBridgeServer.stop());
+    shutdownStep("desktopTokenManager.dispose", () => this.desktopTokenManager.dispose());
+    await shutdownStep("desktopSessionManager.closeAll", () =>
+      this.desktopSessionManager.closeAll()
+    );
     // Stop the periodic AgentStatusService loop here too (not just in
     // shutdown()): dispose() is the path used by the desktop before-quit
     // and ACP in-process close handlers, and the ref'd setInterval would
     // otherwise keep the process alive and continue calling
     // generateWorkspaceStatus against services that are about to be torn
     // down below.
-    this.agentStatusService.stop();
-    await this.browserBridgeServer.stop();
-    this.browserSessionStateHub.dispose();
-    this.browserBridgeTokenManager.dispose();
-    await this.analyticsService.dispose();
-    this.policyService.dispose();
-    this.mcpServerManager.dispose();
-    await this.mcpOauthService.dispose();
-    await this.muxGatewayOauthService.dispose();
-    await this.muxGovernorOauthService.dispose();
-    await this.codexOauthService.dispose();
-    await this.coderOauthService.dispose();
+    shutdownStep("agentStatusService.stop", () => this.agentStatusService.stop());
+    await shutdownStep("browserBridgeServer.stop", () => this.browserBridgeServer.stop());
+    shutdownStep("browserSessionStateHub.dispose", () => this.browserSessionStateHub.dispose());
+    shutdownStep("browserBridgeTokenManager.dispose", () =>
+      this.browserBridgeTokenManager.dispose()
+    );
+    await shutdownStep("analyticsService.dispose", () => this.analyticsService.dispose());
+    shutdownStep("policyService.dispose", () => this.policyService.dispose());
+    shutdownStep("mcpServerManager.dispose", () => this.mcpServerManager.dispose());
+    await shutdownStep("mcpOauthService.dispose", () => this.mcpOauthService.dispose());
+    await shutdownStep("muxGatewayOauthService.dispose", () =>
+      this.muxGatewayOauthService.dispose()
+    );
+    await shutdownStep("muxGovernorOauthService.dispose", () =>
+      this.muxGovernorOauthService.dispose()
+    );
+    await shutdownStep("codexOauthService.dispose", () => this.codexOauthService.dispose());
+    await shutdownStep("coderOauthService.dispose", () => this.coderOauthService.dispose());
 
-    this.copilotOauthService.dispose();
-    this.serverAuthService.dispose();
-    this.providerService.dispose();
-    await this.backgroundProcessManager.terminateAll();
-    await this.timelineService.flush();
+    shutdownStep("copilotOauthService.dispose", () => this.copilotOauthService.dispose());
+    shutdownStep("serverAuthService.dispose", () => this.serverAuthService.dispose());
+    shutdownStep("providerService.dispose", () => this.providerService.dispose());
+    await shutdownStep("backgroundProcessManager.terminateAll", () =>
+      this.backgroundProcessManager.terminateAll()
+    );
+    await shutdownStep("timelineService.flush", () => this.timelineService.flush());
     // Last: close the Effect runtime's scope. No layer owns finalizers yet, so
     // this only releases the runtime; the position (after every explicit
     // teardown step) is fixed now for later scope-owned occupants.
     await disposeAppRuntime(this.runtime.managed);
+    log.debug("[shutdown] ServiceContainer.dispose completed", {
+      totalMs: Math.round(performance.now() - disposeStartedAt),
+    });
   }
 }

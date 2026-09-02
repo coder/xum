@@ -43,6 +43,7 @@ import {
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/providerRequirements";
+import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
 import { resolveProjectDir, resolveProjectTrusted } from "./trust";
@@ -267,65 +268,45 @@ async function disposeWorkflowResources(input: {
   realProviderService?: ProviderService;
   policyService?: PolicyService;
 }): Promise<void> {
-  // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-  // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-  input.services?.backgroundProcessManager.beginShutdown();
-  // Interrupt + await the runtime's supervised fibers while their dependencies
-  // are still alive (same slot as ServiceContainer.dispose); never rejects.
-  if (input.services) {
-    await closeScopeBounded(input.services.appFiberScope);
-  }
-  try {
-    input.session?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose session", { error: getErrorMessage(error) });
-  }
-  try {
-    input.services?.mcpServerManager.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose MCP server manager", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.codexOauthService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose Codex OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.coderOauthService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose Coder OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    input.realProviderService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose real-config provider service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    input.policyService?.dispose();
-  } catch (error) {
-    log.warn("xum workflow: failed to dispose policy service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.services?.backgroundProcessManager.terminateAll();
-  } catch (error) {
-    log.warn("xum workflow: failed to terminate background processes", {
-      error: getErrorMessage(error),
-    });
-  }
-  // Last: release the Effect runtime that owns the core graph; never rejects.
-  if (input.services) {
-    await disposeAppRuntime(input.services.runtime.managed);
-  }
+  const services = input.services;
+  // Same shape as `xum run`'s list: every step is contained, reported, and
+  // timed as a `[shutdown]` line; a failing step never skips the ones after it.
+  await runBestEffortCleanup(
+    [
+      ...(services
+        ? [
+            // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+            // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+            {
+              name: "backgroundProcessManager.beginShutdown",
+              run: () => services.backgroundProcessManager.beginShutdown(),
+            },
+            // Interrupt + await the runtime's supervised fibers while their dependencies
+            // are still alive (same slot as ServiceContainer.dispose); never rejects.
+            { name: "appFiberScope.close", run: () => closeScopeBounded(services.appFiberScope) },
+          ]
+        : []),
+      { name: "session.dispose", run: () => input.session?.dispose() },
+      { name: "mcpServerManager.dispose", run: () => services?.mcpServerManager.dispose() },
+      { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
+      { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
+      { name: "realProviderService.dispose", run: () => input.realProviderService?.dispose() },
+      { name: "policyService.dispose", run: () => input.policyService?.dispose() },
+      {
+        name: "backgroundProcessManager.terminateAll",
+        run: () => services?.backgroundProcessManager.terminateAll(),
+      },
+      // Last: release the Effect runtime that owns the core graph; never rejects.
+      ...(services
+        ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]
+        : []),
+    ],
+    (stepName, error) => {
+      log.warn(`xum workflow: cleanup step failed: ${stepName}`, {
+        error: getErrorMessage(error),
+      });
+    }
+  );
   input.tempDir[Symbol.dispose]();
 }
 
