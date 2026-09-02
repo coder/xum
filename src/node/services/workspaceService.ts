@@ -322,6 +322,7 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
+import type { DevToolsService } from "@/node/services/devToolsService";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createBashTool } from "@/node/services/tools/bash";
@@ -634,6 +635,9 @@ interface WorkspaceAgentStatus {
   url?: string;
 }
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+
+/** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
+type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "removeWorkspaceData">;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
@@ -2594,7 +2598,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
-  private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+  private devToolsService?: WorkspaceDevToolsCleanup;
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
@@ -2942,7 +2946,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
-  setDevToolsService(service: { removeWorkspaceData(workspaceId: string): Promise<void> }): void {
+  setDevToolsService(service: WorkspaceDevToolsCleanup): void {
     this.devToolsService = service;
   }
 
@@ -4501,10 +4505,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
+    const devToolsService = this.devToolsService;
     for (const metadata of allMetadata) {
       if (!isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
       try {
-        await this.devToolsService.removeWorkspaceData(metadata.id);
+        // archive() already removed the log for most archived workspaces, so gate the fresh config
+        // read below on there being something to delete: a per-workspace reload for every archived
+        // entry would scale this sweep with (archived workspaces x config size).
+        if (!(await devToolsService.hasWorkspaceData(metadata.id))) continue;
+        // This sweep can run while the server is serving clients. Unarchive runs under the same
+        // lock, so re-checking the live config inside it means a workspace unarchived since
+        // `allMetadata` was read keeps the logs it has produced since.
+        await this.withTaskTreeLifecycleLock(metadata.id, async () => {
+          const live = findWorkspaceEntry(
+            this.config.loadConfigOrDefault(),
+            metadata.id
+          )?.workspace;
+          if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) return;
+          await devToolsService.removeWorkspaceData(metadata.id);
+        });
       } catch (error: unknown) {
         log.debug("Failed to remove DevTools log for archived workspace", {
           workspaceId: metadata.id,

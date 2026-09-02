@@ -8250,12 +8250,64 @@ describe("WorkspaceService initialize", () => {
       name: "Archived Workspace",
       archivedAt: "2026-03-20T00:00:00.000Z",
     });
+    // Archived when metadata was read, but a client unarchived it (and produced new logs)
+    // before the sweep reached it: the live config decides.
+    const unarchivedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "unarchived-since-ws",
+      name: "Unarchived Since Read",
+      archivedAt: "2026-03-20T00:00:00.000Z",
+    });
+    const archivedWithoutDataWorkspace = createFrontendWorkspaceMetadata({
+      id: "archived-no-data-ws",
+      name: "Archived Without DevTools Data",
+      archivedAt: "2026-03-20T00:00:00.000Z",
+    });
     config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([liveWorkspace, archivedWorkspace])
+      Promise.resolve([
+        liveWorkspace,
+        archivedWorkspace,
+        unarchivedSinceWorkspace,
+        archivedWithoutDataWorkspace,
+      ])
     ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
+              {
+                id: "archived-ws",
+                name: "archived-ws",
+                path: "/tmp/archived-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+              {
+                id: "unarchived-since-ws",
+                name: "unarchived-since-ws",
+                path: "/tmp/unarchived-since-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+                unarchivedAt: "2026-03-21T00:00:00.000Z",
+              },
+              {
+                id: "archived-no-data-ws",
+                name: "archived-no-data-ws",
+                path: "/tmp/archived-no-data-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+            ],
+          },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
 
     const removeWorkspaceData = mock(() => Promise.resolve());
-    workspaceService.setDevToolsService({ removeWorkspaceData });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData: (workspaceId: string) =>
+        Promise.resolve(workspaceId !== "archived-no-data-ws"),
+      removeWorkspaceData,
+    });
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -13662,7 +13714,10 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(entry?.archivedAt).toBeTruthy();
       return Promise.resolve();
     });
-    workspaceService.setDevToolsService({ removeWorkspaceData });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData: () => Promise.resolve(true),
+      removeWorkspaceData,
+    });
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -13672,6 +13727,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("archive() stays successful when DevTools cleanup fails", async () => {
     workspaceService.setDevToolsService({
+      hasWorkspaceData: () => Promise.resolve(true),
       removeWorkspaceData: mock(() => Promise.reject(new Error("disk error"))),
     });
 

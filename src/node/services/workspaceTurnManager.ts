@@ -4830,25 +4830,38 @@ export class WorkspaceTurnManager {
           continue;
         }
 
-        await this.taskHost.editWorkspaceEntry(
-          task.id,
-          (workspace) => {
-            workspace.taskExecutionId = normalized.handleId;
-            workspace.taskExecutionStatus = normalized.status;
-          },
-          { allowMissing: true }
-        );
-        await this.taskHost.emitWorkspaceMetadata(task.id);
-        if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
-          this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
-            handleId: normalized.handleId,
-            ownerWorkspaceId: normalized.ownerWorkspaceId,
-            // Fail closed: the restart killed any live stream, so this recovered registration
-            // exists for settlement ownership, not peer admission. A revival or a fresh
-            // acceptance re-marks the entry accepted.
-            accepted: false,
-          });
-        }
+        const taskId = task.id;
+        const { handleId, ownerWorkspaceId, status } = normalized;
+        // This pass can run while clients are connected, and normalizeWorkspaceTurnRecord awaited:
+        // a task_stop may have settled this handle in the meantime. Settlement persists the record
+        // and its mirror under the per-handle settlement lock, so compare-and-set under that same
+        // lock; writing the pre-await snapshot would restore an active taskExecutionStatus (and a
+        // live registration) for a child that was just stopped.
+        await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+          const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+          if (current?.status !== status) {
+            return;
+          }
+          await this.taskHost.editWorkspaceEntry(
+            taskId,
+            (workspace) => {
+              workspace.taskExecutionId = handleId;
+              workspace.taskExecutionStatus = status;
+            },
+            { allowMissing: true }
+          );
+          await this.taskHost.emitWorkspaceMetadata(taskId);
+          if (isActiveWorkspaceTurnTaskStatus(status)) {
+            this.activeWorkspaceTurnHandleByWorkspaceId.set(taskId, {
+              handleId,
+              ownerWorkspaceId,
+              // Fail closed: the restart killed any live stream, so this recovered registration
+              // exists for settlement ownership, not peer admission. A revival or a fresh
+              // acceptance re-marks the entry accepted.
+              accepted: false,
+            });
+          }
+        });
       } catch (error: unknown) {
         // Startup recovery is best-effort: one read-only/corrupt child must not prevent Xum startup
         // or block reconciliation of the remaining persistent children.

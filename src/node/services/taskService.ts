@@ -2425,10 +2425,14 @@ export class TaskService implements AgentTaskIntegration {
 
       // Recovery may run after the server is accepting connections. Re-read the live status so a
       // task_stop that persisted `interrupted` since the snapshot is not undone by a restart nudge
-      // (sendMessage would treat that as a user-driven resume of the stopped task).
-      const liveStatus = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id)?.workspace
-        .taskStatus;
-      if (liveStatus !== "running") {
+      // (sendMessage would treat that as a user-driven resume of the stopped task). The same check
+      // rides along as the send's admission probe: a stop can also land during the awaits between
+      // here and turn admission, and a guarded send skips the interrupted-task rescue entirely.
+      const taskId = task.id;
+      const admissionStale = (): boolean =>
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskStatus !==
+        "running";
+      if (admissionStale()) {
         skippedRunningNoLongerRunning += 1;
         continue;
       }
@@ -2469,6 +2473,7 @@ export class TaskService implements AgentTaskIntegration {
           {
             synthetic: true,
             agentInitiated: true,
+            admissionStale,
             onAccepted: clearAcceptedPendingGuidance,
           }
         );
@@ -2531,7 +2536,7 @@ export class TaskService implements AgentTaskIntegration {
           reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           experiments: task.taskExperiments,
         },
-        { synthetic: true, agentInitiated: true }
+        { synthetic: true, agentInitiated: true, admissionStale }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
@@ -10471,7 +10476,15 @@ export class TaskService implements AgentTaskIntegration {
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
       },
-      { synthetic: true, agentInitiated: true }
+      {
+        synthetic: true,
+        agentInitiated: true,
+        // The status check at the top of this method is a one-shot read; a task_stop that lands
+        // during the awaits since then must refuse admission rather than be resurrected.
+        admissionStale: () =>
+          findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+            .taskStatus !== "awaiting_report",
+      }
     );
     const durationMs = Date.now() - startedAt;
     if (!sendResult.success) {
