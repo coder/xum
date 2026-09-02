@@ -6902,13 +6902,15 @@ export class AgentSession {
    * reservation kept a send invisible to isBusy() (WorkspaceService preflight)
    * and that settled without a turn, so no stream end will drain what queued
    * behind them. A turn in flight, a mid-stream compaction about to dispatch its
-   * request, a pending auto-retry, or the edit flow still owns the next
-   * dispatch, so the queue keeps waiting for them.
+   * request, or the edit flow still owns the next dispatch, so the queue keeps
+   * waiting for them. A scheduled auto-retry does not: this is the only drain
+   * the queued input gets, and the retry defers to the busy session
+   * (retry_deferred_busy) until stream success cancels it, matching the
+   * failed-startup drains elsewhere in this file.
    */
   drainQueuedMessagesIfIdle(): void {
     if (
       this.hasActiveOrPendingTurnWork() ||
-      this.hasPendingAutoRetry() ||
       this.deferQueuedFlushUntilAfterEdit ||
       this.messageQueue.isEmpty()
     ) {

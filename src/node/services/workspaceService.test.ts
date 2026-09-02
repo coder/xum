@@ -8609,6 +8609,87 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect((await manualResult).success).toBe(true);
   });
 
+  test("a failed send drains the entries queued behind it even when a supersedable preflight is older", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebIHT): the requireIdle send is physically oldest but nobody
+    // queues behind it, so it must not decide who drains. Otherwise the entry queued behind
+    // the failed manual send waits until the maintenance preflight settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      "test-workspace",
+      fakeSession as unknown as AgentSession
+    );
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    const maintenancePreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => maintenancePreflight.promise);
+    const maintenanceResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      sendOptions,
+      { synthetic: true, agentInitiated: true, requireIdle: true }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const firstManual = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstManual.promise);
+    const firstManualResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    await workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
+    firstManual.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
+    expect((await firstManualResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+
+    maintenancePreflight.resolve();
+    await maintenanceResult;
+  });
+
+  test("a queue-mode heartbeat in preflight yields quietly to manual input instead of racing it", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebIHa): queue-mode heartbeats set yieldToQueuedMessages, not
+    // requireIdle. The manual send must not queue behind the heartbeat, and the heartbeat
+    // must not start once that input is in preflight; its next slot fires anyway.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const heartbeatPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => heartbeatPreflight.promise);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+
+    const heartbeatResult = workspaceService.sendMessage(
+      "test-workspace",
+      "check in",
+      { ...sendOptions, queueDispatchMode: "turn-end" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        skipAutoResumeReset: true,
+        queueDedupeKey: "heartbeat",
+        yieldToQueuedMessages: true,
+      }
+    );
+    await waitForCondition(() => persistSettings.mock.calls.length === 1);
+
+    const manualSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => manualSend.promise);
+    const manualResult = workspaceService.sendMessage("test-workspace", "manual", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+    expect(fakeSession.sendMessage.mock.calls[0]?.[0]).toBe("manual");
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    heartbeatPreflight.resolve();
+    // Superseded heartbeats report success so the scheduler does not record a failure.
+    expect((await heartbeatResult).success).toBe(true);
+    expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+
+    manualSend.resolve(Ok(undefined));
+    expect((await manualResult).success).toBe(true);
+  });
+
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): preflightSendCounts stays positive
     // until the outer service call returns, so a probe reading it would let a

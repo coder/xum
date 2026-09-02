@@ -92,12 +92,15 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
       },
       0,
     ],
+    // Codex P2 (PRRT_kwDOPxxmWM6ebIHW): this is the only drain the queued input gets, and a
+    // retry that is later abandoned never drains, so a scheduled retry must not hold it.
+    // The retry defers to the busy session and is cancelled by stream success.
     [
-      "a pending auto-retry owns the next dispatch",
+      "a scheduled auto-retry does not hold the queue",
       (s) => {
         s.autoRetryStarting = true;
       },
-      0,
+      1,
     ],
   ];
 

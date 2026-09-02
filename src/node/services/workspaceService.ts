@@ -2133,8 +2133,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Tickets are kept in arrival order (ticket -> supersedable) so a send can tell
    * whether an EARLIER send is still in preflight (sendMessage queues behind it)
    * without two simultaneous arrivals each deferring to the other. Supersedable
-   * tickets are requireIdle maintenance sends (heartbeats, continuations): manual
-   * input never waits behind them, and they yield to it through preflightSendCounts.
+   * tickets are maintenance sends that yield to user input (requireIdle skips and
+   * queue-mode heartbeats): they never count as "earlier" for anyone, and they yield
+   * to a manual send in preflight through preflightSendCounts.
    */
   private readonly sessionInvisiblePreflights = new Map<string, Map<number, boolean>>();
   private nextSessionInvisiblePreflightTicket = 0;
@@ -2145,12 +2146,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /**
    * See sessionInvisiblePreflights. Release is idempotent. Disposal (scope exit of the
-   * service call) also drains messages queued behind this preflight when it was the head
-   * of the arrival line: those entries have no stream end to drain them if this send
-   * settled without a turn (refused, rejected, startup failed). A younger send that
-   * settles first must not drain, or it would dispatch entries ahead of the older
-   * still-live preflight; the older send drains when it settles, and the drain is a
-   * no-op when a turn was handed off (the session is busy).
+   * service call) also drains messages queued behind this preflight when no blocking
+   * ticket preceded it (it was the head of the line that others queue behind): those
+   * entries have no stream end to drain them if this send settled without a turn
+   * (refused, rejected, startup failed). A younger send that settles first must not
+   * drain, or it would dispatch entries ahead of the older still-live preflight; the
+   * older send drains when it settles, and the drain is a no-op when a turn was
+   * handed off (the session is busy).
    */
   private armSessionInvisiblePreflight(
     workspaceId: string,
@@ -2164,22 +2166,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
     tickets.set(ticket, options?.supersedable === true);
     let released = false;
-    let releasedAsOldest = false;
-    // Map iteration follows insertion order, so the first live ticket is the oldest.
-    const isOldest = () =>
-      this.sessionInvisiblePreflights.get(workspaceId)?.keys().next().value === ticket;
-    const release = () => {
-      if (released) {
-        return;
-      }
-      released = true;
-      releasedAsOldest = isOldest();
-      const live = this.sessionInvisiblePreflights.get(workspaceId);
-      live?.delete(ticket);
-      if (live?.size === 0) {
-        this.sessionInvisiblePreflights.delete(workspaceId);
-      }
-    };
+    let releasedAsHead = false;
+    // Map iteration follows insertion order, so tickets before this one arrived earlier.
     const hasEarlierPreflight = () => {
       if (released) {
         return false;
@@ -2195,12 +2183,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       return false;
     };
+    const release = () => {
+      if (released) {
+        return;
+      }
+      releasedAsHead = !hasEarlierPreflight();
+      released = true;
+      const live = this.sessionInvisiblePreflights.get(workspaceId);
+      live?.delete(ticket);
+      if (live?.size === 0) {
+        this.sessionInvisiblePreflights.delete(workspaceId);
+      }
+    };
     return {
       release,
       hasEarlierPreflight,
       [Symbol.dispose]: () => {
         release();
-        if (releasedAsOldest) {
+        if (releasedAsHead) {
           this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
         }
       },
@@ -10589,8 +10589,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
         },
       };
+      // Maintenance sends that yield to user input: requireIdle skips and queue-mode
+      // heartbeats. Both must yield to a manual send in preflight rather than race it.
+      const yieldsToPreflightSends =
+        internal?.requireIdle === true || internal?.yieldToQueuedMessages === true;
+      // A queue-mode heartbeat superseded by input that arrived during its preparation is a
+      // quiet success: its next slot fires anyway.
+      const yieldToPreflightSend = (): Result<void, SendMessageError> => {
+        log.info("sendMessage: yielded to a send in preflight during send preparation", {
+          workspaceId,
+        });
+        return Ok(undefined);
+      };
       using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
-        supersedable: internal?.requireIdle === true,
+        supersedable: yieldsToPreflightSends,
       });
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
@@ -10742,7 +10754,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const shouldQueue =
         !normalizedOptions?.editMessageId &&
         (session.isBusy() ||
-          (sessionInvisiblePreflight.hasEarlierPreflight() && internal?.requireIdle !== true));
+          (sessionInvisiblePreflight.hasEarlierPreflight() && !yieldsToPreflightSends));
 
       // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
       // captured before a manual send entered preflight would otherwise win
@@ -10752,15 +10764,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // synchronously at entry above), so any other in-preflight send makes
       // the count exceed 1; refusing is safe because idle-only callers
       // (continuations, heartbeats) treat this as a transient skip and retry.
-      if (
-        !shouldQueue &&
-        internal?.requireIdle &&
-        (this.preflightSendCounts.get(workspaceId) ?? 0) > 1
-      ) {
+      const hasOtherSendInPreflight = (this.preflightSendCounts.get(workspaceId) ?? 0) > 1;
+      if (!shouldQueue && internal?.requireIdle && hasOtherSendInPreflight) {
         return Err({
           type: "unknown",
           raw: IDLE_ONLY_BUSY_SKIP_MESSAGE,
         });
+      }
+      // Starting a queue-mode heartbeat here would race that input to PREPARING.
+      if (!shouldQueue && internal?.yieldToQueuedMessages === true && hasOtherSendInPreflight) {
+        return yieldToPreflightSend();
       }
 
       // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the count check above is a one-shot
@@ -10770,9 +10783,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // caller's staleness probe with a live preflight re-check so
       // AgentSession's admission gates (including the last gate before the
       // pre-turn batch becomes irrevocable) re-validate idleness; refusal
-      // rolls back the synthetic row and idle-only callers retry.
-      if (internal?.requireIdle) {
-        const callerAdmissionStale = internal.admissionStale;
+      // rolls back the synthetic row and idle-only callers retry. Queue-mode heartbeats
+      // carry the same probe so they cannot claim PREPARING against a manual send that
+      // entered preflight after their entry check (see the quiet yield below).
+      if (yieldsToPreflightSends) {
+        const callerAdmissionStale = internal?.admissionStale;
         internal = {
           ...internal,
           admissionStale: () =>
@@ -10785,6 +10800,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued.
         if (internal?.admissionStale?.() === true) {
+          if (internal.yieldToQueuedMessages === true) {
+            return yieldToPreflightSend();
+          }
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
         const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
@@ -10993,6 +11011,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
       });
+      if (
+        !result.success &&
+        internal?.yieldToQueuedMessages === true &&
+        result.error.type === "unknown" &&
+        result.error.raw === SEND_ADMISSION_STALE_MESSAGE
+      ) {
+        return yieldToPreflightSend();
+      }
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {
           workspaceId,
