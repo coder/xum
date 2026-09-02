@@ -647,6 +647,30 @@ describe("MessageQueue", () => {
       expect(cancelSignal?.reason).toBe("user stopped the queue dispatch");
     });
 
+    it("requeues a claimed user entry after its admission is canceled", () => {
+      const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      queue.add(
+        "User follow-up",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal, cancelState }
+      );
+
+      const claim = queue.claimNextToolEndEntry();
+      expect(claim?.userAuthored).toBe(true);
+      expect(claim?.commit()).toBe(true);
+      const firstAdmission = queue.dequeueNext();
+      expect(firstAdmission.internal?.cancelSignal).toBe(claim?.admissionSignal);
+
+      expect(claim?.requeueAdmission("user stopped admission")).toBe(true);
+      expect(claim?.admissionSignal.aborted).toBe(true);
+      const retriedAdmission = queue.dequeueNext();
+      expect(retriedAdmission.message).toBe("User follow-up");
+      expect(retriedAdmission.internal?.cancelSignal).toBe(controller.signal);
+      expect(retriedAdmission.internal?.cancelState).toEqual({ canceledBeforeAcceptance: false });
+      expect(retriedAdmission.internal?.cancelState).not.toBe(cancelState);
+    });
+
     it("does not claim a tool-end entry that cancellation already retracted", () => {
       const controller = new AbortController();
       queue.add(

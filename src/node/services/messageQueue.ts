@@ -105,6 +105,8 @@ export interface ToolEndQueueClaim {
   restoreCancellation(): void;
   /** Stop the claimed entry during queue or preparing admission. */
   cancelAdmission(reason: string): void;
+  /** Put a dequeued entry back at the queue head and stop its current admission. */
+  requeueAdmission(reason: string): boolean;
   /** Release claim ownership after the entry crosses admission. */
   release(): void;
 }
@@ -337,6 +339,19 @@ export class MessageQueue {
         }
         settled = true;
         admissionController.abort(reason);
+      },
+      requeueAdmission: (reason) => {
+        if (settled || !committed || this.entries.includes(entry)) {
+          return false;
+        }
+        settled = true;
+        admissionController.abort(reason);
+        entry.cancelSignal = cancelSignal;
+        if (entry.cancelState != null) {
+          entry.cancelState = { canceledBeforeAcceptance: false };
+        }
+        this.entries.unshift(entry);
+        return true;
       },
       release: () => {
         settled = true;

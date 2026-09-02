@@ -653,6 +653,13 @@ interface QueuedToolEndClaim {
   queueClaim: ToolEndQueueClaim;
   source: "sdk" | "provider";
   dispatchStarted: boolean;
+  dispatchDeferredByHardInterrupt: boolean;
+  admissionIrreversible: boolean;
+  retryAfterCancellation: boolean;
+  admissionHold?: {
+    promise: Promise<void>;
+    release: () => void;
+  };
 }
 
 export class AgentSession {
@@ -702,6 +709,8 @@ export class AgentSession {
   private queuedToolEndClaim: QueuedToolEndClaim | undefined;
   // A hard Stop blocks late SDK and provider callbacks until a new stream starts.
   private hardInterruptPendingStreamStart = false;
+  // Hold a claimed admission while a hard interrupt waits for its stop result.
+  private hardInterruptClaimSettlementPending = false;
   // Send now preserves a claimed user entry for the immediate queue drain.
   private preserveQueuedToolEndClaimForImmediateSend = false;
   private readonly activeToolCallIds = new Set<string>();
@@ -3093,6 +3102,10 @@ export class AgentSession {
        * these admission gates instead of starting a privileged turn on a stopped target.
        */
       admissionStale?: () => boolean;
+      /** Wait for a hard-stop cascade before this queued admission can become irreversible. */
+      waitForAdmissionRelease?: () => Promise<void>;
+      /** Record that persisted turn rows have crossed their rollback boundary. */
+      onAdmissionIrreversible?: () => void;
     }
   ): Promise<AgentSessionResult<void>> {
     this.assertNotDisposed("sendMessage");
@@ -3950,11 +3963,17 @@ export class AgentSession {
       );
     }
 
+    await internal?.waitForAdmissionRelease?.();
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
     // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
+      internal?.onAdmissionIrreversible?.();
     }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -4883,7 +4902,9 @@ export class AgentSession {
     const isHardInterrupt = options?.soft !== true;
     if (isHardInterrupt) {
       this.hardInterruptPendingStreamStart = true;
+      this.hardInterruptClaimSettlementPending = true;
       this.preserveQueuedToolEndClaimForImmediateSend = options?.sendQueuedImmediately === true;
+      this.pauseQueuedToolEndClaimAdmission();
       this.activeToolCallIds.clear();
     }
 
@@ -4891,29 +4912,40 @@ export class AgentSession {
     // from committing it. For soft interrupts, defer to stream-abort handler since
     // the stream continues running and would recreate the partial.
     if (options?.abandonPartial && !options?.soft) {
-      const deleteResult = await this.historyService.deletePartial(this.workspaceId);
+      let deleteResult: Result<void>;
+      try {
+        deleteResult = await this.historyService.deletePartial(this.workspaceId);
+      } catch (error: unknown) {
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
+        throw error;
+      }
       if (!deleteResult.success) {
-        this.hardInterruptPendingStreamStart = false;
-        this.preserveQueuedToolEndClaimForImmediateSend = false;
-        this.restoreQueuedToolEndClaim();
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
         return Err(deleteResult.error);
       }
     }
 
-    const stopResult = await this.streamManager.stopStream(this.workspaceId, {
-      ...options,
-      abortReason: "user",
-    });
+    let stopResult: Result<void>;
+    try {
+      stopResult = await this.streamManager.stopStream(this.workspaceId, {
+        ...options,
+        abortReason: "user",
+      });
+    } catch (error: unknown) {
+      if (isHardInterrupt) {
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
+      }
+      throw error;
+    }
     if (!stopResult.success) {
       if (isHardInterrupt) {
-        this.hardInterruptPendingStreamStart = false;
-        this.preserveQueuedToolEndClaimForImmediateSend = false;
-        this.restoreQueuedToolEndClaim();
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
       }
       return Err(stopResult.error);
     }
 
     if (isHardInterrupt) {
+      this.hardInterruptClaimSettlementPending = false;
       this.settleQueuedToolEndClaimAfterUserInterrupt();
       this.preserveQueuedToolEndClaimForImmediateSend = false;
     }
@@ -6855,6 +6887,12 @@ export class AgentSession {
   private dispatchQueuedProviderToolEndMessageAfterAbort(
     abortReason: StreamAbortReason | undefined
   ): boolean {
+    if (this.hardInterruptClaimSettlementPending) {
+      if (abortReason !== "user" && this.queuedToolEndClaim?.source === "provider") {
+        this.queuedToolEndClaim.dispatchDeferredByHardInterrupt = true;
+      }
+      return false;
+    }
     if (this.queuedToolEndClaim == null) {
       return false;
     }
@@ -6887,7 +6925,14 @@ export class AgentSession {
     if (queueClaim == null) {
       return undefined;
     }
-    const activeClaim = { queueClaim, source, dispatchStarted: false };
+    const activeClaim = {
+      queueClaim,
+      source,
+      dispatchStarted: false,
+      dispatchDeferredByHardInterrupt: false,
+      admissionIrreversible: false,
+      retryAfterCancellation: false,
+    };
     this.queuedToolEndClaim = activeClaim;
     return activeClaim;
   }
@@ -6910,6 +6955,7 @@ export class AgentSession {
   private restoreQueuedToolEndClaim(): void {
     const activeClaim = this.queuedToolEndClaim;
     this.queuedToolEndClaim = undefined;
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
     activeClaim?.queueClaim.restoreCancellation();
     if (activeClaim != null) {
       this.emitQueuedMessageChanged();
@@ -6920,6 +6966,7 @@ export class AgentSession {
   private cancelQueuedToolEndClaim(reason: string): void {
     const activeClaim = this.queuedToolEndClaim;
     this.queuedToolEndClaim = undefined;
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
     activeClaim?.queueClaim.cancelAdmission(reason);
     if (activeClaim != null) {
       this.emitQueuedMessageChanged();
@@ -6928,18 +6975,85 @@ export class AgentSession {
   }
 
   private settleQueuedToolEndClaimAfterUserInterrupt(): void {
+    if (this.hardInterruptClaimSettlementPending) {
+      return;
+    }
     const activeClaim = this.queuedToolEndClaim;
     if (
       this.preserveQueuedToolEndClaimForImmediateSend &&
       activeClaim?.queueClaim.userAuthored === true
     ) {
-      this.restoreQueuedToolEndClaim();
+      if (!activeClaim.dispatchStarted) {
+        this.restoreQueuedToolEndClaim();
+      }
       return;
+    }
+    if (
+      activeClaim?.dispatchStarted === true &&
+      activeClaim.queueClaim.userAuthored &&
+      !activeClaim.admissionIrreversible
+    ) {
+      activeClaim.retryAfterCancellation = true;
+      const didRequeue = activeClaim.queueClaim.requeueAdmission(
+        "Queue dispatch canceled by user interrupt."
+      );
+      if (didRequeue) {
+        this.queuedToolEndClaim = undefined;
+        this.resumeQueuedToolEndClaimAdmission(activeClaim);
+        this.emitQueuedMessageChanged();
+        this.syncBackgroundQueuedMessageSignal();
+        // A later service callback cannot recover a dequeued entry. Restore it now.
+        this.restoreQueueToInput();
+        return;
+      }
+      activeClaim.retryAfterCancellation = false;
     }
     this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
   }
 
+  private pauseQueuedToolEndClaimAdmission(): void {
+    const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim?.dispatchStarted !== true || activeClaim.admissionHold != null) {
+      return;
+    }
+    let release: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    activeClaim.admissionHold = { promise, release };
+  }
+
+  private resumeQueuedToolEndClaimAdmission(activeClaim?: QueuedToolEndClaim): void {
+    const admissionHold = activeClaim?.admissionHold;
+    if (activeClaim != null) {
+      activeClaim.admissionHold = undefined;
+    }
+    admissionHold?.release();
+  }
+
+  private async waitForQueuedToolEndClaimAdmission(activeClaim: QueuedToolEndClaim): Promise<void> {
+    await activeClaim.admissionHold?.promise;
+  }
+
+  private resumeQueuedToolEndClaimAfterFailedInterrupt(): void {
+    this.hardInterruptClaimSettlementPending = false;
+    this.hardInterruptPendingStreamStart = false;
+    this.preserveQueuedToolEndClaimForImmediateSend = false;
+    const activeClaim = this.queuedToolEndClaim;
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    if (
+      activeClaim?.dispatchStarted !== true &&
+      activeClaim?.dispatchDeferredByHardInterrupt !== true
+    ) {
+      this.restoreQueuedToolEndClaim();
+    }
+    if (this.turnPhase === TurnPhase.IDLE) {
+      this.sendQueuedMessages();
+    }
+  }
+
   private releaseQueuedToolEndClaim(activeClaim: QueuedToolEndClaim): void {
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
     activeClaim.queueClaim.release();
     if (this.queuedToolEndClaim === activeClaim) {
       this.queuedToolEndClaim = undefined;
@@ -7035,6 +7149,16 @@ export class AgentSession {
    */
   sendNextUserQueuedMessage(): boolean {
     this.assertNotDisposed("sendNextUserQueuedMessage");
+    const activeClaim = this.queuedToolEndClaim;
+    if (
+      activeClaim?.dispatchStarted === true &&
+      activeClaim.queueClaim.userAuthored &&
+      activeClaim.admissionHold != null
+    ) {
+      // WorkspaceService calls this after descendant cleanup. Admission can now continue.
+      this.resumeQueuedToolEndClaimAdmission(activeClaim);
+      return true;
+    }
     if (!this.messageQueue.prioritizeNextUserEntry()) {
       return false;
     }
@@ -7083,6 +7207,14 @@ export class AgentSession {
       return;
     }
 
+    // A hard Stop owns queue admission until WorkspaceService finishes descendant cleanup.
+    if (this.hardInterruptClaimSettlementPending) {
+      if (this.queuedToolEndClaim != null) {
+        this.queuedToolEndClaim.dispatchDeferredByHardInterrupt = true;
+      }
+      return;
+    }
+
     // A dequeued entry owns admission until stream start or explicit failure cleanup.
     if (this.dispatchingQueuedEntry || this.queuedToolEndClaim?.dispatchStarted === true) {
       return;
@@ -7118,7 +7250,17 @@ export class AgentSession {
               admissionStale: () =>
                 dispatchClaim.queueClaim.admissionSignal.aborted ||
                 internal?.admissionStale?.() === true,
+              waitForAdmissionRelease: () => this.waitForQueuedToolEndClaimAdmission(dispatchClaim),
+              onAdmissionIrreversible: () => {
+                dispatchClaim.admissionIrreversible = true;
+              },
+              onCanceled: async (reason: string) => {
+                if (!dispatchClaim.retryAfterCancellation) {
+                  await internal?.onCanceled?.(reason);
+                }
+              },
               onAccepted: async () => {
+                await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
                 if (dispatchClaim.queueClaim.admissionSignal.aborted) {
                   const reason: unknown = dispatchClaim.queueClaim.admissionSignal.reason;
                   throw new Error(
@@ -7178,7 +7320,11 @@ export class AgentSession {
             if (dispatchClaim != null) {
               this.releaseQueuedToolEndClaim(dispatchClaim);
             }
-            if (internal?.onCanceled == null && internal?.onAcceptedPreStreamFailure != null) {
+            if (
+              !dispatchClaim?.retryAfterCancellation &&
+              internal?.onCanceled == null &&
+              internal?.onAcceptedPreStreamFailure != null
+            ) {
               const reason: unknown = effectiveInternal?.cancelSignal?.reason;
               try {
                 await internal.onAcceptedPreStreamFailure(
