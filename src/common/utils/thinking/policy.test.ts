@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
   enforceThinkingPolicy,
@@ -253,6 +254,58 @@ describe("getThinkingPolicyForModel", () => {
       "medium",
       "high",
     ]);
+  });
+
+  // Pre-release assumption: GPT-6 Astra keeps the GPT-5.6 reasoning surface
+  // (native max, off allowed). Named variants and other GPT-6 ids stay outside it.
+  test("returns 6 levels including max for gpt-6-astra (direct, gateway, dated)", () => {
+    const sixLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(sixLevels);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-6-astra")).toEqual(sixLevels);
+    expect(getThinkingPolicyForModel("openrouter:openai/gpt-6-astra-2026-09-30")).toEqual(
+      sixLevels
+    );
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "max")).toBe("max");
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("off");
+  });
+
+  test("gpt-6-astra named variants and other GPT-6 ids fall through to the default policy", () => {
+    const defaultPolicy: ThinkingLevel[] = ["off", "low", "medium", "high"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra-mini")).toEqual(defaultPolicy);
+    expect(getThinkingPolicyForModel("openai:gpt-6")).toEqual(defaultPolicy);
+    expect(enforceThinkingPolicy("openai:gpt-6-astra-mini", "max")).toBe("high");
+  });
+
+  test("gpt-6-astra keeps off as its effective level (no forced thinking)", () => {
+    // Unlike Mythos/GLM/3.8 Flash, Astra's "off" is a real level (wire effort
+    // "none"), so an unset/off request must not be clamped up.
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("off");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "max")).toBe("max");
+    // Recognized reasoning model: default medium floor applies like the GPT-5.6 family.
+    expect(getDefaultMinimumThinkingLevel("openai:gpt-6-astra")).toBe("medium");
+    expect(getAvailableThinkingLevels("openai:gpt-6-astra", "medium")).toEqual([
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  test("mappedToModel aliases inherit gpt-6-astra's 6-level ladder", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      },
+    };
+    expect(getThinkingPolicyForModel("openai:team-astra", providersConfig)).toContain("max");
+    expect(enforceThinkingPolicy("openai:team-astra", "max", null, providersConfig)).toBe("max");
+    expect(getDefaultMinimumThinkingLevel("openai:team-astra", providersConfig)).toBe("medium");
+    // Without providers config the alias is unknown: default 4-level policy clamps max down.
+    expect(enforceThinkingPolicy("openai:team-astra", "max")).toBe("high");
   });
 
   test("returns 5 levels including xhigh for gpt-5.4-mini", () => {

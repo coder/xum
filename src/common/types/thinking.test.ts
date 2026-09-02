@@ -4,6 +4,7 @@ import {
   getOpenAIReasoningEffort,
   getThinkingDisplayLabel,
   getThinkingOptionLabel,
+  isGpt6AstraModel,
   MAX_THINKING_INDEX,
   openaiSupportsNativeMaxEffort,
   openaiSupportsProMode,
@@ -33,6 +34,14 @@ describe("getThinkingDisplayLabel", () => {
     expect(getThinkingDisplayLabel("max", "openai:gpt-5.6-luna")).toBe("MAX");
     // Pre-5.6 OpenAI models keep the max -> XHIGH display.
     expect(getThinkingDisplayLabel("max", "openai:gpt-5.5-pro")).toBe("XHIGH");
+  });
+
+  test("returns MAX for max on GPT-6 Astra (assumed native max effort), XHIGH for xhigh", () => {
+    expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra")).toBe("MAX");
+    expect(getThinkingDisplayLabel("max", "mux-gateway:openai/gpt-6-astra")).toBe("MAX");
+    expect(getThinkingDisplayLabel("xhigh", "openai:gpt-6-astra")).toBe("XHIGH");
+    // Named variants are not part of the assumption and keep the legacy display.
+    expect(getThinkingDisplayLabel("max", "openai:gpt-6-astra-mini")).toBe("XHIGH");
   });
 
   test("returns XHIGH for xhigh on Grok 4.6 (native effort), MAX on Grok 4.5", () => {
@@ -92,6 +101,24 @@ describe("openaiSupportsNativeMaxEffort", () => {
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.5-pro")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.61")).toBe(false);
   });
+
+  test("matches GPT-6 Astra including prefixed and dated variants (pre-release assumption)", () => {
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("mux-gateway:openai/gpt-6-astra")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2026-09-30")).toBe(true);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-20260930")).toBe(true);
+  });
+
+  test("does not extend the Astra assumption to named variants or other GPT-6 ids", () => {
+    expect(isGpt6AstraModel("openai:gpt-6-astra-mini")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6-astra.1")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6-astral")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-6-sol")).toBe(false);
+    expect(isGpt6AstraModel("openai:gpt-5.6-sol")).toBe(false);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6")).toBe(false);
+  });
 });
 
 describe("openaiSupportsProMode", () => {
@@ -110,6 +137,14 @@ describe("openaiSupportsProMode", () => {
     expect(openaiSupportsProMode("openai:gpt-5.6-sol-mini")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-5.61")).toBe(false);
     expect(openaiSupportsProMode("anthropic:claude-opus-4-7")).toBe(false);
+  });
+
+  test("withholds pro mode from GPT-6 Astra until OpenAI documents reasoning.mode for it", () => {
+    // Native max is assumed for Astra, but pro mode is gated separately: an
+    // unsupported reasoning.mode could fail the request, a missing toggle cannot.
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra")).toBe(true);
+    expect(openaiSupportsProMode("openai:gpt-6-astra")).toBe(false);
+    expect(openaiSupportsProMode("mux-gateway:openai/gpt-6-astra")).toBe(false);
   });
 });
 
@@ -132,6 +167,16 @@ describe("getOpenAIReasoningEffort", () => {
   test("keeps the standard mapping for lower levels", () => {
     expect(getOpenAIReasoningEffort("high", "openai:gpt-5.6-sol")).toBe("high");
     expect(getOpenAIReasoningEffort("low", "openai:gpt-5.6-sol")).toBe("low");
+  });
+
+  test("gives GPT-6 Astra the GPT-5.6 wire mapping (native max, explicit none)", () => {
+    expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra")).toBe("max");
+    expect(getOpenAIReasoningEffort("xhigh", "openai:gpt-6-astra")).toBe("xhigh");
+    expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra")).toBe("none");
+    expect(getOpenAIReasoningEffort("medium", "mux-gateway:openai/gpt-6-astra")).toBe("medium");
+    // Named variants fall outside the assumption and keep the legacy mapping.
+    expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra-mini")).toBe("xhigh");
+    expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra-mini")).toBeUndefined();
   });
 });
 

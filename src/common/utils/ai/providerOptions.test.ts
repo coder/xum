@@ -1394,6 +1394,98 @@ describe("buildProviderOptions - OpenAI", () => {
     });
   });
 
+  // Pre-release: Astra is ASSUMED to keep the GPT-5.6 reasoning surface (native
+  // max, explicit none) but NOT pro mode; these tests pin that split so the
+  // launch-day verification can flip exactly the seams that turn out wrong.
+  describe("GPT-6 Astra (pre-release) reasoning options", () => {
+    test("maps max to the native max effort and off to the explicit none effort", () => {
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "max"))).toMatchObject({
+        reasoningEffort: "max",
+        reasoningSummary: "detailed",
+        include: ["reasoning.encrypted_content"],
+      });
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "xhigh"))).toMatchObject({
+        reasoningEffort: "xhigh",
+      });
+      expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "off"))).toMatchObject({
+        reasoningEffort: "none",
+      });
+    });
+
+    test("preserves native max on the chatCompletions wire format", () => {
+      const result = buildProviderOptions("openai:gpt-6-astra", "max", undefined, undefined, {
+        openai: { wireFormat: "chatCompletions" },
+      });
+      expect(getOpenAIOptions(result)?.reasoningEffort).toBe("max");
+    });
+
+    test("degrades max to xhigh and omits none through the Copilot-routed gateway", () => {
+      const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
+        buildProviderOptions(
+          "openai:gpt-6-astra",
+          level,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          "github-copilot"
+        );
+      expect(build("max")).toEqual({ "github-copilot": { reasoningEffort: "xhigh" } });
+      expect(build("off")).toEqual({});
+    });
+
+    test("withholds pro mode even when requested on the direct Responses route", () => {
+      const result = buildProviderOptions(
+        "openai:gpt-6-astra",
+        "max",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "pro"
+      );
+      const openai = getOpenAIOptions(result);
+      expect(openai?.reasoningEffort).toBe("max");
+      expect(openai?.reasoningMode).toBeUndefined();
+    });
+
+    test("resolves mapped aliases to Astra for the native effort mapping", () => {
+      const providersConfig = createMockProvidersConfig({
+        "openai:team-astra": "openai:gpt-6-astra",
+      });
+      const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
+        getOpenAIOptions(
+          buildProviderOptions(
+            "openai:team-astra",
+            level,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            providersConfig
+          )
+        );
+      expect(build("max")?.reasoningEffort).toBe("max");
+      expect(build("off")?.reasoningEffort).toBe("none");
+    });
+
+    test("keeps named Astra variants on the legacy OpenAI mapping", () => {
+      expect(
+        getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra-mini", "max"))
+      ).toMatchObject({ reasoningEffort: "xhigh" });
+      expect(
+        getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra-mini", "off"))?.reasoningEffort
+      ).toBeUndefined();
+    });
+  });
+
   describe("GPT-5.6 explicit prompt caching serialization", () => {
     // Production-path wire test: createOpenAI + capture fetch + streamText
     // (the same streaming parser Xum uses), not intermediate TS objects.

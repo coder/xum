@@ -3858,6 +3858,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| GPT-5.6 Sol            | openai:gpt-5.6-sol            | `gpt`, `sol`                                                 |         |",
       "| GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |",
       "| GPT-5.6 Luna           | openai:gpt-5.6-luna           | `luna`                                                       |         |",
+      "| GPT-6 Astra            | openai:gpt-6-astra            | `astra`, `gpt-6-astra`                                       |         |",
       "| GPT-5.5 Pro            | openai:gpt-5.5-pro            | `gpt-pro`, `gpt-5.5-pro`                                     |         |",
       "| GPT-5.4 Mini           | openai:gpt-5.4-mini           | `gpt-mini`                                                   |         |",
       "| GPT-5.4 Nano           | openai:gpt-5.4-nano           | `gpt-nano`                                                   |         |",

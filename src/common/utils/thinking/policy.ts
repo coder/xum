@@ -82,6 +82,8 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * - openai:gpt-5.2 / openai:gpt-5.5 → ["off", "low", "medium", "high", "xhigh"]
  * - openai:gpt-5.6 family (Sol/Terra/Luna and the bare alias) →
  *   ["off", "low", "medium", "high", "xhigh", "max"] (6 levels; native max at GA)
+ * - openai:gpt-6-astra → same 6 levels (pre-release ASSUMPTION that Astra keeps the
+ *   GPT-5.6 reasoning surface; see openaiSupportsNativeMaxEffort)
  * - openai:gpt-5.2-pro / openai:gpt-5.5-pro → ["medium", "high", "xhigh"] (3 levels)
  * - openai:gpt-5-pro → ["high"] (only supported level, legacy)
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
@@ -164,7 +166,9 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   }
 
   // The GPT-5.6 family (Sol/Terra/Luna and the bare gpt-5.6 alias) supports
-  // the native "max" reasoning effort introduced at GA.
+  // the native "max" reasoning effort introduced at GA; GPT-6 Astra is assumed
+  // to keep it. Astra keeps "off" too (mapped to the explicit "none" effort), so
+  // it needs no forced-thinking entry in resolveEffectiveThinkingLevel.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
