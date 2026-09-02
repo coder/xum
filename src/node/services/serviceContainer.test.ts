@@ -6,36 +6,147 @@ import { Context, Duration, Effect, Layer } from "effect";
 import { TestClock } from "effect/testing";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createConfigStores, type Config, type ConfigStores } from "@/node/config";
+import type { ORPCContext } from "@/node/orpc/context";
+import { isInteractiveHostKeyApprovalAvailable } from "@/node/runtime/sshConnectionPool";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { CoreOptionsTag } from "@/node/services/di/layers/core";
 import {
+  AgentBrowserSessionDiscovery,
+  AgentPluginInstall,
   AI,
   Analytics,
+  Backup,
+  BrowserBridgeServerTag,
+  BrowserBridgeTokenManagerTag,
+  BrowserControl,
+  BrowserSessionStateHubTag,
+  Coder,
+  CoderOauth,
+  CodexOauth,
+  ConfigTag,
+  CopilotOauth,
+  DesktopBridgeServerTag,
+  DesktopSessionManagerTag,
+  DesktopTokenManagerTag,
   DevTools,
+  Editor,
   Experiments,
+  FileLeaseManagerTag,
+  History,
   IdleDispatcherTag,
   InitStateManagerTag,
+  Instructions,
   MCPConfig,
+  McpOauth,
   MCPServerManagerTag,
   Memory,
   MemoryConsolidation,
   MemoryMeta,
+  MenuEvent,
+  MuxGatewayOauth,
+  MuxGovernorOauth,
   Policy,
+  Project,
   Provider,
+  ProvidersConfigStoreTag,
+  QuickJSRuntimeFactoryTag,
+  Refine,
+  SecretsStoreTag,
+  Server,
+  ServerAuth,
+  SessionLocatorTag,
   SessionTiming,
   SessionUsage,
+  SshPrompt,
   StreamManagerTag,
   Task,
   Telemetry,
+  Terminal,
+  Timeline,
+  Tokenizer,
+  TurnRequestBuilderBindingsTag,
+  Update,
+  Voice,
+  WindowTag,
   Workspace,
   WorkspaceGoal,
+  WorkspaceLifecycleHooksTag,
   WorkspaceMcpOverrides,
-  WorkspaceTurnManagerTag,
+  WorktreeArchiveSnapshot,
   type AppTags,
 } from "@/node/services/di/tags";
 import { ServiceContainer } from "./serviceContainer";
+
+/**
+ * Independent field → tag listing for every ORPC context field (the production
+ * mapping lives in the Layer files); `Record<keyof …>` keeps it exhaustive, so
+ * a field added to `ORPCContext` without a tag fails to compile here.
+ */
+const ORPC_FIELD_TAGS: Record<
+  keyof Omit<ORPCContext, "headers" | "effect/context" | "effect/wrap">,
+  Context.Key<AppTags, unknown>
+> = {
+  config: ConfigTag,
+  sessionLocator: SessionLocatorTag,
+  providersConfigStore: ProvidersConfigStoreTag,
+  secretsStore: SecretsStoreTag,
+  fileLeaseManager: FileLeaseManagerTag,
+  aiService: AI,
+  historyService: History,
+  streamManager: StreamManagerTag,
+  initStateManager: InitStateManagerTag,
+  projectService: Project,
+  workspaceService: Workspace,
+  taskService: Task,
+  providerService: Provider,
+  muxGatewayOauthService: MuxGatewayOauth,
+  muxGovernorOauthService: MuxGovernorOauth,
+  codexOauthService: CodexOauth,
+  coderOauthService: CoderOauth,
+  copilotOauthService: CopilotOauth,
+  backupService: Backup,
+  terminalService: Terminal,
+  editorService: Editor,
+  windowService: WindowTag,
+  updateService: Update,
+  tokenizerService: Tokenizer,
+  serverService: Server,
+  menuEventService: MenuEvent,
+  voiceService: Voice,
+  mcpConfigService: MCPConfig,
+  mcpOauthService: McpOauth,
+  workspaceMcpOverridesService: WorkspaceMcpOverrides,
+  mcpServerManager: MCPServerManagerTag,
+  agentPluginInstallService: AgentPluginInstall,
+  sessionTimingService: SessionTiming,
+  timelineService: Timeline,
+  telemetryService: Telemetry,
+  experimentsService: Experiments,
+  memoryService: Memory,
+  memoryMetaService: MemoryMeta,
+  memoryConsolidationService: MemoryConsolidation,
+  refineService: Refine,
+  sessionUsageService: SessionUsage,
+  instructionsService: Instructions,
+  workspaceGoalService: WorkspaceGoal,
+  devToolsService: DevTools,
+  browserSessionDiscoveryService: AgentBrowserSessionDiscovery,
+  browserBridgeTokenManager: BrowserBridgeTokenManagerTag,
+  browserBridgeServer: BrowserBridgeServerTag,
+  browserControlService: BrowserControl,
+  browserSessionStateHub: BrowserSessionStateHubTag,
+  policyService: Policy,
+  coderService: Coder,
+  serverAuthService: ServerAuth,
+  sshPromptService: SshPrompt,
+  analyticsService: Analytics,
+  desktopSessionManager: DesktopSessionManagerTag,
+  desktopTokenManager: DesktopTokenManagerTag,
+  desktopBridgeServer: DesktopBridgeServerTag,
+  workflowRuntimeFactory: QuickJSRuntimeFactoryTag,
+};
 
 describe("ServiceContainer", () => {
   let tempDir: string;
@@ -283,42 +394,155 @@ describe("ServiceContainer", () => {
     services.idleCompactionService.stop();
   });
 
-  it("serves the layer-built core and cross-cutting services through the fields and the Effect context", () => {
+  it("serves every ORPC context field through its tag (one instance each)", () => {
     services = new ServiceContainer(stores);
-    const effectContext = services.toORPCContext()["effect/context"];
+    const orpcContext = services.toORPCContext();
+    const effectContext = orpcContext["effect/context"];
 
-    const fieldTags: Array<[keyof ServiceContainer, Context.Key<AppTags, unknown>]> = [
-      ["aiService", AI],
-      ["streamManager", StreamManagerTag],
-      ["initStateManager", InitStateManagerTag],
-      ["workspaceService", Workspace],
-      ["taskService", Task],
-      ["workspaceTurnManager", WorkspaceTurnManagerTag],
-      ["providerService", Provider],
-      ["mcpConfigService", MCPConfig],
-      ["mcpServerManager", MCPServerManagerTag],
-      ["sessionUsageService", SessionUsage],
-      ["workspaceGoalService", WorkspaceGoal],
-      ["memoryService", Memory],
-      ["memoryMetaService", MemoryMeta],
-      ["memoryConsolidationService", MemoryConsolidation],
-      ["idleDispatcher", IdleDispatcherTag],
-      ["policyService", Policy],
-      ["telemetryService", Telemetry],
-      ["experimentsService", Experiments],
-      ["sessionTimingService", SessionTiming],
-      ["analyticsService", Analytics],
-      ["devToolsService", DevTools],
-      ["workspaceMcpOverridesService", WorkspaceMcpOverrides],
-    ];
-    for (const [field, tag] of fieldTags) {
-      expect(Context.get(effectContext, tag)).toBe(services[field]);
+    for (const [field, tag] of Object.entries(ORPC_FIELD_TAGS) as Array<
+      [keyof typeof ORPC_FIELD_TAGS, Context.Key<AppTags, unknown>]
+    >) {
+      expect(Context.get(effectContext, tag)).toBe(orpcContext[field]);
     }
+    expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
+    expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
+      services.runtime.get(EffectRunnerTag)
+    );
     // The core graph's options are derived from the layer-built cross-cutting
     // instances, so core constructors received the same objects the fields expose.
     const coreOptions = services.runtime.get(CoreOptionsTag);
     expect(coreOptions.policyService).toBe(services.policyService);
     expect(coreOptions.experimentsService).toBe(services.experimentsService);
+  });
+
+  it("wires the desktop services like the constructor did (each line has an observable effect)", () => {
+    services = new ServiceContainer(stores);
+
+    // turnRequestBuilderBindings: the desktop-only collaborators.
+    const bindings = services.runtime.get(TurnRequestBuilderBindingsTag);
+    expect(bindings.analyticsService).toBe(services.analyticsService);
+    expect(bindings.desktopSessionManager).toBe(services.desktopSessionManager);
+    expect(bindings.timelineService).toBe(services.timelineService);
+    expect(bindings.codexOauthService).toBe(services.codexOauthService);
+    expect(bindings.coderOauthService).toBe(services.coderOauthService);
+
+    // Setter-provided collaborators (the former `set*` lines).
+    const workspaceInternals = services.workspaceService as unknown as {
+      terminalService?: unknown;
+      desktopSessionManager?: unknown;
+      refinePassCanceller?: unknown;
+      timelineRecorder?: unknown;
+      worktreeArchiveSnapshotService?: unknown;
+      workspaceLifecycleHooks?: unknown;
+    };
+    expect(workspaceInternals.terminalService).toBe(services.terminalService);
+    expect(workspaceInternals.desktopSessionManager).toBe(services.desktopSessionManager);
+    expect(workspaceInternals.refinePassCanceller).toBe(services.refineService);
+    expect(workspaceInternals.timelineRecorder).toBe(services.timelineService);
+    expect(workspaceInternals.worktreeArchiveSnapshotService).toBe(
+      services.runtime.get(WorktreeArchiveSnapshot)
+    );
+    expect(workspaceInternals.workspaceLifecycleHooks).toBe(
+      services.runtime.get(WorkspaceLifecycleHooksTag)
+    );
+    for (const recorderOwner of [
+      services.taskService,
+      services.heartbeatService,
+      services.workspaceGoalService,
+    ]) {
+      expect((recorderOwner as unknown as { timelineRecorder?: unknown }).timelineRecorder).toBe(
+        services.timelineService
+      );
+    }
+    const projectInternals = services.projectService as unknown as {
+      workspaceService?: unknown;
+      workspaceMetadataRefresher?: unknown;
+      mcpServerManager?: unknown;
+    };
+    expect(projectInternals.workspaceService).toBe(services.workspaceService);
+    expect(projectInternals.workspaceMetadataRefresher).toBe(services.workspaceService);
+    expect(projectInternals.mcpServerManager).toBe(services.mcpServerManager);
+    expect(
+      (services.mcpServerManager as unknown as { mcpOauthService?: unknown }).mcpOauthService
+    ).toBe(services.mcpOauthService);
+    const backupInternals = services.backupService as unknown as {
+      projectRegistrar?: unknown;
+      memoryNotifier?: unknown;
+    };
+    expect(backupInternals.projectRegistrar).toBe(services.projectService);
+    expect(backupInternals.memoryNotifier).toBe(services.memoryService);
+
+    // Idle-compaction outcomes reach the idle compaction service.
+    const recordOutcomeSpy = spyOn(services.idleCompactionService, "recordOutcome");
+    const outcomeListener = (
+      services.workspaceService as unknown as {
+        idleCompactionOutcomeListener?: (workspaceId: string, outcome: unknown) => void;
+      }
+    ).idleCompactionOutcomeListener;
+    outcomeListener?.("ws-1", { success: true });
+    expect(recordOutcomeSpy).toHaveBeenCalledWith("ws-1", { success: true });
+
+    // Global registrations: the SSH connection pools consult this container's
+    // prompt service for interactive host-key approval.
+    const responderSpy = spyOn(services.sshPromptService, "hasInteractiveResponder");
+    responderSpy.mockReturnValue(true);
+    expect(isInteractiveHostKeyApprovalAvailable()).toBe(true);
+    responderSpy.mockReturnValue(false);
+    expect(isInteractiveHostKeyApprovalAvailable()).toBe(false);
+
+    // Timeline subscribed to the workspace service, and the workers' timing
+    // listeners registered: a stream-start reaches the session timing service.
+    const timingSpy = spyOn(services.sessionTimingService, "handleStreamStart").mockImplementation(
+      () => undefined
+    );
+    services.aiService.emit("stream-start", {
+      type: "stream-start",
+      workspaceId: "ws-1",
+      messageId: "m-1",
+      model: "openai:gpt-4o",
+      historySequence: 1,
+      startTime: Date.now(),
+      mode: "exec",
+    });
+    expect(timingSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("tears down in the fixed dispose() and shutdown() order", async () => {
+    const order: string[] = [];
+    const record = (step: string) => () => {
+      order.push(step);
+      return Promise.resolve(undefined);
+    };
+    services = new ServiceContainer(stores);
+    spyOn(services.desktopBridgeServer, "stop").mockImplementation(record("bridge.stop"));
+    spyOn(services.desktopSessionManager, "closeAll").mockImplementation(
+      record("sessions.closeAll")
+    );
+    spyOn(services.browserBridgeServer, "stop").mockImplementation(record("browserBridge.stop"));
+    spyOn(services.analyticsService, "dispose").mockImplementation(record("analytics.dispose"));
+    spyOn(services.timelineService, "flush").mockImplementation(record("timeline.flush"));
+    spyOn(services.telemetryService, "shutdown").mockImplementation(record("telemetry.shutdown"));
+
+    await services.dispose();
+    // §5: bridge before sessions; browser bridge before analytics; timeline flush last.
+    expect(order).toEqual([
+      "bridge.stop",
+      "sessions.closeAll",
+      "browserBridge.stop",
+      "analytics.dispose",
+      "timeline.flush",
+    ]);
+
+    order.length = 0;
+    await services.shutdown();
+    expect(order).toEqual([
+      "bridge.stop",
+      "sessions.closeAll",
+      "browserBridge.stop",
+      "timeline.flush",
+      "analytics.dispose",
+      "telemetry.shutdown",
+    ]);
   });
 
   it("surfaces a throwing layer as a synchronous constructor throw", () => {

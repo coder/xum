@@ -44,6 +44,7 @@ import * as modelStatsModule from "@/common/utils/tokens/modelStats";
 import { SessionUsageService } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
@@ -1108,6 +1109,49 @@ describe("StreamManager - stream resource scope", () => {
     const writesAtStreamEnd = writePartialSpy.mock.calls.length;
     await new Promise((resolve) => setTimeout(resolve, throttleMs + 200));
     expect(writePartialSpy.mock.calls.length).toBe(writesAtStreamEnd);
+  });
+
+  test("runs the partial-write debounce on the injected runner's clock", async () => {
+    // The debounce fiber must sleep on the injected EffectRunner (the app
+    // runtime's clock in production), not the global runtime: a TestClock
+    // runner fires the flush only when the test clock advances.
+    const testRunner = makeTestEffectRunner();
+    try {
+      const streamManager = new StreamManager(
+        historyService,
+        undefined,
+        undefined,
+        undefined,
+        testRunner.runner
+      );
+      expect(streamManager.effectRunner).toBe(testRunner.runner);
+      const workspaceId = "runner-debounce-workspace";
+      // Inside the throttle window, so the write is debounced rather than immediate.
+      const streamInfo = createStreamInfoForTests({ lastPartialWriteTime: Date.now() });
+      getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+      const schedulePartialWrite = getPrivateMethodForTests<
+        (workspaceId: string, streamInfo: Record<string, unknown>) => Promise<void>
+      >(streamManager, "schedulePartialWrite");
+      const writePartialSpy = spyOn(historyService, "writePartial");
+      const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
+      if (typeof throttleMs !== "number") {
+        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
+      }
+
+      await schedulePartialWrite.call(streamManager, workspaceId, streamInfo);
+      expect(streamInfo.partialWriteFiber).toBeDefined();
+      // Real time passes; the virtual clock has not, so nothing flushes.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(writePartialSpy).not.toHaveBeenCalled();
+
+      await testRunner.adjust(throttleMs);
+      // The flush's Effect.promise settles on the next macrotask.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(writePartialSpy).toHaveBeenCalledTimes(1);
+      expect(streamInfo.partialWriteFiber).toBeUndefined();
+    } finally {
+      await testRunner.dispose();
+    }
   });
 });
 

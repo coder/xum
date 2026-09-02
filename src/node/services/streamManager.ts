@@ -97,6 +97,7 @@ import {
 } from "@/common/utils/providers/modelEntries";
 import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
@@ -778,6 +779,14 @@ export class StreamManager {
   private readonly sessionUsageService?: SessionUsageService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
   private eventSink: TurnEngineEventSink;
+  /**
+   * Runs the clock-driven lifecycle fibers (partial-write debounce and its
+   * interrupt) and is handed to per-session workers that must share this
+   * stream's clock (`RetryManager`, via `AgentSessionStreamManager`). The app
+   * runtime's context-bound runner in production — a `TestClock` in tests —
+   * and the global runtime wherever nothing is injected (di/effectRunner.ts).
+   */
+  public readonly effectRunner: EffectRunner;
   // Token tracker for live streaming statistics
   private tokenTracker = new StreamingTokenTracker();
   // Track OpenAI previousResponseIds that have been invalidated
@@ -793,12 +802,14 @@ export class StreamManager {
     historyService: HistoryService,
     sessionUsageService?: SessionUsageService,
     getProvidersConfig?: () => ProvidersConfigMap | null,
-    eventSink: TurnEngineEventSink = () => undefined
+    eventSink: TurnEngineEventSink = () => undefined,
+    runner: EffectRunner = defaultEffectRunner
   ) {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
     this.eventSink = eventSink;
+    this.effectRunner = runner;
   }
 
   setEventSink(eventSink: TurnEngineEventSink): void {
@@ -1138,9 +1149,9 @@ export class StreamManager {
     // to the sleep, so the debounce delay is registered before this method
     // returns (same observable ordering as the previous setTimeout call).
     streamInfo.partialWriteFiber = streamInfo.resourceScope
-      ? Effect.runSync(Effect.forkIn(delayedFlush, streamInfo.resourceScope))
+      ? this.effectRunner.runSync(Effect.forkIn(delayedFlush, streamInfo.resourceScope))
       : // Whitebox test fixtures register stream infos without a resource scope.
-        Effect.runFork(delayedFlush);
+        this.effectRunner.runFork(delayedFlush);
   }
 
   /**
@@ -1155,7 +1166,7 @@ export class StreamManager {
       return;
     }
     streamInfo.partialWriteFiber = undefined;
-    Effect.runFork(Fiber.interrupt(fiber));
+    this.effectRunner.runFork(Fiber.interrupt(fiber));
   }
 
   private async awaitPendingPartialWrite(streamInfo: WorkspaceStreamInfo): Promise<void> {

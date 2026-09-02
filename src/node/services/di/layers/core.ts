@@ -13,7 +13,7 @@ import { AIService } from "@/node/services/aiService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive } from "@/node/services/di/appFiberScope";
-import { EffectRunnerLive } from "@/node/services/di/effectRunner";
+import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AI,
   BackgroundProcessManagerTag,
@@ -90,11 +90,18 @@ export class CoreOptionsTag extends Context.Service<CoreOptionsTag, CoreOptions>
 
 /**
  * What the roots must provide beneath `CoreLive`: the stores, the options,
- * and the two always-present collaborators the desktop builds elsewhere
- * (`MemoryMetaLive`; `WorkspaceMcpOverrides` from `CrossCuttingLive`). CLI
- * roots supply the defaults (`MemoryMetaLive`, `WorkspaceMcpOverridesDefaultLive`).
+ * the runtime's `EffectRunner` (the base seam in both roots; StreamManager's
+ * clock-driven fibers run through it), and the two always-present
+ * collaborators the desktop builds elsewhere (`MemoryMetaLive`;
+ * `WorkspaceMcpOverrides` from `CrossCuttingLive`). CLI roots supply the
+ * defaults (`MemoryMetaLive`, `WorkspaceMcpOverridesDefaultLive`).
  */
-export type CoreInputTags = StoreTags | CoreOptionsTag | MemoryMeta | WorkspaceMcpOverrides;
+export type CoreInputTags =
+  | StoreTags
+  | CoreOptionsTag
+  | EffectRunnerTag
+  | MemoryMeta
+  | WorkspaceMcpOverrides;
 
 /** Memory metadata sidecar; scope root derives from the xum home (`config.rootDir`). */
 export const MemoryMetaLive: Layer.Layer<MemoryMeta, never, ConfigTag> = Layer.effect(
@@ -220,8 +227,13 @@ export const StreamManagerLive = Layer.effect(
   StreamManagerTag,
   Effect.gen(function* () {
     const providerService = yield* Provider;
-    return new StreamManager(yield* History, yield* SessionUsage, () =>
-      providerService.getConfig()
+    return new StreamManager(
+      yield* History,
+      yield* SessionUsage,
+      () => providerService.getConfig(),
+      // Default event sink: AIService installs itself as the sink (S3).
+      undefined,
+      yield* EffectRunnerTag
     );
   })
 );
