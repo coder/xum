@@ -1248,12 +1248,12 @@ body,
 @media (max-width: 768px) {
   .mobile-menu-btn {
     display: inline-flex !important;
-    justify-content: flex-start !important;
-    padding-left: 12px !important;
   }
 
+  /* The collapsed-left-sidebar header inset reserves room for the desktop reopen affordance; at
+     phone widths this button is that affordance, so fall back to the header's ordinary gutter. */
   .mobile-sticky-header:has(.mobile-menu-btn) {
-    padding-left: 0 !important;
+    padding-left: 0.5rem !important;
   }
 
   /* Hand the bottom inset to a column that reserves its own clearance (see ChatPane and
