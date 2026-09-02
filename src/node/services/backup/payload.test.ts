@@ -3848,6 +3848,32 @@ describe("project bundle", () => {
     });
   });
 
+  it("does not bring a superseded association back through the crash fallback", async () => {
+    const a = "/home/dev/src/alpha";
+    const c = "/home/dev/src/gamma";
+    const b = "/home/other/b";
+    const d = "/home/other/d";
+    const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
+    // A moves from B to D (completed), then C is imported into D. A's record still names B
+    // as where it came from, and B's stale record still names A.
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), a);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), a);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), c);
+
+    // D's record exists and names C, so A's pair was completed and then superseded: A is
+    // unmatched, and in particular not matched back to B, whose memory a matched restore
+    // would otherwise overwrite without approval.
+    const origins = await readProjectMemoryOrigins(muxRoot, registered, [a, c]);
+    expect([...origins.entries()]).toEqual([
+      [c, { projectPath: d, memoryDir: projectMemoryDirName(d) }],
+    ]);
+
+    // Likewise when D is unregistered rather than reassigned.
+    const onlyB = new Map([[b, projectMemoryDirName(b)]]);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), a);
+    expect((await readProjectMemoryOrigins(muxRoot, onlyB, [a])).size).toBe(0);
+  });
+
   it("ignores markers that are broken, mis-named, or name an unregistered project", async () => {
     const registeredProject = "/home/other/a";
     const registered = new Map([[registeredProject, projectMemoryDirName(registeredProject)]]);

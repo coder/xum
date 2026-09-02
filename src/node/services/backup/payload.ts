@@ -3297,22 +3297,37 @@ export async function readProjectMemoryOrigins(
     if (claim?.sourcePath !== sourcePath) continue;
     // The project's own record must name this source back: a project imported into again
     // from another source names that source now, and the older claim on it is void even
-    // though the older source's record still exists. The project the source came from is
-    // tried second: a re-import interrupted between its two writes (a crash) has updated the
-    // source's record but not the new project's, and the old project's record still
-    // confirms the source, so that association stands until the pair is completed.
-    for (const memoryDir of [claim.memoryDir, claim.previousMemoryDir]) {
-      if (memoryDir === undefined) continue;
-      const projectPath = projectByDir.get(memoryDir);
-      if (projectPath == null) continue;
-      const target = await readProjectMemoryOriginRecord(
-        root,
-        projectMemoryOriginTargetPath(memoryDir)
-      );
-      if (target?.sourcePath !== sourcePath || target.memoryDir !== memoryDir) continue;
-      origins.set(sourcePath, { projectPath, memoryDir });
-      break;
+    // though the older source's record still exists.
+    const targetBytes = await readProjectMemoryOriginRecordBytes(
+      root,
+      projectMemoryOriginTargetPath(claim.memoryDir)
+    );
+    let memoryDir: string | undefined;
+    if (targetBytes === "absent") {
+      // No record at all for the new project: the re-import that wrote this claim was
+      // interrupted between its two writes, so the pair is provably incomplete and the
+      // project the source came from — whose record a crash leaves intact — still confirms
+      // the association. Only then: a record that exists but names another source means the
+      // pair was completed and later superseded (or the project was imported into meanwhile),
+      // and the previous project's stale record must not bring the old association back.
+      const previousDir = claim.previousMemoryDir;
+      const previous =
+        previousDir === undefined
+          ? null
+          : await readProjectMemoryOriginRecord(root, projectMemoryOriginTargetPath(previousDir));
+      if (previous?.sourcePath === sourcePath && previous.memoryDir === previousDir) {
+        memoryDir = previousDir;
+      }
+    } else if (Buffer.isBuffer(targetBytes)) {
+      const target = parseProjectMemoryOriginRecord(targetBytes);
+      if (target?.sourcePath === sourcePath && target.memoryDir === claim.memoryDir) {
+        memoryDir = claim.memoryDir;
+      }
     }
+    if (memoryDir === undefined) continue;
+    const projectPath = projectByDir.get(memoryDir);
+    if (projectPath == null) continue;
+    origins.set(sourcePath, { projectPath, memoryDir });
   }
   return origins;
 }

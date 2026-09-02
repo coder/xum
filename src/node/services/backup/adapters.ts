@@ -18,7 +18,10 @@ import {
   memoryMutationLockKey,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
-import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
+import {
+  type ProjectRegistrationLockHandle,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   BackupServiceError,
@@ -635,7 +638,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const payload = await readBackupPayload(sourceDir);
       const before = await localFilesByPath();
 
-      const restoreCore = async (): Promise<{ localOnlyFiles: string[] }> => {
+      const restoreCore = async (
+        registration: ProjectRegistrationLockHandle | null
+      ): Promise<{ localOnlyFiles: string[] }> => {
         const result = await restoreBackupPayload({
           muxRoot,
           payload,
@@ -643,15 +648,20 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         });
         if (result.backupPreferences !== undefined) {
           let merged: ReturnType<typeof normalizeUserPreferences> | undefined;
-          await options.config.editConfig((current) => {
-            // Merged against the config this edit reads, not a snapshot taken before the
-            // restore: a whole-object write would otherwise discard preferences another
-            // window saved meanwhile, including the machine-local keys no backup carries.
-            merged = normalizeUserPreferences(
-              mergeBackupPreferences(current.userPreferences, result.backupPreferences)
-            );
-            return { ...current, userPreferences: merged };
-          });
+          await options.config.editConfig(
+            (current) => {
+              // Merged against the config this edit reads, not a snapshot taken before the
+              // restore: a whole-object write would otherwise discard preferences another
+              // window saved meanwhile, including the machine-local keys no backup carries.
+              merged = normalizeUserPreferences(
+                mergeBackupPreferences(current.userPreferences, result.backupPreferences)
+              );
+              return { ...current, userPreferences: merged };
+            },
+            // Inside the project restore's registration window the edit must ride that
+            // window's hold: taking its own would wait on itself.
+            registration === null ? {} : { withinRegistrationLock: registration }
+          );
           // saveConfig logs and swallows write failures, so a resolved edit does not prove
           // the preferences landed. Compared through the backup projection because every
           // key a restore can change is portable, so a lost write is visible there, while
@@ -682,7 +692,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // core-only restore, but its presence is reported so the skip is visible.
         projectBundleSkipped =
           !restoreOptions.includeProjects && (await projectBundleExists(sourceDir));
-        core = await restoreCore();
+        core = await restoreCore(null);
       } else {
         // Only entries the caller validated as matched, to the very same destination. A
         // project registered at its recorded path since validation was previewed as an
@@ -755,7 +765,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // Before each irreversible step: this process must still hold the registration
             // lock, or the registration read above may no longer describe the project set.
             await registration.assertStillOwned();
-            const coreResult = await restoreCore();
+            const coreResult = await restoreCore(registration);
             // Matched entries restore verbatim, exactly what the preview promised. Imports
             // are executed separately by the service, after project registration.
             for (const match of matched) {

@@ -2794,8 +2794,8 @@ exit 1
     it("gates every registration path through Config, not just create and remove", async () => {
       // setTrust registers a missing entry as a side effect — one of several writers that
       // add a project key without going through create(). Config.editConfig serializes it
-      // with the restore window all the same, while an edit that changes nothing about the
-      // project set goes through immediately.
+      // with the restore window all the same — as it does every edit, since each one saves
+      // the whole config.
       const unregistered = "/fake/trusted-later";
       const held = Promise.withResolvers<void>();
       const lockAcquired = Promise.withResolvers<void>();
@@ -2809,16 +2809,22 @@ exit 1
       const trusting = service.setTrust(unregistered, true).then(() => {
         trusted = true;
       });
-      await config.editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }));
+      let valueSaved = false;
+      const valueEdit = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          valueSaved = true;
+        });
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(trusted).toBe(false);
+      expect(valueSaved).toBe(false);
       expect(config.loadConfigOrDefault().projects.has(unregistered)).toBe(false);
-      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
 
       held.resolve();
       await holding;
-      await trusting;
+      await Promise.all([trusting, valueEdit]);
       expect(config.loadConfigOrDefault().projects.get(unregistered)?.trusted).toBe(true);
+      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
     });
 
     it("waits for another process's registration hold and re-reads config under it", async () => {
