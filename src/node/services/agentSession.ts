@@ -5026,7 +5026,11 @@ export class AgentSession {
       // A synthetic acceptance callback can already be running and cannot wait on the new hold.
       // Keep its completion from draining later entries before the workspace-level policy runs.
       this.hardInterruptClaimSettlementPending = options?.deferQueueSettlement === true;
-      await this.excludeCanceledIrreversibleClaim(interruptedClaim);
+      const exclusionResult = await this.excludeCanceledIrreversibleClaim(interruptedClaim);
+      if (!exclusionResult.success) {
+        this.preserveQueuedToolEndClaimForImmediateSend = false;
+        return exclusionResult;
+      }
       if (
         options?.deferQueueSettlement !== true &&
         interruptedClaim?.admissionIrreversible === true &&
@@ -7152,13 +7156,13 @@ export class AgentSession {
 
   private async excludeCanceledIrreversibleClaim(
     activeClaim: QueuedToolEndClaim | undefined
-  ): Promise<void> {
+  ): Promise<Result<void>> {
     if (
       activeClaim?.admissionIrreversible !== true ||
       activeClaim.queueClaim.userAuthored ||
       !activeClaim.queueClaim.admissionSignal.aborted
     ) {
-      return;
+      return Ok(undefined);
     }
 
     const messageIds = activeClaim.persistedMessageIds;
@@ -7166,7 +7170,7 @@ export class AgentSession {
       this.providerExcludedHistoryMessageIds.add(messageId);
     }
     if (messageIds.length === 0) {
-      return;
+      return Ok(undefined);
     }
 
     const exclusionResult = await this.historyService.markMessagesProviderExcluded(
@@ -7175,7 +7179,7 @@ export class AgentSession {
     );
     if (exclusionResult.success) {
       this.onProviderExcludedHistoryChange?.();
-      return;
+      return Ok(undefined);
     }
 
     // Persist the exclusion before producer settlement. A crash must never expose
@@ -7185,13 +7189,10 @@ export class AgentSession {
       messageIds
     );
     if (!tombstoneResult.success) {
-      log.error("Failed to persist a provider exclusion tombstone", {
-        workspaceId: this.workspaceId,
-        messageIds,
-        exclusionError: exclusionResult.error,
-        tombstoneError: tombstoneResult.error,
-      });
-      return;
+      // Keep the admission hold closed. A later Stop retries both durable writes.
+      return Err(
+        `Cannot stop the synthetic wake safely: ${exclusionResult.error}; ${tombstoneResult.error}`
+      );
     }
     this.onProviderExcludedHistoryChange?.();
 
@@ -7203,7 +7204,7 @@ export class AgentSession {
           messageIds,
           exclusionError: exclusionResult.error,
         });
-        return;
+        return Ok(undefined);
       }
       try {
         // The tombstone keeps the recovery record excluded while this watermark advances.
@@ -7215,7 +7216,7 @@ export class AgentSession {
           exclusionError: exclusionResult.error,
           error: getErrorMessage(error),
         });
-        return;
+        return Ok(undefined);
       }
     }
 
@@ -7231,6 +7232,7 @@ export class AgentSession {
         deleteError: deleteResult.error,
       });
     }
+    return Ok(undefined);
   }
 
   private pauseQueuedToolEndClaimAdmission(): void {

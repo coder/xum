@@ -1617,6 +1617,90 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("keeps a stopped wake held when both exclusion writes fail", async () => {
+    const workspaceId = "queue-dispatch-exclusion-write-failure";
+    const records = [
+      {
+        processId: "proc",
+        wakeUpdatedAt: "2026-08-31T12:00:00.000Z:12",
+        kind: "match" as const,
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      },
+    ];
+    const settleProviderExcludedWakeRecords = mock(() => Promise.resolve());
+    const { session, cleanup, aiService, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      settleProviderExcludedWakeRecords,
+    });
+    const messageId = "unexcluded-wake";
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage(messageId, "user", "monitor wake", {
+        synthetic: true,
+        muxMetadata: { type: "bash-monitor-wake", records },
+      })
+    );
+    expect(appendResult.success).toBe(true);
+    const markMessagesProviderExcluded = spyOn(
+      historyService,
+      "markMessagesProviderExcluded"
+    ).mockResolvedValueOnce(Err("injected marker failure"));
+    const addProviderExclusionTombstones = spyOn(
+      historyService,
+      "addProviderExclusionTombstones"
+    ).mockResolvedValueOnce(Err("injected tombstone failure"));
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    const admissionController = new AbortController();
+    const release = mock(() => undefined);
+    const queueClaim: ToolEndQueueClaim = {
+      userAuthored: false,
+      admissionSignal: admissionController.signal,
+      commit: mock(() => true),
+      restoreCancellation: mock(() => undefined),
+      cancelAdmission: mock((reason: string) => admissionController.abort(reason)),
+      requeueAdmission: mock(() => false),
+      release,
+    };
+    const activeClaim = {
+      queueClaim,
+      source: "sdk" as const,
+      dispatchStarted: true,
+      dispatchDeferredByHardInterrupt: false,
+      admissionIrreversible: true,
+      persistedMessageIds: [messageId],
+      providerExcludedWakeRecords: records,
+      retryAfterCancellation: false,
+      admissionHold: undefined as { promise: Promise<void>; release: () => void } | undefined,
+    };
+    const internalSession = session as unknown as {
+      queuedToolEndClaim: typeof activeClaim;
+    };
+    internalSession.queuedToolEndClaim = activeClaim;
+
+    try {
+      const result = await session.interruptStream({ deferQueueSettlement: true });
+
+      expect(result.success).toBe(false);
+      expect(settleProviderExcludedWakeRecords).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+      expect(activeClaim.admissionHold).toBeDefined();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data[0]?.metadata?.providerExcluded).not.toBe(true);
+      }
+    } finally {
+      activeClaim.admissionHold?.release();
+      stopStream.mockRestore();
+      addProviderExclusionTombstones.mockRestore();
+      markMessagesProviderExcluded.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("restores the provider-tool queue claim when the soft stop fails", async () => {
     const workspaceId = "queue-dispatch-provider-tool-stop-failure";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
