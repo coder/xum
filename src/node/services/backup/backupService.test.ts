@@ -1906,6 +1906,63 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("refuses an import whose target directory was deleted and recreated since approval", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const importedTo: string[] = [];
+    let registrations = 0;
+    let approvedInode: bigint | null = null;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        // Deleted and recreated, not moved: the freed inode number is what a filesystem hands
+        // out again, so the new directory can report the identity recorded at approval.
+        writeSafetySnapshot: async () => {
+          approvedInode = (await fs.stat(target, { bigint: true })).ino;
+          await fs.rm(target, { recursive: true });
+          await fs.mkdir(target);
+        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    expect(registrations).toBe(0);
+    expect(importedTo).toEqual([]);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "failed",
+        message: expect.stringContaining("replaced") as string,
+      });
+    }
+    // The plan held the approved directory open, so its inode stayed allocated and the
+    // replacement could not be given it — that, not luck in allocation, is what the check
+    // relies on. Released once the restore returned.
+    expect((await fs.stat(target, { bigint: true })).ino).not.toBe(approvedInode);
+  });
+
   test("does not import into a target replaced while it was being registered", async () => {
     const target = path.join(tempDir, "target");
     await fs.mkdir(target);

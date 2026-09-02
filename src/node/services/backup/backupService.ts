@@ -220,7 +220,14 @@ const REGISTRY_MAX_STALLED_PROBES = 2;
 interface PlannedProjectImport {
   candidate: BackupProjectImport;
   targetPath: string;
-  targetIdentity: { dev: number; ino: number };
+  /**
+   * A handle on the approved directory, held open until the import is done (restore() closes
+   * it). Execution accepts only the directory whose device and inode match this handle's;
+   * comparing against numbers recorded at approval would not do, since a directory deleted
+   * and recreated at the path meanwhile can be given the same inode number back — but not
+   * while a handle keeps that inode allocated.
+   */
+  target: fs.FileHandle;
   registeredPath: string | null;
   /**
    * Whether the candidate's recorded source path was already registered when it was offered.
@@ -362,6 +369,11 @@ function isNetworkOrDevicePath(targetPath: string): boolean {
 
 async function realpathOrNull(target: string): Promise<string | null> {
   return fs.realpath(target).catch(() => null);
+}
+
+/** Releases the directory handles a plan holds (see PlannedProjectImport.target). */
+async function closeProjectImportTargets(planned: readonly PlannedProjectImport[]): Promise<void> {
+  await Promise.all(planned.map((imported) => imported.target.close().catch(() => undefined)));
 }
 
 /**
@@ -707,100 +719,106 @@ export class BackupService {
           validated.matchedProjects,
           includeProjects
         );
-        // The bundle is read once for every approved import, and each import's write-side
-        // refusals run now: an import that cannot land must fail while nothing has changed
-        // yet, not after the core restore and its project registration.
-        const importer =
-          plannedImports.length === 0
-            ? null
-            : await this.dependencies.payload.prepareProjectImports({
-                repositoryRoot: repository.rootDir,
-                managedPath: repository.managedPath,
-              });
-        for (const planned of plannedImports) {
-          await importer?.assertProjectMemoryAllowed({
-            token: planned.candidate.token,
-            // Against the identity the import will actually write to: a target that is an
-            // alias of an already registered project imports into that project.
-            targetPath: planned.registeredPath ?? planned.targetPath,
-          });
-        }
-        const plannedTokens = new Set(plannedImports.map((planned) => planned.candidate.token));
-        const unapprovedProjectImports = validated.projectImports.filter(
-          (candidate) => !plannedTokens.has(candidate.token)
-        );
-        const snapshotPath = await this.createSnapshotPath();
+        // The plan holds a handle per approved target from here until the imports are done
+        // (see PlannedProjectImport.target), released however this ends.
         try {
-          await this.dependencies.payload.writeSafetySnapshot(snapshotPath);
-        } catch (error) {
-          // Nothing has been restored yet, so a snapshot that did not finish is an empty or
-          // partial unredacted copy that no recovery can use, and every retry would add one.
-          await fs.rm(snapshotPath, { recursive: true, force: true });
-          throw error;
-        }
-        try {
-          const restored = await this.dependencies.payload.restore({
-            repositoryRoot: repository.rootDir,
-            managedPath: repository.managedPath,
-            approvedCommandTokens,
-            includeProjects,
-            snapshotPath,
-            matchedProjects: validated.matchedProjects,
-          });
-          // Announced as soon as the memory is on disk: a failure recording the commit below
-          // must not leave subscribers showing pre-restore contents.
-          this.notifyProjectMemoryChanges(restored.restoredProjectMemory, []);
-          // Recorded before the imports: they register projects and create files the snapshot
-          // does not cover, and their per-candidate results are the user's only undo list, so
-          // nothing that can fail may run after them and discard those results.
-          await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
-          const { results: projectImportResults, reclassified } =
-            importer === null
-              ? { results: [], reclassified: new Set<string>() }
-              : await this.executeProjectImports(importer, plannedImports, registry);
-          this.notifyProjectMemoryChanges([], projectImportResults);
-          // A candidate whose import failed per-candidate, or landed only partly because
-          // existing files conflicted, stays on offer so the user can fix the target or the
-          // conflicts and retry without another preview; its token is still current, and a
-          // conflicted import records no origin, so the source is still an import candidate.
-          // Not one whose source became a registered project here: only a new preview can
-          // present it, as a matched entry, so offering it again would only fail.
-          const stillOfferedTokens = new Set(
-            projectImportResults.flatMap((result, index) => {
-              const token = plannedImports[index]?.candidate.token;
-              if (token === undefined || reclassified.has(token)) return [];
-              return result.status === "failed" || result.skippedFiles.length > 0 ? [token] : [];
-            })
-          );
-          return Ok({
-            commit: remoteCommit,
-            snapshotPath,
-            changedFiles: restored.changedFiles,
-            localOnlyFiles: restored.localOnlyFiles,
-            projectImportResults,
-            projectBundleSkipped: restored.projectBundleSkipped,
-            unapprovedProjectImports: [
-              ...unapprovedProjectImports,
-              ...validated.projectImports.filter((candidate) =>
-                stillOfferedTokens.has(candidate.token)
-              ),
-            ],
-          });
-        } catch (error) {
-          // Memory the failed restore already overwrote is on disk; subscribers must
-          // hear about it even though the restore is being reported as failed.
-          if (error instanceof ProjectMemoryRestoreError) {
-            this.notifyProjectMemoryChanges(error.restoredProjectMemory, []);
+          // The bundle is read once for every approved import, and each import's write-side
+          // refusals run now: an import that cannot land must fail while nothing has changed
+          // yet, not after the core restore and its project registration.
+          const importer =
+            plannedImports.length === 0
+              ? null
+              : await this.dependencies.payload.prepareProjectImports({
+                  repositoryRoot: repository.rootDir,
+                  managedPath: repository.managedPath,
+                });
+          for (const planned of plannedImports) {
+            await importer?.assertProjectMemoryAllowed({
+              token: planned.candidate.token,
+              // Against the identity the import will actually write to: a target that is an
+              // alias of an already registered project imports into that project.
+              targetPath: planned.registeredPath ?? planned.targetPath,
+            });
           }
-          // Past the snapshot, the restore may have overwritten files before failing, and
-          // the snapshot is the only recovery path, so the failure must carry it.
-          return Err({ ...toOperationError(error), snapshotPath });
+          const plannedTokens = new Set(plannedImports.map((planned) => planned.candidate.token));
+          const unapprovedProjectImports = validated.projectImports.filter(
+            (candidate) => !plannedTokens.has(candidate.token)
+          );
+          const snapshotPath = await this.createSnapshotPath();
+          try {
+            await this.dependencies.payload.writeSafetySnapshot(snapshotPath);
+          } catch (error) {
+            // Nothing has been restored yet, so a snapshot that did not finish is an empty or
+            // partial unredacted copy that no recovery can use, and every retry would add one.
+            await fs.rm(snapshotPath, { recursive: true, force: true });
+            throw error;
+          }
+          try {
+            const restored = await this.dependencies.payload.restore({
+              repositoryRoot: repository.rootDir,
+              managedPath: repository.managedPath,
+              approvedCommandTokens,
+              includeProjects,
+              snapshotPath,
+              matchedProjects: validated.matchedProjects,
+            });
+            // Announced as soon as the memory is on disk: a failure recording the commit below
+            // must not leave subscribers showing pre-restore contents.
+            this.notifyProjectMemoryChanges(restored.restoredProjectMemory, []);
+            // Recorded before the imports: they register projects and create files the snapshot
+            // does not cover, and their per-candidate results are the user's only undo list, so
+            // nothing that can fail may run after them and discard those results.
+            await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
+            const { results: projectImportResults, reclassified } =
+              importer === null
+                ? { results: [], reclassified: new Set<string>() }
+                : await this.executeProjectImports(importer, plannedImports, registry);
+            this.notifyProjectMemoryChanges([], projectImportResults);
+            // A candidate whose import failed per-candidate, or landed only partly because
+            // existing files conflicted, stays on offer so the user can fix the target or the
+            // conflicts and retry without another preview; its token is still current, and a
+            // conflicted import records no origin, so the source is still an import candidate.
+            // Not one whose source became a registered project here: only a new preview can
+            // present it, as a matched entry, so offering it again would only fail.
+            const stillOfferedTokens = new Set(
+              projectImportResults.flatMap((result, index) => {
+                const token = plannedImports[index]?.candidate.token;
+                if (token === undefined || reclassified.has(token)) return [];
+                return result.status === "failed" || result.skippedFiles.length > 0 ? [token] : [];
+              })
+            );
+            return Ok({
+              commit: remoteCommit,
+              snapshotPath,
+              changedFiles: restored.changedFiles,
+              localOnlyFiles: restored.localOnlyFiles,
+              projectImportResults,
+              projectBundleSkipped: restored.projectBundleSkipped,
+              unapprovedProjectImports: [
+                ...unapprovedProjectImports,
+                ...validated.projectImports.filter((candidate) =>
+                  stillOfferedTokens.has(candidate.token)
+                ),
+              ],
+            });
+          } catch (error) {
+            // Memory the failed restore already overwrote is on disk; subscribers must
+            // hear about it even though the restore is being reported as failed.
+            if (error instanceof ProjectMemoryRestoreError) {
+              this.notifyProjectMemoryChanges(error.restoredProjectMemory, []);
+            }
+            // Past the snapshot, the restore may have overwritten files before failing, and
+            // the snapshot is the only recovery path, so the failure must carry it.
+            return Err({ ...toOperationError(error), snapshotPath });
+          } finally {
+            // Released only now, because until this restore returns its snapshot is the recovery
+            // point it may still hand back. Reaping is safe here rather than gated on other
+            // restores because the local payload lock already excludes them.
+            await releaseSnapshot(snapshotPath);
+            await this.reapOldSnapshots(path.dirname(snapshotPath), snapshotPath);
+          }
         } finally {
-          // Released only now, because until this restore returns its snapshot is the recovery
-          // point it may still hand back. Reaping is safe here rather than gated on other
-          // restores because the local payload lock already excludes them.
-          await releaseSnapshot(snapshotPath);
-          await this.reapOldSnapshots(path.dirname(snapshotPath), snapshotPath);
+          await closeProjectImportTargets(plannedImports);
         }
       });
     });
@@ -832,7 +850,39 @@ export class BackupService {
     const matchedProjectPaths = new Set(matched.map((match) => match.projectPath));
     // Every source path the bundle records, whichever entry recorded it.
     const recordedSources = new Set([...candidates, ...matched].map((entry) => entry.sourcePath));
-    for (const request of requested) {
+    try {
+      for (const request of requested) {
+        planned.push(
+          await this.planProjectImport(request, byToken, registry, {
+            claimedTargets,
+            matchedProjectPaths,
+            recordedSources,
+            candidates,
+          })
+        );
+      }
+    } catch (error) {
+      // A refused request refuses the whole restore; the handles opened for the requests
+      // before it would otherwise stay open.
+      await closeProjectImportTargets(planned);
+      throw error;
+    }
+    return { imports: planned, registry };
+  }
+
+  private async planProjectImport(
+    request: { token: string; targetPath: string },
+    byToken: Map<string, BackupProjectImport>,
+    registry: RegisteredProjectLookup,
+    run: {
+      claimedTargets: Set<string>;
+      matchedProjectPaths: ReadonlySet<string>;
+      recordedSources: ReadonlySet<string>;
+      candidates: readonly BackupProjectImport[];
+    }
+  ): Promise<PlannedProjectImport> {
+    const { claimedTargets, matchedProjectPaths, recordedSources, candidates } = run;
+    {
       const candidate = byToken.get(request.token);
       // Unknown and stale tokens are indistinguishable here; both mean the user approved
       // something other than what the repository currently holds.
@@ -876,53 +926,66 @@ export class BackupService {
           `Cannot import '${candidate.name}': '${resolved}' is not an existing directory`
         );
       }
-      // Claimed by real path: two lexically different targets that reach one directory
-      // through a symlinked parent would otherwise both register/resolve to the same
-      // project and merge two backed-up projects' memories into it.
-      const canonical = (await realpathOrNull(resolved)) ?? resolved;
-      if (claimedTargets.has(canonical)) {
-        throw new BackupServiceError(
-          "IO_ERROR",
-          `Cannot import '${candidate.name}': another import already targets '${resolved}'`
-        );
-      }
-      claimedTargets.add(canonical);
-      // Known up front when the target is already registered (directly or as an alias),
-      // so the preflight checks the memory scope the import will really write to.
-      const registeredPath = this.resolveRegisteredProjectPath(resolved, canonical, registry);
-      // A project that a matched entry restores into in this same run cannot also take an
-      // import: the two would merge into one memory scope and the import's origin marker
-      // would displace the matched entry's identity.
-      if (matchedProjectPaths.has(registeredPath ?? resolved)) {
-        throw new BackupServiceError(
-          "IO_ERROR",
-          `Cannot import '${candidate.name}': '${resolved}' already receives a backed-up project's memory in this restore`
-        );
-      }
-      // Nor a directory at another backed-up project's recorded path: registering it would
-      // make every later restore match that other entry there directly, by exact path — over
-      // an origin record and ahead of anywhere its memory was imported — so the other entry's
-      // notes would be written into this candidate's scope. Its own recorded path is fine:
-      // that is the entry being restored where it came from.
-      for (const spelling of new Set([resolved, canonical, registeredPath ?? resolved])) {
-        if (recordedSources.has(spelling) && spelling !== candidate.sourcePath) {
+      // The directory itself, pinned (see PlannedProjectImport.target): opened after the
+      // checks above, and confirmed to be the very directory they checked, since the path
+      // could have been re-pointed in between.
+      const target = await fs.open(resolved, "r");
+      try {
+        const opened = await target.stat();
+        if (opened.dev !== stat.dev || opened.ino !== stat.ino) {
           throw new BackupServiceError(
             "IO_ERROR",
-            `Cannot import '${candidate.name}': '${resolved}' is the recorded path of another backed-up project`
+            `Cannot import '${candidate.name}': '${resolved}' changed while it was being checked`
           );
         }
+        // Claimed by real path: two lexically different targets that reach one directory
+        // through a symlinked parent would otherwise both register/resolve to the same
+        // project and merge two backed-up projects' memories into it.
+        const canonical = (await realpathOrNull(resolved)) ?? resolved;
+        if (claimedTargets.has(canonical)) {
+          throw new BackupServiceError(
+            "IO_ERROR",
+            `Cannot import '${candidate.name}': another import already targets '${resolved}'`
+          );
+        }
+        claimedTargets.add(canonical);
+        // Known up front when the target is already registered (directly or as an alias),
+        // so the preflight checks the memory scope the import will really write to.
+        const registeredPath = this.resolveRegisteredProjectPath(resolved, canonical, registry);
+        // A project that a matched entry restores into in this same run cannot also take an
+        // import: the two would merge into one memory scope and the import's origin marker
+        // would displace the matched entry's identity.
+        if (matchedProjectPaths.has(registeredPath ?? resolved)) {
+          throw new BackupServiceError(
+            "IO_ERROR",
+            `Cannot import '${candidate.name}': '${resolved}' already receives a backed-up project's memory in this restore`
+          );
+        }
+        // Nor a directory at another backed-up project's recorded path: registering it would
+        // make every later restore match that other entry there directly, by exact path — over
+        // an origin record and ahead of anywhere its memory was imported — so the other entry's
+        // notes would be written into this candidate's scope. Its own recorded path is fine:
+        // that is the entry being restored where it came from.
+        for (const spelling of new Set([resolved, canonical, registeredPath ?? resolved])) {
+          if (recordedSources.has(spelling) && spelling !== candidate.sourcePath) {
+            throw new BackupServiceError(
+              "IO_ERROR",
+              `Cannot import '${candidate.name}': '${resolved}' is the recorded path of another backed-up project`
+            );
+          }
+        }
+        return {
+          candidate,
+          targetPath: resolved,
+          target,
+          registeredPath,
+          sourceRegisteredAtPlanning: registry.keys.has(candidate.sourcePath),
+        };
+      } catch (error) {
+        await target.close().catch(() => undefined);
+        throw error;
       }
-      planned.push({
-        candidate,
-        targetPath: resolved,
-        // The directory itself, not just its name: execution refuses a different directory
-        // that has since taken this path (the checkout moved away, another created here).
-        targetIdentity: { dev: stat.dev, ino: stat.ino },
-        registeredPath,
-        sourceRegisteredAtPlanning: registry.keys.has(candidate.sourcePath),
-      });
     }
-    return { imports: planned, registry };
   }
 
   /**
@@ -974,7 +1037,7 @@ export class BackupService {
       for (const {
         candidate,
         targetPath,
-        targetIdentity,
+        target,
         registeredPath: plannedRegisteredPath,
         sourceRegisteredAtPlanning,
       } of planned) {
@@ -1036,12 +1099,13 @@ export class BackupService {
           }
           // The same directory the user approved, not merely one at the same path: a checkout
           // moved away and another created here since would otherwise be registered and
-          // receive the approved source's memory. Checked again after create() below, which
+          // receive the approved source's memory. Compared against the handle planning has
+          // kept open, whose inode a replacement cannot have been given (see
+          // PlannedProjectImport.target). Checked again after create() below, which
           // re-resolves the path itself during its own asynchronous validation.
+          const approved = await target.stat();
           const replaced = (current: { dev: number; ino: number } | null): boolean =>
-            current === null ||
-            current.dev !== targetIdentity.dev ||
-            current.ino !== targetIdentity.ino;
+            current === null || current.dev !== approved.dev || current.ino !== approved.ino;
           if (replaced(stat)) {
             results.push(
               failed(`'${targetPath}' was replaced by a different directory since it was approved`)

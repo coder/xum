@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -97,7 +98,17 @@ export async function writeConfigDocument<TKey extends ConfigFileKey>(
 ): Promise<ConfigDocumentFor<TKey>> {
   const entry = CONFIG_FILE_REGISTRY[fileKey];
   const filePath = getConfigDocumentPath(xumHomeDir, fileKey);
-  const validatedDocument = parseAndValidateDocument(fileKey, entry.schema, document, filePath);
+  // config.json carries a per-save write stamp (see Config.configFileWriteGeneration). A raw
+  // rewrite refreshes it like a Config save does — the document read from disk carries the
+  // previous one — or a reader comparing generations around this write would not see it.
+  const stamped =
+    fileKey === "config" &&
+    typeof document === "object" &&
+    document !== null &&
+    !Array.isArray(document)
+      ? { ...document, writeId: randomUUID() }
+      : document;
+  const validatedDocument = parseAndValidateDocument(fileKey, entry.schema, stamped, filePath);
   const serialized = JSON.stringify(validatedDocument, null, 2);
 
   await fs.mkdir(xumHomeDir, { recursive: true });

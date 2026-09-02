@@ -421,7 +421,8 @@ describe("mux_config_write", () => {
     const configDocument = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
       defaultModel?: string;
     };
-    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o" });
+    // Repaired to an object carrying the mutation and the per-save write stamp, nothing else.
+    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o", writeId: expect.any(String) });
   });
 
   it("repairs primitive providers.jsonc root during write", async () => {
@@ -475,7 +476,8 @@ describe("mux_config_write", () => {
     const configDocument = JSON.parse(await fs.readFile(configPath, "utf-8")) as {
       defaultModel?: string;
     };
-    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o" });
+    // Repaired to an object carrying the mutation and the per-save write stamp, nothing else.
+    expect(configDocument).toEqual({ defaultModel: "openai:gpt-4o", writeId: expect.any(String) });
   });
 
   it("repairs array providers.jsonc root during write", async () => {
@@ -571,6 +573,32 @@ describe("mux_config_write", () => {
     };
     expect(written.defaultModel).toBe("openai:gpt-4o");
     expect(written.projects.map(([projectPath]) => projectPath)).toEqual(["/imported"]);
+  });
+
+  it("refreshes the write stamp on every config.json rewrite", async () => {
+    using xumHome = new TestTempDir("mux-config-write");
+    const configPath = path.join(xumHome.path, "config.json");
+    const tool = await createWriteTool(xumHome.path, GLOBAL_WORKSPACE_ID);
+    const stampAfter = async (): Promise<unknown> => {
+      const result = (await tool.execute!(
+        {
+          file: "config",
+          operations: [{ op: "set", path: ["defaultModel"], value: "openai:gpt-4o" }],
+          confirm: true,
+        },
+        mockToolCallOptions
+      )) as XumConfigWriteResult;
+      expect(result.success).toBe(true);
+      return (JSON.parse(await fs.readFile(configPath, "utf-8")) as { writeId?: unknown }).writeId;
+    };
+    // The same operation twice writes the same content; a reader comparing the file's write
+    // generation around the second write (a settings-backup export deciding whether remote
+    // hints still apply) must still see a write.
+    const first = await stampAfter();
+    const second = await stampAfter();
+    expect(typeof first).toBe("string");
+    expect(typeof second).toBe("string");
+    expect(second).not.toBe(first);
   });
 
   it("rejects writes to symlinked providers.jsonc target", async () => {
