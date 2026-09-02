@@ -188,9 +188,15 @@ export interface BackupMemoryNotifier {
 interface RegisteredProjectLookup {
   /** Registered user projects (system entries excluded: memory is never kept for them). */
   keys: ReadonlySet<string>;
-  /** Each key's real path, or null when it could not be resolved in time. */
+  /** Each key's real path, or null when it does not resolve or could not be resolved in time. */
   canonicalByKey: ReadonlyMap<string, string | null>;
   byCanonical: ReadonlyMap<string, string>;
+  /**
+   * Keys whose real path is not known — probed past their time or not probed at all — as
+   * opposed to keys that resolve to nothing. Any of them could still be another spelling of
+   * a directory an import is about to register.
+   */
+  unresolved: ReadonlySet<string>;
 }
 
 /**
@@ -1034,6 +1040,20 @@ export class BackupService {
             results.push(unchecked(registeredIdentity ?? targetPath));
             continue;
           }
+          // No alias found is only proof of none when every registered path was resolved. A
+          // lookup left incomplete by unavailable mounts (see registeredProjectLookup) says
+          // nothing about the keys it could not probe, and registering on its word could
+          // give one directory a second project identity and split its memory. Importing
+          // into a project that did resolve is fine either way; a new registration waits for
+          // a pass that can see every key. The candidate stays on offer.
+          if (registeredIdentity === null && registry.unresolved.size > 0) {
+            results.push(
+              failed(
+                `'${targetPath}' could not be checked against ${registry.unresolved.size} registered ${registry.unresolved.size === 1 ? "project whose location" : "projects whose locations"} could not be resolved in time; it was not registered. Retry once every project's location is reachable`
+              )
+            );
+            continue;
+          }
           // Before each irreversible step: this process must still hold the registration
           // lock, or another process has judged it stale and may be registering meanwhile.
           await locked.assertStillOwned();
@@ -1168,6 +1188,7 @@ export class BackupService {
     }
     const probes = new AsyncSemaphore(REGISTRY_CANONICALIZE_CONCURRENCY);
     const deadline = Date.now() + REGISTRY_CANONICALIZE_DEADLINE_MS;
+    const unresolved = new Set<string>();
     let unprobed = pending.length;
     let stalled = 0;
     await Promise.all(
@@ -1184,8 +1205,16 @@ export class BackupService {
               ? Math.ceil((deadline - Date.now()) / unprobed)
               : 0;
           unprobed -= 1;
+          if (budget <= 0) {
+            unresolved.add(key);
+            canonicalByKey.set(key, null);
+            return;
+          }
           const probe = await realpathWithin(key, budget);
-          if (probe.stalled) stalled += 1;
+          if (probe.stalled) {
+            stalled += 1;
+            unresolved.add(key);
+          }
           canonicalByKey.set(key, probe.canonical);
         } finally {
           slot.release();
@@ -1198,7 +1227,7 @@ export class BackupService {
       const canonical = canonicalByKey.get(key);
       if (canonical != null && !byCanonical.has(canonical)) byCanonical.set(canonical, key);
     }
-    return { keys, canonicalByKey, byCanonical };
+    return { keys, canonicalByKey, byCanonical, unresolved };
   }
 
   /** One notification per project whose memory changed; failed imports' partial writes count too. */

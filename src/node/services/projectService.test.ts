@@ -2957,6 +2957,29 @@ exit 1
       expect((await service.create(target, { initGit: true })).success).toBe(true);
     });
 
+    it("keeps a directory registered under another spelling while its hold was reclaimed", async () => {
+      const target = path.join(tempDir, "reclaimed-target");
+      const alias = path.join(tempDir, "reclaimed-alias");
+      await fs.symlink(target, alias, "dir");
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "9999999:reclaimed", "utf-8");
+        // The process that reclaimed the lock registered the same directory through a
+        // symlink: neither spelling create() knows is a registry key.
+        await new Config(tempDir).editConfig((cfg) => {
+          cfg.projects.set(alias, { workspaces: [] });
+          return cfg;
+        }, REGISTER_CONCURRENTLY);
+        return create(target, { initGit: true });
+      });
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("no longer owned");
+      // The directory this request created is the winner's checkout now and stays; only the
+      // .git the request initialized into it goes.
+      expect((await fs.stat(target)).isDirectory()).toBe(true);
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect(config.loadConfigOrDefault().projects.has(alias)).toBe(true);
+    });
+
     it("refuses to register once another process has displaced the registration lock", async () => {
       const target = path.join(tempDir, "displaced");
       await fs.mkdir(target);

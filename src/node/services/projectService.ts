@@ -784,11 +784,10 @@ export class ProjectService {
           // The write itself was refused — most likely this process's hold was judged stale
           // and reclaimed while git init ran (assertStillOwned). Whatever the request wrote
           // into the directory must not stay behind unregistered: a leftover .git would fail
-          // every retry on the non-empty-directory check. Whether the path is now someone
-          // else's is decided under a hold that is verifiably ours — which a request that
-          // wrote nothing has no reason to wait for.
+          // every retry on the non-empty-directory check. A request that wrote nothing has
+          // nothing to roll back and no lock to wait for.
           if (createdDirectory || initializedGitDir) {
-            await this.rollBackRefusedCreate(lock, normalizedPath, canonicalPath, {
+            await this.rollBackRefusedCreate(lock, normalizedPath, {
               initializedGitDir,
               cleanupCreatedDirectory,
               removeInitializedGitDir,
@@ -845,40 +844,35 @@ export class ProjectService {
 
   /**
    * Rollback for a create whose registering write threw after the request had mutated the
-   * directory. Under the caller's hold if that is still ours; otherwise — the hold was
-   * reclaimed, and whoever reclaimed it may have registered this very path — under a fresh
-   * hold of the file lock (the in-process leg is the caller's and not reentrant), where the
-   * registry decides: registered by someone else, the directory is theirs and only the .git
-   * this request initialized is removed; not registered, everything the request created is.
-   * Best effort: a failure here is logged, and the create's own error is what the caller sees.
+   * directory. With the caller's hold still ours, nothing else can have registered anything
+   * (every registration takes the lock), so everything the request created goes. With the
+   * hold reclaimed, whoever reclaimed it may have registered this very directory meanwhile —
+   * under any spelling, so the registry's keys cannot prove it did not, and resolving every
+   * key's real path here would wait on the same unavailable mounts a restore is bounded
+   * against. The directory therefore stays (an empty one this request created is a harmless
+   * leftover a retry finds empty and uses); only the .git this request initialized goes,
+   * which is never a winner's to keep (see the duplicate case), under a fresh hold of the
+   * file lock so it cannot interleave with a winner's own git init. Best effort: a failure
+   * here is logged, and the create's own error is what the caller sees.
    */
   private async rollBackRefusedCreate(
     lock: ProjectRegistrationLockHandle,
     normalizedPath: string,
-    canonicalPath: string,
     created: {
       initializedGitDir: boolean;
       cleanupCreatedDirectory: () => Promise<void>;
       removeInitializedGitDir: () => Promise<void>;
     }
   ): Promise<void> {
-    const rollBack = async (): Promise<void> => {
-      const current = this.config.loadConfigOrDefault();
-      if (current.projects.has(normalizedPath) || current.projects.has(canonicalPath)) {
-        if (created.initializedGitDir) await created.removeInitializedGitDir();
-      } else {
-        await created.cleanupCreatedDirectory();
-      }
-    };
     try {
       const stillOwned = await lock.assertStillOwned().then(
         () => true,
         () => false
       );
       if (stillOwned) {
-        await rollBack();
-      } else {
-        await withProjectRegistrationFileLock(this.config.rootDir, rollBack);
+        await created.cleanupCreatedDirectory();
+      } else if (created.initializedGitDir) {
+        await withProjectRegistrationFileLock(this.config.rootDir, created.removeInitializedGitDir);
       }
     } catch (error) {
       log.error(`Failed to roll back rejected project creation ${normalizedPath}:`, error);
