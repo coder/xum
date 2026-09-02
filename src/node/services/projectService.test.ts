@@ -11,7 +11,11 @@ import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { ProjectService, type CloneEvent } from "./projectService";
-import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
+import {
+  projectRegistrationLockFilePath,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 async function createLocalGitRepository(rootDir: string, repoName: string): Promise<string> {
   const repoPath = path.join(rootDir, repoName);
@@ -2813,6 +2817,56 @@ exit 1
       await holding;
       await trusting;
       expect(config.loadConfigOrDefault().projects.get(unregistered)?.trusted).toBe(true);
+    });
+
+    it("waits for another process's registration hold and re-reads config under it", async () => {
+      // The cross-process leg, as `mux trust` or a restore in another process would hold it.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let transformRuns = 0;
+      let registered = false;
+      const registering = config
+        .editConfig((cfg) => {
+          transformRuns += 1;
+          cfg.projects.set("/fake/from-this-process", { workspaces: [] });
+          return cfg;
+        })
+        .then(() => {
+          registered = true;
+        });
+      // A window in this process waits too; an edit that leaves the project set alone does not.
+      let windowRan = false;
+      const window = withProjectRegistrationLock(tempDir, () => {
+        windowRan = true;
+        return Promise.resolve();
+      });
+      await config.editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }));
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(registered).toBe(false);
+      expect(windowRan).toBe(false);
+      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
+
+      // The other process registers a project while ours waits: our transform must run again
+      // on those bytes, or its pre-wait snapshot would clobber that registration.
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/from-other-process", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: true }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await registering;
+      await window;
+
+      expect(transformRuns).toBe(2);
+      const projects = config.loadConfigOrDefault().projects;
+      expect(projects.has("/fake/from-this-process")).toBe(true);
+      expect(projects.has("/fake/from-other-process")).toBe(true);
     });
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {
