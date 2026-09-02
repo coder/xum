@@ -9,10 +9,12 @@ import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   BACKUP_SCHEMA_VERSION,
   BackupCommandApprovalRequiredError,
+  BackupCredentialDetectedError,
   assertBackupCommandsApproved,
   MAX_BACKUP_DIRECTORY_COUNT,
   MAX_BACKUP_FILE_BYTES,
   MAX_BACKUP_FILE_COUNT,
+  MAX_ANALYZED_COMMAND_LENGTH,
   MAX_BACKUP_MCP_REDACTIONS,
   MAX_BACKUP_MCP_REDACTION_PATH_SEGMENTS,
   MAX_BACKUP_MCP_REDACTION_SEGMENTS,
@@ -134,6 +136,23 @@ function withPayloadFileText(
   return { ...payload, files };
 }
 
+// Ambient Bash startup hooks (BASH_ENV, exported BASH_FUNC_* functions) localize every
+// command, which would silently flip portability expectations on hosts whose
+// environment carries them.
+let ambientStartupHookEnv: Array<[string, string]> = [];
+beforeEach(() => {
+  ambientStartupHookEnv = [];
+  for (const [name, value] of Object.entries(process.env)) {
+    if ((name === "BASH_ENV" || name.startsWith("BASH_FUNC_")) && value !== undefined) {
+      ambientStartupHookEnv.push([name, value]);
+      delete process.env[name];
+    }
+  }
+});
+afterEach(() => {
+  for (const [name, value] of ambientStartupHookEnv) process.env[name] = value;
+});
+
 describe("backup payload", () => {
   let tempDir: string;
   let muxRoot: string;
@@ -215,7 +234,7 @@ describe("backup payload", () => {
     });
   });
 
-  it("keeps MCP commands and URLs while redacting literal header values", async () => {
+  it("redacts credential-bearing URLs and literal header values while keeping plain commands", async () => {
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
@@ -256,18 +275,3936 @@ describe("backup payload", () => {
 
     expect(mcp.servers.api.headers.Authorization).toBe(REDACTED_BACKUP_VALUE);
     expect(mcp.servers.api.headers.Secret).toEqual({ secret: "MCP_SECRET" });
-    expect(mcp.servers.api.url).toBe(
-      "https://user:password@example.com/mcp?token=literal&clientSecret=camel2&X-Amz-Signature=deadbeefcafe&mode=fast"
-    );
+    expect(mcp.servers.api.url).toBe(REDACTED_BACKUP_VALUE);
     expect(mcp.servers.plain.url).toBe("https://example.com/mcp?mode=fast");
     expect(mcp.servers.objectCommand.command).toBe("npx object-mcp --root /workspace");
     expect(mcp.servers.bareCommand).toBe("bare-mcp --verbose");
     const text = payloadFileText(payload, "mcp.jsonc");
     expect(text).not.toContain("commentsecret");
+    expect(text).not.toContain("user:password");
     const destination = path.join(tempDir, "redacted-payload");
     await writeBackupPayload(destination, payload);
     expect((await readBackupPayload(destination)).redactions).toEqual(payload.redactions);
-    expect(payload.redactions).toEqual(["servers.api.headers.Authorization"]);
+    expect(payload.redactions).toEqual(["servers.api.url", "servers.api.headers.Authorization"]);
+  });
+
+  it("redacts inline env-style credentials in command strings into the manifest", async () => {
+    const token = "glsa_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_00000000";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: {
+            command: `GRAFANA_URL=https://grafana.example ORG_ID="1 2" GRAFANA_SERVICE_ACCOUNT_TOKEN=${token} mcp-grafana --transport stdio`,
+          },
+          bare: "FOO_TOKEN=hunter2 bare-mcp --verbose",
+        },
+      })
+    );
+
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const text = payloadFileText(payload, "mcp.jsonc");
+    expect(text).not.toContain(token);
+    expect(text).not.toContain("hunter2");
+    const mcp = jsonc.parse(text) as { servers: { grafana: { command: string }; bare: string } };
+    expect(mcp.servers.grafana.command).toBe(
+      `GRAFANA_URL=${REDACTED_BACKUP_VALUE} ORG_ID=${REDACTED_BACKUP_VALUE} GRAFANA_SERVICE_ACCOUNT_TOKEN=${REDACTED_BACKUP_VALUE} mcp-grafana --transport stdio`
+    );
+    expect(mcp.servers.bare).toBe(`FOO_TOKEN=${REDACTED_BACKUP_VALUE} bare-mcp --verbose`);
+    expect(payload.manifest.mcpRedactions).toEqual([
+      ["servers", "grafana", "command"],
+      ["servers", "bare"],
+    ]);
+
+    // The published checksum must verify against the redacted bytes as written.
+    const destination = path.join(tempDir, "command-redacted-payload");
+    await writeBackupPayload(destination, payload);
+    const written = await fs.readFile(path.join(destination, "mcp.jsonc"), "utf-8");
+    expect(written).not.toContain(token);
+    const entry = payload.manifest.files.find((file) => file.path === "mcp.jsonc");
+    expect(entry?.sha256).toBe(sha256Hex(written));
+    expect((await readBackupPayload(destination)).redactions).toEqual(payload.redactions);
+  });
+
+  async function expectCommandRedaction(command: string, expected: string): Promise<void> {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { notes: { command } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const text = payloadFileText(payload, "mcp.jsonc");
+    expect(text).not.toContain("hunter2");
+    const mcp = jsonc.parse(text) as { servers: { notes: { command: string } } };
+    expect(mcp.servers.notes.command).toBe(expected);
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "notes", "command"]]);
+  }
+
+  it("consumes a whole shell word per assignment and localizes unparseable commands", async () => {
+    const cases: Array<[string, string]> = [
+      // An escaped space extends the word, so the credential's second half is inside it.
+      ["TOKEN=abc\\ hunter2 notes-mcp", `TOKEN=${REDACTED_BACKUP_VALUE} notes-mcp`],
+      // Quoted segments concatenate into the same word.
+      [`TOKEN="a hunter2"'b hunter2'c notes-mcp`, `TOKEN=${REDACTED_BACKUP_VALUE} notes-mcp`],
+      // An unterminated quote leaves the value's extent unknowable.
+      ["TOKEN='abc hunter2 notes-mcp", REDACTED_BACKUP_VALUE],
+      // So does a trailing backslash.
+      ["TOKEN=hunter2\\", REDACTED_BACKUP_VALUE],
+      // Expansions splice one word across whitespace.
+      ["TOKEN=$(cat hunter2) notes-mcp", REDACTED_BACKUP_VALUE],
+      ["TOKEN=${X:-abc hunter2} notes-mcp", REDACTED_BACKUP_VALUE],
+    ];
+    for (const [command, expected] of cases) {
+      await expectCommandRedaction(command, expected);
+    }
+  });
+
+  it("recognizes assignments after shell operators and fails closed inside quotes", async () => {
+    const cases: Array<[string, string]> = [
+      // Control operators end the previous word without whitespace.
+      ["bootstrap;TOKEN=hunter2 mcp-server", `bootstrap;TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["mcp-a&&TOKEN=hunter2 mcp-b", `mcp-a&&TOKEN=${REDACTED_BACKUP_VALUE} mcp-b`],
+      // A pipe moves bytes between stages, so the whole command goes machine-local.
+      ["mcp-a|TOKEN=hunter2 mcp-b", REDACTED_BACKUP_VALUE],
+      ["(TOKEN=hunter2 mcp-server)", `(TOKEN=${REDACTED_BACKUP_VALUE} mcp-server)`],
+      // An unquoted value ends at an operator, and the assignment after it still redacts.
+      [
+        "A=1;B=hunter2 mcp-server",
+        `A=${REDACTED_BACKUP_VALUE};B=${REDACTED_BACKUP_VALUE} mcp-server`,
+      ],
+      // Substitution around an assignment localizes the whole command.
+      ["mcp-a `TOKEN=hunter2 leak`", REDACTED_BACKUP_VALUE],
+      ["mcp-run ${X=hunter2}", REDACTED_BACKUP_VALUE],
+      // A quote-led assignment is a word to the shell, but eval-style consumers read it.
+      ['run-mcp "TOKEN=a hunter2"', REDACTED_BACKUP_VALUE],
+      ["eval 'TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      // Quote removal can still hand env-style consumers an assignment.
+      ["env TOKEN\\=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["T\\OKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ['"TOKEN"=hunter2 mcp-server', REDACTED_BACKUP_VALUE],
+      // Process substitution is an expansion, wherever it appears.
+      ["TOKEN=<(printf hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["FOO=1 mcp-server <(printf hunter2)", REDACTED_BACKUP_VALUE],
+      // GNU env operand names are not limited to shell identifiers.
+      ["env TOKEN-NAME=hunter2 mcp-server", `env TOKEN-NAME=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["env TOKEN:NAME=hunter2 mcp-server", `env TOKEN:NAME=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["env =hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      // Braces stay inside the word, so the marker distributes through any expansion.
+      ["env {TOK,EN}=hunter2 mcp-server", `env {TOK,EN}=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["env TOK{A,B}=hunter2 mcp-server", `env TOK{A,B}=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["TOKEN=public{hunter2} mcp-server", `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
+      // Expansion braces in any unconsumed word can reassemble a credential.
+      [
+        "mcp-grafana --token ghp_12345678901234567{8..8}90123456789012345678",
+        REDACTED_BACKUP_VALUE,
+      ],
+      // An option value can embed a whole assignment for the target program.
+      ["systemd-run --setenv=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["docker run --env=TOKEN=hunter2 mcp-image", REDACTED_BACKUP_VALUE],
+      // A short option's attached argument has no boundary before the assignment.
+      ["systemd-run -ETOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      // A plain flag value has no inner assignment and stays published.
+      [
+        "mcp-run --transport=stdio TOKEN=hunter2",
+        `mcp-run --transport=stdio TOKEN=${REDACTED_BACKUP_VALUE}`,
+      ],
+      // After an option terminator, even an option-looking word is an env operand,
+      // and the terminator itself may arrive through quote removal.
+      ["env -- --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env - --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ['env "--" --evil=hunter2 mcp-server', REDACTED_BACKUP_VALUE],
+      // Append assignments set an unset name and export the same way.
+      ["TOKEN+=hunter2 mcp-server", `TOKEN+=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["mcp-a;TOKEN+=hunter2 mcp-b", `mcp-a;TOKEN+=${REDACTED_BACKUP_VALUE} mcp-b`],
+      ["eval 'TOKEN+=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      // An array value leaves a bare assignment word behind, which fails closed.
+      ["TOKEN=(a hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["TOKEN=(hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      // ANSI-C and locale quoting hand env-style consumers their inner text.
+      ["env $'TOKEN=hunter2' mcp-server", REDACTED_BACKUP_VALUE],
+      ['env $"TOKEN=hunter2" mcp-server', REDACTED_BACKUP_VALUE],
+      // A quoted script string is re-parsed by its interpreter, whatever the grammar.
+      ["powershell -Command '$env:TOKEN=\"hunter2\"; mcp-server'", REDACTED_BACKUP_VALUE],
+      ["sh -c 'exec TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      // A consumed assignment inside a larger script word must not exempt the rest.
+      ["sh -c 'A=1 $env:TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      ["csh -c 'setenv TOKEN hunter2; mcp'", REDACTED_BACKUP_VALUE],
+      ["pwsh -c $env:TOKEN=hunter2;mcp-server", REDACTED_BACKUP_VALUE],
+      // GNU env re-splits a split-string value into assignments, under any unique
+      // long-option abbreviation.
+      ["env --split-string='TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
+      ["env --s=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env --split=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env -S'TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
+      ["env -STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env -0STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      // Expansion bodies can smuggle assignment bytes past every lexical check.
+      ["env TOKEN$(printf =hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["env TOKEN$[0]=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env $'TOKEN\\x3dhunter2' mcp-server", REDACTED_BACKUP_VALUE],
+      ["mcp-run ${X:-hunter2}", REDACTED_BACKUP_VALUE],
+    ];
+    for (const [command, expected] of cases) {
+      await expectCommandRedaction(command, expected);
+    }
+  });
+
+  it("restores an inline-redacted command from the local config and drops it elsewhere", async () => {
+    const command = "FOO_TOKEN=hunter2 notes-mcp --verbose";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { notes: { command } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+
+    const restored = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          muxRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: { notes: { command: string } } };
+    expect(restored.servers.notes.command).toBe(command);
+
+    // A machine without the local command must not gain one the backup cannot carry.
+    const otherRoot = path.join(tempDir, "other-root");
+    await fs.mkdir(otherRoot);
+    const elsewhere = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          otherRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: Record<string, unknown> };
+    expect(elsewhere.servers.notes).toBeUndefined();
+  });
+
+  it("restores a redacted URL from the local config and drops it elsewhere", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          remote: { url: "https://user:hunter2@example.com/mcp" },
+          mixed: { command: "npx notes-mcp", url: "https://mcp.example.com/mcp?api_key=hunter2" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+
+    const restored = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          muxRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: Record<string, { command?: string; url?: string }> };
+    expect(restored.servers.remote.url).toBe("https://user:hunter2@example.com/mcp");
+    expect(restored.servers.mixed.url).toBe("https://mcp.example.com/mcp?api_key=hunter2");
+
+    // A machine without the local url must not keep the marker as a connectable endpoint:
+    // a url-only entry disappears, a mixed one falls back to its stdio command.
+    const otherRoot = path.join(tempDir, "other-url-root");
+    await fs.mkdir(otherRoot);
+    const elsewhere = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          otherRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: Record<string, unknown> };
+    expect(elsewhere.servers.remote).toBeUndefined();
+    expect(elsewhere.servers.mixed).toEqual({ command: "npx notes-mcp" });
+
+    // The stdio fallback the url removal exposes still needs the user to read the command.
+    const approvals = await collectMcpCommandApprovals(
+      otherRoot,
+      payload.files,
+      payload.manifest.mcpRedactions
+    );
+    expect(approvals.map((approval) => approval.command)).toEqual(["npx notes-mcp"]);
+  });
+
+  it("blocks the export outright when a credential pattern survives redaction", async () => {
+    const token = "glsa_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6_00000000";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      // As a plain argument rather than an env assignment, so redaction does not classify it.
+      JSON.stringify({ servers: { grafana: { command: `mcp-grafana --token ${token}` } } })
+    );
+
+    // reportSecrets covers only the reviewable scan; the credential backstop has no override.
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+
+    // The local safety snapshot never leaves the machine and stays exempt.
+    const snapshot = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      keepLocalSecrets: true,
+      reportSecrets: true,
+    });
+    expect(payloadFileText(snapshot, "mcp.jsonc")).toContain(token);
+  });
+
+  it("blocks the export when shell quoting splits a known credential token", async () => {
+    // Bash removes the backslash at execution, handing the server one contiguous token.
+    const brokenToken = "ghp_a1b2c3d4e5f6g7h8i9\\j0k1l2m3n4o5p6q7r8";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: `mcp-grafana --token ${brokenToken}` } } })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+  });
+
+  it("blocks continuation-split command credentials and keeps non-command strings verbatim", async () => {
+    // Bash removes backslash-newline entirely, handing the server one contiguous key,
+    // and the backstop's shell normalization reassembles the same token.
+    const brokenKey = "AKIA12345678\\\n90123456";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: `mcp-grafana --key ${brokenKey}` } } })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+
+    // A non-command string is not shell input: nothing at runtime joins its
+    // fragments, so it publishes verbatim instead of manufacturing a block.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { notes: { command: "npx notes-mcp", toolAllowlist: [brokenKey] } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("AKIA12345678");
+  });
+
+  it("keeps quoted backslashes that the shell preserves from manufacturing tokens", async () => {
+    // Inside single quotes, and before a non-special character inside double quotes,
+    // Bash keeps the backslash, so the runtime argument never becomes one token.
+    for (const command of [
+      "mcp-grafana --pattern 'ghp_aaaaaaaaaa\\bbbbbbbbbb'",
+      'mcp-grafana --pattern "ghp_aaaaaaaaaa\\bbbbbbbbbb"',
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa");
+    }
+  });
+
+  it("does not manufacture a credential block from a CRLF-broken command", async () => {
+    // Backslash before CRLF escapes only the CR, so no runtime join produces a token.
+    // The CR-bearing word makes the command machine-local, but creation must succeed
+    // rather than raise the no-override credential error.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa\\\r\nbbbbbbbbbb" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps inert dollar literals from manufacturing tokens while active ones splice", async () => {
+    // Single-quoted and escaped dollars reach the process literally, so none of
+    // these can reassemble a token at runtime.
+    const inert = [
+      "mcp --pattern 'ghp_aaaaaaaaaa$NAMEbbbbbbbbbb'",
+      "mcp --pattern ghp_aaaaaaaaaa\\$NAMEbbbbbbbbbb",
+      "mcp --pattern 'ghp_aaaaaaaaaa$912345678901234567890'",
+      "mcp --pattern ghp_aaaaaaaaaa\\$912345678901234567890",
+    ];
+    for (const command of inert) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa");
+    }
+
+    // Expansions stay active inside double quotes, and the command itself could
+    // populate the parameter first, so those spellings go machine-local instead
+    // of publishing.
+    for (const command of [
+      'mcp --pattern "ghp_aaaaaaaaaa$912345678901234567890"',
+      'mcp --pattern "ghp_aaaaaaaaaa$NAMEbbbbbbbbbb"',
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes a command whose empty expansion would splice a credential token", async () => {
+    // Bash expands the unset variable to nothing, joining the fragments across the
+    // quote boundary that ends its name; the active expansion sends the command
+    // machine-local before anything publishes.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: 'mcp-grafana --token ghp_1234567890$NOPE"12345678901234567890"' },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps a comment opened after a line continuation portable", async () => {
+    // The backslash-LF continuation vanishes before tokenization, so Bash reads
+    // `# TOKEN=hunter2` as the same comment it would be on one line; rewriting the
+    // prose would send a portable command machine-local.
+    const command = "mcp-server \\\n# TOKEN=hunter2";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(command);
+  });
+
+  it("consumes Bash-only word breaks so a NBSP-joined value cannot leak its tail", async () => {
+    // JS `\s` counts NBSP as whitespace, but Bash keeps it inside the word: the
+    // assignment's runtime value runs through it, so the tail must not stay published.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "TOKEN=public\u00a0hunter2 mcp-server" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(`TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`);
+  });
+
+  it("localizes always-set special parameters instead of blocking or publishing", async () => {
+    // Their expansions produce token-charset output ($# is `0`, $0 the shell name), so
+    // `ghp_...$#` runs with a completed credential no scan of the spelling sees, while
+    // deleting them would manufacture no-override blocks; machine-local avoids both,
+    // and creation must succeed either way.
+    for (const command of [
+      "mcp --pattern ghp_aaaaaaaaaa$0bbbbbbbbbb",
+      "mcp --token ghp_aaaaaaaaaaaaaaaaaaa$#",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("stops the credential scan at a Bash comment but resumes on the next line", async () => {
+    // Bash discards everything from an unquoted `#` word to the newline, so the
+    // quote-separated prose there can never join into a runtime token.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp-server # ghp_aaaaaaaaaa"bbbbbbbbbb"' } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe('mcp-server # ghp_aaaaaaaaaa"bbbbbbbbbb"');
+
+    // A continuation before the `#` disappears first, so the comment position
+    // survives the wrapped line and the scan still skips the prose.
+    const wrapped = 'mcp-server \\\n# ghp_aaaaaaaaaa"bbbbbbbbbb"';
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: wrapped } } })
+    );
+    const wrappedPayload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const wrappedMcp = jsonc.parse(payloadFileText(wrappedPayload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(wrappedMcp.servers.grafana.command).toBe(wrapped);
+
+    // Past the newline execution resumes, so the same splice there still blocks.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: 'mcp-server # note\nmcp2 --pattern ghp_aaaaaaaaaa"bbbbbbbbbb"' },
+        },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("decodes published MCP urls once before the credential backstop", async () => {
+    // A single URL parse yields the contiguous token from `%61`, so the encoded
+    // spelling publishes the same credential the literal one is blocked for.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { url: "https://example.com/mcp?value=ghp_%61b2c3d4e5f6g7h8i9j0k" } },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+
+    // One pass only: a double-encoded `%2561` reaches every client as the literal `%61`.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { url: "https://example.com/mcp?value=ghp_%2561b2c3d4e5f6g7h8i9j0k" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_%2561");
+  });
+
+  it("collapses deterministic globs so a bracketed spelling cannot hide a token", async () => {
+    // `[8]` matches only `8`: pathname expansion can hand the process the contiguous
+    // token, and the published text collapses the same way for any reader.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa[8]aaaaaaaaa" } },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+
+    // A letter member is not deterministic: inherited nocaseglob makes `[P]` match a
+    // lowercase `p` file, so the runtime token differs from any textual collapse and
+    // the command goes machine-local instead.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --token gh[P]_1234567890abcdefghijklmnopqrstuvwxyz" } },
+      })
+    );
+    const localized = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const localizedMcp = jsonc.parse(payloadFileText(localized, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(localizedMcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+
+    // Quoting suppresses pathname expansion, so the same spelling stays publishable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern 'ghp_aaaaaaaaaa[b]aaaaaaaaa'" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa[b]aaaaaaaaa");
+  });
+
+  it("localizes a multi-member glob class instead of publishing the pattern", async () => {
+    // `[px]` expands against whatever the working directory contains, so a file named
+    // for the credential hands the process the token while the pattern publishes; the
+    // whole command goes machine-local like every other undecidable construct.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern gh[px]_aaaaaaaaaaaaaaaaaaaa" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes nondeterministic wildcards instead of publishing them", async () => {
+    // A wildcard inside a known token prefix (`gh?_...`) expands to the credential
+    // when a matching file exists, and no textual scan of the published spelling can
+    // reconstruct that, so the command goes machine-local like the class spellings.
+    for (const command of [
+      "mcp --pattern gh?_aaaaaaaaaaaaaaaaaaaa",
+      "mcp --pattern ghp_aaaaaaaaaa*aaaaaaaaa",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes an escaped class member the collapse pass cannot reproduce", async () => {
+    // Bash still expands `[\\p]` against matching files, but the scan's deterministic
+    // collapse only reproduces the plain `[c]` spelling, so this form goes machine-local.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: {
+            command: "mcp --pattern gh[\\p]_12345678901234567890123456789012345678",
+          },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("classifies a long literal bracket run in linear time as machine-local", async () => {
+    // A regex restarting its `]` search at every bracket goes quadratic on this input;
+    // the analyzer must classify it in one pass and localize the unmatched brackets.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: `mcp --pattern ${"[".repeat(4096)}` } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes here-documents instead of scanning their bodies as words", async () => {
+    // The body's quotes reach the consumer literally, so word-rule quote removal would
+    // manufacture a no-override match from prose; machine-local keeps both sides right.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: 'cat <<EOF\nghp_aaaaaaaaaa"bbbbbbbbbb"\nEOF' },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("recognizes comments opened by a word break, not only by whitespace", async () => {
+    // Bash comments start at any word boundary (`cmd;# ...`), and where the grammar
+    // needed a word instead it errors without executing, so the prose cannot run.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp-server;# ghp_aaaaaaaaaa"bbbbbbbbbb"' } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe('mcp-server;# ghp_aaaaaaaaaa"bbbbbbbbbb"');
+  });
+
+  it("localizes a command whose $! depends on execution state", async () => {
+    // `$!` is empty until the command string starts a background job and a PID after,
+    // so neither deleting it nor keeping it literal scans both runtimes correctly.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "true & mcp --pattern ghp_aaaaaaaaaa$!bbbbbbbbbb" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps quoted braces from localizing an ordinary JSON argument", async () => {
+    // The comma sits inside quotes, so Bash never brace-expands it and the argument
+    // reaches the server literally; the command must stay portable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp-server --config \'{"a":1,"b":2}\'' } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe('mcp-server --config \'{"a":1,"b":2}\'');
+  });
+
+  it("keeps inert expansion syntax from localizing a portable command", async () => {
+    // Single-quoted and commented spellings never reach evaluation, so the command
+    // stays portable...
+    for (const command of [
+      "mcp-server --pattern '$(date)'",
+      "mcp-server --pattern '@(x|y)'",
+      // ANSI-C quoting is not recognized inside double quotes: `$'` there is the
+      // two literal characters the process receives.
+      "mcp-server --label \"price$'5'\"",
+      "mcp-server # regenerate with $(date)",
+      "mcp-server \\\n# regenerate with $(date)",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(command);
+    }
+
+    // ...while double quotes keep the expansion live, so that spelling still localizes.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: 'mcp-server --pattern "$(date)"' } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps repeated-character credential placeholders reviewable", async () => {
+    // The canonical documentation spelling has no issued-token entropy, so it belongs
+    // to the reviewable digest flow rather than the no-override block.
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "Use ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx as your token\n"
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.files.some((file) => file.path === "skills/demo/SKILL.md")).toBe(true);
+
+    // Padding a real-shaped token with an obvious run must not smuggle it past the
+    // backstop: the stripped remainder still matches.
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8xxxxxxxxxxxxxxxx\n"
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("removes URL tab and newline separators before the credential backstop", async () => {
+    // The WHATWG parser deletes embedded tab/newline before parsing, so a client's
+    // `new URL(config.url)` reconstructs the contiguous token the raw text splits.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { url: "https://example.com/mcp?value=ghp_aaaaaaaaaa\tb2c3d4e5f6" },
+        },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("localizes nested brace expansion an inner group would otherwise hide", async () => {
+    // Bash expands `gh{p,{x}}_...` into an argument carrying the contiguous token; a
+    // flat pattern stops at the inner non-expanding group and would publish it.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern gh{p,{x}}_1234567890abcdefghij" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+
+    // A comma between two single-member groups expands nothing and stays portable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "mcp --flag {a},{b}" } } })
+    );
+    const portable = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const portableMcp = jsonc.parse(payloadFileText(portable, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(portableMcp.servers.grafana.command).toBe("mcp --flag {a},{b}");
+  });
+
+  it("leaves comment prose alone while still redacting executable assignments", async () => {
+    // Bash never evaluates the suffix, so rewriting it would only cost portability...
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "mcp-server # TOKEN=hunter2" } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe("mcp-server # TOKEN=hunter2");
+
+    // ...while the executable region before the comment still redacts normally.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "TOKEN=hunter2 mcp-server # NOTE=keep" } },
+      })
+    );
+    const redacted = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const redactedMcp = jsonc.parse(payloadFileText(redacted, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(redactedMcp.servers.grafana.command).toBe(
+      `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server # NOTE=keep`
+    );
+  });
+
+  it("localizes positional expansions the command itself can populate", async () => {
+    // `set -- p` fills $1 before the expansion runs, so the runtime argument carries
+    // the contiguous token while every textual scan of the spelling misses it.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: "set -- p; mcp --token gh$1_1234567890abcdefghijklmnopqrstuvwxyz" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes named expansions the command itself can populate", async () => {
+    // `for X in p` and `printf -v X p` set $X with no NAME=value word for the
+    // redaction to rewrite, so `gh$X'_'...` runs as the contiguous credential while
+    // every scan of the spelling sees only fragments.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: {
+            command: "for X in p; do mcp --token gh$X'_'K3vQ9rT2wY7bN4mJ6hL8cD1fG5sZ0aXe; done",
+          },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes extended glob patterns an inherited extglob would activate", async () => {
+    // With BASHOPTS=extglob in the inherited environment, `@(p|x)` is one active
+    // pathname pattern, and a matching credential-named file hands the process the
+    // contiguous token while the scans split at `(`, `|`, and `)`.
+    for (const command of [
+      "mcp --token gh@(p|x)_1234567890abcdefghij",
+      "mcp --token gh+(p)_1234567890abcdefghij",
+      "mcp --token gh!(q)_1234567890abcdefghij",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("normalizes active line continuations before the shell analyzers run", async () => {
+    // Bash deletes backslash-LF before any expansion, so a continuation can split
+    // syntax the analyzers must still see: a continuation between `$` and `(`
+    // still runs as command substitution, and one splitting a brace sequence's
+    // dots still expands, each yielding a contiguous credential.
+    for (const command of [
+      "mcp --token gh$\\\n(printf p)'_'K3vQ9rT2wY7bN4mJ6hL8cD1fG5sZ0aXe",
+      "mcp --token ghp_aaaaaaaaaaaaaaaaaaa{0.\\\n.0}",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // A wrapped command with nothing to redact keeps its original spelling...
+    const wrapped = "mcp-server \\\n  --transport stdio";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: wrapped } } })
+    );
+    const portable = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const portableMcp = jsonc.parse(payloadFileText(portable, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(portableMcp.servers.grafana.command).toBe(wrapped);
+
+    // ...while a wrapped assignment goes machine-local whole: the marker's position
+    // is only defined in the unwrapped spelling Bash executes.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "TOKEN=hunter2 \\\nmcp-server" } } })
+    );
+    const localized = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const localizedMcp = jsonc.parse(payloadFileText(localized, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(localizedMcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes reparse and file-synthesis constructs regardless of assignments", async () => {
+    // `eval` concatenates and reparses its arguments, dissolving a second quoting
+    // layer (`ghp_aaaaaaaaaa\\bbbbbbbbbb` loses one backslash per parse and runs
+    // contiguous), and a process substitution's inner script can synthesize a
+    // credential file; neither needs an assignment, so both localize on their own.
+    for (const command of [
+      "eval mcp --token ghp_aaaaaaaaaa\\\\bbbbbbbbbb",
+      "mcp --token-file <(printf ghp_aaaaaaaaaa;printf bbbbbbbbbb)",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // A word merely containing the letters stays an ordinary argument.
+    const portable = "run-mcp --formatter evaluate";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
+  it("blocks GitLab tokens in collected files without an override", async () => {
+    // GitLab issued-only prefixes cover more than the PAT: CI job, OAuth app,
+    // feature-flag, mail, and agent tokens are issued the same way, and a generically
+    // named collected file must not publish any of them just because no path-based
+    // gate covers it. Assembled at runtime so this source file never holds a
+    // contiguous token-shaped string, which GitHub push protection would itself
+    // refuse.
+    for (const prefix of ["glpat-", "glcbt-", "gloas-", "glffct-", "glimt-", "glagent-"]) {
+      await writeFixtureFile(
+        muxRoot,
+        "skills/demo/SKILL.md",
+        ["token: ", prefix, "K3vQ9rT2wY7bN4mJ6hL8", "\n"].join("")
+      );
+      const blocked = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        })
+      );
+      expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+      expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+    }
+  });
+
+  it("localizes every command while Bash startup hooks are inherited", async () => {
+    // A sourced BASH_ENV file or an imported exported function can redefine any
+    // command word (`mcp(){ mcp --token "$2$3"; }` joins published fragments), so no
+    // word-level analysis binds while the stdio spawn inherits a hook.
+    const portable = "mcp-server --port 8080";
+    const fixture = JSON.stringify({ servers: { grafana: { command: portable } } });
+    for (const [name, value] of [
+      ["BASH_ENV", "./startup.sh"],
+      ["BASH_FUNC_mcp%%", "() { :; }"],
+    ]) {
+      await writeFixtureFile(muxRoot, "mcp.jsonc", fixture);
+      process.env[name] = value;
+      try {
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { grafana: { command: string } };
+        };
+        expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+      } finally {
+        delete process.env[name];
+      }
+    }
+
+    // An empty BASH_ENV sources nothing, so analysis keeps its authority.
+    await writeFixtureFile(muxRoot, "mcp.jsonc", fixture);
+    process.env.BASH_ENV = "";
+    try {
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(portable);
+    } finally {
+      delete process.env.BASH_ENV;
+    }
+  });
+
+  it("publishes a portable command despite startup hooks in the ignored config env field", async () => {
+    // McpConfigService.normalizeEntry drops env from stdio entries, so a config-level
+    // BASH_ENV never reaches the spawn; localizing the command for it would only make a
+    // fresh-device restore drop the whole server. The env value itself stays redacted
+    // like every other ignored field.
+    const portable = "mcp-server --port 8080";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          hooked: { command: portable, env: { BASH_ENV: "./startup.sh" } },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { hooked: { command: string; env: string } };
+    };
+    expect(mcp.servers.hooked.command).toBe(portable);
+    expect(mcp.servers.hooked.env).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("scans a file holding a multi-megabyte repeated-character run", async () => {
+    // The run stripper must stay linear: a backreference regex exhausts V8's call
+    // stack near 4 MiB and rejected size-valid files before scanning them. The
+    // alternating U+212A KELVIN SIGN/k spelling forces every comparison through the
+    // non-ASCII fold path, which must treat the case-equivalent pair as one run without
+    // allocating per character.
+    for (const content of ["x".repeat(4 * 1024 * 1024), "\u212Ak".repeat(2 * 1024 * 1024)]) {
+      await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", content);
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(payloadFileText(payload, "skills/demo/SKILL.md")).toBe(content);
+    }
+  });
+
+  for (const [name, command] of [
+    ["npx call operands", "npx -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'"],
+    ["npm exec call operands", "npm exec -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'"],
+    [
+      "npm global option values before exec",
+      "npm --prefix /tmp exec -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+    ],
+    [
+      "Rscript expression operands",
+      `Rscript -e 'system(paste0("mcp",intToUtf8(32),"--token",intToUtf8(32),"ghp_Abcdef1234","Klmno56789"))'`,
+    ],
+    [
+      "Lua expression operands",
+      `lua -e 'os.execute("mcp"..string.char(32).."--token"..string.char(32).."ghp_Abcdef1234".."Klmno56789")'`,
+    ],
+    [
+      "Elixir expression operands",
+      `elixir -e 'System.cmd("mcp",["--token","ghp_Abcdef1234"<>"Klmno567890123456"])'`,
+    ],
+    [
+      "IEx RPC evaluation operands",
+      `iex --rpc-eval node@host 'System.cmd("mcp",["--token","ghp_Abcdef1234"<>"Klmno567890123456"])'`,
+    ],
+    [
+      "GNU env split strings without assignments",
+      `env -S'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`,
+    ],
+    ["GNU env clustered split strings", `env -ivS'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`],
+    // find's -exec family hands its operands to execvp as a command.
+    ["GNU find exec callbacks", "find /tmp -maxdepth 0 -exec ~/.xum/skills/launch.txt \\;"],
+    ["GNU find execdir callbacks", "gfind /tmp -execdir mcp --token {} +"],
+    // Carriers run their operand as the command, so the wrapped word is checked
+    // like a command start; a dash option may take a separate value this scan
+    // cannot pair, so later words stay checked.
+    ["timeout-wrapped shells", "timeout 30 bash -c exit"],
+    ["option-carrying carrier wrappers", "nice -n 10 bash -c exit"],
+    ["env-terminated option lists", "env -- bash -c exit"],
+    ["keyword-guarded shells", "if bash -c exit; then mcp; fi"],
+    // coproc runs its command asynchronously; a function body runs at its call site.
+    ["coproc-wrapped shells", "coproc bash -c exit"],
+    ["named coproc compound bodies", "coproc PROXY { bash -c exit; }"],
+    ["function bodies", "function launch { bash -c exit; }; launch"],
+    ["prlimit-wrapped shells", "prlimit --nofile=256 bash -c exit"],
+    ["setpriv-wrapped shells", "setpriv --reuid 1000 bash -c exit"],
+    // setarch's leading arch operand is optional, so every operand is checked.
+    ["setarch-wrapped shells", "setarch linux64 bash -c exit"],
+    ["systemd-run-wrapped shells", "systemd-run --user --scope bash -c exit"],
+    ["systemd-inhibit-wrapped shells", "systemd-inhibit --what=idle bash -c exit"],
+    ["systemd-cat-wrapped shells", "systemd-cat -t mcp bash -c exit"],
+    ["CMake command mode", "cmake -E env bash -c exit"],
+  ] as const) {
+    it(`localizes ${name}`, async () => {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    });
+  }
+
+  it("localizes directly executed auto-published documents", async () => {
+    for (const command of [
+      `${muxRoot}/skills/launch.txt`,
+      `MODE=fast ${muxRoot}/skills/launch.txt`,
+      `env ${muxRoot}/skills/launch.txt`,
+      `env -u TOKEN ${muxRoot}/skills/launch.txt`,
+      `env env ${muxRoot}/agents/launch.md`,
+      // GNU env changes the wrapped utility's working directory before launch.
+      `env -C ${muxRoot} python3 skills/launch.txt`,
+      `env --chdir=${muxRoot} python3 agents/launch.md`,
+      `env --chd ${muxRoot}/skills tclsh launch.txt`,
+      `true; ${muxRoot}/agents/launch.md`,
+      `timeout 30 ${muxRoot}/skills/launch.txt`,
+      `nohup ${muxRoot}/skills/launch.txt`,
+      `prlimit ${muxRoot}/skills/launch.txt`,
+      `setpriv ${muxRoot}/skills/launch.txt`,
+      // Redirected stdin hands the same executable input to an interpreter.
+      `node < ${muxRoot}/skills/launch.txt`,
+      `sh 0< ${muxRoot}/skills/launch.txt`,
+      `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
+      `systemd-run --pipe --working-directory=${muxRoot} python3 skills/launch.txt`,
+      `systemd-run --working-directory ${muxRoot}/skills tclsh launch.txt`,
+      // start-stop-daemon executes the pathname supplied by --exec/--startas.
+      `start-stop-daemon --start --exec ${muxRoot}/skills/launch.txt --`,
+      `start-stop-daemon --start --startas=${muxRoot}/agents/launch.md --`,
+      `start-stop-daemon --start -a${muxRoot}/skills/launch.txt --`,
+      // The util-linux setarch hard links run their first operand as the program.
+      `linux32 ${muxRoot}/skills/launch.txt`,
+      `linux64 ${muxRoot}/agents/launch.md`,
+      `uname26 ${muxRoot}/skills/launch.txt`,
+      // Moving the working directory into the collected root lets any relative
+      // operand name a published document without spelling the root.
+      `cd ${muxRoot} && python3 skills/launch.txt`,
+      `pushd ${muxRoot}/skills; tclsh launch.txt`,
+      // A relative cd resolves against the tracked directory of an earlier cd.
+      `cd ${path.dirname(muxRoot)} && cd ${path.basename(muxRoot)} && python3 skills/launch.txt`,
+      // All shell-resolved executable inputs use the tracked cwd, not only a bare
+      // interpreter script operand.
+      `cd ${path.dirname(muxRoot)} && python3 ${path.basename(muxRoot)}/skills/launch.txt`,
+      `cd ${path.dirname(muxRoot)} && java -cp ${path.basename(muxRoot)}/skills/launch.txt Leak`,
+      `cd ${path.dirname(muxRoot)} && php -c${path.basename(muxRoot)}/skills/config.txt /opt/server.php`,
+      // The command word can follow the redirection, and an interpreter later in
+      // the same command still executes the redirected document.
+      `< ${muxRoot}/skills/launch.txt sh`,
+      `timeout 30 < ${muxRoot}/skills/launch.txt node`,
+      `cmake -P ${muxRoot}/skills/launch.txt`,
+      `ctest -S ${muxRoot}/skills/launch.txt`,
+      // Redundant separators and dot segments name the same collected file.
+      `${muxRoot}//skills/launch.txt`,
+      `env ${muxRoot}/./skills/launch.txt`,
+      // The Java launcher expands @argument-files into options before parsing.
+      `java @${muxRoot}/skills/args.txt`,
+      `java @/tmp/opts.txt --source 17 ${muxRoot}/skills/launch.txt`,
+      // Git searches this directory for external git-<subcommand> executables.
+      `git --exec-path=${muxRoot}/skills leak.txt`,
+      `mise exec -- python3 ${muxRoot}/skills/launch.txt`,
+      `mise x -- ${muxRoot}/agents/launch.md`,
+      `sqlite3 -init ${muxRoot}/skills/launch.txt :memory:`,
+      `sqlite3 -batch -init ${muxRoot}/agents/launch.md /tmp/data.db`,
+      "mise exec --command=launch.txt",
+      "mise x -c launch.txt",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("keeps executable names in argument positions portable", async () => {
+    // Only a word that can execute names an interpreter or wrapper; the same
+    // spelling as another program's argument is data, and localizing it would
+    // remove an otherwise portable server on a fresh-device restore.
+    for (const command of [
+      "mcp-server --shell bash --transport ssh --filter sed",
+      "mcp-server --runtime python3 -c config.toml",
+      "mcp-server --tool git config core.sshCommand ssh",
+      "nohup mcp-server --shell bash",
+      "mcp-server --mode find -exec /tmp/plugin",
+      "mcp-server --wrap prlimit --mode coproc",
+      "mcp-server < /tmp/input.json",
+      "mcp-server --launcher systemd-run",
+      "env -C /opt python3 app.py",
+      `mcp-server --launcher env --chdir=${muxRoot}`,
+      "git --exec-path=/usr/lib/git-core status",
+      `mcp-server --git-exec-path=${muxRoot}/skills`,
+      "start-stop-daemon --stop --exec /usr/bin/mcp-server --",
+      `mcp-server --launcher start-stop-daemon --exec ${muxRoot}/skills/config.txt`,
+      "cmake --build build --target package",
+      "mise --version",
+      "mise exec python@3.11",
+      "sqlite3 -init /tmp/init.sql :memory:",
+      `sqlite3 ${muxRoot}/skills/config.txt`,
+      `mcp-server --database sqlite3 -init ${muxRoot}/skills/config.txt`,
+      `mcp-server --launcher mise exec -- ${muxRoot}/skills/config.txt`,
+      // A control operator starts a new command, ending interpreter tracking.
+      "python3 --version && mcp-server -c config.toml",
+      // deno's entrypoint ends script tracking; later published paths are data.
+      `deno run /opt/server.ts ${muxRoot}/skills/config.txt`,
+      // The script operand after `--` ends tracking; later published paths are data.
+      `python3 -- /tmp/main.py ${muxRoot}/skills/config.txt`,
+      "ruby -C /opt app.rb --config skills/config.txt",
+      "ruby -C/opt app.rb",
+      "ruby -S /opt/tool.rb",
+      "php -c/tmp/php.ini /opt/server.php",
+      `java -cp /opt/app.jar Main ${muxRoot}/skills/config.txt`,
+      "systemd-run --working-directory=/opt node server.js",
+      `mcp-server --launcher systemd-run --working-directory=${muxRoot}`,
+      // Two-segment merge/diff keys hold settings, not driver commands.
+      "git config merge.conflictstyle diff3",
+      "java @/tmp/opts.txt Main --port 8080",
+      "jshell --startup=/tmp/snippets.jsh /tmp/main.jsh",
+      "hash -r; mcp-server",
+      "cd /app && node server.js",
+      // A relative cd from the server's own unknown cwd stays portable, matching
+      // the relative-operand policy.
+      "cd .xum && python3 skills/launch.txt",
+      // A non-interpreter, or an interpreter after its script boundary, consumes
+      // redirected documents as data rather than source code.
+      `mcp-server < ${muxRoot}/skills/config.txt`,
+      `python3 /tmp/main.py < ${muxRoot}/skills/config.txt`,
+      // A foreign jar ends option tracking; later published paths are its data.
+      `java -jar /opt/app.jar ${muxRoot}/skills/config.txt`,
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(command);
+    }
+  });
+
+  it("resolves ~ spellings against a settings root under the home directory", async () => {
+    const homeRoot = await fs.mkdtemp(path.join(os.homedir(), ".xum-backup-test-"));
+    try {
+      // Both the bare and the named-home spellings expand to the same directory.
+      for (const command of [
+        `python3 ~/${path.basename(homeRoot)}/skills/launch.txt`,
+        `python3 ~${os.userInfo().username}/${path.basename(homeRoot)}/skills/launch.txt`,
+        // Relative cd chains resolve against the tracked directory, and a bare
+        // cd goes home.
+        `cd ~ && cd ${path.basename(homeRoot)} && python3 skills/launch.txt`,
+        `cd && cd ${path.basename(homeRoot)}/skills && tclsh launch.txt`,
+      ]) {
+        await writeFixtureFile(
+          homeRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot: homeRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+      }
+    } finally {
+      await fs.rm(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("localizes the canonical target spelling of a symlinked settings root", async () => {
+    // Collection follows a symlinked root to its target, so a command can name the
+    // same collected files through the canonical spelling.
+    const canonicalRoot = await fs.realpath(muxRoot);
+    const linkedRoot = path.join(tempDir, "linked-root");
+    await fs.symlink(canonicalRoot, linkedRoot, "dir");
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { private: { command: `python3 ${canonicalRoot}/skills/launch.txt` } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot: linkedRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes direct executable operands symlinked into the collected root", async () => {
+    await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+    const target = path.join(muxRoot, "skills", "launch.txt");
+    await fs.writeFile(target, "program");
+    const linkedScript = path.join(tempDir, "linked-script");
+    await fs.symlink(target, linkedScript, "file");
+    const foreignTarget = path.join(tempDir, "foreign-script.txt");
+    await fs.writeFile(foreignTarget, "program");
+    const foreignLink = path.join(tempDir, "foreign-script");
+    await fs.symlink(foreignTarget, foreignLink, "file");
+    for (const [command, expected] of [
+      [`python3 ${linkedScript}`, REDACTED_BACKUP_VALUE],
+      [`python3 ${foreignLink}`, `python3 ${foreignLink}`],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes bare commands resolvable through a PATH entry inside the root", async () => {
+    // The spawned server inherits this process's PATH, so an entry inside the
+    // collected root makes a published executable document reachable by name.
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${muxRoot}/skills${path.delimiter}${originalPath ?? ""}`;
+    try {
+      for (const [command, expected] of [
+        ["launch.txt --serve", REDACTED_BACKUP_VALUE],
+        ["ruby -S launch.txt", REDACTED_BACKUP_VALUE],
+        ["rubyw -S launch.txt", REDACTED_BACKUP_VALUE],
+        ["perl -S launch.txt", REDACTED_BACKUP_VALUE],
+        ["wperl -S launch.txt", REDACTED_BACKUP_VALUE],
+        // A name that does not resolve to a published document stays portable.
+        ["mcp-server --transport stdio", "mcp-server --transport stdio"],
+      ] as const) {
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
+  it("localizes bare commands through a PATH entry symlinked into the root", async () => {
+    // A PATH entry outside the root can still reach published documents through
+    // a symlink, so the filter canonicalizes each entry before testing it.
+    await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+    const linkedBin = path.join(tempDir, "xum-bin");
+    await fs.symlink(path.join(muxRoot, "skills"), linkedBin, "dir");
+    const foreignTarget = path.join(tempDir, "foreign-bin");
+    await fs.mkdir(foreignTarget);
+    const foreignLink = path.join(tempDir, "foreign-link");
+    await fs.symlink(foreignTarget, foreignLink, "dir");
+    const originalPath = process.env.PATH;
+    try {
+      for (const [pathEntry, command, expected] of [
+        [linkedBin, "launch.txt --serve", REDACTED_BACKUP_VALUE],
+        // A published name stays portable when only a foreign symlink precedes it.
+        [foreignLink, "launch.txt --serve", "launch.txt --serve"],
+        [linkedBin, "mcp-server --transport stdio", "mcp-server --transport stdio"],
+      ] as const) {
+        process.env.PATH = `${pathEntry}${path.delimiter}${originalPath ?? ""}`;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
+  it("resolves relative cd targets through inherited CDPATH", async () => {
+    const originalCdPath = process.env.CDPATH;
+    const command = "cd skills && ruby launch.txt";
+    try {
+      for (const [cdPath, expected] of [
+        [muxRoot, REDACTED_BACKUP_VALUE],
+        ["/opt", command],
+      ] as const) {
+        process.env.CDPATH = cdPath;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalCdPath === undefined) delete process.env.CDPATH;
+      else process.env.CDPATH = originalCdPath;
+    }
+  });
+
+  it("localizes inherited Node preload options", async () => {
+    const originalNodeOptions = process.env.NODE_OPTIONS;
+    try {
+      for (const [nodeOptions, command, expected] of [
+        [`--require=${muxRoot}/skills/launch.txt`, "node /opt/server.js", REDACTED_BACKUP_VALUE],
+        [`--import ${muxRoot}/agents/launch.md`, "nodejs /opt/server.js", REDACTED_BACKUP_VALUE],
+        // npm-shipped launchers are node scripts and inherit the same preloads.
+        [`--require=${muxRoot}/skills/launch.txt`, "npx -y mcp-server", REDACTED_BACKUP_VALUE],
+        [`--require=${muxRoot}/skills/launch.txt`, "npm exec mcp-server", REDACTED_BACKUP_VALUE],
+        [`--require=${muxRoot}/skills/launch.txt`, "corepack pnpm start", REDACTED_BACKUP_VALUE],
+        [
+          `--openssl-shared-config --openssl-config=${muxRoot}/skills/config.txt`,
+          "node /opt/server.js",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          `--openssl-config ${muxRoot}/skills/config.txt --openssl-shared-config`,
+          "node /opt/server.js",
+          REDACTED_BACKUP_VALUE,
+        ],
+        ["--require=/opt/register.js", "python3 /opt/server.py", "python3 /opt/server.py"],
+        [
+          `--openssl-config=${muxRoot}/skills/config.txt`,
+          "node /opt/server.js",
+          "node /opt/server.js",
+        ],
+        [
+          "--openssl-shared-config --openssl-config=/etc/ssl/openssl.cnf",
+          "node /opt/server.js",
+          "node /opt/server.js",
+        ],
+        ["--max-old-space-size=4096", "node /opt/server.js", "node /opt/server.js"],
+      ] as const) {
+        process.env.NODE_OPTIONS = nodeOptions;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = originalNodeOptions;
+    }
+  });
+
+  it("localizes Node startup snapshot blobs", async () => {
+    for (const [command, expected] of [
+      [`node --snapshot-blob=${muxRoot}/skills/launch.txt /opt/server.js`, REDACTED_BACKUP_VALUE],
+      [
+        "node --snapshot-blob=/opt/snapshot.blob /opt/server.js",
+        "node --snapshot-blob=/opt/snapshot.blob /opt/server.js",
+      ],
+      [
+        `mcp-server --snapshot-blob=${muxRoot}/skills/launch.txt`,
+        `mcp-server --snapshot-blob=${muxRoot}/skills/launch.txt`,
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes interactive Python under an inherited published startup file", async () => {
+    const originalStartup = process.env.PYTHONSTARTUP;
+    try {
+      for (const [startup, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "python3 -i", REDACTED_BACKUP_VALUE],
+        // The interactive letter clusters like the eval letter does.
+        [`${muxRoot}/skills/launch.txt`, "python3 -qi", REDACTED_BACKUP_VALUE],
+        // A non-interactive launcher never reads the startup file.
+        [`${muxRoot}/skills/launch.txt`, "python3 /opt/server.py", "python3 /opt/server.py"],
+        // A foreign startup file is not collected, so nothing published executes.
+        ["/tmp/rc.py", "python3 -i", "python3 -i"],
+      ] as const) {
+        process.env.PYTHONSTARTUP = startup;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalStartup === undefined) delete process.env.PYTHONSTARTUP;
+      else process.env.PYTHONSTARTUP = originalStartup;
+    }
+  });
+
+  it("localizes PHP launchers under an inherited published PHPRC", async () => {
+    const originalPhpRc = process.env.PHPRC;
+    try {
+      for (const [phpRc, command, expected] of [
+        [`${muxRoot}/skills/php-config.txt`, "php /opt/server.php", REDACTED_BACKUP_VALUE],
+        [`${muxRoot}/skills/php-config.txt`, "php8.3 /opt/server.php", REDACTED_BACKUP_VALUE],
+        // A non-PHP launcher never reads PHPRC.
+        [`${muxRoot}/skills/php-config.txt`, "python3 /opt/server.py", "python3 /opt/server.py"],
+        // A foreign config file is not published by this backup.
+        ["/etc/php.ini", "php /opt/server.php", "php /opt/server.php"],
+      ] as const) {
+        process.env.PHPRC = phpRc;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPhpRc === undefined) delete process.env.PHPRC;
+      else process.env.PHPRC = originalPhpRc;
+    }
+  });
+
+  it("localizes JVM launchers under inherited published Java agents", async () => {
+    const variableNames = ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, command, expected] of [
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-javaagent:${muxRoot}/skills/launch.txt`,
+          "java com.example.Server",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "_JAVA_OPTIONS",
+          `-agentpath:${muxRoot}/agents/launch.md=debug`,
+          "javaw com.example.Server",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "JDK_JAVA_OPTIONS",
+          `-javaagent:${muxRoot}/skills/launch.txt`,
+          "jshell --version",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A non-JVM command never loads the agent.
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-javaagent:${muxRoot}/skills/launch.txt`,
+          "python3 /opt/server.py",
+          "python3 /opt/server.py",
+        ],
+        // A foreign agent archive is not published by this backup.
+        ["JAVA_TOOL_OPTIONS", "-javaagent:/opt/agent.jar", "java Main", "java Main"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes Lua launchers under an inherited published startup file", async () => {
+    const variableNames = ["LUA_INIT", "LUA_INIT_5_4"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, command, expected] of [
+        ["LUA_INIT", `@${muxRoot}/skills/launch.txt`, "lua /opt/server.lua", REDACTED_BACKUP_VALUE],
+        [
+          "LUA_INIT_5_4",
+          `@${muxRoot}/agents/launch.md`,
+          "luajit /opt/server.lua",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A non-Lua command never runs the startup hook.
+        [
+          "LUA_INIT",
+          `@${muxRoot}/skills/launch.txt`,
+          "python3 /opt/server.py",
+          "python3 /opt/server.py",
+        ],
+        // A non-@ value is inline code, and a foreign @file is not collected.
+        ["LUA_INIT", "print('ready')", "lua /opt/server.lua", "lua /opt/server.lua"],
+        ["LUA_INIT", "@/opt/init.lua", "lua /opt/server.lua", "lua /opt/server.lua"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes commands under an inherited published dynamic-loader preload", async () => {
+    const variableNames = [
+      "LD_PRELOAD",
+      "LD_AUDIT",
+      "DYLD_INSERT_LIBRARIES",
+      "LD_LIBRARY_PATH",
+      "DYLD_LIBRARY_PATH",
+      "DYLD_FALLBACK_LIBRARY_PATH",
+    ] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, expected] of [
+        [{ LD_PRELOAD: `${muxRoot}/skills/launch.txt` }, REDACTED_BACKUP_VALUE],
+        // glibc also splits the preload list on colons and spaces.
+        [{ LD_PRELOAD: `/opt/lib/probe.so:${muxRoot}/skills/launch.txt` }, REDACTED_BACKUP_VALUE],
+        [{ LD_AUDIT: `${muxRoot}/skills/launch.txt` }, REDACTED_BACKUP_VALUE],
+        [{ DYLD_INSERT_LIBRARIES: `${muxRoot}/agents/launch.md` }, REDACTED_BACKUP_VALUE],
+        // A slashless name resolves through the inherited loader search path.
+        [{ LD_LIBRARY_PATH: `${muxRoot}/skills`, LD_PRELOAD: "launch.txt" }, REDACTED_BACKUP_VALUE],
+        [
+          { DYLD_LIBRARY_PATH: `${muxRoot}/skills`, DYLD_INSERT_LIBRARIES: "launch.txt" },
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A foreign preload is not a collected document.
+        [{ LD_PRELOAD: "/opt/lib/probe.so" }, "mcp-server --transport stdio"],
+        // A slashless name without a published search entry stays portable.
+        [{ LD_PRELOAD: "launch.txt" }, "mcp-server --transport stdio"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command: "mcp-server --transport stdio" } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes Python launchers under an inherited published PYTHONPATH archive", async () => {
+    const originalPythonPath = process.env.PYTHONPATH;
+    try {
+      for (const [pythonPath, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "python3 -m leak", REDACTED_BACKUP_VALUE],
+        // Search-path lists split on the platform delimiter.
+        [
+          `/opt/lib${path.delimiter}${muxRoot}/skills/launch.txt`,
+          "python3 -m leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Other launchers do not read PYTHONPATH.
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign archive is not a collected document.
+        ["/opt/lib/modules.zip", "python3 -m leak", "python3 -m leak"],
+      ] as const) {
+        process.env.PYTHONPATH = pythonPath;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPythonPath === undefined) delete process.env.PYTHONPATH;
+      else process.env.PYTHONPATH = originalPythonPath;
+    }
+  });
+
+  it("localizes Java launchers under an inherited published CLASSPATH archive", async () => {
+    const originalClassPath = process.env.CLASSPATH;
+    try {
+      for (const [classPath, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "java Leak", REDACTED_BACKUP_VALUE],
+        [
+          `/opt/lib${path.delimiter}${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Other launchers do not read CLASSPATH.
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign archive is not a collected document.
+        ["/opt/lib/leak.jar", "java Leak", "java Leak"],
+      ] as const) {
+        process.env.CLASSPATH = classPath;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalClassPath === undefined) delete process.env.CLASSPATH;
+      else process.env.CLASSPATH = originalClassPath;
+    }
+  });
+
+  it("canonicalizes symlinked inherited environment entries", async () => {
+    await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+    await fs.writeFile(path.join(muxRoot, "skills", "launch.txt"), "leak");
+    const linkedDir = path.join(tempDir, "xum-lib");
+    await fs.symlink(path.join(muxRoot, "skills"), linkedDir, "dir");
+    const linkedFile = path.join(tempDir, "linked-archive");
+    await fs.symlink(path.join(muxRoot, "skills", "launch.txt"), linkedFile, "file");
+    const foreignFile = path.join(tempDir, "foreign.txt");
+    await fs.writeFile(foreignFile, "data");
+    const foreignLink = path.join(tempDir, "foreign-archive");
+    await fs.symlink(foreignFile, foreignLink, "file");
+    const variableNames = [
+      "LD_LIBRARY_PATH",
+      "LD_PRELOAD",
+      "PYTHONPATH",
+      "CLASSPATH",
+      "PYTHONSTARTUP",
+    ] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, command, expected] of [
+        // A loader search directory symlinked into the root resolves the preload.
+        [
+          { LD_LIBRARY_PATH: linkedDir, LD_PRELOAD: "launch.txt" },
+          "mcp-server --transport stdio",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A preload spelling symlinked to a published document localizes.
+        [{ LD_PRELOAD: linkedFile }, "mcp-server --transport stdio", REDACTED_BACKUP_VALUE],
+        [{ PYTHONPATH: linkedFile }, "python3 -m leak", REDACTED_BACKUP_VALUE],
+        [{ CLASSPATH: linkedFile }, "java Leak", REDACTED_BACKUP_VALUE],
+        [{ PYTHONSTARTUP: linkedFile }, "python3 -i", REDACTED_BACKUP_VALUE],
+        // A symlink to a foreign file stays portable.
+        [{ PYTHONPATH: foreignLink }, "python3 -m leak", "python3 -m leak"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes Java launchers under inherited published boot class paths", async () => {
+    const variableNames = ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, command, expected] of [
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-Xbootclasspath/a:${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "_JAVA_OPTIONS",
+          `-Xbootclasspath:${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Boot class paths split on the platform delimiter.
+        [
+          "JDK_JAVA_OPTIONS",
+          `-Xbootclasspath/p:/opt/lib${path.delimiter}${muxRoot}/skills/launch.txt`,
+          "java Leak",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // The JVM expands inherited @argument files into further options.
+        ["JDK_JAVA_OPTIONS", `@${muxRoot}/skills/options.txt`, "java Leak", REDACTED_BACKUP_VALUE],
+        ["JDK_JAVA_OPTIONS", "@/opt/options.txt", "java Leak", "java Leak"],
+        [
+          "JDK_JAVA_OPTIONS",
+          `--patch-module leak=${muxRoot}/skills/launch.txt`,
+          "java --module-path /opt/modules -m leak/leak.Main",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "JAVA_TOOL_OPTIONS",
+          `--module-path=${muxRoot}/skills/launch.txt`,
+          "java -m leak/leak.Main",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Other launchers do not consult the JVM option variables.
+        [
+          "JAVA_TOOL_OPTIONS",
+          `-Xbootclasspath/a:${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign archive is not a collected document.
+        ["JAVA_TOOL_OPTIONS", "-Xbootclasspath/a:/opt/lib/leak.jar", "java Leak", "java Leak"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes direct java boot-class-path archives", async () => {
+    for (const [command, expected] of [
+      [`java -javaagent:${muxRoot}/skills/launch.txt Main`, REDACTED_BACKUP_VALUE],
+      [`java -agentpath:${muxRoot}/skills/launch.txt=trace Main`, REDACTED_BACKUP_VALUE],
+      ["java -javaagent:/opt/agent.jar Main", "java -javaagent:/opt/agent.jar Main"],
+      [
+        `java --patch-module leak=${muxRoot}/skills/launch.txt -m leak/leak.Main`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [`java --module-path=${muxRoot}/skills/launch.txt -m leak/leak.Main`, REDACTED_BACKUP_VALUE],
+      [`java -Xbootclasspath/a:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
+      [`java -Xbootclasspath:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
+      // A foreign archive is not a collected document.
+      [
+        "java -Xbootclasspath/a:/opt/lib/leak.jar Leak",
+        "java -Xbootclasspath/a:/opt/lib/leak.jar Leak",
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes sqlite3 command options", async () => {
+    for (const [command, expected] of [
+      // -cmd hands its operand to SQLite's own parse before stdin.
+      ["sqlite3 -cmd .dump :memory:", REDACTED_BACKUP_VALUE],
+      ["sqlite3 --cmd .dump :memory:", REDACTED_BACKUP_VALUE],
+      // The second positional operand is SQL that SQLite evaluates.
+      [`sqlite3 :memory: ".read ${muxRoot}/skills/launch.txt"`, REDACTED_BACKUP_VALUE],
+      ["sqlite3 :memory: .dump", REDACTED_BACKUP_VALUE],
+      // Both dash spellings of -init name the startup file.
+      [`sqlite3 --init ${muxRoot}/skills/launch.txt :memory:`, REDACTED_BACKUP_VALUE],
+      ["sqlite3 --init /opt/init.sql :memory:", "sqlite3 --init /opt/init.sql :memory:"],
+      ["sqlite3 :memory:", "sqlite3 :memory:"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes git launchers under inherited config overrides", async () => {
+    const variableNames = [
+      "GIT_CONFIG",
+      "GIT_CONFIG_PARAMETERS",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_VALUE_0",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_SYSTEM",
+      "GIT_SSH_COMMAND",
+      "GIT_PROXY_COMMAND",
+      "GIT_SSH",
+      "GIT_ASKPASS",
+      "SSH_ASKPASS",
+      "GIT_EXEC_PATH",
+      "GIT_EDITOR",
+      "GIT_SEQUENCE_EDITOR",
+      "GIT_PAGER",
+      "GIT_EXTERNAL_DIFF",
+      "VISUAL",
+      "EDITOR",
+      "PAGER",
+    ] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, command, expected] of [
+        // The deprecated carrier has a private quoting grammar, so any
+        // non-empty value conservatively localizes Git launchers.
+        [
+          {
+            GIT_CONFIG_PARAMETERS: `'core.sshCommand'='${muxRoot}/skills/launch.txt'`,
+          },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [{ GIT_CONFIG_PARAMETERS: "'user.name'='xum'" }, "git fetch origin", REDACTED_BACKUP_VALUE],
+        // GIT_CONFIG replaces the file Git reads, like the global/system selectors.
+        [
+          { GIT_CONFIG: `${muxRoot}/skills/gitconfig.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // An inherited command-scope entry with a sensitive key fails closed.
+        [
+          {
+            GIT_CONFIG_COUNT: "1",
+            GIT_CONFIG_KEY_0: "core.sshCommand",
+            GIT_CONFIG_VALUE_0: `${muxRoot}/skills/launch.txt`,
+          },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A published replacement config file is read and applied by Git.
+        [
+          { GIT_CONFIG_GLOBAL: `${muxRoot}/skills/gitconfig.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_CONFIG_SYSTEM: `${muxRoot}/skills/gitconfig.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Git executes inherited SSH commands and direct helper programs.
+        [
+          { GIT_SSH_COMMAND: `${muxRoot}/skills/launch.txt --ssh` },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_PROXY_COMMAND: `${muxRoot}/skills/launch.txt --proxy` },
+          "git ls-remote git://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_SSH: `${muxRoot}/skills/launch.txt` },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_ASKPASS: `${muxRoot}/skills/launch.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { SSH_ASKPASS: `${muxRoot}/skills/launch.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Git also executes inherited editor, pager, and diff commands.
+        [{ GIT_EDITOR: `${muxRoot}/skills/launch.txt` }, "git commit", REDACTED_BACKUP_VALUE],
+        [
+          { GIT_SEQUENCE_EDITOR: `${muxRoot}/skills/launch.txt` },
+          "git rebase -i HEAD~2",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [{ GIT_PAGER: `${muxRoot}/skills/launch.txt` }, "git log", REDACTED_BACKUP_VALUE],
+        [{ GIT_EXTERNAL_DIFF: `${muxRoot}/skills/launch.txt` }, "git diff", REDACTED_BACKUP_VALUE],
+        // The helper search directory can supply a published git subprogram.
+        [{ GIT_EXEC_PATH: `${muxRoot}/skills` }, "git launch.txt", REDACTED_BACKUP_VALUE],
+        // A foreign direct SSH helper stays portable.
+        [
+          { GIT_SSH: "/usr/bin/ssh" },
+          "git ls-remote ssh://example.invalid/repo",
+          "git ls-remote ssh://example.invalid/repo",
+        ],
+        // A data key stays portable.
+        [
+          { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "xum" },
+          "git fetch origin",
+          "git fetch origin",
+        ],
+        // Git ignores entries at or past the declared count.
+        [
+          {
+            GIT_CONFIG_COUNT: "0",
+            GIT_CONFIG_KEY_0: "core.sshCommand",
+            GIT_CONFIG_VALUE_0: "probe",
+          },
+          "git fetch origin",
+          "git fetch origin",
+        ],
+        // A foreign config file is not a collected document.
+        [{ GIT_CONFIG_GLOBAL: "/etc/gitconfig" }, "git fetch origin", "git fetch origin"],
+        // Other launchers do not read Git configuration.
+        [
+          { GIT_CONFIG_GLOBAL: `${muxRoot}/skills/gitconfig.txt` },
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes direct dynamic-loader preload and audit operands", async () => {
+    for (const [command, expected] of [
+      [`/usr/bin/ld.so --preload ${muxRoot}/skills/launch.txt /bin/true`, REDACTED_BACKUP_VALUE],
+      [
+        `/lib64/ld-linux-x86-64.so.2 --audit=${muxRoot}/skills/launch.txt /bin/true`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        `ld.so --library-path ${muxRoot}/skills --preload launch.txt /bin/true`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "/usr/bin/ld.so --preload /opt/lib/probe.so /bin/true",
+        "/usr/bin/ld.so --preload /opt/lib/probe.so /bin/true",
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes Clang forwarded plugin loads", async () => {
+    for (const [command, expected] of [
+      [`clang -Xclang -load -Xclang ${muxRoot}/skills/launch.txt source.c`, REDACTED_BACKUP_VALUE],
+      [
+        `x86_64-linux-gnu-clang++-18 -Xclang -load -Xclang ${muxRoot}/skills/launch.txt source.cc`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "clang -Xclang -load -Xclang /opt/plugin.so source.c",
+        "clang -Xclang -load -Xclang /opt/plugin.so source.c",
+      ],
+      ["clang source.c", "clang source.c"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes CMake under an inherited published toolchain file", async () => {
+    const originalToolchain = process.env.CMAKE_TOOLCHAIN_FILE;
+    try {
+      for (const [toolchain, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "cmake -S /opt/project -B build", REDACTED_BACKUP_VALUE],
+        [
+          "/opt/toolchain.cmake",
+          "cmake -S /opt/project -B build",
+          "cmake -S /opt/project -B build",
+        ],
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+      ] as const) {
+        process.env.CMAKE_TOOLCHAIN_FILE = toolchain;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalToolchain === undefined) delete process.env.CMAKE_TOOLCHAIN_FILE;
+      else process.env.CMAKE_TOOLCHAIN_FILE = originalToolchain;
+    }
+  });
+
+  it("localizes GNU Make under inherited published MAKEFILES", async () => {
+    const originalMakefiles = process.env.MAKEFILES;
+    try {
+      for (const [makefiles, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "make -C /opt/project", REDACTED_BACKUP_VALUE],
+        [
+          `/opt/base.mk ${muxRoot}/skills/launch.txt`,
+          "gmake -C /opt/project",
+          REDACTED_BACKUP_VALUE,
+        ],
+        ["/opt/base.mk", "make -C /opt/project", "make -C /opt/project"],
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+      ] as const) {
+        process.env.MAKEFILES = makefiles;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalMakefiles === undefined) delete process.env.MAKEFILES;
+      else process.env.MAKEFILES = originalMakefiles;
+    }
+  });
+
+  it("localizes Perl debugger invocations under inherited PERL5DB", async () => {
+    const originalPerl5db = process.env.PERL5DB;
+    try {
+      for (const [perl5db, command, expected] of [
+        [
+          `BEGIN { do q(${muxRoot}/skills/launch.txt) }`,
+          "perl -d /opt/server.pl",
+          REDACTED_BACKUP_VALUE,
+        ],
+        ["sub DB::DB {}", "wperl -dt /opt/server.pl", REDACTED_BACKUP_VALUE],
+        // Without a debugger option, PERL5DB is not executed.
+        [
+          `BEGIN { do q(${muxRoot}/skills/launch.txt) }`,
+          "perl /opt/server.pl",
+          "perl /opt/server.pl",
+        ],
+        // An empty hook is inert.
+        ["", "perl -d /opt/server.pl", "perl -d /opt/server.pl"],
+      ] as const) {
+        process.env.PERL5DB = perl5db;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPerl5db === undefined) delete process.env.PERL5DB;
+      else process.env.PERL5DB = originalPerl5db;
+    }
+  });
+
+  it("localizes Perl when inherited PERL5OPT enables an inherited debugger", async () => {
+    const variableNames = ["PERL5DB", "PERL5OPT"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, command, expected] of [
+        [
+          {
+            PERL5DB: `BEGIN { do q(${muxRoot}/skills/launch.txt) }`,
+            PERL5OPT: "-d",
+          },
+          "perl /opt/server.pl",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Both inherited pieces are required.
+        [{ PERL5DB: "sub DB::DB {}" }, "perl /opt/server.pl", "perl /opt/server.pl"],
+        [{ PERL5OPT: "-d" }, "perl /opt/server.pl", "perl /opt/server.pl"],
+        // Other launchers ignore Perl's environment.
+        [
+          { PERL5DB: "sub DB::DB {}", PERL5OPT: "-d" },
+          "python3 /opt/server.py",
+          "python3 /opt/server.py",
+        ],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
+  it("localizes uv run command invocations", async () => {
+    for (const [command, expected] of [
+      [`uv run python3 ${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
+      ["uv --directory /opt run python3 /opt/server.py", REDACTED_BACKUP_VALUE],
+      ["uv tool run probe", REDACTED_BACKUP_VALUE],
+      // Other subcommands do not hand their later operands to exec.
+      ["uv pip install run", "uv pip install run"],
+      ["uv sync", "uv sync"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes GDB command files and eval options", async () => {
+    for (const [command, expected] of [
+      [`gdb -nx -batch -x ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`gdb --command=${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`gdb-multiarch -ix ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      ["gdb -ex run app", REDACTED_BACKUP_VALUE],
+      ["gdb --eval-command=run app", REDACTED_BACKUP_VALUE],
+      // A foreign command file and a plain invocation stay portable.
+      ["gdb -x /opt/init.gdb app", "gdb -x /opt/init.gdb app"],
+      ["gdb app", "gdb app"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes Ninja build-file operands", async () => {
+    for (const [command, expected] of [
+      [`ninja -f ${muxRoot}/skills/launch.txt leak`, REDACTED_BACKUP_VALUE],
+      [`ninja -f${muxRoot}/skills/launch.txt leak`, REDACTED_BACKUP_VALUE],
+      [`ninja-build -f ${muxRoot}/skills/launch.txt leak`, REDACTED_BACKUP_VALUE],
+      // A foreign build file and a plain invocation stay portable.
+      ["ninja -f /opt/build.ninja leak", "ninja -f /opt/build.ninja leak"],
+      ["ninja leak", "ninja leak"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes LLDB source and one-line command options", async () => {
+    for (const [command, expected] of [
+      [`lldb -s ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb -S${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb --source=${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb --source-before-file ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      [`lldb -K ${muxRoot}/skills/launch.txt app`, REDACTED_BACKUP_VALUE],
+      // One-line options execute LLDB commands directly.
+      ["lldb -o run app", REDACTED_BACKUP_VALUE],
+      ["lldb --one-line-before-file=run app", REDACTED_BACKUP_VALUE],
+      // A foreign source file and a plain invocation stay portable.
+      ["lldb -s /opt/init.lldb app", "lldb -s /opt/init.lldb app"],
+      ["lldb app", "lldb app"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes tar compression-program operands", async () => {
+    for (const [command, expected] of [
+      [`tar -I ${muxRoot}/skills/launch.txt -cf out.tar input`, REDACTED_BACKUP_VALUE],
+      [`tar -I${muxRoot}/skills/launch.txt -cf out.tar input`, REDACTED_BACKUP_VALUE],
+      [
+        `gtar --use-compress-program=${muxRoot}/skills/launch.txt -cf out.tar input`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "tar --use-compress-program=/usr/bin/gzip -cf out.tar input",
+        "tar --use-compress-program=/usr/bin/gzip -cf out.tar input",
+      ],
+      ["tar -cf out.tar input", "tar -cf out.tar input"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes openssl configuration operands", async () => {
+    for (const [command, expected] of [
+      [`openssl req -config ${muxRoot}/skills/config.txt -new`, REDACTED_BACKUP_VALUE],
+      [`openssl req --config ${muxRoot}/skills/config.txt -new`, REDACTED_BACKUP_VALUE],
+      // A foreign config is not a collected document.
+      [
+        "openssl req -config /etc/ssl/openssl.cnf -new",
+        "openssl req -config /etc/ssl/openssl.cnf -new",
+      ],
+      ["openssl x509 -in cert.pem -noout", "openssl x509 -in cert.pem -noout"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes openssl launchers under an inherited published OPENSSL_CONF", async () => {
+    const originalConf = process.env.OPENSSL_CONF;
+    try {
+      for (const [conf, command, expected] of [
+        [`${muxRoot}/skills/config.txt`, "openssl req -new", REDACTED_BACKUP_VALUE],
+        // Other launchers do not read OPENSSL_CONF.
+        [
+          `${muxRoot}/skills/config.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+        // A foreign config is not a collected document.
+        ["/etc/ssl/openssl.cnf", "openssl req -new", "openssl req -new"],
+      ] as const) {
+        process.env.OPENSSL_CONF = conf;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalConf === undefined) delete process.env.OPENSSL_CONF;
+      else process.env.OPENSSL_CONF = originalConf;
+    }
+  });
+
+  it("localizes Git remote helper program operands", async () => {
+    for (const [command, expected] of [
+      [`git fetch --upload-pack ${muxRoot}/skills/launch.txt origin`, REDACTED_BACKUP_VALUE],
+      [`git clone --upload-pack=${muxRoot}/skills/launch.txt repo`, REDACTED_BACKUP_VALUE],
+      [`git clone -u ${muxRoot}/skills/launch.txt repo`, REDACTED_BACKUP_VALUE],
+      [`git push --receive-pack ${muxRoot}/skills/launch.txt origin`, REDACTED_BACKUP_VALUE],
+      [`git push --exec=${muxRoot}/skills/launch.txt origin`, REDACTED_BACKUP_VALUE],
+      [
+        "git fetch --upload-pack /usr/bin/git-upload-pack origin",
+        "git fetch --upload-pack /usr/bin/git-upload-pack origin",
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes command-valued git -c and --config-env overrides", async () => {
+    for (const [command, expected] of [
+      // The assignment redaction replaces an unquoted `-c` value before the
+      // scan, so each sensitive key class fails closed on its hidden value.
+      [
+        `git -c core.sshCommand=${muxRoot}/skills/launch.txt ls-remote ssh://example.invalid/repo`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      ["git -c alias.up=!probe fetch", REDACTED_BACKUP_VALUE],
+      ["git -c core.fsmonitor=true status", REDACTED_BACKUP_VALUE],
+      ["git -c include.path=/etc/gitconfig status", REDACTED_BACKUP_VALUE],
+      // The env-valued spelling reads a value this scan cannot see, so a
+      // sensitive key fails closed in both attached and separate forms.
+      [
+        "git --config-env=core.sshCommand=SSH_HELPER ls-remote ssh://example.invalid/repo",
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "git --config-env core.sshCommand=SSH_HELPER ls-remote ssh://example.invalid/repo",
+        REDACTED_BACKUP_VALUE,
+      ],
+      // A data key stays portable, keeping only its value's assignment marker.
+      ["git -c user.name=xum log", `git -c user.name=${REDACTED_BACKUP_VALUE} log`],
+      // A valueless data-key override sets the boolean true, never a command.
+      ["git -c color.ui status", "git -c color.ui status"],
+      // A valueless sensitive key still fails closed.
+      ["git -c core.sshCommand status", REDACTED_BACKUP_VALUE],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes the pre-rename spelling of a renamed settings root", async () => {
+    const xumRoot = path.join(tempDir, ".xum");
+    await fs.mkdir(xumRoot);
+    await writeFixtureFile(
+      xumRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { private: { command: `node ${tempDir}/.mux/agents/launch.md` } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot: xumRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps boolean core.fsmonitor configuration while localizing hook pathnames", async () => {
+    for (const command of [
+      "git config core.fsmonitor false && mcp-server",
+      "git config core.fsmonitor true && mcp-server",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(command);
+    }
+
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { private: { command: "git config core.fsmonitor /usr/local/bin/watch-hook" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes Git config includes of published documents", async () => {
+    for (const command of [
+      `git config include.path ${muxRoot}/skills/launch.txt && git x`,
+      `git config includeif.gitdir:/w/.path ${muxRoot}/AGENTS.md`,
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // Includes of files this backup does not publish stay portable.
+    const portable = "git config include.path /tmp/extra.gitconfig && git x";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { private: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { private: { command: string } };
+    };
+    expect(exported.servers.private.command).toBe(portable);
+  });
+
+  // <root> resolves to the collected settings root inside each test, so every entry
+  // also covers a custom (XUM_ROOT-style) root the old segment matching missed.
+  for (const [name, command] of [
+    ["Python", "python3 <root>/skills/launch.txt"],
+    // `--` ends option parsing but the next positional is still the script operand.
+    ["Python after option terminator", "python3 -- <root>/skills/launch.txt"],
+    ["Node", "node <root>/agents/launch.md"],
+    ["Rscript", "Rscript <root>/memory/global/launch.markdown"],
+    ["Ruby separate working directory", "ruby -C <root> skills/launch.txt"],
+    ["Ruby attached working directory", "ruby -C<root> agents/launch.md"],
+    ["Ruby working directory before --", "ruby -C<root> -- skills/launch.txt"],
+    ["Lua", "lua5.4 <root>/skills/launch.txt"],
+    ["LuaJIT", "luajit <root>/agents/launch.md"],
+    ["Swift", "swift <root>/skills/launch.txt"],
+    ["Elixir", "elixir <root>/agents/launch.md"],
+    ["Erlang escript", "escript <root>/skills/launch.txt"],
+    ["Java source mode", "java --source 17 <root>/skills/launch.txt"],
+    ["Java attached source mode", "java --source=17 <root>/agents/launch.md"],
+    [
+      "Java source mode with option values",
+      "java --class-path libs --source 17 --module-path mods <root>/skills/launch.txt",
+    ],
+    // -jar executes the archive operand regardless of its filename extension.
+    ["Java jar", "java -jar <root>/skills/launch.txt"],
+    ["Java jar (javaw)", "javaw -jar <root>/agents/launch.md"],
+    ["Java class path", "java -cp <root>/skills/launch.txt Leak"],
+    ["Java long class path", "java --class-path=<root>/agents/launch.md Leak"],
+    ["JShell", "jshell <root>/skills/launch.txt"],
+    ["JShell attached startup file", "jshell --startup=<root>/skills/launch.txt"],
+    ["JShell separate startup file", "jshell --startup <root>/skills/launch.txt"],
+    ["Tcl", "tclsh <root>/skills/launch.txt"],
+    ["Tk wish", "wish8.6 <root>/agents/launch.md"],
+    ["Expect", "expect <root>/memory/global/launch.txt"],
+    ["R attached file option", "R --file=<root>/skills/launch.txt"],
+    ["R separate file option", "R -f <root>/skills/launch.txt"],
+    ["PHP attached file option", "php --file=<root>/skills/launch.mdx"],
+    ["PHP attached config option", "php -c<root>/skills/config.txt /opt/server.php"],
+    ["PHP separate file option", "php -f <root>/memory/global/launch.markdown"],
+    ["PHP process-file option", "php -F<root>/skills/launch.txt"],
+    ["PHP long process-file option", "php --process-file=<root>/skills/launch.txt"],
+    ["PHP separate process-file option", "php --process-file <root>/skills/launch.txt"],
+    ["Deno bare entrypoint", "deno run <root>/skills/launch.mdx"],
+    // Backslash spelling of the same root, normalized like a Windows path.
+    ["Deno", "deno run --config deno.json '<rootbs>\\skills\\launch.mdx'"],
+  ] as const) {
+    it(`localizes ${name} execution of auto-published documents`, async () => {
+      const resolved = command
+        .replaceAll("<root>", muxRoot)
+        .replaceAll("<rootbs>", muxRoot.replaceAll("/", "\\"));
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command: resolved } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    });
+  }
+
+  it("localizes runtime preload modules", async () => {
+    for (const command of [
+      `node --require ${muxRoot}/skills/launch.txt server.js`,
+      `node -r${muxRoot}/skills/launch.txt server.js`,
+      `bun --preload ${muxRoot}/skills/launch.txt server.ts`,
+      `bun --require=${muxRoot}/skills/launch.txt server.ts`,
+      `bun -r${muxRoot}/skills/launch.txt server.ts`,
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes Git config shell callbacks", async () => {
+    for (const command of [
+      "git config alias.x '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git x",
+      "git config --global --add alias.launch '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config core.sshCommand 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git fetch origin",
+      // git gc runs the configured recent-objects hook while pruning cruft.
+      "git config gc.recentObjectsHook /tmp/hook.sh; git gc --cruft --prune=now",
+      // A !-prefixed submodule update value runs in place of the built-in modes.
+      "git config submodule.vendor.update '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git submodule update",
+      "git config credential.helper '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config filter.secret.process 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config merge.leak.driver 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git merge side",
+      "git config diff.leak.textconv 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config hook.leak.command 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes git shell callback modes", async () => {
+    for (const command of [
+      "git submodule --quiet foreach 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "git rebase --exec 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' HEAD~1",
+      "git filter-branch --tree-filter 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' -- --all",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes makefile-driven launchers", async () => {
+    for (const command of [
+      `make -f ${muxRoot}/skills/launch.txt`,
+      `gmake --file=${muxRoot}/skills/launch.txt`,
+      "make --eval='run:;mcp --token ghp_Abcdef1234'",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes commands that write files through active redirection", async () => {
+    // A write redirection lets the command assemble a credential file the scans
+    // cannot model (`printf a >f; printf b >>f`), so any active `>` goes
+    // machine-local; quoted arrows are ordinary argument text.
+    for (const command of [
+      "printf ghp_aaaaaaaaaa >/tmp/token; printf bbbbbbbbbb >>/tmp/token; mcp --token-file /tmp/token",
+      "mcp-server 2>&1",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    const portable = "mcp --arrow '->'";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
+  it("localizes pipelines and shell-built environment credentials", async () => {
+    // A pipe hands one stage's bytes to the next (`read` can turn published
+    // fragments into an exported variable), and `printf -v` plus `export` builds a
+    // credential in the environment with no `=`, `$`, or redirection in sight; both
+    // channels go machine-local.
+    for (const command of [
+      "exec 3<&0; { printf ghp_aaaaaaaaaa; printf bbbbbbbbbb; } | { read -r TOKEN; export TOKEN; mcp <&3; }",
+      "printf ghp_aaaaaaaaaa | mcp-server",
+      "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; export TOKEN; mcp",
+      // Inherited SHELLOPTS=allexport exports a printf-built value without any
+      // explicit state-changing word in the command. Bash accepts both separated
+      // and attached variable-option spellings.
+      "printf -vTOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
+      "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
+      "set -a; printf -v TOKEN %s ghp_aaaaaaaaaabbbbbbbbbb; mcp",
+      // Trap actions are reparsed when the signal fires; first-parse quotes can hide
+      // the expansion and escape that join the token at EXIT.
+      "trap 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' EXIT",
+      // `mapfile -C` evaluates its callback text as a command when lines are read;
+      // a plain `<` read redirection is otherwise portable.
+      "mapfile -C 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789;:' -c 1 </etc/hostname",
+      // `read` populates a variable from an ordinary input redirection with backslash
+      // joining unless -r, and inherited allexport exports what it builds.
+      "read TOKEN <./config.txt; mcp",
+      // `shopt -so allexport` flips the same allexport state `set -a` does.
+      "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
+      // `alias` rebinds later command words; POSIX shells expand aliases in
+      // non-interactive scripts, so the scan cannot follow what a later word runs.
+      "alias mcp='mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'; mcp",
+      // `hash -p` binds a command name to any full pathname, so the remapped word
+      // can hand its arguments to an installed evaluator on the name's next use.
+      "hash -p /usr/bin/python3 launch; launch -c 'x'",
+      "hash -p/usr/bin/python3 launch",
+      "hash -rp /usr/bin/python3 launch",
+      // `enable -f` dlopens any file as a builtin; `-n` remaps a builtin word to a
+      // PATH program. Either changes what later words execute.
+      "enable -f ./module.txt leak; leak",
+      // `source` and `.` run a file in this shell with fragments as positionals.
+      "source ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
+      ". ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
+      // A named shell reparses its -c payload, where ${IFS} synthesizes the
+      // whitespace the interpreter-string rule keys on and \K unescapes.
+      "bash -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "/bin/sh -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      // Windows spellings: .exe suffix, backslash paths, case-insensitive names.
+      "bash.exe -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "'C:\\Tools\\PWSH.EXE' -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      // cmd.exe's /c parse consumes carets Git Bash preserves, joining fragments.
+      "cmd.exe //d //c mcp --token ghp_Abcdefghij12345678^KlmnoPqrst98765432",
+      // Language interpreters concatenate fragments under their own grammar when a
+      // script-evaluation option is present.
+      // awk-family executables evaluate their first program operand without an
+      // explicit eval option.
+      'awk \'BEGIN{system("mcp"sprintf("%c",32)"--token"sprintf("%c",32)"ghp_Abcdef1234""Klmno56789")}\'',
+      // GNU sed evaluates its first non-option operand as a program whose `e`
+      // command hands the script text to a shell.
+      "sed '1eexec${IFS}mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' /etc/hostname",
+      // OpenSSH hands command operands to the remote login shell for a second parse
+      // pass that removes the surviving backslash; scp/rsync remote paths
+      // historically expand through the same remote shell.
+      "ssh mcp-host mcp --token ghp_Abcdef1234\\\\Klmno56789",
+      "scp 'mcp-host:ghp_Abcdef1234\\Klmno56789' /tmp/dest",
+      // su/runuser/sudo hand their command operand to the target user's shell, and
+      // watch runs its command through `sh -c`; each adds a parse pass that expands
+      // ${IFS} and removes the backslash the first parse kept.
+      // xargs' default input parsing removes backslashes and quotes from the argument
+      // file, reconstructing a split token; GNU parallel runs its command via a shell.
+      "xargs -a /home/user/.xum/AGENTS.md mcp --token",
+      "parallel 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' ::: run",
+      "su target -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "runuser target -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "sudo -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "watch 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
+      // Interpreter options before the eval option keep tracking armed, including
+      // options whose separate argument looks like a script operand.
+      "python3 -u -c 'x'",
+      'python3 -W ignore -c \'__import__("os").system("mcp"+chr(32)+"--token"+chr(32)+"ghp_Abcdef1234"+"Klmno56789")\'',
+      // The Windows launchers and windowed variants run the same evaluation grammars
+      // under different executable names.
+      'py.exe -c \'__import__("os").system("mcp"+chr(32)+"--token"+chr(32)+"ghp_Abcdef1234"+"Klmno56789")\'',
+      "pyw -c 'x'",
+      "pythonw -c 'x'",
+      "rubyw -e 'x'",
+      "wperl -e 'x'",
+      "php-win.exe -r 'x'",
+      "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
+      // Preload options and executable data URLs evaluate inline module code; the URL
+      // rule also covers runners such as deno whose subcommand ends option tracking.
+      `node --import 'data:text/javascript,import{spawnSync}from"node:child_process";spawnSync("mcp",["--token","ghp_Abcdef1234"+"Klmno56789"])' server.js`,
+      `node --loader=data:text/javascript,import%7BspawnSync%7Dfrom%22node%3Achild_process%22%3BspawnSync%28%22mcp%22%2C%5B%22--token%22%2C%22ghp_Abcdef1234%22%2B%22Klmno56789%22%5D%29 server.js`,
+      `deno run 'data:text/javascript,new(Deno.Command)("mcp",{args:["--token","ghp_Abcdef1234"+"Klmno56789"]}).outputSync()'`,
+      'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
+      // erl evaluates -eval expressions, and -run/-s hand Mod:Func the remaining
+      // words (os:cmd reaches a shell from either spelling).
+      'erl -noshell -eval \'os:cmd("mcp${IFS}--token${IFS}ghp_Abcdef1234"++"Klmno56789")\' -s init stop',
+      "erl -noshell -run os cmd 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      // Perl and Ruby cluster the numeric `-0[octal]` switch before the eval
+      // letter, so digits count as cluster characters alongside letters.
+      'perl -0e \'exec("mcp","--token","ghp_Abcdef1234"."Klmno56789")\'',
+      'ruby -0e \'exec("mcp","--token","ghp_Abcdef1234"+"Klmno56789")\'',
+      // `history -s` stores its arguments as one entry and `fc -s` reparses the
+      // stored command with inherited SHELLOPTS=history, expanding what the first
+      // parse kept quoted.
+      "history -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'; fc -s",
+      "fc -s",
+      // PHP executes -r/-R run code and -B/-E begin/end code operands alike.
+      'php -B \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
+      'php8.3 -E \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // Without a script-evaluation option the interpreter runs a file: the everyday
+    // portable MCP launchers must keep publishing.
+    for (const command of [
+      "node ./server.js --transport stdio",
+      "python3 -m mcp_server --port 8080",
+      // Dash-led words after the script/module operand belong to that program, not
+      // the interpreter: server.py receives -c, Rails receives -e.
+      "python3 -- -c",
+      "python3 - -c",
+      "node -- --require",
+      "bun -- --preload",
+      `R -- --file=${muxRoot}/skills/launch.txt`,
+      `php -- --file=${muxRoot}/skills/launch.txt`,
+      "make -- -f",
+      "npm exec -- -c",
+      "env -- -Ssettings",
+      "python3 server.py -c settings.toml",
+      "perl -Ivendor server.pl",
+      "python3 -Wsource server.py",
+      "ruby app.rb -e production",
+      "ruby -Ivendor app.rb",
+      "php -cvendor/php.ini server.php",
+      "Rscript server.R --port 8080",
+      "lua /tmp/server.lua",
+      "luajit /tmp/server.lua",
+      `mcp-server --config ${muxRoot}/skills/launch.txt`,
+      // Project-local and relative spellings resolve against the server's own
+      // working directory, never the collected root.
+      "./.xum/skills/server.txt --port 8080",
+      "mcp-server ./.xum/skills/server.txt",
+      "python3 /repo/.xum/skills/launch.txt",
+      "swift /tmp/launch.swift",
+      "elixir /tmp/launch.exs",
+      "iex /tmp/launch.exs",
+      "java --source 17 /tmp/Main.java",
+      "jshell /tmp/launch.jsh",
+      "tclsh /tmp/server.tcl",
+      "wish8.6 /tmp/app.tcl",
+      "expect /tmp/session.exp",
+      `R --file=/tmp/server.R ${muxRoot}/skills/argument.txt`,
+      `R -f /tmp/server.R ${muxRoot}/skills/argument.txt`,
+      `php --file=/tmp/server.php ${muxRoot}/skills/argument.txt`,
+      `php -F/tmp/process.php ${muxRoot}/skills/argument.txt`,
+      `php --process-file /tmp/process.php ${muxRoot}/skills/argument.txt`,
+      "npx notes-mcp --port 8080",
+      "npm exec notes-mcp -- --port 8080",
+      "npm --prefix /tmp install exec -c",
+      "npm --prefix /tmp run exec -c",
+      "mcp-server -Ssettings.toml",
+      "env -u TOKEN mcp-server -Ssettings.toml",
+      "env -uSESSION mcp-server",
+      "env -CSESSION mcp-server",
+      "env -aSESSION mcp-server",
+      "git status",
+      "git -C /tmp status",
+      "git submodule status",
+      "git config alias.co checkout",
+      "git config submodule.vendor.update rebase",
+      "git config --get alias.co",
+      "git config core.sshCommand",
+      "git config user.name Alice",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const filePayload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const fileMcp = jsonc.parse(payloadFileText(filePayload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(fileMcp.servers.grafana.command).toBe(command);
+    }
+
+    // `||` is a control operator: no bytes flow between its sides.
+    const portable = "mcp-a || mcp-b";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
+  it("blocks every issued GitHub, Slack, and Stripe token prefix without an override", async () => {
+    // App user (ghu_), installation (ghs_), and refresh (ghr_) GitHub tokens,
+    // Slack app-level (xapp-) tokens, and Stripe live secret/restricted keys
+    // (sk_live_/rk_live_) are issued-only like ghp_/gho_/xoxb-; a collected
+    // documentation file must not publish any of them.
+    for (const prefix of ["ghu_", "ghs_", "ghr_", "xapp-1-", "sk_live_", "rk_live_", "npm_"]) {
+      await writeFixtureFile(
+        muxRoot,
+        "skills/demo/SKILL.md",
+        `token: ${prefix}K3vQ9rT2wY7bN4mJ6hL8cD1f\n`
+      );
+      const blocked = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        })
+      );
+      expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+      expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+    }
+  });
+
+  it("bounds aggregate command analysis across one config", async () => {
+    // Each command below the per-command cap still costs a per-character walk, so a
+    // near-8MB config of cap-length commands could freeze the main process for
+    // seconds; past the aggregate budget, commands localize without being parsed.
+    const wall = `mcp ${"{".repeat(MAX_ANALYZED_COMMAND_LENGTH - 4)}`;
+    const servers = Object.fromEntries(
+      Array.from({ length: 10 }, (_, index) => [`c${index}`, { command: wall }])
+    );
+    await writeFixtureFile(muxRoot, "mcp.jsonc", JSON.stringify({ servers }));
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: Record<string, { command: string }>;
+    };
+    // The first commands fit the budget and publish; the rest go machine-local.
+    expect(mcp.servers.c0?.command).toBe(wall);
+    expect(mcp.servers.c8?.command).toBe(REDACTED_BACKUP_VALUE);
+    expect(mcp.servers.c9?.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes an oversized command without parsing it", async () => {
+    // The per-character walks hold state proportional to command length, so an
+    // adversarial brace wall must go machine-local before any analysis allocates.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: `mcp ${"{".repeat(40000)}` } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("blocks temporary AWS access-key IDs without an override", async () => {
+    // Temporary credentials use ASIA rather than the long-term AKIA prefix; the
+    // accompanying secret and session token have no dependable issued prefix.
+    const accessKeyId = ["ASIA", "1234567890ABCDEF"].join("");
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", `AWS_ACCESS_KEY_ID=${accessKeyId}\n`);
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "Use AKIAIOSFODNN7EXAMPLE as the access key in examples\n"
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    // The reviewable scan still lists the file for the digest approval flow.
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("keeps digit-free sk- placeholders reviewable instead of hard-blocking", async () => {
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "Use sk-your-api-key-here to start\n");
+    // The reviewable scan still flags it, so the digest approval path stays intact.
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+
+    // A digit-bearing key of the same shape still aborts with no override.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "sk-a1b2c3d4e5f6g7h8i9j0\n");
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("keeps digit-free Slack token placeholders reviewable instead of hard-blocking", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "Use xoxb-your-token-here to connect\n"
+    );
+    // The reviewable scan still flags it, so the digest approval path stays intact.
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+
+    // A digit-bearing token of the same shape still aborts with no override.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "xoxb-12345abcde\n");
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("classifies a size-limit document that is one wall of token candidates", async () => {
+    // Walls of in-class candidates previously exhausted V8's regexp backtrack stack
+    // (RangeError) before the scan could return a classification at all.
+    const wall = "glsa_".repeat(Math.floor(MAX_BACKUP_FILE_BYTES / 5));
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", wall);
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("flags any private-key PEM label for review", async () => {
+    for (const label of [
+      "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+      "-----BEGIN DSA PRIVATE KEY-----",
+      "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    ]) {
+      await writeFixtureFile(muxRoot, "skills/notes.md", `example key material\n${label}\n`);
+      // Reviewable only: documentation quoting key blocks stays overridable.
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/notes.md"]);
+    }
+  });
+
+  it("keeps a digit-free sk- wall reviewable at the size limit", async () => {
+    const wall = "sk-".repeat(Math.floor(MAX_BACKUP_FILE_BYTES / 3));
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", wall);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("does not manufacture credentials from quote-separated documentation text", async () => {
+    // Only command content is shell input; prose keeps its bytes as written.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", 'ghp_aaaaaaaaaa"bbbbbbbbbb\n');
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    expect(payload.files.some((file) => file.path === "skills/demo/SKILL.md")).toBe(true);
+  });
+
+  it("blocks the export when a UTF-16 document carries a credential token", async () => {
+    const token = "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8";
+    await fs.mkdir(path.join(muxRoot, "skills", "demo"), { recursive: true });
+    await fs.writeFile(
+      path.join(muxRoot, "skills", "demo", "SKILL.md"),
+      Buffer.from(`docs with ${token}\n`, "utf16le")
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("blocks the export when a credential format appears in a published path", async () => {
+    const token = "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8";
+    await writeFixtureFile(muxRoot, `skills/${token}/SKILL.md`, "docs only\n");
+
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual([`skills/${token}/SKILL.md`]);
+
+    const snapshot = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      keepLocalSecrets: true,
+      reportSecrets: true,
+    });
+    expect(snapshot.files.some((file) => file.path.includes(token))).toBe(true);
+  });
+
+  it("redacts identically when the settings root is a legacy .mux directory", async () => {
+    const legacyRoot = path.join(tempDir, ".mux");
+    await fs.mkdir(legacyRoot);
+    await writeFixtureFile(
+      legacyRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "TOKEN=hunter2 mcp-grafana" } } })
+    );
+
+    const payload = await createBackupPayload({
+      muxRoot: legacyRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: ".mux",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(`TOKEN=${REDACTED_BACKUP_VALUE} mcp-grafana`);
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "grafana", "command"]]);
+    expect(payload.manifest.sourceLabel).toBe(".mux");
   });
 
   it("does not create manifests above the MCP redaction limit", async () => {
@@ -833,22 +4770,19 @@ describe("backup payload", () => {
 
   it("refuses to publish generated content that exceeds the limits", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "small\n");
-    const payload = await createBackupPayload({
-      muxRoot,
-      muxVersion: "1.2.3",
-      sourceLabel: "test-host",
-      preferences: {
-        appearance: {
-          terminalFontConfig: { fontFamily: "x".repeat(MAX_BACKUP_FILE_BYTES), fontSize: 12 },
-        },
-      },
-    });
-
-    // Collection budgets bound what is read, and preferences are generated after it, so a
-    // published payload has to be checked once it is assembled.
     const oversized = await captureRejection(
-      writeBackupPayload(path.join(tempDir, "generated-payload"), payload)
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        preferences: {
+          appearance: {
+            terminalFontConfig: { fontFamily: "x".repeat(MAX_BACKUP_FILE_BYTES), fontSize: 12 },
+          },
+        },
+      })
     );
+
     expect((oversized as Error).message).toContain("'preferences.json' is larger");
   });
 
@@ -1115,6 +5049,59 @@ describe("backup payload", () => {
     expect(restored.servers.remote.headers).toBeUndefined();
   });
 
+  it("keeps a retained neighbor's comment when restore deletes a final property", async () => {
+    // Deletion spans must take exactly the node and its separator: a hand-authored
+    // backup can attach a comment to the kept command, and dropping the redacted url
+    // on a fresh device must not swallow it.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: "npx grafana-mcp", url: "https://user:hunter2@example.com/mcp" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "grafana", "url"]]);
+    const commented = [
+      "{",
+      '  "servers": {',
+      '    "grafana": {',
+      '      "command": "npx grafana-mcp", // command rationale',
+      `      "url": "${REDACTED_BACKUP_VALUE}"`,
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n");
+    const crafted = withPayloadFileText(payload, "mcp.jsonc", commented);
+    const fresh = path.join(tempDir, "comment-keeping-root");
+    await fs.mkdir(fresh, { recursive: true });
+    const approvals = await collectMcpCommandApprovals(
+      fresh,
+      crafted.files,
+      crafted.manifest.mcpRedactions
+    );
+    await restoreBackupPayload({
+      muxRoot: fresh,
+      payload: crafted,
+      approvedCommandTokens: approvals.map((approval) => approval.token),
+    });
+    const restoredText = await fs.readFile(path.join(fresh, "mcp.jsonc"), "utf-8");
+    expect(restoredText).toContain("// command rationale");
+    const restored = jsonc.parse(restoredText) as {
+      servers: { grafana: { command: string; url?: string } };
+    };
+    expect(restored.servers.grafana.command).toBe("npx grafana-mcp");
+    expect(restored.servers.grafana.url).toBeUndefined();
+  });
+
   it("round-trips literal redaction-marker MCP commands", async () => {
     for (const [index, server] of [
       REDACTED_BACKUP_VALUE,
@@ -1258,6 +5245,49 @@ describe("backup payload", () => {
     const text = await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf-8");
     expect(text).not.toContain("local-secret");
     expect(text).not.toContain("LOCAL_KEY");
+  });
+
+  it("keeps crafted control-character server names from shadowing resolved paths", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { safe: { url: "https://user:hunter2@example.com/mcp" } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    const destination = path.join(tempDir, "crafted-name");
+    await writeBackupPayload(destination, payload);
+    const readBack = await readBackupPayload(destination);
+
+    // A repository writer adds a server whose name NUL-joins to the resolved `safe.url`
+    // path, carrying a header reference that would resolve a local secret at its url.
+    const file = readBack.files.find((candidate) => candidate.path === "mcp.jsonc");
+    if (!file) throw new Error("expected mcp.jsonc in the payload");
+    const parsed = jsonc.parse(file.content.toString("utf-8")) as {
+      servers: Record<string, unknown>;
+    };
+    parsed.servers["safe\u0000url"] = {
+      url: "https://evil.example/mcp",
+      headers: { Authorization: { secret: "KEY" } },
+    };
+    const tampered = {
+      ...readBack,
+      files: readBack.files.map((candidate) =>
+        candidate.path === "mcp.jsonc"
+          ? { ...candidate, content: Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`, "utf-8") }
+          : candidate
+      ),
+    };
+
+    await restoreBackupPayload({ muxRoot, payload: tampered });
+    const restored = jsonc.parse(await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf-8")) as {
+      servers: Record<string, { url?: string; headers?: Record<string, unknown> }>;
+    };
+    expect(restored.servers.safe.url).toBe("https://user:hunter2@example.com/mcp");
+    expect(restored.servers["safe\u0000url"]).toEqual({ url: "https://evil.example/mcp" });
   });
 
   it("drops a header reference the backup adds, with or without any redaction marker", async () => {
@@ -2065,6 +6095,78 @@ describe("backup payload", () => {
     ).toBeInstanceOf(BackupCommandApprovalRequiredError);
   });
 
+  it("binds command approval to the exact planned MCP bytes", async () => {
+    // A concurrent editor can rewrite the local mcp.jsonc between restore's reads. If
+    // approval and planning resolve the file separately, the first resolution can
+    // rehydrate a redacted url (shadowing the backup's command, exempting it from
+    // approval) while the second sees the url gone and writes the command runnable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      '{ "servers": { "evil": { "command": "npx notes-mcp --root /data", "url": "https://mcp.example.com/mcp?api_key=hunter2" } } }\n'
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.redactions).toEqual(["servers.evil.url"]);
+    const destination = path.join(tempDir, "toctou-approval");
+    await writeBackupPayload(destination, payload);
+    const readBack = await readBackupPayload(destination);
+
+    const withUrl = '{ "servers": { "evil": { "url": "https://mcp.example.com/mcp" } } }\n';
+    await writeFixtureFile(muxRoot, "mcp.jsonc", withUrl);
+
+    // The editor removes the url right after the first marker resolution has observed
+    // it: opens 1 (restore's local file listing) and 2 (the first resolution) see the
+    // url; the file is rewritten before open 3.
+    const realOpen = fs.open;
+    let localMcpOpens = 0;
+    const openSpy = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+      if (
+        typeof target === "string" &&
+        target.endsWith("mcp.jsonc") &&
+        !target.includes("toctou-approval")
+      ) {
+        localMcpOpens += 1;
+        if (localMcpOpens === 3) {
+          openSpy.mockRestore();
+          await fs.writeFile(target, '{ "servers": {} }\n', "utf-8");
+          return fs.open(target, flags, mode);
+        }
+      }
+      return realOpen.call(fs, target, flags, mode);
+    });
+    try {
+      let approvalError: unknown = null;
+      try {
+        await restoreBackupPayload({ muxRoot, payload: readBack });
+      } catch (error) {
+        approvalError = error;
+      }
+      // Whatever interleaving restore observed, the repository-controlled command must
+      // not become runnable without approval: either restore demanded approval, or the
+      // written entry still carries a url shadowing the command (or lost the server).
+      if (approvalError === null) {
+        const written = jsonc.parse(
+          await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf-8")
+        ) as {
+          servers?: Record<string, { command?: string; url?: string }>;
+        };
+        const entry = written.servers?.evil;
+        if (entry?.command !== undefined) {
+          expect(typeof entry.url === "string" && entry.url !== "").toBe(true);
+        }
+      } else {
+        expect(approvalError).toBeInstanceOf(BackupCommandApprovalRequiredError);
+      }
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
   it("needs no approval to disable a command or for an empty one", async () => {
     await writeFixtureFile(
       muxRoot,
@@ -2444,7 +6546,7 @@ describe("backup payload", () => {
     }
   });
 
-  it("gates credential-bearing MCP URLs without rewriting them", async () => {
+  it("redacts credential-bearing MCP URLs whole-value", async () => {
     const urls = [
       "https://user:hunter2@example.com/mcp",
       "https:token@example.com/mcp",
@@ -2452,8 +6554,19 @@ describe("backup payload", () => {
       "https:\\token@example.com\\mcp",
       "https://mcp.example.com/mcp?api_key=hunter2",
       "https://mcp.example.com/mcp?clientSecret=abc",
+      "https://mcp.example.com/mcp?apiToken=hunter2",
+      "https://mcp.example.com/mcp?x-api-key=hunter2",
+      "https://mcp.example.com/mcp?X-Auth-Token=hunter2",
+      "https://mcp.example.com/mcp?private_token=hunter2",
+      "https://mcp.example.com/mcp?sessionToken=hunter2",
+      "https://mcp.example.com/mcp?Ocp-Apim-Subscription-Key=hunter2",
+      "https://mcp.example.com/mcp?subscription_key=hunter2",
       "https://mcp.example.com/mcp?code=review",
       "https://mcp.example.com/mcp?X-Amz-Signature=deadbeef",
+      // Provider-prefixed signed-URL families qualify the credential word
+      // (X-Goog-Signature, x-oss-credential); one stripped leading x cannot reach them.
+      "https://storage.googleapis.com/bucket/backup?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=svc%40proj.iam.gserviceaccount.com%2F20260827%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Signature=deadbeefcafe0123",
+      "https://oss.example.com/mcp?x-oss-security-token=hunter2",
       "https://mcp.example.com/callback?code=oauth-code",
       "https://mcp.example.com/mcp#access_token=fragtoken",
       "https://mcp.example.com/mcp#callback?api_key=fragment-secret",
@@ -2473,27 +6586,18 @@ describe("backup payload", () => {
         "mcp.jsonc",
         JSON.stringify({ servers: { private: { url } } })
       );
-      const blocked = await captureRejection(
-        createBackupPayload({
-          muxRoot,
-          muxVersion: "1.2.3",
-          sourceLabel: "test-host",
-        })
-      );
-      expect((blocked as Error).message).toContain("mcp.jsonc");
-
+      // No reportSecrets: with the credential redacted there is nothing left to approve.
       const payload = await createBackupPayload({
         muxRoot,
         muxVersion: "1.2.3",
         sourceLabel: "test-host",
-        reportSecrets: true,
       });
       const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
         servers: { private: { url: string } };
       };
-      expect(exported.servers.private.url).toBe(url);
-      expect(scanBackupFilesForSecrets(payload.files)).toEqual(["mcp.jsonc"]);
-      expect(payload.redactions).toEqual([]);
+      expect(exported.servers.private.url).toBe(REDACTED_BACKUP_VALUE);
+      expect(scanBackupFilesForSecrets(payload.files)).toEqual([]);
+      expect(payload.redactions).toEqual(["servers.private.url"]);
     }
   });
 
@@ -2536,7 +6640,7 @@ describe("backup payload", () => {
       JSON.stringify({
         servers: {
           safe: {
-            url: "https://mcp.example.com/mcp?mode=fast&tenant=acme&client_id=public&monkey=banana",
+            url: "https://mcp.example.com/mcp?mode=fast&tenant=acme&client_id=public&monkey=banana&verify_signature=false",
           },
           unusual: { url: "not a url without parameters" },
           email: { url: "mailto:user@example.com" },
@@ -2551,6 +6655,13 @@ describe("backup payload", () => {
       sourceLabel: "test-host",
     });
     expect(scanBackupFilesForSecrets(payload.files)).toEqual([]);
+    // The ordinary parameters must also survive redaction: a false credential match
+    // here removes the server outright on a fresh-device restore.
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { safe: { url: string } };
+    };
+    expect(exported.servers.safe.url).toContain("verify_signature=false");
+    expect(payload.redactions).toEqual([]);
   });
 
   it("charges what a restore writes, not only what it read", async () => {
@@ -3314,6 +7425,22 @@ describe("backup payload", () => {
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       expect(error.message).toContain("AGENTS.md");
+    }
+  });
+
+  it("blocks URL-encoded high-confidence secrets in published documentation", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "https://example.test/?access_token=ghp%5fAbcdef1234567890KlmnoPqrst987654\n"
+    );
+
+    try {
+      await createBackupPayload({ muxRoot, muxVersion: "1.2.3", sourceLabel: "test-host" });
+      throw new Error("Expected encoded secret scan rejection");
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      expect(error.message).toContain("skills/demo/SKILL.md");
     }
   });
 

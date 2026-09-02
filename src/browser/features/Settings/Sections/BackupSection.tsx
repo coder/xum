@@ -359,15 +359,23 @@ export function BackupSection() {
     setStatusMessage(null);
     setPreview(null);
     setOverrideSecretScan(false);
+    // Cleared before the await, so a rejection (transport failure, not a scan result)
+    // cannot leave a previous scan's override rendering beside an unrelated error.
+    setSecretScanBlocked(false);
+    setSecretScanApproval(null);
 
     try {
       const result = await api.backup.preview(savedDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
+        // The scan state must describe this failure, not a previous push's: a stale
+        // digest would keep rendering an override the backend now rejects.
+        const blocked = result.error.code === "SECRET_DETECTED";
+        setSecretScanBlocked(blocked);
+        setSecretScanApproval(blocked ? (result.error.secretApproval ?? null) : null);
         return;
       }
       setPreview(result.data);
-      setSecretScanBlocked(false);
       const nextApprovals = result.data.commandApprovals;
       // An approval only covers the exact command text the user read, so a changed list
       // has to be read again.
@@ -600,10 +608,10 @@ export function BackupSection() {
           ))}
         </ul>
         <p className="text-foreground text-xs font-medium">
-          Provider key files and dedicated secret files have no export path. MCP commands and URLs
-          are included verbatim; credential-like URL components require review, while literal MCP
-          header values are redacted. Inside skills and memory, only documentation is published
-          automatically; any other file waits for you to review it.
+          Provider key files and dedicated secret files have no export path. Env-style values in MCP
+          commands, URLs carrying credentials, and literal MCP header values are redacted;
+          publishing a command still requires review. Inside skills and memory, only documentation
+          is published automatically; any other file waits for you to review it.
         </p>
       </section>
 
@@ -713,7 +721,9 @@ export function BackupSection() {
         )}
       </section>
 
-      {secretScanBlocked ? (
+      {/* A credential-format block carries no approval digest and cannot be overridden,
+          so a dead override control must not suggest otherwise. */}
+      {secretScanBlocked && secretScanApproval !== null ? (
         <div className="border-border-light rounded-md border p-3">
           <label className="flex items-start gap-2">
             <Checkbox

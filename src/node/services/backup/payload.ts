@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import type { Dirent, Stats } from "node:fs";
+import { realpathSync, type Dirent, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as jsonc from "jsonc-parser";
 import {
@@ -67,15 +68,267 @@ function isForbiddenBasename(name: string): boolean {
 function isHiddenName(name: string): boolean {
   return name.startsWith(".");
 }
-const SECRET_PATTERNS = [
-  /\bsk-[A-Za-z0-9_-]{16,}\b/,
-  /\bghp_[A-Za-z0-9]{20,}\b/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-  /\bAIza[A-Za-z0-9_-]{35,}/,
-  /\bxoxb-[A-Za-z0-9-]{10,}\b/,
-  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
-] as const;
+/** Suffix alphabets of the issued-token shapes; `word` is exactly the regexp `\w` set. */
+type TokenRunClass = "alnum" | "word" | "alnum-dash" | "word-dash";
+
+/**
+ * One `\b<prefix>[<runClass>]{minRun,}\b` token format, matched by hasIssuedToken's
+ * linear scan rather than that regexp: V8 grows its backtrack stack per unbounded
+ * quantifier iteration, so a size-capped file that is one in-class wall
+ * (`glsa_glsa_...`) exhausts it with a RangeError before the scan can classify
+ * anything. Bounded quantifiers and literal alternations stay regexps below.
+ */
+interface IssuedTokenShape {
+  /** Literal case-sensitive spellings that start every candidate; each begins with a word char. */
+  prefixes: readonly string[];
+  runClass: TokenRunClass;
+  minRun: number;
+  /**
+   * Hard-block only digit-bearing bodies: issued keys embed digits practically always
+   * (base62 randomness, Slack's numeric workspace and app IDs), while documentation
+   * placeholders (`sk-your-api-key-here`, `xoxb-your-token-here`) are dash-separated
+   * words. The digit-free spelling stays in the reviewable scan, which ignores this flag.
+   */
+  hardBlockRequiresDigit?: boolean;
+  /** No trailing word boundary: any long-enough body matches even mid-word. */
+  openEnded?: boolean;
+}
+
+/**
+ * Formats issued only as live credentials. A match aborts the export outright, with no
+ * user override: redaction is the primary mechanism, so a surviving match means either a
+ * shape redaction does not classify (a token passed as a command argument) or a redaction
+ * defect, and neither is something a backup should publish.
+ */
+const ISSUED_TOKEN_SHAPES: readonly IssuedTokenShape[] = [
+  // GitHub issued prefixes: personal, OAuth, App user, installation, refresh tokens.
+  { prefixes: ["gho_", "ghp_", "ghu_", "ghs_", "ghr_"], runClass: "alnum", minRun: 20 },
+  { prefixes: ["github_pat_"], runClass: "word", minRun: 20 },
+  { prefixes: ["glsa_"], runClass: "word", minRun: 20 },
+  {
+    // GitLab issued prefixes: personal, deploy, runner, service-account, trigger,
+    // CI job, OAuth app, feature-flag, incoming-mail, and cluster-agent tokens.
+    prefixes: [
+      "glpat-",
+      "gldt-",
+      "glrt-",
+      "glsoat-",
+      "glptt-",
+      "glcbt-",
+      "gloas-",
+      "glffct-",
+      "glimt-",
+      "glagent-",
+    ],
+    runClass: "word-dash",
+    minRun: 20,
+  },
+  { prefixes: ["lin_api_"], runClass: "alnum", minRun: 16 },
+  { prefixes: ["ntn_"], runClass: "alnum", minRun: 16 },
+  // Slack workspace (xox?-) and app-level (xapp-) issued tokens.
+  {
+    prefixes: ["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xapp-"],
+    runClass: "alnum-dash",
+    minRun: 10,
+    hardBlockRequiresDigit: true,
+  },
+  // Stripe live secret and restricted keys. Test-mode keys stay reviewable:
+  // documentation routinely quotes them, and the block has no override.
+  { prefixes: ["sk_live_", "rk_live_"], runClass: "alnum", minRun: 16 },
+  // npm issued access tokens.
+  { prefixes: ["npm_"], runClass: "alnum", minRun: 24 },
+  { prefixes: ["sk-"], runClass: "word-dash", minRun: 16, hardBlockRequiresDigit: true },
+];
+
+// AWS long-term (AKIA) and temporary-session (ASIA) access-key IDs. The exact {16}
+// count leaves the quantifier no choice points, so the regexp form cannot backtrack.
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/;
+
+/** Key formats that documentation legitimately quotes: reviewable, never hard-blocked. */
+const REVIEW_ONLY_TOKEN_SHAPES: readonly IssuedTokenShape[] = [
+  { prefixes: ["AIza"], runClass: "word-dash", minRun: 35, openEnded: true },
+];
+
+// Any qualifier before PRIVATE KEY counts: OpenSSL emits ENCRYPTED/DSA qualifiers and
+// PGP armors a BLOCK suffix, and a prose false positive only flags a file for review.
+const PRIVATE_KEY_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
+
+function isAsciiDigitCode(code: number): boolean {
+  return code >= 48 && code <= 57;
+}
+
+/** Exactly the alphabet the regexp `\b` assertion evaluates. */
+function isWordCode(code: number): boolean {
+  return (
+    isAsciiDigitCode(code) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    code === 95
+  );
+}
+
+function isRunCode(code: number, runClass: TokenRunClass): boolean {
+  if (code === 95) return runClass === "word" || runClass === "word-dash";
+  if (code === 45) return runClass === "alnum-dash" || runClass === "word-dash";
+  return isAsciiDigitCode(code) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function rangeHasDigit(text: string, start: number, end: number): boolean {
+  for (let pos = start; pos < end; pos += 1) {
+    if (isAsciiDigitCode(text.charCodeAt(pos))) return true;
+  }
+  return false;
+}
+
+/**
+ * Linear-time equivalent of the shape's regexp. Each candidate extends its maximal
+ * in-class run once; when no trailing boundary satisfies the run, later candidates
+ * inside the same run are skipped, because they would need a boundary even further
+ * right than the ones that already failed. The trailing boundary walks backward from
+ * the run end so the digit check sees the same greedy span the regexp would match,
+ * and a digit-free match resumes at its end exactly like a matchAll iteration.
+ */
+function hasIssuedToken(text: string, shape: IssuedTokenShape, requireDigit: boolean): boolean {
+  for (const prefix of shape.prefixes) {
+    let from = 0;
+    let idx = text.indexOf(prefix, from);
+    while (idx !== -1) {
+      if (idx > 0 && isWordCode(text.charCodeAt(idx - 1))) {
+        // No word boundary before the prefix. A candidate hidden inside a run this
+        // scan skips below is always in this case: run alphabets contain only word
+        // characters and `-`, and a `-` before a skipped candidate implies a
+        // boundary the failed enclosing candidate would have matched first.
+        from = idx + 1;
+      } else {
+        const runStart = idx + prefix.length;
+        let runEnd = runStart;
+        while (runEnd < text.length && isRunCode(text.charCodeAt(runEnd), shape.runClass)) {
+          runEnd += 1;
+        }
+        const shortestEnd = runStart + shape.minRun;
+        if (runEnd < shortestEnd) {
+          from = runEnd;
+        } else {
+          let matchEnd = -1;
+          if (shape.openEnded === true) {
+            matchEnd = runEnd;
+          } else {
+            for (let pos = runEnd; pos >= shortestEnd; pos -= 1) {
+              const wordAfter = pos < text.length && isWordCode(text.charCodeAt(pos));
+              if (isWordCode(text.charCodeAt(pos - 1)) !== wordAfter) {
+                matchEnd = pos;
+                break;
+              }
+            }
+          }
+          if (matchEnd === -1) {
+            from = runEnd;
+          } else if (!requireDigit || rangeHasDigit(text, runStart, matchEnd)) {
+            return true;
+          } else {
+            from = matchEnd;
+          }
+        }
+      }
+      idx = text.indexOf(prefix, from);
+    }
+  }
+  return false;
+}
+
+/**
+ * AWS's documented example access key is valid-shape but never a live credential;
+ * documentation quoting it stays in the reviewable scan instead of the no-override
+ * block. Replaced with a space so removal cannot splice surrounding text into a match.
+ */
+const EXAMPLE_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
+
+/**
+ * Lazily filled fold-class ids for the non-ASCII comparison path: two units share an
+ * id exactly when their single-unit `toLowerCase` strings are equal, so a run
+ * alternating case-equivalent units (U+212A KELVIN SIGN with `k`) costs one typed
+ * array read per unit instead of two string allocations per comparison across a
+ * size-capped payload. The table is bounded by the UTF-16 alphabet (256 KiB).
+ */
+const FOLD_CLASS_IDS = new Uint32Array(65536);
+const FOLD_CLASS_BY_STRING = new Map<string, number>();
+
+function foldClassId(code: number): number {
+  let id = FOLD_CLASS_IDS[code];
+  if (id === 0) {
+    const folded = String.fromCharCode(code).toLowerCase();
+    id = FOLD_CLASS_BY_STRING.get(folded) ?? 0;
+    if (id === 0) {
+      id = FOLD_CLASS_BY_STRING.size + 1;
+      FOLD_CLASS_BY_STRING.set(folded, id);
+    }
+    FOLD_CLASS_IDS[code] = id;
+  }
+  return id;
+}
+
+/**
+ * Case-insensitive equality of two UTF-16 units without allocating per-character
+ * lowercase strings, which dominated the synchronous scan of a size-capped payload.
+ * ASCII folds arithmetically; only a non-ASCII unit pays for a cached fold-class
+ * lookup (which also catches case-equivalent units like U+212A KELVIN SIGN and `k`).
+ */
+function sameFoldedUnit(a: number, b: number): boolean {
+  if (a === b) return true;
+  const foldedA = a >= 65 && a <= 90 ? a + 32 : a;
+  const foldedB = b >= 65 && b <= 90 ? b + 32 : b;
+  if (foldedA === foldedB) return true;
+  if (a < 128 && b < 128) return false;
+  return foldClassId(a) === foldClassId(b);
+}
+
+/**
+ * A run of one repeated character (case-insensitive) is documentation spelling, never
+ * issued-token entropy (`ghp_xxxxxxxx...`), so those spellings stay in the reviewable
+ * scan instead of the no-override block. Replaced with a space like the example key,
+ * so the removal cannot splice neighbors into a match, and a real token padded with an
+ * obvious run still matches on what remains. One linear pass rather than
+ * `/(.)\1{15,}/gi`: V8 exhausts its call stack evaluating that backreference across a
+ * multi-megabyte single-character run, rejecting a size-valid file before it is
+ * scanned. Line terminators never join runs, matching the dot the regex used.
+ */
+function stripPlaceholderRuns(text: string): string {
+  let result = "";
+  let keptFrom = 0;
+  let i = 0;
+  while (i < text.length) {
+    const anchor = text.charCodeAt(i);
+    let end = i + 1;
+    if (anchor !== 10 && anchor !== 13 && anchor !== 0x2028 && anchor !== 0x2029) {
+      while (end < text.length && sameFoldedUnit(anchor, text.charCodeAt(end))) end += 1;
+    }
+    if (end - i >= 16) {
+      result += text.slice(keptFrom, i) + " ";
+      keptFrom = end;
+    }
+    i = end;
+  }
+  return keptFrom === 0 ? text : result + text.slice(keptFrom);
+}
+
+function matchesCredentialToken(text: string): boolean {
+  const scannable = stripPlaceholderRuns(text.replaceAll(EXAMPLE_ACCESS_KEY, " "));
+  return (
+    ISSUED_TOKEN_SHAPES.some((shape) =>
+      hasIssuedToken(scannable, shape, shape.hardBlockRequiresDigit === true)
+    ) || AWS_ACCESS_KEY_ID_PATTERN.test(scannable)
+  );
+}
+
+/** The reviewable scan flags every issued shape, digit-bearing or not. */
+function matchesReviewableSecret(content: string): boolean {
+  return (
+    ISSUED_TOKEN_SHAPES.some((shape) => hasIssuedToken(content, shape, false)) ||
+    REVIEW_ONLY_TOKEN_SHAPES.some((shape) => hasIssuedToken(content, shape, false)) ||
+    AWS_ACCESS_KEY_ID_PATTERN.test(content) ||
+    PRIVATE_KEY_PATTERN.test(content)
+  );
+}
 
 export interface BackupFile {
   path: string;
@@ -125,6 +378,21 @@ export interface RestoreBackupPayloadOptions {
   muxRoot: string;
   payload: BackupPayload;
   approvedCommandTokens?: readonly string[];
+}
+
+/**
+ * No secretApproval digest on purpose: unlike the reviewable secret scan, this block has no
+ * user override, so the UI shows it as a hard failure instead of offering approval.
+ */
+export class BackupCredentialDetectedError extends Error {
+  readonly code = "SECRET_DETECTED";
+
+  constructor(readonly files: string[]) {
+    super(
+      `Backup blocked: values matching known credential formats were found in ${files.join(", ")}. Remove the credentials from the local files, then back up again.`
+    );
+    this.name = "BackupCredentialDetectedError";
+  }
 }
 
 export class BackupCommandApprovalRequiredError extends Error {
@@ -376,6 +644,10 @@ function createByteBudget() {
 }
 
 type ByteBudget = ReturnType<typeof createByteBudget>;
+
+function takeBackupFileBytes(budget: ByteBudget, files: readonly BackupFile[]): void {
+  for (const file of files) budget(file.path, file.content.length);
+}
 
 /**
  * Two paths collide when the filesystem cannot tell them apart, so the comparison has to fold
@@ -938,16 +1210,162 @@ const JSONC_EDIT_OPTIONS: jsonc.ModificationOptions = {
 /**
  * Rewrites values in place with jsonc edits, leaving the rest of the document as it was.
  * Restore needs that: it writes the file the user just previewed, not a reformatted copy.
+ *
+ * One parse for the whole batch: `jsonc.modify` reparses the document on every call, so
+ * per-edit application costs edit-count times document-size synchronous work on inputs
+ * a crafted backup controls (256 valid deletions on a near-limit file take nearly a
+ * minute). Spans are planned against a single tree and spliced in one pass; any batch
+ * the planner cannot place falls back to the sequential behavior it replaces.
  */
 function applyJsoncEdits(text: string, edits: Array<{ path: jsonc.JSONPath; value: unknown }>) {
-  let result = text;
-  for (const edit of edits) {
-    result = jsonc.applyEdits(
-      result,
-      jsonc.modify(result, edit.path, edit.value, JSONC_EDIT_OPTIONS)
-    );
+  if (edits.length === 0) return text;
+  const spans = planJsoncEditSpans(text, edits);
+  if (spans === undefined) {
+    let result = text;
+    for (const edit of edits) {
+      result = jsonc.applyEdits(
+        result,
+        jsonc.modify(result, edit.path, edit.value, JSONC_EDIT_OPTIONS)
+      );
+    }
+    return result;
   }
-  return result;
+  let result = "";
+  let cursor = 0;
+  for (const span of spans) {
+    result += text.slice(cursor, span.offset) + span.content;
+    cursor = span.offset + span.length;
+  }
+  return result + text.slice(cursor);
+}
+
+interface JsoncEditSpan {
+  offset: number;
+  length: number;
+  content: string;
+}
+
+/**
+ * Finds the separator comma inside the trivia between two sibling nodes, skipping
+ * comments whose text may itself contain commas. Undefined when the gap holds anything
+ * other than whitespace, comments, and at most one comma, sending the batch to the
+ * sequential path.
+ */
+function findSeparatorCommaOffset(gapText: string): number | undefined {
+  let i = 0;
+  while (i < gapText.length) {
+    const character = gapText[i] ?? "";
+    if (character === ",") return i;
+    if (character === "/" && gapText[i + 1] === "/") {
+      while (i < gapText.length && gapText[i] !== "\n") i += 1;
+      continue;
+    }
+    if (character === "/" && gapText[i + 1] === "*") {
+      const end = gapText.indexOf("*/", i + 2);
+      if (end < 0) return undefined;
+      i = end + 2;
+      continue;
+    }
+    if (!/\s/.test(character)) return undefined;
+    i += 1;
+  }
+  return undefined;
+}
+
+/**
+ * Plans one text span per replacement plus per-node and per-comma spans for deletions,
+ * all against a single parse. Returns undefined for any batch it cannot place exactly
+ * (a missing node, a segment/container type mismatch, an unrecognizable separator gap,
+ * overlapping spans), handing those to the sequential path instead of guessing.
+ */
+function planJsoncEditSpans(
+  text: string,
+  edits: Array<{ path: jsonc.JSONPath; value: unknown }>
+): JsoncEditSpan[] | undefined {
+  const root = jsonc.parseTree(text);
+  if (root === undefined) return undefined;
+  const spans: JsoncEditSpan[] = [];
+  const deletionsByParent = new Map<
+    string,
+    { parentPath: jsonc.JSONPath; segments: Array<string | number> }
+  >();
+  for (const edit of edits) {
+    if (edit.value !== undefined) {
+      const node = jsonc.findNodeAtLocation(root, edit.path);
+      if (node === undefined) return undefined;
+      spans.push({ offset: node.offset, length: node.length, content: JSON.stringify(edit.value) });
+      continue;
+    }
+    const segment = edit.path[edit.path.length - 1];
+    if (segment === undefined) return undefined;
+    const parentPath = edit.path.slice(0, -1);
+    const key = JSON.stringify(parentPath);
+    const entry = deletionsByParent.get(key) ?? { parentPath, segments: [] };
+    entry.segments.push(segment);
+    deletionsByParent.set(key, entry);
+  }
+  for (const { parentPath, segments } of deletionsByParent.values()) {
+    const parent = parentPath.length === 0 ? root : jsonc.findNodeAtLocation(root, parentPath);
+    if (parent === undefined || (parent.type !== "object" && parent.type !== "array")) {
+      return undefined;
+    }
+    const children = parent.children ?? [];
+    const deleted = new Set<number>();
+    for (const segment of segments) {
+      let index: number;
+      if (parent.type === "array") {
+        if (typeof segment !== "number") return undefined;
+        index = segment;
+      } else {
+        if (typeof segment !== "string") return undefined;
+        index = children.findIndex((child) => child.children?.[0]?.value === segment);
+      }
+      if (index < 0 || index >= children.length || deleted.has(index)) return undefined;
+      deleted.add(index);
+    }
+    // Exactly the child nodes and their separator commas go; comments and other
+    // trivia in the gaps survive, so a comment attached to a retained neighbor is
+    // not swallowed when the entry after it is deleted.
+    let lastKept = -1;
+    for (let i = 0; i < children.length; i += 1) {
+      if (!deleted.has(i)) lastKept = i;
+    }
+    for (const index of deleted) {
+      const child = children[index];
+      if (child === undefined) return undefined;
+      spans.push({ offset: child.offset, length: child.length, content: "" });
+    }
+    for (let i = 0; i < children.length - 1; i += 1) {
+      // The comma right after a kept child with a later kept sibling still separates
+      // them; every other comma belonged to a deleted entry.
+      if (!deleted.has(i) && i < lastKept) continue;
+      const current = children[i];
+      const next = children[i + 1];
+      if (current === undefined || next === undefined) return undefined;
+      const gapStart = current.offset + current.length;
+      const commaOffset = findSeparatorCommaOffset(text.slice(gapStart, next.offset));
+      if (commaOffset === undefined) return undefined;
+      spans.push({ offset: gapStart + commaOffset, length: 1, content: "" });
+    }
+    const lastChild = children[children.length - 1];
+    if (lastChild !== undefined && deleted.has(children.length - 1)) {
+      // A JSONC trailing comma after a deleted final entry would dangle; it goes too.
+      const gapStart = lastChild.offset + lastChild.length;
+      const gapEnd = parent.offset + parent.length - 1;
+      const commaOffset = findSeparatorCommaOffset(text.slice(gapStart, gapEnd));
+      if (commaOffset !== undefined) {
+        spans.push({ offset: gapStart + commaOffset, length: 1, content: "" });
+      }
+    }
+  }
+  spans.sort((a, b) => a.offset - b.offset);
+  for (let i = 1; i < spans.length; i += 1) {
+    const previous = spans[i - 1];
+    const current = spans[i];
+    if (previous === undefined || current === undefined) return undefined;
+    if (current.offset < previous.offset + previous.length) return undefined;
+  }
+  return spans;
 }
 
 interface JsoncPropertyInsertion {
@@ -1055,6 +1473,10 @@ function isUnsupportedServerMap(value: unknown): boolean {
  * value is a credential, and `{ "API_KEY": "hunter2" }` is not something a scanner can catch.
  * Restore puts the local value back at that exact path, so a field only Xum ignores is not
  * lost from a machine that already has it.
+ *
+ * `command` and `url` pass the type check but can still carry credentials in-band, so the
+ * projection additionally redacts env-style assignment values in commands and whole urls
+ * with credential components.
  */
 const PORTABLE_SERVER_FIELDS: Record<string, (value: unknown) => boolean> = {
   command: (value) => typeof value === "string",
@@ -1098,10 +1520,2676 @@ function valueHasRedactionAtPath(
   return typeof value === "string" && containsRedaction(value);
 }
 
-function redactMcpConfig(content: Buffer): {
+/**
+ * `NAME=value` assignments in a command string are how stdio servers get credentials
+ * (`GRAFANA_SERVICE_ACCOUNT_TOKEN=... mcp-grafana`), and nothing here can say which values
+ * are secret, so every assignment value is replaced. Matched anywhere in the string, not
+ * just before the program name, so `env NAME=value cmd` and trailing `KEY=value` arguments
+ * are covered too. The value grammar consumes a whole shell word, escaped characters and
+ * quoted segments included, so an escape cannot carry part of the value past the
+ * replacement. Restore puts the whole local command back at that path.
+ */
+// The shell ends a word at these without whitespace, so an assignment can directly follow
+// one (`bootstrap;TOKEN=... mcp`) and an unquoted value ends at the next one. Braces are
+// deliberately absent: brace expansion happens within one word and non-expanding braces
+// are literal, so braces travel inside names and values, where a replaced marker
+// distributes safely through any expansion (`TOK{A,B}=x` becomes `TOKA=x TOKB=x`).
+const SHELL_WORD_BREAK = ";&|<>()`";
+// Only space, tab, and newline delimit words for Bash. JS `\s` would also break on NBSP
+// and its other Unicode cousins, which Bash keeps inside the word: an assignment value
+// would end early there, publishing the rest of the runtime value as its own word.
+const SHELL_BLANK = " \\t\\n";
+// Any non-option word up to an unquoted `=` is an assignment name: GNU `env` accepts
+// arbitrary `NAME=VALUE` operands (`TOKEN:NAME=x`, `TOKEN+=x`), and Bash's identifier
+// rule is just the narrow case. Quoting, `$`, and `=` end a name; a leading dash is an
+// option word (`--transport=stdio`), which stays published.
+const ASSIGNMENT_NAME = `[^-${SHELL_BLANK}\\\\'"$=${SHELL_WORD_BREAK}][^${SHELL_BLANK}\\\\'"$=${SHELL_WORD_BREAK}]*=`;
+const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^${SHELL_BLANK}\\\\'"${SHELL_WORD_BREAK}]+)+`;
+const COMMAND_ENV_ASSIGNMENT = new RegExp(
+  `(^|[${SHELL_BLANK}${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
+  "g"
+);
+
+/**
+ * An assignment value the word grammar could not fully consume: after replacement its
+ * remainder trails the marker, or the whole match failed and the original text follows the
+ * `=`. Either way the value's true extent is unknowable, e.g. an unterminated quote.
+ */
+const UNCONSUMED_ASSIGNMENT = new RegExp(
+  `(^|[${SHELL_BLANK}${SHELL_WORD_BREAK}])${ASSIGNMENT_NAME}` +
+    `(?!${REDACTED_BACKUP_VALUE}(?=[${SHELL_BLANK}${SHELL_WORD_BREAK}]|$))(?=[^${SHELL_BLANK}${SHELL_WORD_BREAK}])`
+);
+
+/** One whole shell word, however its quoted and escaped segments interleave. */
+const SHELL_WORD = new RegExp(
+  `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^${SHELL_BLANK}\\\\'"${SHELL_WORD_BREAK}])+`,
+  "g"
+);
+const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
+
+/**
+ * A parameter expansion that can turn into nothing at runtime: an unset variable.
+ * Deleting it models the vanish-splice (`ghp_aaa$NOPE"bbb"` joins around the expansion
+ * the quote boundary ends). Redaction localizes every command holding an active
+ * expansion before anything publishes, so this deletion survives only as the
+ * backstop's independent model of that splice over the finished payload.
+ */
+const SIMPLE_EXPANSION = /^\$[A-Za-z_][A-Za-z0-9_]*/;
+
+/**
+ * Bash-accurate quote removal, in both directions on purpose: under-stripping would hide
+ * disguised assignments, while over-stripping would join quoted fragments the shell
+ * keeps apart and manufacture no-override credential matches (`'ghp_aa\\bb'` keeps its
+ * backslash at runtime). `stripExpansions` deletes simple parameter expansions only in
+ * the contexts where the shell expands them, so a single-quoted or escaped dollar stays
+ * the literal the process receives.
+ */
+function unquoteShellWord(word: string, stripExpansions = false, collapseGlobs = false): string {
+  let result = "";
+  let i = 0;
+  while (i < word.length) {
+    const char = word[i];
+    // ANSI-C ($'...') and locale ($"...") quoting hand the consumer their inner text.
+    if (char === "$" && (word[i + 1] === "'" || word[i + 1] === '"')) {
+      i += 1;
+      continue;
+    }
+    if (char === "$" && stripExpansions) {
+      const expansion = SIMPLE_EXPANSION.exec(word.slice(i));
+      if (expansion) {
+        i += expansion[0].length;
+        continue;
+      }
+    }
+    if (char === "\\") {
+      // A line continuation disappears entirely. Only backslash-LF: before CRLF the
+      // backslash escapes the CR, which stays a literal character and breaks the word.
+      if (word[i + 1] === "\n") {
+        i += 2;
+        continue;
+      }
+      result += word[i + 1] ?? "";
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = word.indexOf("'", i + 1);
+      result += word.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < word.length && word[j] !== '"') {
+        // Expansions stay active inside double quotes.
+        if (word[j] === "$" && stripExpansions) {
+          const expansion = SIMPLE_EXPANSION.exec(word.slice(j));
+          if (expansion) {
+            j += expansion[0].length;
+            continue;
+          }
+        }
+        if (word[j] === "\\") {
+          const next = word[j + 1] ?? "";
+          // Inside double quotes the shell unescapes only these; any other
+          // backslash stays a literal character.
+          if (next === "$" || next === "`" || next === '"' || next === "\\") {
+            result += next;
+            j += 2;
+            continue;
+          }
+          if (next === "\n") {
+            j += 2;
+            continue;
+          }
+          result += word[j];
+          j += 1;
+          continue;
+        }
+        result += word[j];
+        j += 1;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (collapseGlobs) {
+      // Pathname expansion is live in this unquoted context. A single caseless
+      // member is deterministic (`[8]` can only produce `8`), and any reader
+      // collapses the published spelling the same way, so scan what it yields.
+      // Letter members and nondeterministic wildcards never reach this scan:
+      // redaction localizes their whole command (nocaseglob makes letters casefold).
+      if (char === "[" && word[i + 2] === "]") {
+        const member = word[i + 1] ?? "";
+        if (!"!^]\\'\"".includes(member) && !/[A-Za-z]/.test(member)) {
+          result += member;
+          i += 3;
+          continue;
+        }
+      }
+    }
+    result += char;
+    i += 1;
+  }
+  return result;
+}
+
+/**
+ * The words Bash would execute: an unquoted `#` opening a word after a blank (or the
+ * string start) discards the rest of that line before quote removal even applies, so
+ * scanning a comment would manufacture no-override matches from prose the process never
+ * sees. Text past the newline is live again and re-tokenized from scratch, because a
+ * quoted word begun inside the comment must not swallow it.
+ */
+function executedShellWords(text: string): string[] {
+  const words: string[] = [];
+  let rest: string | undefined = text;
+  while (rest !== undefined) {
+    const current: string = rest;
+    rest = undefined;
+    for (const match of current.matchAll(SHELL_WORD)) {
+      const start = match.index;
+      const before = start === 0 ? "" : (current[start - 1] ?? "");
+      // Any word break opens a comment position, not just blanks: `cmd;# ...` comments,
+      // and where the grammar wanted a word instead (`>#f`) Bash reports a syntax error
+      // and executes nothing, so skipping the text cannot hide a live word either way.
+      // Leading backslash-LF continuations disappear before tokenization, so a word
+      // spelled `\<LF>#...` opens the same comment its unwrapped form would.
+      if (
+        match[0].replace(/^(?:\\\n)+/, "").startsWith("#") &&
+        (start === 0 ||
+          before === " " ||
+          before === "\t" ||
+          before === "\n" ||
+          SHELL_WORD_BREAK.includes(before))
+      ) {
+        const lineEnd = current.indexOf("\n", start);
+        if (lineEnd !== -1) rest = current.slice(lineEnd + 1);
+        break;
+      }
+      words.push(match[0]);
+    }
+  }
+  return words;
+}
+
+/**
+ * GNU `env -S`/`--split-string` re-splits its attached value into assignments, and GNU
+ * getopt accepts any unique long-option abbreviation. No other `env` long option starts
+ * with `s`, so every `--s...` prefix spelling (`--s=`, `--split=`) resolves to it.
+ */
+function isSplitStringOption(unquoted: string): boolean {
+  // -u/-C/-a consume the rest of their word, so an S inside that operand is not
+  // a clustered split-string flag. Only no-argument short options may precede -S.
+  if (/^-[i0v]*S/.test(unquoted)) return true;
+  const abbreviation = /^--([A-Za-z-]*)=/.exec(unquoted);
+  return (
+    abbreviation !== null && abbreviation[1] !== "" && "split-string".startsWith(abbreviation[1])
+  );
+}
+
+/** GNU env options whose following word is an option value, not COMMAND. */
+function envOptionTakesSeparateValue(unquoted: string): boolean {
+  if (unquoted === "-u" || unquoted === "-C" || unquoted === "-a") return true;
+  const abbreviation = /^--([A-Za-z-]+)$/.exec(unquoted)?.[1];
+  return (
+    abbreviation !== undefined &&
+    ("unset".startsWith(abbreviation) ||
+      "chdir".startsWith(abbreviation) ||
+      "argv0".startsWith(abbreviation))
+  );
+}
+
+/** Git global options whose following word is a value, not the subcommand. */
+function gitOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env))$/.test(unquoted);
+}
+
+/** Git config options whose following word is an option value, not the key. */
+function gitConfigOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:-[ft]|--(?:file|blob|type|comment|default))$/.test(unquoted);
+}
+
+/** Java class-path options whose value may itself be an executable archive. */
+function isJavaClassPathOption(unquoted: string): boolean {
+  return /^(?:-cp|-classpath|--class-path)$/.test(unquoted);
+}
+
+/** Java launcher options whose following word is opaque, not the source file. */
+function javaOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:-p|--(?:module-path|upgrade-module-path|add-modules|enable-native-access|describe-module|add-reads|add-exports|add-opens|limit-modules|patch-module))$/.test(
+    unquoted
+  );
+}
+
+function javaClassPathPublishesExecutable(
+  value: string,
+  rootPrefixes: readonly string[],
+  currentDirectory: string | null
+): boolean {
+  return value.split(path.delimiter).some((entry) => {
+    if (
+      isAutoPublishedScriptOperand(entry, rootPrefixes) ||
+      isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+    ) {
+      return true;
+    }
+    const resolved = resolveKnownDirectory(entry, currentDirectory);
+    return (
+      resolved !== null &&
+      (isAutoPublishedScriptOperand(resolved, rootPrefixes) ||
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(resolved), rootPrefixes))
+    );
+  });
+}
+
+function javaPatchModulePublishesExecutable(
+  value: string,
+  rootPrefixes: readonly string[],
+  currentDirectory: string | null
+): boolean {
+  const separator = value.indexOf("=");
+  return (
+    separator !== -1 &&
+    javaClassPathPublishesExecutable(value.slice(separator + 1), rootPrefixes, currentDirectory)
+  );
+}
+
+/**
+ * Git config values that Git later executes as commands or helper processes. Driver,
+ * tool, and hook names are user-chosen subsections that may themselves contain dots,
+ * so those middles match greedily.
+ */
+const GIT_COMMAND_CONFIG_KEY =
+  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|alternaterefscommand)|sequence\.editor|diff\.(?:external|.+\.(?:command|textconv))|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|gpg\.ssh\.defaultkeycommand|pager\.[^.]+|(?:diff|merge)tool\..+\.cmd|guitool\..+\.cmd|merge\..+\.driver|hook\..+\.command|browser\..+\.(?:cmd|path)|filter\..+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\..+\.cmd|tar\..+\.command|sendemail\.(?:sendmailcmd|cccmd|tocmd)|uploadpack\.packobjectshook|gc\.recentobjectshook)$/i;
+
+/**
+ * core.fsmonitor doubles as a boolean toggle for the built-in monitor; only a
+ * non-boolean value is the hook pathname Git executes. Git reads the boolean with
+ * its maybe-bool parser, which accepts these spellings and any integer.
+ */
+const GIT_FSMONITOR_CONFIG_KEY = /^core\.fsmonitor$/i;
+const GIT_BOOLEAN_CONFIG_VALUE = /^(?:true|false|yes|no|on|off|[+-]?[0-9]+)$/i;
+
+/** Git config keys whose value names another config file Git reads and applies. */
+const GIT_INCLUDE_PATH_CONFIG_KEY = /^include(?:if\..+)?\.path$/i;
+
+/**
+ * Whether a `git -c`/`--config-env` override names a key whose value Git later
+ * executes or reads as config. The key alone decides: the assignment redaction
+ * replaces an unquoted `-c` value before this scan runs, a quote-mangled value
+ * localizes through the disguised-assignment rules, and `--config-env` reads a
+ * variable this scan cannot see, so a sensitive key fails closed on all three.
+ */
+function gitConfigOverrideNamesSensitiveKey(unquoted: string): boolean {
+  const separator = unquoted.indexOf("=");
+  const key = separator === -1 ? unquoted : unquoted.slice(0, separator);
+  return (
+    /^(?:alias\.[^.]+|submodule\..+\.update)$/i.test(key) ||
+    GIT_FSMONITOR_CONFIG_KEY.test(key) ||
+    GIT_INCLUDE_PATH_CONFIG_KEY.test(key) ||
+    GIT_COMMAND_CONFIG_KEY.test(key)
+  );
+}
+
+/**
+ * Documentation is the only thing a recursive collection publishes without asking.
+ * An interpreter that executes one of these files can reconstruct a credential across
+ * the command and file even when neither spelling matches the token backstop.
+ */
+const AUTO_PUBLISHED_RECURSIVE_FILE = /\.(?:md|mdx|markdown|txt)$/i;
+
+/**
+ * Lowercased forward-slash spelling with redundant separators and dot segments
+ * collapsed lexically (`//`, `/./`, `a/../`), without trailing separators, for prefix
+ * compares. Lexical `..` collapse can differ from the filesystem across symlinks,
+ * which can only localize a spelling that resolves elsewhere, failing closed.
+ */
+function normalizeComparablePath(value: string): string {
+  return path.posix.normalize(value.replaceAll("\\", "/")).replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * The spellings a command can use for the directory this backup actually collects:
+ * the configured root (a custom XUM_ROOT or a `.xum-dev` build's root included), its
+ * pre-rename alias when the basename carries the product name (a config written
+ * before the rename spells the same collected files under `.mux`), and the `~/`
+ * shorthand for any of them under the home directory. Comparison is case-insensitive:
+ * Windows paths are, and folding a Unix spelling can only localize more.
+ */
+function collectedDocumentRootPrefixes(muxRoot: string): string[] {
+  const absolute = new Set<string>();
+  // Collection follows a symlinked root to its target, so a command can name the
+  // same collected files through the canonical spelling; when resolution fails the
+  // configured spelling still covers the common case.
+  const spellings = [muxRoot];
+  try {
+    spellings.push(realpathSync(muxRoot));
+  } catch {
+    // Ignored: an unresolvable root keeps only its configured spelling.
+  }
+  for (const spelling of spellings) {
+    const root = normalizeComparablePath(spelling);
+    if (root === "") continue;
+    absolute.add(root);
+    const basename = root.slice(root.lastIndexOf("/") + 1);
+    const renamed = basename.startsWith(".xum")
+      ? `.mux${basename.slice(4)}`
+      : basename.startsWith(".mux")
+        ? `.xum${basename.slice(4)}`
+        : null;
+    if (renamed !== null) absolute.add(root.slice(0, root.length - basename.length) + renamed);
+  }
+  const prefixes = new Set<string>(absolute);
+  const home = normalizeComparablePath(os.homedir());
+  // Bash also expands the current user's named-home form (`~alice/...`) to the same
+  // directory. userInfo can throw on systems without a passwd entry; the bare `~`
+  // spelling still covers the common case then.
+  let username = "";
+  try {
+    username = os.userInfo().username.toLowerCase();
+  } catch {
+    username = "";
+  }
+  if (home !== "") {
+    for (const candidate of absolute) {
+      if (!candidate.startsWith(`${home}/`)) continue;
+      prefixes.add(`~${candidate.slice(home.length)}`);
+      if (username !== "") prefixes.add(`~${username}${candidate.slice(home.length)}`);
+    }
+  }
+  return [...prefixes];
+}
+
+/**
+ * Whether the operand names a file this backup publishes automatically, resolved
+ * against the collected root's spellings rather than any `.xum` path segment: a
+ * relative or project-local path (`./.xum/skills/server.txt`) resolves against the
+ * server's own working directory, never the collected root, so localizing it would
+ * only remove a portable launcher on a fresh-device restore.
+ */
+function isAutoPublishedScriptOperand(unquoted: string, rootPrefixes: readonly string[]): boolean {
+  const normalized = normalizeComparablePath(unquoted);
+  for (const prefix of rootPrefixes) {
+    if (!normalized.startsWith(`${prefix}/`)) continue;
+    const relative = normalized.slice(prefix.length + 1);
+    if (relative === "agents.md") return true;
+    if (/^agents\/[^/]+\.md$/.test(relative)) return true;
+    if (
+      /^(?:skills|memory\/global)\//.test(relative) &&
+      AUTO_PUBLISHED_RECURSIVE_FILE.test(relative)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Resolve an absolute/home target, or a relative target from a known directory. */
+function resolveKnownDirectory(target: string, current: string | null): string | null {
+  if (/^(?:\/|\\|~|[a-z]:)/i.test(target)) return normalizeComparablePath(target);
+  if (current === null) return null;
+  return normalizeComparablePath(`${current}/${target}`);
+}
+
+/** Whether the operand names the collected root itself or a directory inside it. */
+function isUnderCollectedRoot(unquoted: string, rootPrefixes: readonly string[]): boolean {
+  const normalized = normalizeComparablePath(unquoted);
+  return rootPrefixes.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`)
+  );
+}
+
+/**
+ * Inherited environment paths resolve on this machine, so a symlinked spelling
+ * reaches the same collected documents; the canonical target decides. A path
+ * that does not resolve keeps its lexical spelling, and a relative spelling
+ * stays lexical because it resolves against the server's own working
+ * directory, not this process's.
+ */
+function canonicalizeInheritedPath(target: string): string {
+  if (!/^(?:\/|\\|[a-z]:)/i.test(target)) return target;
+  try {
+    return realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+
+/** Known npm commands and aliases terminate global-option parsing. */
+const NPM_SUBCOMMANDS = new Set(
+  "access adduser audit bugs cache ci completion config dedupe deprecate diff dist-tag docs doctor edit exec explain explore find-dupes fund get help help-search hook init install install-ci-test install-test link ll login logout ls org outdated owner pack ping pkg prefix profile prune publish query rebuild repo restart root run-script sbom search set shrinkwrap star stars start stop team test token uninstall unpublish unstar update version view whoami add add-user author c cit clean-install clean-install-test create ddp dist-tags find hlep home i ic in info innit ins inst insta instal install-clean isnt isnta isntal isntall isntall-clean issues it la list ln ogr r rb remove rm rum run s se show sit t tst udpate un unlink up upgrade urn v verison why x".split(
+    " "
+  )
+);
+
+const UV_SUBCOMMANDS = new Set(
+  "auth run init add remove version sync lock export tree format tool python pip venv build publish cache self generate-shell-completion help".split(
+    " "
+  )
+);
+const UV_TOOL_SUBCOMMANDS = new Set("run install upgrade uninstall update list dir".split(" "));
+
+function uvGlobalOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:--(?:cache-dir|color|directory|project|config-file|python-preference|allow-insecure-host))$/.test(
+    unquoted
+  );
+}
+
+/** Exactly one replaced assignment, nothing else riding along in the same word. */
+const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
+
+/**
+ * The word with every quoted or escaped character reduced to one placeholder, so a
+ * syntax test sees only the regions Bash parses as syntax: a quoted comma cannot
+ * trigger brace expansion and a quoted bracket cannot open a glob class. The
+ * placeholder keeps the active fragments around a quoted run from splicing into
+ * syntax that never existed (`{a.'x'.b}` must not read as `{a..b}`).
+ */
+function activeWordProjection(word: string): string {
+  let result = "";
+  let i = 0;
+  while (i < word.length) {
+    const char = word[i];
+    if (char === "\\") {
+      result += "_";
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = word.indexOf("'", i + 1);
+      result += "_";
+      i = end === -1 ? word.length : end + 1;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < word.length && word[j] !== '"') {
+        j += word[j] === "\\" ? 2 : 1;
+      }
+      result += "_";
+      i = j + 1;
+      continue;
+    }
+    result += char;
+    i += 1;
+  }
+  return result;
+}
+
+/**
+ * A glob whose output depends on the working directory: `?`, `*`, and any class other
+ * than `[c]` with one plain literal member expand against whatever files exist, so a
+ * wildcard inside a known token prefix (`gh?_...`) can hand the process a credential no
+ * textual scan reconstructs. Escaped, quoted, negated, and `]` members are excluded
+ * from the deterministic form: the projection cannot represent them faithfully, and
+ * only the plain `[c]` spelling is what the scan's collapse pass reproduces. A single
+ * quote-aware pass rather than a regex, because a regex restarts its `]` search at
+ * every bracket of a long literal `[` run, going quadratic on input an 8 MB mcp.jsonc
+ * can deliver to this synchronous scan. Unmatched `[` stays literal for Bash but
+ * localizes here, one more undecidable-cheap case.
+ */
+function hasNondeterministicGlob(word: string): boolean {
+  let i = 0;
+  while (i < word.length) {
+    const char = word[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = word.indexOf("'", i + 1);
+      i = end === -1 ? word.length : end + 1;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < word.length && word[j] !== '"') {
+        j += word[j] === "\\" ? 2 : 1;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (char === "?" || char === "*") return true;
+    if (char === "[") {
+      // A letter member is only deterministic case-sensitively; with nocaseglob
+      // inherited via BASHOPTS, `[P]` matches a lowercase `p` file, so letters
+      // localize and only caseless members (digits, symbols) collapse.
+      const member = word[i + 1] ?? "";
+      if (word[i + 2] === "]" && !"!^]\\'\"".includes(member) && !/[A-Za-z]/.test(member)) {
+        i += 3;
+        continue;
+      }
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * A brace group holding `,` or `..` at any nesting depth expands, and expansion output
+ * can reassemble a credential from fragments no scanner recognizes (`ghp_...{8..8}...`,
+ * nested `gh{p,{x}}_...`). Literal braces (`{hunter2}`) do not expand and stay inside
+ * the word the ordinary rules cover. A depth stack rather than a flat regex, because an
+ * inner non-expanding group otherwise hides the expanding outer one. Runs on the active
+ * projection, so quoted commas stay inert.
+ */
+function hasActiveBraceExpansion(active: string): boolean {
+  const groupExpands: boolean[] = [];
+  let i = 0;
+  while (i < active.length) {
+    const char = active[i];
+    if (char === "{") groupExpands.push(false);
+    else if (char === "}" && groupExpands.length > 0) {
+      if (groupExpands.pop()) return true;
+    } else if (
+      groupExpands.length > 0 &&
+      (char === "," || (char === "." && active[i + 1] === "."))
+    ) {
+      groupExpands[groupExpands.length - 1] = true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * Shells whose `-c` payload (or script argument) is reparsed under full expansion
+ * rules: a quoted script with no literal whitespace still synthesizes separators
+ * there (`bash -c 'printf${IFS}%s...'`), so naming one localizes the command.
+ * Matched on the quote-removed word's basename over both separators with a
+ * case-insensitive `.exe` suffix removed, covering `/bin/sh`, `bash.exe`, and
+ * `C:\Tools\PWSH.EXE` spellings alike (Windows names are case-insensitive, and
+ * lowercasing a Unix spelling can only fail closed). A
+ * custom wrapper that reparses its argv is per-program knowledge no shell-syntax
+ * scan can model, the same boundary drawn for `tee` and option semantics; these
+ * names are the shells the platform actually ships.
+ */
+const SHELL_INTERPRETER_NAMES = new Set([
+  "sh",
+  "bash",
+  "dash",
+  "ash",
+  "zsh",
+  "ksh",
+  "mksh",
+  "csh",
+  "tcsh",
+  "fish",
+  "busybox",
+  // cmd.exe reparses its /c operand, consuming carets that split fragments upstream.
+  "cmd",
+  "pwsh",
+  "powershell",
+]);
+
+/**
+ * Executables that evaluate a program operand by default, with no `-c`/`-e` marker to
+ * distinguish it from a file launcher: awk runs its first operand as a program, and
+ * GNU sed's `e` command hands script text from the same positional slot to a shell.
+ * Localize the invocation as soon as its exact normalized executable name appears; the
+ * portability cost of `awk -f`/`sed -f` is preferable to parsing each implementation's
+ * option grammar and failing open.
+ */
+const PROGRAM_OPERAND_INTERPRETER_NAMES = new Set([
+  "awk",
+  "gawk",
+  "mawk",
+  "nawk",
+  "goawk",
+  "sed",
+  "gsed",
+]);
+
+/**
+ * Executables whose operands are handed to another shell parse this scan never sees.
+ * Remotely: OpenSSH sends command words to the remote login shell for re-evaluation
+ * (`ssh host mcp --token a\\b` loses the second backslash remotely), and the
+ * scp/rsync remote-path grammars expand through that same remote shell. Locally:
+ * su/runuser/sudo hand their command operand to the target user's shell, and
+ * watch/flock/script/tmux run theirs through a `sh -c`-style pass. Naming one
+ * localizes the invocation, accepting the portability cost like the program-operand
+ * interpreters above.
+ */
+const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
+  "ssh",
+  "slogin",
+  "autossh",
+  "scp",
+  "rsync",
+  "su",
+  "runuser",
+  "sudo",
+  "watch",
+  "flock",
+  "script",
+  "tmux",
+  // xargs' default input parsing removes backslashes and quotes from stdin or an
+  // `-a` argument file, reconstructing a token a collected file carries split; GNU
+  // parallel additionally runs its composed command lines through a shell.
+  "xargs",
+  "parallel",
+]);
+
+/**
+ * Reserved words that leave the following word in command position
+ * (`if sh -c x; then`). A quoted spelling is a keyword to no shell, but treating it
+ * alike only widens the checked positions, failing closed. `for`, `case`, and
+ * `select` bind a name or pattern next, not a command, so they end command position
+ * like any operand.
+ */
+const SHELL_COMMAND_KEYWORDS = new Set([
+  "if",
+  "then",
+  "elif",
+  "else",
+  "do",
+  "while",
+  "until",
+  "!",
+  "{",
+  "}",
+  // Both run what follows: coproc executes its command asynchronously, and a
+  // function body executes at the call site later in the same command string.
+  // Their optional/required NAME operand is handled where the keyword is seen.
+  "coproc",
+  "function",
+]);
+
+/**
+ * Wrappers that run their first operand as a command under this same shell parse: the
+ * name itself evaluates nothing, so a portable launcher merely named in an argument
+ * stays published, but the wrapped command word is checked exactly like a command
+ * start. The count is the leading non-option operands the wrapper consumes first
+ * (`timeout 30 CMD`, `chroot /root CMD`).
+ */
+const COMMAND_CARRIER_OPERANDS = new Map<string, number>([
+  ["nohup", 0],
+  ["setsid", 0],
+  ["stdbuf", 0],
+  ["nice", 0],
+  ["ionice", 0],
+  ["doas", 0],
+  ["unshare", 0],
+  ["nsenter", 0],
+  ["strace", 0],
+  ["ltrace", 0],
+  ["time", 0],
+  ["command", 0],
+  ["builtin", 0],
+  ["exec", 0],
+  ["prlimit", 0],
+  ["setpriv", 0],
+  ["numactl", 0],
+  ["eatmydata", 0],
+  // systemd executors share the [OPTIONS...] COMMAND grammar; a dash option makes
+  // the walk sticky below, which also covers their separate-value option spellings.
+  ["systemd-run", 0],
+  ["systemd-inhibit", 0],
+  ["systemd-cat", 0],
+  ["timeout", 1],
+  ["chrt", 1],
+  ["taskset", 1],
+  ["chroot", 1],
+  ["runcon", 1],
+  // -1: the wrapper's leading operand is optional (setarch [ARCH] COMMAND), so no
+  // fixed count is safe; every following word is checked instead, failing closed.
+  ["setarch", -1],
+  // The util-linux setarch hard links imply the architecture, so their first
+  // operand is already the program.
+  ["linux32", 0],
+  ["linux64", 0],
+  ["uname26", 0],
+  // CMake executes several operand grammars (-P script mode, -E env/chdir/time
+  // command mode) and CTest runs -S/-SP dashboard scripts; checking every operand
+  // covers them all without modeling each option, failing closed like setarch.
+  ["cmake", -1],
+  ["ctest", -1],
+]);
+
+/**
+ * find's -exec family hands the operands that follow to execvp as a command.
+ * Localizing on the primary itself skips modeling the `;`/`+` terminator grammar,
+ * accepting the portability cost like the program-operand interpreters.
+ */
+const FIND_EXECUTABLE_NAMES = new Set(["find", "gfind"]);
+const FIND_EXEC_PRIMARY = /^-(?:exec|execdir|ok|okdir)$/;
+
+/**
+ * Language interpreters whose script-evaluation spellings reparse an operand under the
+ * language's own grammar, where quoted fragments concatenate into one runtime value
+ * (`python3 -c '..."ghp_a"+"b"...'`, `node -e "...'ghp_a'+'b'..."`, `deno eval ...`).
+ * Only the evaluation spelling localizes: file launchers (`node server.js`,
+ * `python -m pkg`) are the everyday portable MCP commands and stay published. Cluster
+ * spellings count (`-Bc`, `-pe`), and digits cluster too: perl and ruby take the
+ * numeric `-0[octal]` switch before the eval letter (`-0e`). Which letters evaluate
+ * is per-interpreter knowledge this table owns, unlike arbitrary programs' options.
+ */
+interface LanguageInterpreter {
+  name: RegExp;
+  evalWord?: RegExp;
+  attachedScriptFile?: RegExp;
+  separateScriptFileOption?: RegExp;
+  /** Option whose following script name is resolved through inherited PATH. */
+  pathScriptFileOption?: RegExp;
+  /** Captures an attached cwd, or an empty string when the next word is the cwd. */
+  workingDirectoryOption?: RegExp;
+  /**
+   * Interactive-mode spelling that executes the interpreter's inherited startup
+   * file (PYTHONSTARTUP). The cluster prefix excludes E and I, which disable
+   * environment inspection, and letters that consume an attached argument.
+   */
+  interactiveOption?: RegExp;
+  /** Option that enables an inherited debugger program (PERL5DB). */
+  debuggerOption?: RegExp;
+  /**
+   * Attached option naming an auxiliary file consumed before the main operand
+   * (jshell --startup=FILE, PHP -cFILE). Such a file can inject executable behavior,
+   * but it is not the script boundary: a positional script can still follow, so
+   * interpreter tracking stays armed. Separate spellings need no matcher because
+   * the following published operand already localizes through armed tracking.
+   */
+  attachedStartupFile?: RegExp;
+}
+
+/**
+ * Launchers the Node distribution itself ships as `#!/usr/bin/env node` scripts,
+ * so inherited NODE_OPTIONS preloads execute for them exactly as for node.
+ */
+const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "corepack"]);
+const PYTHON_LAUNCHER_NAME = /^(?:py|pyw|pythonw?[0-9.]*)$/;
+const PHP_LAUNCHER_NAME = /^(?:php[0-9.]*|php-win)$/;
+const JAVA_RUNTIME_LAUNCHER_NAME = /^(?:javaw?|jshell[0-9.]*)$/;
+const PERL_LAUNCHER_NAME = /^w?perl[0-9.]*$/;
+const LUA_LAUNCHER_NAME = /^(?:lua|luajit)[0-9.]*$/;
+
+const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
+  // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
+  // windowed `pythonw`/`rubyw`/`wperl`/`php-win` builds run the same evaluation
+  // grammars under different executable names. Short eval flags can follow only flags
+  // that consume no attached operand: `-Bc` evaluates, while `-Wsource` does not.
+  {
+    name: PYTHON_LAUNCHER_NAME,
+    evalWord: /^-[bBdEhiIOPqRsuSvVx]*c/,
+    interactiveOption: /^-[bBdhOPqRsuv]*i/,
+  },
+  {
+    name: /^(?:node|nodejs)$/,
+    evalWord:
+      /^(?:(?:--eval|--print|--import|--loader|--experimental-loader|--require)(?:=|$)|-[epr])/,
+    attachedStartupFile: /^--snapshot-blob=(.+)$/,
+  },
+  {
+    name: /^bun$/,
+    evalWord:
+      /^(?:(?:--eval|--print|--import|--loader|--experimental-loader|--preload|--require)(?:=|$)|-[epr])/,
+  },
+  // npx keeps ordinary package launchers portable; only its call operand is reparsed
+  // through a shell. npm needs its `exec` subcommand tracked separately below.
+  { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
+  { name: /^deno$/, evalWord: /^eval$/ },
+  { name: LUA_LAUNCHER_NAME, evalWord: /^-e/ },
+  { name: /^(?:elixir|iex)[0-9.]*$/, evalWord: /^(?:-e$|--eval(?:=|$)|--rpc-eval(?:=|$))/ },
+  // erl's -eval runs an expression, and -run/-s call Mod:Func with the remaining
+  // words as arguments (`-run os cmd "..."` reaches a shell; os:cmd also accepts
+  // the atoms -s passes), so each hands the grammar executable code.
+  { name: /^w?erl[0-9.]*$/, evalWord: /^-(?:eval|run|s)$/ },
+  // These launchers execute a positional script but need no inline-eval matcher here;
+  // auto-published script operands still localize through the shared check.
+  { name: /^(?:swift|tclsh|wish|expectk?|jimsh|escript)[0-9.]*$/ },
+  { name: /^jshell[0-9.]*$/, attachedStartupFile: /^--startup=(.+)$/ },
+  {
+    name: /^r$/,
+    evalWord: /^(?:-e$|--expression(?:=|$))/,
+    attachedScriptFile: /^(?:--file=|-f)(.+)$/,
+    separateScriptFileOption: /^-f$/,
+  },
+  { name: /^rscript$/, evalWord: /^(?:-e$|--expression(?:=|$))/ },
+  {
+    name: PERL_LAUNCHER_NAME,
+    evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
+    pathScriptFileOption: /^-S$/,
+    debuggerOption: /^-d(?:$|[:t])/,
+  },
+  {
+    name: /^rubyw?[0-9.]*$/,
+    evalWord: /^-(?:(?:0[0-7]*|W[0-2]?)|[acdlnpsvwy])*e/,
+    workingDirectoryOption: /^-C(.*)$/,
+    pathScriptFileOption: /^-S$/,
+  },
+  // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
+  {
+    name: PHP_LAUNCHER_NAME,
+    evalWord: /^-[nq]*[rRBE]/,
+    attachedScriptFile: /^(?:--file=|--process-file=|-[fF])(.+)$/,
+    separateScriptFileOption: /^(?:-[fF]|--file|--process-file)$/,
+    attachedStartupFile: /^-c(.+)$/,
+  },
+  // make evaluates recipes from an explicit makefile through a shell, and --eval/-E
+  // evaluates the option operand as makefile syntax; plain target launchers stay portable.
+  {
+    name: /^(?:g?make|mingw(?:32|64)-make)$/,
+    evalWord: /^(?:-f|--file(?:=|$)|--makefile(?:=|$)|-E|--eval(?:=|$))/,
+  },
+];
+
+/**
+ * Builtins that rewrite shell state the word scans cannot follow: `eval` reparses its
+ * concatenated arguments, and the others give a shell-built value environment or
+ * parameter visibility without any `=` or `$` spelling. Matched on quote-removed
+ * words, so a binary that merely contains the letters (`evaluate`) stays an argument.
+ */
+const SHELL_STATE_WORDS = new Set([
+  "eval",
+  // Trap actions are reparsed only when their signal fires, after first-parse quotes
+  // have hidden any expansion or escape inside the handler.
+  "trap",
+  // `mapfile`/`readarray` evaluate their `-C` callback text as a command each time
+  // lines are read, after first-parse quotes have hidden what joins inside it.
+  "mapfile",
+  "readarray",
+  // `read` builds a variable from input bytes with backslash joining unless -r, and
+  // inherited allexport exports what it builds.
+  "read",
+  "export",
+  "declare",
+  "typeset",
+  "readonly",
+  "local",
+  "set",
+  // `shopt -so allexport` flips the same allexport state `set -a` does, and
+  // `shopt -s expand_aliases` opens alias rewriting of later lines.
+  "shopt",
+  // `alias` rebinds later command words themselves; POSIX shells expand aliases in
+  // non-interactive scripts, so no later word reliably names what actually runs.
+  "alias",
+  // `enable` rewrites the builtin table: `-f` dlopens FILENAME as builtin NAME (dlopen
+  // needs no .so suffix, so any collected file qualifies), and `-n` makes a builtin
+  // word run a PATH program instead. Either changes what later words execute.
+  "enable",
+  // With inherited SHELLOPTS=history, `history -s` stores its arguments as one entry
+  // and `fc -s` reparses the stored command, expanding what the first parse kept
+  // quoted (`history -s 'mcp${IFS}--token${IFS}ghp_a\\b'; fc -s`).
+  "history",
+  "fc",
+  // `source`/`.` run a file in this shell with the remaining words as positionals
+  // (`source ./launch ghp_aaa bbb` can join them into one runtime token).
+  "source",
+  ".",
+]);
+
+/**
+ * Words that hand a downstream consumer an assignment the shell itself does not see,
+ * none of them decidable here. Only a word that is exactly one consumed assignment is
+ * exempt (`A="B=1"` cannot fire); a marker merely inside a larger word proves nothing
+ * about the rest of that word.
+ */
+function hasDisguisedAssignment(
+  redacted: string,
+  rootPrefixes: readonly string[],
+  inherited: InheritedLaunchContext
+): boolean {
+  let commandPosition = true;
+  let wrappedCommandExpected = false;
+  let carrierArmed = false;
+  let carrierSticky = false;
+  let carrierOperandSkips = 0;
+  let pendingFindPrimaries = false;
+  let pendingBodyName: "coproc" | "function" | null = null;
+  let envOperandsOnly = false;
+  let pendingPrintfVariableOption = false;
+  let sawEnv = false;
+  let pendingEnvOptionValue = false;
+  let pendingEnvWorkingDirectory = false;
+  let pendingNpmSubcommand = false;
+  let pendingNpmExecOptions = false;
+  let pendingUvSubcommand = false;
+  let pendingUvOptionValue = false;
+  let pendingUvToolSubcommand = false;
+  let pendingMiseSubcommand = false;
+  let pendingMiseExecOptions = false;
+  let pendingGitSubcommand = false;
+  let pendingGitOptionValue = false;
+  let pendingGitRemoteProgramOptions: "fetch" | "clone" | "push" | null = null;
+  let pendingGitRemoteProgramValue = false;
+  let pendingGitConfigOverrideValue = false;
+  let pendingGitConfigEnvValue = false;
+  let pendingGitSubmoduleAction = false;
+  let pendingGitRebaseOptions = false;
+  let pendingGitConfigKey = false;
+  let pendingGitConfigOptionValue = false;
+  let pendingGitAliasValue = false;
+  let pendingGitCommandValue = false;
+  let pendingGitFsmonitorValue = false;
+  let pendingGitIncludePathValue = false;
+  let pendingDenoSubcommand = false;
+  let pendingDenoRunScript = false;
+  let pendingDenoRunAmbiguous = false;
+  let pendingSqliteOptions = false;
+  let pendingSqliteInitFile = false;
+  let sqliteDatabaseSeen = false;
+  let pendingLoaderOptions = false;
+  let pendingLoaderPreloadValue = false;
+  let pendingLoaderLibraryPathValue = false;
+  let loaderSearchDirs: string[] = [];
+  let pendingClangOptions = false;
+  let pendingClangForwardedOption = false;
+  let pendingClangPluginMarker = false;
+  let pendingClangPluginOperand = false;
+  let pendingOpensslOptions = false;
+  let pendingOpensslConfigFile = false;
+  let pendingLldbOptions = false;
+  let pendingLldbSourceFile = false;
+  let pendingGdbOptions = false;
+  let pendingGdbCommandFile = false;
+  let pendingNinjaOptions = false;
+  let pendingNinjaBuildFile = false;
+  let pendingTarOptions = false;
+  let pendingTarProgramValue = false;
+  let pendingJavaOptions = false;
+  let pendingJavaSourceVersion = false;
+  let pendingJavaSourceFile = false;
+  let pendingJavaOptionValue = false;
+  let pendingJavaClassPathValue = false;
+  let pendingJavaPatchModuleValue = false;
+  let pendingHashOptions = false;
+  let pendingStartStopDaemonOptions = false;
+  let pendingStartStopDaemonExecutable = false;
+  let pendingSystemdRunOptions = false;
+  let pendingSystemdRunWorkingDirectory = false;
+  let pendingCdBuiltin: "cd" | "pushd" | null = null;
+  // Lexical spelling of the working directory once a cd/pushd chain makes it known;
+  // it survives separators because the moved directory outlives the command.
+  let trackedCwd: string | null = null;
+  let commandWordSeen = false;
+  let commandConsumesStdin = false;
+  let commandPublishedStdin = false;
+  let pendingScriptFileOperand = false;
+  let pendingScriptFileUsesPath = false;
+  let evalOperandAmbiguous = false;
+  // Static table entries keep the pending set bounded, so repeated interpreter words
+  // cannot make these checks superlinear in command length.
+  const pendingLanguages = new Set<LanguageInterpreter>();
+  const languageWorkingDirectories = new Map<LanguageInterpreter, string>();
+  let pendingLanguageWorkingDirectory: LanguageInterpreter | null = null;
+
+  function isShellResolvedPublishedOperand(value: string): boolean {
+    if (
+      isAutoPublishedScriptOperand(value, rootPrefixes) ||
+      isAutoPublishedScriptOperand(canonicalizeInheritedPath(value), rootPrefixes)
+    ) {
+      return true;
+    }
+    const resolved = resolveKnownDirectory(value, trackedCwd);
+    return (
+      resolved !== null &&
+      (isAutoPublishedScriptOperand(resolved, rootPrefixes) ||
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(resolved), rootPrefixes))
+    );
+  }
+
+  function isPendingLanguageScriptOperand(value: string): boolean {
+    if (isShellResolvedPublishedOperand(value)) return true;
+    for (const language of pendingLanguages) {
+      const directory = languageWorkingDirectories.get(language);
+      if (directory === undefined) continue;
+      const resolved = resolveKnownDirectory(value, directory);
+      if (
+        resolved !== null &&
+        (isAutoPublishedScriptOperand(resolved, rootPrefixes) ||
+          isAutoPublishedScriptOperand(canonicalizeInheritedPath(resolved), rootPrefixes))
+      ) {
+        return true;
+      }
+    }
+    if (pendingScriptFileUsesPath && !/[/\\]/.test(value)) {
+      for (const directory of inherited.publishedPathDirs) {
+        if (isAutoPublishedScriptOperand(`${directory}/${value}`, rootPrefixes)) return true;
+      }
+    }
+    return false;
+  }
+
+  function clearInterpreterTracking(): void {
+    pendingLanguages.clear();
+    languageWorkingDirectories.clear();
+    pendingLanguageWorkingDirectory = null;
+    pendingScriptFileOperand = false;
+    pendingScriptFileUsesPath = false;
+    evalOperandAmbiguous = false;
+  }
+  const words = [...redacted.matchAll(SHELL_WORD)];
+  let previousEnd = 0;
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]?.[0] ?? "";
+    const wordStart = words[index]?.index ?? previousEnd;
+    const gap = redacted.slice(previousEnd, wordStart);
+    previousEnd = wordStart + word.length;
+    // Control and grouping operators start a new command. Of the other break
+    // characters, a live backtick localizes upstream as a carrier and a write
+    // redirection localizes on its own, so only `<` still needs position handling.
+    if (/[;&|()\n]/.test(gap)) {
+      // A control operator starts a new command, so no parser state from the
+      // previous one applies: retained interpreter tracking would read the next
+      // command's ordinary options as evaluation (`python3 --version && mcp -c x`).
+      commandPosition = true;
+      wrappedCommandExpected = false;
+      carrierArmed = false;
+      carrierSticky = false;
+      carrierOperandSkips = 0;
+      pendingFindPrimaries = false;
+      pendingBodyName = null;
+      sawEnv = false;
+      pendingEnvOptionValue = false;
+      pendingEnvWorkingDirectory = false;
+      envOperandsOnly = false;
+      pendingPrintfVariableOption = false;
+      pendingNpmSubcommand = false;
+      pendingNpmExecOptions = false;
+      pendingUvSubcommand = false;
+      pendingUvOptionValue = false;
+      pendingUvToolSubcommand = false;
+      pendingMiseSubcommand = false;
+      pendingMiseExecOptions = false;
+      pendingGitSubcommand = false;
+      pendingGitOptionValue = false;
+      pendingGitRemoteProgramOptions = null;
+      pendingGitRemoteProgramValue = false;
+      pendingGitConfigOverrideValue = false;
+      pendingGitConfigEnvValue = false;
+      pendingGitSubmoduleAction = false;
+      pendingGitRebaseOptions = false;
+      pendingGitConfigKey = false;
+      pendingGitConfigOptionValue = false;
+      pendingGitAliasValue = false;
+      pendingGitCommandValue = false;
+      pendingGitFsmonitorValue = false;
+      pendingGitIncludePathValue = false;
+      pendingDenoSubcommand = false;
+      pendingDenoRunScript = false;
+      pendingDenoRunAmbiguous = false;
+      pendingSqliteOptions = false;
+      pendingSqliteInitFile = false;
+      sqliteDatabaseSeen = false;
+      pendingLoaderOptions = false;
+      pendingLoaderPreloadValue = false;
+      pendingLoaderLibraryPathValue = false;
+      loaderSearchDirs = [];
+      pendingClangOptions = false;
+      pendingClangForwardedOption = false;
+      pendingClangPluginMarker = false;
+      pendingClangPluginOperand = false;
+      pendingOpensslOptions = false;
+      pendingOpensslConfigFile = false;
+      pendingLldbOptions = false;
+      pendingLldbSourceFile = false;
+      pendingGdbOptions = false;
+      pendingGdbCommandFile = false;
+      pendingNinjaOptions = false;
+      pendingNinjaBuildFile = false;
+      pendingTarOptions = false;
+      pendingTarProgramValue = false;
+      pendingJavaOptions = false;
+      pendingJavaSourceVersion = false;
+      pendingJavaSourceFile = false;
+      pendingJavaOptionValue = false;
+      pendingJavaClassPathValue = false;
+      pendingJavaPatchModuleValue = false;
+      pendingHashOptions = false;
+      pendingStartStopDaemonOptions = false;
+      pendingStartStopDaemonExecutable = false;
+      pendingSystemdRunOptions = false;
+      pendingSystemdRunWorkingDirectory = false;
+      // A bare cd goes home; a bare pushd swaps to a stack entry this scan
+      // cannot resolve.
+      if (pendingCdBuiltin === "cd") trackedCwd = "~";
+      if (pendingCdBuiltin === "pushd") trackedCwd = null;
+      pendingCdBuiltin = null;
+      commandWordSeen = false;
+      commandConsumesStdin = false;
+      commandPublishedStdin = false;
+      clearInterpreterTracking();
+    }
+    // The word after `<` is a read redirection's filename, never a command or an
+    // operand; the command word can still follow it (`< input sh -c x`). A published
+    // document as redirected input is executable to a stdin-reading interpreter
+    // (`node < launch.txt` runs it as a script), so that filename localizes.
+    if (gap.includes("<")) {
+      if (isShellResolvedPublishedOperand(unquoteShellWord(word))) {
+        // Published input localizes only when something can execute it: a
+        // stdin-running interpreter in this command or a command word not yet
+        // seen (`< input sh -c x`), which fails closed. A non-interpreter
+        // consumes the document as data (`mcp-server < config.txt` stays
+        // portable). An interpreter can still follow the redirection, so the
+        // published filename stays remembered for that case.
+        if (commandConsumesStdin || !commandWordSeen) return true;
+        commandPublishedStdin = true;
+      }
+      continue;
+    }
+    if (CONSUMED_ASSIGNMENT.test(word)) {
+      if (pendingJavaPatchModuleValue) {
+        pendingJavaPatchModuleValue = false;
+        return true;
+      }
+      // A git -c or --config-env value can itself be the replaced assignment
+      // (`-c core.sshCommand=<marker>`): the key still classifies, and the
+      // hidden value fails closed wherever it would decide.
+      if (pendingGitOptionValue) {
+        pendingGitOptionValue = false;
+        const classifiable = pendingGitConfigOverrideValue || pendingGitConfigEnvValue;
+        pendingGitConfigOverrideValue = false;
+        pendingGitConfigEnvValue = false;
+        if (classifiable && gitConfigOverrideNamesSensitiveKey(word)) return true;
+      }
+      continue;
+    }
+    // Bash expands neither syntax from quoted or escaped text (`--config
+    // '{"a":1,"b":2}'` stays a literal argument). The brace test runs on the active
+    // projection; the glob analyzer is quote-aware itself and needs the raw word to
+    // tell `[\p]` (escaped member) from `[p]`.
+    if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
+    if (hasNondeterministicGlob(word)) return true;
+    const unquoted = unquoteShellWord(word);
+    // A bare descriptor immediately before `<` belongs to that redirection
+    // (`2<file cmd`, `{fd}<file cmd`), so it does not occupy a command position.
+    if (
+      /^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})$/.test(unquoted) &&
+      redacted.slice(previousEnd, words[index + 1]?.index ?? redacted.length).startsWith("<")
+    ) {
+      continue;
+    }
+    if (pendingLanguageWorkingDirectory !== null) {
+      const language = pendingLanguageWorkingDirectory;
+      pendingLanguageWorkingDirectory = null;
+      const directory = resolveKnownDirectory(unquoted, trackedCwd);
+      if (directory === null) languageWorkingDirectories.delete(language);
+      else languageWorkingDirectories.set(language, directory);
+      continue;
+    }
+    if (pendingScriptFileOperand) {
+      const autoPublished = isPendingLanguageScriptOperand(unquoted);
+      commandConsumesStdin = false;
+      clearInterpreterTracking();
+      if (autoPublished) return true;
+    }
+    // A bare dash is a script operand for interpreters; double dash ends their option
+    // parsing. Handle both before eval matching so the following dash-led filename or
+    // argument is never mistaken for an evaluator. They also terminate env options,
+    // npm exec call options, and git rebase options at this parse level.
+    if (unquoted === "-" || unquoted === "--") {
+      if (unquoted === "-" && pendingCdBuiltin !== null) {
+        // `cd -` returns to OLDPWD, which this scan cannot resolve.
+        pendingCdBuiltin = null;
+        trackedCwd = null;
+      }
+      const scriptOperandFollows = unquoted === "--" && pendingLanguages.size > 0;
+      if (scriptOperandFollows) {
+        // Preserve interpreter-specific cwd state until the one script operand is
+        // consumed; only option/eval parsing ends at the terminator.
+        pendingLanguageWorkingDirectory = null;
+        pendingScriptFileOperand = true;
+        evalOperandAmbiguous = false;
+      } else {
+        // A bare dash reads the script from stdin instead.
+        clearInterpreterTracking();
+      }
+      envOperandsOnly ||= sawEnv;
+      // `--` ends env option parsing, so the next word is the utility; a bare `-`
+      // is `-i`, leaving option parsing armed.
+      if (unquoted === "--") {
+        wrappedCommandExpected ||= sawEnv || pendingMiseExecOptions;
+        sawEnv = false;
+        pendingMiseExecOptions = false;
+        pendingStartStopDaemonOptions = false;
+        pendingStartStopDaemonExecutable = false;
+        pendingSystemdRunOptions = false;
+        pendingSystemdRunWorkingDirectory = false;
+        pendingSqliteOptions = false;
+        pendingSqliteInitFile = false;
+      }
+      pendingEnvOptionValue = false;
+      pendingEnvWorkingDirectory = false;
+      pendingNpmExecOptions = false;
+      pendingGitRebaseOptions = false;
+      pendingJavaOptions = false;
+      pendingJavaSourceVersion = false;
+      pendingJavaSourceFile = false;
+      pendingJavaOptionValue = false;
+      pendingJavaClassPathValue = false;
+      pendingJavaPatchModuleValue = false;
+      continue;
+    }
+    if (pendingBodyName !== null) {
+      const keyword = pendingBodyName;
+      pendingBodyName = null;
+      // The NAME between the keyword and its compound body does not execute; the
+      // body's opening `{` keeps command position through the keyword set. coproc
+      // treats the word as a name only when a compound follows; otherwise it is the
+      // simple command itself and falls through to the checks below.
+      if (
+        /^[A-Za-z_][A-Za-z0-9_]*$/.test(unquoted) &&
+        (keyword === "function" || unquoteShellWord(words[index + 1]?.[0] ?? "") === "{")
+      ) {
+        continue;
+      }
+    }
+    // Reserved words leave the following word in command position.
+    if (commandPosition && SHELL_COMMAND_KEYWORDS.has(unquoted)) {
+      if (unquoted === "coproc" || unquoted === "function") pendingBodyName = unquoted;
+      continue;
+    }
+    // Whether this word can execute: a command start, env's utility operand, or a
+    // carrier's wrapped command. Only such words can name an interpreter, a wrapper,
+    // or a state-changing builtin; everywhere else the same spelling is an ordinary
+    // argument (`mcp-server --shell bash` stays published).
+    let executesHere = commandPosition || carrierSticky;
+    commandPosition = false;
+    if (wrappedCommandExpected) {
+      wrappedCommandExpected = false;
+      executesHere = true;
+    }
+    // GNU env reparses its split-string value even without an assignment or literal
+    // whitespace, so this runs before the assignment-only exit below. Stop tracking at
+    // its command operand: the target program may use -S for an ordinary option.
+    if (sawEnv) {
+      if (pendingEnvWorkingDirectory) {
+        pendingEnvWorkingDirectory = false;
+        executesHere = false;
+        const directory = resolveKnownDirectory(unquoted, trackedCwd);
+        if (directory !== null && isUnderCollectedRoot(directory, rootPrefixes)) return true;
+      } else if (pendingEnvOptionValue) {
+        pendingEnvOptionValue = false;
+        executesHere = false;
+      } else if (isSplitStringOption(unquoted)) {
+        return true;
+      } else {
+        const attachedChdir = /^(?:-C(.+)|--([A-Za-z-]+)=(.*))$/.exec(unquoted);
+        const longChdir = attachedChdir?.[2];
+        if (
+          attachedChdir?.[1] !== undefined ||
+          (longChdir !== undefined && "chdir".startsWith(longChdir))
+        ) {
+          const value = attachedChdir?.[1] ?? attachedChdir?.[3] ?? "";
+          const directory = resolveKnownDirectory(value, trackedCwd);
+          if (directory !== null && isUnderCollectedRoot(directory, rootPrefixes)) return true;
+        } else {
+          const longOption = /^--([A-Za-z-]+)$/.exec(unquoted)?.[1];
+          if (unquoted === "-C" || (longOption !== undefined && "chdir".startsWith(longOption))) {
+            pendingEnvWorkingDirectory = true;
+          } else if (envOptionTakesSeparateValue(unquoted)) {
+            pendingEnvOptionValue = true;
+          } else if (!unquoted.startsWith("-")) {
+            sawEnv = false;
+            executesHere = true;
+          }
+        }
+      }
+    } else if (carrierArmed) {
+      if (unquoted.startsWith("-")) {
+        // The option may take a separate value this scan cannot pair (the same
+        // boundary as `python3 -W ignore -c x` below), so from here any word may be
+        // the wrapped command and all of them are checked, failing closed.
+        carrierSticky = true;
+        executesHere = true;
+      } else if (carrierOperandSkips > 0) {
+        carrierOperandSkips -= 1;
+      } else {
+        carrierArmed = false;
+        executesHere = true;
+      }
+    }
+    if (pendingGitAliasValue) {
+      pendingGitAliasValue = false;
+      if (unquoted.startsWith("!")) return true;
+    }
+    if (pendingGitCommandValue) {
+      pendingGitCommandValue = false;
+      return true;
+    }
+    if (pendingGitFsmonitorValue) {
+      pendingGitFsmonitorValue = false;
+      if (!GIT_BOOLEAN_CONFIG_VALUE.test(unquoted)) return true;
+    }
+    if (pendingGitIncludePathValue) {
+      pendingGitIncludePathValue = false;
+      // The included config file is read and applied (aliases, command-valued keys),
+      // so including a published document localizes; any other include stays portable.
+      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+    }
+    if (pendingGitConfigKey) {
+      if (pendingGitConfigOptionValue) {
+        pendingGitConfigOptionValue = false;
+      } else if (gitConfigOptionTakesSeparateValue(unquoted)) {
+        pendingGitConfigOptionValue = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingGitConfigKey = false;
+        if (/^alias\.[^.]+$/i.test(unquoted)) {
+          pendingGitAliasValue = true;
+        } else if (/^submodule\..+\.update$/i.test(unquoted)) {
+          // Shares the alias rule: only a `!`-prefixed update value is a command,
+          // which `git submodule update` executes in place of the built-in modes.
+          pendingGitAliasValue = true;
+        } else if (GIT_FSMONITOR_CONFIG_KEY.test(unquoted)) {
+          pendingGitFsmonitorValue = true;
+        } else if (GIT_INCLUDE_PATH_CONFIG_KEY.test(unquoted)) {
+          pendingGitIncludePathValue = true;
+        } else if (GIT_COMMAND_CONFIG_KEY.test(unquoted)) {
+          pendingGitCommandValue = true;
+        }
+      }
+    }
+    if (pendingGitRemoteProgramValue) {
+      pendingGitRemoteProgramValue = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingGitRemoteProgramOptions !== null) {
+      const names =
+        pendingGitRemoteProgramOptions === "push" ? "(?:receive-pack|exec)" : "upload-pack";
+      const attached = new RegExp(`^--${names}=(.+)$`).exec(unquoted)?.[1];
+      if (attached !== undefined && isShellResolvedPublishedOperand(attached)) return true;
+      if (
+        new RegExp(`^--${names}$`).test(unquoted) ||
+        (pendingGitRemoteProgramOptions === "clone" && unquoted === "-u")
+      ) {
+        pendingGitRemoteProgramValue = true;
+      }
+    }
+    if (pendingGitSubmoduleAction) {
+      if (unquoted === "foreach") return true;
+      if (!unquoted.startsWith("-")) pendingGitSubmoduleAction = false;
+    }
+    if (pendingGitRebaseOptions && /^(?:-x|--exec(?:=|$))/.test(unquoted)) return true;
+    if (pendingGitSubcommand) {
+      if (pendingGitOptionValue) {
+        pendingGitOptionValue = false;
+        if (pendingGitConfigOverrideValue || pendingGitConfigEnvValue) {
+          pendingGitConfigOverrideValue = false;
+          pendingGitConfigEnvValue = false;
+          if (gitConfigOverrideNamesSensitiveKey(unquoted)) return true;
+        }
+      } else {
+        const execPath = /^--exec-path=(.*)$/.exec(unquoted)?.[1];
+        if (execPath !== undefined && isUnderCollectedRoot(execPath, rootPrefixes)) return true;
+        const configEnv = /^--config-env=(.*)$/.exec(unquoted)?.[1];
+        if (configEnv !== undefined && gitConfigOverrideNamesSensitiveKey(configEnv)) return true;
+        if (gitOptionTakesSeparateValue(unquoted)) {
+          pendingGitOptionValue = true;
+          pendingGitConfigOverrideValue = unquoted === "-c";
+          pendingGitConfigEnvValue = unquoted === "--config-env";
+        } else if (!unquoted.startsWith("-")) {
+          pendingGitSubcommand = false;
+          if (unquoted === "config") {
+            pendingGitConfigKey = true;
+          } else if (unquoted === "fetch" || unquoted === "pull") {
+            pendingGitRemoteProgramOptions = "fetch";
+          } else if (unquoted === "clone") {
+            pendingGitRemoteProgramOptions = "clone";
+          } else if (unquoted === "push") {
+            pendingGitRemoteProgramOptions = "push";
+          } else if (unquoted === "submodule") {
+            pendingGitSubmoduleAction = true;
+          } else if (unquoted === "rebase") {
+            pendingGitRebaseOptions = true;
+          } else if (unquoted === "filter-branch") {
+            return true;
+          }
+        }
+      }
+    }
+    if (pendingUvToolSubcommand) {
+      if (unquoted === "run") return true;
+      if (UV_TOOL_SUBCOMMANDS.has(unquoted)) pendingUvToolSubcommand = false;
+    }
+    if (pendingUvSubcommand) {
+      if (pendingUvOptionValue) {
+        pendingUvOptionValue = false;
+      } else if (uvGlobalOptionTakesSeparateValue(unquoted)) {
+        pendingUvOptionValue = true;
+      } else if (unquoted === "run") {
+        // uv run executes the command that follows after its own option parse.
+        // Localizing at the subcommand avoids duplicating that evolving grammar.
+        return true;
+      } else if (unquoted === "tool") {
+        pendingUvSubcommand = false;
+        pendingUvToolSubcommand = true;
+      } else if (UV_SUBCOMMANDS.has(unquoted)) {
+        pendingUvSubcommand = false;
+      }
+    }
+    if (pendingMiseExecOptions && /^(?:-c(?:.+)?|--command(?:=|$))/.test(unquoted)) {
+      return true;
+    }
+    if (pendingMiseSubcommand) {
+      if (unquoted === "exec" || unquoted === "x") {
+        pendingMiseSubcommand = false;
+        pendingMiseExecOptions = true;
+      }
+    }
+    if (pendingNpmExecOptions) {
+      if (/^(?:-c|--call(?:=|$))/.test(unquoted)) return true;
+      if (!unquoted.startsWith("-")) pendingNpmExecOptions = false;
+    }
+    if (pendingNpmSubcommand) {
+      if (unquoted === "exec" || unquoted === "x") {
+        pendingNpmSubcommand = false;
+        pendingNpmExecOptions = true;
+      } else if (NPM_SUBCOMMANDS.has(unquoted)) {
+        pendingNpmSubcommand = false;
+      }
+      // Anything else can be a separated value for a global config option
+      // (`--prefix /tmp`), so tracking stays armed until a known subcommand.
+    }
+    if (pendingDenoRunScript) {
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+      if (unquoted.startsWith("-")) {
+        // The option may take a separate value this scan cannot pair, so from here
+        // a non-option word no longer proves the entrypoint; tracking stays armed,
+        // failing closed like the interpreter boundary below.
+        pendingDenoRunAmbiguous = true;
+      } else if (!pendingDenoRunAmbiguous) {
+        // The entrypoint ends tracking: later words are that program's arguments,
+        // and a published path among them is data, not something deno executes.
+        pendingDenoRunScript = false;
+      }
+    }
+    if (pendingLoaderPreloadValue) {
+      pendingLoaderPreloadValue = false;
+      if (loaderListPublishesExecutable(unquoted, rootPrefixes, trackedCwd, loaderSearchDirs)) {
+        return true;
+      }
+      continue;
+    }
+    if (pendingLoaderLibraryPathValue) {
+      pendingLoaderLibraryPathValue = false;
+      loaderSearchDirs = unquoted
+        .split(path.delimiter)
+        .map((entry) => resolveKnownDirectory(entry, trackedCwd))
+        .filter((entry): entry is string => entry !== null);
+      continue;
+    }
+    if (pendingLoaderOptions) {
+      const preload = /^--(?:preload|audit)=(.+)$/.exec(unquoted)?.[1];
+      if (
+        preload !== undefined &&
+        loaderListPublishesExecutable(preload, rootPrefixes, trackedCwd, loaderSearchDirs)
+      ) {
+        return true;
+      }
+      const libraryPath = /^--library-path=(.+)$/.exec(unquoted)?.[1];
+      if (libraryPath !== undefined) {
+        loaderSearchDirs = libraryPath
+          .split(path.delimiter)
+          .map((entry) => resolveKnownDirectory(entry, trackedCwd))
+          .filter((entry): entry is string => entry !== null);
+      } else if (/^--(?:preload|audit)$/.test(unquoted)) {
+        pendingLoaderPreloadValue = true;
+      } else if (unquoted === "--library-path") {
+        pendingLoaderLibraryPathValue = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingLoaderOptions = false;
+      }
+    }
+    if (pendingSqliteInitFile) {
+      pendingSqliteInitFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+      continue;
+    } else if (pendingSqliteOptions && /^--?init$/.test(unquoted)) {
+      // SQLite accepts every option with one or two leading dashes.
+      pendingSqliteInitFile = true;
+      continue;
+    } else if (pendingSqliteOptions && /^--?cmd$/.test(unquoted)) {
+      // -cmd runs its operand through SQLite's own parse before stdin, an
+      // evaluation channel this scan cannot follow (.shell and dot-command
+      // quoting), so it localizes like other eval words.
+      return true;
+    } else if (pendingSqliteOptions && !unquoted.startsWith("-")) {
+      if (sqliteDatabaseSeen) return true;
+      sqliteDatabaseSeen = true;
+    }
+    if (pendingTarProgramValue) {
+      pendingTarProgramValue = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingTarOptions) {
+      const attachedProgram = /^(?:-I|--use-compress-program=)(.+)$/.exec(unquoted)?.[1];
+      if (attachedProgram !== undefined && isShellResolvedPublishedOperand(attachedProgram)) {
+        return true;
+      }
+      if (unquoted === "-I" || unquoted === "--use-compress-program") {
+        pendingTarProgramValue = true;
+      }
+    }
+    if (pendingOpensslConfigFile) {
+      pendingOpensslConfigFile = false;
+      // A published OpenSSL config can load another collected document as a
+      // dynamic engine object, executing it inside the launcher.
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingOpensslOptions && /^--?config$/.test(unquoted)) {
+      pendingOpensslConfigFile = true;
+    }
+    if (pendingClangPluginOperand) {
+      pendingClangPluginOperand = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+      continue;
+    }
+    if (pendingClangPluginMarker) {
+      pendingClangPluginMarker = false;
+      if (unquoted === "-Xclang") {
+        pendingClangPluginOperand = true;
+        continue;
+      }
+    }
+    if (pendingClangForwardedOption) {
+      pendingClangForwardedOption = false;
+      if (unquoted === "-load") pendingClangPluginMarker = true;
+      continue;
+    }
+    if (pendingClangOptions && unquoted === "-Xclang") {
+      pendingClangForwardedOption = true;
+      continue;
+    }
+    if (pendingGdbCommandFile) {
+      pendingGdbCommandFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingGdbOptions) {
+      const attachedCommandFile = /^-(?:x|ix)(.+)$/.exec(unquoted)?.[1];
+      const longCommandFile = /^--?(?:command|init-command)=(.+)$/.exec(unquoted)?.[1];
+      const commandFile = attachedCommandFile ?? longCommandFile;
+      if (commandFile !== undefined && isShellResolvedPublishedOperand(commandFile)) return true;
+      if (/^(?:-x|-ix|--?(?:command|init-command))$/.test(unquoted)) {
+        pendingGdbCommandFile = true;
+      }
+      if (/^(?:-ex|-iex|--?(?:eval-command|init-eval-command)(?:=.*)?)$/.test(unquoted)) {
+        return true;
+      }
+    }
+    if (pendingNinjaBuildFile) {
+      pendingNinjaBuildFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingNinjaOptions) {
+      const attachedBuildFile = /^-f(.+)$/.exec(unquoted)?.[1];
+      if (attachedBuildFile !== undefined && isShellResolvedPublishedOperand(attachedBuildFile)) {
+        return true;
+      }
+      if (unquoted === "-f") pendingNinjaBuildFile = true;
+    }
+    if (pendingLldbSourceFile) {
+      pendingLldbSourceFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingLldbOptions) {
+      const attachedSource = /^--(?:source|source-before-file|source-on-crash)=(.+)$/.exec(
+        unquoted
+      )?.[1];
+      const attachedShortSource = /^-[sSK](.+)$/.exec(unquoted)?.[1];
+      const source = attachedSource ?? attachedShortSource;
+      if (source !== undefined && isShellResolvedPublishedOperand(source)) return true;
+      if (/^(?:-[sSK]|--(?:source|source-before-file|source-on-crash))$/.test(unquoted)) {
+        pendingLldbSourceFile = true;
+      }
+      // One-line options execute the following LLDB command, and attached long
+      // forms execute their value. Either is an eval boundary this scan cannot
+      // safely reinterpret.
+      if (
+        /^(?:-[oOk]|--(?:one-line|one-line-before-file|one-line-on-crash)(?:=|$))/.test(unquoted)
+      ) {
+        return true;
+      }
+    }
+    if (pendingJavaPatchModuleValue) {
+      pendingJavaPatchModuleValue = false;
+      if (javaPatchModulePublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
+    } else if (pendingJavaClassPathValue) {
+      pendingJavaClassPathValue = false;
+      if (javaClassPathPublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
+    } else if (pendingJavaOptionValue) {
+      pendingJavaOptionValue = false;
+    } else if (pendingJavaSourceVersion) {
+      pendingJavaSourceVersion = false;
+      pendingJavaSourceFile = true;
+    } else if (pendingJavaOptions || pendingJavaSourceFile) {
+      if (unquoted.startsWith("@")) {
+        // The launcher expands an @argument-file into options before parsing, so a
+        // published file can inject --source and a script operand; the file itself
+        // localizes, and any other @-file leaves tracking armed because the options
+        // it expands to are not visible here.
+        if (isShellResolvedPublishedOperand(unquoted.slice(1))) return true;
+      } else if (
+        isJavaClassPathOption(unquoted) ||
+        /^(?:-p|--module-path|--upgrade-module-path)$/.test(unquoted)
+      ) {
+        pendingJavaClassPathValue = true;
+      } else if (/^--(?:class-path|module-path|upgrade-module-path)=/.test(unquoted)) {
+        if (
+          javaClassPathPublishesExecutable(
+            unquoted.slice(unquoted.indexOf("=") + 1),
+            rootPrefixes,
+            trackedCwd
+          )
+        ) {
+          return true;
+        }
+      } else if (unquoted === "--patch-module") {
+        pendingJavaPatchModuleValue = true;
+      } else if (unquoted.startsWith("--patch-module=")) {
+        if (
+          javaPatchModulePublishesExecutable(
+            unquoted.slice("--patch-module=".length),
+            rootPrefixes,
+            trackedCwd
+          )
+        ) {
+          return true;
+        }
+      } else if (/^-(?:javaagent|agentpath):/.test(unquoted)) {
+        const agent = /^-(?:javaagent|agentpath):([^=]+)/.exec(unquoted)?.[1];
+        if (agent !== undefined && isShellResolvedPublishedOperand(agent)) return true;
+      } else if (/^-Xbootclasspath(?:\/[ap])?:/.test(unquoted)) {
+        // Boot-class-path entries execute like the class path: they load ahead
+        // of the application regardless of filename extension.
+        if (
+          javaClassPathPublishesExecutable(
+            unquoted.slice(unquoted.indexOf(":") + 1),
+            rootPrefixes,
+            trackedCwd
+          )
+        ) {
+          return true;
+        }
+      } else if (javaOptionTakesSeparateValue(unquoted)) {
+        pendingJavaOptionValue = true;
+      } else if (unquoted === "--source") {
+        pendingJavaSourceVersion = true;
+      } else if (unquoted.startsWith("--source=")) {
+        pendingJavaSourceFile = true;
+      } else if (unquoted === "-jar") {
+        // -jar's operand is executed like a --source script: the archive itself
+        // runs, and the launcher opens it regardless of filename extension.
+        pendingJavaSourceFile = true;
+      } else if (pendingJavaSourceFile && !unquoted.startsWith("-")) {
+        const autoPublished = isShellResolvedPublishedOperand(unquoted);
+        pendingJavaOptions = false;
+        pendingJavaSourceFile = false;
+        if (autoPublished) return true;
+      } else if (pendingJavaOptions && !unquoted.startsWith("-")) {
+        pendingJavaOptions = false;
+      }
+    }
+    if (pendingDenoSubcommand) {
+      if (unquoted === "run") {
+        pendingDenoSubcommand = false;
+        pendingDenoRunScript = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingDenoSubcommand = false;
+      }
+    }
+    if (pendingCdBuiltin !== null && !unquoted.startsWith("-")) {
+      pendingCdBuiltin = null;
+      // An absolute or home-anchored target replaces the working directory, and a
+      // relative target resolves against the last tracked one, staying unknown
+      // when the chain starts from the server's own cwd (a plain `cd build`
+      // launcher stays portable). Once the directory reaches the collected root,
+      // any relative operand can name a published document without spelling the
+      // root at all (`cd ~ && cd .xum && python3 skills/launch.txt`), so the
+      // move itself localizes. Dash words are cd's own options and keep the
+      // target pending.
+      if (!/^(?:\/|\\|~|[a-z]:)/i.test(unquoted)) {
+        // Bash searches inherited CDPATH before its ordinary relative target. A
+        // candidate inside the collected root localizes even when the server's
+        // original cwd is unknown (CDPATH=<root>; cd skills).
+        for (const entry of inherited.cdPathDirs) {
+          const base = entry === "" ? trackedCwd : resolveKnownDirectory(entry, trackedCwd);
+          const candidate = base === null ? null : resolveKnownDirectory(unquoted, base);
+          if (candidate !== null && isUnderCollectedRoot(candidate, rootPrefixes)) return true;
+        }
+      }
+      trackedCwd = resolveKnownDirectory(unquoted, trackedCwd);
+      if (trackedCwd !== null && isUnderCollectedRoot(trackedCwd, rootPrefixes)) return true;
+    }
+    // `hash -p PATHNAME NAME` binds NAME to any full pathname, so every remap
+    // changes what a later word executes (`hash -p /usr/bin/python3 launch` hands
+    // launch's arguments to an installed evaluator); the pathname's location proves
+    // nothing, so any -p spelling localizes. Scanning past bash's option terminator
+    // or its first name operand only fails closed.
+    if (pendingHashOptions && /^-[dlrt]*p/.test(unquoted)) return true;
+    // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
+    // builds even when this command contains no explicit export/set/shopt word.
+    if (pendingPrintfVariableOption && unquoted.startsWith("-v")) return true;
+    pendingPrintfVariableOption = executesHere && unquoted === "printf";
+    // `eval` concatenates its arguments and reparses the result, dissolving one more
+    // layer of quoting than any single-pass scan models (`ghp_a\\\\b` reaches the
+    // process as `ghp_ab`). The export-family builtins move a shell-built variable
+    // into the environment with no `=` or `$` in the text (`printf -v TOKEN ...;
+    // export TOKEN`), and `set` reaches the same end through `-a` or the positional
+    // parameters. Each is a builtin only where a command can start: `env eval ...`
+    // arrives through env's utility operand and `bash -c 'eval ...'` localized at
+    // `bash`, so an argument merely named `eval` stays published.
+    if (executesHere && SHELL_STATE_WORDS.has(unquoted)) return true;
+    // Executable-MIME data URLs are inline modules even when a runner subcommand
+    // prevents interpreter option tracking from reaching them.
+    if (/^data:[^,]*(?:javascript|ecmascript|typescript)/i.test(unquoted)) return true;
+    if (pendingFindPrimaries && FIND_EXEC_PRIMARY.test(unquoted)) return true;
+    if (pendingSystemdRunWorkingDirectory) {
+      pendingSystemdRunWorkingDirectory = false;
+      const directory = resolveKnownDirectory(unquoted, trackedCwd);
+      if (directory !== null && isUnderCollectedRoot(directory, rootPrefixes)) return true;
+    } else if (pendingSystemdRunOptions) {
+      const directory = /^--working-directory=(.*)$/.exec(unquoted)?.[1];
+      if (directory !== undefined) {
+        const resolved = resolveKnownDirectory(directory, trackedCwd);
+        if (resolved !== null && isUnderCollectedRoot(resolved, rootPrefixes)) return true;
+      } else if (unquoted === "--working-directory") {
+        pendingSystemdRunWorkingDirectory = true;
+      }
+    }
+    let executableWord = unquoted;
+    if (pendingStartStopDaemonExecutable) {
+      pendingStartStopDaemonExecutable = false;
+      executableWord = unquoted;
+      executesHere = true;
+    } else if (pendingStartStopDaemonOptions) {
+      const attachedExecutable = /^(?:--(?:exec|startas)=|-[xa])(.+)$/.exec(unquoted)?.[1];
+      if (attachedExecutable !== undefined) {
+        executableWord = attachedExecutable;
+        executesHere = true;
+      } else if (/^(?:-x|-a|--exec|--startas)$/.test(unquoted)) {
+        pendingStartStopDaemonExecutable = true;
+      }
+    }
+    const executable = executableWord
+      .slice(Math.max(executableWord.lastIndexOf("/"), executableWord.lastIndexOf("\\")) + 1)
+      .toLowerCase()
+      .replace(/\.exe$/, "");
+    if (executesHere) {
+      commandWordSeen = true;
+      // A directly executed auto-published document runs through its shebang,
+      // publishing an executable relationship no marker can rehydrate elsewhere.
+      if (isShellResolvedPublishedOperand(executableWord)) return true;
+      // A bare name resolves through the inherited PATH, so an entry inside the
+      // collected root reaches the same documents without spelling the root.
+      if (!/[/\\]/.test(executableWord)) {
+        for (const dir of inherited.publishedPathDirs) {
+          if (isAutoPublishedScriptOperand(`${dir}/${executableWord}`, rootPrefixes)) return true;
+        }
+      }
+      if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
+      if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.javaLaunchOptionsHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) {
+        return true;
+      }
+      // A published sys.path or class-path archive executes through the plain
+      // launcher (`python3 -m leak`, `java Leak`) without spelling the root.
+      if (inherited.pythonPathHook && PYTHON_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.javaClassPathHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.luaStartupHook && LUA_LAUNCHER_NAME.test(executable)) return true;
+      if (
+        inherited.perlDebuggerHook &&
+        inherited.perlDebuggerEnvHook &&
+        PERL_LAUNCHER_NAME.test(executable)
+      ) {
+        return true;
+      }
+      // The dynamic loader injects an inherited published preload into every
+      // dynamically linked launcher, ahead of whatever the command runs.
+      if (inherited.loaderPreloadHook) return true;
+      if (inherited.gitConfigHook && executable === "git") return true;
+      if (inherited.opensslConfigHook && executable === "openssl") return true;
+      if (inherited.cmakeToolchainHook && executable === "cmake") return true;
+      if (inherited.makefilesHook && /^(?:g?make|mingw(?:32|64)-make)$/.test(executable)) {
+        return true;
+      }
+      if (executable === "env") sawEnv = true;
+      if (executable === "npm") pendingNpmSubcommand = true;
+      if (executable === "uv") pendingUvSubcommand = true;
+      if (executable === "mise") pendingMiseSubcommand = true;
+      if (executable === "git") pendingGitSubcommand = true;
+      if (executable === "deno") pendingDenoSubcommand = true;
+      if (/^sqlite3[0-9.]*$/.test(executable)) pendingSqliteOptions = true;
+      if (executable === "openssl") pendingOpensslOptions = true;
+      if (/^(?:ld\.so|ld-(?:linux|musl)[^/]*\.so)(?:\.[0-9]+)*$/.test(executable)) {
+        pendingLoaderOptions = true;
+      }
+      if (/^(?:.*-)?clang(?:\+\+)?(?:-[0-9.]+)?$/.test(executable)) pendingClangOptions = true;
+      if (/^lldb(?:-[0-9.]+)?$/.test(executable)) pendingLldbOptions = true;
+      if (/^(?:.*-)?gdb(?:-multiarch)?(?:-[0-9.]+)?$/.test(executable)) pendingGdbOptions = true;
+      if (/^ninja(?:-build)?$/.test(executable)) pendingNinjaOptions = true;
+      if (/^g?tar$/.test(executable)) pendingTarOptions = true;
+      if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
+      if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
+      if (executable === "systemd-run") pendingSystemdRunOptions = true;
+      // Builtins, so matched on the quote-removed word like the state words above.
+      if (unquoted === "hash") pendingHashOptions = true;
+      if (unquoted === "cd" || unquoted === "pushd") pendingCdBuiltin = unquoted;
+      if (FIND_EXECUTABLE_NAMES.has(executable)) pendingFindPrimaries = true;
+      const carrierSkips = COMMAND_CARRIER_OPERANDS.get(executable);
+      if (carrierSkips === -1) {
+        carrierSticky = true;
+      } else if (carrierSkips !== undefined) {
+        carrierArmed = true;
+        carrierOperandSkips = carrierSkips;
+      }
+      if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
+      if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
+      if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
+    }
+    // Attached/separate R/PHP file options name the same script boundary as a
+    // positional operand, but their leading dash would otherwise look merely
+    // ambiguous. Either form ends tracking so later script arguments are not mistaken
+    // for code; an automatically published script localizes first.
+    let attachedScriptBoundary = false;
+    let workingDirectoryOptionMatched = false;
+    for (const pending of pendingLanguages) {
+      const workingDirectory = pending.workingDirectoryOption?.exec(unquoted)?.[1];
+      if (workingDirectory !== undefined) {
+        if (workingDirectory === "") {
+          pendingLanguageWorkingDirectory = pending;
+        } else {
+          const resolved = resolveKnownDirectory(workingDirectory, trackedCwd);
+          if (resolved === null) languageWorkingDirectories.delete(pending);
+          else languageWorkingDirectories.set(pending, resolved);
+        }
+        workingDirectoryOptionMatched = true;
+        break;
+      }
+      const startup = pending.attachedStartupFile?.exec(unquoted)?.[1];
+      if (startup !== undefined && isShellResolvedPublishedOperand(startup)) {
+        return true;
+      }
+      const script = pending.attachedScriptFile?.exec(unquoted)?.[1];
+      if (script !== undefined) {
+        if (isPendingLanguageScriptOperand(script)) return true;
+        attachedScriptBoundary = true;
+        break;
+      }
+      if (pending.pathScriptFileOption?.test(unquoted) === true) {
+        pendingScriptFileOperand = true;
+        pendingScriptFileUsesPath = true;
+      } else if (pending.separateScriptFileOption?.test(unquoted) === true) {
+        pendingScriptFileOperand = true;
+        pendingScriptFileUsesPath = false;
+      }
+      // An inherited startup hook naming a published document executes on any
+      // interactive spelling before the first prompt.
+      if (inherited.pythonStartupHook && pending.interactiveOption?.test(unquoted) === true) {
+        return true;
+      }
+      if (inherited.perlDebuggerHook && pending.debuggerOption?.test(unquoted) === true) {
+        return true;
+      }
+      // An evaluation word after a language interpreter hands that grammar a script.
+      if (pending.evalWord?.test(unquoted) === true) return true;
+    }
+    if (workingDirectoryOptionMatched) continue;
+    if (attachedScriptBoundary) {
+      commandConsumesStdin = false;
+      clearInterpreterTracking();
+    }
+
+    const language = executesHere
+      ? LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable))
+      : undefined;
+    if (language) {
+      // Without a script operand these interpreters execute standard input, so a
+      // published document already redirected into this command localizes here.
+      commandConsumesStdin = true;
+      if (commandPublishedStdin) return true;
+      pendingLanguages.add(language);
+      evalOperandAmbiguous = false;
+    } else if (pendingLanguages.size > 0) {
+      if (unquoted.startsWith("-")) {
+        // An interpreter option may take a separate argument this scan cannot pair
+        // (`python3 -W ignore -c x`), so from here a non-option word no longer
+        // proves the script boundary; tracking stays armed, failing closed.
+        evalOperandAmbiguous = true;
+      } else if (isPendingLanguageScriptOperand(unquoted)) {
+        // The backup publishes this document automatically. An interpreter executing
+        // it can join credential fragments across the command and file even when
+        // neither spelling matches the non-overridable token backstop.
+        return true;
+      } else if (!evalOperandAmbiguous) {
+        // The first non-option word no pending pattern matched is the script/module
+        // operand: later dash-led words and stdin belong to that program (`python3
+        // server.py -c settings.toml` hands -c to server.py), so eval tracking ends
+        // here and the file launchers this table intends to preserve stay portable.
+        commandConsumesStdin = false;
+        clearInterpreterTracking();
+      }
+    }
+    // A quoted region spanning whitespace is a script or argument string some
+    // interpreter re-parses on its own terms (`sh -c '...'`, `powershell -Command
+    // '$env:TOKEN=...; ...'`, `csh -c 'setenv TOKEN ...'`, `env -S'...'`); what that
+    // grammar treats as an assignment is not decidable here.
+    if (/\s/.test(unquoted)) return true;
+    if (!word.includes("=")) continue;
+    if (envOperandsOnly) return true;
+    // GNU `env` reads a bare `=value` word as an assignment operand too.
+    if (unquoted.startsWith("=")) return true;
+    // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
+    if (ASSIGNMENT_START.test(unquoted)) return true;
+    // An option value can embed a whole assignment for the target program
+    // (`systemd-run --setenv=TOKEN=x`, `--env=TOKEN=x`): a second `=` past the
+    // option's own separator marks one. Plain long-option flag values
+    // (`--transport=stdio`) carry no inner `=` and stay published.
+    if (
+      unquoted.startsWith("-") &&
+      ASSIGNMENT_START.test(unquoted.slice(unquoted.indexOf("=") + 1))
+    ) {
+      return true;
+    }
+    // A short option with an attached argument leaves no boundary before the
+    // assignment (`systemd-run -ETOKEN=x`, `-Dapi.key=x`), and which letters take
+    // env-like arguments is per-program knowledge this scan cannot have.
+    if (/^-[^-]/.test(unquoted)) return true;
+    // `=` mixed with quoting or expansion machinery: some other grammar's assignment
+    // (`$env:TOKEN=x`, `python -c 'os.environ["TOKEN"]="x"'` fragments).
+    if (/['"\\$]/.test(word)) return true;
+  }
+  return false;
+}
+
+/**
+ * The undecidable constructs, detected only where the shell parses them. An expansion
+ * body can carry arbitrary bytes into one runtime word (`TOKEN$(printf =hunter2)`,
+ * `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), and every parameter
+ * expansion depends on execution state the words cannot show: the command itself can
+ * fill `$1` (`set -- p`) or a plain `$X` with no assignment word to rewrite
+ * (`for X in p`, `printf -v X p`), so `gh$X'_'...` runs as a contiguous credential
+ * no scan of the spelling reconstructs. Any of them makes assignment detection
+ * undecidable. A
+ * here-document or here-string feeds the consumer a body under document rules the word
+ * scans would misread. Process substitution and write redirection each hand the
+ * consumer a file whose bytes the command chooses (`--token-file <(printf a;printf b)`,
+ * `printf a >f; printf b >>f`), assignment or not, so both localize; program-internal
+ * writes (`tee`) are per-program knowledge no shell-syntax scan can model, the same
+ * boundary drawn for option semantics. A pipe moves one stage's bytes into the next
+ * (`printf a | { read -r T; export T; ... }`), so pipes localize too, while `||` and
+ * `&&` carry no data and stay portable. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
+ * pathname pattern whose file match can complete a credential, undecidable like any
+ * glob. Single-quoted, escaped, and commented spellings are inert
+ * (`--pattern '$(date)'` is a literal argument a raw-string test would localize), while
+ * double quotes keep expansions live but make redirections literal.
+ */
+function findActiveShellConstructs(command: string): {
+  carrier: boolean;
+  heredoc: boolean;
+  processSubstitution: boolean;
+  redirection: boolean;
+  pipeline: boolean;
+} {
+  const found = {
+    carrier: false,
+    heredoc: false,
+    processSubstitution: false,
+    redirection: false,
+    pipeline: false,
+  };
+  let i = 0;
+  let wordStart = true;
+  // The previous character as Bash sees it, or "" when that character was quoted or
+  // escaped: extglob operators only form from two adjacent unquoted characters.
+  let prevActive = "";
+  while (i < command.length) {
+    const char = command[i];
+    if (char === "\\") {
+      // A backslash-LF continuation vanishes before tokenization, so it neither opens
+      // nor ends a word: a `#` right after `cmd \` still sits at a comment position.
+      if (command[i + 1] !== "\n") {
+        wordStart = false;
+        prevActive = "";
+      }
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = command.indexOf("'", i + 1);
+      i = end === -1 ? command.length : end + 1;
+      wordStart = false;
+      prevActive = "";
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < command.length && command[j] !== '"') {
+        if (command[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (command[j] === "`") found.carrier = true;
+        if (command[j] === "$" && /[({[!0-9@*#?$A-Za-z_-]/.test(command[j + 1] ?? "")) {
+          found.carrier = true;
+        }
+        j += 1;
+      }
+      i = j + 1;
+      wordStart = false;
+      prevActive = "";
+      continue;
+    }
+    if (char === "#" && wordStart) {
+      const lineEnd = command.indexOf("\n", i);
+      if (lineEnd === -1) break;
+      i = lineEnd + 1;
+      wordStart = true;
+      prevActive = "";
+      continue;
+    }
+    if (char === "`") {
+      found.carrier = true;
+      i += 1;
+      wordStart = false;
+      prevActive = char;
+      continue;
+    }
+    if (char === "$") {
+      if (/[({['"!0-9@*#?$A-Za-z_-]/.test(command[i + 1] ?? "")) found.carrier = true;
+      i += 1;
+      wordStart = false;
+      prevActive = char;
+      continue;
+    }
+    if (char === "<") {
+      if (command[i + 1] === "<") found.heredoc = true;
+      if (command[i + 1] === "(") found.processSubstitution = true;
+      i += 1;
+      wordStart = true;
+      prevActive = char;
+      continue;
+    }
+    if (char === ">") {
+      if (command[i + 1] === "(") found.processSubstitution = true;
+      // Any write redirection lets the command assemble a file whose bytes the scans
+      // cannot model (`printf a >f; printf b >>f; mcp --token-file f`).
+      found.redirection = true;
+      i += 1;
+      wordStart = true;
+      prevActive = char;
+      continue;
+    }
+    if (char === "|") {
+      // `||` is a control operator with no data flow, but a pipe (`|`, `|&`) hands one
+      // stage's bytes to the next, where `read` can turn published fragments into an
+      // exported variable.
+      if (command[i + 1] === "|") {
+        i += 2;
+        wordStart = true;
+        prevActive = char;
+        continue;
+      }
+      found.pipeline = true;
+      i += 1;
+      wordStart = true;
+      prevActive = char;
+      continue;
+    }
+    if (char === "(" && prevActive !== "" && "?*+@!".includes(prevActive)) {
+      found.carrier = true;
+    }
+    wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    prevActive = char;
+    i += 1;
+  }
+  return found;
+}
+
+/**
+ * The command split at Bash comment boundaries, quote-aware: assignment-like prose in a
+ * comment must neither be rewritten (Bash never evaluates it, and a marker would make
+ * the whole command machine-local) nor feed the residue checks. Each piece keeps its
+ * trailing comment, and the newline that ends a comment stays in the next piece's code,
+ * so per-piece replacement sees the same boundaries the one-string form did.
+ */
+function splitCommandComments(command: string): Array<{ code: string; comment: string }> {
+  const pieces: Array<{ code: string; comment: string }> = [];
+  let code = "";
+  let i = 0;
+  let wordStart = true;
+  while (i < command.length) {
+    const char = command[i];
+    if (char === "#" && wordStart) {
+      const lineEnd = command.indexOf("\n", i);
+      const end = lineEnd === -1 ? command.length : lineEnd;
+      pieces.push({ code, comment: command.slice(i, end) });
+      code = "";
+      i = end;
+      wordStart = true;
+      continue;
+    }
+    if (char === "\\") {
+      code += command.slice(i, i + 2);
+      // Invisible to tokenization, a continuation keeps the comment position open.
+      if (command[i + 1] !== "\n") wordStart = false;
+      i += 2;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      const quote = char;
+      let j = i + 1;
+      while (j < command.length && command[j] !== quote) {
+        j += quote === '"' && command[j] === "\\" ? 2 : 1;
+      }
+      code += command.slice(i, Math.min(j + 1, command.length));
+      i = j + 1;
+      wordStart = false;
+      continue;
+    }
+    code += char;
+    wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    i += 1;
+  }
+  pieces.push({ code, comment: "" });
+  return pieces;
+}
+
+/**
+ * The command with every active line continuation removed. Bash deletes an unquoted or
+ * double-quoted backslash-LF before any expansion, so syntax split across one
+ * (`$`+continuation+`(`, a brace sequence's `..`) reads contiguously to the shell
+ * while a per-character analyzer would see an escape pair. Single-quoted pairs stay the
+ * literal bytes the process receives, and a comment's backslash is prose that cannot
+ * hide the newline ending the comment.
+ */
+function removeActiveLineContinuations(command: string): string {
+  let result = "";
+  let i = 0;
+  let wordStart = true;
+  while (i < command.length) {
+    const char = command[i];
+    if (char === "\\") {
+      if (command[i + 1] === "\n") {
+        i += 2;
+        continue;
+      }
+      result += command.slice(i, i + 2);
+      i += 2;
+      wordStart = false;
+      continue;
+    }
+    if (char === "'") {
+      const end = command.indexOf("'", i + 1);
+      const stop = end === -1 ? command.length : end + 1;
+      result += command.slice(i, stop);
+      i = stop;
+      wordStart = false;
+      continue;
+    }
+    if (char === '"') {
+      result += char;
+      let j = i + 1;
+      while (j < command.length && command[j] !== '"') {
+        if (command[j] === "\\" && command[j + 1] === "\n") {
+          j += 2;
+          continue;
+        }
+        if (command[j] === "\\") {
+          result += command.slice(j, j + 2);
+          j += 2;
+          continue;
+        }
+        result += command[j];
+        j += 1;
+      }
+      if (j < command.length) result += '"';
+      i = j + 1;
+      wordStart = false;
+      continue;
+    }
+    if (char === "#" && wordStart) {
+      const lineEnd = command.indexOf("\n", i);
+      const end = lineEnd === -1 ? command.length : lineEnd;
+      result += command.slice(i, end);
+      i = end;
+      continue;
+    }
+    result += char;
+    wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    i += 1;
+  }
+  return result;
+}
+
+/**
+ * Fail closed before any per-character analysis: mcp.jsonc may be megabytes, and the
+ * walks below hold per-character state (projection copies, brace stacks), so an
+ * adversarial brace wall could stall the synchronous main process for seconds and
+ * balloon memory. No legitimate portable command approaches this length; beyond it the
+ * command goes machine-local without being parsed at all.
+ */
+export const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
+
+/**
+ * The per-command cap composes: a near-8 MB mcp.jsonc can hold ~250 commands that each
+ * pass it, and their walks together still stall the synchronous main process for
+ * seconds. One aggregate budget per config bounds total analysis work; commands past
+ * it go machine-local unparsed, exactly like a single oversized command.
+ */
+export const MAX_TOTAL_ANALYZED_COMMAND_LENGTH = 8 * MAX_ANALYZED_COMMAND_LENGTH;
+
+function redactCommandEnvAssignments(
+  command: string,
+  rootPrefixes: readonly string[],
+  inherited: InheritedLaunchContext
+): string {
+  if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
+  // Analysis mirrors execution: active continuations vanish first, so every analyzer
+  // below sees the same contiguous syntax the shell parses.
+  const analyzed = removeActiveLineContinuations(command);
+  const pieces = splitCommandComments(analyzed);
+  const redactedPieces = pieces.map((piece) =>
+    piece.code.replace(
+      COMMAND_ENV_ASSIGNMENT,
+      (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
+    )
+  );
+  const redactedCode = redactedPieces.join("");
+  // When an assignment's boundaries cannot be trusted, no partial rewrite can be either,
+  // so the whole command goes local and restore puts the exact text back. The residue and
+  // quote-led checks run even when nothing was replaced: an unconsumable or quote-led
+  // value means the replacement never saw it.
+  const constructs = findActiveShellConstructs(analyzed);
+  if (
+    UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
+    hasDisguisedAssignment(redactedCode, rootPrefixes, inherited) ||
+    constructs.carrier ||
+    constructs.heredoc ||
+    constructs.processSubstitution ||
+    constructs.redirection ||
+    constructs.pipeline
+  ) {
+    return REDACTED_BACKUP_VALUE;
+  }
+  const rewritten = redactedPieces
+    .map((piece, index) => piece + (pieces[index]?.comment ?? ""))
+    .join("");
+  // Nothing to redact: the original spelling, wrapped lines and all, is what executes.
+  if (rewritten === analyzed) return command;
+  // Markers are positioned in the unwrapped spelling; when the original wrapped lines,
+  // mapping them back onto the wrapped text is not decidable, so the command goes
+  // machine-local instead of publishing a respelled value.
+  return analyzed === command ? rewritten : REDACTED_BACKUP_VALUE;
+}
+
+/**
+ * Non-interactive Bash consults inherited startup state before parsing its `-c`
+ * command: a non-empty `BASH_ENV` names a file it sources first, and `BASH_FUNC_*`
+ * environment entries import exported functions. Either hook can redefine any command
+ * word (`mcp(){ mcp --token "$2$3"; }`), so the word-level semantics every command
+ * analyzer above relies on stop binding. The stdio launch inherits this process's
+ * environment (mcpServerManager passes commands to `runtime.exec`, a `bash -c`), so
+ * while a hook is present commands go machine-local without being analyzed at all.
+ * An empty `BASH_ENV` sources nothing and is inert. Only the inherited process
+ * environment gates this: a server entry's own `env` field is dropped by
+ * `McpConfigService.normalizeEntry` before spawn, so it must not localize an otherwise
+ * portable command (a fresh-device restore would drop the whole server over a field
+ * the runtime never reads). This covers only startup hooks visible in the exporting
+ * process environment: off-host runtime startup state (container images, remote SSH
+ * hosts) is not observable to settings backup export, and treating it as an input
+ * would force localizing every command; neutralizing those shells belongs to the
+ * runtime spawn paths.
+ */
+function isBashStartupHookVariable(name: string, value: unknown): boolean {
+  if (name.startsWith("BASH_FUNC_")) return true;
+  return name === "BASH_ENV" && value !== "" && value !== undefined;
+}
+
+/**
+ * Ambient facts from the exporting process environment that the spawned server
+ * inherits (see isBashStartupHookVariable for the channel).
+ */
+interface InheritedLaunchContext {
+  /** PATH entries resolving into the collected root. */
+  publishedPathDirs: readonly string[];
+  /** CDPATH entries Bash searches before a relative cd target. */
+  cdPathDirs: readonly string[];
+  /** NODE_OPTIONS carries an executable preload/import option. */
+  nodeCodeOptions: boolean;
+  /** PYTHONSTARTUP names an auto-published document. */
+  pythonStartupHook: boolean;
+  /** A PYTHONPATH entry names an auto-published archive Python imports from. */
+  pythonPathHook: boolean;
+  /** The inherited CLASSPATH names an auto-published executable archive. */
+  javaClassPathHook: boolean;
+  /** PHPRC names an auto-published configuration document. */
+  phpConfigHook: boolean;
+  /** A JVM option variable names an auto-published agent or boot-class-path archive. */
+  javaLaunchOptionsHook: boolean;
+  /** A LUA_INIT variable's @file form names an auto-published document. */
+  luaStartupHook: boolean;
+  /** An inherited dynamic-loader preload list names an auto-published document. */
+  loaderPreloadHook: boolean;
+  /** Inherited Git config overrides name a sensitive key or a published file. */
+  gitConfigHook: boolean;
+  /** OPENSSL_CONF names an auto-published configuration document. */
+  opensslConfigHook: boolean;
+  /** A non-empty PERL5DB program runs when Perl's debugger is enabled. */
+  perlDebuggerHook: boolean;
+  /** PERL5OPT enables the debugger before command-line option parsing. */
+  perlDebuggerEnvHook: boolean;
+  /** CMAKE_TOOLCHAIN_FILE names an auto-published toolchain script. */
+  cmakeToolchainHook: boolean;
+  /** MAKEFILES includes an auto-published makefile before the normal inputs. */
+  makefilesHook: boolean;
+}
+
+/** Whether inherited NODE_OPTIONS asks Node to execute a preload/import/config input. */
+function hasInheritedNodeCodeOptions(value: unknown, rootPrefixes: readonly string[]): boolean {
+  if (typeof value !== "string" || value === "") return false;
+  let sharedOpenSslConfig = false;
+  let publishedOpenSslConfig = false;
+  let pendingOpenSslConfig = false;
+  for (const match of value.matchAll(SHELL_WORD)) {
+    const option = unquoteShellWord(match[0]);
+    if (pendingOpenSslConfig) {
+      pendingOpenSslConfig = false;
+      publishedOpenSslConfig ||= isAutoPublishedScriptOperand(
+        canonicalizeInheritedPath(option),
+        rootPrefixes
+      );
+      continue;
+    }
+    if (/^(?:-r(?:.*)|--(?:require|import|loader|experimental-loader)(?:=|$))/.test(option)) {
+      return true;
+    }
+    if (option === "--openssl-shared-config") sharedOpenSslConfig = true;
+    const config = /^--openssl-config=(.+)$/.exec(option)?.[1];
+    if (config !== undefined) {
+      publishedOpenSslConfig ||= isAutoPublishedScriptOperand(
+        canonicalizeInheritedPath(config),
+        rootPrefixes
+      );
+    } else if (option === "--openssl-config") {
+      pendingOpenSslConfig = true;
+    }
+  }
+  return sharedOpenSslConfig && publishedOpenSslConfig;
+}
+
+function hasInheritedPerlDebuggerOption(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return [...value.matchAll(SHELL_WORD)].some((match) =>
+    /^-d(?:$|[:t])/.test(unquoteShellWord(match[0]))
+  );
+}
+
+/**
+ * JVM option variables inject execution into every launched JVM: agents,
+ * class/module paths, module patches, boot paths, and argument files can all
+ * supply executable bytecode before the application starts.
+ */
+function hasInheritedJavaLaunchOptions(
+  values: readonly unknown[],
+  rootPrefixes: readonly string[]
+): boolean {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    let pendingPathOption: "path" | "patch" | null = null;
+    for (const match of value.matchAll(SHELL_WORD)) {
+      const option = unquoteShellWord(match[0]);
+      if (pendingPathOption !== null) {
+        const publishes =
+          pendingPathOption === "patch"
+            ? javaPatchModulePublishesExecutable(option, rootPrefixes, null)
+            : javaClassPathPublishesExecutable(option, rootPrefixes, null);
+        pendingPathOption = null;
+        if (publishes) return true;
+        continue;
+      }
+      if (
+        option.startsWith("@") &&
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(option.slice(1)), rootPrefixes)
+      ) {
+        return true;
+      }
+      const agent = /^-(?:javaagent|agentpath):([^=]+)/.exec(option)?.[1];
+      if (
+        agent !== undefined &&
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(agent), rootPrefixes)
+      ) {
+        return true;
+      }
+      const bootClassPath = /^-Xbootclasspath(?:\/[ap])?:(.+)$/.exec(option)?.[1];
+      if (
+        bootClassPath !== undefined &&
+        javaClassPathPublishesExecutable(bootClassPath, rootPrefixes, null)
+      ) {
+        return true;
+      }
+      const pathOption = /^--(?:class-path|module-path|upgrade-module-path)=(.+)$/.exec(
+        option
+      )?.[1];
+      if (
+        pathOption !== undefined &&
+        javaClassPathPublishesExecutable(pathOption, rootPrefixes, null)
+      ) {
+        return true;
+      }
+      const patchModule = /^--patch-module=(.+)$/.exec(option)?.[1];
+      if (
+        patchModule !== undefined &&
+        javaPatchModulePublishesExecutable(patchModule, rootPrefixes, null)
+      ) {
+        return true;
+      }
+      if (
+        isJavaClassPathOption(option) ||
+        /^(?:-p|--module-path|--upgrade-module-path)$/.test(option)
+      ) {
+        pendingPathOption = "path";
+      } else if (option === "--patch-module") {
+        pendingPathOption = "patch";
+      }
+    }
+  }
+  return false;
+}
+
+function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
+  for (const [name, value] of Object.entries(process.env)) {
+    // Lua runs LUA_INIT (and per-version LUA_INIT_5_4 spellings) at startup; the
+    // @ prefix names a file, and any other value is inline code, not a document.
+    if (!/^LUA_INIT(?:_\d+_\d+)?$/.test(name)) continue;
+    if (typeof value !== "string" || !value.startsWith("@")) continue;
+    if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(value.slice(1)), rootPrefixes)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function loaderListPublishesExecutable(
+  value: string,
+  rootPrefixes: readonly string[],
+  currentDirectory: string | null,
+  searchDirs: readonly string[]
+): boolean {
+  for (const entry of value.split(/[:\s]+/)) {
+    if (entry === "") continue;
+    if (/[/\\]/.test(entry)) {
+      if (isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+      const resolved = resolveKnownDirectory(entry, currentDirectory);
+      if (resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes)) return true;
+    } else {
+      for (const directory of searchDirs) {
+        if (isAutoPublishedScriptOperand(`${directory}/${entry}`, rootPrefixes)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * The dynamic loader runs inherited preload/audit objects inside every
+ * dynamically linked launcher before the command, and accepts a shared object
+ * regardless of filename suffix. glibc splits its lists on colons or spaces;
+ * dyld's DYLD_INSERT_LIBRARIES is colon-separated, preserving spaced paths.
+ * A slashless entry is not a pathname: the loader resolves it through the
+ * inherited library search path before the default directories.
+ */
+function hasInheritedLoaderPreload(rootPrefixes: readonly string[]): boolean {
+  const linuxSearchDirs = (process.env.LD_LIBRARY_PATH ?? "")
+    .split(/[:;]/)
+    .map(canonicalizeInheritedPath);
+  const dyldSearchDirs = [
+    ...(process.env.DYLD_LIBRARY_PATH ?? "").split(":"),
+    ...(process.env.DYLD_FALLBACK_LIBRARY_PATH ?? "").split(":"),
+  ].map(canonicalizeInheritedPath);
+  const preloadLists: ReadonlyArray<readonly [unknown, RegExp, readonly string[]]> = [
+    [process.env.LD_PRELOAD, /[:\s]+/, linuxSearchDirs],
+    [process.env.LD_AUDIT, /[:\s]+/, linuxSearchDirs],
+    [process.env.DYLD_INSERT_LIBRARIES, /:/, dyldSearchDirs],
+  ];
+  for (const [value, delimiter, searchDirs] of preloadLists) {
+    if (typeof value !== "string") continue;
+    for (const entry of value.split(delimiter)) {
+      if (entry === "") continue;
+      if (/[/\\]/.test(entry)) {
+        if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)) {
+          return true;
+        }
+      } else {
+        for (const dir of searchDirs) {
+          if (
+            dir !== "" &&
+            isAutoPublishedScriptOperand(canonicalizeInheritedPath(`${dir}/${entry}`), rootPrefixes)
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Inherited Git config overrides apply to every git invocation: the
+ * GIT_CONFIG_COUNT/KEY/VALUE family injects command-scope entries, and
+ * GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM replace the files Git reads. A sensitive
+ * key or a published replacement file localizes git launchers.
+ */
+function hasInheritedGitConfig(rootPrefixes: readonly string[]): boolean {
+  // This deprecated carrier has a private shell-quoted grammar and takes
+  // precedence over the numbered family. Any non-empty value can inject a
+  // command-valued key, so affected Git launchers fail closed.
+  if ((process.env.GIT_CONFIG_PARAMETERS ?? "").trim() !== "") return true;
+  const count = Number.parseInt(process.env.GIT_CONFIG_COUNT ?? "", 10);
+  if (Number.isFinite(count) && count > 0) {
+    for (const [name, value] of Object.entries(process.env)) {
+      const index = /^GIT_CONFIG_KEY_(\d+)$/.exec(name)?.[1];
+      if (index === undefined || Number.parseInt(index, 10) >= count) continue;
+      if (typeof value === "string" && gitConfigOverrideNamesSensitiveKey(value)) return true;
+    }
+  }
+  for (const file of [
+    process.env.GIT_CONFIG,
+    process.env.GIT_CONFIG_GLOBAL,
+    process.env.GIT_CONFIG_SYSTEM,
+  ]) {
+    if (typeof file !== "string") continue;
+    if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(file), rootPrefixes)) return true;
+  }
+  return false;
+}
+
+/**
+ * Git also executes commands inherited directly from the environment. Shell
+ * command variables use the same bounded command analyzer as MCP commands;
+ * direct program variables and the helper search directory resolve as paths.
+ */
+function hasInheritedGitExecutionHook(
+  rootPrefixes: readonly string[],
+  inherited: InheritedLaunchContext
+): boolean {
+  const nestedContext = { ...inherited, gitConfigHook: false };
+  for (const command of [
+    process.env.GIT_SSH_COMMAND,
+    process.env.GIT_PROXY_COMMAND,
+    process.env.GIT_EDITOR,
+    process.env.GIT_SEQUENCE_EDITOR,
+    process.env.GIT_PAGER,
+    process.env.GIT_EXTERNAL_DIFF,
+    process.env.VISUAL,
+    process.env.EDITOR,
+    process.env.PAGER,
+  ]) {
+    if (typeof command !== "string" || command.trim() === "") continue;
+    if (
+      redactCommandEnvAssignments(command, rootPrefixes, nestedContext) === REDACTED_BACKUP_VALUE
+    ) {
+      return true;
+    }
+  }
+  for (const program of [process.env.GIT_SSH, process.env.GIT_ASKPASS, process.env.SSH_ASKPASS]) {
+    if (typeof program !== "string") continue;
+    if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(program), rootPrefixes)) return true;
+  }
+  const execPath = process.env.GIT_EXEC_PATH;
+  return (
+    typeof execPath === "string" &&
+    isUnderCollectedRoot(canonicalizeInheritedPath(execPath), rootPrefixes)
+  );
+}
+
+function redactMcpConfig(
+  content: Buffer,
+  muxRoot: string
+): {
   content: Buffer;
   redactionPaths: BackupRedactionPath[];
 } {
+  const rootPrefixes = collectedDocumentRootPrefixes(muxRoot);
+  // The stdio launch inherits this process's environment (see
+  // isBashStartupHookVariable), so a PATH entry inside the collected root makes
+  // published executable documents reachable as bare command names.
+  const inherited: InheritedLaunchContext = {
+    publishedPathDirs: (process.env.PATH ?? "")
+      .split(path.delimiter)
+      // A PATH entry can reach the collected root through a symlink, so filter
+      // on the canonical target; joining a bare name against that spelling then
+      // matches the published document it actually resolves to.
+      .map(canonicalizeInheritedPath)
+      .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes)),
+    cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter).map(canonicalizeInheritedPath),
+    nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS, rootPrefixes),
+    pythonStartupHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.PYTHONSTARTUP ?? ""),
+      rootPrefixes
+    ),
+    pythonPathHook: (process.env.PYTHONPATH ?? "")
+      .split(path.delimiter)
+      .some((entry) =>
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+      ),
+    javaClassPathHook: (process.env.CLASSPATH ?? "")
+      .split(path.delimiter)
+      .some((entry) =>
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+      ),
+    phpConfigHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.PHPRC ?? ""),
+      rootPrefixes
+    ),
+    javaLaunchOptionsHook: hasInheritedJavaLaunchOptions(
+      [process.env.JAVA_TOOL_OPTIONS, process.env._JAVA_OPTIONS, process.env.JDK_JAVA_OPTIONS],
+      rootPrefixes
+    ),
+    luaStartupHook: hasInheritedLuaStartupFile(rootPrefixes),
+    loaderPreloadHook: hasInheritedLoaderPreload(rootPrefixes),
+    gitConfigHook: hasInheritedGitConfig(rootPrefixes),
+    opensslConfigHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.OPENSSL_CONF ?? ""),
+      rootPrefixes
+    ),
+    perlDebuggerHook: (process.env.PERL5DB ?? "").trim() !== "",
+    perlDebuggerEnvHook: hasInheritedPerlDebuggerOption(process.env.PERL5OPT),
+    cmakeToolchainHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.CMAKE_TOOLCHAIN_FILE ?? ""),
+      rootPrefixes
+    ),
+    makefilesHook: (process.env.MAKEFILES ?? "")
+      .split(/\s+/)
+      .some((entry) =>
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+      ),
+  };
+  inherited.gitConfigHook ||= hasInheritedGitExecutionHook(rootPrefixes, inherited);
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
   const redactionPaths: BackupRedactionPath[] = [];
@@ -1110,6 +4198,29 @@ function redactMcpConfig(content: Buffer): {
   function redact(jsonPath: jsonc.JSONPath): void {
     edits.push({ path: jsonPath, value: REDACTED_BACKUP_VALUE });
     redactionPaths.push([...jsonPath]);
+    // Queue-time, not only in finish(): each queued edit costs a full-document
+    // jsonc.modify pass there, so an over-limit config must be rejected before it can
+    // buy edit-count x document-size synchronous work with a guaranteed-refused payload.
+    assertBackupMcpRedactionCount(redactionPaths.length);
+  }
+
+  let analysisBudget = MAX_TOTAL_ANALYZED_COMMAND_LENGTH;
+  const ambientStartupHooks = Object.entries(process.env).some(([name, value]) =>
+    isBashStartupHookVariable(name, value)
+  );
+
+  function redactCommand(jsonPath: jsonc.JSONPath, command: string): void {
+    let redacted: string;
+    if (ambientStartupHooks || command.length > analysisBudget) {
+      redacted = REDACTED_BACKUP_VALUE;
+    } else {
+      analysisBudget -= command.length;
+      redacted = redactCommandEnvAssignments(command, rootPrefixes, inherited);
+    }
+    if (redacted === command) return;
+    edits.push({ path: jsonPath, value: redacted });
+    redactionPaths.push([...jsonPath]);
+    assertBackupMcpRedactionCount(redactionPaths.length);
   }
 
   function finish(): { content: Buffer; redactionPaths: BackupRedactionPath[] } {
@@ -1148,7 +4259,10 @@ function redactMcpConfig(content: Buffer): {
   for (const serverName of objectKeyNames(tree, ["servers"])) {
     const rawServer = readOwn(serverRecord, serverName);
     // A bare string entry is the stdio command itself (`McpConfigService.normalizeEntry`).
-    if (typeof rawServer === "string") continue;
+    if (typeof rawServer === "string") {
+      redactCommand(["servers", serverName], rawServer);
+      continue;
+    }
     const server = readRecord(rawServer);
     if (!server) {
       redact(["servers", serverName]);
@@ -1164,7 +4278,17 @@ function redactMcpConfig(content: Buffer): {
       if (isPortableField) {
         // Read as the wrong type, `normalizeEntry` ignores it, which makes it another place
         // to hide a value nobody reads.
-        if (!isPortableField(value)) redact(fieldPath);
+        if (!isPortableField(value)) {
+          redact(fieldPath);
+          continue;
+        }
+        if (field === "command" && typeof value === "string") redactCommand(fieldPath, value);
+        // Whole-value, not in-string: the userinfo/parameter detection deliberately covers
+        // malformed and percent-encoded spellings a partial rewrite could misparse and leave
+        // the credential in. Restore puts the local url back at this path.
+        if (field === "url" && typeof value === "string" && urlHasCredentialComponents(value)) {
+          redact(fieldPath);
+        }
         continue;
       }
       if (field === "headers") {
@@ -1222,6 +4346,11 @@ function findMcpRedactionPaths(tree: jsonc.Node): BackupRedactionPath[] {
   return paths;
 }
 
+/**
+ * JSON, not delimiter-joined: server and header names come from the backup, so a crafted
+ * name containing the delimiter could collide with another entry's field path and shadow
+ * its resolution (e.g. skipping the header drop for a server named `safe\u0000url`).
+ */
 function redactionPathKey(jsonPath: ReadonlyArray<string | number>): string {
   return JSON.stringify(jsonPath);
 }
@@ -1241,15 +4370,6 @@ function validateMcpRedactionPaths(tree: jsonc.Node, paths: readonly BackupRedac
     }
   }
 }
-
-/**
- * Documentation is the only thing a recursive collection publishes without asking. `skills/`
- * and `memory/global/` hold whatever the user put there, and no content scanner can decide
- * whether an arbitrary file is a credential: `{"password":"hunter2"}` has no distinguishing
- * shape. So the gate is structural rather than pattern-based, and anything outside the
- * documented set is surfaced for review instead of being published or silently dropped.
- */
-const AUTO_PUBLISHED_RECURSIVE_FILE = /\.(?:md|mdx|markdown|txt)$/i;
 
 /** A name promising credentials earns review even when the extension is documentation. */
 const CREDENTIAL_PATH_HINT =
@@ -1334,7 +4454,7 @@ export function scanBackupFilesForSecrets(files: readonly BackupFile[]): string[
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
-      if (SECRET_PATTERNS.some((pattern) => pattern.test(content))) return true;
+      if (matchesReviewableSecret(content)) return true;
       if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content)) return true;
       // Every collected file, not just the recursive ones: `agents/` is collected by name and
       // its `.md` filter would otherwise auto-publish `agents/api-key.md`.
@@ -1372,7 +4492,7 @@ export async function createBackupPayload(
   const mcpRedactionPaths: BackupRedactionPath[] = [];
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   if (mcpFile && options.keepLocalSecrets !== true) {
-    const redacted = redactMcpConfig(mcpFile.content);
+    const redacted = redactMcpConfig(mcpFile.content, options.muxRoot);
     mcpFile.content = redacted.content;
     mcpRedactionPaths.push(...redacted.redactionPaths);
   }
@@ -1380,12 +4500,81 @@ export async function createBackupPayload(
     path: "preferences.json",
     content: serializeBackupPreferences(options.preferences),
   });
+  const assembledBudget = createByteBudget();
+  takeBackupFileBytes(assembledBudget, files);
   // Count and complexity only: this payload may be a local snapshot, whose names keep
   // current-filesystem forms that portable validation would refuse. Collection already
   // validated each name under local rules; publication re-checks with portable rules.
   assertBackupFileCount(files.length);
   assertBackupPathComplexity(files.map((file) => file.path));
   files.sort((a, b) => a.path.localeCompare(b.path));
+
+  // Backstop behind the redaction above, not the primary mechanism: a credential-format
+  // match in the finished payload always aborts, with no reportSecrets override. The local
+  // safety snapshot keeps secrets by design and never leaves the machine, so it is exempt.
+  if (options.keepLocalSecrets !== true) {
+    const leakedFiles = files
+      .filter((file) => {
+        // The path publishes alongside the content, and recursive collections take
+        // whatever a directory entry happens to be named.
+        const content = file.content.toString("utf-8");
+        // NUL-stripping reassembles ASCII tokens out of UTF-16 text, which decodes to
+        // interleaved NUL characters here; text published as prose has no business
+        // holding NULs, so this manufactures no match from ordinary content. NUL-free
+        // content strips to itself, so the second scan pass runs only when NULs exist
+        // rather than doubling the synchronous scan of a size-capped payload.
+        const targets = [content, file.path];
+        if (content.includes("\u0000")) targets.push(content.replaceAll("\u0000", ""));
+        // A reader's ordinary URL parsing decodes percent triplets in published
+        // documentation. Scan that one-pass decoded view too, but only when a percent
+        // sign exists so ordinary near-limit payloads pay no extra full-file pass.
+        if (AUTO_PUBLISHED_RECURSIVE_FILE.test(file.path) && content.includes("%")) {
+          const decoded = percentDecodeOnce(content);
+          targets.push(decoded);
+          if (decoded.includes("\u0000")) targets.push(decoded.replaceAll("\u0000", ""));
+        }
+        // Shell-normalized variants catch a token split by quoting or an expansion
+        // (`--token ghp_123\456...`, `ghp_...$9...`): the shell removes both on
+        // execution, and the published text reconstructs the same credential.
+        // Normalization works on parsed command strings, not the raw JSON text, whose
+        // escape encoding garbles the reassembly. Only command values are shell input;
+        // other strings (tool names, urls, prose) can legitimately hold quote-separated
+        // token-like fragments, and this block has no override.
+        if (file.path === "mcp.jsonc") {
+          const parsedMcp: unknown = jsonc.parse(content);
+          for (const text of collectCommandStrings(parsedMcp)) {
+            // Word-by-word, with real quoting rules: raw character stripping would
+            // join fragments the shell keeps apart (a backslash inside single quotes
+            // survives execution) and manufacture a match from a harmless command.
+            const words = executedShellWords(text);
+            targets.push(words.map((word) => unquoteShellWord(word)).join(" "));
+            // A simple parameter expansion that is unset at runtime vanishes,
+            // splicing the fragments around it into one token. Redaction localizes
+            // active expansions before publication; this pass is the backstop's own
+            // model of the same splice, independent of that layer.
+            targets.push(words.map((word) => unquoteShellWord(word, true)).join(" "));
+            // Pathname expansion can hand the process a token a deterministic glob
+            // spelling hides, and the published text collapses the same way for any
+            // reader.
+            targets.push(words.map((word) => unquoteShellWord(word, true, true)).join(" "));
+          }
+          // A standard URL parse hands any reader the decoded value, so a published
+          // url is scanned as what it decodes to, not just its encoded spelling. The
+          // WHATWG parser deletes embedded tab and newline separators before anything
+          // else, so they are removed first: `ghp_aaa\tbbb` reaches the client as the
+          // contiguous token. Separator removal cannot hide a match, because no token
+          // charset contains them.
+          for (const url of collectUrlStrings(parsedMcp)) {
+            const canonical = url.replaceAll("\t", "").replaceAll("\n", "").replaceAll("\r", "");
+            targets.push(percentDecodeOnce(canonical));
+          }
+        }
+        return targets.some(matchesCredentialToken);
+      })
+      .map((file) => file.path)
+      .sort();
+    if (leakedFiles.length > 0) throw new BackupCredentialDetectedError(leakedFiles);
+  }
 
   if (options.reportSecrets !== true) {
     const secretFiles = scanBackupFilesForSecrets(files);
@@ -1469,7 +4658,7 @@ function assertPayloadWithinLimits(files: readonly BackupFile[], manifestJson: s
   // cannot be one that every later read rejects.
   const budget = createByteBudget();
   budget(BACKUP_MANIFEST_FILE, Buffer.byteLength(manifestJson, "utf-8"));
-  for (const file of files) budget(file.path, file.content.length);
+  takeBackupFileBytes(budget, files);
 }
 
 export async function writeBackupPayload(
@@ -1777,7 +4966,7 @@ function collectRedactionRestoreEdits(
   // Only the paths handled by command or header resolution are skipped, so a mixed entry
   // can still rehydrate its other redacted values. A dropped entry is skipped wholesale,
   // since a nested edit would resurrect what it removed.
-  if (resolvedServers.has(currentPath.join("\u0000"))) return;
+  if (resolvedServers.has(redactionPathKey(currentPath))) return;
   if (typeof backup === "string" && isRedactedBackupValue(backup, currentPath, redactedPaths)) {
     if (local !== undefined) edits.push({ path: currentPath, value: local });
     return;
@@ -1928,6 +5117,18 @@ export async function collectMcpCommandApprovals(
   if (!file) return [];
 
   const restored = await resolveRestoredContent(muxRoot, file, mcpRedactions);
+  return collectApprovalsForResolvedMcp(muxRoot, restored);
+}
+
+/**
+ * Approvals for already-resolved MCP bytes, so restore can gate the exact content its
+ * plan writes: the local file can change between reads, and a separate resolution could
+ * observe a different rehydration than the one being written.
+ */
+export async function collectApprovalsForResolvedMcp(
+  muxRoot: string,
+  restored: Buffer
+): Promise<BackupCommandApproval[]> {
   const incoming = readServerCommands(restored.toString("utf-8"));
   const localText = await readLocalMcpText(muxRoot);
   const local =
@@ -1998,6 +5199,9 @@ async function restoreMcpFile(
       ? preserveLocalOnlyMcpServers(backupTree, localTree, localText)
       : ({ kind: "none" } satisfies LocalMcpServerMerge);
   const resolved = resolveRestoredCommands(backup, local, edits, redactedPaths);
+  for (const path of resolveRestoredUrls(backup, local, edits, resolved, redactedPaths)) {
+    resolved.add(path);
+  }
   for (const path of resolveRestoredHeaders(
     backup,
     local,
@@ -2187,12 +5391,62 @@ function resolveRestoredCommands(
       const hasUrl = url !== undefined && url !== "" && !containsRedaction(url);
       const removed: jsonc.JSONPath = hasUrl ? ["servers", name, "command"] : ["servers", name];
       edits.push({ path: removed, value: undefined });
-      handled.add(removed.join("\u0000"));
+      handled.add(redactionPathKey(removed));
       continue;
     }
     const commandPath = isBareMarker ? barePath : objectPath;
     edits.push({ path: commandPath, value: localCommand });
-    handled.add(commandPath.join("\u0000"));
+    handled.add(redactionPathKey(commandPath));
+  }
+  return handled;
+}
+
+/**
+ * Mirrors the command resolution for `url`: a marker is only ever replaced by the local
+ * value at the same path. Without one the marker must not survive as the endpoint the
+ * entry connects to, so the url is dropped when the entry still has a usable command
+ * (`collectMcpCommandApprovals` gates any command that removal makes runnable) and the
+ * whole server is removed otherwise.
+ */
+function resolveRestoredUrls(
+  backup: Record<string, unknown>,
+  local: Record<string, unknown>,
+  edits: Array<{ path: jsonc.JSONPath; value: unknown }>,
+  resolvedServers: ReadonlySet<string>,
+  redactedPaths: ReadonlySet<string> | undefined
+): Set<string> {
+  const handled = new Set<string>();
+  const servers = readRecord(backup.servers);
+  if (!servers) return handled;
+  const localServers = readRecord(local.servers) ?? {};
+
+  for (const [name, entry] of Object.entries(servers)) {
+    // An entry the command resolution removed has no url left to decide about.
+    if (resolvedServers.has(redactionPathKey(["servers", name]))) continue;
+    const record = readRecord(entry);
+    const url = record?.url;
+    const urlPath: jsonc.JSONPath = ["servers", name, "url"];
+    if (typeof url !== "string" || !isRedactedBackupValue(url, urlPath, redactedPaths)) continue;
+
+    const localUrl = readUrl(readRecord(readOwn(localServers, name)));
+    if (localUrl !== undefined) {
+      edits.push({ path: urlPath, value: localUrl });
+      handled.add(redactionPathKey(urlPath));
+      continue;
+    }
+    const commandPath: jsonc.JSONPath = ["servers", name, "command"];
+    const command = record?.command;
+    // Either the command resolution already put the local command back at this path, or the
+    // backup carries a plain command of its own. A marker command never reaches the second
+    // arm: without a local command the command resolution removed the server above.
+    const hasCommand =
+      resolvedServers.has(redactionPathKey(commandPath)) ||
+      (typeof command === "string" &&
+        command.trim() !== "" &&
+        !isRedactedBackupValue(command, commandPath, redactedPaths));
+    const removed: jsonc.JSONPath = hasCommand ? urlPath : ["servers", name];
+    edits.push({ path: removed, value: undefined });
+    handled.add(redactionPathKey(removed));
   }
   return handled;
 }
@@ -2232,14 +5486,14 @@ function resolveRestoredHeaders(
   for (const [name, entry] of Object.entries(servers)) {
     // An entry command resolution already removed has no headers left to decide about, and
     // `jsonc.modify` cannot address a path whose parent this edit list deletes.
-    if (resolvedServers.has(["servers", name].join("\u0000"))) continue;
+    if (resolvedServers.has(redactionPathKey(["servers", name]))) continue;
     const rawHeaders = readRecord(entry)?.headers;
     if (rawHeaders === undefined) continue;
     const localServer = readRecord(readOwn(localServers, name));
     const headersPath: jsonc.JSONPath = ["servers", name, "headers"];
     // The whole subtree is withheld from the generic walk, so no header can be rehydrated
     // by a path this function did not decide on.
-    handled.add(headersPath.join("\u0000"));
+    handled.add(redactionPathKey(headersPath));
 
     const headers = readRecord(rawHeaders);
     const endpointMatches =
@@ -2321,6 +5575,73 @@ function restoredServerUrl(
 function readUrl(server: Record<string, unknown> | undefined): string | undefined {
   const url = server?.url;
   return typeof url === "string" ? url : undefined;
+}
+
+/** Every command string a shell would execute, for shell-normalized credential scans. */
+function collectCommandStrings(root: unknown): string[] {
+  const servers = readRecord(readRecord(root)?.servers);
+  if (!servers) return [];
+  const commands: string[] = [];
+  for (const value of Object.values(servers)) {
+    const command = typeof value === "string" ? value : readRecord(value)?.command;
+    if (typeof command === "string") commands.push(command);
+  }
+  return commands;
+}
+
+function collectUrlStrings(root: unknown): string[] {
+  const servers = readRecord(readRecord(root)?.servers);
+  if (!servers) return [];
+  const urls: string[] = [];
+  for (const value of Object.values(servers)) {
+    const url = readRecord(value)?.url;
+    if (typeof url === "string") urls.push(url);
+  }
+  return urls;
+}
+
+/**
+ * One decoding pass, never a loop: a double-encoded `%2561` reaches a client as the
+ * literal `%61` a single standard parse yields, and repeated decoding would manufacture
+ * blocks from spellings no consumer resolves to the credential.
+ */
+function hexDigitValue(code: number): number {
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 65 && code <= 70) return code - 55;
+  if (code >= 97 && code <= 102) return code - 87;
+  return -1;
+}
+
+/** One-pass %XX decoding without one regex callback/allocation per triplet. */
+function percentDecodeOnce(text: string): string {
+  if (!text.includes("%")) return text;
+  const chunks: string[] = [];
+  const codes = new Uint16Array(16_384);
+  let used = 0;
+  function flush(): void {
+    if (used === 0) return;
+    chunks.push(String.fromCharCode(...codes.subarray(0, used)));
+    used = 0;
+  }
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 37 && i + 2 < text.length) {
+      const high = hexDigitValue(text.charCodeAt(i + 1));
+      const low = hexDigitValue(text.charCodeAt(i + 2));
+      if (high >= 0 && low >= 0) {
+        codes[used] = (high << 4) | low;
+        used += 1;
+        i += 2;
+        if (used === codes.length) flush();
+        continue;
+      }
+    }
+    codes[used] = code;
+    used += 1;
+    if (used === codes.length) flush();
+  }
+  flush();
+  return chunks.join("");
 }
 
 /**
@@ -2488,18 +5809,19 @@ export async function restoreBackupPayload(
       .filter((file) => file.path !== "preferences.json")
       .map((file) => file.path)
   );
+  const plan = await planRestoreWrites(options.muxRoot, options.payload);
   // Recomputed here rather than trusted from the preview, so an approval cannot authorize
-  // a command the repository changed between the preview and this restore.
+  // a command the repository changed between the preview and this restore. Computed from
+  // the exact bytes the plan writes, not a separate resolution: the local file can change
+  // between reads, and a divergent rehydration could exempt a command (url restored,
+  // shadowing it) that the planned content then carries runnable (url dropped).
+  const plannedMcp = plan.writes.find((write) => write.path === "mcp.jsonc");
   assertBackupCommandsApproved(
-    await collectMcpCommandApprovals(
-      options.muxRoot,
-      options.payload.files,
-      options.payload.manifest.mcpRedactions
-    ),
+    plannedMcp === undefined
+      ? []
+      : await collectApprovalsForResolvedMcp(options.muxRoot, plannedMcp.content),
     options.approvedCommandTokens
   );
-
-  const plan = await planRestoreWrites(options.muxRoot, options.payload);
   // Classify against the pre-restore filesystem state before writes change file identities.
   const { localOnly } = await localOnlyPayloadFiles(options.muxRoot, localPaths, restoredPaths);
 

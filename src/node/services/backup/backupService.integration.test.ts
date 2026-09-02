@@ -156,7 +156,7 @@ describe("BackupService against a real repository", () => {
     );
   });
 
-  it("blocks a push when a backed-up file contains a token, and proceeds once allowed", async () => {
+  it("blocks a push outright when a backed-up file contains a credential token", async () => {
     await writeFixtureFile(
       muxRoot,
       "AGENTS.md",
@@ -165,34 +165,31 @@ describe("BackupService against a real repository", () => {
 
     const blocked = await service.push(settings);
     expect(blocked.success).toBe(false);
-    if (blocked.success) throw new Error("Expected the secret scan to block the push");
+    if (blocked.success) throw new Error("Expected the credential backstop to block the push");
     expect(blocked.error.code).toBe("SECRET_DETECTED");
     expect(blocked.error.files).toContain("AGENTS.md");
+    // No approval digest: a credential-format match has no user override.
+    expect(blocked.error.secretApproval ?? null).toBeNull();
     expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
 
-    const allowed = await service.push(settings, {
-      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
-    });
-    expect(allowed.success).toBe(true);
+    const stillBlocked = await service.push(settings, { approvedSecretDigest: "any-digest" });
+    expect(stillBlocked.success).toBe(false);
+    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
   });
 
-  it("gates a low-entropy MCP URL credential until the exact payload is approved", async () => {
+  it("redacts a low-entropy MCP URL credential instead of gating the push", async () => {
     const url = "https://user:hunter2@example.com/mcp?api_key=abc123";
     await writeFixtureFile(muxRoot, "mcp.jsonc", JSON.stringify({ servers: { private: { url } } }));
 
-    const blocked = await service.push(settings);
-    expect(blocked.success).toBe(false);
-    if (blocked.success) throw new Error("Expected the URL credential gate to block the push");
-    expect(blocked.error.code).toBe("SECRET_DETECTED");
-    expect(blocked.error.files).toEqual(["mcp.jsonc"]);
-    expect(await runGit(["--git-dir", originPath, "rev-list", "--count", "--all"])).toBe("0");
+    const pushed = await service.push(settings);
+    expect(pushed.success).toBe(true);
+    if (!pushed.success) throw new Error("Expected the redacted payload to push cleanly");
+    expect(pushed.data.redactions).toEqual(["servers.private.url"]);
 
-    const allowed = await service.push(settings, {
-      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
-    });
-    expect(allowed.success).toBe(true);
     const clone = await cloneOrigin("url-credential-verify");
-    expect(await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8")).toContain(url);
+    const published = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
+    expect(published).not.toContain("hunter2");
+    expect(published).toContain(REDACTED_BACKUP_VALUE);
   });
 
   it("requires exact-payload approval before publishing an MCP command", async () => {

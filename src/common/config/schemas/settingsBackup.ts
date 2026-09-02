@@ -79,9 +79,14 @@ export const CREDENTIAL_URL_PARAMETER_NAMES: ReadonlySet<string> = new Set([
   "accesskeyid",
   "accesstoken",
   "apikey",
+  "apisecret",
+  "apitoken",
+  "appkey",
   "appsecret",
+  "apptoken",
   "auth",
   "authcode",
+  "authkey",
   "authorization",
   "authtoken",
   "awsaccesskeyid",
@@ -90,6 +95,7 @@ export const CREDENTIAL_URL_PARAMETER_NAMES: ReadonlySet<string> = new Set([
   "bearertoken",
   "clientkey",
   "clientsecret",
+  "clienttoken",
   "consumersecret",
   "credential",
   "credentials",
@@ -100,17 +106,33 @@ export const CREDENTIAL_URL_PARAMETER_NAMES: ReadonlySet<string> = new Set([
   "passwd",
   "password",
   "privatekey",
+  "privatetoken",
   "pwd",
   "refreshtoken",
   "secret",
   "secretaccesskey",
   "secretkey",
+  "secrettoken",
+  "securitytoken",
   "sessionid",
+  "sessiontoken",
+  "subscriptionkey",
+  "ocpapimsubscriptionkey",
   "signature",
   "token",
   "xamzcredential",
   "xamzsignature",
 ]);
+
+/**
+ * Signed-URL families qualify the credential word with a header-style provider
+ * prefix (`X-Goog-Signature`, `X-Amz-Credential`, `x-oss-security-token`), so an
+ * `x`-led name ending in one of these unambiguous words matches without enumerating
+ * providers. Descriptive options that merely end in the word
+ * (`verify_signature=false`) carry no provider marker and stay accepted.
+ */
+const PROVIDER_CREDENTIAL_NAME =
+  /^x[a-z0-9]*(?:accesskeyid|credential|secretaccesskey|securitytoken|signature)$/;
 
 function parametersContainCredential(
   parameters: URLSearchParams,
@@ -118,7 +140,12 @@ function parametersContainCredential(
 ): boolean {
   for (const [name, value] of parameters) {
     const normalizedName = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (value !== "" && names.has(normalizedName)) return true;
+    if (value === "") continue;
+    if (names.has(normalizedName)) return true;
+    // Header-style spellings prefix the same names with `x` (`x-api-key`,
+    // `X-Auth-Token`), so one stripped leading `x` matches the whole class.
+    if (normalizedName.startsWith("x") && names.has(normalizedName.slice(1))) return true;
+    if (PROVIDER_CREDENTIAL_NAME.test(normalizedName)) return true;
   }
   return false;
 }

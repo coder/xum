@@ -142,6 +142,7 @@ describe("AppConfigOnDiskSchema", () => {
       "ssh+git:user:hunter2@",
       "https://example.com/repo.git?access_token=hunter2",
       "https://example.com/repo.git?passphrase=hunter2",
+      "https://example.com/repo.git?Ocp-Apim-Subscription-Key=hunter2",
       "https://example.com/repo.git#access_token=hunter2",
     ]) {
       expect(SettingsBackupSchema.safeParse({ ...base, repoUrl }).success).toBe(false);
@@ -149,6 +150,9 @@ describe("AppConfigOnDiskSchema", () => {
     for (const repoUrl of [
       "https://github.com/me/dotfiles.git",
       "https://github.com/me/dotfiles.git?client_id=mux",
+      // A descriptive option that happens to end in a credential word is not a
+      // provider-qualified signed-URL parameter.
+      "https://github.com/me/dotfiles.git?verify_signature=false",
       "https://github.com/me/dotfiles.git?code=review&key=branch&session=docs",
       "https://github.com/me/dotfiles.git#section=backup",
       "ssh://git@example.com/repo.git",
