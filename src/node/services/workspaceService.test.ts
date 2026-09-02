@@ -23,7 +23,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
+import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -304,11 +304,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("provider-excluded wake reads use a per-workspace cache", async () => {
+  test("provider-excluded wake reads reuse unchanged shared history", async () => {
     const { service, historyService, cleanup } = await createWakeWiringService();
     const ownerWorkspaceId = "cache-owner";
     const internal = service as unknown as {
-      providerExcludedBashMonitorWakeRecordsByWorkspace: Map<string, Promise<unknown>>;
+      providerExcludedBashMonitorWakeRecordsByWorkspace: Map<string, unknown>;
       listProviderExcludedBashMonitorWakeRecords(
         workspaceId: string
       ): Promise<ReadonlyArray<{ processId?: string }>>;
@@ -345,6 +345,53 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
       internal.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(ownerWorkspaceId);
       await internal.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
+      expect(iterateFullHistory).toHaveBeenCalledTimes(2);
+    } finally {
+      iterateFullHistory.mockRestore();
+      await cleanup();
+    }
+  });
+
+  test("provider-excluded wake reads refresh after a foreign history write", async () => {
+    const { config, service, historyService, cleanup } = await createWakeWiringService();
+    const ownerWorkspaceId = "foreign-cache-owner";
+    const internal = service as unknown as {
+      listProviderExcludedBashMonitorWakeRecords(
+        workspaceId: string
+      ): Promise<ReadonlyArray<{ processId?: string }>>;
+    };
+    const iterateFullHistory = spyOn(historyService, "iterateFullHistory");
+
+    try {
+      expect(await internal.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId)).toEqual(
+        []
+      );
+
+      const foreignHistoryService = new HistoryService(config);
+      const appendResult = await foreignHistoryService.appendToHistory(
+        ownerWorkspaceId,
+        createMuxMessage("foreign-excluded-wake", "user", "monitor wake", {
+          synthetic: true,
+          providerExcluded: true,
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: [
+              {
+                processId: "foreign-proc",
+                wakeUpdatedAt: "2026-08-31T12:00:00.000Z:12",
+                kind: "match",
+                displayName: "CI watcher",
+                filter: "READY",
+                filterExclude: false,
+              },
+            ],
+          },
+        })
+      );
+      expect(appendResult.success).toBe(true);
+
+      const records = await internal.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
+      expect(records[0]?.processId).toBe("foreign-proc");
       expect(iterateFullHistory).toHaveBeenCalledTimes(2);
     } finally {
       iterateFullHistory.mockRestore();

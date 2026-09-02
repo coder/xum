@@ -1843,7 +1843,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly providerExcludedBashMonitorWakeRecordsByWorkspace = new Map<
     string,
-    Promise<readonly BashMonitorWakeDisplayRecord[]>
+    {
+      changeToken: string;
+      records: Promise<readonly BashMonitorWakeDisplayRecord[]>;
+    }
   >();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -2540,17 +2543,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async listProviderExcludedBashMonitorWakeRecords(
     ownerWorkspaceId: string
   ): Promise<readonly BashMonitorWakeDisplayRecord[]> {
+    const changeToken = await this.historyService.getProviderExclusionChangeToken(ownerWorkspaceId);
     const cached = this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId);
-    if (cached != null) return cached;
+    if (cached?.changeToken === changeToken) return cached.records;
 
-    const pending = this.readProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId);
-    this.providerExcludedBashMonitorWakeRecordsByWorkspace.set(ownerWorkspaceId, pending);
+    const records = this.readProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId).then(
+      async (result) => {
+        const finalChangeToken =
+          await this.historyService.getProviderExclusionChangeToken(ownerWorkspaceId);
+        if (finalChangeToken !== changeToken) {
+          throw new Error(
+            `Provider exclusion history changed while reading ${ownerWorkspaceId}; retry reconciliation.`
+          );
+        }
+        return result;
+      }
+    );
+    const entry = { changeToken, records };
+    this.providerExcludedBashMonitorWakeRecordsByWorkspace.set(ownerWorkspaceId, entry);
     try {
-      return await pending;
+      return await records;
     } catch (error) {
-      if (
-        this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId) === pending
-      ) {
+      if (this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId) === entry) {
         this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(ownerWorkspaceId);
       }
       throw error;

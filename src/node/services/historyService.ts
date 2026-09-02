@@ -554,6 +554,30 @@ export class HistoryService {
   }
 
   /**
+   * Return a cross-process token for files that can contain provider exclusions.
+   * Callers use this token to invalidate caches after another backend writes history.
+   */
+  async getProviderExclusionChangeToken(workspaceId: string): Promise<string> {
+    const paths = [
+      this.getChatArchivePath(workspaceId),
+      this.getChatHistoryPath(workspaceId),
+      this.getProviderExcludedMessageIdsPath(workspaceId),
+    ];
+    const versions = await Promise.all(
+      paths.map(async (filePath) => {
+        try {
+          const stat = await fs.stat(filePath, { bigint: true });
+          return `${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+        } catch (error) {
+          if (isErrnoWithCode(error, "ENOENT")) return "missing";
+          throw error;
+        }
+      })
+    );
+    return versions.join("|");
+  }
+
+  /**
    * Durably exclude synthetic rows before their producer watermark advances.
    * Tombstones remain after row deletion because removal would create a cross-file read race.
    */
