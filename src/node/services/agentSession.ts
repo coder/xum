@@ -6928,7 +6928,12 @@ export class AgentSession {
   }
 
   private settleQueuedToolEndClaimAfterUserInterrupt(): void {
-    if (this.preserveQueuedToolEndClaimForImmediateSend) {
+    const activeClaim = this.queuedToolEndClaim;
+    if (
+      this.preserveQueuedToolEndClaimForImmediateSend &&
+      activeClaim?.dispatchStarted === false &&
+      activeClaim.queueClaim.userAuthored
+    ) {
       this.restoreQueuedToolEndClaim();
       return;
     }

@@ -95,6 +95,8 @@ export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMod
 
 /** Cancellation handoff for a claimed tool-end queue cut. */
 export interface ToolEndQueueClaim {
+  /** Whether the claimed entry contains user-authored input. */
+  readonly userAuthored: boolean;
   /** Signal used to stop this exact entry during dispatch admission. */
   readonly admissionSignal: AbortSignal;
   /** Move the claimed entry to the dispatch head. */
@@ -305,6 +307,7 @@ export class MessageQueue {
     let settled = false;
     let committed = false;
     return {
+      userAuthored: entry.userAuthored,
       admissionSignal: admissionController.signal,
       commit: () => {
         if (settled || committed) {
