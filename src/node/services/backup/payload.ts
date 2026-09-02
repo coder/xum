@@ -3045,19 +3045,30 @@ export class ProjectMemoryRestoreError extends Error {
 /**
  * Regular files under a directory as MemoryService counts them for its per-scope cap:
  * dot-prefixed entries (and anything beneath one) are invisible to the memory store, so
- * counting them here would refuse a note the store itself would still create.
+ * counting them here would refuse a note the store itself would still create. The walk
+ * stops as soon as the count exceeds `limit`, so an externally bloated scope cannot make the
+ * preflight materialize its whole tree just to learn it is over the limit.
  */
-async function countFilesUnder(dirAbs: string): Promise<number> {
-  // Recursive readdir does not follow directory symlinks, and a missing scope directory
-  // counts as empty rather than failing the restore.
-  const entries = await fs
-    .readdir(dirAbs, { withFileTypes: true, recursive: true })
-    .catch(() => []);
-  return entries.filter((entry) => {
-    if (!entry.isFile()) return false;
-    const relative = path.relative(dirAbs, path.join(entry.parentPath, entry.name));
-    return !relative.split(path.sep).some(isHiddenName);
-  }).length;
+async function countFilesUnder(dirAbs: string, limit: number): Promise<number> {
+  let count = 0;
+  const pending = [dirAbs];
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    if (dir === undefined) break;
+    // A missing scope directory counts as empty rather than failing the restore.
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (isHiddenName(entry.name)) continue;
+      // Dirent reports a symlink as neither file nor directory, so links are not followed.
+      if (entry.isDirectory()) {
+        pending.push(path.join(dir, entry.name));
+      } else if (entry.isFile()) {
+        count += 1;
+        if (count > limit) return count;
+      }
+    }
+  }
+  return count;
 }
 
 /**
@@ -3159,7 +3170,10 @@ async function planProjectMemoryWrites(
     addsByDir.set(scopeDir, (addsByDir.get(scopeDir) ?? 0) + 1);
   }
   for (const [scopeDir, adds] of addsByDir) {
-    const existingCount = await countFilesUnder(path.join(root.path, scopeDir));
+    const existingCount = await countFilesUnder(
+      path.join(root.path, scopeDir),
+      MEMORY_MAX_FILES_PER_SCOPE
+    );
     if (existingCount + adds > MEMORY_MAX_FILES_PER_SCOPE && adds > 0) {
       throw new Error(
         `Cannot restore '${scopeDir}': it would exceed the ${MEMORY_MAX_FILES_PER_SCOPE}-file memory limit`

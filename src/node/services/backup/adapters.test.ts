@@ -1683,6 +1683,35 @@ describe("backup adapters project bundle", () => {
     });
   });
 
+  it("refuses a matched destination it could not snapshot before the core restore", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backup instructions\n");
+    const memoryDir = projectMemoryDirName(project);
+    const { repository, payload } = await exportBundle();
+
+    // The local file at the incoming path grew past the backup file budget: the recovery
+    // copy cannot hold it, so overwriting it must be refused — and refused up front.
+    await fs.writeFile(
+      path.join(muxRoot, "memory", "project", memoryDir, "notes.md"),
+      Buffer.alloc(MAX_BACKUP_FILE_BYTES + 1, "x")
+    );
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local instructions\n");
+
+    const error = await captureRejection(
+      payload.validateRestore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+      })
+    );
+    expect((error as Error).message).toContain("notes.md");
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "local instructions\n"
+    );
+  });
+
   it("refuses a matched entry that would break memory limits before the core restore", async () => {
     const project = path.join(tempDir, "projects", "alpha");
     registerProject(project);

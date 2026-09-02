@@ -537,6 +537,14 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       for (const match of bundlePlan.plan.matched) {
         await assertProjectMemoryWritesAllowed(muxRoot, match.files);
       }
+      // So does the recovery copy: a destination that cannot be snapshotted (a local file
+      // past the backup budgets) refuses the restore here, not after the core writes. The
+      // restore takes the real snapshot again inside its lock window.
+      if (bundlePlan.plan.matched.length > 0) {
+        await withMemoryLock(() =>
+          collectOverwritableProjectMemory(muxRoot, bundlePlan.plan.matched)
+        );
+      }
       return {
         hasProjectBundle: true,
         projectImports: toProjectImports(bundlePlan.plan),

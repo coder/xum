@@ -14,6 +14,7 @@ import {
 import {
   BackupService,
   type BackupProjectImporter,
+  type BackupProjectRegistrar,
   BackupServiceError,
   type BackupGitRepo,
   type BackupPayloadStore,
@@ -114,6 +115,14 @@ function importsWith(
     Promise.resolve()
 ): BackupProjectImporter {
   return { assertProjectMemoryAllowed, importProjectMemory };
+}
+
+/** A registrar mock: the given create() plus a no-op display-name setter unless overridden. */
+function registrar(
+  create: BackupProjectRegistrar["create"],
+  setDisplayName: BackupProjectRegistrar["setDisplayName"] = () => Promise.resolve()
+): BackupProjectRegistrar {
+  return { create, setDisplayName };
 }
 
 function createService(
@@ -1196,14 +1205,14 @@ describe("BackupService project imports", () => {
           ),
       }),
     });
-    service.setProjectService({
-      create: (projectPath) => {
+    service.setProjectService(
+      registrar((projectPath) => {
         events.push(`create:${projectPath}`);
         return Promise.resolve(
           projectPath === goodDir ? Ok({ normalizedPath: projectPath }) : Err("registration failed")
         );
-      },
-    });
+      })
+    );
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1266,9 +1275,7 @@ describe("BackupService project imports", () => {
           ),
       }),
     });
-    service.setProjectService({
-      create: () => Promise.resolve(Err("Project already exists")),
-    });
+    service.setProjectService(registrar(() => Promise.resolve(Err("Project already exists"))));
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1312,9 +1319,7 @@ describe("BackupService project imports", () => {
       }),
     });
     // ProjectService resolves the alias to the registered project and reports a duplicate.
-    service.setProjectService({
-      create: () => Promise.resolve(Err("Project already exists")),
-    });
+    service.setProjectService(registrar(() => Promise.resolve(Err("Project already exists"))));
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1348,9 +1353,9 @@ describe("BackupService project imports", () => {
           }),
       }),
     });
-    service.setProjectService({
-      create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
-    });
+    service.setProjectService(
+      registrar((projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })))
+    );
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1391,12 +1396,12 @@ describe("BackupService project imports", () => {
         },
       }),
     });
-    service.setProjectService({
-      create: (projectPath) => {
+    service.setProjectService(
+      registrar((projectPath) => {
         registrations += 1;
         return Promise.resolve(Ok({ normalizedPath: projectPath }));
-      },
-    });
+      })
+    );
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1443,9 +1448,7 @@ describe("BackupService project imports", () => {
           ),
       }),
     });
-    service.setProjectService({
-      create: () => Promise.resolve(Err("Project already exists")),
-    });
+    service.setProjectService(registrar(() => Promise.resolve(Err("Project already exists"))));
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1455,6 +1458,108 @@ describe("BackupService project imports", () => {
     expect(result.success).toBe(true);
     // The memory scope actually written is the registered project's, not the alias's.
     expect(preflighted).toEqual([registered]);
+  });
+
+  test("imports into a project registered under a different alias of the same directory", async () => {
+    const realParent = path.join(tempDir, "real");
+    await fs.mkdir(path.join(realParent, "repo"), { recursive: true });
+    const aliasA = path.join(tempDir, "alias-a");
+    const aliasB = path.join(tempDir, "alias-b");
+    await fs.symlink(realParent, aliasA, "dir");
+    await fs.symlink(realParent, aliasB, "dir");
+    const registeredAlias = path.join(aliasA, "repo");
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(registeredAlias, { workspaces: [] });
+    const importedTo: string[] = [];
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjectPaths: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    // create() would happily register the second alias; the service must not ask it to.
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: path.join(aliasB, "repo") }] }
+    );
+
+    expect(result.success).toBe(true);
+    expect(registrations).toBe(0);
+    // One checkout, one registration, one memory scope.
+    expect(importedTo).toEqual([registeredAlias]);
+  });
+
+  test("applies the backed-up name to a newly registered project only", async () => {
+    const fresh = path.join(tempDir, "checkout");
+    const existing = path.join(tempDir, "existing");
+    await fs.mkdir(fresh);
+    await fs.mkdir(existing);
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(existing, { workspaces: [], displayName: "Local name" });
+    const named: Array<[string, string]> = [];
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [
+              candidate({ name: "Rocket Science" }),
+              candidate({ name: "Probe", token: "probe-token", sourcePath: "/src/probe" }),
+            ],
+            matchedProjectPaths: [],
+          }),
+      }),
+    });
+    service.setProjectService(
+      registrar(
+        (projectPath) =>
+          Promise.resolve(
+            projectPath === existing
+              ? Err("Project already exists")
+              : Ok({ normalizedPath: projectPath })
+          ),
+        (projectPath, displayName) => {
+          named.push([projectPath, displayName]);
+          return Promise.resolve();
+        }
+      )
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      {
+        projectImports: [
+          { token: "candidate-token", targetPath: fresh },
+          { token: "probe-token", targetPath: existing },
+        ],
+      }
+    );
+
+    expect(result.success).toBe(true);
+    // "checkout" would otherwise show up under its basename, not the name it was backed
+    // up with; the already registered project keeps its local name.
+    expect(named).toEqual([[fresh, "Rocket Science"]]);
   });
 
   test("keeps a candidate on offer when its import fails per-candidate", async () => {
@@ -1471,9 +1576,7 @@ describe("BackupService project imports", () => {
           }),
       }),
     });
-    service.setProjectService({
-      create: () => Promise.resolve(Err("registration failed")),
-    });
+    service.setProjectService(registrar(() => Promise.resolve(Err("registration failed"))));
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1551,9 +1654,7 @@ describe("BackupService project imports", () => {
       }),
     });
     // Duplicate reported, but nothing in config matches the target or its real path.
-    service.setProjectService({
-      create: () => Promise.resolve(Err("Project already exists")),
-    });
+    service.setProjectService(registrar(() => Promise.resolve(Err("Project already exists"))));
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1593,9 +1694,9 @@ describe("BackupService project imports", () => {
           ),
       }),
     });
-    service.setProjectService({
-      create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
-    });
+    service.setProjectService(
+      registrar((projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })))
+    );
 
     const result = await service.restore(
       { ...SETTINGS, includeProjects: true },
@@ -1685,9 +1786,9 @@ describe("BackupService project imports", () => {
           ),
       }),
     });
-    service.setProjectService({
-      create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
-    });
+    service.setProjectService(
+      registrar((projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })))
+    );
     service.setMemoryNotifier({
       notifyExternalProjectChange: (projectPath) => {
         notified.push(projectPath);
@@ -1730,9 +1831,9 @@ describe("BackupService project imports", () => {
           ),
       }),
     });
-    service.setProjectService({
-      create: (projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })),
-    });
+    service.setProjectService(
+      registrar((projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })))
+    );
     expect((await service.saveSettings({ ...SETTINGS, includeProjects: true })).success).toBe(true);
 
     const result = await service.restore(

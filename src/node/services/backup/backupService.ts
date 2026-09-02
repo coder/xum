@@ -4,6 +4,7 @@ import type { Config } from "@/node/config";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { getProjectDisplayName } from "@/common/utils/subProjects";
 import {
   BackupOperationErrorSchema,
   type BackupCommandApproval,
@@ -144,6 +145,7 @@ export interface BackupProjectImporter {
  */
 export interface BackupProjectRegistrar {
   create(projectPath: string): Promise<Result<{ normalizedPath: string }, string>>;
+  setDisplayName(projectPath: string, displayName: string): Promise<void>;
 }
 
 /**
@@ -745,7 +747,7 @@ export class BackupService {
         targetPath: resolved,
         // Known up front when the target is already registered (directly or as an alias),
         // so the preflight checks the memory scope the import will really write to.
-        registeredPath: this.resolveRegisteredProjectPath(resolved, canonical),
+        registeredPath: await this.resolveRegisteredProjectPath(resolved, canonical),
       });
     }
     return planned;
@@ -763,7 +765,7 @@ export class BackupService {
     planned: readonly PlannedProjectImport[]
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
-    for (const { candidate, targetPath } of planned) {
+    for (const { candidate, targetPath, registeredPath: plannedRegisteredPath } of planned) {
       // Once registration resolves the project identity, failures report that path: it is
       // where any partially written memory actually lives.
       let registeredPath: string | null = null;
@@ -791,14 +793,24 @@ export class BackupService {
           results.push(failed(`'${targetPath}' is not an existing directory`));
           continue;
         }
-        const created = await this.projectRegistrar.create(targetPath);
+        // An alias of an already registered project (resolved during planning) imports into
+        // that project without a second registration; create() would otherwise register the
+        // alias as a duplicate when its own duplicate check misses the aliased key.
+        const created =
+          plannedRegisteredPath === null
+            ? await this.projectRegistrar.create(targetPath)
+            : Err("Project already exists");
         if (created.success) {
           registeredPath = created.data.normalizedPath;
+          // The backed-up name travels with a newly registered project; an already
+          // registered target keeps its local name.
+          if (candidate.name !== getProjectDisplayName(registeredPath)) {
+            await this.projectRegistrar.setDisplayName(registeredPath, candidate.name);
+          }
         } else if (created.error === "Project already exists") {
-          registeredPath = this.resolveRegisteredProjectPath(
-            targetPath,
-            await realpathOrNull(targetPath)
-          );
+          registeredPath =
+            plannedRegisteredPath ??
+            (await this.resolveRegisteredProjectPath(targetPath, await realpathOrNull(targetPath)));
           if (registeredPath === null) {
             results.push(failed(`'${targetPath}' is already registered under a different path`));
             continue;
@@ -839,11 +851,21 @@ export class BackupService {
    * registered identity — writing under the alias would land files the project never
    * reads while reporting them as imported. Null when neither spelling is registered.
    */
-  private resolveRegisteredProjectPath(targetPath: string, canonicalPath: string | null) {
+  private async resolveRegisteredProjectPath(
+    targetPath: string,
+    canonicalPath: string | null
+  ): Promise<string | null> {
     const projects = this.config.loadConfigOrDefault().projects;
     const resolved = path.resolve(targetPath);
     if (projects.has(resolved)) return resolved;
-    if (canonicalPath !== null && projects.has(canonicalPath)) return canonicalPath;
+    if (canonicalPath === null) return null;
+    if (projects.has(canonicalPath)) return canonicalPath;
+    // Registered keys may themselves be aliases (a project added through a symlinked
+    // parent), so the target's real path is compared with each registered project's real
+    // path rather than only looked up literally.
+    for (const registered of projects.keys()) {
+      if ((await realpathOrNull(registered)) === canonicalPath) return registered;
+    }
     return null;
   }
 
