@@ -2092,6 +2092,69 @@ describe("BackupService project imports", () => {
     expect(snapshots).toBe(0);
   });
 
+  test("still resolves a registered alias of the target behind a project on an unavailable mount", async () => {
+    const realParent = path.join(tempDir, "real");
+    await fs.mkdir(path.join(realParent, "repo"), { recursive: true });
+    const aliasA = path.join(tempDir, "alias-a");
+    const aliasB = path.join(tempDir, "alias-b");
+    await fs.symlink(realParent, aliasA, "dir");
+    await fs.symlink(realParent, aliasB, "dir");
+    const registeredAlias = path.join(aliasA, "repo");
+    const unavailable = path.join(tempDir, "unavailable-mount");
+    const config = new TestBackupConfig(tempDir);
+    // Probed first, in registration order, at planning and again at execution.
+    config.state.projects.set(unavailable, { workspaces: [] });
+    config.state.projects.set(registeredAlias, { workspaces: [] });
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() => Promise.resolve({ writtenFiles: [], skippedFiles: [] }))
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+    const realRealpath = fs.realpath.bind(fs);
+    const realpath = spyOn(fs, "realpath").mockImplementation(((target: string) =>
+      // A mount that never answers: the probe pins its worker for good.
+      target === unavailable
+        ? new Promise<string>(() => undefined)
+        : realRealpath(target)) as unknown as typeof fs.realpath);
+    try {
+      const result = await service.restore(
+        { ...SETTINGS, includeProjects: true },
+        { projectImports: [{ token: "candidate-token", targetPath: path.join(aliasB, "repo") }] }
+      );
+      expect(result.success).toBe(true);
+      // Given the whole pass, the unavailable project would have left the alias unprobed
+      // at planning and again at execution, and the target would have been registered as
+      // a second spelling of the same directory. With its share only, the alias resolves
+      // and the import goes into the registered project.
+      expect(registrations).toBe(0);
+      if (result.success) {
+        expect(result.data.projectImportResults[0]).toMatchObject({
+          status: "imported",
+          targetPath: registeredAlias,
+        });
+      }
+    } finally {
+      realpath.mockRestore();
+    }
+  }, 20_000);
+
   test("refuses an import into a directory at another backed-up project's recorded path", async () => {
     // Local directories at two other entries' recorded paths: one still on offer, one matched.
     const otherCandidatePath = path.join(tempDir, "beta");

@@ -6,9 +6,11 @@ import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schema
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import {
   MAX_BACKUP_PROJECT_ENTRIES,
+  MAX_BACKUP_PROJECT_PATH_CHARS,
   sanitizeBackupGitRemote,
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
+import { log } from "@/node/services/log";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import type { ProjectConfig } from "@/common/types/project";
@@ -330,7 +332,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   function listProjectBundleEntries(
     remotes: ReadonlyMap<string, string | undefined>
   ): BackupProjectBundleEntry[] {
-    const projects = userProjects();
+    // A registered path past the manifest schema's cap — registration itself caps nothing —
+    // has no valid manifest entry, and one such project must not fail every push for all
+    // the others; it stays local, logged, exactly as an import of it would be refused.
+    const projects = userProjects().filter(([projectPath]) => {
+      if (projectPath.length <= MAX_BACKUP_PROJECT_PATH_CHARS) return true;
+      log.warn(
+        `Settings backup: not backing up project '${projectPath.slice(0, 80)}…': its path is longer than ${MAX_BACKUP_PROJECT_PATH_CHARS} characters`
+      );
+      return false;
+    });
     if (projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
       throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
     }

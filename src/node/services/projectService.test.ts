@@ -2940,6 +2940,23 @@ exit 1
       expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
     });
 
+    it("rolls back git init when the registering write finds the hold reclaimed", async () => {
+      const target = path.join(tempDir, "reclaimed-init");
+      await fs.mkdir(target);
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        // Displaced while git init runs, by a holder whose pid is dead: the registering
+        // write's ownership check refuses, and the rollback's own hold can reclaim the lock.
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "9999999:reclaimed", "utf-8");
+        return create(target, { initGit: true });
+      });
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("no longer owned");
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+      // Left behind, the .git would fail every retry on the non-empty-directory check.
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect((await service.create(target, { initGit: true })).success).toBe(true);
+    });
+
     it("refuses to register once another process has displaced the registration lock", async () => {
       const target = path.join(tempDir, "displaced");
       await fs.mkdir(target);

@@ -14,7 +14,10 @@ import {
 } from "./payload";
 import { MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
 import { projectMemoryDirName } from "@/node/services/memoryService";
-import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
+import {
+  MAX_BACKUP_PROJECT_ENTRIES,
+  MAX_BACKUP_PROJECT_PATH_CHARS,
+} from "@/common/config/schemas/settingsBackup";
 import {
   memoryMutationLockKey,
   withTargetMutationLock,
@@ -1989,6 +1992,27 @@ describe("backup adapters project bundle", () => {
     expect((error as Error).message).toContain(`${MAX_BACKUP_PROJECT_ENTRIES}`);
     // Sequential probing of 257 directories would take far longer than the check itself.
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("leaves a project whose registered path exceeds the manifest cap out of the bundle", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    // Registration caps nothing; the manifest schema does. One such project must not fail
+    // every push for all the others.
+    const overlong = path.join(tempDir, "p".repeat(MAX_BACKUP_PROJECT_PATH_CHARS));
+    registerProject(overlong);
+    await seedProjectMemory(project, "notes.md", "alpha notes\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+
+    const { repository } = await exportBundle();
+
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(repository.rootDir, settings.path, "project-bundle", "manifest.json"),
+        "utf-8"
+      )
+    ) as { projects: Array<{ path: string }> };
+    expect(manifest.projects.map((entry) => entry.path)).toEqual([project]);
   });
 
   it("collects project memory for export under the memory mutation lock", async () => {

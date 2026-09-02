@@ -196,12 +196,16 @@ interface RegisteredProjectLookup {
 /**
  * Bounds on resolving registered projects' real paths; see registeredProjectLookup. One probe
  * in flight, deliberately: Node's fs has no cancellation, so a `realpath` that a timed-out
- * race stopped waiting for keeps its libuv threadpool worker until the mount answers. With
- * one at a time, an unavailable mount can hold at most one of the pool's threads, not the
- * whole pool; the deadline bounds how long the restore itself waits.
+ * race stopped waiting for keeps its libuv threadpool worker until the mount answers. The
+ * deadline bounds how long the restore itself waits, shared out equally among the keys still
+ * to probe rather than spent by whichever comes first, so a project on an unavailable mount
+ * cannot leave every key after it unprobed. Each stalled probe is one worker held until its
+ * mount answers; after REGISTRY_MAX_STALLED_PROBES of them the pass stops probing, so a
+ * pass can hold at most that many of the pool's threads, not the whole pool.
  */
 const REGISTRY_CANONICALIZE_CONCURRENCY = 1;
 const REGISTRY_CANONICALIZE_DEADLINE_MS = 5_000;
+const REGISTRY_MAX_STALLED_PROBES = 2;
 
 /**
  * One approved import after planning: its resolved target, the directory's filesystem
@@ -348,18 +352,24 @@ async function realpathOrNull(target: string): Promise<string | null> {
 }
 
 /**
- * `realpathOrNull` bounded by `timeoutMs`: null once the time is up. A resolution still
- * blocked on an unavailable mount then finishes on its own in the threadpool; nothing waits
- * for it, and REGISTRY_CANONICALIZE_CONCURRENCY keeps such leftovers to one at a time.
+ * `realpathOrNull` bounded by `timeoutMs`; `stalled` when the time ran out first. A
+ * resolution still blocked on an unavailable mount then finishes on its own in the
+ * threadpool; nothing waits for it (see REGISTRY_MAX_STALLED_PROBES).
  */
-async function realpathWithin(target: string, timeoutMs: number): Promise<string | null> {
-  if (timeoutMs <= 0) return null;
+async function realpathWithin(
+  target: string,
+  timeoutMs: number
+): Promise<{ canonical: string | null; stalled: boolean }> {
+  if (timeoutMs <= 0) return { canonical: null, stalled: false };
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
+  const expired = new Promise<{ canonical: null; stalled: true }>((resolve) => {
+    timer = setTimeout(() => resolve({ canonical: null, stalled: true }), timeoutMs);
   });
   try {
-    return await Promise.race([realpathOrNull(target), expired]);
+    return await Promise.race([
+      realpathOrNull(target).then((canonical) => ({ canonical, stalled: false })),
+      expired,
+    ]);
   } finally {
     clearTimeout(timer);
   }
@@ -1158,11 +1168,25 @@ export class BackupService {
     }
     const probes = new AsyncSemaphore(REGISTRY_CANONICALIZE_CONCURRENCY);
     const deadline = Date.now() + REGISTRY_CANONICALIZE_DEADLINE_MS;
+    let unprobed = pending.length;
+    let stalled = 0;
     await Promise.all(
       pending.map(async (key) => {
         const slot = await probes.acquire();
         try {
-          canonicalByKey.set(key, await realpathWithin(key, deadline - Date.now()));
+          // An equal share of the time left for each key still to probe, not all of it: a
+          // key on an unavailable mount would otherwise use up the pass and leave every key
+          // after it unprobed — at planning and, in the same order, again at execution, so
+          // an alias of the import target behind it would never be seen and the target
+          // registered as a second spelling of one directory.
+          const budget =
+            stalled < REGISTRY_MAX_STALLED_PROBES
+              ? Math.ceil((deadline - Date.now()) / unprobed)
+              : 0;
+          unprobed -= 1;
+          const probe = await realpathWithin(key, budget);
+          if (probe.stalled) stalled += 1;
+          canonicalByKey.set(key, probe.canonical);
         } finally {
           slot.release();
         }
