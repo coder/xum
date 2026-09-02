@@ -1794,25 +1794,34 @@ describe("backup adapters project bundle", () => {
     );
   });
 
-  it("leaves a project alone that was unregistered after the plan was computed", async () => {
+  it("refuses the restore when a validated match was unregistered before the write boundary", async () => {
     const project = path.join(tempDir, "projects", "alpha");
     registerProject(project);
     await seedProjectMemory(project, "notes.md", "backup version\n");
-    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backup instructions\n");
     const memoryPath = `memory/project/${projectMemoryDirName(project)}/notes.md`;
     const { repository, payload } = await exportBundle();
     await seedProjectMemory(project, "notes.md", "local edit\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local instructions\n");
 
-    // Unregistered between validation (which matched it) and the write boundary.
+    // Unregistered between validation (which matched it) and the write boundary. The entry
+    // is now an import candidate the caller never saw, so silently skipping it would let the
+    // restore complete with this project's memory neither written nor offered.
     config.state.projects.delete(project);
-    const restored = await payload.restore({
-      repositoryRoot: repository.rootDir,
-      managedPath: settings.path,
-      includeProjects: true,
-      snapshotPath: path.join(tempDir, "restore-snapshot"),
-      matchedProjects: [matchedAt(project)],
-    });
-    expect(restored.changedFiles).not.toContain(memoryPath);
+    const error = await captureRejection(
+      payload.restore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+        snapshotPath: path.join(tempDir, "restore-snapshot"),
+        matchedProjects: [matchedAt(project)],
+      })
+    );
+    expect((error as Error).message).toContain("changed since the restore was validated");
+    // Refused before anything changed: neither the core files nor the project's memory.
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "local instructions\n"
+    );
     expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
       "local edit\n"
     );

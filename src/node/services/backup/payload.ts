@@ -3083,8 +3083,9 @@ export function matchedProjectWrites(
 const PROJECT_MEMORY_ORIGINS_DIR = "memory/.backup-origins";
 const MAX_PROJECT_MEMORY_ORIGIN_BYTES = 4096;
 
-function projectMemoryOriginPath(rootPath: string, localMemoryDir: string): string {
-  return path.join(rootPath, ...PROJECT_MEMORY_ORIGINS_DIR.split("/"), `${localMemoryDir}.json`);
+/** Root-relative, so the checked reader and writer walk every component below the root. */
+function projectMemoryOriginPath(localMemoryDir: string): string {
+  return `${PROJECT_MEMORY_ORIGINS_DIR}/${localMemoryDir}.json`;
 }
 
 export async function writeProjectMemoryOrigin(
@@ -3093,9 +3094,18 @@ export async function writeProjectMemoryOrigin(
   sourcePath: string
 ): Promise<void> {
   const root = await resolveRoot(muxRoot);
-  const marker = projectMemoryOriginPath(root.path, localMemoryDir);
-  await fs.mkdir(path.dirname(marker), { recursive: true });
-  await fs.writeFile(marker, `${JSON.stringify({ sourcePath })}\n`, "utf-8");
+  const relativePath = projectMemoryOriginPath(localMemoryDir);
+  // Contained and then written through the checked writer, like every other file a restore
+  // lands: `.backup-origins` or the marker itself left behind as a symlink (a copied or
+  // corrupted Xum home) would otherwise be followed, and an approved import would replace a
+  // file outside the memory tree with backup-controlled JSON.
+  await resolveContainedPath(root.path, relativePath);
+  await writeCheckedFile(
+    root,
+    relativePath,
+    Buffer.from(`${JSON.stringify({ sourcePath })}\n`, "utf-8"),
+    false
+  );
 }
 
 /**
@@ -3111,14 +3121,21 @@ export async function readProjectMemoryOrigins(
   const origins = new Map<string, ProjectMemoryOrigin>();
   const registered = [...registeredDirByPath.entries()].sort(([a], [b]) => a.localeCompare(b));
   for (const [projectPath, memoryDir] of registered) {
-    const marker = projectMemoryOriginPath(root.path, memoryDir);
-    const stat = await lstatOrNull(marker);
-    if (stat?.isFile() !== true || stat.size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) continue;
     let sourcePath: unknown;
     try {
-      const parsed: unknown = JSON.parse(await fs.readFile(marker, "utf-8"));
+      // The checked reader refuses a symlinked directory or marker the same way the
+      // writer does, so a planted link cannot re-point a project at another source.
+      const { content } = await readCheckedFile(
+        root,
+        projectMemoryOriginPath(memoryDir),
+        (size) => {
+          if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
+        }
+      );
+      const parsed: unknown = JSON.parse(content.toString("utf-8"));
       sourcePath = isPlainObject(parsed) ? parsed.sourcePath : undefined;
     } catch {
+      // Missing, unreadable, or refused: the project simply has no recorded origin.
       continue;
     }
     if (typeof sourcePath !== "string" || sourcePath === "" || origins.has(sourcePath)) continue;

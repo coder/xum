@@ -68,6 +68,7 @@ import {
   writeBackupPayload,
   type BackupFile,
   type BackupProjectBundle,
+  type MatchedProjectEntry,
   type ProjectBundleRestorePlan,
 } from "./payload";
 
@@ -653,11 +654,14 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       } else {
         // Only entries the caller validated as matched, to the very same destination. A
         // project registered at its recorded path since validation was previewed as an
-        // import and is not covered by the snapshot, so it must not be overwritten here;
-        // one unregistered since validation drops out of the recomputed plan on its own.
+        // import and is not covered by the snapshot, so it must not be overwritten here.
+        const matchKey = (sourcePath: string, projectPath: string, localMemoryDir: string) =>
+          `${sourcePath}\0${projectPath}\0${localMemoryDir}`;
+        const planKey = (match: MatchedProjectEntry) =>
+          matchKey(match.entry.path, match.projectPath, match.localMemoryDir);
         const validatedMatched = new Set(
-          restoreOptions.matchedProjects.map(
-            (match) => `${match.sourcePath}\0${match.projectPath}\0${match.localMemoryDir}`
+          restoreOptions.matchedProjects.map((match) =>
+            matchKey(match.sourcePath, match.projectPath, match.localMemoryDir)
           )
         );
         // One lock window from the memory preflight through the matched write, entered
@@ -674,10 +678,25 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           const registered = registeredProjectDirs();
           const matched = bundlePlan.plan.matched.filter(
             (match) =>
-              validatedMatched.has(
-                `${match.entry.path}\0${match.projectPath}\0${match.localMemoryDir}`
-              ) && registered.get(match.projectPath) === match.localMemoryDir
+              validatedMatched.has(planKey(match)) &&
+              registered.get(match.projectPath) === match.localMemoryDir
           );
+          // A validated match that no longer writes — its project unregistered since, or
+          // resolved to a different local project now — is refused rather than dropped:
+          // the caller reports unapproved candidates from its validation, so a silently
+          // omitted entry would leave a "completed" restore with that project's memory
+          // neither written nor offered. Nothing has changed yet; a new preview re-offers it.
+          const stillMatched = new Set(matched.map(planKey));
+          const dropped = restoreOptions.matchedProjects.find(
+            (match) =>
+              !stillMatched.has(matchKey(match.sourcePath, match.projectPath, match.localMemoryDir))
+          );
+          if (dropped !== undefined) {
+            throw new BackupServiceError(
+              "IO_ERROR",
+              `Cannot restore: the project registration for '${dropped.projectPath}' changed since the restore was validated; preview again to continue`
+            );
+          }
           if (matched.length > 0) {
             for (const match of matched) {
               await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match));

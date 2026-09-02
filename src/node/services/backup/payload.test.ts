@@ -3733,6 +3733,40 @@ describe("project bundle", () => {
     ]);
   });
 
+  it("refuses an origin marker behind a symlinked directory or marker", async () => {
+    const localProject = "/home/other/a";
+    const localDir = projectMemoryDirName(localProject);
+    const outside = path.join(tempDir, "outside-origins");
+    await fs.mkdir(outside, { recursive: true });
+    const originsDir = path.join(muxRoot, "memory", ".backup-origins");
+    await fs.mkdir(path.dirname(originsDir), { recursive: true });
+
+    // A copied or corrupted Xum home left `.backup-origins` itself as a symlink.
+    await fs.symlink(outside, originsDir, "dir");
+    const viaDir = await captureRejection(
+      writeProjectMemoryOrigin(muxRoot, localDir, "/home/dev/src/alpha")
+    );
+    expect((viaDir as Error).message).toContain("symlink");
+    expect(await fs.readdir(outside)).toEqual([]);
+
+    // The directory is real but the marker is a link to a file outside the memory tree.
+    await fs.unlink(originsDir);
+    await fs.mkdir(originsDir);
+    const victim = path.join(outside, "victim.json");
+    await fs.writeFile(victim, JSON.stringify({ sourcePath: "/home/dev/src/alpha" }), "utf-8");
+    await fs.symlink(victim, path.join(originsDir, `${localDir}.json`));
+    const viaMarker = await captureRejection(
+      writeProjectMemoryOrigin(muxRoot, localDir, "/home/dev/src/planted")
+    );
+    expect((viaMarker as Error).message).toContain("symlink");
+    expect(JSON.parse(await fs.readFile(victim, "utf-8"))).toEqual({
+      sourcePath: "/home/dev/src/alpha",
+    });
+    // Nor is the linked file's content trusted as this project's origin.
+    const origins = await readProjectMemoryOrigins(muxRoot, new Map([[localProject, localDir]]));
+    expect(origins.size).toBe(0);
+  });
+
   it("skips an oversized memory file without charging the backup budget", async () => {
     const entry = entryFor("/home/dev/src/alpha");
     await writeFixtureFile(muxRoot, `memory/project/${entry.memoryDir}/small.md`, "fine\n");

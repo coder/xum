@@ -808,7 +808,15 @@ export class BackupService {
     planned: readonly PlannedProjectImport[]
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
-    for (const { candidate, targetPath, registeredPath: plannedRegisteredPath } of planned) {
+    if (planned.length === 0) return results;
+    // Rebuilt now rather than reused from planning: project registration is not serialized
+    // with this restore, so the registry may have changed in between. A target unregistered
+    // since must be registered again, not written into on its stale identity; one registered
+    // meanwhile — possibly through a different symlinked spelling of the same directory,
+    // which create()'s own duplicate check does not resolve — must import into that
+    // registration instead of adding a second one and splitting the project identity.
+    const registry = await this.registeredProjectLookup();
+    for (const { candidate, targetPath } of planned) {
       // Once registration resolves the project identity, failures report that path: it is
       // where any partially written memory actually lives.
       let registeredPath: string | null = null;
@@ -836,17 +844,14 @@ export class BackupService {
           results.push(failed(`'${targetPath}' is not an existing directory`));
           continue;
         }
-        // An alias of an already registered project (resolved during planning) imports into
-        // that project without a second registration; create() would otherwise register the
-        // alias as a duplicate when its own duplicate check misses the aliased key. The
-        // identity is re-read here because project registration is not serialized with this
-        // restore: a project unregistered meanwhile must be registered again, not written
-        // into as if it still existed.
-        const registeredIdentity =
-          plannedRegisteredPath !== null &&
-          this.config.loadConfigOrDefault().projects.has(plannedRegisteredPath)
-            ? plannedRegisteredPath
-            : null;
+        // An alias of an already registered project imports into that project without a
+        // second registration; create() would otherwise register the alias as a duplicate
+        // when its own duplicate check misses the aliased key.
+        const registeredIdentity = this.resolveRegisteredProjectPath(
+          targetPath,
+          await realpathOrNull(targetPath),
+          registry
+        );
         // The backed-up name travels with a newly registered project (in the same config
         // write as the registration); an already registered target keeps its local name.
         const created =
@@ -861,8 +866,8 @@ export class BackupService {
         if (created.success) {
           registeredPath = created.data.normalizedPath;
         } else if (created.error === "Project already exists") {
-          // Registered since planning (a concurrent registration): resolve against a fresh
-          // lookup, since the planning-time one predates it.
+          // Registered while this loop ran (a concurrent registration): resolve against a
+          // lookup fresher than the one built above.
           registeredPath =
             registeredIdentity ??
             this.resolveRegisteredProjectPath(
@@ -926,9 +931,9 @@ export class BackupService {
   }
 
   /**
-   * Registered project keys and their real paths, resolved once per restore: resolving
-   * them per candidate would cost registered × approved filesystem calls, and registered
-   * paths on slow mounts would make the restore look hung.
+   * Registered project keys and their real paths, resolved once per phase (planning, then
+   * import execution): resolving them per candidate would cost registered × approved
+   * filesystem calls, and registered paths on slow mounts would make the restore look hung.
    */
   private async registeredProjectLookup(): Promise<RegisteredProjectLookup> {
     const keys = new Set(this.config.loadConfigOrDefault().projects.keys());

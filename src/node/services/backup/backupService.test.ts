@@ -1634,6 +1634,60 @@ describe("BackupService project imports", () => {
     expect(registrations).toBe(1);
   });
 
+  test("imports into a project registered through another alias after planning", async () => {
+    const realParent = path.join(tempDir, "real");
+    await fs.mkdir(path.join(realParent, "repo"), { recursive: true });
+    const aliasA = path.join(tempDir, "alias-a");
+    const aliasB = path.join(tempDir, "alias-b");
+    await fs.symlink(realParent, aliasA, "dir");
+    await fs.symlink(realParent, aliasB, "dir");
+    const registeredAlias = path.join(aliasA, "repo");
+    const config = new TestBackupConfig(tempDir);
+    const importedTo: string[] = [];
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        // Nothing was registered when planning ran; another window then adds the same
+        // checkout through a different symlinked spelling before the imports execute.
+        writeSafetySnapshot: () => {
+          config.state.projects.set(registeredAlias, { workspaces: [] });
+          return Promise.resolve();
+        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    // create() checks only the target spelling and its canonical path, so it would register
+    // the second alias and split the project identity; the service must not ask it to.
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: path.join(aliasB, "repo") }] }
+    );
+
+    expect(result.success).toBe(true);
+    expect(registrations).toBe(0);
+    expect(importedTo).toEqual([registeredAlias]);
+  });
+
   test("refuses an import into a project that a matched entry restores in the same run", async () => {
     const target = path.join(tempDir, "target");
     await fs.mkdir(target);
