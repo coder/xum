@@ -2582,6 +2582,102 @@ describe("TaskService", () => {
     expect(liftedOptions.toolPolicy).toBeUndefined();
   });
 
+  test("workflow wakes skip the compaction request's own disable-all tool policy", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+    const compactionPolicy = [{ regex_match: ".*", action: "disable" as const }];
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
+    const createRun = async (runId: string) => {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    };
+    await createRun("wfr_policy_through_compaction");
+    await createRun("wfr_policy_unrestricted_compaction");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    const appendCompaction = async (id: string, timestamp: number) => {
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(id, "user", "Summarize this conversation", {
+          timestamp,
+          synthetic: true,
+          toolPolicy: compactionPolicy,
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        })
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(id + "-summary", "assistant", "Summary", { timestamp: timestamp + 1 })
+      );
+      await historyService.appendToHistory(
+        parentId,
+        createMuxMessage(id + "-continue", "user", "Continue", {
+          timestamp: timestamp + 2,
+          synthetic: true,
+        })
+      );
+    };
+
+    // The compaction row is the newest user row carrying a tool policy, but that policy only
+    // governed the summary turn. The wake must reach the manual row beneath it.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-restricted", "user", "run the audit", {
+        timestamp: 1_000,
+        toolPolicy: restrictedPolicy,
+      })
+    );
+    await appendCompaction("compaction-1", 1_100);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId: "wfr_policy_through_compaction",
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      toolPolicy: restrictedPolicy,
+    });
+
+    // An unrestricted manual row followed by a compaction must wake with tools available.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-unrestricted", "user", "carry on", { timestamp: 1_200 })
+    );
+    await appendCompaction("compaction-2", 1_300);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId: "wfr_policy_unrestricted_compaction",
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const unrestrictedOptions = sendMessage.mock.calls[1]?.[2] as { toolPolicy?: unknown };
+    expect(unrestrictedOptions.toolPolicy).toBeUndefined();
+  });
+
   test("wake restoration walks a long agent-less tail: caller policy, agent identity, disable flag", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

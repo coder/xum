@@ -1030,6 +1030,10 @@ function isResetBoundaryMessage(message: MuxMessage): boolean {
   return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
 }
 
+function isCompactionRequestMessage(message: MuxMessage): boolean {
+  return message.metadata?.muxMetadata?.type === "compaction-request";
+}
+
 function isWorkflowSupersessionMessage(message: MuxMessage): boolean {
   return isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message);
 }
@@ -6680,6 +6684,13 @@ export class TaskService implements AgentTaskIntegration {
             return false;
           }
           if (message.role !== "user") {
+            continue;
+          }
+          // A compaction request disables every tool for its own summary turn only. That
+          // per-turn policy is not a caller restriction: adopting it would strip all tools
+          // from every wake until the next manual send, so the walk keeps going to the row
+          // that actually defines the conversation's restrictions.
+          if (isCompactionRequestMessage(message)) {
             continue;
           }
           const metadata = message.metadata;
