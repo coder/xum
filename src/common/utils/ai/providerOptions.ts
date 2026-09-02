@@ -34,7 +34,10 @@ import {
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
 } from "@/common/types/thinking";
-import { isGeminiFlashThinkingLevelModelName } from "@/common/utils/thinking/policy";
+import {
+  isGeminiFlashMinimalRejectingModelName,
+  isGeminiFlashThinkingLevelModelName,
+} from "@/common/utils/thinking/policy";
 import { openaiExplicitPromptCachingAvailable } from "@/common/utils/ai/cacheStrategy";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
@@ -550,7 +553,11 @@ export function buildProviderOptions(
     if (isGeminiFlashThinkingModel && effectiveThinking === "off") {
       // Gemini Flash chat models default to medium and do not support true thinking-off;
       // send minimal explicitly so Xum's "off" setting means lowest-effort behavior.
-      thinkingConfig = { thinkingLevel: "minimal" };
+      // Gemini 3.8 Flash rejects "minimal" with a 400 (policy already excludes "off");
+      // clamp to "low" here too so a caller bypassing policy cannot trigger the error.
+      thinkingConfig = isGeminiFlashMinimalRejectingModelName(capBareModelName)
+        ? { includeThoughts: true, thinkingLevel: "low" }
+        : { thinkingLevel: "minimal" };
     } else if (effectiveThinking !== "off") {
       thinkingConfig = {
         includeThoughts: true,

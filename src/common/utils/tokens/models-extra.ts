@@ -602,18 +602,19 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
-  // Gemini 3.8 Flash - prepared ahead of Google's official release. Assumes the
-  // stable `gemini-3.8-flash` model ID keeps the Flash-tier limits (1M context,
-  // 65K max output) and the standard list rates carried since 3.6 Flash
-  // ($1.50/M input, $7.50/M output incl. thinking, $0.15/M cached input).
-  // TODO: verify limits and pricing against the Gemini API model/pricing docs once
-  // Google publishes them; adjust if 3.8 Flash launches with an intro rate like 3.7.
+  // Gemini 3.8 Flash - GA on September 2, 2026. Stable `gemini-3.8-flash` model ID with
+  // 1M context, 64K max output (DeepMind model card). Like 3.7 Flash, we encode the
+  // introductory rates Google actually bills through December 31, 2026 ($0.75/M input,
+  // $3.75/M output, $0.075/M cached input) so displayed costs and goal budgets match
+  // real charges. TODO(2027-01-01): raise to the standard list rates ($1.50/$7.50/$0.15)
+  // when the intro pricing expires. Source: Gemini API pricing docs as of 2026-09-02.
+  // Note: 3.8 Flash rejects thinkingLevel "minimal" (see isGeminiFlashMinimalRejectingModelName).
   "gemini-3.8-flash": {
     max_input_tokens: 1048576,
     max_output_tokens: 65536,
-    input_cost_per_token: 0.0000015, // $1.50 per million input tokens
-    output_cost_per_token: 0.0000075, // $7.50 per million output tokens, including thinking tokens
-    cache_read_input_token_cost: 0.00000015, // $0.15 per million cached input tokens
+    input_cost_per_token: 0.00000075, // $0.75 per million input tokens (intro rate)
+    output_cost_per_token: 0.00000375, // $3.75 per million output tokens, including thinking tokens (intro rate)
+    cache_read_input_token_cost: 0.000000075, // $0.075 per million cached input tokens (intro rate)
     litellm_provider: "vertex_ai-language-models",
     mode: "chat",
     supports_function_calling: true,

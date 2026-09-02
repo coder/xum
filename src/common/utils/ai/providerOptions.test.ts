@@ -1760,13 +1760,19 @@ describe("buildProviderOptions - Google", () => {
     });
   });
 
-  test("maps Gemini 3.8 Flash off to minimal thinking without thoughts", () => {
+  test("clamps Gemini 3.8 Flash off to low thinking because the API rejects minimal", () => {
+    // Policy already excludes "off" for 3.8 Flash; this guards callers that bypass it.
     expect(buildProviderOptions("google:gemini-3.8-flash", "off")).toEqual({
       google: {
         thinkingConfig: {
-          thinkingLevel: "minimal",
+          includeThoughts: true,
+          thinkingLevel: "low",
         },
       },
+    });
+    // Older Flash tiers keep the minimal mapping.
+    expect(buildProviderOptions("google:gemini-3.7-flash", "off")).toEqual({
+      google: { thinkingConfig: { thinkingLevel: "minimal" } },
     });
   });
 

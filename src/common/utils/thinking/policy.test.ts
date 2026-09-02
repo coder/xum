@@ -5,6 +5,7 @@ import {
   enforceThinkingPolicy,
   resolveThinkingInput,
   isGeminiFlashThinkingLevelModelName,
+  isGeminiFlashMinimalRejectingModelName,
   getDefaultMinimumThinkingLevel,
   lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
@@ -644,15 +645,19 @@ describe("getThinkingPolicyForModel", () => {
     }
   });
 
-  test("returns off/low/medium/high for stable Gemini 3.8 Flash", () => {
+  test("returns low/medium/high (no off) for Gemini 3.8 Flash, which rejects minimal", () => {
     for (const model of [
       "google:gemini-3.8-flash",
       "mux-gateway:google/gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-3.8-flash-001",
     ]) {
-      expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
     }
+    // Still a recognized reasoning model: defaults to the medium floor like other Flash tiers.
+    expect(getDefaultMinimumThinkingLevel("google:gemini-3.8-flash")).toBe("medium");
   });
 
   test("returns off/low/medium/high for stable Gemini 3.5 Flash behind OpenRouter", () => {
@@ -729,6 +734,17 @@ describe("isGeminiFlashThinkingLevelModelName", () => {
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash")).toBe(true);
     expect(isGeminiFlashThinkingLevelModelName("Gemini-3.8-Flash ")).toBe(true);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-001")).toBe(true);
+  });
+});
+
+describe("isGeminiFlashMinimalRejectingModelName", () => {
+  test("matches only Gemini 3.8 Flash chat IDs, not older Flash tiers or Lite variants", () => {
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-001")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-lite")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.7-flash")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3-flash")).toBe(false);
   });
 });
 
