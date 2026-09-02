@@ -211,7 +211,14 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         return;
       }
 
-      setState({ status: "connecting" });
+      // Once a session has been connected, any new attempt is a reconnect from the user's
+      // perspective: keep the "Reconnecting to server" banner up through the handshake instead
+      // of dropping to "connecting", which renders nothing and is meant for the initial load.
+      setState(
+        hasConnectedRef.current
+          ? { status: "reconnecting", attempt: Math.max(1, reconnectAttemptRef.current) }
+          : { status: "connecting" }
+      );
       const { client, cleanup, ws } = createBrowserClient(token, wsFactory);
       ws.addEventListener("message", () => {
         // Inbound frames prove the transport is alive, not that the backend is responsive:

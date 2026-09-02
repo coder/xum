@@ -675,9 +675,14 @@ describe("API reconnection", () => {
         { timeout: 22000 }
       );
 
-      const statuses = states.map((s) => s.status);
-      expect(statuses.some((s) => s === "reconnecting" || s === "connecting")).toBe(true);
-      expect(statuses.filter((s) => s === "auth_required")).toHaveLength(0);
+      // The forced reconnect must stay visible as "reconnecting" through the replacement
+      // socket's handshake; "connecting" renders no banner and is reserved for the initial load.
+      const statusesAfterConnected = states
+        .map((s) => s.status)
+        .slice(states.findIndex((s) => s.status === "connected") + 1);
+      expect(statusesAfterConnected).toContain("reconnecting");
+      expect(statusesAfterConnected).not.toContain("connecting");
+      expect(statusesAfterConnected).not.toContain("auth_required");
 
       // The replacement socket's auth-check pong is the next ping call.
       pingImpl = () => Promise.resolve("pong");
