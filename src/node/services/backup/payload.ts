@@ -3537,5 +3537,17 @@ export async function collectOverwritableProjectMemory(
   // The writer charges the manifest against the same budget, so a preflight that skipped
   // it could pass a recovery copy the write would then refuse.
   budget(BACKUP_MANIFEST_FILE, serializeProjectBundleManifest(manifest).length);
+  // And validates it against the same schema: a local project path or name the manifest
+  // cannot record would otherwise refuse the restore only at the recovery write, after the
+  // core snapshot. Imports cap their targets to keep this from arising; this is the check
+  // that makes the preflight, not the write, the place it surfaces if it ever does.
+  const manifestCheck = BackupProjectBundleManifestSchema.safeParse(manifest);
+  if (!manifestCheck.success) {
+    throw new Error(
+      `Cannot snapshot project memory: ${manifestCheck.error.issues
+        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+        .join("; ")}`
+    );
+  }
   return { manifest, files };
 }

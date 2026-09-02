@@ -237,8 +237,15 @@ export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
 // otherwise valid manifest could put megabytes into one name or path and push that through
 // hashing, IPC, and renderer text nodes. The bounds are generous for real values — paths
 // beat every platform default and the remote cap matches sanitizeBackupGitRemote's.
+/**
+ * Cap on a recorded project path. Also the cap on an import's target path: the local
+ * recovery copy a later matched restore writes records the local project path in this same
+ * schema, so a target this build could not record would fail every later restore of it.
+ */
+export const MAX_BACKUP_PROJECT_PATH_CHARS = 1024;
+
 export const BackupProjectBundleEntrySchema = z.object({
-  path: z.string().min(1).max(1024),
+  path: z.string().min(1).max(MAX_BACKUP_PROJECT_PATH_CHARS),
   name: z.string().min(1).max(256),
   gitRemote: z.string().max(2048).optional(),
   memoryDir: z.string().min(1),

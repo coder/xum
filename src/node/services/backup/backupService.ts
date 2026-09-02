@@ -7,6 +7,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { getProjectDisplayName } from "@/common/utils/subProjects";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
+import { MAX_BACKUP_PROJECT_PATH_CHARS } from "@/common/config/schemas/settingsBackup";
 import {
   BackupOperationErrorSchema,
   type BackupCommandApproval,
@@ -814,6 +815,15 @@ export class BackupService {
         );
       }
       const resolved = path.resolve(targetPath);
+      // The recovery copy a later matched restore of this project takes records the local
+      // path in the bundle manifest schema; a target past its cap would import today and
+      // fail every restore that later matches it, after the core snapshot.
+      if (resolved.length > MAX_BACKUP_PROJECT_PATH_CHARS) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': the target path is longer than ${MAX_BACKUP_PROJECT_PATH_CHARS} characters`
+        );
+      }
       const stat = await fs.lstat(resolved).catch(() => null);
       // A symlinked target would register the link's path while memory lands under a dir
       // name derived from it; require the plain directory itself.
@@ -1059,10 +1069,13 @@ export class BackupService {
    * Registered user projects and their real paths. Resolved once per restore, then extended
    * for import execution with only the projects registered since (`previous` supplies the
    * rest): per-candidate resolution would cost registered × approved filesystem calls.
-   * Real paths are probed in parallel under one deadline for the whole pass, so a project
-   * on an unavailable mount cannot make the restore look hung or hold the registration lock
-   * for as long as that mount blocks; a project probed after the deadline records no real
-   * path and is matched by its registered spelling only.
+   * Real paths are probed under one deadline for the whole pass, so a project on an
+   * unavailable mount cannot make the restore look hung or hold the registration lock for
+   * as long as that mount blocks; a project probed after the deadline records no real path
+   * and is matched by its registered spelling only. That is safe for alias detection in all
+   * but one exotic case: an import target resolved, so its directory is reachable, and a
+   * registered spelling of that same directory can only be unreachable through a symlink
+   * that itself sits on an unavailable mount.
    */
   private async registeredProjectLookup(
     previous?: RegisteredProjectLookup
@@ -1075,8 +1088,11 @@ export class BackupService {
     const canonicalByKey = new Map<string, string | null>();
     const pending: string[] = [];
     for (const key of keys) {
+      // Only resolved paths carry over: a key the planning pass could not resolve in time
+      // is probed again, so a transient stall does not leave an alias undetected at the
+      // moment an import decides whether to register.
       const known = previous?.canonicalByKey.get(key);
-      if (known !== undefined) canonicalByKey.set(key, known);
+      if (known != null) canonicalByKey.set(key, known);
       else pending.push(key);
     }
     const probes = new AsyncSemaphore(REGISTRY_CANONICALIZE_CONCURRENCY);

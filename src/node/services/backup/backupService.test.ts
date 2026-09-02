@@ -1851,6 +1851,103 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("refuses an import target longer than the manifest's path cap before the snapshot", async () => {
+    // Deep enough to pass 1024 characters while every component stays under NAME_MAX.
+    const target = path.join(tempDir, ...Array.from({ length: 6 }, () => "p".repeat(200)));
+    await fs.mkdir(target, { recursive: true });
+    let snapshots = 0;
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+
+    // The import itself could land, but the recovery copy a later matched restore of this
+    // project takes could not record the path, failing every such restore after its snapshot.
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toContain("longer than");
+      expect(result.error.snapshotPath).toBeUndefined();
+    }
+    expect(snapshots).toBe(0);
+  });
+
+  test("re-probes a registered path whose real path did not resolve during planning", async () => {
+    const realParent = path.join(tempDir, "real");
+    await fs.mkdir(path.join(realParent, "repo"), { recursive: true });
+    const aliasA = path.join(tempDir, "alias-a");
+    const aliasB = path.join(tempDir, "alias-b");
+    await fs.symlink(realParent, aliasA, "dir");
+    await fs.symlink(realParent, aliasB, "dir");
+    const registeredAlias = path.join(aliasA, "repo");
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(registeredAlias, { workspaces: [] });
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() => Promise.resolve({ writtenFiles: [], skippedFiles: [] }))
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+    // The registered alias fails to resolve once (a stalled mount at planning time) and
+    // resolves on the next attempt.
+    const realRealpath = fs.realpath.bind(fs);
+    let stalledOnce = false;
+    const realpath = spyOn(fs, "realpath").mockImplementation(((target, options) => {
+      if (String(target) === registeredAlias && !stalledOnce) {
+        stalledOnce = true;
+        return Promise.reject(new Error("EIO: mount unavailable"));
+      }
+      return realRealpath(target, options);
+    }) as typeof fs.realpath);
+    try {
+      const result = await service.restore(
+        { ...SETTINGS, includeProjects: true },
+        { projectImports: [{ token: "candidate-token", targetPath: path.join(aliasB, "repo") }] }
+      );
+      expect(result.success).toBe(true);
+      // Reusing the unresolved planning result would have registered the second alias; the
+      // execution-time lookup must probe it again and see the same directory.
+      expect(registrations).toBe(0);
+      if (result.success) {
+        expect(result.data.projectImportResults[0]).toMatchObject({
+          status: "failed",
+          message: expect.stringContaining(registeredAlias) as string,
+        });
+      }
+    } finally {
+      realpath.mockRestore();
+    }
+  });
+
   test("refuses an import into a project that a matched entry restores in the same run", async () => {
     const target = path.join(tempDir, "target");
     await fs.mkdir(target);
