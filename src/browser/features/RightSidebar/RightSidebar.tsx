@@ -1066,7 +1066,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
 
-    if (apiState.status !== "connected" || !api) {
+    // A degraded (slow) connection still has a usable api; only a missing api means offline.
+    if (!api) {
       setDesktopAvailable(null);
       return;
     }
@@ -1089,7 +1090,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [api, apiState.status, desktopExperimentEnabled, workspaceId]);
+  }, [api, desktopExperimentEnabled, workspaceId]);
 
   React.useEffect(() => {
     if (desktopAvailable == null) {

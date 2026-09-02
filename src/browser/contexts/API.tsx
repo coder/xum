@@ -26,7 +26,7 @@ export type { APIClient };
 export type APIState =
   | { status: "connecting"; api: null; error: null }
   | { status: "connected"; api: APIClient; error: null }
-  | { status: "degraded"; api: APIClient; error: null; latencyMs: number } // Connected but the backend answers slowly
+  | { status: "degraded"; api: APIClient; error: null } // Connected but the backend answers slowly
   | { status: "reconnecting"; api: null; error: null; attempt: number }
   | { status: "auth_required"; api: null; error: string | null }
   | { status: "error"; api: null; error: string };
@@ -43,7 +43,7 @@ export type UseAPIResult = APIState & APIStateMethods;
 type ConnectionState =
   | { status: "connecting" }
   | { status: "connected"; client: APIClient; cleanup: () => void }
-  | { status: "degraded"; client: APIClient; cleanup: () => void; latencyMs: number } // Backend slow
+  | { status: "degraded"; client: APIClient; cleanup: () => void } // Backend slow
   | { status: "reconnecting"; attempt: number }
   | { status: "auth_required"; error?: string }
   | { status: "error"; error: string };
@@ -71,6 +71,10 @@ const SILENCE_FOR_RECONNECT_MS = 15000;
 // Abandon an outstanding probe older than this so a single lost ping cannot pin the
 // indicator on "degraded" after the backend recovers.
 const MAX_PROBE_AGE_MS = 30000;
+// Browser WebSocket only: a probe that is rejected outright (not slow) means the server is
+// answering but refusing us, e.g. an expired session. Reconnect after this many in a row so
+// the handshake's auth-check can surface auth_required instead of pinning "degraded".
+const REJECTED_PROBES_FOR_RECONNECT = 3;
 
 // Exported so hooks that need to tolerate being mounted outside an
 // APIProvider (e.g., `useGoalDefaults`, `useGoalBoard`) can read the
@@ -78,6 +82,10 @@ const MAX_PROBE_AGE_MS = 30000;
 // canonical `useAPI()` below still throws — keep using it whenever
 // API access is required, not optional.
 export const APIContext = createContext<UseAPIResult | null>(null);
+
+// The live latency figure changes on every liveness tick while degraded. It lives in its own
+// context so those ticks re-render only the indicator, not every useAPI() consumer.
+const ConnectionLatencyContext = createContext<number | null>(null);
 
 interface APIProviderProps {
   children: React.ReactNode;
@@ -164,6 +172,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scheduleReconnectRef = useRef<(() => void) | null>(null);
   const consecutiveSlowProbesRef = useRef(0);
+  const consecutiveRejectedProbesRef = useRef(0);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const connectionIdRef = useRef(0);
   const forceReconnectInProgressRef = useRef(false);
   const outstandingProbeRef = useRef<{ sentAt: number; connectionId: number } | null>(null);
@@ -190,6 +200,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
       lastInboundBrowserFrameAtRef.current = 0;
       outstandingProbeRef.current = null;
       consecutiveSlowProbesRef.current = 0;
+      consecutiveRejectedProbesRef.current = 0;
+      setLatencyMs(null);
 
       authRequiredRef.current = false;
 
@@ -462,12 +474,24 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     const isBrowserWebSocket = Boolean(props.createWebSocket) || !window.api;
     let effectDisposed = false;
 
-    const recordSlowObservation = (latencyMs: number) => {
+    const forceReconnect = (reason: string) => {
+      if (!isBrowserWebSocket || forceReconnectInProgressRef.current) return false;
+      forceReconnectInProgressRef.current = true;
+      console.warn(`[APIProvider] ${reason}; reconnecting...`);
+      cleanup();
+      if (!effectDisposed) connect(authToken);
+      return true;
+    };
+
+    const recordSlowObservation = (observedLatencyMs: number) => {
       consecutiveSlowProbesRef.current += 1;
       if (consecutiveSlowProbesRef.current < SLOW_OBSERVATIONS_FOR_DEGRADED) return;
+      setLatencyMs(observedLatencyMs);
+      // Returning prev while already degraded keeps the API context value stable, so only the
+      // latency context consumers re-render on later ticks.
       setState((prev) =>
-        (prev.status === "connected" || prev.status === "degraded") && prev.client === client
-          ? { status: "degraded", client, cleanup, latencyMs }
+        prev.status === "connected" && prev.client === client
+          ? { status: "degraded", client, cleanup }
           : prev
       );
     };
@@ -475,6 +499,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     const recordFastObservation = () => {
       consecutiveSlowProbesRef.current = 0;
       forceReconnectInProgressRef.current = false;
+      setLatencyMs(null);
       setState((prev) =>
         prev.status === "degraded" && prev.client === client
           ? { status: "connected", client, cleanup }
@@ -497,11 +522,23 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         }
         outstandingProbeRef.current = null;
         const rtt = Date.now() - probe.sentAt;
-        if (resolved && rtt <= SLOW_RESPONSE_MS) {
-          recordFastObservation();
-        } else {
+        if (resolved) {
+          consecutiveRejectedProbesRef.current = 0;
+          if (rtt <= SLOW_RESPONSE_MS) {
+            recordFastObservation();
+            return;
+          }
           recordSlowObservation(rtt);
+          return;
         }
+        consecutiveRejectedProbesRef.current += 1;
+        if (
+          consecutiveRejectedProbesRef.current >= REJECTED_PROBES_FOR_RECONNECT &&
+          forceReconnect(`Liveness probe rejected ${consecutiveRejectedProbesRef.current} times`)
+        ) {
+          return;
+        }
+        recordSlowObservation(rtt);
       };
 
       client.general.ping("liveness").then(
@@ -524,19 +561,10 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
             recordSlowObservation(pendingMs);
 
             const silentMs = now - lastInboundBrowserFrameAtRef.current;
-            if (
-              isBrowserWebSocket &&
-              pendingMs >= SILENCE_FOR_RECONNECT_MS &&
-              silentMs >= SILENCE_FOR_RECONNECT_MS &&
-              !forceReconnectInProgressRef.current
-            ) {
-              forceReconnectInProgressRef.current = true;
-              console.warn(
-                `[APIProvider] Liveness probe outstanding for ${pendingMs}ms with no inbound traffic; reconnecting...`
+            if (pendingMs >= SILENCE_FOR_RECONNECT_MS && silentMs >= SILENCE_FOR_RECONNECT_MS) {
+              forceReconnect(
+                `Liveness probe outstanding for ${pendingMs}ms with no inbound traffic`
               );
-              cleanup();
-              if (effectDisposed) return;
-              connect(authToken);
             }
           }
           return;
@@ -581,13 +609,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
       case "connected":
         return { status: "connected", api: state.client, error: null, ...base };
       case "degraded":
-        return {
-          status: "degraded",
-          api: state.client,
-          error: null,
-          latencyMs: state.latencyMs,
-          ...base,
-        };
+        return { status: "degraded", api: state.client, error: null, ...base };
       case "reconnecting":
         return { status: "reconnecting", api: null, error: null, attempt: state.attempt, ...base };
       case "auth_required":
@@ -598,7 +620,13 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   }, [state, authenticate, retry]);
 
   // Always render children - consumers handle their own loading/error states
-  return <APIContext.Provider value={value}>{props.children}</APIContext.Provider>;
+  return (
+    <APIContext.Provider value={value}>
+      <ConnectionLatencyContext.Provider value={latencyMs}>
+        {props.children}
+      </ConnectionLatencyContext.Provider>
+    </APIContext.Provider>
+  );
 }
 
 function InjectedClientAPIProvider(
@@ -651,3 +679,6 @@ export const useAPI = (): UseAPIResult => {
  * test harnesses) and should degrade gracefully rather than crash.
  */
 export const useOptionalAPI = (): UseAPIResult | null => useContext(APIContext);
+
+/** Last measured backend round-trip time while the connection is degraded, else null. */
+export const useConnectionLatencyMs = (): number | null => useContext(ConnectionLatencyContext);
