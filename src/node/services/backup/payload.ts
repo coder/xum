@@ -3211,17 +3211,18 @@ export async function collectOverwritableProjectMemory(
   const entries = [...matched.map((match) => match.entry)].sort((a, b) =>
     a.path.localeCompare(b.path)
   );
-  return {
-    manifest: {
-      schemaVersion: 1,
-      projects: entries.map((entry) => ({
-        path: entry.path,
-        name: entry.name,
-        ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
-        memoryDir: entry.memoryDir,
-      })),
-      files: files.map((file) => ({ path: file.path, sha256: sha256(file.content) })),
-    },
-    files,
+  const manifest: BackupProjectBundleManifest = {
+    schemaVersion: 1,
+    projects: entries.map((entry) => ({
+      path: entry.path,
+      name: entry.name,
+      ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
+      memoryDir: entry.memoryDir,
+    })),
+    files: files.map((file) => ({ path: file.path, sha256: sha256(file.content) })),
   };
+  // The writer charges the manifest against the same budget, so a preflight that skipped
+  // it could pass a recovery copy the write would then refuse.
+  budget(BACKUP_MANIFEST_FILE, serializeProjectBundleManifest(manifest).length);
+  return { manifest, files };
 }

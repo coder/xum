@@ -157,6 +157,12 @@ export interface BackupMemoryNotifier {
   notifyExternalProjectChange(projectPath: string): void;
 }
 
+/** Registered project keys plus a real-path → key index, built once per restore. */
+interface RegisteredProjectLookup {
+  keys: ReadonlySet<string>;
+  byCanonical: ReadonlyMap<string, string>;
+}
+
 /** One approved import after planning: its resolved target and, if already registered, its identity. */
 interface PlannedProjectImport {
   candidate: BackupProjectImport;
@@ -706,6 +712,7 @@ export class BackupService {
     const byToken = new Map(candidates.map((candidate) => [candidate.token, candidate]));
     const planned: PlannedProjectImport[] = [];
     const claimedTargets = new Set<string>();
+    const registry = await this.registeredProjectLookup();
     for (const request of requested) {
       const candidate = byToken.get(request.token);
       // Unknown and stale tokens are indistinguishable here; both mean the user approved
@@ -747,7 +754,7 @@ export class BackupService {
         targetPath: resolved,
         // Known up front when the target is already registered (directly or as an alias),
         // so the preflight checks the memory scope the import will really write to.
-        registeredPath: await this.resolveRegisteredProjectPath(resolved, canonical),
+        registeredPath: this.resolveRegisteredProjectPath(resolved, canonical, registry),
       });
     }
     return planned;
@@ -808,9 +815,15 @@ export class BackupService {
             await this.projectRegistrar.setDisplayName(registeredPath, candidate.name);
           }
         } else if (created.error === "Project already exists") {
+          // Registered since planning (a concurrent registration): resolve against a fresh
+          // lookup, since the planning-time one predates it.
           registeredPath =
             plannedRegisteredPath ??
-            (await this.resolveRegisteredProjectPath(targetPath, await realpathOrNull(targetPath)));
+            this.resolveRegisteredProjectPath(
+              targetPath,
+              await realpathOrNull(targetPath),
+              await this.registeredProjectLookup()
+            );
           if (registeredPath === null) {
             results.push(failed(`'${targetPath}' is already registered under a different path`));
             continue;
@@ -851,22 +864,34 @@ export class BackupService {
    * registered identity — writing under the alias would land files the project never
    * reads while reporting them as imported. Null when neither spelling is registered.
    */
-  private async resolveRegisteredProjectPath(
+  private resolveRegisteredProjectPath(
     targetPath: string,
-    canonicalPath: string | null
-  ): Promise<string | null> {
-    const projects = this.config.loadConfigOrDefault().projects;
+    canonicalPath: string | null,
+    registry: RegisteredProjectLookup
+  ): string | null {
     const resolved = path.resolve(targetPath);
-    if (projects.has(resolved)) return resolved;
+    if (registry.keys.has(resolved)) return resolved;
     if (canonicalPath === null) return null;
-    if (projects.has(canonicalPath)) return canonicalPath;
+    if (registry.keys.has(canonicalPath)) return canonicalPath;
     // Registered keys may themselves be aliases (a project added through a symlinked
     // parent), so the target's real path is compared with each registered project's real
     // path rather than only looked up literally.
-    for (const registered of projects.keys()) {
-      if ((await realpathOrNull(registered)) === canonicalPath) return registered;
+    return registry.byCanonical.get(canonicalPath) ?? null;
+  }
+
+  /**
+   * Registered project keys and their real paths, resolved once per restore: resolving
+   * them per candidate would cost registered × approved filesystem calls, and registered
+   * paths on slow mounts would make the restore look hung.
+   */
+  private async registeredProjectLookup(): Promise<RegisteredProjectLookup> {
+    const keys = new Set(this.config.loadConfigOrDefault().projects.keys());
+    const byCanonical = new Map<string, string>();
+    for (const registered of keys) {
+      const canonical = await realpathOrNull(registered);
+      if (canonical !== null && !byCanonical.has(canonical)) byCanonical.set(canonical, registered);
     }
-    return null;
+    return { keys, byCanonical };
   }
 
   /** One notification per project whose memory changed; failed imports' partial writes count too. */
