@@ -87,12 +87,12 @@ import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import {
+  isProjectRegistrationFileLockHeld,
   isProjectRegistrationMutexHeld,
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
   withProjectRegistrationLock,
-  withProjectRegistrationMutex,
 } from "@/node/config/projectRegistrationLock";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
@@ -908,15 +908,13 @@ function normalizeAdvisorPositiveInteger(value: number | null, label: string): n
 
 /**
  * What an edit already holds of the project registration lock when it enters the queue:
- * `held` both legs (issued inside a restore or import window), `in-process` the mutex only
- * (editConfig's free path; the file lock is taken in the queue slot if needed), `none`.
+ * `held` (issued inside a window, or re-run under a lock editConfig took for it), or `none`.
  */
 type RegistrationLockState =
   | { kind: "held"; lock: ProjectRegistrationLockHandle }
-  | { kind: "in-process" }
   | { kind: "none" };
 
-/** Thrown inside the edit queue when a transform changes the project set without the lock. */
+/** Thrown inside the edit queue when a transform changes the project set while a window runs here. */
 class ProjectRegistrationLockRequired extends Error {
   constructor() {
     super("project registration lock required");
@@ -2230,37 +2228,26 @@ export class Config {
   private async enqueueGatedConfigEdit(
     fn: (config: ProjectsConfig) => ProjectsConfig
   ): Promise<void> {
-    // Mutex free: taken now, around this one edit. Its free path runs synchronously, so the
-    // edit keeps its place in the queue relative to edits issued around it. The cross-process
-    // leg is tried inside the queue slot; only when another process holds it does the edit
-    // step out of the queue to wait, so no other edit is held up behind a wait on another
-    // process.
-    if (!isProjectRegistrationMutexHeld(this.rootDir)) {
-      return withProjectRegistrationMutex(this.rootDir, async () => {
-        try {
-          return await this.enqueueConfigEdit(fn, { kind: "in-process" });
-        } catch (error) {
-          if (!(error instanceof ProjectRegistrationLockContended)) throw error;
-          return withProjectRegistrationFileLock(this.rootDir, (lock) =>
-            this.enqueueConfigEdit(fn, { kind: "held", lock })
-          );
-        }
-      });
-    }
-    // Mutex held (a restore or an import window is running in this process, and with it the
-    // cross-process lock, so other processes are excluded already): edits that leave the
-    // project set alone go ahead under that hold; one that would change it is refused by the
-    // queue before writing and re-run under the full lock once the window ends. Its first run
-    // was discarded — nothing it mutated survives, since loadConfigOrDefault parses fresh
-    // bytes on every call — and it waits outside the queue, so no other edit is held up
-    // behind it.
+    // Straight into the queue, in call order: everything the edit needs is decided inside
+    // its slot, at write time. An edit that cannot commit there — it would change the project
+    // set while a window runs in this process, or another process holds the file lock — fails
+    // the slot before writing and is re-run here under the lock it lacked, outside the queue,
+    // so no other edit is held up behind its wait. Its first run was discarded: nothing it
+    // mutated survives, since loadConfigOrDefault parses fresh bytes on every call.
     try {
       return await this.enqueueConfigEdit(fn, { kind: "none" });
     } catch (error) {
-      if (!(error instanceof ProjectRegistrationLockRequired)) throw error;
-      return withProjectRegistrationLock(this.rootDir, (lock) =>
-        this.enqueueConfigEdit(fn, { kind: "held", lock })
-      );
+      if (error instanceof ProjectRegistrationLockRequired) {
+        return withProjectRegistrationLock(this.rootDir, (lock) =>
+          this.enqueueConfigEdit(fn, { kind: "held", lock })
+        );
+      }
+      if (error instanceof ProjectRegistrationLockContended) {
+        return withProjectRegistrationFileLock(this.rootDir, (lock) =>
+          this.enqueueConfigEdit(fn, { kind: "held", lock })
+        );
+      }
+      throw error;
     }
   }
 
@@ -2654,22 +2641,22 @@ export class Config {
               first.changesProjects ? registrationLock.lock : null
             );
           }
-          if (registrationLock.kind === "none") {
-            // Issued while a window runs in this process: the window's hold covers this edit
-            // against other processes. Changing the project set under it is not allowed, so
-            // that edit fails the slot before writing and editConfig re-runs it under the
-            // full lock once the window ends; see editConfig.
-            if (first.changesProjects) {
-              return yield* Effect.fail(new ProjectRegistrationLockRequired());
-            }
+          // Changing the project set while a window runs in this process is not allowed:
+          // the edit fails the slot before writing and editConfig re-runs it under the full
+          // lock once the window ends. Only windows take the mutex, so held means a window.
+          if (first.changesProjects && isProjectRegistrationMutexHeld(self.rootDir)) {
+            return yield* Effect.fail(new ProjectRegistrationLockRequired());
+          }
+          // Under a hold this process already has (a window's), the write is covered.
+          if (isProjectRegistrationFileLockHeld(self.rootDir)) {
             return yield* write(first.newConfig, null);
           }
-          // The in-process mutex is held; the cross-process leg is tried here, inside the
-          // queue slot so the edit keeps its order. Held by another process, the edit fails
-          // the slot and editConfig waits for the lock outside the queue. Under the lock the
-          // transform runs again on the bytes as they are: another process may have written
-          // config.json between the first run and the acquisition, and a snapshot from before
-          // it would clobber whatever that process wrote.
+          // Otherwise the cross-process leg is tried here, inside the queue slot so the edit
+          // keeps its order. Held by another process, the edit fails the slot and editConfig
+          // waits for the lock outside the queue. Under the lock the transform runs again on
+          // the bytes as they are: another process may have written config.json between the
+          // first run and the acquisition, and a snapshot from before it would clobber
+          // whatever that process wrote.
           yield* Effect.tryPromise({
             try: async () => {
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);

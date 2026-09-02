@@ -2839,17 +2839,15 @@ exit 1
         .then(() => {
           registered = true;
         });
-      // A window in this process waits too; an edit that leaves the project set alone does not.
+      // A window in this process waits too.
       let windowRan = false;
       const window = withProjectRegistrationLock(tempDir, () => {
         windowRan = true;
         return Promise.resolve();
       });
-      await config.editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }));
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 100));
       expect(registered).toBe(false);
       expect(windowRan).toBe(false);
-      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
 
       // The other process registers a project while ours waits: our transform must run again
       // on those bytes, or its pre-wait snapshot would clobber that registration.
@@ -2918,6 +2916,52 @@ exit 1
       const after = config.loadConfigOrDefault();
       expect(after.llmDebugLogs).toBe(true);
       expect(after.projects.has("/fake/registered-meanwhile")).toBe(true);
+    });
+
+    it("does not let a value-only edit slip past a foreign hold while another edit waits for it", async () => {
+      // A registration edit waiting for another process's hold must not make a concurrent
+      // value-only edit believe this process holds the lock: both have to wait, or the
+      // value-only edit's whole-config save drops what the other process registers.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let registered = false;
+      const registering = config
+        .editConfig((cfg) => {
+          cfg.projects.set("/fake/waiting-registration", { workspaces: [] });
+          return cfg;
+        })
+        .then(() => {
+          registered = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(registered).toBe(false);
+      let valueSaved = false;
+      const valueEdit = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          valueSaved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(valueSaved).toBe(false);
+
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/from-other-process", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await Promise.all([registering, valueEdit]);
+
+      const after = config.loadConfigOrDefault();
+      expect(after.llmDebugLogs).toBe(true);
+      expect(after.projects.has("/fake/waiting-registration")).toBe(true);
+      expect(after.projects.has("/fake/from-other-process")).toBe(true);
     });
 
     it("returns an Err when the registration lock cannot be taken", async () => {

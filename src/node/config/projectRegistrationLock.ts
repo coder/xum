@@ -10,17 +10,18 @@ import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concu
  * would now belong to a different local project) may land underneath it before the memory
  * does.
  *
- * Two legs. The in-process mutex serializes this process's own windows and edits and has a
- * synchronous free path — `Config.editConfig` relies on that so an edit taken under it keeps
- * its place in the config edit queue relative to edits issued around it. The cross-process
- * file lock excludes other processes: config.json is edited by the desktop or server process,
- * but also by standalone CLIs (`mux trust` creates a project entry when the project was never
- * added), each through its own `Config`, and every edit persists the whole file from the bytes
- * it read — so an edit that never touched the project set would still drop a registration
- * another process made in between. `Config.editConfig` therefore takes both legs itself for
- * every edit's read and write, whichever process or service the write comes from. Restore and
- * import windows hold both legs; edits issued inside such a window pass
- * `withinRegistrationLock` and take neither, since neither leg is reentrant.
+ * Two legs. The in-process mutex is taken only by windows — a restore, an import, a
+ * `ProjectService.create`, or a config edit that changes the project set and has to wait for
+ * one — and has a synchronous free path. The cross-process file lock excludes other processes:
+ * config.json is edited by the desktop or server process, but also by standalone CLIs
+ * (`mux trust` creates a project entry when the project was never added), each through its
+ * own `Config`, and every edit persists the whole file from the bytes it read — so an edit that
+ * never touched the project set would still drop a registration another process made in
+ * between. `Config.editConfig` therefore commits every edit only while this process holds the
+ * file lock (`isProjectRegistrationFileLockHeld`): under a window's hold, or under one it
+ * takes for the write itself. Restore and import windows hold both legs; edits issued inside
+ * such a window pass `withinRegistrationLock` and take neither, since neither leg is
+ * reentrant.
  *
  * Registration takes no memory lock and the restore takes this before the memory lock, so
  * the order is fixed.
@@ -76,34 +77,66 @@ export interface ProjectRegistrationLockHandle {
   assertStillOwned(): Promise<void>;
 }
 
-/** Cross-process leg only; the caller must already hold the in-process mutex. */
+/**
+ * Roots whose file lock this process currently holds (a count: a window may hold it while
+ * an edit inside the window is written). What `Config.editConfig` consults at write time —
+ * not whether the mutex is held, which an edit waiting for another process's hold also does
+ * without owning anything yet.
+ */
+const fileLockHolds = new Map<string, number>();
+
+export function isProjectRegistrationFileLockHeld(muxRoot: string): boolean {
+  return (fileLockHolds.get(path.resolve(muxRoot)) ?? 0) > 0;
+}
+
+function recordFileLockHold(muxRoot: string, lock: ProcessFileLock): ProcessFileLock {
+  const key = path.resolve(muxRoot);
+  fileLockHolds.set(key, (fileLockHolds.get(key) ?? 0) + 1);
+  return {
+    assertStillOwned: () => lock.assertStillOwned(),
+    [Symbol.asyncDispose]: async () => {
+      const remaining = (fileLockHolds.get(key) ?? 1) - 1;
+      if (remaining > 0) fileLockHolds.set(key, remaining);
+      else fileLockHolds.delete(key);
+      await lock[Symbol.asyncDispose]();
+    },
+  };
+}
+
+/** Cross-process leg only, waiting for another process's hold; not reentrant. */
 export async function withProjectRegistrationFileLock<T>(
   muxRoot: string,
   fn: (lock: ProjectRegistrationLockHandle) => Promise<T>
 ): Promise<T> {
-  await using lock = await acquireProcessFileLock({
-    lockPath: projectRegistrationLockFilePath(muxRoot),
-    timeoutMs: PROJECT_REGISTRATION_FILE_LOCK_TIMEOUT_MS,
-    label: "project registration lock",
-  });
+  await using lock = recordFileLockHold(
+    muxRoot,
+    await acquireProcessFileLock({
+      lockPath: projectRegistrationLockFilePath(muxRoot),
+      timeoutMs: PROJECT_REGISTRATION_FILE_LOCK_TIMEOUT_MS,
+      label: "project registration lock",
+    })
+  );
   return await fn(lock);
 }
 
 /**
  * The cross-process leg without waiting: the lock, or null when another process holds it.
- * `Config.editConfig` uses this inside its queue slot so an uncontended registration write
- * keeps its place in the edit queue, and only a contended one steps out of the queue to wait.
+ * `Config.editConfig` uses this inside its queue slot so an uncontended write keeps its place
+ * in the edit queue, and only a contended one steps out of the queue to wait.
  */
 export async function tryProjectRegistrationFileLock(
   muxRoot: string
 ): Promise<ProcessFileLock | null> {
   try {
     // The acquisition attempts the link before checking the deadline, so this is one attempt.
-    return await acquireProcessFileLock({
-      lockPath: projectRegistrationLockFilePath(muxRoot),
-      timeoutMs: 1,
-      label: "project registration lock",
-    });
+    return recordFileLockHold(
+      muxRoot,
+      await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(muxRoot),
+        timeoutMs: 1,
+        label: "project registration lock",
+      })
+    );
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Timed out acquiring")) return null;
     throw error;
