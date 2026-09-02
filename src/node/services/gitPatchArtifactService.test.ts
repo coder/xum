@@ -96,6 +96,7 @@ describe("GitPatchArtifactService coordination", () => {
     const childId = "child-reported";
     const freshChildId = "child-fresh";
     const removedChildId = "child-removed-since-snapshot";
+    const reactivatedChildId = "child-reactivated-since-snapshot";
     const execChild = (id: string) => ({
       path: path.join(projectPath, id),
       id,
@@ -112,6 +113,7 @@ describe("GitPatchArtifactService coordination", () => {
           execChild(childId),
           execChild(freshChildId),
           execChild(removedChildId),
+          execChild(reactivatedChildId),
         ],
       });
       return cfg;
@@ -183,6 +185,25 @@ describe("GitPatchArtifactService coordination", () => {
     });
     await service.maybeStartGeneration(parentId, removedChildId, onComplete, { config: snapshot });
     expect(await readSubagentGitPatchArtifact(parentSessionDir, removedChildId)).toBeNull();
+    expect(completedChildIds).toEqual([]);
+
+    // A snapshot child a client reactivated since (live workspace-turn execution) is committing
+    // again; generating from its checkout now would capture a partial continuation, so it is
+    // left to the continuation refresh.
+    await config.editConfig((cfg) => {
+      const entry = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((ws) => ws.id === reactivatedChildId);
+      if (entry) {
+        entry.taskExecutionId = "wst_reactivated";
+        entry.taskExecutionStatus = "running";
+      }
+      return cfg;
+    });
+    await service.maybeStartGeneration(parentId, reactivatedChildId, onComplete, {
+      config: snapshot,
+    });
+    expect(await readSubagentGitPatchArtifact(parentSessionDir, reactivatedChildId)).toBeNull();
     expect(completedChildIds).toEqual([]);
 
     // A snapshot child without an artifact still takes the normal generation path (pending

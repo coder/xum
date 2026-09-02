@@ -1,5 +1,5 @@
 import { log } from "@/node/services/log";
-import type { Config, ConfigStores, ProjectsConfig, WorkspaceSessionLocator } from "@/node/config";
+import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import type { CoreServices } from "@/node/services/coreServices";
@@ -212,13 +212,13 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
-  // Shared between initializeCore() and runStartupRecovery() so the completion log still
+  // Shared between initializeCore() and runStartupHousekeeping() so the completion log still
   // reports every step and the total wall time from the start of core init.
   private startupStartedAt: number | undefined;
   private readonly startupStepDurationsMs: Record<string, number> = {};
-  // Aborted by dispose(): background startup recovery must stop at its next step boundary and
-  // never start periodic services against services that are being torn down.
-  private readonly startupRecoveryAbort = new AbortController();
+  // Aborted by dispose(): background startup housekeeping must stop at its next step boundary
+  // and never start periodic services against services that are being torn down.
+  private readonly startupHousekeepingAbort = new AbortController();
 
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
@@ -305,7 +305,7 @@ export class ServiceContainer {
 
   async initialize(): Promise<void> {
     await this.initializeCore();
-    await this.runStartupRecovery();
+    await this.runStartupHousekeeping();
   }
 
   private async recordStartupStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
@@ -318,8 +318,11 @@ export class ServiceContainer {
   }
 
   /**
-   * Fast startup steps that request handling depends on. Safe to await before binding the
-   * server listener; the slow per-workspace recovery pass lives in runStartupRecovery().
+   * Everything request handling depends on, plus agent-task restart recovery. The server entry
+   * point awaits this before binding its listener: task recovery must finish before any client
+   * can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and it is
+   * bounded by the number of active tasks rather than by deployment size. The per-workspace
+   * housekeeping lives in runStartupHousekeeping().
    */
   async initializeCore(): Promise<void> {
     this.startupStartedAt = Date.now();
@@ -340,26 +343,24 @@ export class ServiceContainer {
     await this.recordStartupStep("experimentsService.initialize", () =>
       this.experimentsService.initialize()
     );
+
+    await this.recordStartupStep("taskService.recoverInterruptedTasks", () =>
+      this.taskService.recoverInterruptedTasks()
+    );
   }
 
   /**
-   * Workspace/task restart recovery plus background housekeeping. On large deployments this
-   * scales with the number of workspaces, so the server entry point runs it after the
-   * listener is bound instead of on the critical path to accepting connections.
-   *
-   * @param startupConfig - config snapshot from before the listener opened. TaskService's
-   *   stale-`starting` recovery must only judge tasks that were `starting` when the process
-   *   started, never a task a freshly connected client is legitimately starting, so a caller
-   *   that accepts connections before recovery must capture the snapshot before listening.
+   * Startup housekeeping that scales with the number of workspaces (chat restart retries and
+   * orphan sweeps, reported-task patch and cleanup passes, terminal-attention sweeps), then the
+   * periodic services. The server runs it after its listener is bound, so every step re-checks
+   * live state before mutating; dispose() cancels it at the next step boundary.
    */
-  async runStartupRecovery(
-    startupConfig: ProjectsConfig = this.config.loadConfigOrDefault()
-  ): Promise<void> {
-    const signal = this.startupRecoveryAbort.signal;
-    // Recovery is best-effort and runs while the server may already be serving requests: a
-    // failing recovery step must not skip the periodic services below (startup-time rule:
-    // never let background housekeeping take the app down).
-    // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.initialize().
+  async runStartupHousekeeping(): Promise<void> {
+    const signal = this.startupHousekeepingAbort.signal;
+    // Housekeeping is best-effort and may run while the server is already serving requests: a
+    // failing step must not skip the periodic services below (startup-time rule: never let
+    // background housekeeping take the app down).
+    // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.
     try {
       await this.recordStartupStep("workspaceService.initialize", () =>
         this.workspaceService.initialize()
@@ -368,18 +369,18 @@ export class ServiceContainer {
       log.error("[startup] WorkspaceService recovery failed", { error });
     }
     if (signal.aborted) {
-      log.info("[startup] Startup recovery cancelled by dispose before task recovery");
+      log.info("[startup] Startup housekeeping cancelled by dispose before task housekeeping");
       return;
     }
     try {
-      await this.recordStartupStep("taskService.initialize", () =>
-        this.taskService.initialize(startupConfig, { signal })
+      await this.recordStartupStep("taskService.runStartupHousekeeping", () =>
+        this.taskService.runStartupHousekeeping({ signal })
       );
     } catch (error: unknown) {
-      log.error("[startup] TaskService recovery failed", { error });
+      log.error("[startup] TaskService housekeeping failed", { error });
     }
     if (signal.aborted) {
-      log.info("[startup] Startup recovery cancelled by dispose before periodic services");
+      log.info("[startup] Startup housekeeping cancelled by dispose before periodic services");
       return;
     }
 
@@ -545,9 +546,9 @@ export class ServiceContainer {
   private async disposeOnce(): Promise<void> {
     const disposeStartedAt = performance.now();
     log.debug("[shutdown] ServiceContainer.dispose starting");
-    // Background startup recovery (server mode) must not start periodic services or keep
-    // issuing recovery work against the services torn down below.
-    this.startupRecoveryAbort.abort();
+    // Background startup housekeeping (server mode) must not start periodic services or keep
+    // issuing work against the services torn down below.
+    this.startupHousekeepingAbort.abort();
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.

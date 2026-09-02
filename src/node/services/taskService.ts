@@ -187,7 +187,6 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { hasInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   isActiveWorkspaceTurnTaskStatus,
   isWorkspaceTurnTaskId,
@@ -1728,20 +1727,10 @@ export class TaskService implements AgentTaskIntegration {
 
     let interrupted = false;
     let transitionedToInterrupted = false;
-    let resumeInFlight = false;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
       taskId,
       (ws) => {
-        // Startup recovery can run while clients are connected, and the run-store read above
-        // awaited. A resume of this run admitted since then owns this child's fate: it holds a
-        // run-keyed workflow admission (see workflowArchiveAdmission) from its synchronous entry
-        // until the run settles, so checking it inside this synchronous edit cannot miss an
-        // in-flight resume, and unrelated runs in the same workspace do not match.
-        if (hasInProcessWorkflowRun(inactiveOwner.runId)) {
-          resumeInFlight = true;
-          return;
-        }
         const previousStatus = ws.taskStatus;
         parentWorkspaceId = ws.parentWorkspaceId;
         interrupted = this.applyInterruptedTaskStatus(ws) === "interrupted";
@@ -1749,15 +1738,6 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
-    if (resumeInFlight) {
-      log.debug("Skipping workflow-owned task recovery; owner workflow is being resumed", {
-        taskId,
-        trigger,
-        ownerTaskId: inactiveOwner.ownerTaskId,
-        workflowRunId: inactiveOwner.runId,
-      });
-      return true;
-    }
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
@@ -2281,25 +2261,31 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * @param startupConfigSnapshot - config snapshot taken when the process started. When the server
-   *   binds its listener before running recovery, clients may already be creating tasks; judging
-   *   stale-`starting` recovery from this snapshot keeps those fresh tasks out of scope.
+   * Restart recovery for agent tasks followed by the startup housekeeping passes. The server
+   * entry point runs the two halves separately around its listener bind (see
+   * ServiceContainer.initializeCore / runStartupHousekeeping); desktop startup runs them back to back.
    */
-  async initialize(
-    startupConfigSnapshot?: ProjectsConfig,
-    options?: { signal?: AbortSignal }
-  ): Promise<void> {
+  async initialize(): Promise<void> {
+    await this.recoverInterruptedTasks();
+    await this.runStartupHousekeeping();
+  }
+
+  /**
+   * Re-establishes the tasks that were active when the process last exited: execution-handle
+   * mirrors, stale `starting` tasks, the queue drain, and the restart prompts for
+   * `awaiting_report`/`running` tasks. Bounded by the number of active tasks, not by deployment
+   * size. Must finish before any client can act on tasks: a stop, resume, or send racing these
+   * transitions would be overwritten or would resurrect a task the client just stopped, so the
+   * server binds its listener only after this resolves.
+   */
+  async recoverInterruptedTasks(): Promise<void> {
     const startupStartedAt = Date.now();
-    // Server-mode recovery runs after the listener is bound and can be cancelled by dispose();
-    // every size-dependent step below checks this (and returns) so teardown is neither delayed
-    // by nor raced with recovery work against disposed services.
-    const cancelled = (): boolean => options?.signal?.aborted === true;
-    const startupConfig = startupConfigSnapshot ?? this.config.loadConfigOrDefault();
+    const startupConfig = this.config.loadConfigOrDefault();
     const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) => task.taskStatus === "queued" && typeof task.id === "string"
     ).length;
 
-    log.info("[startup] TaskService.initialize starting", {
+    log.info("[startup] TaskService.recoverInterruptedTasks starting", {
       queuedTaskCountAtStartup,
     });
 
@@ -2328,10 +2314,7 @@ export class TaskService implements AgentTaskIntegration {
           const recovery = recoveries.get(task.id);
           assert(recovery != null, "stale starting task recovery is required");
           const entry = findWorkspaceEntry(config, task.id);
-          // Compare-and-set: recovery may run while clients are connected, so a task_stop that
-          // already persisted `interrupted` (or any other transition) must not be overwritten
-          // with the snapshot-derived status and relaunched by the queue drain below.
-          if (entry?.workspace.taskStatus !== "starting") continue;
+          if (!entry) continue;
           entry.workspace.taskStatus = recovery.status;
           if (recovery.acceptedPrompt) {
             // The initial prompt is already durable in chat history; clearing taskPrompt makes the
@@ -2434,7 +2417,6 @@ export class TaskService implements AgentTaskIntegration {
     let resumedRunningCount = 0;
     let skippedRunningDueToActiveDescendants = 0;
     let skippedRunningAlreadyStreaming = 0;
-    let skippedRunningNoLongerRunning = 0;
     let failedRunningCount = 0;
 
     for (const task of runningTasks) {
@@ -2449,35 +2431,6 @@ export class TaskService implements AgentTaskIntegration {
       ) {
         continue;
       }
-
-      // Recovery may run after the server is accepting connections. Re-read the live status so a
-      // task_stop that persisted `interrupted` since the snapshot is not undone by a restart nudge
-      // (sendMessage would treat that as a user-driven resume of the stopped task). The same check
-      // rides along as the send's admission probe: a stop can also land during the awaits between
-      // here and turn admission, and a guarded send skips the interrupted-task rescue entirely.
-      const taskId = task.id;
-      const admissionStale = (): boolean =>
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskStatus !==
-        "running";
-      if (admissionStale()) {
-        skippedRunningNoLongerRunning += 1;
-        continue;
-      }
-      // The restart nudge additionally requires no blocking active descendants; a client can
-      // spawn one after `taskIndex` was captured, so the probe re-derives that gate from fresh
-      // config at admission as well (pending guidance replays regardless, see above).
-      const restartNudgeAdmissionStale = (): boolean => {
-        const freshConfig = this.config.loadConfigOrDefault();
-        if (findWorkspaceEntry(freshConfig, taskId)?.workspace.taskStatus !== "running") {
-          return true;
-        }
-        return (
-          this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(
-            this.buildAgentTaskIndex(freshConfig),
-            taskId
-          ).length > 0
-        );
-      };
 
       const pendingGuidance = task.taskPendingGuidance ?? [];
       if (pendingGuidance.length > 0) {
@@ -2515,7 +2468,6 @@ export class TaskService implements AgentTaskIntegration {
           {
             synthetic: true,
             agentInitiated: true,
-            admissionStale,
             onAccepted: clearAcceptedPendingGuidance,
           }
         );
@@ -2531,9 +2483,8 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
-      // Recovery may run after the server is already accepting connections, so a client (or the
-      // queue drain above) can legitimately have this task streaming by now. Nudging it again
-      // would inject a spurious "Xum restarted" turn into a live stream.
+      // The queue drain above can have launched this task already; nudging it again would queue
+      // a spurious "Xum restarted" turn behind its first stream.
       if (this.aiService.isStreaming(task.id)) {
         skippedRunningAlreadyStreaming += 1;
         continue;
@@ -2578,14 +2529,7 @@ export class TaskService implements AgentTaskIntegration {
           reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           experiments: task.taskExperiments,
         },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          // Idle-only: a client turn that entered preflight after the isStreaming() check above
-          // must suppress this stale "Xum restarted" nudge instead of queueing it behind itself.
-          requireIdle: true,
-          admissionStale: restartNudgeAdmissionStale,
-        }
+        { synthetic: true, agentInitiated: true }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
@@ -2619,8 +2563,35 @@ export class TaskService implements AgentTaskIntegration {
       // Startup queue draining already ran before these interruptions freed slots.
       // Run it once more after recovery prompts so unrelated queued work is not stranded.
       await this.maybeStartQueuedTasks();
-      config = this.config.loadConfigOrDefault();
     }
+
+    log.info("[startup] TaskService.recoverInterruptedTasks completed", {
+      totalMs: Date.now() - startupStartedAt,
+      maybeStartQueuedTasksMs,
+      awaitingReportTaskCount: awaitingReportTasks.length,
+      resumedAwaitingReportCount,
+      skippedAwaitingReportDueToActiveDescendants,
+      failedAwaitingReportCount,
+      runningTaskCount: runningTasks.length,
+      resumedRunningCount,
+      skippedRunningDueToActiveDescendants,
+      skippedRunningAlreadyStreaming,
+      failedRunningCount,
+    });
+  }
+
+  /**
+   * Startup passes over every reported task and session directory: pending patch-artifact
+   * generation, reported-task cleanup, workflow garbage sweeps, and terminal-attention delivery.
+   * Scales with deployment size, so the server runs it after its listener is bound. Clients may
+   * therefore already be acting: every step re-checks live state before it mutates, and
+   * `options.signal` (aborted by dispose) stops the pass at the next step boundary so teardown
+   * neither waits for nor races housekeeping against disposed services.
+   */
+  async runStartupHousekeeping(options?: { signal?: AbortSignal }): Promise<void> {
+    const startupStartedAt = Date.now();
+    const cancelled = (): boolean => options?.signal?.aborted === true;
+    const config = this.config.loadConfigOrDefault();
 
     // Restart-safety for git patch artifacts:
     // - If xum crashed mid-generation, patch artifacts can be left "pending".
@@ -2634,6 +2605,9 @@ export class TaskService implements AgentTaskIntegration {
     for (const task of completedReportTasks) {
       if (cancelled()) return;
       if (!task.parentWorkspaceId) continue;
+      // A reported task that is streaming again (a client reactivated it) may be committing;
+      // the continuation refresh that runs when that turn ends generates its artifact.
+      if (this.aiService.isStreaming(task.id!)) continue;
       try {
         // Pass the loop snapshot: reloading config.json per reported task made this pass scale
         // with (reported tasks x config size) on large deployments.
@@ -2737,17 +2711,6 @@ export class TaskService implements AgentTaskIntegration {
     const totalMs = Date.now() - startupStartedAt;
     const completedPayload = {
       totalMs,
-      maybeStartQueuedTasksMs,
-      awaitingReportTaskCount: awaitingReportTasks.length,
-      resumedAwaitingReportCount,
-      skippedAwaitingReportDueToActiveDescendants,
-      failedAwaitingReportCount,
-      runningTaskCount: runningTasks.length,
-      resumedRunningCount,
-      skippedRunningDueToActiveDescendants,
-      skippedRunningAlreadyStreaming,
-      skippedRunningNoLongerRunning,
-      failedRunningCount,
       completedReportTaskCount: completedReportTasks.length,
       patchGenerationRecoveryMs,
       bestOfParentRecoveryCount: bestOfParentWorkspaceIds.size,
@@ -2759,9 +2722,9 @@ export class TaskService implements AgentTaskIntegration {
       cleanupReportedTasksMs,
     };
     if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
-      log.warn("[startup] TaskService.initialize completed", completedPayload);
+      log.warn("[startup] TaskService.runStartupHousekeeping completed", completedPayload);
     } else {
-      log.info("[startup] TaskService.initialize completed", completedPayload);
+      log.info("[startup] TaskService.runStartupHousekeeping completed", completedPayload);
     }
   }
 
@@ -10532,52 +10495,10 @@ export class TaskService implements AgentTaskIntegration {
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
       },
-      {
-        synthetic: true,
-        agentInitiated: true,
-        // Startup recovery runs while clients may be sending to this task: a user turn that
-        // entered preflight after the isStreaming() check must suppress the prompt instead of
-        // queueing it behind the user's turn (stream-end re-prompts if that turn ends unreported).
-        requireIdle: options?.reason === "startup",
-        // The status and descendant checks at the top of this method are one-shot reads; a
-        // task_stop or a newly spawned blocking descendant landing during the awaits since then
-        // must refuse admission rather than resume the coordinator.
-        admissionStale: () => {
-          const freshConfig = this.config.loadConfigOrDefault();
-          if (
-            findWorkspaceEntry(freshConfig, workspaceId)?.workspace.taskStatus !== "awaiting_report"
-          ) {
-            return true;
-          }
-          return (
-            this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(
-              this.buildAgentTaskIndex(freshConfig),
-              workspaceId
-            ).length > 0
-          );
-        },
-      }
+      { synthetic: true, agentInitiated: true }
     );
     const durationMs = Date.now() - startedAt;
     if (!sendResult.success) {
-      if (isWorkspaceBusyIdleOnlySend(sendResult.error)) {
-        // A client turn won admission first (only startup sends are idle-only). Nothing was
-        // sent, so hand the attempt back: a user's turn must not draw down the recovery budget.
-        await this.editWorkspaceEntry(
-          workspaceId,
-          (ws) => {
-            ws.taskRecoveryAttempts = Math.max(0, (ws.taskRecoveryAttempts ?? 0) - 1);
-          },
-          { allowMissing: true }
-        );
-        log.info("Skipped completion prompt: task became busy", {
-          workspaceId,
-          taskName: entry.workspace.name,
-          completionKind,
-          reason: options?.reason,
-        });
-        return false;
-      }
       log.error("Failed to prompt task for required completion", {
         workspaceId,
         taskName: entry.workspace.name,

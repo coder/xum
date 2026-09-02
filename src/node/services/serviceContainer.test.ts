@@ -221,88 +221,101 @@ describe("ServiceContainer", () => {
     );
   });
 
-  it("initializeCore resolves without waiting for task recovery", async () => {
+  it("initializeCore completes task recovery and leaves housekeeping to runStartupHousekeeping", async () => {
     services = new ServiceContainer(stores);
-    let releaseTaskInit: (() => void) | undefined;
-    const taskInitGate = new Promise<void>((resolve) => {
-      releaseTaskInit = resolve;
+    const callOrder: string[] = [];
+    let releaseTaskRecovery: (() => void) | undefined;
+    let taskRecoveryCalled: (() => void) | undefined;
+    const taskRecoveryCalledPromise = new Promise<void>((resolve) => {
+      taskRecoveryCalled = resolve;
     });
-    const taskInitializeSpy = spyOn(services.taskService, "initialize").mockImplementation(
-      () => taskInitGate
-    );
+    const recoverTasksSpy = spyOn(
+      services.taskService,
+      "recoverInterruptedTasks"
+    ).mockImplementation(() => {
+      callOrder.push("recoverTasks");
+      taskRecoveryCalled?.();
+      return new Promise<void>((resolve) => {
+        releaseTaskRecovery = resolve;
+      });
+    });
     const workspaceInitializeSpy = spyOn(
       services.workspaceService,
       "initialize"
-    ).mockImplementation(() => Promise.resolve());
-    const loadConfigSpy = spyOn(config, "loadConfigOrDefault");
-
-    await services.initializeCore();
-    expect(taskInitializeSpy).not.toHaveBeenCalled();
-    expect(workspaceInitializeSpy).not.toHaveBeenCalled();
-
-    const callOrder: string[] = [];
-    let taskInitCalled: (() => void) | undefined;
-    const taskInitCalledPromise = new Promise<void>((resolve) => {
-      taskInitCalled = resolve;
-    });
-    workspaceInitializeSpy.mockImplementation(() => {
+    ).mockImplementation(() => {
       callOrder.push("workspace");
       return Promise.resolve();
     });
-    taskInitializeSpy.mockImplementation(() => {
-      callOrder.push("task");
-      taskInitCalled?.();
-      return taskInitGate;
+    const taskHousekeepingSpy = spyOn(
+      services.taskService,
+      "runStartupHousekeeping"
+    ).mockImplementation(() => {
+      callOrder.push("taskHousekeeping");
+      return Promise.resolve();
     });
-    // The server entry point snapshots config before its listener opens and hands that exact
-    // snapshot to task recovery; recovery must not substitute a fresh load.
-    const preListenSnapshot = config.loadConfigOrDefault();
-    loadConfigSpy.mockClear();
 
-    let recoverySettled = false;
-    const recovery = services.runStartupRecovery(preListenSnapshot).then(() => {
-      recoverySettled = true;
+    let coreSettled = false;
+    const core = services.initializeCore().then(() => {
+      coreSettled = true;
     });
-    await taskInitCalledPromise;
-    expect(callOrder).toEqual(["workspace", "task"]);
-    expect(recoverySettled).toBe(false);
-    expect(taskInitializeSpy.mock.calls[0]?.[0]).toBe(preListenSnapshot);
-    expect(loadConfigSpy).not.toHaveBeenCalled();
+    await taskRecoveryCalledPromise;
+    // The listener must wait for task recovery (clients may otherwise race its transitions)...
+    expect(recoverTasksSpy).toHaveBeenCalledTimes(1);
+    expect(coreSettled).toBe(false);
+    releaseTaskRecovery?.();
+    await core;
+    // ...but not for the O(workspaces) housekeeping, which runs only when the caller asks for it.
+    expect(workspaceInitializeSpy).not.toHaveBeenCalled();
+    expect(taskHousekeepingSpy).not.toHaveBeenCalled();
 
-    releaseTaskInit?.();
-    await recovery;
-    expect(recoverySettled).toBe(true);
+    await services.runStartupHousekeeping();
+    expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping"]);
+    expect(taskHousekeepingSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("dispose cancels an in-flight startup recovery before the periodic services start", async () => {
+  it("dispose cancels in-flight startup housekeeping before the periodic services start", async () => {
     services = new ServiceContainer(stores);
-    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
-    let releaseTaskInit: (() => void) | undefined;
-    spyOn(services.taskService, "initialize").mockImplementation(
-      () =>
-        new Promise<void>((resolve) => {
-          releaseTaskInit = resolve;
-        })
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
     );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    let releaseTaskHousekeeping: (() => void) | undefined;
+    let housekeepingSignal: AbortSignal | undefined;
+    let taskHousekeepingCalled: (() => void) | undefined;
+    const taskHousekeepingCalledPromise = new Promise<void>((resolve) => {
+      taskHousekeepingCalled = resolve;
+    });
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation((options) => {
+      housekeepingSignal = options?.signal;
+      taskHousekeepingCalled?.();
+      return new Promise<void>((release) => {
+        releaseTaskHousekeeping = release;
+      });
+    });
     const heartbeatStart = spyOn(services.heartbeatService, "start");
     const idleCompactionStart = spyOn(services.idleCompactionService, "start");
 
     await services.initializeCore();
-    const recovery = services.runStartupRecovery();
-    // Task recovery is mid-flight when the process shuts down.
+    const housekeeping = services.runStartupHousekeeping();
+    await taskHousekeepingCalledPromise;
+    // Task housekeeping is mid-flight when the process shuts down.
     const disposed = services.dispose();
-    releaseTaskInit?.();
-    await recovery;
+    expect(housekeepingSignal?.aborted).toBe(true);
+    releaseTaskHousekeeping?.();
+    await housekeeping;
     await disposed;
 
     expect(heartbeatStart).not.toHaveBeenCalled();
     expect(idleCompactionStart).not.toHaveBeenCalled();
   });
 
-  it("runStartupRecovery starts the periodic services even when task recovery rejects", async () => {
+  it("runStartupHousekeeping starts the periodic services even when task housekeeping rejects", async () => {
     services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
     spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
-    spyOn(services.taskService, "initialize").mockImplementation(() =>
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation(() =>
       Promise.reject(new Error("terminal-attention store unreadable"))
     );
     const idleCompactionStart = spyOn(services.idleCompactionService, "start");
@@ -310,7 +323,7 @@ describe("ServiceContainer", () => {
     const agentStatusStart = spyOn(services.agentStatusService, "start");
 
     await services.initializeCore();
-    await services.runStartupRecovery();
+    await services.runStartupHousekeeping();
 
     expect(idleCompactionStart).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).toHaveBeenCalledTimes(1);

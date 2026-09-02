@@ -14,6 +14,7 @@ import {
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { log } from "@/node/services/log";
+import { isActiveWorkspaceTurnTaskStatus } from "@/node/services/taskHandleStore";
 import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
@@ -412,15 +413,17 @@ export class GitPatchArtifactService {
     }
 
     if (options?.config != null) {
-      // The caller's snapshot can predate a client removing this task. The updater below leaves an
-      // existing artifact untouched, so only a task with no artifact yet would get a fresh pending
-      // marker; re-read config for exactly those before creating one for a removed task.
+      // The caller's snapshot can predate a client removing or reactivating this task. The updater
+      // below leaves an existing artifact untouched, so only a task with no artifact yet would get
+      // a fresh pending marker; re-read config for exactly those. A removed task gets no artifact,
+      // and a reactivated one (live execution handle, so its checkout is changing again) is left
+      // to the continuation refresh that runs when that execution settles.
       const existing = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
-      if (
-        existing == null &&
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId) == null
-      ) {
-        return;
+      if (existing == null) {
+        const live = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
+        if (live == null || isActiveWorkspaceTurnTaskStatus(live.workspace.taskExecutionStatus)) {
+          return;
+        }
       }
     }
 

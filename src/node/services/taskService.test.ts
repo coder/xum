@@ -47,7 +47,6 @@ import {
 } from "@/node/services/taskHandleStore";
 import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { acquireWorkflowArchiveAdmission } from "@/node/services/workflows/workflowArchiveAdmission";
 import { log } from "@/node/services/log";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import type { WorkspaceForkParams } from "@/node/runtime/Runtime";
@@ -3439,80 +3438,12 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
   });
 
-  test("initialize judges stale starting tasks from the startup config snapshot", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-snapshot";
-    const staleStartingTaskId = "child-stale-starting";
-    const stoppedStartingTaskId = "child-stopped-starting";
-    const freshStartingTaskId = "child-fresh-starting";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentWorkspaceId),
-        projectWorkspace(projectPath, "stale", staleStartingTaskId, {
-          parentWorkspaceId,
-          agentId: "exec",
-          agentType: "exec",
-          taskStatus: "starting",
-          taskModelString: "openai:gpt-5.2",
-        }),
-        projectWorkspace(projectPath, "stopped", stoppedStartingTaskId, {
-          parentWorkspaceId,
-          agentId: "exec",
-          agentType: "exec",
-          taskStatus: "starting",
-          taskModelString: "openai:gpt-5.2",
-        }),
-      ],
-      testTaskSettings()
-    );
-    const startupSnapshot = config.loadConfigOrDefault();
-
-    // A client connected after the listener was bound: it is legitimately starting a new task and
-    // has stopped one of the snapshot's `starting` tasks before recovery applied its verdict.
-    await config.editConfig((cfg) => {
-      const workspaces = cfg.projects.get(projectPath)?.workspaces ?? [];
-      workspaces.push(
-        projectWorkspace(projectPath, "fresh", freshStartingTaskId, {
-          parentWorkspaceId,
-          agentId: "exec",
-          agentType: "exec",
-          taskStatus: "starting",
-          taskModelString: "openai:gpt-5.2",
-        })
-      );
-      const stopped = workspaces.find((workspace) => workspace.id === stoppedStartingTaskId);
-      if (stopped) stopped.taskStatus = "interrupted";
-      return cfg;
-    });
-
-    const isStreaming = mock((workspaceId: string) => workspaceId === staleStartingTaskId);
-    const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-
-    await taskService.initialize(startupSnapshot);
-
-    expect(findWorkspaceInConfig(config, staleStartingTaskId)?.taskStatus).toBe("running");
-    expect(findWorkspaceInConfig(config, freshStartingTaskId)?.taskStatus).toBe("starting");
-    expect(findWorkspaceInConfig(config, stoppedStartingTaskId)?.taskStatus).toBe("interrupted");
-    const messagedWorkspaceIds = (
-      sendMessage as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls.map((call) => call[0]);
-    expect(messagedWorkspaceIds).not.toContain(freshStartingTaskId);
-    expect(messagedWorkspaceIds).not.toContain(stoppedStartingTaskId);
-  });
-
   test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const parentWorkspaceId = "parent-restart-streaming";
     const streamingTaskId = "child-running-streaming";
     const idleTaskId = "child-running-idle";
-    const stoppedTaskId = "child-running-stopped";
 
     await saveWorkspaces(
       config,
@@ -3533,34 +3464,14 @@ describe("TaskService", () => {
           taskStatus: "running",
           taskModelString: "openai:gpt-5.2",
         }),
-        projectWorkspace(projectPath, "stopped", stoppedTaskId, {
-          parentWorkspaceId,
-          agentId: "exec",
-          agentType: "exec",
-          taskStatus: "running",
-          taskModelString: "openai:gpt-5.2",
-        }),
       ],
       testTaskSettings()
     );
 
+    // The queue drain can leave a task streaming before the running-task pass reaches it.
     const isStreaming = mock((workspaceId: string) => workspaceId === streamingTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
-    // A connected client stops one running task while recovery is resuming the others: the
-    // persisted `interrupted` status wins over the snapshot, so no restart nudge is sent.
-    const sendMessage = mock(async (workspaceId: string): Promise<Result<void>> => {
-      if (workspaceId === idleTaskId) {
-        await config.editConfig((cfg) => {
-          const stopped = cfg.projects
-            .get(projectPath)
-            ?.workspaces.find((workspace) => workspace.id === stoppedTaskId);
-          if (stopped) stopped.taskStatus = "interrupted";
-          return cfg;
-        });
-      }
-      return Ok(undefined);
-    });
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     await taskService.initialize();
@@ -3570,237 +3481,57 @@ describe("TaskService", () => {
     ).mock.calls.map((call) => call[0]);
     expect(messagedWorkspaceIds).toContain(idleTaskId);
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
-    expect(messagedWorkspaceIds).not.toContain(stoppedTaskId);
-    expect(findWorkspaceInConfig(config, stoppedTaskId)?.taskStatus).toBe("interrupted");
   });
 
-  test("startup recovery sends refuse admission once a task_stop lands mid-send", async () => {
+  test("startup phases stay partitioned: recovery resumes tasks, housekeeping prunes reported ones", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
-    const parentWorkspaceId = "parent-stop-mid-send";
-    const guidanceTaskId = "child-guidance-stopped-mid-send";
-    const nudgeTaskId = "child-running-stopped-mid-send";
-    const reportTaskId = "child-awaiting-report-stopped-mid-send";
+    const parentWorkspaceId = "parent-startup-phases";
+    const runningTaskId = "child-running-phases";
+    const reportedTaskId = "child-reported-phases";
 
     await saveWorkspaces(
       config,
       projectPath,
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
-        projectWorkspace(projectPath, "guidance", guidanceTaskId, {
-          parentWorkspaceId,
-          agentId: "exec",
-          agentType: "exec",
-          taskStatus: "running",
-          taskModelString: "openai:gpt-5.2",
-          taskPendingGuidance: [
-            { id: "guidance-1", message: "First correction", queueDispatchMode: "turn-end" },
-          ],
-        }),
-        projectWorkspace(projectPath, "nudge", nudgeTaskId, {
+        projectWorkspace(projectPath, "running", runningTaskId, {
           parentWorkspaceId,
           agentId: "exec",
           agentType: "exec",
           taskStatus: "running",
           taskModelString: "openai:gpt-5.2",
         }),
-        projectWorkspace(projectPath, "report", reportTaskId, {
+        projectWorkspace(projectPath, "reported", reportedTaskId, {
           parentWorkspaceId,
           agentId: "explore",
           agentType: "explore",
-          taskStatus: "awaiting_report",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
           taskModelString: "openai:gpt-5.2",
+          workflowTask: { runId: "wfr_startup_phases", stepId: "explore" },
         }),
       ],
       testTaskSettings()
     );
 
-    // The host re-evaluates internal.admissionStale at enqueue and at the session's admission
-    // gates. Model a task_stop persisting `interrupted` inside that window: the probe must flip
-    // from live to stale on the same send, and a stale send is refused (never resumed).
-    const probeBeforeStop: Record<string, boolean | undefined> = {};
-    const probeAfterStop: Record<string, boolean | undefined> = {};
-    const sendMessage = mock(
-      async (
-        workspaceId: string,
-        _message: string,
-        _options: unknown,
-        internal?: { admissionStale?: () => boolean; onAccepted?: () => Promise<void> | void }
-      ): Promise<Result<void>> => {
-        probeBeforeStop[workspaceId] = internal?.admissionStale?.();
-        await config.editConfig((cfg) => {
-          const stopped = cfg.projects
-            .get(projectPath)
-            ?.workspaces.find((workspace) => workspace.id === workspaceId);
-          if (stopped) stopped.taskStatus = "interrupted";
-          return cfg;
-        });
-        probeAfterStop[workspaceId] = internal?.admissionStale?.();
-        return Err("stopped before admission");
-      }
-    );
-    const { aiService } = createAIServiceMocks(config);
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+    const remove = createConfigBackedRemoveMock(config);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await taskService.initialize();
+    // The listener-gating phase only touches active tasks: no O(reported tasks) cleanup here.
+    await taskService.recoverInterruptedTasks();
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toEqual([runningTaskId]);
+    expect(remove).not.toHaveBeenCalled();
 
-    for (const taskId of [guidanceTaskId, nudgeTaskId, reportTaskId]) {
-      expect(probeBeforeStop[taskId]).toBe(false);
-      expect(probeAfterStop[taskId]).toBe(true);
-      expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
-    }
-    // A refused guidance replay keeps its durable reservation for the next resume.
-    expect(findWorkspaceInConfig(config, guidanceTaskId)?.taskPendingGuidance).toHaveLength(1);
-  });
-
-  test("initialize does not restore an execution mirror that a stop settled during reconciliation", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    const childTaskId = "child-stopped-during-reconcile";
-    const handleId = "wst_stopped_during_reconcile";
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push(
-        projectWorkspace(projectPath, "child-reconcile", childTaskId, {
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "reported",
-          reportedAt: "2026-08-10T00:00:00.000Z",
-          taskExecutionId: handleId,
-          taskExecutionStatus: "running",
-        })
-      );
-      return cfg;
-    });
-    const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
-    const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { taskService } = createTaskServiceHarness(config, { aiService });
-    const internals = taskService as unknown as {
-      taskHandleStore: TaskHandleStore;
-      workspaceTurnManager: WorkspaceTurnManager;
-      activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
-    };
-    await internals.taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, childTaskId, handleId, "running", {
-        turnId: "turn-reconcile",
-        createdAt: "2026-08-10T00:00:01.000Z",
-        updatedAt: "2026-08-10T00:00:01.000Z",
-      })
-    );
-
-    // A task_stop settles the handle while reconciliation is between its liveness check and its
-    // mirror write: the persisted terminal state must win over the pre-await snapshot.
-    const manager = internals.workspaceTurnManager;
-    const originalNormalize = manager.normalizeWorkspaceTurnRecord.bind(manager);
-    spyOn(manager, "normalizeWorkspaceTurnRecord").mockImplementation(async (record, options) => {
-      const normalized = await originalNormalize(record, options);
-      if (normalized?.handleId === handleId) {
-        await internals.taskHandleStore.upsertWorkspaceTurn({
-          ...normalized,
-          status: "interrupted",
-          updatedAt: "2026-08-10T00:00:02.000Z",
-        });
-        await config.editConfig((cfg) => {
-          const child = cfg.projects
-            .get(projectPath)
-            ?.workspaces.find((workspace) => workspace.id === childTaskId);
-          if (child) child.taskExecutionStatus = "interrupted";
-          return cfg;
-        });
-      }
-      return normalized;
-    });
-
-    await taskService.initialize();
-
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("interrupted");
-    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.get(childTaskId)).toBeUndefined();
-  });
-
-  test("initialize does not overwrite an execution handle a client installed during reconciliation", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    const childTaskId = "child-replaced-during-reconcile";
-    const oldHandleId = "wst_replaced_old";
-    const newHandleId = "wst_replaced_new";
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push(
-        projectWorkspace(projectPath, "child-replaced", childTaskId, {
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "reported",
-          reportedAt: "2026-08-10T00:00:00.000Z",
-          taskExecutionId: oldHandleId,
-          taskExecutionStatus: "running",
-        })
-      );
-      return cfg;
-    });
-    const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
-    const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { taskService } = createTaskServiceHarness(config, { aiService });
-    const internals = taskService as unknown as {
-      taskHandleStore: TaskHandleStore;
-      workspaceTurnManager: WorkspaceTurnManager;
-      activeWorkspaceTurnHandleByWorkspaceId: Map<
-        string,
-        { handleId: string; ownerWorkspaceId: string; accepted: boolean }
-      >;
-    };
-    await internals.taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, childTaskId, oldHandleId, "running", {
-        turnId: "turn-replaced-old",
-        createdAt: "2026-08-10T00:00:01.000Z",
-        updatedAt: "2026-08-10T00:00:01.000Z",
-      })
-    );
-
-    // While reconciliation awaits the old handle's liveness check, a client reawakens the child
-    // under a new handle: it persists the new record, repoints the mirror, and registers the new
-    // handle under its own settlement lock. The old record itself is untouched.
-    const manager = internals.workspaceTurnManager;
-    const originalNormalize = manager.normalizeWorkspaceTurnRecord.bind(manager);
-    spyOn(manager, "normalizeWorkspaceTurnRecord").mockImplementation(async (record, options) => {
-      const normalized = await originalNormalize(record, options);
-      if (normalized?.handleId === oldHandleId) {
-        await internals.taskHandleStore.upsertWorkspaceTurn(
-          workspaceTurnRecord(parentId, childTaskId, newHandleId, "running", {
-            turnId: "turn-replaced-new",
-            createdAt: "2026-08-10T00:00:03.000Z",
-            updatedAt: "2026-08-10T00:00:03.000Z",
-          })
-        );
-        await config.editConfig((cfg) => {
-          const child = cfg.projects
-            .get(projectPath)
-            ?.workspaces.find((workspace) => workspace.id === childTaskId);
-          if (child) {
-            child.taskExecutionId = newHandleId;
-            child.taskExecutionStatus = "running";
-          }
-          return cfg;
-        });
-        internals.activeWorkspaceTurnHandleByWorkspaceId.set(childTaskId, {
-          handleId: newHandleId,
-          ownerWorkspaceId: parentId,
-          accepted: true,
-        });
-      }
-      return normalized;
-    });
-
-    await taskService.initialize();
-
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toBe(newHandleId);
-    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.get(childTaskId)?.handleId).toBe(
-      newHandleId
-    );
+    // The background phase never resumes tasks (clients may be acting on them by now).
+    await taskService.runStartupHousekeeping();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(remove.mock.calls.map((call) => call[0])).toEqual([reportedTaskId]);
+    expect(findWorkspaceInConfig(config, reportedTaskId)).toBeUndefined();
   });
 
   test("initialize does not reload config.json per completed-report task", async () => {
@@ -13755,72 +13486,6 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, queuedChildId)?.taskPrompt).toBe("queued work");
   });
 
-  test("initialize leaves workflow-owned children alone while their run is being resumed", async () => {
-    const config = await createTestConfig(rootDir);
-
-    const projectPath = path.join(rootDir, "repo");
-    const runtimeConfig = { type: "local" as const };
-    const parentId = "parent-workflow-resuming";
-    const runningChildId = "child-workflow-resuming-running";
-    const workflowRunId = "wfr_interrupted_but_resuming";
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentId, { runtimeConfig }),
-        projectWorkspace(projectPath, "running", runningChildId, {
-          name: "agent_explore_running",
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "running",
-          taskModelString: defaultModel,
-          runtimeConfig,
-          workflowTask: { runId: workflowRunId, stepId: "running" },
-        }),
-      ],
-      testTaskSettings(10, 3)
-    );
-    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
-    await runStore.createRun({
-      id: workflowRunId,
-      workspaceId: parentId,
-      workflow: {
-        name: "interrupted",
-        description: "Interrupted",
-        scope: "built-in",
-        executable: true,
-      },
-      source: "export default function workflow() { return {}; }\n",
-      args: {},
-      now: "2026-05-29T00:00:00.000Z",
-    });
-    await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
-
-    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-
-    // A client resumed the owning run while recovery was reading it as interrupted: the resume
-    // holds a run-keyed workflow admission until the run settles, and recovery must neither
-    // interrupt the child (the resumed run owns it) nor nudge it as an orphaned running task.
-    {
-      using _resumeAdmission = acquireWorkflowArchiveAdmission(parentId, workflowRunId);
-      await taskService.initialize();
-    }
-    expect(findWorkspaceInConfig(config, runningChildId)?.taskStatus).toBe("running");
-    expect(sendMessage).not.toHaveBeenCalled();
-
-    // An unrelated run active in the same workspace must not shield the stale child.
-    {
-      using _otherRunAdmission = acquireWorkflowArchiveAdmission(parentId, "wfr_unrelated_run");
-      await taskService.initialize();
-    }
-    expect(findWorkspaceInConfig(config, runningChildId)?.taskStatus).toBe("interrupted");
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-
   test("initialize recovers parent tasks after interrupting inactive workflow children", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -14465,62 +14130,6 @@ describe("TaskService", () => {
       expect.any(Object),
       expect.objectContaining({ synthetic: true })
     );
-  });
-
-  test("startup completion prompt is idle-only and refunds its attempt when a client turn wins", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-    const parentId = "parent-idle-only";
-    const childId = "child-idle-only";
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "parent", parentId),
-        projectWorkspace(projectPath, "child", childId, {
-          name: "agent_explore_child",
-          parentWorkspaceId: parentId,
-          agentType: "explore",
-          taskStatus: "awaiting_report",
-          taskRecoveryAttempts: 2,
-        }),
-      ],
-      testTaskSettings(1, 3)
-    );
-
-    // A client turn entered preflight after the isStreaming() probe: idle-only sends skip.
-    const sendMessage = mock((..._args: unknown[]): Promise<Result<void, SendMessageError>> => {
-      const internal = _args[3] as { requireIdle?: boolean } | undefined;
-      if (internal?.requireIdle === true) {
-        return Promise.resolve(
-          Err({ type: "unknown", raw: "Workspace is busy; idle-only send was skipped." })
-        );
-      }
-      return Promise.resolve(Ok(undefined));
-    });
-    const { aiService } = createAIServiceMocks(config);
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-    const internals = taskService as unknown as {
-      promptTaskForRequiredCompletionTool: (
-        workspaceId: string,
-        options?: { reason?: "startup" | "stream_end" | "error" }
-      ) => Promise<boolean>;
-    };
-
-    await taskService.initialize();
-
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({ requireIdle: true });
-    // The skipped prompt sent nothing, so the recovery budget is untouched.
-    expect(findWorkspaceInConfig(config, childId)?.taskRecoveryAttempts).toBe(2);
-
-    // Stream-end prompts still queue behind whatever is running.
-    expect(
-      await internals.promptTaskForRequiredCompletionTool(childId, { reason: "stream_end" })
-    ).toBe(true);
-    expect(sendMessage.mock.calls[1]?.[3]).not.toMatchObject({ requireIdle: true });
-    expect(findWorkspaceInConfig(config, childId)?.taskRecoveryAttempts).toBe(3);
   });
 
   test("initialize uses legacy agentType when modern agentId is unavailable for awaiting_report tasks", async () => {
