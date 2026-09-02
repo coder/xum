@@ -2,9 +2,12 @@ import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { Context, Layer } from "effect";
+import { Context, Duration, Effect, Layer } from "effect";
+import { TestClock } from "effect/testing";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createConfigStores, type Config, type ConfigStores } from "@/node/config";
+import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as appLayers from "@/node/services/di/layers/app";
 import { MemoryMeta } from "@/node/services/di/tags";
 import { ServiceContainer } from "./serviceContainer";
@@ -141,6 +144,88 @@ describe("ServiceContainer", () => {
     // ManagedRuntime clears its cached context when its scope closes.
     expect(services.runtime.managed.cachedContext).toBeUndefined();
     // The afterEach dispose()+shutdown() pair then exercises the latched path.
+  });
+
+  it("exposes the runtime seams through the field and the Effect context", () => {
+    services = new ServiceContainer(stores);
+
+    const effectContext = services.toORPCContext()["effect/context"];
+
+    expect(Context.get(effectContext, AppFiberScopeTag)).toBe(services.appFiberScope);
+    expect(services.appFiberScope.state._tag).not.toBe("Closed");
+    expect(Context.get(effectContext, EffectRunnerTag)).toBe(services.runtime.get(EffectRunnerTag));
+  });
+
+  it("closes the AppFiberScope (interrupt + await) before the explicit teardown steps", async () => {
+    services = new ServiceContainer(stores);
+    const steps: string[] = [];
+    // An I/O-suspended occupant: never resolves on its own, records its cancel
+    // path and finalizer. Supervised fibers must be gone before any explicit
+    // teardown step so they can still use their dependencies while finalizing.
+    services.runtime.managed.runSync(
+      Effect.forkIn(
+        Effect.callback<void>(() =>
+          Effect.sync(() => {
+            steps.push("occupant-cancelled");
+          })
+        ).pipe(Effect.ensuring(Effect.sync(() => steps.push("occupant-finalized")))),
+        services.appFiberScope
+      )
+    );
+    // desktopBridgeServer.stop() is the first explicit teardown step after the
+    // shutdown latch.
+    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+      steps.push("bridge-stop");
+      return Promise.resolve(undefined);
+    });
+
+    await services.dispose();
+
+    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+    expect(steps).toEqual(["occupant-cancelled", "occupant-finalized", "bridge-stop"]);
+    expect(services.appFiberScope.state._tag).toBe("Closed");
+  });
+
+  it("runs the clock-driven workers on the runtime's clock", async () => {
+    // Inject a TestClock beneath the real graph: EffectRunnerLive captures it,
+    // so the workers' lifecycle fibers sleep on virtual time if (and only if)
+    // the container hands them the runtime's runner.
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    // IdleCompactionService.checkAllWorkspaces reads the config synchronously
+    // at the start of every check.
+    const loadConfigSpy = spyOn(services.config, "loadConfigOrDefault");
+    // HeartbeatService's observable lifecycle contract: the scheduler fiber is
+    // held in `startupTimeout` during the startup delay and moves to
+    // `checkInterval` once ticking (same shape heartbeatService.test.ts pins).
+    const heartbeatInternals = services.heartbeatService as unknown as {
+      startupTimeout: unknown;
+      checkInterval: unknown;
+    };
+
+    services.idleCompactionService.start();
+    services.heartbeatService.start();
+    expect(loadConfigSpy).not.toHaveBeenCalled();
+    expect(heartbeatInternals.startupTimeout).not.toBeNull();
+    expect(heartbeatInternals.checkInterval).toBeNull();
+
+    // Both workers wait one minute before their first tick.
+    await runtime.runPromise(TestClock.adjust(Duration.minutes(1)));
+
+    expect(loadConfigSpy).toHaveBeenCalledTimes(1);
+    expect(heartbeatInternals.startupTimeout).toBeNull();
+    expect(heartbeatInternals.checkInterval).not.toBeNull();
+
+    services.heartbeatService.stop();
+    services.idleCompactionService.stop();
   });
 
   it("surfaces a throwing layer as a synchronous constructor throw", () => {

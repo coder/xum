@@ -29,11 +29,20 @@
  *   `disposeAppRuntime` (the last dispose step) reorders nothing. It is wired
  *   now so that later phases (the streamManager engine core) have a fixed,
  *   bounded slot for scope-owned resources.
+ * - **Two runtime seams, not one handle.** Workers hold an `EffectRunner`
+ *   (`./effectRunner.ts`: context-bound, unsupervised, `R = never`) so they can
+ *   run on the runtime's `Clock` without ever holding the runtime; work that
+ *   shutdown must await forks into `AppFiberScope` (`./appFiberScope.ts`),
+ *   the one supervised resource, closed explicitly early in `dispose()` via
+ *   `closeScopeBounded` and re-closed idempotently by `disposeAppRuntime`.
  */
 import assert from "@/common/utils/assert";
-import { Context, Duration, Effect, Fiber, ManagedRuntime } from "effect";
+import { Context, Duration, Effect, Exit, Fiber, ManagedRuntime, Scope } from "effect";
 import type { Layer } from "effect";
-import { APP_RUNTIME_DISPOSE_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import {
+  APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS,
+  APP_RUNTIME_DISPOSE_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
 import { log } from "@/node/services/log";
 
 export interface AppRuntime<R> {
@@ -79,37 +88,63 @@ export function disposeAppRuntime(
   runtime: ManagedRuntime.ManagedRuntime<never, never>,
   timeoutMs: number = APP_RUNTIME_DISPOSE_TIMEOUT_MS
 ): Promise<void> {
-  return Effect.runPromise(disposeAppRuntimeEffect(runtime, timeoutMs));
+  return Effect.runPromise(
+    boundedTeardown("AppRuntime", "disposed", runtime.disposeEffect, timeoutMs)
+  );
 }
 
-function disposeAppRuntimeEffect(
-  runtime: ManagedRuntime.ManagedRuntime<never, never>,
+/**
+ * Close a runtime-owned scope (`AppFiberScope`), interrupting and awaiting the
+ * fibers forked into it, bounded by `timeoutMs`. Same contract as
+ * `disposeAppRuntime`: never rejects, idempotent (`Scope.close` on a closed
+ * scope is a no-op), warns and returns at the bound if a fiber's finalization
+ * hangs.
+ */
+export function closeScopeBounded(
+  scope: Scope.Closeable,
+  timeoutMs: number = APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS
+): Promise<void> {
+  return Effect.runPromise(
+    boundedTeardown("AppFiberScope", "closed", Scope.close(scope, Exit.void), timeoutMs)
+  );
+}
+
+/**
+ * Uninterruptible teardown shell around a bounded wait on `target`. The target
+ * runs in a detached fiber and the caller waits on its join, so a hung
+ * finalizer cannot pin shutdown past the bound — only the wait is
+ * interruptible (so the timeout can win the race; house shape from #4038),
+ * the target keeps running best-effort, and a warning is logged. Defects are
+ * folded into a warning so the returned effect never fails.
+ */
+function boundedTeardown(
+  subject: string,
+  doneVerb: string,
+  target: Effect.Effect<void>,
   timeoutMs: number
 ): Effect.Effect<void> {
   const startedAt = performance.now();
-  // Uninterruptible teardown shell; only the bounded wait inside is interruptible
-  // so the timeout can win the race (house shape from #4038).
   return Effect.uninterruptible(
     Effect.gen(function* () {
-      const closing = yield* Effect.forkDetach(runtime.disposeEffect);
+      const closing = yield* Effect.forkDetach(target);
       yield* Effect.interruptible(
         Fiber.join(closing).pipe(Effect.timeout(Duration.millis(timeoutMs)))
       ).pipe(
         Effect.catchTag("TimeoutError", () =>
           Effect.sync(() => {
-            log.warn("[shutdown] AppRuntime dispose timed out; finalizers continue best-effort", {
+            log.warn(`[shutdown] ${subject} teardown timed out; finalizers continue best-effort`, {
               timeoutMs,
             });
           })
         )
       );
-      log.debug("[shutdown] AppRuntime disposed", {
+      log.debug(`[shutdown] ${subject} ${doneVerb}`, {
         ms: Math.round(performance.now() - startedAt),
       });
     }).pipe(
       Effect.catchDefect((defect) =>
         Effect.sync(() => {
-          log.warn("[shutdown] AppRuntime dispose failed", { error: defect });
+          log.warn(`[shutdown] ${subject} teardown failed`, { error: defect });
         })
       )
     )

@@ -81,7 +81,15 @@ import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { ORPCContext } from "@/node/orpc/context";
-import { disposeAppRuntime, makeAppRuntime, type AppRuntime } from "@/node/services/di/appRuntime";
+import type { Scope } from "effect";
+import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
+import {
+  closeScopeBounded,
+  disposeAppRuntime,
+  makeAppRuntime,
+  type AppRuntime,
+} from "@/node/services/di/appRuntime";
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import { AppLive } from "@/node/services/di/layers/app";
 import { MemoryMeta, type AppTags } from "@/node/services/di/tags";
 /**
@@ -97,6 +105,11 @@ import { MemoryMeta, type AppTags } from "@/node/services/di/tags";
  */
 export class ServiceContainer {
   public readonly runtime: AppRuntime<AppTags>;
+  /**
+   * Supervised fiber scope owned by the runtime (`di/appFiberScope.ts`).
+   * Closed early in `dispose()`; no production occupant yet.
+   */
+  public readonly appFiberScope: Scope.Closeable;
   public readonly workflowRuntimeFactory = new QuickJSRuntimeFactory();
   public readonly config: Config;
   public readonly sessionLocator: WorkspaceSessionLocator;
@@ -172,6 +185,10 @@ export class ServiceContainer {
     // constructor, like any service constructor) before the constructor-wired
     // services so layer-provided instances can be passed into them.
     this.runtime = makeAppRuntime(AppLive(stores));
+    this.appFiberScope = this.runtime.get(AppFiberScopeTag);
+    // Clock-driven workers run their lifecycle fibers through the runtime's
+    // context-bound runner (unsupervised; see di/effectRunner.ts).
+    const effectRunner = this.runtime.get(EffectRunnerTag);
     const config = stores.config;
     this.config = config;
     this.sessionLocator = stores.sessionLocator;
@@ -294,7 +311,8 @@ export class ServiceContainer {
       config,
       this.historyService,
       this.extensionMetadata,
-      (workspaceId) => this.workspaceService.executeIdleCompaction(workspaceId)
+      (workspaceId) => this.workspaceService.executeIdleCompaction(workspaceId),
+      effectRunner
     );
     // Forward terminal idle-compaction outcomes so the loop stops re-attempting a
     // persistently failing workspace (immediately on model_not_found, otherwise after
@@ -312,7 +330,8 @@ export class ServiceContainer {
       this.extensionMetadata,
       this.workspaceService,
       this.taskService,
-      this.idleDispatcher
+      this.idleDispatcher,
+      effectRunner
     );
     this.timelineService = new TimelineService(
       config,
@@ -762,6 +781,11 @@ export class ServiceContainer {
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.
     this.backgroundProcessManager.beginShutdown();
+    // Interrupt and await the runtime's supervised fibers while every dependency
+    // they might touch during finalization is still alive. Fixed here (before
+    // the explicit teardown) so later occupants do not re-derive the position;
+    // bounded and idempotent, and never rejects (di/appRuntime.ts).
+    await closeScopeBounded(this.appFiberScope);
     // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();

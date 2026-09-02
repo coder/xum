@@ -20,6 +20,8 @@ import type {
   WorkspaceSessionLocator,
 } from "@/node/config";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
+import type { AppFiberScopeTag } from "./appFiberScope";
+import type { EffectRunnerTag } from "./effectRunner";
 
 export class ConfigTag extends Context.Service<ConfigTag, Config>()("xum/Config") {}
 export class SessionLocatorTag extends Context.Service<
@@ -50,5 +52,11 @@ export type StoreTags =
   | SecretsStoreTag
   | FileLeaseManagerTag;
 
+/**
+ * The runtime seams provided at the base of every graph (`./effectRunner.ts`,
+ * `./appFiberScope.ts`); their tags live next to their layers.
+ */
+export type RuntimeSeamTags = EffectRunnerTag | AppFiberScopeTag;
+
 /** Every service the desktop/server app graph (`AppLive`) provides. */
-export type AppTags = StoreTags | MemoryMeta;
+export type AppTags = StoreTags | RuntimeSeamTags | MemoryMeta;

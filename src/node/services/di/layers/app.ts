@@ -1,5 +1,7 @@
 import { Layer } from "effect";
 import type { ConfigStores } from "@/node/config";
+import { AppFiberScopeLive } from "@/node/services/di/appFiberScope";
+import { EffectRunnerLive } from "@/node/services/di/effectRunner";
 import type { AppTags } from "@/node/services/di/tags";
 import { MemoryMetaLive } from "./core";
 import { StoresLive } from "./stores";
@@ -12,7 +14,14 @@ import { StoresLive } from "./stores";
  * right-hand operand satisfies the left-hand operand's requirements and both
  * stay exposed in the final context. `Layer.mergeAll` is only for true
  * siblings; it does not satisfy one sibling's requirements from another.
+ *
+ * The runtime seams sit at the base, above the stores: `EffectRunnerLive`
+ * captures its building context, so placing it there keeps that context to the
+ * stores plus references (`Clock`, …).
  */
 export function AppLive(stores: ConfigStores): Layer.Layer<AppTags> {
-  return MemoryMetaLive.pipe(Layer.provideMerge(StoresLive(stores)));
+  const runtimeSeams = AppFiberScopeLive.pipe(
+    Layer.provideMerge(EffectRunnerLive.pipe(Layer.provideMerge(StoresLive(stores))))
+  );
+  return MemoryMetaLive.pipe(Layer.provideMerge(runtimeSeams));
 }

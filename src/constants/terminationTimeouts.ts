@@ -15,3 +15,10 @@ export const BACKUP_GIT_TIMEOUT_MS = 5 * 60 * 1000;
  * `desktop/main.ts` and `cli/server.ts` race the whole dispose against.
  */
 export const APP_RUNTIME_DISPOSE_TIMEOUT_MS = 2 * 1000;
+
+/**
+ * Bounds the early `AppFiberScope` close in `ServiceContainer.dispose()`
+ * (interrupt + await of supervised fibers). Together with the runtime dispose
+ * bound this fits inside the same 5 s quit budgets.
+ */
+export const APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS = 2 * 1000;

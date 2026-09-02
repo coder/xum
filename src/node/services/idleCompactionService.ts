@@ -1,13 +1,14 @@
 import { Duration, Effect, Exit, Schedule, Scope } from "effect";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
 import { log } from "./log";
 
-const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
-const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+export const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
+export const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const HOURS_TO_MS = 60 * 60 * 1000;
 
 /**
@@ -46,6 +47,12 @@ export class IdleCompactionService {
   private readonly extensionMetadata: ExtensionMetadataService;
   private readonly executeIdleCompaction: (workspaceId: string) => Promise<void>;
   /**
+   * Runs the checker fork and the scope close. Context-bound in the app (the
+   * checker reads the runtime's `Clock` — a `TestClock` in tests); the global
+   * runtime by default.
+   */
+  private readonly runner: EffectRunner;
+  /**
    * Owns the checker fiber forked by start(): sleep(INITIAL_CHECK_DELAY_MS),
    * then check immediately and every CHECK_INTERVAL_MS. Closing the scope in
    * stop() interrupts the fiber, synchronously clearing its pending timer.
@@ -66,12 +73,14 @@ export class IdleCompactionService {
     config: Config,
     historyService: HistoryService,
     extensionMetadata: ExtensionMetadataService,
-    executeIdleCompaction: (workspaceId: string) => Promise<void>
+    executeIdleCompaction: (workspaceId: string) => Promise<void>,
+    runner: EffectRunner = defaultEffectRunner
   ) {
     this.config = config;
     this.historyService = historyService;
     this.extensionMetadata = extensionMetadata;
     this.executeIdleCompaction = executeIdleCompaction;
+    this.runner = runner;
   }
 
   /**
@@ -100,7 +109,7 @@ export class IdleCompactionService {
     // Runs synchronously up to the checker's first sleep, so the initial-delay
     // timer is registered before start() returns (same as the previous
     // setTimeout call).
-    Effect.runSync(Effect.forkIn(checker, scope));
+    this.runner.runSync(Effect.forkIn(checker, scope));
 
     log.info("IdleCompactionService started", {
       initialDelayMs: INITIAL_CHECK_DELAY_MS,
@@ -119,7 +128,7 @@ export class IdleCompactionService {
       this.lifecycleScope = null;
       // Interrupts the checker fiber, synchronously clearing its pending
       // timer — the fiber only ever suspends on its clock timer.
-      Effect.runSync(Scope.close(scope, Exit.void));
+      this.runner.runSync(Scope.close(scope, Exit.void));
     }
 
     // Best-effort queue reset: do not start new compactions after stop().
