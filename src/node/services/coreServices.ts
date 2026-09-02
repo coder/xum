@@ -63,6 +63,11 @@ export interface CoreServicesOptions {
   mcpConfig?: Config;
   mcpServerManagerOptions?: MCPServerManagerOptions;
   workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
+  /**
+   * Layer-provided instance (desktop `ServiceContainer` builds it from its
+   * Effect graph, see `di/layers/core.ts`); default-constructed when absent.
+   */
+  memoryMetaService?: MemoryMetaService;
   /** Optional cross-cutting services (desktop creates before core services). */
   policyService?: PolicyService;
   telemetryService?: TelemetryService;
@@ -205,7 +210,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   // Agent memory (memory experiment): scope roots derive from Config (xum home
   // + session dirs); experiment gating happens per stream in AIService.
   // Host-local sidecar for user-owned memory metadata (pins + usage stats).
-  const memoryMetaService = new MemoryMetaService(config.rootDir);
+  const memoryMetaService = opts.memoryMetaService ?? new MemoryMetaService(config.rootDir);
   const memoryService = new MemoryService(config, memoryMetaService);
   turnRequestBuilderBindings.memoryService = memoryService;
 

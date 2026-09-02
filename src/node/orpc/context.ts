@@ -64,8 +64,8 @@ import type { OrpcEffectServices } from "@/node/orpc/effectContext";
 
 /**
  * `WithEffectContext` adds the `"effect/context"` key carrying the Effect
- * services available to Effect-native handlers (built via
- * `buildOrpcEffectContext` in the service container).
+ * services available to Effect-native handlers (the app runtime's built
+ * service context, `ServiceContainer.runtime.context`).
  */
 export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   config: Config;

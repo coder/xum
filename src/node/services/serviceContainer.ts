@@ -81,14 +81,22 @@ import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { ORPCContext } from "@/node/orpc/context";
-import { buildOrpcEffectContext } from "@/node/orpc/effectContext";
+import { disposeAppRuntime, makeAppRuntime, type AppRuntime } from "@/node/services/di/appRuntime";
+import { AppLive } from "@/node/services/di/layers/app";
+import { MemoryMeta, type AppTags } from "@/node/services/di/tags";
 /**
  * ServiceContainer - Central dependency container for all backend services.
  *
  * This class instantiates and wires together all services needed by the ORPC router.
  * Services are accessed via the ORPC context object.
+ *
+ * Services provided by the Effect Layer graph (`di/layers/app.ts`) are built
+ * first by `runtime` and handed to the constructor-wired remainder; the
+ * migration moves services into the graph incrementally (see the DI contract in
+ * `di/appRuntime.ts`).
  */
 export class ServiceContainer {
+  public readonly runtime: AppRuntime<AppTags>;
   public readonly workflowRuntimeFactory = new QuickJSRuntimeFactory();
   public readonly config: Config;
   public readonly sessionLocator: WorkspaceSessionLocator;
@@ -157,8 +165,13 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
+  private runtimeDisposed = false;
 
   constructor(stores: ConfigStores) {
+    // Built eagerly and synchronously (a layer body that throws fails the
+    // constructor, like any service constructor) before the constructor-wired
+    // services so layer-provided instances can be passed into them.
+    this.runtime = makeAppRuntime(AppLive(stores));
     const config = stores.config;
     this.config = config;
     this.sessionLocator = stores.sessionLocator;
@@ -193,6 +206,7 @@ export class ServiceContainer {
       ...stores,
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
+      memoryMetaService: this.runtime.get(MemoryMeta),
       policyService: this.policyService,
       telemetryService: this.telemetryService,
       analyticsService: this.analyticsService,
@@ -648,9 +662,9 @@ export class ServiceContainer {
    */
   toORPCContext(): Omit<ORPCContext, "headers"> {
     return {
-      // Pre-built Effect service context consumed by Effect-native oRPC
-      // handlers (see src/node/orpc/effectContext.ts).
-      "effect/context": buildOrpcEffectContext({ memoryMetaService: this.memoryMetaService }),
+      // The runtime's built service context, consumed by Effect-native oRPC
+      // handlers (`yield* MemoryMeta`; see src/node/orpc/effectContext.ts).
+      "effect/context": this.runtime.context,
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
       sessionLocator: this.sessionLocator,
@@ -776,5 +790,14 @@ export class ServiceContainer {
     this.providerService.dispose();
     await this.backgroundProcessManager.terminateAll();
     await this.timelineService.flush();
+    // Last: close the Effect runtime's scope. No layer owns finalizers yet, so
+    // this only releases the runtime; the position (after every explicit
+    // teardown step) is fixed now for later scope-owned occupants. Latched so
+    // the concurrent before-quit paths and dispose-then-shutdown callers cannot
+    // race a second close into the bounded wait.
+    if (!this.runtimeDisposed) {
+      this.runtimeDisposed = true;
+      await disposeAppRuntime(this.runtime.managed);
+    }
   }
 }

@@ -2,8 +2,11 @@ import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { Context, Layer } from "effect";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createConfigStores, type Config, type ConfigStores } from "@/node/config";
+import * as appLayers from "@/node/services/di/layers/app";
+import { MemoryMeta } from "@/node/services/di/tags";
 import { ServiceContainer } from "./serviceContainer";
 
 describe("ServiceContainer", () => {
@@ -107,5 +110,52 @@ describe("ServiceContainer", () => {
     await services.dispose();
 
     expect(closeAllSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("serves the layer-built MemoryMetaService through both the field and the Effect context", () => {
+    services = new ServiceContainer(stores);
+
+    const effectContext = services.toORPCContext()["effect/context"];
+
+    // One instance: constructor-wired consumers (memoryService, refineService)
+    // and Effect-native oRPC handlers (`yield* MemoryMeta`) must share state.
+    expect(Context.get(effectContext, MemoryMeta)).toBe(services.memoryMetaService);
+    expect(services.runtime.get(MemoryMeta)).toBe(services.memoryMetaService);
+  });
+
+  it("closes the Effect runtime as the last dispose step", async () => {
+    services = new ServiceContainer(stores);
+    const container = services;
+    let runtimeAliveAtLastExplicitStep: boolean | undefined;
+    // timelineService.flush() is the final explicit teardown step; the runtime
+    // must still be alive when it runs and gone once dispose() resolves.
+    const flushSpy = spyOn(services.timelineService, "flush").mockImplementation(() => {
+      runtimeAliveAtLastExplicitStep = container.runtime.managed.cachedContext !== undefined;
+      return Promise.resolve(undefined);
+    });
+
+    await services.dispose();
+
+    expect(flushSpy).toHaveBeenCalledTimes(1);
+    expect(runtimeAliveAtLastExplicitStep).toBe(true);
+    // ManagedRuntime clears its cached context when its scope closes.
+    expect(services.runtime.managed.cachedContext).toBeUndefined();
+    // The afterEach dispose()+shutdown() pair then exercises the latched path.
+  });
+
+  it("surfaces a throwing layer as a synchronous constructor throw", () => {
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      Layer.sync(MemoryMeta, () => {
+        throw new Error("layer boom");
+      }).pipe(Layer.provideMerge(realAppLive(appStores)))
+    );
+    try {
+      // Same shape as a throwing service constructor, so the entry points'
+      // existing startup catch paths (dialog / log-and-exit) apply unchanged.
+      expect(() => new ServiceContainer(stores)).toThrow("layer boom");
+    } finally {
+      appLiveSpy.mockRestore();
+    }
   });
 });
