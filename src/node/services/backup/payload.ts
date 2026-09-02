@@ -3137,16 +3137,50 @@ export async function writeProjectMemoryOrigin(
   if (content.length > MAX_PROJECT_MEMORY_ORIGIN_BYTES) {
     throw new Error("Cannot record the imported project's origin: the marker is too large");
   }
-  // The source's record first, then the project's. Should the second write fail, the
-  // source's old project (if any) still names a different source and this project's record
-  // still names its previous source, so the reader confirms neither new half: the previous
-  // associations stand, and the import is reported failed for a clean retry.
-  await writeProjectMemoryOriginRecord(root, projectMemoryOriginPath(sourcePath), content);
-  await writeProjectMemoryOriginRecord(
-    root,
-    projectMemoryOriginTargetPath(localMemoryDir),
-    content
-  );
+  // Two files cannot change atomically, so the source's record goes first and is put back
+  // the way it was if the project's record then cannot be written: otherwise a failed
+  // re-import of a source elsewhere would leave neither its old association nor its new one
+  // with two agreeing halves, and later restores would stop matching the project it still
+  // lives in. The restore is best effort under the same I/O conditions that failed the
+  // write; if it fails too, the reader confirms neither half rather than a wrong one.
+  const sourceRecord = projectMemoryOriginPath(sourcePath);
+  const previous = await readProjectMemoryOriginRecordBytes(root, sourceRecord);
+  await writeProjectMemoryOriginRecord(root, sourceRecord, content);
+  try {
+    await writeProjectMemoryOriginRecord(
+      root,
+      projectMemoryOriginTargetPath(localMemoryDir),
+      content
+    );
+  } catch (error) {
+    if (previous === "absent") {
+      await fs.rm(absolutePathOf(root.path, sourceRecord), { force: true }).catch(() => undefined);
+    } else if (previous !== "unreadable") {
+      await writeProjectMemoryOriginRecord(root, sourceRecord, previous).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+/**
+ * A record's current bytes for putting it back, `"absent"` when there is none, and
+ * `"unreadable"` when it exists but cannot be read — in which case nothing can be restored,
+ * and the caller leaves the new record in place for the reader to refuse.
+ */
+async function readProjectMemoryOriginRecordBytes(
+  root: BackupRoot,
+  relativePath: string
+): Promise<Buffer | "absent" | "unreadable"> {
+  if ((await lstatIfExists(absolutePathOf(root.path, relativePath))) === null) return "absent";
+  try {
+    return (
+      await readCheckedFile(root, relativePath, (size) => {
+        if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
+      })
+    ).content;
+  } catch {
+    return "unreadable";
+  }
 }
 
 async function writeProjectMemoryOriginRecord(

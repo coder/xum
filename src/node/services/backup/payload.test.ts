@@ -3786,6 +3786,37 @@ describe("project bundle", () => {
     );
   });
 
+  it("puts the source's previous record back when the project-side write fails", async () => {
+    const source = "/home/dev/src/alpha";
+    const fresh = "/home/dev/src/epsilon";
+    const b = "/home/other/b";
+    const d = "/home/other/d";
+    const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), source);
+    // A directory squats on D's record, so only the second of the two writes can fail.
+    await fs.mkdir(originTargetPath(projectMemoryDirName(d)), { recursive: true });
+
+    // Moving the source from B to D fails halfway: the source's record had already been
+    // replaced, and without being put back neither A→B nor A→D would have two agreeing
+    // halves — a failed import would have cost the project its association.
+    const moved = await captureRejection(
+      writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), source)
+    );
+    expect(moved).toBeInstanceOf(Error);
+    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
+      projectPath: b,
+      memoryDir: projectMemoryDirName(b),
+    });
+
+    // A first-ever association that fails the same way leaves no half record behind.
+    await captureRejection(writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), fresh));
+    expect(await fs.lstat(originMarkerPath(fresh)).catch(() => null)).toBeNull();
+    const leftovers = (await fs.readdir(path.join(muxRoot, "memory", ".backup-origins"))).filter(
+      (name) => name.endsWith(".tmp")
+    );
+    expect(leftovers).toEqual([]);
+  });
+
   it("ignores markers that are broken, mis-named, or name an unregistered project", async () => {
     const registeredProject = "/home/other/a";
     const registered = new Map([[registeredProject, projectMemoryDirName(registeredProject)]]);
