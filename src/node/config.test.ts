@@ -543,6 +543,31 @@ describe("Config", () => {
       ]);
       expect(new Config(tempDir).loadConfigOrDefault().advisorMaxUsesPerTurn).toBe(6);
     });
+
+    it("invokes the edit callback exactly once, with or without waiting for the lock", async () => {
+      // Callbacks are not pure: TaskService.editWorkspaceEntry runs a caller-supplied updater
+      // inside one, and others record results into captured state. A discarded first run
+      // would let those side effects escape twice.
+      let calls = 0;
+      const count = (cfg: Parameters<Parameters<Config["editConfig"]>[0]>[0]) => {
+        calls += 1;
+        return cfg;
+      };
+      await config.editConfig(count);
+      expect(calls).toBe(1);
+
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = config.editConfig(count);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls).toBe(1);
+      await otherProcess[Symbol.asyncDispose]();
+      await waiting;
+      expect(calls).toBe(2);
+    });
   });
 
   describe("workspace tags", () => {

@@ -923,17 +923,6 @@ class ProjectRegistrationLockContended extends Error {
   }
 }
 
-function sameProjectKeys(
-  before: ReadonlySet<string>,
-  after: ReadonlyMap<string, unknown>
-): boolean {
-  if (before.size !== after.size) return false;
-  for (const key of after.keys()) {
-    if (!before.has(key)) return false;
-  }
-  return true;
-}
-
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -2604,17 +2593,12 @@ export class Config {
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    /** The transform on fresh bytes, and whether it changes the project set. */
-    const transform = (): { newConfig: ProjectsConfig; changesProjects: boolean } => {
-      const config = self.loadConfigOrDefault();
-      // Snapshotted before the transform, which usually mutates `config` in place.
-      const projectKeysBefore = new Set(config.projects.keys());
-      const newConfig = fn(config);
-      return {
-        newConfig,
-        changesProjects: !sameProjectKeys(projectKeysBefore, newConfig.projects),
-      };
-    };
+    /**
+     * The transform on fresh bytes. Invoked exactly once per edit, since `fn` need not be
+     * pure (callers run their own updaters and record results inside it): only after the
+     * edit holds the lock it will write under, so no invocation's result is discarded.
+     */
+    const transform = (): ProjectsConfig => fn(self.loadConfigOrDefault());
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -2641,27 +2625,35 @@ export class Config {
       Effect.uninterruptible(
         Effect.gen(function* () {
           // Effect.try keeps the pre-Effect contract: a throwing transform or a rejected
-          // corrupt-file gate reaches the caller as the raw original error. The gate runs
-          // here, before any lock work, so an unreadable config is refused for that reason
-          // and not for a lockfile it could not create; `write` re-checks it before saving.
-          const first = yield* Effect.try({
+          // corrupt-file gate reaches the caller as the raw original error.
+          if (registrationLock.kind === "held") {
+            const newConfig = yield* Effect.try({
+              try: () => {
+                const result = transform();
+                self.assertConfigWritable();
+                return result;
+              },
+              catch: (error) => error,
+            });
+            return yield* write(newConfig, registrationLock.lock);
+          }
+          // The gate runs here, before any lock work, so an unreadable config is refused for
+          // that reason and not for a lockfile it could not create; `write` re-checks it
+          // before saving. The load is what records a failed read for the gate; `fn` is not
+          // invoked until the edit holds the lock.
+          yield* Effect.try({
             try: () => {
-              const result = transform();
+              self.loadConfigOrDefault();
               self.assertConfigWritable();
-              return result;
             },
             catch: (error) => error,
           });
-          if (registrationLock.kind === "held") {
-            return yield* write(first.newConfig, registrationLock.lock);
-          }
           // The file lock is tried here, inside the queue slot so the edit keeps its order.
           // Held elsewhere — by another process, or by a window in this one — the edit fails
           // the slot and editConfig waits for the lock outside the queue, behind any edit
           // already waiting; while one is, the lock is not even tried, since taking it would
-          // put this edit ahead of that one. Under the lock the transform runs again on the
-          // bytes as they are: whoever held it may have written config.json since the first
-          // run, and a snapshot from before would clobber that.
+          // put this edit ahead of that one. The transform runs only under the lock, on the
+          // bytes as they are: whoever held it may have written config.json meanwhile.
           yield* Effect.tryPromise({
             try: async () => {
               if (self.lockWaiters !== null) {
@@ -2670,8 +2662,7 @@ export class Config {
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null)
                 throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
-              const fresh = transform();
-              await Effect.runPromise(write(fresh.newConfig, lock));
+              await Effect.runPromise(write(transform(), lock));
             },
             catch: (error) => error,
           });

@@ -2855,8 +2855,9 @@ exit 1
       expect(registered).toBe(false);
       expect(windowRan).toBe(false);
 
-      // The other process registers a project while ours waits: our transform must run again
-      // on those bytes, or its pre-wait snapshot would clobber that registration.
+      // The other process registers a project while ours waits: our transform must run on
+      // those bytes — once, under the lock — or a pre-wait snapshot would clobber that
+      // registration.
       const otherConfig = new Config(tempDir);
       await otherConfig.editConfig(
         (cfg) => {
@@ -2869,7 +2870,7 @@ exit 1
       await registering;
       await window;
 
-      expect(transformRuns).toBe(2);
+      expect(transformRuns).toBe(1);
       const projects = config.loadConfigOrDefault().projects;
       expect(projects.has("/fake/from-this-process")).toBe(true);
       expect(projects.has("/fake/from-other-process")).toBe(true);
