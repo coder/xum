@@ -4863,10 +4863,11 @@ export class WorkspaceTurnManager {
             return;
           }
           await this.taskHost.emitWorkspaceMetadata(taskId);
-          const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(taskId);
+          // A registration for this same handle that a live client turn already installed (and
+          // possibly marked accepted) is authoritative; only a missing registration is recovered.
           if (
             isActiveWorkspaceTurnTaskStatus(status) &&
-            (live == null || live.handleId === handleId)
+            this.activeWorkspaceTurnHandleByWorkspaceId.get(taskId) == null
           ) {
             this.activeWorkspaceTurnHandleByWorkspaceId.set(taskId, {
               handleId,

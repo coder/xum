@@ -13191,27 +13191,9 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
-  /**
-   * @param snapshot - optional config snapshot that only screens out ineligible tasks cheaply.
-   *   A positive verdict is always re-evaluated on freshly loaded config, because the snapshot
-   *   can predate a client reactivating or re-parenting the task.
-   */
   private async canCleanupReportedTask(
     workspaceId: string,
-    snapshot?: ProjectsConfig
-  ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
-    if (snapshot != null) {
-      const screened = await this.evaluateReportedTaskCleanup(workspaceId, snapshot);
-      if (!screened.ok) {
-        return screened;
-      }
-    }
-    return await this.evaluateReportedTaskCleanup(workspaceId, this.config.loadConfigOrDefault());
-  }
-
-  private async evaluateReportedTaskCleanup(
-    workspaceId: string,
-    config: ProjectsConfig
+    config: ProjectsConfig = this.config.loadConfigOrDefault()
   ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
     assert(workspaceId.length > 0, "canCleanupReportedTask: workspaceId must be non-empty");
 
@@ -13279,9 +13261,9 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * @param options.config - config snapshot used to screen the first (depth 0) eligibility check
-   *   only; a positive verdict is still confirmed on fresh config, and every later depth
-   *   re-evaluates the parent on fresh config because a removal just changed the tree.
+   * @param options.config - config snapshot used only to screen the first (depth 0) candidate
+   *   cheaply; deletion eligibility is always decided on fresh config under the lifecycle lock,
+   *   and every later depth re-evaluates the parent the same way after a removal changed the tree.
    * @returns the number of workspaces removed.
    */
   private async cleanupReportedLeafTask(
@@ -13305,25 +13287,42 @@ export class TaskService implements AgentTaskIntegration {
       }
       visited.add(currentWorkspaceId);
 
-      const cleanupEligibility = await this.canCleanupReportedTask(
-        currentWorkspaceId,
-        depth === 0 ? options?.config : undefined
-      );
-      if (!cleanupEligibility.ok) {
+      const targetWorkspaceId = currentWorkspaceId;
+      if (depth === 0 && options?.config != null) {
+        // The caller's snapshot only screens: it lets the (usual) ineligible majority return
+        // without a config parse or a lock acquisition. Deletion is decided on live state below.
+        const screened = await this.canCleanupReportedTask(targetWorkspaceId, options.config);
+        if (!screened.ok) {
+          return removedCount;
+        }
+      }
+      // Live eligibility and removal share one hold of the task-tree lifecycle lock:
+      // reactivation, re-parenting, and task_stop all mutate under that lock, so a task judged
+      // eligible here cannot change underneath the removal (the same pattern as task_remove).
+      const outcome = await this.withTaskTreeLifecycleLock(targetWorkspaceId, async () => {
+        const cleanupEligibility = await this.canCleanupReportedTask(targetWorkspaceId);
+        if (!cleanupEligibility.ok) {
+          return null;
+        }
+        const removeResult = await this.workspaceService.removeWhileTaskTreeLocked(
+          targetWorkspaceId,
+          true
+        );
+        return { parentWorkspaceId: cleanupEligibility.parentWorkspaceId, removeResult };
+      });
+      if (outcome == null) {
         return removedCount;
       }
-
-      const removeResult = await this.workspaceService.remove(currentWorkspaceId, true);
-      if (!removeResult.success) {
+      if (!outcome.removeResult.success) {
         log.error("Failed to auto-delete completed task workspace", {
           workspaceId: currentWorkspaceId,
-          error: removeResult.error,
+          error: outcome.removeResult.error,
         });
         return removedCount;
       }
       removedCount += 1;
 
-      currentWorkspaceId = cleanupEligibility.parentWorkspaceId;
+      currentWorkspaceId = outcome.parentWorkspaceId;
     }
 
     log.error("cleanupReportedLeafTask: exceeded max parent traversal depth", {
