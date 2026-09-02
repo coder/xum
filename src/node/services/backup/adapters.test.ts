@@ -1518,6 +1518,10 @@ describe("backup adapters project bundle", () => {
     await runGit(["-C", project, "init"]);
     await runGit(["-C", project, "remote", "add", "origin", "git@github.com:dev/old.git"]);
     registerProject(project);
+    // The test double keeps the registry in memory; a real Config stamps a fresh writeId into
+    // the file on every save. Modelled here by hand, with two files of the same size, so the
+    // stamp alone is what distinguishes the writes.
+    await fs.writeFile(path.join(muxRoot, "config.json"), '{"writeId":"before"}\n', "utf-8");
     const payload = createBackupPayloadStore({ config });
     const gitRepo = createBackupGitRepo({ cacheRoot });
     const repository = await gitRepo.prepare(settings);
@@ -1525,8 +1529,7 @@ describe("backup adapters project bundle", () => {
     // Remotes are discovered outside the registration lock; the listing waits for it. While
     // it waits, the project is removed and another checkout registered at the same path with
     // the very same config — indistinguishable in the registry's content, so the write
-    // itself (the test double keeps the registry in memory; a real Config rewrites the file
-    // on every save) is what has to be seen.
+    // itself is what has to be seen.
     const held = Promise.withResolvers<void>();
     const lockAcquired = Promise.withResolvers<void>();
     const holding = withProjectRegistrationLock(muxRoot, async () => {
@@ -1534,7 +1537,7 @@ describe("backup adapters project bundle", () => {
       await held.promise;
       config.state.projects.delete(project);
       config.state.projects.set(project, { workspaces: [] });
-      await fs.writeFile(path.join(muxRoot, "config.json"), "{}\n", "utf-8");
+      await fs.writeFile(path.join(muxRoot, "config.json"), '{"writeId":"after-"}\n', "utf-8");
     });
     await lockAcquired.promise;
     const exporting = payload.exportTo({

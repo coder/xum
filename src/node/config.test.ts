@@ -570,6 +570,35 @@ describe("Config", () => {
     });
   });
 
+  describe("configFileWriteGeneration", () => {
+    it("differs between two saves of the same content", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      const withoutStamp = () => {
+        const { writeId, ...rest } = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+          writeId: unknown;
+        };
+        expect(typeof writeId).toBe("string");
+        return rest;
+      };
+      // The first save also persists load-time migrations; the two compared are steady-state.
+      await flushConfigEdits();
+      await config.editConfig((cfg) => cfg);
+      const first = await config.configFileWriteGeneration();
+      const firstContent = withoutStamp();
+      await config.editConfig((cfg) => cfg);
+      // Nothing but the stamp changed, and the stamp is what tells the two writes apart — a
+      // reader comparing generations around a window sees the second save even where mtime
+      // granularity and inode reuse would make the file look untouched.
+      expect(withoutStamp()).toEqual(firstContent);
+      expect(await config.configFileWriteGeneration()).not.toBe(first);
+      expect(
+        await new Config(
+          fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-"))
+        ).configFileWriteGeneration()
+      ).toBe("absent");
+    });
+  });
+
   describe("workspace tags", () => {
     it("persists programmatic tags through save/load and metadata mapping", async () => {
       await config.editConfig((cfg) => {

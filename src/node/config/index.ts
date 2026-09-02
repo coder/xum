@@ -1893,6 +1893,8 @@ export class Config {
       const data: Partial<Record<keyof AppConfigOnDisk, unknown>> & {
         projects: Array<[string, ProjectConfig]>;
       } = {
+        // Stamped by every save; see configFileWriteGeneration.
+        writeId: crypto.randomUUID(),
         projects: Array.from(config.projects.entries()).map(([projectPath, projectConfig]) => {
           const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
           const persistedProjectConfig = {
@@ -2187,21 +2189,39 @@ export class Config {
   }
 
   /**
-   * The config file as a write generation: its inode, mtime, and size, which every save
-   * changes — a save renames a fresh file into place — even when the bytes written are the
-   * ones already there, and whichever process wrote it. For a caller that reads the project
-   * registry at two points and needs to know whether anything happened in between: a
-   * registration, a removal, or a removal and a re-registration with identical config, which
-   * the registry's content alone cannot show. "absent" when there is no file.
+   * The config file as a write generation, for a caller that reads the project registry at
+   * two points and needs to know whether anything was written in between — a registration, a
+   * removal, or a removal and a re-registration with identical config, which the registry's
+   * content alone cannot show. Two parts: the `writeId` every save of this class stamps into
+   * the file, a fresh random value that two writes cannot share even when they write the same
+   * bytes (a timestamp can, on a filesystem with coarse mtimes, and so can an inode the
+   * allocator hands out again); and the file's inode, mtime, and size, for writers that do
+   * not stamp (an older build, the config tool), whose writes at least usually change those.
+   * "absent" when there is no file.
    */
   async configFileWriteGeneration(): Promise<string> {
+    let stat: fs.Stats;
     try {
-      const stat = await fs.promises.stat(this.configFile);
-      return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+      stat = await fs.promises.stat(this.configFile);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
       throw error;
     }
+    let writeId = "-";
+    try {
+      const parsed: unknown = JSON.parse(await fs.promises.readFile(this.configFile, "utf-8"));
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        typeof (parsed as { writeId?: unknown }).writeId === "string"
+      ) {
+        writeId = (parsed as { writeId: string }).writeId;
+      }
+    } catch {
+      // Unreadable or not JSON: the stat part still distinguishes most writes, and the
+      // caller's content comparison the rest it cares about.
+    }
+    return `${writeId}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
   }
 
   /**

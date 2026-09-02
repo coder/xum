@@ -309,7 +309,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * outside the registration lock; a project removed and another registered at the same path
    * during discovery would otherwise carry the removed project's remote into the new
    * project's entry. The listing under the lock uses the hints only if nothing has been
-   * written to the registry since: the config file's write generation changes on every save
+   * written to the registry since: the config file's write generation differs for every save
    * — so a removal and a re-registration with identical config, invisible in the content, is
    * seen — and the content is compared too. Conservative by design, since config records no
    * per-registration identity: any write in the window costs this export its hints, never
