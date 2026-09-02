@@ -11,6 +11,7 @@ import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { ProjectService, type CloneEvent } from "./projectService";
+import { withProjectRegistrationLock } from "@/node/services/refinement/targetMutationLocks";
 
 async function createLocalGitRepository(rootDir: string, repoName: string): Promise<string> {
   const repoPath = path.join(rootDir, repoName);
@@ -2707,6 +2708,37 @@ exit 1
       expect(result.success).toBe(false);
       if (result.success) throw new Error("Expected failure");
       expect(result.error.type).toBe("project_not_found");
+    });
+
+    it("waits for a settings-backup restore holding the registration lock", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, { workspaces: [] });
+      await config.editConfig(() => cfg);
+
+      // A restore writing this project's matched memory holds the lock; the removal must
+      // land after it, never between its registration read and its memory write.
+      const held = Promise.withResolvers<void>();
+      const lockAcquired = Promise.withResolvers<void>();
+      const holding = withProjectRegistrationLock(tempDir, async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      });
+      await lockAcquired.promise;
+
+      let removed = false;
+      const removing = service.remove(projectPath).then((result) => {
+        removed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(removed).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+
+      held.resolve();
+      await holding;
+      expect((await removing).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
     });
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {

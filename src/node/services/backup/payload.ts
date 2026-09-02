@@ -2847,16 +2847,14 @@ export async function assertManagedTreeWithinLimits(destinationDir: string): Pro
 /**
  * Existence is checked without parsing, so a malformed sidecar can be reported as present
  * while `includeProjects` is off without ever blocking a core-only restore on its contents.
+ * "Present" is anything at the sidecar path: a symlink or a stray file there is a bundle
+ * the full read refuses, and the toggle-off report should say so rather than "none".
  */
 export async function projectBundleExists(sourceDir: string): Promise<boolean> {
-  // lstat at both levels, never stat: on hosts where git materializes symlinks, a crafted
-  // sidecar directory or manifest pointing at a UNC path would otherwise be followed here —
-  // reached even with project backup off — and Windows would start SMB authentication. A
-  // symlinked directory or manifest is treated as absent; the full read refuses it anyway.
-  const bundleDir = path.join(sourceDir, PROJECT_BUNDLE_DIR);
-  if ((await lstatOrNull(bundleDir))?.isDirectory() !== true) return false;
-  const stat = await lstatOrNull(path.join(bundleDir, BACKUP_MANIFEST_FILE));
-  return stat?.isFile() === true;
+  // lstat, never stat: on hosts where git materializes symlinks, a crafted sidecar pointing
+  // at a UNC path would otherwise be followed here — reached even with project backup off —
+  // and Windows would start SMB authentication.
+  return (await lstatIfExists(path.join(sourceDir, PROJECT_BUNDLE_DIR))) !== null;
 }
 
 function parseProjectBundleManifest(raw: string): BackupProjectBundleManifest {
@@ -2897,6 +2895,10 @@ function parseProjectBundleManifest(raw: string): BackupProjectBundleManifest {
  * Reads and fully validates the sidecar, or returns null when the backup carries none.
  * Callers gate this on `includeProjects`: with the toggle off the sidecar is never parsed,
  * so a malformed bundle cannot block a core-only restore.
+ *
+ * "None" means nothing at the sidecar path. Anything else there — a symlink, a file, a
+ * directory without its manifest — is a bundle the read below refuses: reading it as absent
+ * would apply the core restore while silently omitting every backed-up project.
  */
 export async function readProjectBundle(
   sourceDir: string,
@@ -2921,6 +2923,11 @@ async function readProjectBundleUnchecked(
   const budget = createByteBudget();
   const root = await resolveRoot(bundleDir);
   await resolveContainedPath(root.path, BACKUP_MANIFEST_FILE);
+  // Explicit, so a sidecar directory without its manifest is an invalid bundle rather than
+  // an ENOENT surfacing as an I/O failure.
+  if ((await lstatIfExists(path.join(root.path, BACKUP_MANIFEST_FILE)))?.isFile() !== true) {
+    throw new Error("Backup project bundle has no manifest");
+  }
   const manifestRaw = await readCheckedFile(root, BACKUP_MANIFEST_FILE, (size) => {
     budget(BACKUP_MANIFEST_FILE, size);
   });
@@ -3114,6 +3121,14 @@ export async function writeProjectMemoryOrigin(
   // corrupted Xum home) would otherwise be followed, and an approved import would replace a
   // file outside the memory tree with backup-controlled JSON.
   await resolveContainedPath(root.path, relativePath);
+  // The newest explicit association is the only one kept. A marker left by an earlier
+  // import of this source — its project since unregistered, or still registered — would
+  // otherwise survive as a second claim: re-registering that project later would make the
+  // source ambiguous, or match whichever project sorted first and overwrite its memory in
+  // matched mode without any approval.
+  for (const claim of await listProjectMemoryOriginClaims(root, sourcePath)) {
+    if (claim !== relativePath) await fs.unlink(absolutePathOf(root.path, claim));
+  }
   await writeCheckedFile(
     root,
     relativePath,
@@ -3122,38 +3137,72 @@ export async function writeProjectMemoryOrigin(
   );
 }
 
+/** Root-relative paths of every marker recording `sourcePath`, whichever project they name. */
+async function listProjectMemoryOriginClaims(
+  root: BackupRoot,
+  sourcePath: string
+): Promise<string[]> {
+  const entries = await fs
+    .readdir(absolutePathOf(root.path, PROJECT_MEMORY_ORIGINS_DIR), { withFileTypes: true })
+    .catch((error: unknown) => {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return [];
+      throw error;
+    });
+  const claims: string[] = [];
+  for (const entry of entries) {
+    // Dirent reports a symlink as neither file nor directory, so links are never read.
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const relativePath = `${PROJECT_MEMORY_ORIGINS_DIR}/${entry.name}`;
+    if ((await readProjectMemoryOriginSource(root, relativePath)) === sourcePath) {
+      claims.push(relativePath);
+    }
+  }
+  return claims;
+}
+
+/** The source a marker records, or null for a missing, unreadable, refused, or malformed one. */
+async function readProjectMemoryOriginSource(
+  root: BackupRoot,
+  relativePath: string
+): Promise<string | null> {
+  try {
+    // The checked reader refuses a symlinked directory or marker the same way the writer
+    // does, so a planted link cannot re-point a project at another source.
+    const { content } = await readCheckedFile(root, relativePath, (size) => {
+      if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
+    });
+    const parsed: unknown = JSON.parse(content.toString("utf-8"));
+    const sourcePath = isPlainObject(parsed) ? parsed.sourcePath : undefined;
+    return typeof sourcePath === "string" && sourcePath !== "" ? sourcePath : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Recorded source path → local project, for every registered project whose memory
- * directory carries an origin marker. Two projects claiming one source keep the first in
- * path order so the classification is deterministic; an unreadable marker is ignored.
+ * directory carries an origin marker. A source claimed by two registered projects is
+ * ambiguous and left unmatched (both are re-offered as imports): the writer removes older
+ * claims, so this arises only from a copied home or hand-placed markers, and picking one
+ * lexically would overwrite an arbitrary project's memory in matched mode without approval.
  */
 export async function readProjectMemoryOrigins(
   muxRoot: string,
   registeredDirByPath: ReadonlyMap<string, string>
 ): Promise<Map<string, ProjectMemoryOrigin>> {
   const root = await resolveRoot(muxRoot);
+  const claims = new Map<string, ProjectMemoryOrigin[]>();
+  for (const [projectPath, memoryDir] of registeredDirByPath) {
+    const sourcePath = await readProjectMemoryOriginSource(
+      root,
+      projectMemoryOriginPath(memoryDir)
+    );
+    if (sourcePath === null) continue;
+    claims.set(sourcePath, [...(claims.get(sourcePath) ?? []), { projectPath, memoryDir }]);
+  }
   const origins = new Map<string, ProjectMemoryOrigin>();
-  const registered = [...registeredDirByPath.entries()].sort(([a], [b]) => a.localeCompare(b));
-  for (const [projectPath, memoryDir] of registered) {
-    let sourcePath: unknown;
-    try {
-      // The checked reader refuses a symlinked directory or marker the same way the
-      // writer does, so a planted link cannot re-point a project at another source.
-      const { content } = await readCheckedFile(
-        root,
-        projectMemoryOriginPath(memoryDir),
-        (size) => {
-          if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
-        }
-      );
-      const parsed: unknown = JSON.parse(content.toString("utf-8"));
-      sourcePath = isPlainObject(parsed) ? parsed.sourcePath : undefined;
-    } catch {
-      // Missing, unreadable, or refused: the project simply has no recorded origin.
-      continue;
-    }
-    if (typeof sourcePath !== "string" || sourcePath === "" || origins.has(sourcePath)) continue;
-    origins.set(sourcePath, { projectPath, memoryDir });
+  for (const [sourcePath, projects] of claims) {
+    if (projects.length === 1) origins.set(sourcePath, projects[0]);
   }
   return origins;
 }

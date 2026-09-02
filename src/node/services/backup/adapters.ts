@@ -17,6 +17,7 @@ import { getProjectDisplayName } from "@/common/utils/subProjects";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import {
   memoryMutationLockKey,
+  withProjectRegistrationLock,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -670,86 +671,92 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // before the core settings change: an in-app memory edit between the caller's
         // preflight and this point can no longer turn a still-valid plan into a failure
         // discovered only after the core files were already overwritten, and nothing can
-        // edit a file between its snapshot bytes and its overwrite.
-        core = await withMemoryLock(async () => {
-          // The plan is recomputed at the write boundary, from registration and the origin
-          // markers as they are now. Origin markers are written under this same lock (by an
-          // import), so a project re-pointed at another source since validation no longer
-          // matches the old entry here. Project registration is not serialized with memory
-          // writes (config edits take no memory lock), so for it this is the narrowest check
-          // available, not a guarantee against a concurrent edit landing before the write.
-          const registered = registeredProjectDirs();
-          const plan = planProjectBundleRestore(
-            bundle,
-            registered,
-            await readProjectMemoryOrigins(muxRoot, registered)
-          );
-          const matched = plan.matched.filter((match) => validatedMatched.has(planKey(match)));
-          // A validated match that no longer writes — its project unregistered since, or
-          // resolved to a different local project now — is refused rather than dropped:
-          // the caller reports unapproved candidates from its validation, so a silently
-          // omitted entry would leave a "completed" restore with that project's memory
-          // neither written nor offered. Nothing has changed yet; a new preview re-offers it.
-          const stillMatched = new Set(matched.map(planKey));
-          const dropped = restoreOptions.matchedProjects.find(
-            (match) =>
-              !stillMatched.has(matchKey(match.sourcePath, match.projectPath, match.localMemoryDir))
-          );
-          if (dropped !== undefined) {
-            throw new BackupServiceError(
-              "IO_ERROR",
-              `Cannot restore: the project registration for '${dropped.projectPath}' changed since the restore was validated; preview again to continue`
+        // edit a file between its snapshot bytes and its overwrite. The registration lock
+        // is taken first (the fixed order; `ProjectService.remove` takes only it) and holds
+        // project unregistration off for the same window, so the registration read below
+        // stays true until the matched memory has landed.
+        core = await withProjectRegistrationLock(muxRoot, () =>
+          withMemoryLock(async () => {
+            // The plan is recomputed at the write boundary, from registration and the origin
+            // markers as they are now: origin markers are written under the memory lock (by
+            // an import) and registration cannot change under the registration lock, so a
+            // project re-pointed at another source or unregistered since validation no
+            // longer matches the old entry here, and what matches here is what gets written.
+            const registered = registeredProjectDirs();
+            const plan = planProjectBundleRestore(
+              bundle,
+              registered,
+              await readProjectMemoryOrigins(muxRoot, registered)
             );
-          }
-          if (matched.length > 0) {
-            for (const match of matched) {
-              await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match), {
-                addOnly: false,
-              });
-            }
-            // Exactly the files these writes can overwrite: not whole project directories,
-            // whose unrelated local-only notes neither need covering nor may fail the
-            // restore, and never other registered projects.
-            const localBundle = await collectOverwritableProjectMemory(muxRoot, matched);
-            await writeProjectBundle(
-              path.join(restoreOptions.snapshotPath, PROJECT_BUNDLE_DIR),
-              localBundle,
-              { portable: false, ownerOnly: true }
+            const matched = plan.matched.filter((match) => validatedMatched.has(planKey(match)));
+            // A validated match that no longer writes — its project unregistered since, or
+            // resolved to a different local project now — is refused rather than dropped:
+            // the caller reports unapproved candidates from its validation, so a silently
+            // omitted entry would leave a "completed" restore with that project's memory
+            // neither written nor offered. Nothing has changed yet; a new preview re-offers it.
+            const stillMatched = new Set(matched.map(planKey));
+            const dropped = restoreOptions.matchedProjects.find(
+              (match) =>
+                !stillMatched.has(
+                  matchKey(match.sourcePath, match.projectPath, match.localMemoryDir)
+                )
             );
-          }
-          const coreResult = await restoreCore();
-          // Matched entries restore verbatim, exactly what the preview promised. Imports
-          // are executed separately by the service, after project registration.
-          for (const match of matched) {
-            let written: string[];
-            try {
-              written = (
-                await writeProjectMemoryFiles(muxRoot, matchedProjectWrites(match), {
-                  addOnly: false,
-                })
-              ).written;
-            } catch (error) {
-              // Files written so far — earlier entries and this one's partial progress —
-              // are on disk; the failure must still announce them.
-              if (error instanceof ProjectMemoryWriteError && error.written.length > 0) {
-                restoredProjectMemory.push({
-                  projectPath: match.projectPath,
-                  files: error.written,
-                });
-              }
-              throw new ProjectMemoryRestoreError(
-                error instanceof Error ? error.message : String(error),
-                restoredProjectMemory,
-                { cause: error }
+            if (dropped !== undefined) {
+              throw new BackupServiceError(
+                "IO_ERROR",
+                `Cannot restore: the project registration for '${dropped.projectPath}' changed since the restore was validated; preview again to continue`
               );
             }
-            if (written.length > 0) {
-              memoryChanges.push(...written);
-              restoredProjectMemory.push({ projectPath: match.projectPath, files: written });
+            if (matched.length > 0) {
+              for (const match of matched) {
+                await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match), {
+                  addOnly: false,
+                });
+              }
+              // Exactly the files these writes can overwrite: not whole project directories,
+              // whose unrelated local-only notes neither need covering nor may fail the
+              // restore, and never other registered projects.
+              const localBundle = await collectOverwritableProjectMemory(muxRoot, matched);
+              await writeProjectBundle(
+                path.join(restoreOptions.snapshotPath, PROJECT_BUNDLE_DIR),
+                localBundle,
+                { portable: false, ownerOnly: true }
+              );
             }
-          }
-          return coreResult;
-        });
+            const coreResult = await restoreCore();
+            // Matched entries restore verbatim, exactly what the preview promised. Imports
+            // are executed separately by the service, after project registration.
+            for (const match of matched) {
+              let written: string[];
+              try {
+                written = (
+                  await writeProjectMemoryFiles(muxRoot, matchedProjectWrites(match), {
+                    addOnly: false,
+                  })
+                ).written;
+              } catch (error) {
+                // Files written so far — earlier entries and this one's partial progress —
+                // are on disk; the failure must still announce them.
+                if (error instanceof ProjectMemoryWriteError && error.written.length > 0) {
+                  restoredProjectMemory.push({
+                    projectPath: match.projectPath,
+                    files: error.written,
+                  });
+                }
+                throw new ProjectMemoryRestoreError(
+                  error instanceof Error ? error.message : String(error),
+                  restoredProjectMemory,
+                  { cause: error }
+                );
+              }
+              if (written.length > 0) {
+                memoryChanges.push(...written);
+                restoredProjectMemory.push({ projectPath: match.projectPath, files: written });
+              }
+            }
+            return coreResult;
+          })
+        );
       }
 
       const after = await localFilesByPath();

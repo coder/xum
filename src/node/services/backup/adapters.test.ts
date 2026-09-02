@@ -17,6 +17,7 @@ import { projectMemoryDirName } from "@/node/services/memoryService";
 import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
 import {
   memoryMutationLockKey,
+  withProjectRegistrationLock,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { TestBackupConfig, captureRejection, runGit, writeFixtureFile } from "./testHelpers";
@@ -2204,6 +2205,54 @@ describe("backup adapters project bundle", () => {
       { projectPath: targetPath, files: [localPath] },
     ]);
     expect(await fs.readFile(path.join(muxRoot, ...localPath.split("/")), "utf-8")).toBe("v2\n");
+  });
+
+  it("holds project unregistration off while matched memory is written", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const memoryPath = `memory/project/${projectMemoryDirName(project)}/notes.md`;
+    const { repository, payload } = await exportBundle();
+    await seedProjectMemory(project, "notes.md", "local edit\n");
+
+    // The lock `ProjectService.remove` takes: while a removal holds it, the restore must
+    // not read registration and write, and once the restore holds it a removal cannot
+    // land between its registration read and its memory write.
+    const held = Promise.withResolvers<void>();
+    const lockAcquired = Promise.withResolvers<void>();
+    const holding = withProjectRegistrationLock(muxRoot, async () => {
+      lockAcquired.resolve();
+      await held.promise;
+    });
+    await lockAcquired.promise;
+
+    const progress = { restored: false };
+    const restoring = payload
+      .restore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+        snapshotPath: path.join(tempDir, "restore-snapshot"),
+        matchedProjects: [matchedAt(project)],
+      })
+      .then((result) => {
+        progress.restored = true;
+        return result;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(progress.restored).toBe(false);
+    expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
+      "local edit\n"
+    );
+
+    held.resolve();
+    await holding;
+    const restored = await restoring;
+    expect(restored.changedFiles).toContain(memoryPath);
+    expect(await fs.readFile(path.join(muxRoot, ...memoryPath.split("/")), "utf-8")).toBe(
+      "backup version\n"
+    );
   });
 
   it("re-reads origin markers at the write boundary, inside the memory lock", async () => {

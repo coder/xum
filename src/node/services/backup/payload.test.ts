@@ -3712,26 +3712,51 @@ describe("project bundle", () => {
     expect(plan.imports.map((item) => item.entry.path)).toEqual([sourceA.path]);
   });
 
-  it("ignores origin markers that are unreadable or claim a source twice", async () => {
+  it("keeps only the newest claim on a source when writing an origin marker", async () => {
+    const source = "/home/dev/src/alpha";
+    const b = "/home/other/b";
+    const c = "/home/other/c";
+    // Source imported to B; B unregistered; source imported again to C; B re-registered.
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), source);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(c), source);
+    const registered = new Map([b, c].map((project) => [project, projectMemoryDirName(project)]));
+
+    // B's stale marker was removed when C claimed the source, so re-registering B cannot
+    // revive the older association or make the source ambiguous.
+    expect(
+      await fs
+        .lstat(path.join(muxRoot, "memory", ".backup-origins", `${projectMemoryDirName(b)}.json`))
+        .catch(() => null)
+    ).toBeNull();
+    expect([...(await readProjectMemoryOrigins(muxRoot, registered)).entries()]).toEqual([
+      [source, { projectPath: c, memoryDir: projectMemoryDirName(c) }],
+    ]);
+  });
+
+  it("leaves a source claimed by two registered projects unmatched and ignores broken markers", async () => {
     const first = "/home/other/a";
     const second = "/home/other/b";
     const broken = "/home/other/c";
     const registered = new Map(
       [first, second, broken].map((project) => [project, projectMemoryDirName(project)])
     );
-    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(first), "/home/dev/src/alpha");
-    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(second), "/home/dev/src/alpha");
+    // Hand-placed (a copied home): the writer would never leave two claims behind.
+    for (const project of [first, second]) {
+      await writeFixtureFile(
+        muxRoot,
+        `memory/.backup-origins/${projectMemoryDirName(project)}.json`,
+        JSON.stringify({ sourcePath: "/home/dev/src/alpha" })
+      );
+    }
     await writeFixtureFile(
       muxRoot,
       `memory/.backup-origins/${projectMemoryDirName(broken)}.json`,
       "{ not json"
     );
 
-    const origins = await readProjectMemoryOrigins(muxRoot, registered);
-    // Deterministic: the first project in path order keeps the source.
-    expect([...origins.entries()]).toEqual([
-      ["/home/dev/src/alpha", { projectPath: first, memoryDir: projectMemoryDirName(first) }],
-    ]);
+    // Ambiguous: neither project is matched, so a restore re-offers the source as an import
+    // instead of overwriting whichever project happens to sort first.
+    expect((await readProjectMemoryOrigins(muxRoot, registered)).size).toBe(0);
   });
 
   it("refuses an origin marker behind a symlinked directory or marker", async () => {
@@ -3867,22 +3892,47 @@ describe("project bundle", () => {
     expect((hidden as Error).message).toContain("disallowed path");
   });
 
-  it("treats a symlinked sidecar manifest as absent without following it", async () => {
+  it("refuses a symlinked sidecar manifest as an invalid bundle without following it", async () => {
     await fs.mkdir(path.join(managedDir, PROJECT_BUNDLE_DIR), { recursive: true });
     const outside = path.join(tempDir, "outside-manifest.json");
-    await fs.writeFile(outside, "{}", "utf-8");
+    // Would parse as a manifest if followed; the refusal must come from the link itself.
+    await fs.writeFile(
+      outside,
+      JSON.stringify({ schemaVersion: 1, projects: [], files: [] }),
+      "utf-8"
+    );
     await fs.symlink(outside, path.join(managedDir, PROJECT_BUNDLE_DIR, "manifest.json"));
-    expect(await projectBundleExists(managedDir)).toBe(false);
-    expect(await readProjectBundle(managedDir)).toBeNull();
+    expect(await projectBundleExists(managedDir)).toBe(true);
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    expect((error as Error).message).toContain("symlink");
   });
 
-  it("treats a symlinked sidecar directory as absent without traversing it", async () => {
+  it("refuses a symlinked sidecar directory as an invalid bundle without traversing it", async () => {
     const outsideDir = path.join(tempDir, "outside-bundle");
     await fs.mkdir(outsideDir, { recursive: true });
-    await fs.writeFile(path.join(outsideDir, "manifest.json"), "{}", "utf-8");
+    await fs.writeFile(
+      path.join(outsideDir, "manifest.json"),
+      JSON.stringify({ schemaVersion: 1, projects: [], files: [] }),
+      "utf-8"
+    );
     await fs.symlink(outsideDir, path.join(managedDir, PROJECT_BUNDLE_DIR), "dir");
-    expect(await projectBundleExists(managedDir)).toBe(false);
-    expect(await readProjectBundle(managedDir)).toBeNull();
+    // Present — so a toggle-off restore reports it as skipped — but never read as a bundle:
+    // absent would let a restore with projects on apply the core settings while silently
+    // omitting every backed-up project.
+    expect(await projectBundleExists(managedDir)).toBe(true);
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    expect((error as Error).message).toContain("symlink");
+  });
+
+  it("refuses a sidecar directory without a manifest as an invalid bundle", async () => {
+    await fs.mkdir(path.join(managedDir, PROJECT_BUNDLE_DIR, "memory", "project"), {
+      recursive: true,
+    });
+    const error = await captureRejection(readProjectBundle(managedDir));
+    expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
+    expect((error as Error).message).toContain("no manifest");
   });
 
   it("rejects unsafe memory directory segments", async () => {

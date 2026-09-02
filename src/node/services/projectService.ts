@@ -54,6 +54,7 @@ import {
   syncProjectCodeWorkspace,
 } from "@/node/worktree/codeWorkspaceSync";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { withProjectRegistrationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
@@ -1222,6 +1223,17 @@ export class ProjectService {
   }
 
   async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
+    // Serialized with a settings-backup restore writing project memory, which must not have
+    // a project it matched unregistered underneath it (see withProjectRegistrationLock).
+    return withProjectRegistrationLock(this.config.rootDir, () =>
+      this.removeUnlocked(projectPath, force)
+    );
+  }
+
+  private async removeUnlocked(
+    projectPath: string,
+    force: boolean
+  ): Promise<Result<void, ProjectRemoveError>> {
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();
