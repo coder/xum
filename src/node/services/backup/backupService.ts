@@ -144,8 +144,10 @@ export interface BackupProjectImporter {
  * setter because the container constructs BackupService before ProjectService.
  */
 export interface BackupProjectRegistrar {
-  create(projectPath: string): Promise<Result<{ normalizedPath: string }, string>>;
-  setDisplayName(projectPath: string, displayName: string): Promise<void>;
+  create(
+    projectPath: string,
+    options?: { displayName?: string }
+  ): Promise<Result<{ normalizedPath: string }, string>>;
 }
 
 /**
@@ -803,17 +805,19 @@ export class BackupService {
         // An alias of an already registered project (resolved during planning) imports into
         // that project without a second registration; create() would otherwise register the
         // alias as a duplicate when its own duplicate check misses the aliased key.
+        // The backed-up name travels with a newly registered project (in the same config
+        // write as the registration); an already registered target keeps its local name.
         const created =
           plannedRegisteredPath === null
-            ? await this.projectRegistrar.create(targetPath)
+            ? await this.projectRegistrar.create(
+                targetPath,
+                candidate.name === getProjectDisplayName(targetPath)
+                  ? undefined
+                  : { displayName: candidate.name }
+              )
             : Err("Project already exists");
         if (created.success) {
           registeredPath = created.data.normalizedPath;
-          // The backed-up name travels with a newly registered project; an already
-          // registered target keeps its local name.
-          if (candidate.name !== getProjectDisplayName(registeredPath)) {
-            await this.projectRegistrar.setDisplayName(registeredPath, candidate.name);
-          }
         } else if (created.error === "Project already exists") {
           // Registered since planning (a concurrent registration): resolve against a fresh
           // lookup, since the planning-time one predates it.

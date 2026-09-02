@@ -117,12 +117,9 @@ function importsWith(
   return { assertProjectMemoryAllowed, importProjectMemory };
 }
 
-/** A registrar mock: the given create() plus a no-op display-name setter unless overridden. */
-function registrar(
-  create: BackupProjectRegistrar["create"],
-  setDisplayName: BackupProjectRegistrar["setDisplayName"] = () => Promise.resolve()
-): BackupProjectRegistrar {
-  return { create, setDisplayName };
+/** A registrar mock around the given create(). */
+function registrar(create: BackupProjectRegistrar["create"]): BackupProjectRegistrar {
+  return { create };
 }
 
 function createService(
@@ -1516,7 +1513,7 @@ describe("BackupService project imports", () => {
     await fs.mkdir(existing);
     const config = new TestBackupConfig(tempDir);
     config.state.projects.set(existing, { workspaces: [], displayName: "Local name" });
-    const named: Array<[string, string]> = [];
+    const created: Array<[string, string | undefined]> = [];
     const service = createService(tempDir, {
       config,
       payload: createPayload({
@@ -1532,18 +1529,10 @@ describe("BackupService project imports", () => {
       }),
     });
     service.setProjectService(
-      registrar(
-        (projectPath) =>
-          Promise.resolve(
-            projectPath === existing
-              ? Err("Project already exists")
-              : Ok({ normalizedPath: projectPath })
-          ),
-        (projectPath, displayName) => {
-          named.push([projectPath, displayName]);
-          return Promise.resolve();
-        }
-      )
+      registrar((projectPath, options) => {
+        created.push([projectPath, options?.displayName]);
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
     );
 
     const result = await service.restore(
@@ -1557,9 +1546,10 @@ describe("BackupService project imports", () => {
     );
 
     expect(result.success).toBe(true);
-    // "checkout" would otherwise show up under its basename, not the name it was backed
-    // up with; the already registered project keeps its local name.
-    expect(named).toEqual([[fresh, "Rocket Science"]]);
+    // "checkout" would otherwise show up under its basename, not the name it was backed up
+    // with — set in the registration itself. The already registered project is never
+    // re-created, so its local name is untouched.
+    expect(created).toEqual([[fresh, "Rocket Science"]]);
   });
 
   test("keeps a candidate on offer when its import fails per-candidate", async () => {

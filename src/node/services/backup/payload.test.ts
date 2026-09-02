@@ -29,8 +29,11 @@ import {
   createBackupPayload,
   localOnlyPayloadFiles,
   mergeBackupPreferences,
+  matchedProjectWrites,
   planProjectBundleRestore,
   planRestoreWrites,
+  readProjectMemoryOrigins,
+  writeProjectMemoryOrigin,
   projectBundleExists,
   projectImportToken,
   readProjectBundle,
@@ -3657,6 +3660,59 @@ describe("project bundle", () => {
       const error = await captureRejection(readProjectBundle(managedDir));
       expect((error as { code?: string }).code).toBe("INVALID_BACKUP");
     }
+  });
+
+  it("matches an entry to the local project an earlier import created for it", async () => {
+    const sourceEntry = entryFor("/home/dev/src/alpha");
+    await writeFixtureFile(muxRoot, `memory/project/${sourceEntry.memoryDir}/notes.md`, "v2\n");
+    const bundle = await collectProjectBundle(muxRoot, [sourceEntry]);
+
+    const localProject = "/home/other/checkouts/alpha";
+    const localDir = projectMemoryDirName(localProject);
+    const registered = new Map([[localProject, localDir]]);
+
+    // No marker: the entry is an import candidate on this machine.
+    expect(planProjectBundleRestore(bundle, registered).imports).toHaveLength(1);
+
+    await writeProjectMemoryOrigin(muxRoot, localDir, sourceEntry.path);
+    const origins = await readProjectMemoryOrigins(muxRoot, registered);
+    expect(origins.get(sourceEntry.path)).toEqual({
+      projectPath: localProject,
+      memoryDir: localDir,
+    });
+    const plan = planProjectBundleRestore(bundle, registered, origins);
+    expect(plan.imports).toEqual([]);
+    expect(plan.matched).toHaveLength(1);
+    expect(plan.matched[0]).toMatchObject({ projectPath: localProject, localMemoryDir: localDir });
+    // Writes land in the local project's directory, not the recorded source's.
+    expect(matchedProjectWrites(plan.matched[0]).map((write) => write.path)).toEqual([
+      `memory/project/${localDir}/notes.md`,
+    ]);
+
+    // A marker whose project is no longer registered falls back to an import.
+    expect(planProjectBundleRestore(bundle, new Map(), origins).imports).toHaveLength(1);
+  });
+
+  it("ignores origin markers that are unreadable or claim a source twice", async () => {
+    const first = "/home/other/a";
+    const second = "/home/other/b";
+    const broken = "/home/other/c";
+    const registered = new Map(
+      [first, second, broken].map((project) => [project, projectMemoryDirName(project)])
+    );
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(first), "/home/dev/src/alpha");
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(second), "/home/dev/src/alpha");
+    await writeFixtureFile(
+      muxRoot,
+      `memory/project/${projectMemoryDirName(broken)}/.backup-origin.json`,
+      "{ not json"
+    );
+
+    const origins = await readProjectMemoryOrigins(muxRoot, registered);
+    // Deterministic: the first project in path order keeps the source.
+    expect([...origins.entries()]).toEqual([
+      ["/home/dev/src/alpha", { projectPath: first, memoryDir: projectMemoryDirName(first) }],
+    ]);
   });
 
   it("skips an oversized memory file without charging the backup budget", async () => {

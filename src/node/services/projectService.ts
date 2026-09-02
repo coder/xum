@@ -431,7 +431,7 @@ export class ProjectService {
 
   async create(
     projectPath: string,
-    options?: { initGit?: boolean }
+    options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
     let gitInitClaimKey: string | null = null;
     try {
@@ -704,6 +704,9 @@ export class ProjectService {
         const projectConfig: ProjectConfig = {
           workspaces: [],
           parentProjectPath: freshParentProjectPath ?? undefined,
+          // Set in the same config write as the registration (a backup restore names
+          // imported projects) rather than as a second write and notification.
+          ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
         };
         freshConfig.projects.set(normalizedPath, projectConfig);
         freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);

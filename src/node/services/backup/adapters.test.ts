@@ -2034,6 +2034,82 @@ describe("backup adapters project bundle", () => {
     ).toBe("local wins\n");
   });
 
+  it("updates an imported project's memory on later restores instead of re-offering it", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "v1\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
+    const { gitRepo, repository, payload } = await exportBundle();
+    await gitRepo.commitAndPush(repository, {
+      message: "v1",
+      expectedRemoteCommit: repository.remoteCommit,
+    });
+
+    // Fresh machine: import the project under a different path.
+    config.state.projects.delete(project);
+    await fs.rm(path.join(muxRoot, "memory", "project", projectMemoryDirName(project)), {
+      recursive: true,
+      force: true,
+    });
+    const targetPath = path.join(tempDir, "projects", "alpha-here");
+    const targetDir = projectMemoryDirName(targetPath);
+    const checkout = await gitRepo.prepare(settings);
+    const preview = await payload.previewRestore({
+      repositoryRoot: checkout.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    const importer = await payload.prepareProjectImports({
+      repositoryRoot: checkout.rootDir,
+      managedPath: settings.path,
+    });
+    await importer.importProjectMemory({ token: preview.projectImports[0].token, targetPath });
+    registerProject(targetPath);
+
+    // The source machine updates the note and pushes; here the imported project must now be
+    // matched and updated — an add-only re-import could never change the existing file.
+    const bundleDir = path.join(checkout.rootDir, settings.path, "project-bundle");
+    const updated = Buffer.from("v2\n");
+    await fs.writeFile(
+      path.join(bundleDir, "memory", "project", projectMemoryDirName(project), "notes.md"),
+      updated
+    );
+    const manifestPath = path.join(bundleDir, "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf-8")) as {
+      files: Array<{ path: string; sha256: string }>;
+    };
+    manifest.files[0].sha256 = createHash("sha256").update(updated).digest("hex");
+    await fs.writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
+
+    const localPath = `memory/project/${targetDir}/notes.md`;
+    const second = await payload.previewRestore({
+      repositoryRoot: checkout.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(second.projectImports).toEqual([]);
+    expect(second.changes).toContainEqual({ status: "M", path: localPath });
+
+    const validated = await payload.validateRestore({
+      repositoryRoot: checkout.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(validated.matchedProjectPaths).toEqual([project]);
+    const restored = await payload.restore({
+      repositoryRoot: checkout.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjectPaths: validated.matchedProjectPaths,
+    });
+    expect(restored.changedFiles).toContain(localPath);
+    expect(restored.restoredProjectMemory).toEqual([
+      { projectPath: targetPath, files: [localPath] },
+    ]);
+    expect(await fs.readFile(path.join(muxRoot, ...localPath.split("/")), "utf-8")).toBe("v2\n");
+  });
+
   it("skips a malformed sidecar when the toggle is off but refuses it when on", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "instructions\n");
     const gitRepo = createBackupGitRepo({ cacheRoot });

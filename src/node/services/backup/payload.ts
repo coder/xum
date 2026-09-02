@@ -2966,11 +2966,29 @@ export function projectImportToken(
   );
 }
 
+/**
+ * A bundle entry the restore writes without approval, and the local project it writes to.
+ * `projectPath`/`localMemoryDir` equal the entry's own path/dir for a project registered at
+ * its recorded path, and the import target's for a project brought in by an earlier import.
+ */
+export interface MatchedProjectEntry {
+  entry: BackupProjectBundleEntry;
+  files: BackupFile[];
+  projectPath: string;
+  localMemoryDir: string;
+}
+
 export interface ProjectBundleRestorePlan {
-  /** Entries registered here at exactly their recorded path and dir name: restored verbatim. */
-  matched: Array<{ entry: BackupProjectBundleEntry; files: BackupFile[] }>;
+  /** Entries with a local project identity: restored verbatim into that project's memory. */
+  matched: MatchedProjectEntry[];
   /** Everything else: never written without an explicit per-entry import approval. */
   imports: Array<{ entry: BackupProjectBundleEntry; files: BackupFile[]; token: string }>;
+}
+
+/** The local project an earlier import created for a recorded source path. */
+export interface ProjectMemoryOrigin {
+  projectPath: string;
+  memoryDir: string;
 }
 
 /**
@@ -2979,21 +2997,107 @@ export interface ProjectBundleRestorePlan {
  * match asserts both "registered at exactly this path" and "the recorded dir name is the
  * one this host computes" — a foreign-OS source path with a correct hash suffix falls
  * through to an import candidate rather than being rejected or silently written.
+ * `origins` (recorded source path → local project) lets a project imported under another
+ * path keep receiving updates on later restores; without it every restore after an import
+ * would re-offer the project as an add-only candidate that can never update a file.
  */
 export function planProjectBundleRestore(
   bundle: BackupProjectBundle,
-  registeredDirByPath: ReadonlyMap<string, string>
+  registeredDirByPath: ReadonlyMap<string, string>,
+  origins: ReadonlyMap<string, ProjectMemoryOrigin> = new Map()
 ): ProjectBundleRestorePlan {
   const plan: ProjectBundleRestorePlan = { matched: [], imports: [] };
   for (const entry of bundle.manifest.projects) {
     const files = bundleEntryFiles(bundle.files, entry);
     if (registeredDirByPath.get(entry.path) === entry.memoryDir) {
-      plan.matched.push({ entry, files });
-    } else {
-      plan.imports.push({ entry, files, token: projectImportToken(entry, bundle.files) });
+      plan.matched.push({
+        entry,
+        files,
+        projectPath: entry.path,
+        localMemoryDir: entry.memoryDir,
+      });
+      continue;
     }
+    const origin = origins.get(entry.path);
+    // The origin's project must still be registered with the dir name this host computes;
+    // a stale marker under an unregistered or renamed directory falls back to an import.
+    if (origin !== undefined && registeredDirByPath.get(origin.projectPath) === origin.memoryDir) {
+      plan.matched.push({
+        entry,
+        files,
+        projectPath: origin.projectPath,
+        localMemoryDir: origin.memoryDir,
+      });
+      continue;
+    }
+    plan.imports.push({ entry, files, token: projectImportToken(entry, bundle.files) });
   }
   return plan;
+}
+
+/** A matched entry's files addressed to the local project's memory directory. */
+export function matchedProjectWrites(
+  match: MatchedProjectEntry
+): Array<{ path: string; content: Buffer }> {
+  return match.files.map((file) => ({
+    path: rekeyProjectMemoryPath(file.path, match.localMemoryDir),
+    content: file.content,
+  }));
+}
+
+/**
+ * Hidden marker inside an imported project's memory directory recording which backed-up
+ * project it came from. Dot-prefixed so MemoryService never lists or counts it and exports
+ * never collect it; it travels with the memory directory and needs no config schema.
+ */
+const PROJECT_MEMORY_ORIGIN_FILE = ".backup-origin.json";
+const MAX_PROJECT_MEMORY_ORIGIN_BYTES = 4096;
+
+export async function writeProjectMemoryOrigin(
+  muxRoot: string,
+  localMemoryDir: string,
+  sourcePath: string
+): Promise<void> {
+  const root = await resolveRoot(muxRoot);
+  const directory = await resolveContainedPath(
+    root.path,
+    `${PROJECT_MEMORY_PATH_PREFIX}${localMemoryDir}`
+  );
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(
+    path.join(directory, PROJECT_MEMORY_ORIGIN_FILE),
+    `${JSON.stringify({ sourcePath })}\n`,
+    "utf-8"
+  );
+}
+
+/**
+ * Recorded source path → local project, for every registered project whose memory
+ * directory carries an origin marker. Two projects claiming one source keep the first in
+ * path order so the classification is deterministic; an unreadable marker is ignored.
+ */
+export async function readProjectMemoryOrigins(
+  muxRoot: string,
+  registeredDirByPath: ReadonlyMap<string, string>
+): Promise<Map<string, ProjectMemoryOrigin>> {
+  const root = await resolveRoot(muxRoot);
+  const origins = new Map<string, ProjectMemoryOrigin>();
+  const registered = [...registeredDirByPath.entries()].sort(([a], [b]) => a.localeCompare(b));
+  for (const [projectPath, memoryDir] of registered) {
+    const marker = path.join(root.path, "memory", "project", memoryDir, PROJECT_MEMORY_ORIGIN_FILE);
+    const stat = await lstatOrNull(marker);
+    if (stat?.isFile() !== true || stat.size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) continue;
+    let sourcePath: unknown;
+    try {
+      const parsed: unknown = JSON.parse(await fs.readFile(marker, "utf-8"));
+      sourcePath = isPlainObject(parsed) ? parsed.sourcePath : undefined;
+    } catch {
+      continue;
+    }
+    if (typeof sourcePath !== "string" || sourcePath === "" || origins.has(sourcePath)) continue;
+    origins.set(sourcePath, { projectPath, memoryDir });
+  }
+  return origins;
 }
 
 /** `memory/project/<recorded>/rest` re-keyed to the locally computed target directory. */
@@ -3191,33 +3295,33 @@ async function planProjectMemoryWrites(
  */
 export async function collectOverwritableProjectMemory(
   muxRoot: string,
-  matched: ReadonlyArray<{ entry: BackupProjectBundleEntry; files: readonly BackupFile[] }>
+  matched: readonly MatchedProjectEntry[]
 ): Promise<BackupProjectBundle> {
   const root = await resolveRoot(muxRoot);
   const budget = createByteBudget();
   const files: BackupFile[] = [];
   for (const match of matched) {
-    for (const incoming of match.files) {
-      assertAllowedBundleFilePath(incoming.path);
-      const destination = await resolveContainedPath(root.path, incoming.path);
+    for (const write of matchedProjectWrites(match)) {
+      assertAllowedBundleFilePath(write.path);
+      const destination = await resolveContainedPath(root.path, write.path);
       if ((await lstatOrNull(destination))?.isFile() !== true) continue;
-      const current = await readCheckedFile(root, incoming.path, (size) => {
-        budget(incoming.path, size);
+      const current = await readCheckedFile(root, write.path, (size) => {
+        budget(write.path, size);
       });
-      files.push({ path: incoming.path, content: current.content });
+      files.push({ path: write.path, content: current.content });
     }
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
-  const entries = [...matched.map((match) => match.entry)].sort((a, b) =>
-    a.path.localeCompare(b.path)
-  );
+  // Entries describe the LOCAL projects the copy came from, so the recovery copy's manifest
+  // is consistent with its own file paths even for import-matched entries.
+  const entries = [...matched].sort((a, b) => a.projectPath.localeCompare(b.projectPath));
   const manifest: BackupProjectBundleManifest = {
     schemaVersion: 1,
-    projects: entries.map((entry) => ({
-      path: entry.path,
-      name: entry.name,
-      ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
-      memoryDir: entry.memoryDir,
+    projects: entries.map((match) => ({
+      path: match.projectPath,
+      name: match.entry.name,
+      ...(match.entry.gitRemote !== undefined ? { gitRemote: match.entry.gitRemote } : {}),
+      memoryDir: match.localMemoryDir,
     })),
     files: files.map((file) => ({ path: file.path, sha256: sha256(file.content) })),
   };

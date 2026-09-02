@@ -38,7 +38,10 @@ import {
   backupPayloadExists,
   bundleEntryFiles,
   collectOverwritableProjectMemory,
+  matchedProjectWrites,
+  readProjectMemoryOrigins,
   serializeProjectBundleManifest,
+  writeProjectMemoryOrigin,
   collectProjectBundle,
   planProjectBundleRestore,
   projectBundleExists,
@@ -199,12 +202,19 @@ function describeMissingBackup(managedPath: string): string {
 
 /** Concurrent `git remote get-url` probes during bundle export. */
 const REMOTE_DISCOVERY_CONCURRENCY = 8;
+/** Per-probe ceiling and the deadline for the whole discovery pass; remotes are hints, not requirements. */
+const REMOTE_PROBE_TIMEOUT_MS = 5_000;
+const REMOTE_DISCOVERY_DEADLINE_MS = 20_000;
 
 /** Best-effort: a missing origin, a non-git directory, or a hung git must never fail an export. */
-async function readProjectGitRemote(projectPath: string): Promise<string | undefined> {
+async function readProjectGitRemote(
+  projectPath: string,
+  timeoutMs: number
+): Promise<string | undefined> {
+  if (timeoutMs <= 0) return undefined;
   try {
     using gitProcess = execFileAsync("git", ["-C", projectPath, "remote", "get-url", "origin"], {
-      timeoutMs: 5_000,
+      timeoutMs,
       maxOutputBytes: 64 * 1024,
       killTreeOnTermination: true,
     });
@@ -289,15 +299,20 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
     }
     // Each probe has its own timeout, so sequential discovery over many projects on slow
-    // filesystems could stall a preview or push for minutes; bounded parallelism keeps the
-    // worst case proportional to the limit, not the project count.
+    // filesystems could stall a preview or push for minutes; bounded parallelism plus one
+    // deadline for the whole pass caps the wait regardless of the project count. Projects
+    // probed after the deadline simply record no remote.
     const probes = new AsyncSemaphore(REMOTE_DISCOVERY_CONCURRENCY);
+    const deadline = Date.now() + REMOTE_DISCOVERY_DEADLINE_MS;
     return await Promise.all(
       projects.map(async ([projectPath, projectConfig]) => {
         const slot = await probes.acquire();
         let gitRemote: string | undefined;
         try {
-          gitRemote = await readProjectGitRemote(projectPath);
+          gitRemote = await readProjectGitRemote(
+            projectPath,
+            Math.min(REMOTE_PROBE_TIMEOUT_MS, deadline - Date.now())
+          );
         } finally {
           slot.release();
         }
@@ -336,7 +351,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   ): Promise<{ bundle: BackupProjectBundle; plan: ProjectBundleRestorePlan } | null> {
     const bundle = await readProjectBundle(sourceDir);
     if (bundle === null) return null;
-    return { bundle, plan: planProjectBundleRestore(bundle, registeredProjectDirs()) };
+    const registered = registeredProjectDirs();
+    return {
+      bundle,
+      plan: planProjectBundleRestore(
+        bundle,
+        registered,
+        await readProjectMemoryOrigins(muxRoot, registered)
+      ),
+    };
   }
 
   /** Restore-preview statuses for matched entries, diffed against the local memory files. */
@@ -353,12 +376,14 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     const localByPath = new Map(localBundle.files.map((file) => [file.path, file]));
     const changes: BackupFileChange[] = [];
     for (const match of plan.matched) {
-      for (const file of match.files) {
-        const existing = localByPath.get(file.path);
+      // Reported at the local destination, which differs from the bundle path for a
+      // project matched through an earlier import.
+      for (const write of matchedProjectWrites(match)) {
+        const existing = localByPath.get(write.path);
         if (existing === undefined) {
-          changes.push({ status: "A", path: file.path });
-        } else if (!existing.content.equals(file.content)) {
-          changes.push({ status: "M", path: file.path });
+          changes.push({ status: "A", path: write.path });
+        } else if (!existing.content.equals(write.content)) {
+          changes.push({ status: "M", path: write.path });
         }
       }
     }
@@ -535,7 +560,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       // destinations) belong to the preflight too: found only inside the restore, they
       // would surface after the core settings were already overwritten.
       for (const match of bundlePlan.plan.matched) {
-        await assertProjectMemoryWritesAllowed(muxRoot, match.files);
+        await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match));
       }
       // So does the recovery copy: a destination that cannot be snapshotted (a local file
       // past the backup budgets) refuses the restore here, not after the core writes. The
@@ -638,7 +663,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             const matched = bundlePlan.plan.matched.filter(
               (match) =>
                 validatedMatched.has(match.entry.path) &&
-                registered.get(match.entry.path) === match.entry.memoryDir
+                registered.get(match.projectPath) === match.localMemoryDir
             );
             if (matched.length > 0) {
               // Exactly the files these writes can overwrite: not whole project directories,
@@ -657,18 +682,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
               let written: string[];
               try {
                 written = (
-                  await writeProjectMemoryFiles(
-                    muxRoot,
-                    match.files.map((file) => ({ path: file.path, content: file.content })),
-                    { addOnly: false }
-                  )
+                  await writeProjectMemoryFiles(muxRoot, matchedProjectWrites(match), {
+                    addOnly: false,
+                  })
                 ).written;
               } catch (error) {
                 // Files written so far — earlier entries and this one's partial progress —
                 // are on disk; the failure must still announce them.
                 if (error instanceof ProjectMemoryWriteError && error.written.length > 0) {
                   restoredProjectMemory.push({
-                    projectPath: match.entry.path,
+                    projectPath: match.projectPath,
                     files: error.written,
                   });
                 }
@@ -680,7 +703,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
               }
               if (written.length > 0) {
                 changedFiles.push(...written);
-                restoredProjectMemory.push({ projectPath: match.entry.path, files: written });
+                restoredProjectMemory.push({ projectPath: match.projectPath, files: written });
               }
             }
           });
@@ -711,14 +734,18 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       );
       // Token lookup rather than trusting any caller-named entry: the token binds the
       // approval to the exact entry and content, so a miss here is defensive only.
-      const rekeyedWrites = (importOptions: { token: string; targetPath: string }) => {
-        const entry = entriesByToken.get(importOptions.token);
+      const entryFor = (token: string): BackupProjectBundleEntry => {
+        const entry = entriesByToken.get(token);
         if (entry === undefined) {
           throw new BackupServiceError(
             "INVALID_BACKUP",
             "The approved project import no longer matches the backup"
           );
         }
+        return entry;
+      };
+      const rekeyedWrites = (importOptions: { token: string; targetPath: string }) => {
+        const entry = entryFor(importOptions.token);
         const targetDir = projectMemoryDirName(importOptions.targetPath);
         return bundleEntryFiles(bundle.files, entry).map((file) => ({
           path: rekeyProjectMemoryPath(file.path, targetDir),
@@ -730,9 +757,18 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           await assertProjectMemoryWritesAllowed(muxRoot, rekeyedWrites(importOptions));
         },
         async importProjectMemory(importOptions) {
-          const { written, skipped } = await withMemoryLock(() =>
-            writeProjectMemoryFiles(muxRoot, rekeyedWrites(importOptions), { addOnly: true })
-          );
+          const entry = entryFor(importOptions.token);
+          const targetDir = projectMemoryDirName(importOptions.targetPath);
+          const { written, skipped } = await withMemoryLock(async () => {
+            const result = await writeProjectMemoryFiles(muxRoot, rekeyedWrites(importOptions), {
+              addOnly: true,
+            });
+            // From now on this project is the local identity of the recorded source: later
+            // restores match it and can update its memory instead of re-offering an
+            // add-only import that can never change an existing file.
+            await writeProjectMemoryOrigin(muxRoot, targetDir, entry.path);
+            return result;
+          });
           return { writtenFiles: written, skippedFiles: skipped };
         },
       };
