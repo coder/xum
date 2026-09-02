@@ -4063,6 +4063,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
         this.scheduleBashMonitorWakeReconcile(workspaceId);
       },
+      settleProviderExcludedWakeRecords: (records) =>
+        this.bashMonitorWakeReconciler.settleProviderExcludedWakeRecords(workspaceId, records),
       // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
       // preflights (manual sends counted but not yet queued or busy) to the
       // session's follow-up idle probes so redispatched synthetic turns yield

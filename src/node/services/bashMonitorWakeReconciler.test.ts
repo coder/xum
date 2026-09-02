@@ -996,6 +996,35 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].muxMetadata.records[0]).not.toHaveProperty("terminal");
   });
 
+  test("consumes a provider-excluded opted-out lost wake", async () => {
+    rows = [
+      registryRecord({
+        status: "exited",
+        exitCode: 0,
+        settledAt: "2026-09-01T00:02:00.000Z",
+        wakeOnExit: false,
+        terminalStatusShown: false,
+        matchedThroughOffset: 12,
+      }),
+    ];
+    providerExcludedWakeRecords = [
+      {
+        processId: "dead",
+        wakeUpdatedAt: CREATED_AT + ":12",
+        kind: "monitor-lost",
+        lostReason: "restart",
+        displayName: "dead",
+        filter: "DONE",
+        filterExclude: false,
+      },
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toEqual([]);
+    expect(removed).toEqual(["dead"]);
+  });
+
   test("snapshot supplies pending kinds without dispatching and removes the legacy wake directory", async () => {
     rows = [
       registryRecord({

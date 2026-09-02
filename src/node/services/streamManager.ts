@@ -1767,7 +1767,8 @@ export class StreamManager {
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     abortReason: StreamAbortReason,
-    abandonPartial?: boolean
+    abandonPartial?: boolean,
+    abortTurnGeneration?: number
   ): Promise<void> {
     // If stream already completed normally (emitted stream-end), wait for its
     // finally block to finish before returning. This happens when ensureStreamSafety
@@ -1791,7 +1792,13 @@ export class StreamManager {
       streamInfo.abortController.abort();
 
       // Unlike checkSoftCancelStream, await cleanup (blocking)
-      await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
+      await this.cleanupAbortedStream(
+        workspaceId,
+        streamInfo,
+        abortReason,
+        abandonPartial,
+        abortTurnGeneration
+      );
     } catch (error) {
       log.error("Error during stream cancellation:", error);
       // Force cleanup even if cancellation fails
@@ -1829,7 +1836,8 @@ export class StreamManager {
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     abortReason: StreamAbortReason,
-    abandonPartial?: boolean
+    abandonPartial?: boolean,
+    abortTurnGeneration?: number
   ): Promise<void> {
     // CRITICAL: Wait for processing to fully complete before cleanup
     // This prevents race conditions where the old stream is still running
@@ -1931,7 +1939,14 @@ export class StreamManager {
     const abortDelivery = this.emitStreamAbort(
       workspaceId,
       streamInfo.messageId,
-      { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      {
+        usage,
+        contextUsage,
+        duration,
+        providerMetadata,
+        contextProviderMetadata,
+        ...(abortTurnGeneration != null ? { abortTurnGeneration } : {}),
+      },
       abortReason,
       abandonPartial,
       streamInfo.initialMetadata?.acpPromptId
@@ -5043,7 +5058,12 @@ export class StreamManager {
    */
   async stopStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      abortReason?: StreamAbortReason;
+      abortTurnGeneration?: number;
+    }
   ): Promise<Result<void>> {
     const typedWorkspaceId = workspaceId as WorkspaceId;
     const pending = this.pendingStreamStarts.get(workspaceId);
@@ -5057,7 +5077,12 @@ export class StreamManager {
         await this.emitStreamAbort(
           typedWorkspaceId,
           pending.syntheticMessageId,
-          { duration: Date.now() - pending.startTime },
+          {
+            duration: Date.now() - pending.startTime,
+            ...(options?.abortTurnGeneration != null
+              ? { abortTurnGeneration: options.abortTurnGeneration }
+              : {}),
+          },
           options?.abortReason ?? "startup",
           options?.abandonPartial,
           pending.acpPromptId
@@ -5077,7 +5102,9 @@ export class StreamManager {
           void this.emitStreamAbort(
             typedWorkspaceId,
             "",
-            {},
+            options?.abortTurnGeneration != null
+              ? { abortTurnGeneration: options.abortTurnGeneration }
+              : {},
             options?.abortReason ?? "startup",
             options?.abandonPartial
           ).catch((error) => {
@@ -5101,7 +5128,8 @@ export class StreamManager {
           typedWorkspaceId,
           streamInfo,
           abortReason,
-          options?.abandonPartial
+          options?.abandonPartial,
+          options?.abortTurnGeneration
         );
       }
       return Ok(undefined);

@@ -5724,23 +5724,35 @@ describe("StreamManager - stopStream", () => {
     const streamManager = new StreamManager(historyService);
 
     // Track emitted events
-    const abortEvents: Array<{ workspaceId: string; messageId: string }> = [];
+    const abortEvents: Array<{
+      workspaceId: string;
+      messageId: string;
+      metadata?: { abortTurnGeneration?: number };
+    }> = [];
     onTurnEngineEvent(
       streamManager,
       "stream-abort",
-      (data: { workspaceId: string; messageId: string }) => {
+      (data: {
+        workspaceId: string;
+        messageId: string;
+        metadata?: { abortTurnGeneration?: number };
+      }) => {
         abortEvents.push(data);
       }
     );
 
     // Stop a stream that doesn't exist (simulates interrupt before stream-start)
-    const result = await streamManager.stopStream("test-workspace");
+    const result = await streamManager.stopStream("test-workspace", {
+      abortReason: "user",
+      abortTurnGeneration: 7,
+    });
 
     expect(result.success).toBe(true);
     expect(abortEvents).toHaveLength(1);
     expect(abortEvents[0].workspaceId).toBe("test-workspace");
     // messageId is empty for synthetic abort (no actual stream existed)
     expect(abortEvents[0].messageId).toBe("");
+    expect(abortEvents[0].metadata?.abortTurnGeneration).toBe(7);
   });
 });
 

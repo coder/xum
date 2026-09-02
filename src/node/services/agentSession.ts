@@ -100,6 +100,7 @@ import {
   type AgentSkillReference,
   isSyntheticSnapshotUserMessage,
   type CompactionFollowUpRequest,
+  type BashMonitorWakeDisplayRecord,
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
@@ -541,7 +542,12 @@ interface AgentSessionActiveStreamInfo {
 export interface AgentSessionStreamManager {
   stopStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      abortReason?: StreamAbortReason;
+      abortTurnGeneration?: number;
+    }
   ): Promise<Result<void>>;
   isStreaming(workspaceId: string): boolean;
   getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
@@ -619,6 +625,10 @@ interface AgentSessionOptions {
   onPostCompactionStateChange?: () => void;
   /** Called after a canceled synthetic turn changes its durable provider exclusion. */
   onProviderExcludedHistoryChange?: () => void;
+  /** Persists a stopped wake settlement before provider exclusion falls back to deletion. */
+  settleProviderExcludedWakeRecords?: (
+    records: readonly BashMonitorWakeDisplayRecord[]
+  ) => Promise<void>;
   /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRJD-): true while a service-level send is in
    * its preflight (counted in WorkspaceService.preflightSendCounts but not
@@ -660,6 +670,7 @@ interface QueuedToolEndClaim {
   dispatchDeferredByHardInterrupt: boolean;
   admissionIrreversible: boolean;
   persistedMessageIds: string[];
+  providerExcludedWakeRecords: readonly BashMonitorWakeDisplayRecord[];
   retryAfterCancellation: boolean;
   admissionHold?: {
     promise: Promise<void>;
@@ -682,6 +693,7 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly onProviderExcludedHistoryChange?: () => void;
+  private readonly settleProviderExcludedWakeRecords?: AgentSessionOptions["settleProviderExcludedWakeRecords"];
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -690,6 +702,7 @@ export class AgentSession {
     [];
   private disposed = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
+  private preparingTurnGeneration = 0;
   /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
   private editAdmissionDepth = 0;
   /**
@@ -930,6 +943,7 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       onProviderExcludedHistoryChange,
+      settleProviderExcludedWakeRecords,
       hasExternalSendPreflight,
     } = options;
 
@@ -959,6 +973,7 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.onProviderExcludedHistoryChange = onProviderExcludedHistoryChange;
+    this.settleProviderExcludedWakeRecords = settleProviderExcludedWakeRecords;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
 
     this.compactionHandler = new CompactionHandler({
@@ -4147,7 +4162,11 @@ export class AgentSession {
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    if (this.dispatchingQueuedEntry && this.turnPhase === TurnPhase.PREPARING) {
+      this.setTurnPhase(TurnPhase.PREPARING);
+    } else {
+      this.beginPreparingTurn();
+    }
     // From this synchronous point isBusy() reports the turn — release the
     // service-side preflight reservation (see onTurnAdmissionCommitted doc).
     internal?.onTurnAdmissionCommitted?.();
@@ -4313,7 +4332,7 @@ export class AgentSession {
       internal?.goalId
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.beginPreparingTurn();
     // Open the mid-turn thinking override window for the resumed turn (after
     // setTurnPhase(PREPARING), which clears the holder on the IDLE transition).
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
@@ -4949,6 +4968,7 @@ export class AgentSession {
     const isHardInterrupt = options?.soft !== true;
     // Bind Stop to the current claim before partial cleanup or abort delivery can yield.
     const interruptedClaim = isHardInterrupt ? this.queuedToolEndClaim : undefined;
+    const interruptedTurnGeneration = this.preparingTurnGeneration;
     if (isHardInterrupt) {
       this.hardInterruptPendingStreamStart = true;
       this.hardInterruptClaimSettlementPending = true;
@@ -4979,6 +4999,7 @@ export class AgentSession {
       stopResult = await this.streamManager.stopStream(this.workspaceId, {
         ...options,
         abortReason: "user",
+        ...(isHardInterrupt ? { abortTurnGeneration: interruptedTurnGeneration } : {}),
       });
     } catch (error: unknown) {
       if (isHardInterrupt) {
@@ -5601,7 +5622,7 @@ export class AgentSession {
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
     );
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.beginPreparingTurn();
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5708,7 +5729,7 @@ export class AgentSession {
 
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.beginPreparingTurn();
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -6069,6 +6090,20 @@ export class AgentSession {
         this.emitChatEvent(payload);
         return;
       }
+      const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
+      const abortTurnGeneration = payload.metadata?.abortTurnGeneration;
+      if (
+        abortReason === "user" &&
+        abortTurnGeneration != null &&
+        abortTurnGeneration !== this.preparingTurnGeneration
+      ) {
+        log.debug("Ignoring a stale user abort", {
+          workspaceId: this.workspaceId,
+          abortTurnGeneration,
+          preparingTurnGeneration: this.preparingTurnGeneration,
+        });
+        return;
+      }
 
       // stopStream() emits synthetic aborts even when no real stream is active
       // (e.g., during PREPARING or after COMPLETING). We must still forward the
@@ -6083,7 +6118,7 @@ export class AgentSession {
           turnPhase: this.turnPhase,
         });
 
-        const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+        const preStreamAbortReason = abortReason;
         if (this.turnPhase === TurnPhase.PREPARING) {
           this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
@@ -6124,7 +6159,6 @@ export class AgentSession {
 
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
-      const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
       const isQueuedProviderToolEndAbort =
         this.queuedToolEndClaim?.source === "provider" && abortReason !== "user";
       if (abortReason === "user") {
@@ -6416,6 +6450,11 @@ export class AgentSession {
       workspaceId: this.workspaceId,
       message,
     } satisfies AgentSessionChatEvent);
+  }
+
+  private beginPreparingTurn(): void {
+    this.preparingTurnGeneration += 1;
+    this.setTurnPhase(TurnPhase.PREPARING);
   }
 
   private setTurnPhase(next: TurnPhase): void {
@@ -7006,6 +7045,7 @@ export class AgentSession {
     if (queueClaim == null) {
       return undefined;
     }
+    const queueMuxMetadata = queueClaim.muxMetadata as MuxMessageMetadata | undefined;
     const activeClaim = {
       queueClaim,
       source,
@@ -7013,6 +7053,8 @@ export class AgentSession {
       dispatchDeferredByHardInterrupt: false,
       admissionIrreversible: false,
       persistedMessageIds: [],
+      providerExcludedWakeRecords:
+        queueMuxMetadata?.type === "bash-monitor-wake" ? queueMuxMetadata.records : [],
       retryAfterCancellation: false,
     };
     this.queuedToolEndClaim = activeClaim;
@@ -7129,6 +7171,30 @@ export class AgentSession {
     if (exclusionResult.success) {
       this.onProviderExcludedHistoryChange?.();
       return;
+    }
+
+    const wakeRecords = activeClaim.providerExcludedWakeRecords;
+    if (wakeRecords.length > 0) {
+      if (this.settleProviderExcludedWakeRecords == null) {
+        log.error("Cannot delete a canceled wake without durable producer settlement", {
+          workspaceId: this.workspaceId,
+          messageIds,
+          exclusionError: exclusionResult.error,
+        });
+        return;
+      }
+      try {
+        // Deletion removes the recovery record. Persist the producer watermark first.
+        await this.settleProviderExcludedWakeRecords(wakeRecords);
+      } catch (error) {
+        log.error("Failed to settle a canceled wake before provider-exclusion deletion", {
+          workspaceId: this.workspaceId,
+          messageIds,
+          exclusionError: exclusionResult.error,
+          error: getErrorMessage(error),
+        });
+        return;
+      }
     }
 
     // Keep the hard Stop fail-closed. Deletion is a safe fallback when the marker rewrite fails.
@@ -7450,7 +7516,7 @@ export class AgentSession {
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.
       this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
-      this.setTurnPhase(TurnPhase.PREPARING);
+      this.beginPreparingTurn();
 
       void this.sendMessage(message, options, { ...effectiveInternal, enqueuedAtMs })
         .then(async (result) => {

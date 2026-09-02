@@ -97,6 +97,8 @@ export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMod
 export interface ToolEndQueueClaim {
   /** Whether the claimed entry contains user-authored input. */
   readonly userAuthored: boolean;
+  /** Metadata for the exact claimed entry. */
+  readonly muxMetadata?: unknown;
   /** Signal used to stop this exact entry during dispatch admission. */
   readonly admissionSignal: AbortSignal;
   /** Move the claimed entry to the dispatch head. */
@@ -315,6 +317,7 @@ export class MessageQueue {
     let committed = false;
     return {
       userAuthored: entry.userAuthored,
+      muxMetadata: entry.muxMetadata,
       admissionSignal: admissionController.signal,
       commit: () => {
         if (settled || committed) {

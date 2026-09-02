@@ -2,6 +2,7 @@ import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { BashMonitorWakeDisplayRecord } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
@@ -110,6 +111,10 @@ export interface AgentSessionHarnessOptions {
   workspaceGoalService?: WorkspaceGoalService;
   mcpServerManager?: MCPServerManager;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  onProviderExcludedHistoryChange?: () => void;
+  settleProviderExcludedWakeRecords?: (
+    records: readonly BashMonitorWakeDisplayRecord[]
+  ) => Promise<void>;
   captureEvents?: boolean;
 }
 
@@ -154,6 +159,8 @@ export async function createAgentSessionHarness(
     workspaceGoalService: options.workspaceGoalService,
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
+    onProviderExcludedHistoryChange: options.onProviderExcludedHistoryChange,
+    settleProviderExcludedWakeRecords: options.settleProviderExcludedWakeRecords,
   });
 
   const events: WorkspaceChatMessage[] = [];

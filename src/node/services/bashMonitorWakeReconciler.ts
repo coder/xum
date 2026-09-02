@@ -213,7 +213,7 @@ function getProviderExcludedWakeSettlement(
     }
 
     const matchPrefix = snapshot.createdAt + ":";
-    if (record.kind !== "match" || !record.wakeUpdatedAt.startsWith(matchPrefix)) continue;
+    if (!record.wakeUpdatedAt.startsWith(matchPrefix)) continue;
     const excludedOffset = Number(record.wakeUpdatedAt.slice(matchPrefix.length));
     if (
       Number.isSafeInteger(excludedOffset) &&
@@ -221,6 +221,7 @@ function getProviderExcludedWakeSettlement(
       excludedOffset <= maximumKnownMatchOffset
     ) {
       matchedThroughOffset = Math.max(matchedThroughOffset, excludedOffset);
+      if (record.kind === "monitor-lost") lost = true;
       matchedRecord = true;
     }
   }
@@ -480,6 +481,19 @@ export class BashMonitorWakeReconciler {
     });
   }
 
+  async settleProviderExcludedWakeRecords(
+    ownerWorkspaceId: string,
+    records: readonly BashMonitorWakeDisplayRecord[]
+  ): Promise<void> {
+    if (records.length === 0) return;
+    await this.locks.withLock(ownerWorkspaceId, async () => {
+      const collected = await this.collect(ownerWorkspaceId, true, records);
+      await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, collected.autoConsumed);
+      await this.cleanup(collected.autoConsumed);
+    });
+    this.scheduleReconcile(ownerWorkspaceId);
+  }
+
   pendingWakeKind(
     snapshot: BashMonitorWakeReconcilerSnapshot,
     processId: string
@@ -670,7 +684,8 @@ export class BashMonitorWakeReconciler {
 
   private async collect(
     ownerWorkspaceId: string,
-    applyFrontier: boolean
+    applyFrontier: boolean,
+    providerExcludedRecords?: readonly BashMonitorWakeDisplayRecord[]
   ): Promise<{
     signals: DerivedSignal[];
     autoConsumed: DerivedSignal[];
@@ -722,7 +737,15 @@ export class BashMonitorWakeReconciler {
     }
     if (pruned) await this.writeWatermarks(ownerWorkspaceId, watermarks);
     if (applyFrontier) {
-      await this.applyProviderExcludedWakeRecords(ownerWorkspaceId, candidates, watermarks);
+      const records =
+        providerExcludedRecords ??
+        (await this.args.listProviderExcludedWakeRecords(ownerWorkspaceId));
+      await this.applyProviderExcludedWakeRecords(
+        ownerWorkspaceId,
+        candidates,
+        watermarks,
+        records
+      );
     }
 
     const signals: DerivedSignal[] = [];
@@ -752,12 +775,10 @@ export class BashMonitorWakeReconciler {
       snapshot: BashMonitorProcessSnapshot;
       deadRegistryRow: boolean;
     }>,
-    watermarks: Map<string, WatermarkEntry>
+    watermarks: Map<string, WatermarkEntry>,
+    records: readonly BashMonitorWakeDisplayRecord[]
   ): Promise<void> {
-    if (candidates.length === 0) return;
-
-    const records = await this.args.listProviderExcludedWakeRecords(ownerWorkspaceId);
-    if (records.length === 0) return;
+    if (candidates.length === 0 || records.length === 0) return;
     const recordsByProcess = new Map<string, BashMonitorWakeDisplayRecord[]>();
     for (const record of records) {
       if (record.processId == null) continue;

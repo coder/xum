@@ -1,6 +1,6 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
-import type { MuxMessageMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
@@ -39,14 +39,18 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
 
 function streamAbortEvent(
   workspaceId: string,
-  abortReason: "system" | "user"
+  abortReason: "system" | "user",
+  abortTurnGeneration?: number
 ): Record<string, unknown> {
   return {
     type: "stream-abort",
     workspaceId,
     messageId: "assistant-1",
     abortReason,
-    metadata: { duration: 1 },
+    metadata: {
+      duration: 1,
+      ...(abortTurnGeneration != null ? { abortTurnGeneration } : {}),
+    },
   };
 }
 
@@ -1480,6 +1484,125 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       stopStream.mockRestore();
       claimNextToolEndEntry.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("ignores a stale pre-stream abort before replacement state changes", async () => {
+    const workspaceId = "queue-dispatch-stale-abort-generation";
+    const recordUserStoppedStream = mock(() => Promise.resolve());
+    const workspaceGoalService = {
+      recordUserStoppedStream,
+    } as unknown as WorkspaceGoalService;
+    const { session, cleanup, aiEmitter, events } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      captureEvents: true,
+    });
+    const updateStartupAutoRetryAbandonFromAbort = mock(() => Promise.resolve());
+    const internalSession = session as unknown as {
+      preparingTurnGeneration: number;
+      setTurnPhase(phase: "preparing"): void;
+      updateStartupAutoRetryAbandonFromAbort: typeof updateStartupAutoRetryAbandonFromAbort;
+    };
+    internalSession.updateStartupAutoRetryAbandonFromAbort = updateStartupAutoRetryAbandonFromAbort;
+
+    try {
+      internalSession.preparingTurnGeneration = 2;
+      internalSession.setTurnPhase("preparing");
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "user", 1));
+      await Promise.resolve();
+
+      expect(recordUserStoppedStream).not.toHaveBeenCalled();
+      expect(updateStartupAutoRetryAbandonFromAbort).not.toHaveBeenCalled();
+      expect(events.some((event) => event.type === "stream-abort")).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("settles a wake before provider exclusion falls back to deletion", async () => {
+    const workspaceId = "queue-dispatch-exclusion-delete-settlement";
+    const records = [
+      {
+        processId: "proc",
+        wakeUpdatedAt: "2026-08-31T12:00:00.000Z:12",
+        kind: "match" as const,
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      },
+    ];
+    let markSettlementStarted: () => void = () => undefined;
+    const settlementStarted = new Promise<void>((resolve) => {
+      markSettlementStarted = resolve;
+    });
+    let releaseSettlement: () => void = () => undefined;
+    const settlementRelease = new Promise<void>((resolve) => {
+      releaseSettlement = resolve;
+    });
+    const settleProviderExcludedWakeRecords = mock(async () => {
+      markSettlementStarted();
+      await settlementRelease;
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      settleProviderExcludedWakeRecords,
+    });
+    const messageId = "excluded-wake";
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage(messageId, "user", "monitor wake", {
+        synthetic: true,
+        muxMetadata: { type: "bash-monitor-wake", records },
+      })
+    );
+    expect(appendResult.success).toBe(true);
+    const markMessagesProviderExcluded = spyOn(
+      historyService,
+      "markMessagesProviderExcluded"
+    ).mockResolvedValueOnce(Err("injected marker failure"));
+    const deleteMessages = spyOn(historyService, "deleteMessages");
+    const admissionController = new AbortController();
+    admissionController.abort("user Stop");
+    const queueClaim: ToolEndQueueClaim = {
+      userAuthored: false,
+      admissionSignal: admissionController.signal,
+      commit: mock(() => true),
+      restoreCancellation: mock(() => undefined),
+      cancelAdmission: mock(() => undefined),
+      requeueAdmission: mock(() => false),
+      release: mock(() => undefined),
+    };
+    const activeClaim = {
+      queueClaim,
+      admissionIrreversible: true,
+      persistedMessageIds: [messageId],
+      providerExcludedWakeRecords: records,
+    };
+    const internalSession = session as unknown as {
+      excludeCanceledIrreversibleClaim(claim: typeof activeClaim): Promise<void>;
+    };
+
+    try {
+      const exclusion = internalSession.excludeCanceledIrreversibleClaim(activeClaim);
+      await settlementStarted;
+      expect(deleteMessages).not.toHaveBeenCalled();
+
+      releaseSettlement();
+      await exclusion;
+
+      expect(settleProviderExcludedWakeRecords).toHaveBeenCalledWith(records);
+      expect(deleteMessages).toHaveBeenCalledWith(workspaceId, [messageId]);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) expect(history.data).toEqual([]);
+    } finally {
+      releaseSettlement();
+      deleteMessages.mockRestore();
+      markMessagesProviderExcluded.mockRestore();
       session.dispose();
       await cleanup();
     }
