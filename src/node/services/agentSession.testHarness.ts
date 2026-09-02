@@ -110,6 +110,7 @@ export interface AgentSessionHarnessOptions {
   workspaceGoalService?: WorkspaceGoalService;
   mcpServerManager?: MCPServerManager;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  hasExternalSendPreflight?: () => boolean;
   captureEvents?: boolean;
 }
 
@@ -154,6 +155,7 @@ export async function createAgentSessionHarness(
     workspaceGoalService: options.workspaceGoalService,
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
+    hasExternalSendPreflight: options.hasExternalSendPreflight,
   });
 
   const events: WorkspaceChatMessage[] = [];

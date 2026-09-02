@@ -1297,6 +1297,24 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(stopsForQueuedMessage).toBe(2);
   });
 
+  test("queued-message stop does not report itself once the step cap is reached", () => {
+    let stopsForQueuedMessage = 0;
+    const [maxStepCondition, queuedMessageCondition] = buildStopWhenForTests()({
+      hasQueuedMessages: () => true,
+      onQueuedMessageStop: () => {
+        stopsForQueuedMessage += 1;
+      },
+    });
+    const cappedSteps = { steps: new Array<unknown>(100000).fill({}) };
+
+    expect(maxStepCondition(cappedSteps)).toBe(true);
+    expect(queuedMessageCondition(cappedSteps)).toBe(true);
+    expect(stopsForQueuedMessage).toBe(0);
+
+    expect(queuedMessageCondition({ steps: new Array<unknown>(99999).fill({}) })).toBe(true);
+    expect(stopsForQueuedMessage).toBe(1);
+  });
+
   const requiredToolCases: Array<{
     name: string;
     toolPolicy: ToolPolicy;

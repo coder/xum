@@ -114,6 +114,8 @@ const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
   "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
 const MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS = 1;
+/** Hard per-stream step cap; the practical limit is the model's own finish. */
+const MAX_STREAM_STEPS = 100_000;
 
 /** Drop reason for a partial that never reaches chat.jsonl. */
 type DroppedStreamSource = "aborted_stream" | "errored_stream";
@@ -2188,15 +2190,19 @@ export class StreamManager {
       if (!(request.hasQueuedMessages?.("tool-end") ?? false)) {
         return false;
       }
-      // A successful required tool result is a legitimate end of turn on its own;
-      // only a stop made purely for the queued message may need resuming later.
-      if (!hasSuccessfulRequiredToolResult(state)) {
+      // The step cap and a successful required tool result each end the turn on their
+      // own; only a stop made purely for the queued message may need resuming later.
+      if (state.steps.length < MAX_STREAM_STEPS && !hasSuccessfulRequiredToolResult(state)) {
         request.onQueuedMessageStop?.();
       }
       return true;
     };
 
-    return [stepCountIs(100000), hasQueuedToolEndMessage, hasSuccessfulRequiredToolResult];
+    return [
+      stepCountIs(MAX_STREAM_STEPS),
+      hasQueuedToolEndMessage,
+      hasSuccessfulRequiredToolResult,
+    ];
   }
 
   /**
