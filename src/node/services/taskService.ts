@@ -2301,7 +2301,10 @@ export class TaskService implements AgentTaskIntegration {
           const recovery = recoveries.get(task.id);
           assert(recovery != null, "stale starting task recovery is required");
           const entry = findWorkspaceEntry(config, task.id);
-          if (!entry) continue;
+          // Compare-and-set: recovery may run while clients are connected, so a task_stop that
+          // already persisted `interrupted` (or any other transition) must not be overwritten
+          // with the snapshot-derived status and relaunched by the queue drain below.
+          if (entry?.workspace.taskStatus !== "starting") continue;
           entry.workspace.taskStatus = recovery.status;
           if (recovery.acceptedPrompt) {
             // The initial prompt is already durable in chat history; clearing taskPrompt makes the
@@ -2404,6 +2407,7 @@ export class TaskService implements AgentTaskIntegration {
     let resumedRunningCount = 0;
     let skippedRunningDueToActiveDescendants = 0;
     let skippedRunningAlreadyStreaming = 0;
+    let skippedRunningNoLongerRunning = 0;
     let failedRunningCount = 0;
 
     for (const task of runningTasks) {
@@ -2416,6 +2420,16 @@ export class TaskService implements AgentTaskIntegration {
           taskIndex
         )
       ) {
+        continue;
+      }
+
+      // Recovery may run after the server is accepting connections. Re-read the live status so a
+      // task_stop that persisted `interrupted` since the snapshot is not undone by a restart nudge
+      // (sendMessage would treat that as a user-driven resume of the stopped task).
+      const liveStatus = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id)?.workspace
+        .taskStatus;
+      if (liveStatus !== "running") {
+        skippedRunningNoLongerRunning += 1;
         continue;
       }
 
@@ -2671,6 +2685,7 @@ export class TaskService implements AgentTaskIntegration {
       resumedRunningCount,
       skippedRunningDueToActiveDescendants,
       skippedRunningAlreadyStreaming,
+      skippedRunningNoLongerRunning,
       failedRunningCount,
       completedReportTaskCount: completedReportTasks.length,
       patchGenerationRecoveryMs,

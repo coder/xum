@@ -7983,10 +7983,51 @@ describe("WorkspaceService initialize", () => {
       name: "Archived Workspace",
       archivedAt: "2026-03-20T00:00:00.000Z",
     });
+    // Active when metadata was read, but archived (or removed) by a client before the
+    // scheduling loop ran: the live config decides, not the stale metadata.
+    const archivedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "archived-since-ws",
+      name: "Archived Since Read",
+    });
+    const removedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "removed-since-ws",
+      name: "Removed Since Read",
+    });
 
     config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([liveWorkspace, taskWorkspace, archivedWorkspace])
+      Promise.resolve([
+        liveWorkspace,
+        taskWorkspace,
+        archivedWorkspace,
+        archivedSinceWorkspace,
+        removedSinceWorkspace,
+      ])
     ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
+              { id: "task-ws", name: "task-ws", path: "/tmp/task-ws", taskStatus: "running" },
+              {
+                id: "archived-ws",
+                name: "archived-ws",
+                path: "/tmp/archived-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+              {
+                id: "archived-since-ws",
+                name: "archived-since-ws",
+                path: "/tmp/archived-since-ws",
+                archivedAt: "2026-03-21T00:00:00.000Z",
+              },
+            ],
+          },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;

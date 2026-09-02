@@ -3178,13 +3178,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let skippedTaskCount = 0;
       let skippedArchivedCount = 0;
 
+      // This can run while the server is already serving clients, and the cleanups above took
+      // time: re-read config right before the (synchronous) scheduling loop so a workspace archived
+      // or removed since `allMetadata` was read does not get a hidden recovery stream.
+      const liveConfig = this.config.loadConfigOrDefault();
       for (const metadata of allMetadata) {
         if (metadata.taskStatus) {
           skippedTaskCount += 1;
           continue;
         }
 
-        if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+        const live = findWorkspaceEntry(liveConfig, metadata.id)?.workspace;
+        if (live == null || isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) {
           skippedArchivedCount += 1;
           continue;
         }

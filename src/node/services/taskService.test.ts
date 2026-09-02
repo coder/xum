@@ -3443,6 +3443,7 @@ describe("TaskService", () => {
     const projectPath = path.join(rootDir, "repo");
     const parentWorkspaceId = "parent-snapshot";
     const staleStartingTaskId = "child-stale-starting";
+    const stoppedStartingTaskId = "child-stopped-starting";
     const freshStartingTaskId = "child-fresh-starting";
 
     await saveWorkspaces(
@@ -3457,14 +3458,23 @@ describe("TaskService", () => {
           taskStatus: "starting",
           taskModelString: "openai:gpt-5.2",
         }),
+        projectWorkspace(projectPath, "stopped", stoppedStartingTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "starting",
+          taskModelString: "openai:gpt-5.2",
+        }),
       ],
       testTaskSettings()
     );
     const startupSnapshot = config.loadConfigOrDefault();
 
-    // A client connected after the listener was bound and is legitimately starting this task.
+    // A client connected after the listener was bound: it is legitimately starting a new task and
+    // has stopped one of the snapshot's `starting` tasks before recovery applied its verdict.
     await config.editConfig((cfg) => {
-      cfg.projects.get(projectPath)?.workspaces.push(
+      const workspaces = cfg.projects.get(projectPath)?.workspaces ?? [];
+      workspaces.push(
         projectWorkspace(projectPath, "fresh", freshStartingTaskId, {
           parentWorkspaceId,
           agentId: "exec",
@@ -3473,6 +3483,8 @@ describe("TaskService", () => {
           taskModelString: "openai:gpt-5.2",
         })
       );
+      const stopped = workspaces.find((workspace) => workspace.id === stoppedStartingTaskId);
+      if (stopped) stopped.taskStatus = "interrupted";
       return cfg;
     });
 
@@ -3485,10 +3497,12 @@ describe("TaskService", () => {
 
     expect(findWorkspaceInConfig(config, staleStartingTaskId)?.taskStatus).toBe("running");
     expect(findWorkspaceInConfig(config, freshStartingTaskId)?.taskStatus).toBe("starting");
+    expect(findWorkspaceInConfig(config, stoppedStartingTaskId)?.taskStatus).toBe("interrupted");
     const messagedWorkspaceIds = (
       sendMessage as unknown as { mock: { calls: unknown[][] } }
     ).mock.calls.map((call) => call[0]);
     expect(messagedWorkspaceIds).not.toContain(freshStartingTaskId);
+    expect(messagedWorkspaceIds).not.toContain(stoppedStartingTaskId);
   });
 
   test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
@@ -3497,6 +3511,7 @@ describe("TaskService", () => {
     const parentWorkspaceId = "parent-restart-streaming";
     const streamingTaskId = "child-running-streaming";
     const idleTaskId = "child-running-idle";
+    const stoppedTaskId = "child-running-stopped";
 
     await saveWorkspaces(
       config,
@@ -3517,13 +3532,34 @@ describe("TaskService", () => {
           taskStatus: "running",
           taskModelString: "openai:gpt-5.2",
         }),
+        projectWorkspace(projectPath, "stopped", stoppedTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
       ],
       testTaskSettings()
     );
 
     const isStreaming = mock((workspaceId: string) => workspaceId === streamingTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    // A connected client stops one running task while recovery is resuming the others: the
+    // persisted `interrupted` status wins over the snapshot, so no restart nudge is sent.
+    const sendMessage = mock(async (workspaceId: string): Promise<Result<void>> => {
+      if (workspaceId === idleTaskId) {
+        await config.editConfig((cfg) => {
+          const stopped = cfg.projects
+            .get(projectPath)
+            ?.workspaces.find((workspace) => workspace.id === stoppedTaskId);
+          if (stopped) stopped.taskStatus = "interrupted";
+          return cfg;
+        });
+      }
+      return Ok(undefined);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     await taskService.initialize();
@@ -3533,6 +3569,8 @@ describe("TaskService", () => {
     ).mock.calls.map((call) => call[0]);
     expect(messagedWorkspaceIds).toContain(idleTaskId);
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
+    expect(messagedWorkspaceIds).not.toContain(stoppedTaskId);
+    expect(findWorkspaceInConfig(config, stoppedTaskId)?.taskStatus).toBe("interrupted");
   });
 
   test("initialize does not reload config.json per completed-report task", async () => {
