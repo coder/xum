@@ -726,11 +726,15 @@ export class BackupService {
               ? []
               : await this.executeProjectImports(importer, plannedImports, registry);
           this.notifyProjectMemoryChanges([], projectImportResults);
-          // A candidate whose import failed per-candidate stays on offer so the user can fix
-          // the target and retry without another preview; its token is still current.
-          const failedTokens = new Set(
+          // A candidate whose import failed per-candidate, or landed only partly because
+          // existing files conflicted, stays on offer so the user can fix the target or the
+          // conflicts and retry without another preview; its token is still current, and a
+          // conflicted import records no origin, so the source is still an import candidate.
+          const stillOfferedTokens = new Set(
             projectImportResults.flatMap((result, index) =>
-              result.status === "failed" ? [plannedImports[index]?.candidate.token] : []
+              result.status === "failed" || result.skippedFiles.length > 0
+                ? [plannedImports[index]?.candidate.token]
+                : []
             )
           );
           return Ok({
@@ -742,7 +746,9 @@ export class BackupService {
             projectBundleSkipped: restored.projectBundleSkipped,
             unapprovedProjectImports: [
               ...unapprovedProjectImports,
-              ...validated.projectImports.filter((candidate) => failedTokens.has(candidate.token)),
+              ...validated.projectImports.filter((candidate) =>
+                stillOfferedTokens.has(candidate.token)
+              ),
             ],
           });
         } catch (error) {
@@ -936,6 +942,20 @@ export class BackupService {
             `'${targetPath}' is now registered as '${registered}', which this import was not checked against; approve it again`
           );
         try {
+          // Reclassified since validation: the candidate's recorded source path is registered
+          // on this machine now, so every later restore writes the entry directly into that
+          // project — memory imported into the approved target would be orphaned there and
+          // its origin record overridden by the exact-path match. Refused under the
+          // registration lock, where this cannot change again before the write; the next
+          // preview shows the entry as matched.
+          if (registry.keys.has(candidate.sourcePath)) {
+            results.push(
+              failed(
+                `'${candidate.sourcePath}' was registered on this machine since the preview and is now restored directly; preview again`
+              )
+            );
+            continue;
+          }
           // Re-verify under the local payload lock: the preflight ran before the snapshot and
           // the directory may have vanished since.
           const stat = await fs.lstat(targetPath).catch(() => null);

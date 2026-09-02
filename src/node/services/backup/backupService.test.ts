@@ -1595,6 +1595,103 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("keeps a candidate on offer when its import skipped conflicting files", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const conflicted = candidate();
+    const service = createService(tempDir, {
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [conflicted],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith(() =>
+              Promise.resolve({
+                writtenFiles: ["memory/project/target-abc/notes.md"],
+                skippedFiles: ["memory/project/target-abc/conflict.md"],
+              })
+            )
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => Promise.resolve(Ok({ normalizedPath: projectPath })))
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]?.status).toBe("imported");
+      // No origin was recorded over the conflict, so the source is still an import
+      // candidate; the card must stay so the user can resolve and retry without a preview.
+      expect(result.data.unapprovedProjectImports).toEqual([conflicted]);
+    }
+  });
+
+  test("refuses an import whose source became a registered project since the preview", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const config = new TestBackupConfig(tempDir);
+    const reclassified = candidate();
+    const importedTo: string[] = [];
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [reclassified],
+            matchedProjects: [],
+          }),
+        // Another window registers the entry's recorded source path itself while the
+        // snapshot is written: the entry is an exact match from now on.
+        writeSafetySnapshot: () => {
+          config.state.projects.set(reclassified.sourcePath, { workspaces: [] });
+          return Promise.resolve();
+        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    // Neither registered nor written: memory imported into the target would be orphaned
+    // there once every later restore writes the entry into its own registered project.
+    expect(registrations).toBe(0);
+    expect(importedTo).toEqual([]);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "failed",
+        message: expect.stringContaining("registered on this machine since the preview") as string,
+      });
+    }
+  });
+
   test("re-registers a target whose planned registration vanished before the import", async () => {
     const target = path.join(tempDir, "target");
     await fs.mkdir(target);
