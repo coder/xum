@@ -110,6 +110,59 @@ describe("ServiceContainer", () => {
     );
   });
 
+  it("initializeCore resolves without waiting for task recovery", async () => {
+    services = new ServiceContainer(stores);
+    let releaseTaskInit: (() => void) | undefined;
+    const taskInitGate = new Promise<void>((resolve) => {
+      releaseTaskInit = resolve;
+    });
+    const taskInitializeSpy = spyOn(services.taskService, "initialize").mockImplementation(
+      () => taskInitGate
+    );
+    const workspaceInitializeSpy = spyOn(
+      services.workspaceService,
+      "initialize"
+    ).mockImplementation(() => Promise.resolve());
+    const loadConfigSpy = spyOn(config, "loadConfigOrDefault");
+
+    await services.initializeCore();
+    expect(taskInitializeSpy).not.toHaveBeenCalled();
+    expect(workspaceInitializeSpy).not.toHaveBeenCalled();
+
+    const callOrder: string[] = [];
+    let taskInitCalled: (() => void) | undefined;
+    const taskInitCalledPromise = new Promise<void>((resolve) => {
+      taskInitCalled = resolve;
+    });
+    workspaceInitializeSpy.mockImplementation(() => {
+      callOrder.push("workspace");
+      return Promise.resolve();
+    });
+    taskInitializeSpy.mockImplementation(() => {
+      callOrder.push("task");
+      taskInitCalled?.();
+      return taskInitGate;
+    });
+    loadConfigSpy.mockClear();
+
+    let recoverySettled = false;
+    const recovery = services.runStartupRecovery().then(() => {
+      recoverySettled = true;
+    });
+    await taskInitCalledPromise;
+    expect(callOrder).toEqual(["workspace", "task"]);
+    expect(recoverySettled).toBe(false);
+
+    // The snapshot handed to TaskService is the one loaded synchronously at recovery start.
+    const snapshot = loadConfigSpy.mock.results[0]?.value;
+    expect(snapshot).toBeDefined();
+    expect(taskInitializeSpy).toHaveBeenCalledWith(snapshot);
+
+    releaseTaskInit?.();
+    await recovery;
+    expect(recoverySettled).toBe(true);
+  });
+
   it("exposes desktopSessionManager in the ORPC context", () => {
     services = new ServiceContainer(stores);
 

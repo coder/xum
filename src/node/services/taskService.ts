@@ -10,6 +10,7 @@ import {
 // Persisted task snapshots stamp the legacy exclusive mirror so downgraded
 // builds resume tasks in the exclusive posture (see withLegacyPtcExclusiveMirror).
 import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
+import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -2259,9 +2260,14 @@ export class TaskService implements AgentTaskIntegration {
     return found;
   }
 
-  async initialize(): Promise<void> {
+  /**
+   * @param startupConfigSnapshot - config snapshot taken when the process started. When the server
+   *   binds its listener before running recovery, clients may already be creating tasks; judging
+   *   stale-`starting` recovery from this snapshot keeps those fresh tasks out of scope.
+   */
+  async initialize(startupConfigSnapshot?: ProjectsConfig): Promise<void> {
     const startupStartedAt = Date.now();
-    const startupConfig = this.config.loadConfigOrDefault();
+    const startupConfig = startupConfigSnapshot ?? this.config.loadConfigOrDefault();
     const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) => task.taskStatus === "queued" && typeof task.id === "string"
     ).length;
@@ -2397,6 +2403,7 @@ export class TaskService implements AgentTaskIntegration {
 
     let resumedRunningCount = 0;
     let skippedRunningDueToActiveDescendants = 0;
+    let skippedRunningAlreadyStreaming = 0;
     let failedRunningCount = 0;
 
     for (const task of runningTasks) {
@@ -2460,6 +2467,14 @@ export class TaskService implements AgentTaskIntegration {
           continue;
         }
         resumedRunningCount += 1;
+        continue;
+      }
+
+      // Recovery may run after the server is already accepting connections, so a client (or the
+      // queue drain above) can legitimately have this task streaming by now. Nudging it again
+      // would inject a spurious "Xum restarted" turn into a live stream.
+      if (this.aiService.isStreaming(task.id)) {
+        skippedRunningAlreadyStreaming += 1;
         continue;
       }
 
@@ -2551,10 +2566,13 @@ export class TaskService implements AgentTaskIntegration {
     for (const task of completedReportTasks) {
       if (!task.parentWorkspaceId) continue;
       try {
+        // Pass the loop snapshot: reloading config.json per reported task made this pass scale
+        // with (reported tasks x config size) on large deployments.
         await this.gitPatchArtifactService.maybeStartGeneration(
           task.parentWorkspaceId,
           task.id!,
-          (wsId) => this.requestReportedTaskCleanupRecheck(wsId)
+          (wsId) => this.requestReportedTaskCleanupRecheck(wsId),
+          { config }
         );
       } catch (error: unknown) {
         log.error("Failed to resume subagent git patch generation on startup", {
@@ -2591,9 +2609,17 @@ export class TaskService implements AgentTaskIntegration {
 
     // Best-effort completed-report ancestor recheck after restart.
     const cleanupReportedTasksStartedAt = Date.now();
+    // Reuse one config snapshot across tasks and reload only after a removal changed the tree.
+    // A stale snapshot is conservative here: it can only show more workspaces than exist, so the
+    // structural-leaf gate errs toward skipping. Concurrent removals from patch-generation
+    // onComplete callbacks are re-evaluated on fresh config by those callbacks.
+    let cleanupConfig = config;
     for (const task of completedReportTasks) {
       if (!task.id) continue;
-      await this.cleanupReportedLeafTask(task.id);
+      const removedCount = await this.cleanupReportedLeafTask(task.id, { config: cleanupConfig });
+      if (removedCount > 0) {
+        cleanupConfig = this.config.loadConfigOrDefault();
+      }
     }
     const cleanupReportedTasksMs = Date.now() - cleanupReportedTasksStartedAt;
 
@@ -2633,8 +2659,9 @@ export class TaskService implements AgentTaskIntegration {
       await this.schedulePendingTerminalAttentionOwnerDrains();
     const terminalAttentionDrainMs = Date.now() - terminalAttentionDrainStartedAt;
 
-    log.info("[startup] TaskService.initialize completed", {
-      totalMs: Date.now() - startupStartedAt,
+    const totalMs = Date.now() - startupStartedAt;
+    const completedPayload = {
+      totalMs,
       maybeStartQueuedTasksMs,
       awaitingReportTaskCount: awaitingReportTasks.length,
       resumedAwaitingReportCount,
@@ -2643,6 +2670,7 @@ export class TaskService implements AgentTaskIntegration {
       runningTaskCount: runningTasks.length,
       resumedRunningCount,
       skippedRunningDueToActiveDescendants,
+      skippedRunningAlreadyStreaming,
       failedRunningCount,
       completedReportTaskCount: completedReportTasks.length,
       patchGenerationRecoveryMs,
@@ -2653,7 +2681,12 @@ export class TaskService implements AgentTaskIntegration {
       pendingTerminalAttentionOwnerWorkspaceCount,
       terminalAttentionDrainMs,
       cleanupReportedTasksMs,
-    });
+    };
+    if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
+      log.warn("[startup] TaskService.initialize completed", completedPayload);
+    } else {
+      log.info("[startup] TaskService.initialize completed", completedPayload);
+    }
   }
 
   private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
@@ -13111,11 +13144,11 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async canCleanupReportedTask(
-    workspaceId: string
+    workspaceId: string,
+    config: ProjectsConfig = this.config.loadConfigOrDefault()
   ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
     assert(workspaceId.length > 0, "canCleanupReportedTask: workspaceId must be non-empty");
 
-    const config = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(config, workspaceId);
     if (!entry) {
       return { ok: false, reason: "workspace_not_found" };
@@ -13179,26 +13212,38 @@ export class TaskService implements AgentTaskIntegration {
     return { ok: true, parentWorkspaceId };
   }
 
-  private async cleanupReportedLeafTask(workspaceId: string): Promise<void> {
+  /**
+   * @param options.config - config snapshot for the first (depth 0) eligibility check only; every
+   *   later depth re-evaluates the parent on fresh config because a removal just changed the tree.
+   * @returns the number of workspaces removed.
+   */
+  private async cleanupReportedLeafTask(
+    workspaceId: string,
+    options?: { config?: ProjectsConfig }
+  ): Promise<number> {
     assert(workspaceId.length > 0, "cleanupReportedLeafTask: workspaceId must be non-empty");
 
     // Lineage reduction: each iteration removes exactly one completed leaf, then re-evaluates
     // the parent on fresh config. The structural-leaf gate in canCleanupReportedTask ensures
     // ancestors are only deleted after every child has been pruned.
     let currentWorkspaceId = workspaceId;
+    let removedCount = 0;
     const visited = new Set<string>();
     for (let depth = 0; depth < 32; depth++) {
       if (visited.has(currentWorkspaceId)) {
         log.error("cleanupReportedLeafTask: possible parentWorkspaceId cycle", {
           workspaceId: currentWorkspaceId,
         });
-        return;
+        return removedCount;
       }
       visited.add(currentWorkspaceId);
 
-      const cleanupEligibility = await this.canCleanupReportedTask(currentWorkspaceId);
+      const cleanupEligibility = await this.canCleanupReportedTask(
+        currentWorkspaceId,
+        depth === 0 ? options?.config : undefined
+      );
       if (!cleanupEligibility.ok) {
-        return;
+        return removedCount;
       }
 
       const removeResult = await this.workspaceService.remove(currentWorkspaceId, true);
@@ -13207,8 +13252,9 @@ export class TaskService implements AgentTaskIntegration {
           workspaceId: currentWorkspaceId,
           error: removeResult.error,
         });
-        return;
+        return removedCount;
       }
+      removedCount += 1;
 
       currentWorkspaceId = cleanupEligibility.parentWorkspaceId;
     }
@@ -13216,5 +13262,6 @@ export class TaskService implements AgentTaskIntegration {
     log.error("cleanupReportedLeafTask: exceeded max parent traversal depth", {
       workspaceId,
     });
+    return removedCount;
   }
 }

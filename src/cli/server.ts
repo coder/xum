@@ -94,11 +94,10 @@ async function main(): Promise<void> {
   launchProjectPath = null;
 
   // Keepalive interval to prevent premature process exit during async initialization.
-  // During startup, taskService.initialize() may resume running tasks by calling
-  // sendMessage(), which spawns background AI streams. Between the completion of
-  // serviceContainer.initialize() and the HTTP server starting to listen, there can
-  // be a brief moment where no ref'd handles exist, causing Node to exit with code 0.
-  // This interval ensures the event loop stays alive until the server is listening.
+  // Between the completion of serviceContainer.initializeCore() and the HTTP server
+  // starting to listen, there can be a brief moment where no ref'd handles exist,
+  // causing Node to exit with code 0. This interval ensures the event loop stays alive
+  // until the server is listening; startup recovery runs after that point.
   const startupKeepalive = setInterval(() => {
     // Intentionally empty - keeps event loop alive during startup
   }, 1000);
@@ -115,9 +114,9 @@ async function main(): Promise<void> {
   }
 
   // Early lockfile check: detect an existing server BEFORE initializing services.
-  // serviceContainer.initialize() resumes queued/running tasks (via TaskService),
-  // so we must fail fast here to avoid orphaned side effects when another server
-  // already holds the lock. ServerService.startServer() re-checks as defense-in-depth.
+  // Task recovery (runStartupRecovery) only runs after startServer() has acquired the
+  // lock, so this check is a fast-fail nicety that avoids core init work when another
+  // server already holds the lock. ServerService.startServer() re-checks as the real gate.
   const xumHome = getXumHome();
   const earlyLockfile = new ServerLockfile(xumHome);
   const existing = await earlyLockfile.read();
@@ -132,7 +131,9 @@ async function main(): Promise<void> {
   const serviceContainer = new ServiceContainer(stores);
   // Headless server has no interactive host-key dialog
   setOpenSSHHostKeyPolicyMode("headless-fallback");
-  await serviceContainer.initialize();
+  // Only the fast core init gates the listener; workspace/task recovery scales with the
+  // number of workspaces and runs in the background once the server is accepting connections.
+  await serviceContainer.initializeCore();
   serviceContainer.windowService.setMainWindow(mockWindow);
 
   if (ADD_PROJECT_PATH) {
@@ -160,6 +161,14 @@ async function main(): Promise<void> {
     authToken: resolved.token,
     serveStatic: true,
     allowHttpOrigin: ALLOW_HTTP_ORIGIN,
+  });
+
+  // Start recovery in the same synchronous continuation as startServer resolving, before any
+  // further await: runStartupRecovery snapshots config before its first await, and that
+  // snapshot must predate anything a freshly connected client can create. Recovery is
+  // best-effort background work; a failure must not take the listening server down.
+  void serviceContainer.runStartupRecovery().catch((error: unknown) => {
+    log.error("[startup] Background startup recovery failed", { error });
   });
 
   // Server is now listening - clear the startup keepalive since httpServer keeps the loop alive

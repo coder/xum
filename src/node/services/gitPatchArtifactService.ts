@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import assert from "node:assert/strict";
 
-import type { Config } from "@/node/config";
+import type { Config, ProjectsConfig } from "@/node/config";
 import type {
   SubagentGitPatchArtifact,
   SubagentGitProjectPatchArtifact,
@@ -330,12 +330,14 @@ export class GitPatchArtifactService {
    *
    * @param onComplete - called after generation finishes (success *or* failure),
    *   typically used to trigger reported-leaf-task cleanup.
+   * @param options.config - config snapshot to resolve the child/parent entries from; callers that
+   *   iterate many tasks (startup recovery) pass one instead of reloading config.json per task.
    */
   async maybeStartGeneration(
     parentWorkspaceId: string,
     childWorkspaceId: string,
     onComplete: OnPatchGenerationComplete,
-    options?: { refreshForContinuation?: boolean }
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     return await this.withOperationLock(childWorkspaceId, async () => {
       await this.maybeStartGenerationUnlocked(
@@ -351,7 +353,7 @@ export class GitPatchArtifactService {
     parentWorkspaceId: string,
     childWorkspaceId: string,
     onComplete: OnPatchGenerationComplete,
-    options?: { refreshForContinuation?: boolean }
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     assert(
       parentWorkspaceId.length > 0,
@@ -371,7 +373,7 @@ export class GitPatchArtifactService {
     // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
     // while we're still reading commits from it.
     const nowMs = Date.now();
-    const cfg = this.config.loadConfigOrDefault();
+    const cfg = options?.config ?? this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
 
     if (childEntry?.workspace.kind === "scratch") {

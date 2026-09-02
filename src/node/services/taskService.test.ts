@@ -3438,6 +3438,140 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
   });
 
+  test("initialize judges stale starting tasks from the startup config snapshot", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-snapshot";
+    const staleStartingTaskId = "child-stale-starting";
+    const freshStartingTaskId = "child-fresh-starting";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "stale", staleStartingTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "starting",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const startupSnapshot = config.loadConfigOrDefault();
+
+    // A client connected after the listener was bound and is legitimately starting this task.
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)?.workspaces.push(
+        projectWorkspace(projectPath, "fresh", freshStartingTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "starting",
+          taskModelString: "openai:gpt-5.2",
+        })
+      );
+      return cfg;
+    });
+
+    const isStreaming = mock((workspaceId: string) => workspaceId === staleStartingTaskId);
+    const { aiService } = createAIServiceMocks(config, { isStreaming });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.initialize(startupSnapshot);
+
+    expect(findWorkspaceInConfig(config, staleStartingTaskId)?.taskStatus).toBe("running");
+    expect(findWorkspaceInConfig(config, freshStartingTaskId)?.taskStatus).toBe("starting");
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).not.toContain(freshStartingTaskId);
+  });
+
+  test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-restart-streaming";
+    const streamingTaskId = "child-running-streaming";
+    const idleTaskId = "child-running-idle";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "streaming", streamingTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+        projectWorkspace(projectPath, "idle", idleTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const isStreaming = mock((workspaceId: string) => workspaceId === streamingTaskId);
+    const { aiService } = createAIServiceMocks(config, { isStreaming });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.initialize();
+
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toContain(idleTaskId);
+    expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
+  });
+
+  test("initialize does not reload config.json per completed-report task", async () => {
+    const countConfigLoadsDuringInitialize = async (reportedTaskCount: number): Promise<number> => {
+      const runRootDir = path.join(rootDir, `run-${reportedTaskCount}`);
+      const config = await createTestConfig(runRootDir);
+      const projectPath = path.join(runRootDir, "repo");
+      const parentWorkspaceId = "parent-reload";
+      const reportedTasks = Array.from({ length: reportedTaskCount }, (_unused, index) =>
+        projectWorkspace(projectPath, `reported-${index}`, `child-reported-${index}`, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          taskModelString: "openai:gpt-5.2",
+        })
+      );
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [projectWorkspace(projectPath, "parent", parentWorkspaceId), ...reportedTasks],
+        testTaskSettings()
+      );
+      const { taskService } = createTaskServiceHarness(config);
+      const loadConfigSpy = spyOn(config, "loadConfigOrDefault");
+      try {
+        await taskService.initialize();
+        return loadConfigSpy.mock.calls.length;
+      } finally {
+        loadConfigSpy.mockRestore();
+      }
+    };
+
+    const loadsWithTwoTasks = await countConfigLoadsDuringInitialize(2);
+    const loadsWithSixTasks = await countConfigLoadsDuringInitialize(6);
+    expect(loadsWithSixTasks).toBe(loadsWithTwoTasks);
+  });
+
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

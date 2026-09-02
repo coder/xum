@@ -4,6 +4,7 @@ import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchi
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
+import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import type { CoreServices } from "@/node/services/coreServices";
 import { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -190,6 +191,11 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
+  // Shared between initializeCore() and runStartupRecovery() so the completion log still
+  // reports every step and the total wall time from the start of core init.
+  private startupStartedAt: number | undefined;
+  private readonly startupStepDurationsMs: Record<string, number> = {};
+
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
    * so a concurrent or repeated dispose() (the desktop's two before-quit
@@ -613,43 +619,78 @@ export class ServiceContainer {
   }
 
   async initialize(): Promise<void> {
-    const startupStartedAt = Date.now();
-    const stepDurationsMs: Record<string, number> = {};
-    const recordStep = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
-      const stepStartedAt = Date.now();
-      try {
-        return await fn();
-      } finally {
-        stepDurationsMs[name] = Date.now() - stepStartedAt;
-      }
-    };
+    await this.initializeCore();
+    await this.runStartupRecovery();
+  }
+
+  private async recordStartupStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const stepStartedAt = Date.now();
+    try {
+      return await fn();
+    } finally {
+      this.startupStepDurationsMs[name] = Date.now() - stepStartedAt;
+    }
+  }
+
+  /**
+   * Fast startup steps that request handling depends on. Safe to await before binding the
+   * server listener; the slow per-workspace recovery pass lives in runStartupRecovery().
+   */
+  async initializeCore(): Promise<void> {
+    this.startupStartedAt = Date.now();
 
     log.info("[startup] ServiceContainer.initialize starting");
 
-    await recordStep("extensionMetadata.initialize", () => this.extensionMetadata.initialize());
+    await this.recordStartupStep("extensionMetadata.initialize", () =>
+      this.extensionMetadata.initialize()
+    );
     // Initialize telemetry service
-    await recordStep("telemetryService.initialize", () => this.telemetryService.initialize());
+    await this.recordStartupStep("telemetryService.initialize", () =>
+      this.telemetryService.initialize()
+    );
 
     // Initialize policy service (startup gating)
-    await recordStep("policyService.initialize", () => this.policyService.initialize());
+    await this.recordStartupStep("policyService.initialize", () => this.policyService.initialize());
 
-    await recordStep("experimentsService.initialize", () => this.experimentsService.initialize());
+    await this.recordStartupStep("experimentsService.initialize", () =>
+      this.experimentsService.initialize()
+    );
+  }
+
+  /**
+   * Workspace/task restart recovery plus background housekeeping. On large deployments this
+   * scales with the number of workspaces, so the server entry point runs it after the
+   * listener is bound instead of on the critical path to accepting connections.
+   */
+  async runStartupRecovery(): Promise<void> {
+    // Snapshot config synchronously, before the first await. server.ts calls this in the same
+    // tick that startServer resolves, so a snapshot taken here cannot contain tasks created by
+    // clients that connect after listen. TaskService's stale-`starting` recovery must only judge
+    // tasks that were `starting` when the process started, never a task a freshly connected
+    // client is legitimately starting.
+    const startupConfig = this.config.loadConfigOrDefault();
+
     // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.initialize().
-    await recordStep("workspaceService.initialize", () => this.workspaceService.initialize());
-    await recordStep("taskService.initialize", () => this.taskService.initialize());
+    await this.recordStartupStep("workspaceService.initialize", () =>
+      this.workspaceService.initialize()
+    );
+    await this.recordStartupStep("taskService.initialize", () =>
+      this.taskService.initialize(startupConfig)
+    );
 
     const idleCompactionStartedAt = Date.now();
     // Start idle compaction checker
     this.idleCompactionService.start();
-    stepDurationsMs["idleCompactionService.start"] = Date.now() - idleCompactionStartedAt;
+    this.startupStepDurationsMs["idleCompactionService.start"] =
+      Date.now() - idleCompactionStartedAt;
 
     const heartbeatStartedAt = Date.now();
     this.heartbeatService.start();
-    stepDurationsMs["heartbeatService.start"] = Date.now() - heartbeatStartedAt;
+    this.startupStepDurationsMs["heartbeatService.start"] = Date.now() - heartbeatStartedAt;
 
     const agentStatusStartedAt = Date.now();
     this.agentStatusService.start();
-    stepDurationsMs["agentStatusService.start"] = Date.now() - agentStatusStartedAt;
+    this.startupStepDurationsMs["agentStatusService.start"] = Date.now() - agentStatusStartedAt;
 
     // Dream launch sweep (PRD #3534): consolidate memory for workspaces idle
     // ≥24h with writes since their last run. Fire-and-forget after the await
@@ -673,10 +714,13 @@ export class ServiceContainer {
       log.warn("Background xum SSH config setup failed", { error });
     });
 
-    log.info("[startup] ServiceContainer.initialize completed", {
-      totalMs: Date.now() - startupStartedAt,
-      stepDurationsMs,
-    });
+    const totalMs = Date.now() - (this.startupStartedAt ?? Date.now());
+    const completedPayload = { totalMs, stepDurationsMs: this.startupStepDurationsMs };
+    if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
+      log.warn("[startup] ServiceContainer.initialize completed", completedPayload);
+    } else {
+      log.info("[startup] ServiceContainer.initialize completed", completedPayload);
+    }
   }
 
   /**
