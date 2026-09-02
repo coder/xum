@@ -1,5 +1,6 @@
 import React from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { formatDuration } from "@/common/utils/formatDuration";
 
 const wrapperClassName =
   "pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 [&>*]:pointer-events-auto";
@@ -42,7 +43,11 @@ export const ConnectionStatusToast: React.FC<ConnectionStatusToastProps> = ({ wr
         <span className="bg-warning inline-block h-2 w-2 animate-pulse rounded-full" />
         <span>
           {apiState.status === "degraded" ? (
-            "Connection unstable — messages may be delayed"
+            <>
+              Server is slow to respond (
+              <span className="counter-nums">{formatDuration(apiState.latencyMs, "precise")}</span>
+              ); messages may be delayed
+            </>
           ) : (
             <>
               Reconnecting to server
