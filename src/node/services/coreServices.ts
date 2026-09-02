@@ -1,5 +1,13 @@
 /**
- * Core service graph shared by `xum run` (CLI) and `ServiceContainer` (desktop).
+ * Core service graph shared by `xum run`/`xum workflow` (CLI) and
+ * `ServiceContainer` (desktop).
+ *
+ * `buildCoreGraph` is the imperative construction body. Both roots reach it
+ * through the Effect Layer graph — `CoreProjectionLive` in `di/layers/core.ts`
+ * wraps it as a single coarse layer (Effect migration Phase 11) — so the roots
+ * are `createCoreServices` (`./coreServicesRoot.ts`, CLI) and `AppLive`
+ * (`di/layers/app.ts`, desktop). Construction order and wiring here are the
+ * behavioral contract the per-service layers of the next phase must replay.
  */
 
 import * as os from "os";
@@ -63,6 +71,11 @@ export interface CoreServicesOptions {
   mcpConfig?: Config;
   mcpServerManagerOptions?: MCPServerManagerOptions;
   workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
+  /**
+   * Layer-provided instance (desktop `ServiceContainer` builds it from its
+   * Effect graph, see `di/layers/core.ts`); default-constructed when absent.
+   */
+  memoryMetaService?: MemoryMetaService;
   /** Optional cross-cutting services (desktop creates before core services). */
   policyService?: PolicyService;
   telemetryService?: TelemetryService;
@@ -100,7 +113,7 @@ export interface CoreServices {
   turnRequestBuilderBindings: TurnRequestBuilderBindings;
 }
 
-export function createCoreServices(opts: CoreServicesOptions): CoreServices {
+export function buildCoreGraph(opts: CoreServicesOptions): CoreServices {
   const { config, extensionMetadataPath } = opts;
 
   const sessionLocator = opts.sessionLocator ?? new WorkspaceSessionLocator(config.rootDir);
@@ -205,7 +218,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   // Agent memory (memory experiment): scope roots derive from Config (xum home
   // + session dirs); experiment gating happens per stream in AIService.
   // Host-local sidecar for user-owned memory metadata (pins + usage stats).
-  const memoryMetaService = new MemoryMetaService(config.rootDir);
+  const memoryMetaService = opts.memoryMetaService ?? new MemoryMetaService(config.rootDir);
   const memoryService = new MemoryService(config, memoryMetaService);
   turnRequestBuilderBindings.memoryService = memoryService;
 
@@ -352,7 +365,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   workspaceService.setAgentTaskIntegration(taskService);
 
   // Goal continuation bridge lives at the core scope so every codepath that
-  // uses createCoreServices (xum run, xum server via ServiceContainer, tests)
+  // uses the core graph (xum run, xum server via ServiceContainer, tests)
   // gets a working dispatcher. Without this, requestContinuationAfterStreamEnd
   // is a no-op and the auto-continuation loop never fires. The dispatcher is
   // also exposed so ServiceContainer can share it with HeartbeatService.

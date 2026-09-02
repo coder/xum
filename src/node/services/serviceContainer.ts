@@ -4,7 +4,7 @@ import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchi
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
-import { createCoreServices, type CoreServices } from "@/node/services/coreServices";
+import type { CoreServices } from "@/node/services/coreServices";
 import { PTYService } from "@/node/services/ptyService";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import { ProjectService } from "@/node/services/projectService";
@@ -24,7 +24,7 @@ import { InstructionsService } from "@/node/services/instructionsService";
 import { ServerService } from "@/node/services/serverService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { VoiceService } from "@/node/services/voiceService";
-import { TelemetryService } from "@/node/services/telemetryService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import type {
   ErrorEvent,
   ReasoningDeltaEvent,
@@ -41,15 +41,15 @@ import { AgentBrowserSessionDiscoveryService } from "@/node/services/browser/Age
 import { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserBridgeTokenManager";
 import { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
-import { DevToolsService } from "@/node/services/devToolsService";
-import { SessionTimingService } from "@/node/services/sessionTimingService";
+import type { DevToolsService } from "@/node/services/devToolsService";
+import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import { TimelineService } from "@/node/services/timelineService";
-import {
+import type {
   AnalyticsService,
-  type IngestWorkspaceMeta,
+  IngestWorkspaceMeta,
 } from "@/node/services/analytics/analyticsService";
-import { ExperimentsService } from "@/node/services/experimentsService";
-import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { McpOauthService } from "@/node/services/mcpOauthService";
@@ -75,27 +75,60 @@ import {
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
-import { PolicyService } from "@/node/services/policyService";
+import type { PolicyService } from "@/node/services/policyService";
 import { ServerAuthService } from "@/node/services/serverAuthService";
 import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { ORPCContext } from "@/node/orpc/context";
-import { buildOrpcEffectContext } from "@/node/orpc/effectContext";
+import type { Scope } from "effect";
+import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
+import {
+  closeScopeBounded,
+  disposeAppRuntime,
+  makeAppRuntime,
+  type AppRuntime,
+} from "@/node/services/di/appRuntime";
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
+import { AppLive } from "@/node/services/di/layers/app";
+import { coreServicesFromContext } from "@/node/services/di/layers/core";
+import {
+  Analytics,
+  DevTools,
+  Experiments,
+  Policy,
+  SessionTiming,
+  Telemetry,
+  WorkspaceMcpOverrides,
+  type AppTags,
+} from "@/node/services/di/tags";
 /**
  * ServiceContainer - Central dependency container for all backend services.
  *
  * This class instantiates and wires together all services needed by the ORPC router.
  * Services are accessed via the ORPC context object.
+ *
+ * Services provided by the Effect Layer graph (`di/layers/app.ts`: the stores,
+ * the runtime seams, the cross-cutting services and the whole core graph) are
+ * built first by `runtime` and handed to the constructor-wired desktop
+ * remainder; the migration moves services into the graph incrementally (see
+ * the DI contract in `di/appRuntime.ts`).
  */
 export class ServiceContainer {
+  public readonly runtime: AppRuntime<AppTags>;
+  /**
+   * Supervised fiber scope owned by the runtime (`di/appFiberScope.ts`).
+   * Closed early in `dispose()`; no production occupant yet.
+   */
+  public readonly appFiberScope: Scope.Closeable;
   public readonly workflowRuntimeFactory = new QuickJSRuntimeFactory();
   public readonly config: Config;
   public readonly sessionLocator: WorkspaceSessionLocator;
   public readonly providersConfigStore: ProvidersConfigStore;
   public readonly secretsStore: SecretsStore;
   public readonly fileLeaseManager: FileLeaseManager;
-  // Core services — instantiated by createCoreServices (shared with `xum run` CLI)
+  // Core services — built by the shared core graph layer (`di/layers/core.ts`;
+  // the same definitions back the `xum run`/`xum workflow` roots)
   private readonly historyService: CoreServices["historyService"];
   public readonly aiService: CoreServices["aiService"];
   public readonly streamManager: CoreServices["streamManager"];
@@ -157,8 +190,25 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
+  /**
+   * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
+   * so a concurrent or repeated dispose() (the desktop's two before-quit
+   * paths, tests' dispose-then-shutdown) awaits the one sequence instead of
+   * re-running steps — in particular it cannot observe the AppFiberScope as
+   * already closed and start tearing down dependencies while the first call
+   * is still awaiting the scope's fibers.
+   */
+  private disposePromise: Promise<void> | null = null;
 
   constructor(stores: ConfigStores) {
+    // Built eagerly and synchronously (a layer body that throws fails the
+    // constructor, like any service constructor) before the constructor-wired
+    // services so layer-provided instances can be passed into them.
+    this.runtime = makeAppRuntime(AppLive(stores));
+    this.appFiberScope = this.runtime.get(AppFiberScopeTag);
+    // Clock-driven workers run their lifecycle fibers through the runtime's
+    // context-bound runner (unsupervised; see di/effectRunner.ts).
+    const effectRunner = this.runtime.get(EffectRunnerTag);
     const config = stores.config;
     this.config = config;
     this.sessionLocator = stores.sessionLocator;
@@ -166,40 +216,26 @@ export class ServiceContainer {
     this.secretsStore = stores.secretsStore;
     this.fileLeaseManager = stores.fileLeaseManager;
 
-    // Cross-cutting services: created first so they can be passed to core
-    // services via constructor params (no setter injection needed).
-    this.policyService = new PolicyService(config);
-    this.telemetryService = new TelemetryService(config.rootDir);
-    this.experimentsService = new ExperimentsService({
-      telemetryService: this.telemetryService,
-      xumHome: config.rootDir,
-    });
+    // Cross-cutting services: layer-built (`CrossCuttingLive`) ahead of the
+    // core graph, whose options derive from them (`CoreOptionsFromDesktopLive`).
+    this.policyService = this.runtime.get(Policy);
+    this.telemetryService = this.runtime.get(Telemetry);
+    this.experimentsService = this.runtime.get(Experiments);
     this.backupService = new BackupService(config, {
       gitRepo: createBackupGitRepo({
         cacheRoot: path.join(config.rootDir, "backup-cache"),
       }),
       payload: createBackupPayloadStore({ config }),
     });
-    this.sessionTimingService = new SessionTimingService(config, this.telemetryService);
-    this.analyticsService = new AnalyticsService(config);
-    this.devToolsService = new DevToolsService(config);
+    this.sessionTimingService = this.runtime.get(SessionTiming);
+    this.analyticsService = this.runtime.get(Analytics);
+    this.devToolsService = this.runtime.get(DevTools);
     this.browserBridgeTokenManager = new BrowserBridgeTokenManager();
+    this.workspaceMcpOverridesService = this.runtime.get(WorkspaceMcpOverrides);
 
-    // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
-    // the persistent config rather than creating a default with an ephemeral one.
-    this.workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
-
-    const core = createCoreServices({
-      ...stores,
-      extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
-      workspaceMcpOverridesService: this.workspaceMcpOverridesService,
-      policyService: this.policyService,
-      telemetryService: this.telemetryService,
-      analyticsService: this.analyticsService,
-      experimentsService: this.experimentsService,
-      sessionTimingService: this.sessionTimingService,
-      devToolsService: this.devToolsService,
-    });
+    // The core graph (shared with the `xum run`/`xum workflow` roots) is built by
+    // `CoreProjectionLive`; read it back as the plain object the wiring below uses.
+    const core = coreServicesFromContext(this.runtime.context);
 
     // Spread core services into class fields
     this.historyService = core.historyService;
@@ -280,7 +316,8 @@ export class ServiceContainer {
       config,
       this.historyService,
       this.extensionMetadata,
-      (workspaceId) => this.workspaceService.executeIdleCompaction(workspaceId)
+      (workspaceId) => this.workspaceService.executeIdleCompaction(workspaceId),
+      effectRunner
     );
     // Forward terminal idle-compaction outcomes so the loop stops re-attempting a
     // persistently failing workspace (immediately on model_not_found, otherwise after
@@ -288,7 +325,7 @@ export class ServiceContainer {
     this.workspaceService.setIdleCompactionOutcomeListener((workspaceId, outcome) =>
       this.idleCompactionService.recordOutcome(workspaceId, outcome)
     );
-    // IdleDispatcher + goal continuation bridge are owned by createCoreServices
+    // IdleDispatcher + goal continuation bridge are owned by the core graph
     // so the wiring works for `xum run` too. Share the same dispatcher with
     // HeartbeatService — its priority ordering ensures an active goal
     // suppresses background heartbeats.
@@ -298,7 +335,8 @@ export class ServiceContainer {
       this.extensionMetadata,
       this.workspaceService,
       this.taskService,
-      this.idleDispatcher
+      this.idleDispatcher,
+      effectRunner
     );
     this.timelineService = new TimelineService(
       config,
@@ -380,7 +418,7 @@ export class ServiceContainer {
     // Wire terminal service to workspace service for cleanup on removal
     this.workspaceService.setTerminalService(this.terminalService);
     this.workspaceService.setDesktopSessionManager(this.desktopSessionManager);
-    // Plugin-override pruning is wired inside createCoreServices (shared with
+    // Plugin-override pruning is wired inside the core graph (shared with
     // headless CLI registration), using this.workspaceMcpOverridesService.
     // Editor service for opening workspaces in code editors
     this.editorService = new EditorService(config, this.workspaceService);
@@ -648,9 +686,9 @@ export class ServiceContainer {
    */
   toORPCContext(): Omit<ORPCContext, "headers"> {
     return {
-      // Pre-built Effect service context consumed by Effect-native oRPC
-      // handlers (see src/node/orpc/effectContext.ts).
-      "effect/context": buildOrpcEffectContext({ memoryMetaService: this.memoryMetaService }),
+      // The runtime's built service context, consumed by Effect-native oRPC
+      // handlers (`yield* MemoryMeta`; see src/node/orpc/effectContext.ts).
+      "effect/context": this.runtime.context,
       workflowRuntimeFactory: this.workflowRuntimeFactory,
       config: this.config,
       sessionLocator: this.sessionLocator,
@@ -741,13 +779,24 @@ export class ServiceContainer {
 
   /**
    * Dispose all services. Called on app quit to clean up resources.
-   * Terminates all background processes to prevent orphans.
+   * Terminates all background processes to prevent orphans. Idempotent:
+   * concurrent and repeated calls share one teardown (see `disposePromise`).
    */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    this.disposePromise ??= this.disposeOnce();
+    return this.disposePromise;
+  }
+
+  private async disposeOnce(): Promise<void> {
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.
     this.backgroundProcessManager.beginShutdown();
+    // Interrupt and await the runtime's supervised fibers while every dependency
+    // they might touch during finalization is still alive. Fixed here (before
+    // the explicit teardown) so later occupants do not re-derive the position;
+    // bounded and idempotent, and never rejects (di/appRuntime.ts).
+    await closeScopeBounded(this.appFiberScope);
     // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();
@@ -776,5 +825,9 @@ export class ServiceContainer {
     this.providerService.dispose();
     await this.backgroundProcessManager.terminateAll();
     await this.timelineService.flush();
+    // Last: close the Effect runtime's scope. No layer owns finalizers yet, so
+    // this only releases the runtime; the position (after every explicit
+    // teardown step) is fixed now for later scope-owned occupants.
+    await disposeAppRuntime(this.runtime.managed);
   }
 }

@@ -10,6 +10,7 @@ import {
   isNonRetryableSendError,
   isNonRetryableStreamError,
 } from "@/common/utils/messages/retryEligibility";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 
 export interface RetryFailureError {
   type: string;
@@ -63,7 +64,14 @@ export class RetryManager {
   constructor(
     private readonly workspaceId: string,
     private readonly onRetry: () => Promise<void>,
-    private readonly onStatusChange: (event: RetryStatusEvent) => void
+    private readonly onStatusChange: (event: RetryStatusEvent) => void,
+    /**
+     * Runs the retry fiber fork and its interrupt. The global runtime by
+     * default (the streamManager call site keeps it until the runtime seam
+     * reaches StreamManager); a context-bound runner puts the backoff sleep on
+     * the runtime's `Clock` — a `TestClock` in tests.
+     */
+    private readonly runner: EffectRunner = defaultEffectRunner
   ) {
     assert(this.workspaceId.trim().length > 0, "RetryManager: workspaceId must be non-empty");
     assert(typeof this.onRetry === "function", "RetryManager: onRetry must be a function");
@@ -118,7 +126,7 @@ export class RetryManager {
   }
 
   /**
-   * Fork the retry fiber. `Effect.runFork` executes synchronously up to the
+   * Fork the retry fiber. `runner.runFork` executes synchronously up to the
    * sleep, so the backoff timer is registered before this method returns —
    * the same observable ordering as the previous `setTimeout` call.
    *
@@ -131,7 +139,7 @@ export class RetryManager {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     this.retryPending = true;
-    this.retryFiber = Effect.runFork(
+    this.retryFiber = this.runner.runFork(
       Effect.gen(function* () {
         yield* Effect.sleep(Duration.millis(delayMs));
         self.retryPending = false;
@@ -195,7 +203,7 @@ export class RetryManager {
       this.retryPending = false;
       // Fire-and-forget: the interrupt signal lands synchronously; awaiting
       // full fiber exit is unnecessary (and impossible from sync callers).
-      Effect.runFork(Fiber.interrupt(fiber));
+      this.runner.runFork(Fiber.interrupt(fiber));
     }
   }
 
