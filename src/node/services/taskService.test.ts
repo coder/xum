@@ -3879,7 +3879,9 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const { workspaceService, remove } = createWorkspaceServiceMocks();
+    const { workspaceService } = createWorkspaceServiceMocks({
+      remove: createConfigBackedRemoveMock(config),
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     const internals = taskService as unknown as {
       cleanupReportedLeafTask: (
@@ -3892,10 +3894,8 @@ describe("TaskService", () => {
       0
     );
     expect(await internals.cleanupReportedLeafTask(staleTaskId, { config: snapshot })).toBe(1);
-    const removedWorkspaceIds = (
-      remove as unknown as { mock: { calls: unknown[][] } }
-    ).mock.calls.map((call) => call[0]);
-    expect(removedWorkspaceIds).toEqual([staleTaskId]);
+    expect(findWorkspaceInConfig(config, reactivatedTaskId)?.taskStatus).toBe("running");
+    expect(findWorkspaceInConfig(config, staleTaskId)).toBeUndefined();
   });
 
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
@@ -14467,6 +14467,62 @@ describe("TaskService", () => {
     );
   });
 
+  test("startup completion prompt is idle-only and refunds its attempt when a client turn wins", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-idle-only";
+    const childId = "child-idle-only";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "awaiting_report",
+          taskRecoveryAttempts: 2,
+        }),
+      ],
+      testTaskSettings(1, 3)
+    );
+
+    // A client turn entered preflight after the isStreaming() probe: idle-only sends skip.
+    const sendMessage = mock((..._args: unknown[]): Promise<Result<void, SendMessageError>> => {
+      const internal = _args[3] as { requireIdle?: boolean } | undefined;
+      if (internal?.requireIdle === true) {
+        return Promise.resolve(
+          Err({ type: "unknown", raw: "Workspace is busy; idle-only send was skipped." })
+        );
+      }
+      return Promise.resolve(Ok(undefined));
+    });
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+    const internals = taskService as unknown as {
+      promptTaskForRequiredCompletionTool: (
+        workspaceId: string,
+        options?: { reason?: "startup" | "stream_end" | "error" }
+      ) => Promise<boolean>;
+    };
+
+    await taskService.initialize();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[3]).toMatchObject({ requireIdle: true });
+    // The skipped prompt sent nothing, so the recovery budget is untouched.
+    expect(findWorkspaceInConfig(config, childId)?.taskRecoveryAttempts).toBe(2);
+
+    // Stream-end prompts still queue behind whatever is running.
+    expect(
+      await internals.promptTaskForRequiredCompletionTool(childId, { reason: "stream_end" })
+    ).toBe(true);
+    expect(sendMessage.mock.calls[1]?.[3]).not.toMatchObject({ requireIdle: true });
+    expect(findWorkspaceInConfig(config, childId)?.taskRecoveryAttempts).toBe(3);
+  });
+
   test("initialize uses legacy agentType when modern agentId is unavailable for awaiting_report tasks", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -22298,6 +22354,26 @@ describe("TaskService", () => {
     expect(childEntry?.runtimeConfig?.type).toBe("worktree");
   }, 20_000);
 
+  /**
+   * A remove() stand-in that mirrors the real one: the under-lock `beforeRemove` precondition
+   * decides whether the workspace actually leaves the config.
+   */
+  function createConfigBackedRemoveMock(config: Config) {
+    return mock(
+      async (
+        workspaceId: string,
+        _force?: boolean,
+        options?: { beforeRemove?: () => Promise<boolean> }
+      ): Promise<Result<void>> => {
+        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+          return Ok(undefined);
+        }
+        await removeWorkspaceFromTestConfig(config, workspaceId);
+        return Ok(undefined);
+      }
+    );
+  }
+
   async function removeWorkspaceFromTestConfig(config: Config, workspaceId: string): Promise<void> {
     const cfg = config.loadConfigOrDefault();
     let removed = false;
@@ -22637,10 +22713,7 @@ describe("TaskService", () => {
       });
 
       const isStreaming = mock(() => false);
-      const remove = mock(async (workspaceId: string, _force?: boolean): Promise<Result<void>> => {
-        await removeWorkspaceFromTestConfig(config, workspaceId);
-        return Ok(undefined);
-      });
+      const remove = createConfigBackedRemoveMock(config);
       const { aiService } = createAIServiceMocks(config, { isStreaming });
       const { workspaceService } = createWorkspaceServiceMocks({ remove });
       const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
@@ -22702,10 +22775,7 @@ describe("TaskService", () => {
       });
       await internal.cleanupReportedLeafTask(childTaskId);
 
-      expect(remove.mock.calls).toEqual([
-        [childTaskId, true],
-        [workflowTaskId, true],
-      ]);
+      expect(remove.mock.calls.map((call) => call[0])).toEqual([childTaskId, workflowTaskId]);
       expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
       expect(findWorkspaceInConfig(config, workflowTaskId)).toBeUndefined();
     });

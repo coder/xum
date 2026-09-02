@@ -310,7 +310,17 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
     remove:
       overrides.remove ??
       overrides.removeWhileTaskTreeLocked ??
-      mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
+      mock(
+        async (
+          _workspaceId: string,
+          _force?: boolean,
+          options?: { beforeRemove?: () => Promise<boolean> }
+        ): Promise<Result<void>> => {
+          // Mirror the real remove(): the under-lock precondition decides whether anything happens.
+          await options?.beforeRemove?.();
+          return Ok(undefined);
+        }
+      ),
     updateTitle:
       overrides.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     emitChatEvent: overrides.emitChatEvent ?? mock(() => undefined),

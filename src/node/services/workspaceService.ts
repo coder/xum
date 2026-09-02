@@ -5451,10 +5451,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       : await integration.withTaskTreeLifecycleLock(workspaceId, operation);
   }
 
-  async remove(workspaceId: string, force = false): Promise<Result<void>> {
-    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
-      this.removeUnlocked(workspaceId, force)
-    );
+  /**
+   * @param options.beforeRemove - evaluated inside the task-tree lifecycle lock; returning false
+   *   turns the call into a no-op. Lets callers that screened eligibility outside the lock confirm
+   *   it against live state within the same lock hold that performs the removal.
+   */
+  async remove(
+    workspaceId: string,
+    force = false,
+    options?: { beforeRemove?: () => Promise<boolean> }
+  ): Promise<Result<void>> {
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
+      if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+        return Ok(undefined);
+      }
+      return await this.removeUnlocked(workspaceId, force);
+    });
   }
 
   /**

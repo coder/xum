@@ -10535,6 +10535,10 @@ export class TaskService implements AgentTaskIntegration {
       {
         synthetic: true,
         agentInitiated: true,
+        // Startup recovery runs while clients may be sending to this task: a user turn that
+        // entered preflight after the isStreaming() check must suppress the prompt instead of
+        // queueing it behind the user's turn (stream-end re-prompts if that turn ends unreported).
+        requireIdle: options?.reason === "startup",
         // The status and descendant checks at the top of this method are one-shot reads; a
         // task_stop or a newly spawned blocking descendant landing during the awaits since then
         // must refuse admission rather than resume the coordinator.
@@ -10556,6 +10560,24 @@ export class TaskService implements AgentTaskIntegration {
     );
     const durationMs = Date.now() - startedAt;
     if (!sendResult.success) {
+      if (isWorkspaceBusyIdleOnlySend(sendResult.error)) {
+        // A client turn won admission first (only startup sends are idle-only). Nothing was
+        // sent, so hand the attempt back: a user's turn must not draw down the recovery budget.
+        await this.editWorkspaceEntry(
+          workspaceId,
+          (ws) => {
+            ws.taskRecoveryAttempts = Math.max(0, (ws.taskRecoveryAttempts ?? 0) - 1);
+          },
+          { allowMissing: true }
+        );
+        log.info("Skipped completion prompt: task became busy", {
+          workspaceId,
+          taskName: entry.workspace.name,
+          completionKind,
+          reason: options?.reason,
+        });
+        return false;
+      }
       log.error("Failed to prompt task for required completion", {
         workspaceId,
         taskName: entry.workspace.name,
@@ -13310,8 +13332,8 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * @param options.config - config snapshot used only to screen the first (depth 0) candidate
-   *   cheaply; deletion eligibility is always decided on fresh config under the lifecycle lock,
-   *   and every later depth re-evaluates the parent the same way after a removal changed the tree.
+   *   cheaply; deletion eligibility is always confirmed on fresh config inside remove()'s
+   *   lifecycle lock, and every later depth re-evaluates the parent after a removal changed the tree.
    * @returns the number of workspaces removed.
    */
   private async cleanupReportedLeafTask(
@@ -13336,41 +13358,41 @@ export class TaskService implements AgentTaskIntegration {
       visited.add(currentWorkspaceId);
 
       const targetWorkspaceId = currentWorkspaceId;
-      if (depth === 0 && options?.config != null) {
-        // The caller's snapshot only screens: it lets the (usual) ineligible majority return
-        // without a config parse or a lock acquisition. Deletion is decided on live state below.
-        const screened = await this.canCleanupReportedTask(targetWorkspaceId, options.config);
-        if (!screened.ok) {
-          return removedCount;
-        }
-      }
-      // Live eligibility and removal share one hold of the task-tree lifecycle lock:
-      // reactivation, re-parenting, and task_stop all mutate under that lock, so a task judged
-      // eligible here cannot change underneath the removal (the same pattern as task_remove).
-      const outcome = await this.withTaskTreeLifecycleLock(targetWorkspaceId, async () => {
-        const cleanupEligibility = await this.canCleanupReportedTask(targetWorkspaceId);
-        if (!cleanupEligibility.ok) {
-          return null;
-        }
-        const removeResult = await this.workspaceService.removeWhileTaskTreeLocked(
-          targetWorkspaceId,
-          true
-        );
-        return { parentWorkspaceId: cleanupEligibility.parentWorkspaceId, removeResult };
-      });
-      if (outcome == null) {
+      // Screen outside any lock (with the caller's snapshot at depth 0) so the (usual) ineligible
+      // majority returns without a lock acquisition or config parse.
+      const screened = await this.canCleanupReportedTask(
+        targetWorkspaceId,
+        depth === 0 ? options?.config : undefined
+      );
+      if (!screened.ok) {
         return removedCount;
       }
-      if (!outcome.removeResult.success) {
+      // Deletion is decided on live state inside the task-tree lifecycle lock that remove()
+      // holds: reactivation, re-parenting, and task_stop all mutate under that lock, so a task
+      // confirmed eligible there cannot change underneath the removal. remove() is the only lock
+      // acquisition on this path: runtime callers reach it under the workspace event lock
+      // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the inverse of
+      // the send path's task-tree -> event. That nesting predates the live recheck.
+      let confirmed = false;
+      const removeResult = await this.workspaceService.remove(targetWorkspaceId, true, {
+        beforeRemove: async () => {
+          confirmed = (await this.canCleanupReportedTask(targetWorkspaceId)).ok;
+          return confirmed;
+        },
+      });
+      if (!removeResult.success) {
         log.error("Failed to auto-delete completed task workspace", {
           workspaceId: currentWorkspaceId,
-          error: outcome.removeResult.error,
+          error: removeResult.error,
         });
+        return removedCount;
+      }
+      if (!confirmed) {
         return removedCount;
       }
       removedCount += 1;
 
-      currentWorkspaceId = outcome.parentWorkspaceId;
+      currentWorkspaceId = screened.parentWorkspaceId;
     }
 
     log.error("cleanupReportedLeafTask: exceeded max parent traversal depth", {
