@@ -97,6 +97,7 @@ describe("GitPatchArtifactService coordination", () => {
     const freshChildId = "child-fresh";
     const removedChildId = "child-removed-since-snapshot";
     const reactivatedChildId = "child-reactivated-since-snapshot";
+    const pendingReactivatedChildId = "child-pending-reactivated-since-snapshot";
     const execChild = (id: string) => ({
       path: path.join(projectPath, id),
       id,
@@ -114,6 +115,7 @@ describe("GitPatchArtifactService coordination", () => {
           execChild(freshChildId),
           execChild(removedChildId),
           execChild(reactivatedChildId),
+          execChild(pendingReactivatedChildId),
         ],
       });
       return cfg;
@@ -204,6 +206,53 @@ describe("GitPatchArtifactService coordination", () => {
       config: snapshot,
     });
     expect(await readSubagentGitPatchArtifact(parentSessionDir, reactivatedChildId)).toBeNull();
+    expect(completedChildIds).toEqual([]);
+
+    // Same for a crash-left pending artifact, the case startup exists to resume: the reactivated
+    // checkout is not snapshotted and the marker is left for the continuation refresh.
+    const crashLeftPending = await upsertSubagentGitPatchArtifact({
+      workspaceId: parentId,
+      workspaceSessionDir: parentSessionDir,
+      childTaskId: pendingReactivatedChildId,
+      updater: () => ({
+        childTaskId: pendingReactivatedChildId,
+        parentWorkspaceId: parentId,
+        createdAtMs: 1,
+        updatedAtMs: 2,
+        status: "pending",
+        projectArtifacts: [
+          {
+            projectPath,
+            projectName: "repo",
+            storageKey: "repo",
+            status: "pending",
+            baseCommitSha: "launch-base",
+          },
+        ],
+        readyProjectCount: 0,
+        failedProjectCount: 0,
+        skippedProjectCount: 0,
+        totalCommitCount: 0,
+      }),
+    });
+    await config.editConfig((cfg) => {
+      const entry = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((ws) => ws.id === pendingReactivatedChildId);
+      if (entry) {
+        entry.taskExecutionId = "wst_pending_reactivated";
+        entry.taskExecutionStatus = "starting";
+      }
+      return cfg;
+    });
+    await service.maybeStartGeneration(parentId, pendingReactivatedChildId, onComplete, {
+      config: snapshot,
+    });
+    // Resolves immediately when no job started; a wrongly started job would rewrite the marker.
+    await service.waitForGeneration(pendingReactivatedChildId);
+    expect(await readSubagentGitPatchArtifact(parentSessionDir, pendingReactivatedChildId)).toEqual(
+      crashLeftPending
+    );
     expect(completedChildIds).toEqual([]);
 
     // A snapshot child without an artifact still takes the normal generation path (pending

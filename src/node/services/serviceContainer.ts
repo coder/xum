@@ -2,6 +2,7 @@ import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
+import { STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import type { CoreServices } from "@/node/services/coreServices";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
@@ -58,6 +59,7 @@ import {
 } from "@/node/services/di/appRuntime";
 import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -219,6 +221,9 @@ export class ServiceContainer {
   // Aborted by dispose(): background startup housekeeping must stop at its next step boundary
   // and never start periodic services against services that are being torn down.
   private readonly startupHousekeepingAbort = new AbortController();
+  // Retained so dispose() can wait for the in-flight housekeeping step to settle (bounded)
+  // before tearing down the services it is using.
+  private startupHousekeepingSettled: Promise<void> | null = null;
 
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
@@ -353,9 +358,19 @@ export class ServiceContainer {
    * Startup housekeeping that scales with the number of workspaces (chat restart retries and
    * orphan sweeps, reported-task patch and cleanup passes, terminal-attention sweeps), then the
    * periodic services. The server runs it after its listener is bound, so every step re-checks
-   * live state before mutating; dispose() cancels it at the next step boundary.
+   * live state before mutating; dispose() cancels it at the next step boundary and waits
+   * (bounded) for the step in flight to settle.
    */
-  async runStartupHousekeeping(): Promise<void> {
+  runStartupHousekeeping(): Promise<void> {
+    const housekeeping = this.runStartupHousekeepingSteps();
+    this.startupHousekeepingSettled = housekeeping.then(
+      () => undefined,
+      () => undefined
+    );
+    return housekeeping;
+  }
+
+  private async runStartupHousekeepingSteps(): Promise<void> {
     const signal = this.startupHousekeepingAbort.signal;
     // Housekeeping is best-effort and may run while the server is already serving requests: a
     // failing step must not skip the periodic services below (startup-time rule: never let
@@ -547,8 +562,22 @@ export class ServiceContainer {
     const disposeStartedAt = performance.now();
     log.debug("[shutdown] ServiceContainer.dispose starting");
     // Background startup housekeeping (server mode) must not start periodic services or keep
-    // issuing work against the services torn down below.
+    // issuing work against the services torn down below. Its steps only observe the abort at
+    // their boundaries, so give the one in flight a bounded chance to settle first.
     this.startupHousekeepingAbort.abort();
+    const housekeepingSettled = this.startupHousekeepingSettled;
+    if (housekeepingSettled != null) {
+      await shutdownStep("startupHousekeeping.join", async () => {
+        const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+          timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+        });
+        if (joined.kind === "timeout") {
+          log.warn("[shutdown] startup housekeeping still running; teardown continues", {
+            timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+          });
+        }
+      });
+    }
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.

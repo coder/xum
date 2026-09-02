@@ -8643,6 +8643,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return config;
       });
 
+      // Startup housekeeping may still be recovering this chat in a transient session whose
+      // stream has not started yet, so the stream stop cannot see it. Disposing it once
+      // archivedAt is durable stops its pending auto-retry or follow-up dispatch; a session the
+      // scheduling loop creates later sees the archived entry and is never started.
+      const transientRecoverySession = this.transientStartupRecoverySessions.get(workspaceId);
+      if (transientRecoverySession) {
+        this.transientStartupRecoverySessions.delete(workspaceId);
+        transientRecoverySession.dispose();
+      }
+
       if (!needsSnapshotCapture) {
         try {
           await this.stopLiveWorkspaceActivityForArchive(workspaceId);

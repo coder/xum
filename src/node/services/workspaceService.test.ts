@@ -13605,6 +13605,26 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(entry?.archivedAt).toBeTruthy();
   });
 
+  test("archive() disposes a transient startup-recovery session once archivedAt is durable", async () => {
+    let editConfigCallsAtDispose = -1;
+    const dispose = mock(() => {
+      editConfigCallsAtDispose = editConfigSpy.mock.calls.length;
+    });
+    const access = workspaceService as unknown as {
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+    };
+    access.transientStartupRecoverySessions.set(workspaceId, {
+      dispose,
+    } as unknown as AgentSession);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(editConfigCallsAtDispose).toBe(1);
+    expect(access.transientStartupRecoverySessions.has(workspaceId)).toBe(false);
+  });
+
   test("archive() closes workspace terminal sessions on success", async () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {

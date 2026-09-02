@@ -3576,6 +3576,7 @@ describe("TaskService", () => {
     const projectPath = path.join(rootDir, "repo");
     const parentWorkspaceId = "parent-cleanup-live";
     const reactivatedTaskId = "child-workflow-reactivated";
+    const turnStartingTaskId = "child-workflow-turn-starting";
     const staleTaskId = "child-workflow-stale";
     const workflowTask = (stepId: string) => ({
       parentWorkspaceId,
@@ -3593,19 +3594,26 @@ describe("TaskService", () => {
       [
         projectWorkspace(projectPath, "parent", parentWorkspaceId),
         projectWorkspace(projectPath, "reactivated", reactivatedTaskId, workflowTask("a")),
+        projectWorkspace(projectPath, "turn-starting", turnStartingTaskId, workflowTask("c")),
         projectWorkspace(projectPath, "stale", staleTaskId, workflowTask("b")),
       ],
       testTaskSettings()
     );
     const snapshot = config.loadConfigOrDefault();
-    // A client reactivated one child after the startup snapshot was taken.
+    // After the startup snapshot, a client reactivated one child, and another got an
+    // existing-workspace turn whose execution mirror is starting before any stream registers
+    // (taskStatus stays "reported" on that path).
     await config.editConfig((cfg) => {
-      const entry = cfg.projects
-        .get(projectPath)
-        ?.workspaces.find((workspace) => workspace.id === reactivatedTaskId);
-      if (entry) {
-        entry.taskStatus = "running";
-        entry.reportedAt = undefined;
+      const workspaces = cfg.projects.get(projectPath)?.workspaces ?? [];
+      const reactivated = workspaces.find((workspace) => workspace.id === reactivatedTaskId);
+      if (reactivated) {
+        reactivated.taskStatus = "running";
+        reactivated.reportedAt = undefined;
+      }
+      const turnStarting = workspaces.find((workspace) => workspace.id === turnStartingTaskId);
+      if (turnStarting) {
+        turnStarting.taskExecutionId = "wst_turn_starting";
+        turnStarting.taskExecutionStatus = "starting";
       }
       return cfg;
     });
@@ -3624,8 +3632,12 @@ describe("TaskService", () => {
     expect(await internals.cleanupReportedLeafTask(reactivatedTaskId, { config: snapshot })).toBe(
       0
     );
+    expect(await internals.cleanupReportedLeafTask(turnStartingTaskId, { config: snapshot })).toBe(
+      0
+    );
     expect(await internals.cleanupReportedLeafTask(staleTaskId, { config: snapshot })).toBe(1);
     expect(findWorkspaceInConfig(config, reactivatedTaskId)?.taskStatus).toBe("running");
+    expect(findWorkspaceInConfig(config, turnStartingTaskId)?.taskExecutionStatus).toBe("starting");
     expect(findWorkspaceInConfig(config, staleTaskId)).toBeUndefined();
   });
 

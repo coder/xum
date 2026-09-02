@@ -167,8 +167,9 @@ async function main(): Promise<void> {
   });
 
   // Housekeeping is best-effort background work; a failure must not take the listening server
-  // down. serviceContainer.dispose() cancels it at its next task/step boundary, so shutdown
-  // during housekeeping never starts periodic services against disposed dependencies.
+  // down. serviceContainer.dispose() cancels it at its next task/step boundary and waits
+  // (bounded) for the step in flight, so shutdown during housekeeping never starts periodic
+  // services against disposed dependencies.
   void serviceContainer.runStartupHousekeeping().catch((error: unknown) => {
     log.error("[startup] Background startup housekeeping failed", { error });
   });

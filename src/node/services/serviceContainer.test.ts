@@ -294,6 +294,11 @@ describe("ServiceContainer", () => {
     });
     const heartbeatStart = spyOn(services.heartbeatService, "start");
     const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const beginShutdown = spyOn(
+      (services as unknown as { backgroundProcessManager: { beginShutdown: () => void } })
+        .backgroundProcessManager,
+      "beginShutdown"
+    );
 
     await services.initializeCore();
     const housekeeping = services.runStartupHousekeeping();
@@ -301,10 +306,14 @@ describe("ServiceContainer", () => {
     // Task housekeeping is mid-flight when the process shuts down.
     const disposed = services.dispose();
     expect(housekeepingSignal?.aborted).toBe(true);
+    // Teardown of the services housekeeping is using waits for the in-flight step to settle
+    // (without the join, this first teardown step runs synchronously inside dispose()).
+    expect(beginShutdown).not.toHaveBeenCalled();
     releaseTaskHousekeeping?.();
     await housekeeping;
     await disposed;
 
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).not.toHaveBeenCalled();
     expect(idleCompactionStart).not.toHaveBeenCalled();
   });

@@ -13209,6 +13209,12 @@ export class TaskService implements AgentTaskIntegration {
       return { ok: false, reason: "task_not_reported" };
     }
 
+    // A reported task reactivated through an existing-workspace turn keeps taskStatus "reported"
+    // while its execution mirror is already starting or running, before any stream registers.
+    if (isActiveWorkspaceTurnTaskStatus(entry.workspace.taskExecutionStatus)) {
+      return { ok: false, reason: "workspace_turn_active" };
+    }
+
     const bestOf = this.getEffectiveTaskGroup(workspaceId, entry.workspace);
     if (bestOf?.total != null && bestOf.total > 1) {
       if (
