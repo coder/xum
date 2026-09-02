@@ -554,18 +554,22 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
       if (outstanding) {
         const pendingMs = now - outstanding.sentAt;
+        // Silence is checked before the probe is aged out: a throttled or suspended tab can
+        // fire its next tick past MAX_PROBE_AGE_MS, and a half-open socket must reconnect on
+        // that tick rather than merely re-probe.
+        const silentMs = now - lastInboundBrowserFrameAtRef.current;
+        if (
+          pendingMs >= SILENCE_FOR_RECONNECT_MS &&
+          silentMs >= SILENCE_FOR_RECONNECT_MS &&
+          forceReconnect(`Liveness probe outstanding for ${pendingMs}ms with no inbound traffic`)
+        ) {
+          return;
+        }
         if (pendingMs <= MAX_PROBE_AGE_MS) {
           // At most one probe in flight; a pending probe past the slow threshold is itself a
           // slow observation, with the pending age as the live latency figure.
           if (pendingMs > SLOW_RESPONSE_MS) {
             recordSlowObservation(pendingMs);
-
-            const silentMs = now - lastInboundBrowserFrameAtRef.current;
-            if (pendingMs >= SILENCE_FOR_RECONNECT_MS && silentMs >= SILENCE_FOR_RECONNECT_MS) {
-              forceReconnect(
-                `Liveness probe outstanding for ${pendingMs}ms with no inbound traffic`
-              );
-            }
           }
           return;
         }

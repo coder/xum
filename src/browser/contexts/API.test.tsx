@@ -712,6 +712,39 @@ describe("API reconnection", () => {
   );
 
   test(
+    "reconnects on a late tick past the probe age limit instead of re-probing a silent socket",
+    async () => {
+      const states: ObservedState[] = [];
+      const pingCalls = installLivenessPing(neverSettlingPong);
+      const realNow = Date.now;
+
+      try {
+        await connectFirstSocket(states);
+        await waitFor(() => {
+          expect(pingCalls()).toBe(2);
+        });
+
+        // Emulate a throttled tab whose next interval fires long after the probe was sent.
+        const skewMs = 31000;
+        Date.now = () => realNow() + skewMs;
+
+        await waitFor(
+          () => {
+            expect(MockWebSocket.instances.length).toBe(2);
+          },
+          { timeout: 8000 }
+        );
+      } finally {
+        Date.now = realNow;
+      }
+
+      // The stalled probe was not replaced on the old socket before reconnecting.
+      expect(pingCalls()).toBe(2);
+    },
+    { timeout: 20000 }
+  );
+
+  test(
     "reconnects after repeated rejected probes so a lost session reaches auth_required",
     async () => {
       const states: ObservedState[] = [];
