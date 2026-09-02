@@ -1921,13 +1921,15 @@ describe("BackupService project imports", () => {
     // resolves on the next attempt.
     const realRealpath = fs.realpath.bind(fs);
     let stalledOnce = false;
-    const realpath = spyOn(fs, "realpath").mockImplementation(((target, options) => {
-      if (String(target) === registeredAlias && !stalledOnce) {
+    // Cast through unknown: `typeof fs.realpath` also carries the `.native` member, which a
+    // plain implementation function cannot satisfy.
+    const realpath = spyOn(fs, "realpath").mockImplementation(((target: string) => {
+      if (target === registeredAlias && !stalledOnce) {
         stalledOnce = true;
         return Promise.reject(new Error("EIO: mount unavailable"));
       }
-      return realRealpath(target, options);
-    }) as typeof fs.realpath);
+      return realRealpath(target);
+    }) as unknown as typeof fs.realpath);
     try {
       const result = await service.restore(
         { ...SETTINGS, includeProjects: true },
