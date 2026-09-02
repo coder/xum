@@ -716,7 +716,7 @@ describe("API reconnection", () => {
     async () => {
       const states: ObservedState[] = [];
       const pingCalls = installLivenessPing(neverSettlingPong);
-      const realNow = Date.now;
+      const realNow = performance.now.bind(performance);
 
       try {
         await connectFirstSocket(states);
@@ -726,7 +726,7 @@ describe("API reconnection", () => {
 
         // Emulate a throttled tab whose next interval fires long after the probe was sent.
         const skewMs = 31000;
-        Date.now = () => realNow() + skewMs;
+        performance.now = () => realNow() + skewMs;
 
         await waitFor(
           () => {
@@ -735,11 +735,36 @@ describe("API reconnection", () => {
           { timeout: 8000 }
         );
       } finally {
-        Date.now = realNow;
+        performance.now = realNow;
       }
 
       // The stalled probe was not replaced on the old socket before reconnecting.
       expect(pingCalls()).toBe(2);
+    },
+    { timeout: 20000 }
+  );
+
+  test(
+    "still degrades on a stalled probe when the wall clock steps backwards",
+    async () => {
+      const states: ObservedState[] = [];
+      installLivenessPing(neverSettlingPong);
+      const realDateNow = Date.now;
+
+      try {
+        await connectFirstSocket(states);
+        // A clock correction after the probe was sent must not make it look young.
+        Date.now = () => realDateNow() - 60000;
+
+        await waitFor(
+          () => {
+            expect(states.some((s) => s.status === "degraded")).toBe(true);
+          },
+          { timeout: 15000 }
+        );
+      } finally {
+        Date.now = realDateNow;
+      }
     },
     { timeout: 20000 }
   );

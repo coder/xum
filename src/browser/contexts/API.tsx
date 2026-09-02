@@ -176,6 +176,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const connectionIdRef = useRef(0);
   const forceReconnectInProgressRef = useRef(false);
+  // Probe ages, RTT, and silence use performance.now(): it is monotonic, whereas a wall-clock
+  // correction could make a stalled probe look young or a slow probe look fast.
   const outstandingProbeRef = useRef<{ sentAt: number; connectionId: number } | null>(null);
   const lastInboundBrowserFrameAtRef = useRef(0);
 
@@ -196,8 +198,9 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     (token: string | null) => {
       const connectionId = ++connectionIdRef.current;
       // Reset per-connection liveness bookkeeping so a prior socket's frames or probes
-      // cannot influence the next connection.
-      lastInboundBrowserFrameAtRef.current = 0;
+      // cannot influence the next connection. Silence is measured from the connect time until
+      // the first frame arrives.
+      lastInboundBrowserFrameAtRef.current = performance.now();
       outstandingProbeRef.current = null;
       consecutiveSlowProbesRef.current = 0;
       consecutiveRejectedProbesRef.current = 0;
@@ -239,7 +242,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
           return;
         }
 
-        lastInboundBrowserFrameAtRef.current = Date.now();
+        lastInboundBrowserFrameAtRef.current = performance.now();
       });
 
       ws.addEventListener("open", () => {
@@ -508,7 +511,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     };
 
     const sendProbe = () => {
-      const probe = { sentAt: Date.now(), connectionId: connectionIdRef.current };
+      const probe = { sentAt: performance.now(), connectionId: connectionIdRef.current };
       outstandingProbeRef.current = probe;
 
       const settle = (resolved: boolean) => {
@@ -521,7 +524,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
           return;
         }
         outstandingProbeRef.current = null;
-        const rtt = Date.now() - probe.sentAt;
+        const rtt = performance.now() - probe.sentAt;
         if (resolved) {
           consecutiveRejectedProbesRef.current = 0;
           if (rtt <= SLOW_RESPONSE_MS) {
@@ -549,7 +552,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
     const tick = () => {
       if (effectDisposed) return;
-      const now = Date.now();
+      const now = performance.now();
       const outstanding = outstandingProbeRef.current;
 
       if (outstanding) {
