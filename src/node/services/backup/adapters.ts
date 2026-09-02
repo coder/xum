@@ -10,16 +10,15 @@ import {
   type BackupProjectBundleEntry,
 } from "@/common/config/schemas/settingsBackup";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
-import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import type { ProjectConfig } from "@/common/types/project";
 import { getProjectDisplayName } from "@/common/utils/subProjects";
 import { projectMemoryDirName } from "@/node/services/memoryService";
 import {
   memoryMutationLockKey,
-  withProjectRegistrationLock,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
+import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   BackupServiceError,
@@ -271,14 +270,6 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       muxRoot,
       memoryMutationLockKey(muxRoot, path.join(muxRoot, "memory")),
       operation
-    );
-  }
-
-  function isSystemProjectEntry(projectPath: string, projectConfig: ProjectConfig): boolean {
-    return (
-      projectPath === MULTI_PROJECT_CONFIG_KEY ||
-      projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
-      projectConfig.projectKind === "system"
     );
   }
 

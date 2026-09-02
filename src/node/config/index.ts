@@ -86,6 +86,10 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
+import {
+  isProjectRegistrationLockHeld,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
@@ -898,6 +902,25 @@ function normalizeAdvisorPositiveInteger(value: number | null, label: string): n
   return value;
 }
 
+/** Thrown inside the edit queue when a transform changes the project set without the lock. */
+class ProjectRegistrationLockRequired extends Error {
+  constructor() {
+    super("project registration lock required");
+    this.name = "ProjectRegistrationLockRequired";
+  }
+}
+
+function sameProjectKeys(
+  before: ReadonlySet<string>,
+  after: ReadonlyMap<string, unknown>
+): boolean {
+  if (before.size !== after.size) return false;
+  for (const key of after.keys()) {
+    if (!before.has(key)) return false;
+  }
+  return true;
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -1698,7 +1721,7 @@ export class Config {
           // re-applied on every load, so the identity transform re-reads disk, re-runs them,
           // and persists the migrated form under the queue. One-shot guard: while a persist
           // is in flight, the loads it performs internally must not re-schedule.
-          this.migrationPersist = this.enqueueConfigEdit((migratedConfig) => migratedConfig)
+          this.migrationPersist = this.enqueueConfigEdit((migratedConfig) => migratedConfig, false)
             .catch((error: unknown) => {
               // Keep startup resilient even if persisting migration fails.
               log.warn("Failed to persist migrated config", { error });
@@ -2158,9 +2181,34 @@ export class Config {
    * after the previous edit's write has landed. Without this, concurrent edits
    * (e.g. parallel task launches updating taskStatus) read the same snapshot
    * and the later write silently clobbers the earlier one.
+   *
+   * An edit that adds or removes a project key additionally runs under the project
+   * registration lock (see `withProjectRegistrationLock`), whichever service it comes from,
+   * so a settings-backup restore writing project memory never has the project set change
+   * underneath it. A caller already holding that lock passes `withinRegistrationLock`.
    */
-  async editConfig(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
-    return this.enqueueConfigEdit(fn);
+  async editConfig(
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    options: { withinRegistrationLock?: boolean } = {}
+  ): Promise<void> {
+    if (options.withinRegistrationLock === true) return this.enqueueConfigEdit(fn, true);
+    // Free: taken now, around this one edit, whether or not it turns out to change the
+    // project set. The lock's free path runs synchronously, so the edit keeps its place in
+    // the queue relative to edits issued around it.
+    if (!isProjectRegistrationLockHeld(this.rootDir)) {
+      return withProjectRegistrationLock(this.rootDir, () => this.enqueueConfigEdit(fn, true));
+    }
+    // Held (a restore or an import window is running): edits that leave the project set
+    // alone go ahead; one that would change it is refused by the queue before writing and
+    // re-run under the lock once it is released. Its first run was discarded — nothing it
+    // mutated survives, since loadConfigOrDefault parses fresh bytes on every call — and it
+    // waits outside the queue, so no other edit is held up behind it.
+    try {
+      return await this.enqueueConfigEdit(fn, false);
+    } catch (error) {
+      if (!(error instanceof ProjectRegistrationLockRequired)) throw error;
+      return withProjectRegistrationLock(this.rootDir, () => this.enqueueConfigEdit(fn, true));
+    }
   }
 
   getClientConfig() {
@@ -2465,7 +2513,10 @@ export class Config {
    * spied/overridden in tests, and the internally scheduled write is an implementation
    * detail rather than a caller-initiated mutation.
    */
-  private enqueueConfigEdit(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+  private enqueueConfigEdit(
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    withinRegistrationLock: boolean
+  ): Promise<void> {
     // Defer the fiber start to a microtask: Effect.runPromise executes fibers
     // synchronously on the caller's stack until the first async boundary, but the old
     // promise-chain queue always ran edit bodies on a later microtask.
@@ -2474,7 +2525,9 @@ export class Config {
     // assignment, or a load-time migration would schedule its persist twice.
     // Effect failures reject this promise with the raw error (v4 runPromise does not
     // wrap causes), so callers observe the same rejections as before.
-    return Promise.resolve().then(() => Effect.runPromise(this.enqueueConfigEditEffect(fn)));
+    return Promise.resolve().then(() =>
+      Effect.runPromise(this.enqueueConfigEditEffect(fn, withinRegistrationLock))
+    );
   }
 
   /**
@@ -2486,7 +2539,8 @@ export class Config {
    * fiber cancelled while waiting never runs its edit).
    */
   private enqueueConfigEditEffect(
-    fn: (config: ProjectsConfig) => ProjectsConfig
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    withinRegistrationLock: boolean
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2498,7 +2552,17 @@ export class Config {
           const newConfig = yield* Effect.try({
             try: () => {
               const config = self.loadConfigOrDefault();
+              // Snapshotted before the transform, which usually mutates `config` in place.
+              const projectKeysBefore = new Set(config.projects.keys());
               const newConfig = fn(config);
+              // Before the write, so the permit is released and editConfig retries this edit
+              // under the registration lock; see editConfig.
+              if (
+                !withinRegistrationLock &&
+                !sameProjectKeys(projectKeysBefore, newConfig.projects)
+              ) {
+                throw new ProjectRegistrationLockRequired();
+              }
               // If that load failed, writing would replace the corrupt file with defaults. Only
               // proceed when the bytes on disk right now are the ones with a confirmed sidecar:
               // no confirmed backup, a concurrent replacement since the load, or an unreadable

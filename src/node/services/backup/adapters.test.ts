@@ -17,9 +17,9 @@ import { projectMemoryDirName } from "@/node/services/memoryService";
 import { MAX_BACKUP_PROJECT_ENTRIES } from "@/common/config/schemas/settingsBackup";
 import {
   memoryMutationLockKey,
-  withProjectRegistrationLock,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
+import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
 import { TestBackupConfig, captureRejection, runGit, writeFixtureFile } from "./testHelpers";
 
 describe("backup adapters", () => {

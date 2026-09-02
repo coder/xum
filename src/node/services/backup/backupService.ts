@@ -4,7 +4,9 @@ import type { Config } from "@/node/config";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { getProjectDisplayName } from "@/common/utils/subProjects";
+import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import {
   BackupOperationErrorSchema,
   type BackupCommandApproval,
@@ -181,15 +183,32 @@ export interface BackupMemoryNotifier {
 
 /** Registered project keys plus a real-path → key index, built once per restore. */
 interface RegisteredProjectLookup {
+  /** Registered user projects (system entries excluded: memory is never kept for them). */
   keys: ReadonlySet<string>;
+  /** Each key's real path, or null when it could not be resolved in time. */
+  canonicalByKey: ReadonlyMap<string, string | null>;
   byCanonical: ReadonlyMap<string, string>;
 }
 
-/** One approved import after planning: its resolved target and, if already registered, its identity. */
+/** Bounds on resolving registered projects' real paths; see registeredProjectLookup. */
+const REGISTRY_CANONICALIZE_CONCURRENCY = 8;
+const REGISTRY_CANONICALIZE_DEADLINE_MS = 5_000;
+
+/**
+ * One approved import after planning: its resolved target, the directory's filesystem
+ * identity at approval, and, if already registered, the project identity it imports into.
+ */
 interface PlannedProjectImport {
   candidate: BackupProjectImport;
   targetPath: string;
+  targetIdentity: { dev: number; ino: number };
   registeredPath: string | null;
+}
+
+/** planProjectImports' result: the imports and the registry lookup they were resolved against. */
+interface PlannedProjectImports {
+  imports: PlannedProjectImport[];
+  registry: RegisteredProjectLookup | null;
 }
 
 export interface BackupServiceDependencies {
@@ -317,6 +336,24 @@ function isNetworkOrDevicePath(targetPath: string): boolean {
 
 async function realpathOrNull(target: string): Promise<string | null> {
   return fs.realpath(target).catch(() => null);
+}
+
+/**
+ * `realpathOrNull` bounded by `timeoutMs`: null once the time is up. A resolution still
+ * blocked on an unavailable mount then finishes on its own in the threadpool; nothing
+ * waits for it.
+ */
+async function realpathWithin(target: string, timeoutMs: number): Promise<string | null> {
+  if (timeoutMs <= 0) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    return await Promise.race([realpathOrNull(target), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function repoLockKey(settings: SettingsBackupInput): string {
@@ -624,7 +661,7 @@ export class BackupService {
         // Import approvals are also checked before the snapshot and before any mutation: a
         // stale token or an unusable target directory refuses the whole restore while
         // nothing has changed yet. Runtime failures after this point are per-candidate.
-        const plannedImports = await this.planProjectImports(
+        const { imports: plannedImports, registry } = await this.planProjectImports(
           requestedImports,
           validated.projectImports,
           validated.matchedProjects,
@@ -678,7 +715,9 @@ export class BackupService {
           // nothing that can fail may run after them and discard those results.
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
           const projectImportResults =
-            importer === null ? [] : await this.executeProjectImports(importer, plannedImports);
+            importer === null
+              ? []
+              : await this.executeProjectImports(importer, plannedImports, registry);
           this.notifyProjectMemoryChanges([], projectImportResults);
           // A candidate whose import failed per-candidate stays on offer so the user can fix
           // the target and retry without another preview; its token is still current.
@@ -730,8 +769,8 @@ export class BackupService {
     candidates: readonly BackupProjectImport[],
     matched: readonly BackupMatchedProject[],
     includeProjects: boolean
-  ): Promise<PlannedProjectImport[]> {
-    if (requested.length === 0) return [];
+  ): Promise<PlannedProjectImports> {
+    if (requested.length === 0) return { imports: [], registry: null };
     if (!includeProjects) {
       throw new BackupServiceError(
         "IO_ERROR",
@@ -801,9 +840,16 @@ export class BackupService {
           `Cannot import '${candidate.name}': '${resolved}' already receives a backed-up project's memory in this restore`
         );
       }
-      planned.push({ candidate, targetPath: resolved, registeredPath });
+      planned.push({
+        candidate,
+        targetPath: resolved,
+        // The directory itself, not just its name: execution refuses a different directory
+        // that has since taken this path (the checkout moved away, another created here).
+        targetIdentity: { dev: stat.dev, ino: stat.ino },
+        registeredPath,
+      });
     }
-    return planned;
+    return { imports: planned, registry };
   }
 
   /**
@@ -815,7 +861,8 @@ export class BackupService {
    */
   private async executeProjectImports(
     importer: BackupProjectImporter,
-    planned: readonly PlannedProjectImport[]
+    planned: readonly PlannedProjectImport[],
+    planningRegistry: RegisteredProjectLookup | null
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
     if (planned.length === 0) return results;
@@ -838,8 +885,15 @@ export class BackupService {
     // between that read and the memory writes, so the project an import wrote into is the
     // project registered when it reports success.
     return registrar.withRegistrationLock(async (locked) => {
-      const registry = await this.registeredProjectLookup();
-      for (const { candidate, targetPath, registeredPath: plannedRegisteredPath } of planned) {
+      // Real paths resolved during planning are reused; only projects registered since are
+      // probed, so a slow mount is waited on once per restore, not again under this lock.
+      const registry = await this.registeredProjectLookup(planningRegistry ?? undefined);
+      for (const {
+        candidate,
+        targetPath,
+        targetIdentity,
+        registeredPath: plannedRegisteredPath,
+      } of planned) {
         // The identity the preflight checked (memory limits, non-file destinations,
         // permissions) is the only one this import may write to. A different identity now —
         // the checkout registered under another alias since planning — names a memory scope
@@ -869,8 +923,18 @@ export class BackupService {
           // Re-verify under the local payload lock: the preflight ran before the snapshot and
           // the directory may have vanished since.
           const stat = await fs.lstat(targetPath).catch(() => null);
-          if (!stat?.isDirectory()) {
+          if (!stat?.isDirectory() || stat.isSymbolicLink()) {
             results.push(failed(`'${targetPath}' is not an existing directory`));
+            continue;
+          }
+          // The same directory the user approved, not merely one at the same path: a checkout
+          // moved away and another created here since would otherwise be registered and
+          // receive the approved source's memory. create() re-resolves the path itself, so
+          // a swap after this check remains a race this pinning narrows rather than closes.
+          if (stat.dev !== targetIdentity.dev || stat.ino !== targetIdentity.ino) {
+            results.push(
+              failed(`'${targetPath}' was replaced by a different directory since it was approved`)
+            );
             continue;
           }
           // An alias of an already registered project imports into that project without a
@@ -970,18 +1034,48 @@ export class BackupService {
   }
 
   /**
-   * Registered project keys and their real paths, resolved once per phase (planning, then
-   * import execution): resolving them per candidate would cost registered × approved
-   * filesystem calls, and registered paths on slow mounts would make the restore look hung.
+   * Registered user projects and their real paths. Resolved once per restore, then extended
+   * for import execution with only the projects registered since (`previous` supplies the
+   * rest): per-candidate resolution would cost registered × approved filesystem calls.
+   * Real paths are probed in parallel under one deadline for the whole pass, so a project
+   * on an unavailable mount cannot make the restore look hung or hold the registration lock
+   * for as long as that mount blocks; a project probed after the deadline records no real
+   * path and is matched by its registered spelling only.
    */
-  private async registeredProjectLookup(): Promise<RegisteredProjectLookup> {
-    const keys = new Set(this.config.loadConfigOrDefault().projects.keys());
-    const byCanonical = new Map<string, string>();
-    for (const registered of keys) {
-      const canonical = await realpathOrNull(registered);
-      if (canonical !== null && !byCanonical.has(canonical)) byCanonical.set(canonical, registered);
+  private async registeredProjectLookup(
+    previous?: RegisteredProjectLookup
+  ): Promise<RegisteredProjectLookup> {
+    const keys = new Set(
+      [...this.config.loadConfigOrDefault().projects.entries()]
+        .filter(([projectPath, projectConfig]) => !isSystemProjectEntry(projectPath, projectConfig))
+        .map(([projectPath]) => projectPath)
+    );
+    const canonicalByKey = new Map<string, string | null>();
+    const pending: string[] = [];
+    for (const key of keys) {
+      const known = previous?.canonicalByKey.get(key);
+      if (known !== undefined) canonicalByKey.set(key, known);
+      else pending.push(key);
     }
-    return { keys, byCanonical };
+    const probes = new AsyncSemaphore(REGISTRY_CANONICALIZE_CONCURRENCY);
+    const deadline = Date.now() + REGISTRY_CANONICALIZE_DEADLINE_MS;
+    await Promise.all(
+      pending.map(async (key) => {
+        const slot = await probes.acquire();
+        try {
+          canonicalByKey.set(key, await realpathWithin(key, deadline - Date.now()));
+        } finally {
+          slot.release();
+        }
+      })
+    );
+    // Sorted so the project a shared real path resolves to does not depend on probe timing.
+    const byCanonical = new Map<string, string>();
+    for (const key of [...keys].sort()) {
+      const canonical = canonicalByKey.get(key);
+      if (canonical != null && !byCanonical.has(canonical)) byCanonical.set(canonical, key);
+    }
+    return { keys, canonicalByKey, byCanonical };
   }
 
   /** One notification per project whose memory changed; failed imports' partial writes count too. */

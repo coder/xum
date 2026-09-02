@@ -54,7 +54,7 @@ import {
   syncProjectCodeWorkspace,
 } from "@/node/worktree/codeWorkspaceSync";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { withProjectRegistrationLock } from "@/node/services/refinement/targetMutationLocks";
+import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
@@ -434,9 +434,9 @@ export class ProjectService {
     projectPath: string,
     options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
-    // Serialized with a settings-backup restore writing project memory: a registration
-    // landing at a backed-up source path mid-restore would change which local project that
-    // entry belongs to (see withProjectRegistrationLock).
+    // Config.editConfig would take the registration lock for the registering write anyway;
+    // taken here, around the whole operation, so withRegistrationLock can hand out a create
+    // that registers inside a window the caller already holds.
     return withProjectRegistrationLock(this.config.rootDir, () =>
       this.createUnlocked(projectPath, options)
     );
@@ -676,70 +676,74 @@ export class ProjectService {
         | "hierarchy-changed"
         | "hierarchy-changed-descendant"
         | null = null;
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
-          transformFailure = "duplicate";
-          createResult = Err("Project already exists");
+      await this.config.editConfig(
+        (freshConfig) => {
+          if (freshConfig.projects.has(normalizedPath) || freshConfig.projects.has(canonicalPath)) {
+            transformFailure = "duplicate";
+            createResult = Err("Project already exists");
+            return freshConfig;
+          }
+          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+          // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
+          // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
+          // can introduce a sub-project ancestor that the snapshot-time check missed,
+          // which would persist a second-level sub-project.
+          if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
+            transformFailure = "depth";
+            createResult = Err("Sub-projects can only be one level deep");
+            return freshConfig;
+          }
+          const freshParentProjectPath = findDeepestTopLevelParentProject(
+            normalizedPath,
+            freshConfig.projects
+          );
+          // The same-git-repository validations above ran against the snapshot hierarchy
+          // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
+          // If a concurrent edit introduced a different parent or new descendants, those
+          // were never git-validated — reject instead of persisting an unvalidated
+          // hierarchy (e.g. a sub-project from a different git repository).
+          const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
+            (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
+          );
+          const hasNewDescendantProject = freshDescendantProjectPaths.some(
+            (candidatePath) => !descendantProjectPaths.includes(candidatePath)
+          );
+          // Re-check the canonical parent for initGit: the snapshot-time rejection above
+          // can miss a parent registered concurrently, and the lexical freshParent check
+          // below cannot see it when this path reaches the checkout through a symlink.
+          if (
+            options?.initGit &&
+            findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
+          ) {
+            transformFailure = "hierarchy-changed";
+            createResult = Err("Project hierarchy changed concurrently; please retry");
+            return freshConfig;
+          }
+          if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
+            // A new descendant registered under this path claims the directory tree we
+            // created: recursive cleanup would delete that project's checkout, so treat
+            // it like the duplicate case and leave the directory alone.
+            transformFailure = hasNewDescendantProject
+              ? "hierarchy-changed-descendant"
+              : "hierarchy-changed";
+            createResult = Err("Project hierarchy changed concurrently; please retry");
+            return freshConfig;
+          }
+          const projectConfig: ProjectConfig = {
+            workspaces: [],
+            parentProjectPath: freshParentProjectPath ?? undefined,
+            // Set in the same config write as the registration (a backup restore names
+            // imported projects) rather than as a second write and notification.
+            ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
+          };
+          freshConfig.projects.set(normalizedPath, projectConfig);
+          freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
+          createResult = Ok({ projectConfig, normalizedPath });
           return freshConfig;
-        }
-        freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-        // Re-run the sub-project depth check against FRESH hierarchy: a concurrent
-        // registration (e.g. /repo/pkg landing while /repo/pkg/api is validating)
-        // can introduce a sub-project ancestor that the snapshot-time check missed,
-        // which would persist a second-level sub-project.
-        if (hasRegisteredSubProjectAncestor(normalizedPath, freshConfig.projects)) {
-          transformFailure = "depth";
-          createResult = Err("Sub-projects can only be one level deep");
-          return freshConfig;
-        }
-        const freshParentProjectPath = findDeepestTopLevelParentProject(
-          normalizedPath,
-          freshConfig.projects
-        );
-        // The same-git-repository validations above ran against the snapshot hierarchy
-        // only, and this transform is synchronous so it cannot re-run readGitTopLevel.
-        // If a concurrent edit introduced a different parent or new descendants, those
-        // were never git-validated — reject instead of persisting an unvalidated
-        // hierarchy (e.g. a sub-project from a different git repository).
-        const freshDescendantProjectPaths = Array.from(freshConfig.projects.keys()).filter(
-          (candidatePath) => isPathDescendant(normalizedPath, candidatePath)
-        );
-        const hasNewDescendantProject = freshDescendantProjectPaths.some(
-          (candidatePath) => !descendantProjectPaths.includes(candidatePath)
-        );
-        // Re-check the canonical parent for initGit: the snapshot-time rejection above
-        // can miss a parent registered concurrently, and the lexical freshParent check
-        // below cannot see it when this path reaches the checkout through a symlink.
-        if (
-          options?.initGit &&
-          findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
-        ) {
-          transformFailure = "hierarchy-changed";
-          createResult = Err("Project hierarchy changed concurrently; please retry");
-          return freshConfig;
-        }
-        if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
-          // A new descendant registered under this path claims the directory tree we
-          // created: recursive cleanup would delete that project's checkout, so treat
-          // it like the duplicate case and leave the directory alone.
-          transformFailure = hasNewDescendantProject
-            ? "hierarchy-changed-descendant"
-            : "hierarchy-changed";
-          createResult = Err("Project hierarchy changed concurrently; please retry");
-          return freshConfig;
-        }
-        const projectConfig: ProjectConfig = {
-          workspaces: [],
-          parentProjectPath: freshParentProjectPath ?? undefined,
-          // Set in the same config write as the registration (a backup restore names
-          // imported projects) rather than as a second write and notification.
-          ...(options?.displayName !== undefined ? { displayName: options.displayName } : {}),
-        };
-        freshConfig.projects.set(normalizedPath, projectConfig);
-        freshConfig.projects = deriveProjectHierarchy(freshConfig.projects);
-        createResult = Ok({ projectConfig, normalizedPath });
-        return freshConfig;
-      });
+          // create() (or a withRegistrationLock caller) already holds the registration lock.
+        },
+        { withinRegistrationLock: true }
+      );
 
       // Do NOT clean up the created directory when a concurrent registration claims
       // it: a duplicate owns this exact path, and a new descendant project lives
@@ -1001,17 +1005,14 @@ export class ProjectService {
       }
 
       const projectConfig: ProjectConfig = { workspaces: [] };
-      // A registration like create()'s, serialized with backup restores the same way.
-      await withProjectRegistrationLock(this.config.rootDir, () =>
-        this.config.editConfig((freshConfig) => {
-          if (freshConfig.projects.has(normalizedPath)) {
-            return freshConfig;
-          }
-          const updatedProjects = new Map(freshConfig.projects);
-          updatedProjects.set(normalizedPath, projectConfig);
-          return { ...freshConfig, projects: updatedProjects };
-        })
-      );
+      await this.config.editConfig((freshConfig) => {
+        if (freshConfig.projects.has(normalizedPath)) {
+          return freshConfig;
+        }
+        const updatedProjects = new Map(freshConfig.projects);
+        updatedProjects.set(normalizedPath, projectConfig);
+        return { ...freshConfig, projects: updatedProjects };
+      });
 
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
         // Config persistence (editConfig → private saveConfig) logs-and-continues on write
@@ -1252,17 +1253,6 @@ export class ProjectService {
   }
 
   async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
-    // Serialized with a settings-backup restore writing project memory, which must not have
-    // a project it matched unregistered underneath it (see withProjectRegistrationLock).
-    return withProjectRegistrationLock(this.config.rootDir, () =>
-      this.removeUnlocked(projectPath, force)
-    );
-  }
-
-  private async removeUnlocked(
-    projectPath: string,
-    force: boolean
-  ): Promise<Result<void, ProjectRemoveError>> {
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
       let config = this.config.loadConfigOrDefault();

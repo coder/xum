@@ -1703,6 +1703,105 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("never resolves an import target to a system project entry", async () => {
+    // A system-kind entry registered at a real directory: MemoryService keeps no project
+    // memory for it, so an import resolving to that identity would land notes nowhere.
+    const target = path.join(tempDir, "system-checkout");
+    await fs.mkdir(target);
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(target, { workspaces: [], projectKind: "system" });
+    const importedTo: string[] = [];
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    // Not found in the identity lookup, so registration is attempted — and ProjectService
+    // refuses the path as already taken; the candidate fails instead of writing.
+    service.setProjectService(registrar(() => Promise.resolve(Err("Project already exists"))));
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    expect(importedTo).toEqual([]);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "failed",
+        message: expect.stringContaining("different path") as string,
+      });
+    }
+  });
+
+  test("refuses an import whose target directory was replaced since approval", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const config = new TestBackupConfig(tempDir);
+    const importedTo: string[] = [];
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        // The approved checkout is moved away and another directory created at its path
+        // while the snapshot is being written.
+        writeSafetySnapshot: async () => {
+          await fs.rename(target, path.join(tempDir, "target-moved"));
+          await fs.mkdir(target);
+        },
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    // Neither registered nor written into: it is not the directory the user approved.
+    expect(registrations).toBe(0);
+    expect(importedTo).toEqual([]);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "failed",
+        message: expect.stringContaining("replaced") as string,
+      });
+    }
+  });
+
   test("refuses an import into a project that a matched entry restores in the same run", async () => {
     const target = path.join(tempDir, "target");
     await fs.mkdir(target);

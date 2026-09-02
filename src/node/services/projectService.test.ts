@@ -11,7 +11,7 @@ import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { ProjectService, type CloneEvent } from "./projectService";
-import { withProjectRegistrationLock } from "@/node/services/refinement/targetMutationLocks";
+import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
 
 async function createLocalGitRepository(rootDir: string, repoName: string): Promise<string> {
   const repoPath = path.join(rootDir, repoName);
@@ -137,6 +137,14 @@ async function collectCloneEvents(
   const clonedUrls = (await fs.readFile(fakeGit.fakeGitArgsLogPath, "utf-8")).trim().split("\n");
   return { events, clonedUrls };
 }
+
+/**
+ * Simulated concurrent registration for create()'s in-transform duplicate re-check. Real
+ * writers are serialized with create() by the registration lock (Config.editConfig takes
+ * it for any project-set change), so the interleaving these tests exercise is reproduced by
+ * marking the edit as a same-window writer; the re-check stays as defense in depth.
+ */
+const REGISTER_CONCURRENTLY = { withinRegistrationLock: true } as const;
 
 describe("ProjectService", () => {
   let tempDir: string;
@@ -268,7 +276,7 @@ describe("ProjectService", () => {
       const registerParent = config.editConfig((cfg) => {
         cfg.projects.set(parentPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(nestedAliasPath, { initGit: true });
       await registerParent;
 
@@ -342,7 +350,7 @@ exit 1
       const registerPlain = config.editConfig((cfg) => {
         cfg.projects.set(projectPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(projectPath, { initGit: true });
       await registerPlain;
 
@@ -403,7 +411,7 @@ exit 1
       const registerDescendant = config.editConfig((cfg) => {
         cfg.projects.set(descendantPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(parentPath, { initGit: true });
       await registerDescendant;
 
@@ -559,7 +567,7 @@ exec ${realGit} "$@"
       const registerPkg = config.editConfig((cfg) => {
         cfg.projects.set(pkgPath, { workspaces: [], parentProjectPath: repoPath });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const api = await service.create(apiPath);
       await registerPkg;
 
@@ -591,7 +599,7 @@ exec ${realGit} "$@"
       const registerRepo = config.editConfig((cfg) => {
         cfg.projects.set(repoPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(pkgPath);
       await registerRepo;
 
@@ -616,7 +624,7 @@ exec ${realGit} "$@"
       const registerDescendant = config.editConfig((cfg) => {
         cfg.projects.set(descendantPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(parentPath);
       await registerDescendant;
 
@@ -2775,6 +2783,36 @@ exit 1
       expect((await removing).success).toBe(true);
       expect(config.loadConfigOrDefault().projects.has(existing)).toBe(false);
       expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+    });
+
+    it("gates every registration path through Config, not just create and remove", async () => {
+      // setTrust registers a missing entry as a side effect — one of several writers that
+      // add a project key without going through create(). Config.editConfig serializes it
+      // with the restore window all the same, while an edit that changes nothing about the
+      // project set goes through immediately.
+      const unregistered = "/fake/trusted-later";
+      const held = Promise.withResolvers<void>();
+      const lockAcquired = Promise.withResolvers<void>();
+      const holding = withProjectRegistrationLock(tempDir, async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      });
+      await lockAcquired.promise;
+
+      let trusted = false;
+      const trusting = service.setTrust(unregistered, true).then(() => {
+        trusted = true;
+      });
+      await config.editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(trusted).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(unregistered)).toBe(false);
+      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
+
+      held.resolve();
+      await holding;
+      await trusting;
+      expect(config.loadConfigOrDefault().projects.get(unregistered)?.trusted).toBe(true);
     });
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {
