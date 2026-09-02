@@ -182,6 +182,7 @@ import {
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
+  filterProviderExcludedMessages,
   getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
@@ -783,7 +784,8 @@ function collectWorkspaceTitleContextTurns(
 ): WorkspaceTitleContextTurn[] {
   const turns: WorkspaceTitleContextTurn[] = [];
 
-  for (const message of messages) {
+  // A hard Stop excludes its synthetic row from every later provider request.
+  for (const message of filterProviderExcludedMessages([...messages])) {
     if (message.role !== "user" && message.role !== "assistant") {
       continue;
     }

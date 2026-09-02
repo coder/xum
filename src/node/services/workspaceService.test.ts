@@ -16749,6 +16749,13 @@ describe("WorkspaceService regenerateTitle", () => {
     );
     await historyService.appendToHistory(
       workspaceId,
+      createMuxMessage("canceled-wake", "user", "Canceled process output", {
+        synthetic: true,
+        providerExcluded: true,
+      })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
       createMuxMessage("assistant-after-boundary", "assistant", "No new user messages yet")
     );
 
@@ -16784,6 +16791,7 @@ describe("WorkspaceService regenerateTitle", () => {
         expect(context).toContain("Refactor sidebar loading");
         expect(context).toContain("Compacted summary");
         expect(context).toContain("No new user messages yet");
+        expect(context).not.toContain("Canceled process output");
         expect(context).not.toContain("omitted for brevity");
       }
       expect(call?.[4]).toBe("Refactor sidebar loading");
