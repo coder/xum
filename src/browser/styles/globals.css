@@ -1320,6 +1320,21 @@ body,
   }
 }
 
+/* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
+   would drift the icon to 22px; anchor the box to the header edge to keep it on the 12px gutter.
+   Fine pointers keep the 24px box, where this inset would push the icon out of the box and paint
+   the hover pill against the window edge. */
+@media (max-width: 768px) and (pointer: coarse) {
+  .mobile-menu-btn {
+    justify-content: flex-start !important;
+    padding-left: 12px !important;
+  }
+
+  .mobile-sticky-header:has(.mobile-menu-btn) {
+    padding-left: 0 !important;
+  }
+}
+
 /* Hide right sidebar when the workspace shell is too narrow to fit
    ChatPane(min 384px) + RightSidebar(min 300px) side-by-side. */
 @container (max-width: 684px) {
