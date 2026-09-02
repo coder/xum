@@ -3841,6 +3841,15 @@ describe("project bundle", () => {
     expect(await readProjectBundle(managedDir)).toBeNull();
   });
 
+  it("treats a symlinked sidecar directory as absent without traversing it", async () => {
+    const outsideDir = path.join(tempDir, "outside-bundle");
+    await fs.mkdir(outsideDir, { recursive: true });
+    await fs.writeFile(path.join(outsideDir, "manifest.json"), "{}", "utf-8");
+    await fs.symlink(outsideDir, path.join(managedDir, PROJECT_BUNDLE_DIR), "dir");
+    expect(await projectBundleExists(managedDir)).toBe(false);
+    expect(await readProjectBundle(managedDir)).toBeNull();
+  });
+
   it("rejects unsafe memory directory segments", async () => {
     for (const memoryDir of ["..", "evil/../../up", "nul", ".hidden-abcdef123456"]) {
       await rewriteBundleManifest(managedDir, {

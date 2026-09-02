@@ -1634,6 +1634,44 @@ describe("BackupService project imports", () => {
     expect(registrations).toBe(1);
   });
 
+  test("refuses an import into a project that a matched entry restores in the same run", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(target, { workspaces: [] });
+    let snapshots = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            // Another backed-up project already restores into `target` on this machine.
+            matchedProjects: [
+              { sourcePath: "/home/dev/src/other", projectPath: target, localMemoryDir: "t-abc" },
+            ],
+          }),
+        writeSafetySnapshot: () => {
+          snapshots += 1;
+          return Promise.resolve();
+        },
+      }),
+    });
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.message).toContain("already receives a backed-up project's memory");
+    }
+    // Refused during planning: two project identities would otherwise merge into one scope.
+    expect(snapshots).toBe(0);
+  });
+
   test("refuses network and device import targets before probing them", async () => {
     let probes = 0;
     const realLstat = fs.lstat.bind(fs);

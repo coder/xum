@@ -1697,6 +1697,40 @@ describe("backup adapters project bundle", () => {
     });
   });
 
+  it("re-validates matched memory under the lock before touching core settings", async () => {
+    const project = path.join(tempDir, "projects", "alpha");
+    registerProject(project);
+    await seedProjectMemory(project, "notes.md", "backup version\n");
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backup instructions\n");
+    const memoryDir = projectMemoryDirName(project);
+    const { repository, payload } = await exportBundle();
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local instructions\n");
+
+    const validated = await payload.validateRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    // Between the preflight and the restore, an in-app memory write turns the incoming
+    // destination into a directory. The restore must fail before the core files change.
+    await fs.rm(path.join(muxRoot, "memory", "project", memoryDir, "notes.md"));
+    await fs.mkdir(path.join(muxRoot, "memory", "project", memoryDir, "notes.md"));
+
+    const error = await captureRejection(
+      payload.restore({
+        repositoryRoot: repository.rootDir,
+        managedPath: settings.path,
+        includeProjects: true,
+        snapshotPath: path.join(tempDir, "restore-snapshot"),
+        matchedProjects: validated.matchedProjects,
+      })
+    );
+    expect((error as Error).message).toContain("non-file");
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "local instructions\n"
+    );
+  });
+
   it("refuses a matched destination it could not snapshot before the core restore", async () => {
     const project = path.join(tempDir, "projects", "alpha");
     registerProject(project);

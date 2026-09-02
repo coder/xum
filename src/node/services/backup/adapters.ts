@@ -601,36 +601,130 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       const sourceDir = await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath);
       const payload = await readBackupPayload(sourceDir);
       const before = await localFilesByPath();
-      const result = await restoreBackupPayload({
-        muxRoot,
-        payload,
-        approvedCommandTokens: restoreOptions.approvedCommandTokens,
-      });
-      if (result.backupPreferences !== undefined) {
-        let merged: ReturnType<typeof normalizeUserPreferences> | undefined;
-        await options.config.editConfig((current) => {
-          // Merged against the config this edit reads, not a snapshot taken before the
-          // restore: a whole-object write would otherwise discard preferences another
-          // window saved meanwhile, including the machine-local keys no backup carries.
-          merged = normalizeUserPreferences(
-            mergeBackupPreferences(current.userPreferences, result.backupPreferences)
-          );
-          return { ...current, userPreferences: merged };
+
+      const restoreCore = async (): Promise<{ localOnlyFiles: string[] }> => {
+        const result = await restoreBackupPayload({
+          muxRoot,
+          payload,
+          approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
-        // saveConfig logs and swallows write failures, so a resolved edit does not prove
-        // the preferences landed. Compared through the backup projection because every
-        // key a restore can change is portable, so a lost write is visible there, while
-        // machine-local keys the load path normalizes differently stay out of the check.
-        const stored = options.config.loadConfigOrDefault().userPreferences;
-        if (
-          merged !== undefined &&
-          !serializeBackupPreferences(stored ?? {}).equals(serializeBackupPreferences(merged))
-        ) {
-          throw new BackupServiceError(
-            "IO_ERROR",
-            "The restored preferences could not be written to config.json"
-          );
+        if (result.backupPreferences !== undefined) {
+          let merged: ReturnType<typeof normalizeUserPreferences> | undefined;
+          await options.config.editConfig((current) => {
+            // Merged against the config this edit reads, not a snapshot taken before the
+            // restore: a whole-object write would otherwise discard preferences another
+            // window saved meanwhile, including the machine-local keys no backup carries.
+            merged = normalizeUserPreferences(
+              mergeBackupPreferences(current.userPreferences, result.backupPreferences)
+            );
+            return { ...current, userPreferences: merged };
+          });
+          // saveConfig logs and swallows write failures, so a resolved edit does not prove
+          // the preferences landed. Compared through the backup projection because every
+          // key a restore can change is portable, so a lost write is visible there, while
+          // machine-local keys the load path normalizes differently stay out of the check.
+          const stored = options.config.loadConfigOrDefault().userPreferences;
+          if (
+            merged !== undefined &&
+            !serializeBackupPreferences(stored ?? {}).equals(serializeBackupPreferences(merged))
+          ) {
+            throw new BackupServiceError(
+              "IO_ERROR",
+              "The restored preferences could not be written to config.json"
+            );
+          }
         }
+        return { localOnlyFiles: result.localOnlyFiles };
+      };
+
+      let projectBundleSkipped = false;
+      const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
+      const memoryChanges: string[] = [];
+      let core: { localOnlyFiles: string[] };
+      const bundlePlan = restoreOptions.includeProjects
+        ? await readBundleWithPlan(sourceDir)
+        : null;
+      if (bundlePlan === null) {
+        // Existence-only, like the preview: a malformed sidecar must never block a
+        // core-only restore, but its presence is reported so the skip is visible.
+        projectBundleSkipped =
+          !restoreOptions.includeProjects && (await projectBundleExists(sourceDir));
+        core = await restoreCore();
+      } else {
+        // Only entries the caller validated as matched, to the very same destination. A
+        // project registered at its recorded path since validation was previewed as an
+        // import and is not covered by the snapshot, so it must not be overwritten here;
+        // one unregistered since validation drops out of the recomputed plan on its own.
+        const validatedMatched = new Set(
+          restoreOptions.matchedProjects.map(
+            (match) => `${match.sourcePath}\0${match.projectPath}\0${match.localMemoryDir}`
+          )
+        );
+        // One lock window from the memory preflight through the matched write, entered
+        // before the core settings change: an in-app memory edit between the caller's
+        // preflight and this point can no longer turn a still-valid plan into a failure
+        // discovered only after the core files were already overwritten, and nothing can
+        // edit a file between its snapshot bytes and its overwrite.
+        core = await withMemoryLock(async () => {
+          // Registration is re-read at the write boundary so a project unregistered since
+          // the plan was computed is left alone. Project registration is not serialized
+          // with memory writes (config edits take no memory lock), so this is the
+          // narrowest check available, not a guarantee against a concurrent edit landing
+          // between this read and the write.
+          const registered = registeredProjectDirs();
+          const matched = bundlePlan.plan.matched.filter(
+            (match) =>
+              validatedMatched.has(
+                `${match.entry.path}\0${match.projectPath}\0${match.localMemoryDir}`
+              ) && registered.get(match.projectPath) === match.localMemoryDir
+          );
+          if (matched.length > 0) {
+            for (const match of matched) {
+              await assertProjectMemoryWritesAllowed(muxRoot, matchedProjectWrites(match));
+            }
+            // Exactly the files these writes can overwrite: not whole project directories,
+            // whose unrelated local-only notes neither need covering nor may fail the
+            // restore, and never other registered projects.
+            const localBundle = await collectOverwritableProjectMemory(muxRoot, matched);
+            await writeProjectBundle(
+              path.join(restoreOptions.snapshotPath, PROJECT_BUNDLE_DIR),
+              localBundle,
+              { portable: false, ownerOnly: true }
+            );
+          }
+          const coreResult = await restoreCore();
+          // Matched entries restore verbatim, exactly what the preview promised. Imports
+          // are executed separately by the service, after project registration.
+          for (const match of matched) {
+            let written: string[];
+            try {
+              written = (
+                await writeProjectMemoryFiles(muxRoot, matchedProjectWrites(match), {
+                  addOnly: false,
+                })
+              ).written;
+            } catch (error) {
+              // Files written so far — earlier entries and this one's partial progress —
+              // are on disk; the failure must still announce them.
+              if (error instanceof ProjectMemoryWriteError && error.written.length > 0) {
+                restoredProjectMemory.push({
+                  projectPath: match.projectPath,
+                  files: error.written,
+                });
+              }
+              throw new ProjectMemoryRestoreError(
+                error instanceof Error ? error.message : String(error),
+                restoredProjectMemory,
+                { cause: error }
+              );
+            }
+            if (written.length > 0) {
+              memoryChanges.push(...written);
+              restoredProjectMemory.push({ projectPath: match.projectPath, files: written });
+            }
+          }
+          return coreResult;
+        });
       }
 
       const after = await localFilesByPath();
@@ -640,87 +734,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           return !previous?.content.equals(current.content) || !sameMode(previous, current);
         })
         .map(([file]) => file);
-
-      let projectBundleSkipped = false;
-      const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
-      if (!restoreOptions.includeProjects) {
-        // Existence-only, like the preview: a malformed sidecar must never block a
-        // core-only restore, but its presence is reported so the skip is visible.
-        projectBundleSkipped = await projectBundleExists(sourceDir);
-      } else {
-        const bundlePlan = await readBundleWithPlan(sourceDir);
-        if (bundlePlan !== null) {
-          // Only entries the caller validated as matched. A project registered at its
-          // recorded path since validation was previewed as an import and is not covered
-          // by the snapshot, so it must not be overwritten here; one unregistered since
-          // validation drops out of the recomputed plan on its own.
-          const validatedMatched = new Set(
-            restoreOptions.matchedProjects.map(
-              (match) => `${match.sourcePath}\0${match.projectPath}\0${match.localMemoryDir}`
-            )
-          );
-          // One lock window for the snapshot and the overwrite: a memory edit landing
-          // between them would otherwise be destroyed with a snapshot that predates it.
-          await withMemoryLock(async () => {
-            // Registration is re-read at the write boundary so a project unregistered since
-            // the plan was computed is left alone. Project registration is not serialized
-            // with memory writes (config edits take no memory lock), so this is the
-            // narrowest check available, not a guarantee against a concurrent edit landing
-            // between this read and the write.
-            const registered = registeredProjectDirs();
-            const matched = bundlePlan.plan.matched.filter(
-              (match) =>
-                validatedMatched.has(
-                  `${match.entry.path}\0${match.projectPath}\0${match.localMemoryDir}`
-                ) && registered.get(match.projectPath) === match.localMemoryDir
-            );
-            if (matched.length > 0) {
-              // Exactly the files these writes can overwrite: not whole project directories,
-              // whose unrelated local-only notes neither need covering nor may fail the
-              // restore, and never other registered projects.
-              const localBundle = await collectOverwritableProjectMemory(muxRoot, matched);
-              await writeProjectBundle(
-                path.join(restoreOptions.snapshotPath, PROJECT_BUNDLE_DIR),
-                localBundle,
-                { portable: false, ownerOnly: true }
-              );
-            }
-            // Matched entries restore verbatim, exactly what the preview promised. Imports
-            // are executed separately by the service, after project registration.
-            for (const match of matched) {
-              let written: string[];
-              try {
-                written = (
-                  await writeProjectMemoryFiles(muxRoot, matchedProjectWrites(match), {
-                    addOnly: false,
-                  })
-                ).written;
-              } catch (error) {
-                // Files written so far — earlier entries and this one's partial progress —
-                // are on disk; the failure must still announce them.
-                if (error instanceof ProjectMemoryWriteError && error.written.length > 0) {
-                  restoredProjectMemory.push({
-                    projectPath: match.projectPath,
-                    files: error.written,
-                  });
-                }
-                throw new ProjectMemoryRestoreError(
-                  error instanceof Error ? error.message : String(error),
-                  restoredProjectMemory,
-                  { cause: error }
-                );
-              }
-              if (written.length > 0) {
-                changedFiles.push(...written);
-                restoredProjectMemory.push({ projectPath: match.projectPath, files: written });
-              }
-            }
-          });
-        }
-      }
       return {
-        changedFiles: changedFiles.sort(),
-        localOnlyFiles: result.localOnlyFiles,
+        changedFiles: [...changedFiles, ...memoryChanges].sort(),
+        localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         restoredProjectMemory,
       };

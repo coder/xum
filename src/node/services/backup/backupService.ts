@@ -617,6 +617,7 @@ export class BackupService {
         const plannedImports = await this.planProjectImports(
           requestedImports,
           validated.projectImports,
+          validated.matchedProjects,
           includeProjects
         );
         // The bundle is read once for every approved import, and each import's write-side
@@ -717,6 +718,7 @@ export class BackupService {
   private async planProjectImports(
     requested: ReadonlyArray<{ token: string; targetPath: string }>,
     candidates: readonly BackupProjectImport[],
+    matched: readonly BackupMatchedProject[],
     includeProjects: boolean
   ): Promise<PlannedProjectImport[]> {
     if (requested.length === 0) return [];
@@ -730,6 +732,7 @@ export class BackupService {
     const planned: PlannedProjectImport[] = [];
     const claimedTargets = new Set<string>();
     const registry = await this.registeredProjectLookup();
+    const matchedProjectPaths = new Set(matched.map((match) => match.projectPath));
     for (const request of requested) {
       const candidate = byToken.get(request.token);
       // Unknown and stale tokens are indistinguishable here; both mean the user approved
@@ -776,13 +779,19 @@ export class BackupService {
         );
       }
       claimedTargets.add(canonical);
-      planned.push({
-        candidate,
-        targetPath: resolved,
-        // Known up front when the target is already registered (directly or as an alias),
-        // so the preflight checks the memory scope the import will really write to.
-        registeredPath: this.resolveRegisteredProjectPath(resolved, canonical, registry),
-      });
+      // Known up front when the target is already registered (directly or as an alias),
+      // so the preflight checks the memory scope the import will really write to.
+      const registeredPath = this.resolveRegisteredProjectPath(resolved, canonical, registry);
+      // A project that a matched entry restores into in this same run cannot also take an
+      // import: the two would merge into one memory scope and the import's origin marker
+      // would displace the matched entry's identity.
+      if (matchedProjectPaths.has(registeredPath ?? resolved)) {
+        throw new BackupServiceError(
+          "IO_ERROR",
+          `Cannot import '${candidate.name}': '${resolved}' already receives a backed-up project's memory in this restore`
+        );
+      }
+      planned.push({ candidate, targetPath: resolved, registeredPath });
     }
     return planned;
   }

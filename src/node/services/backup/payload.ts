@@ -2835,11 +2835,13 @@ export async function assertManagedTreeWithinLimits(destinationDir: string): Pro
  * while `includeProjects` is off without ever blocking a core-only restore on its contents.
  */
 export async function projectBundleExists(sourceDir: string): Promise<boolean> {
-  // lstat, never stat: on hosts where git materializes symlinks, a crafted sidecar manifest
-  // pointing at a UNC path would otherwise be followed here — reached even with project
-  // backup off — and Windows would start SMB authentication. A symlinked manifest is
-  // treated as absent; the full read refuses it anyway.
-  const stat = await lstatOrNull(path.join(sourceDir, PROJECT_BUNDLE_DIR, BACKUP_MANIFEST_FILE));
+  // lstat at both levels, never stat: on hosts where git materializes symlinks, a crafted
+  // sidecar directory or manifest pointing at a UNC path would otherwise be followed here —
+  // reached even with project backup off — and Windows would start SMB authentication. A
+  // symlinked directory or manifest is treated as absent; the full read refuses it anyway.
+  const bundleDir = path.join(sourceDir, PROJECT_BUNDLE_DIR);
+  if ((await lstatOrNull(bundleDir))?.isDirectory() !== true) return false;
+  const stat = await lstatOrNull(path.join(bundleDir, BACKUP_MANIFEST_FILE));
   return stat?.isFile() === true;
 }
 
