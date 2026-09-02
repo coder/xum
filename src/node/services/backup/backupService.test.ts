@@ -1581,6 +1581,49 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("re-registers a target whose planned registration vanished before the import", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const config = new TestBackupConfig(tempDir);
+    config.state.projects.set(target, { workspaces: [] });
+    let registrations = 0;
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjectPaths: [],
+          }),
+        // Another window unregisters the project while the snapshot is being written —
+        // after planning resolved the target as already registered.
+        writeSafetySnapshot: () => {
+          config.state.projects.delete(target);
+          return Promise.resolve();
+        },
+      }),
+    });
+    service.setProjectService(
+      registrar((projectPath) => {
+        registrations += 1;
+        return Promise.resolve(Ok({ normalizedPath: projectPath }));
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]?.status).toBe("imported");
+    }
+    // Memory must not be written into an unregistered scope on a stale identity.
+    expect(registrations).toBe(1);
+  });
+
   test("refuses network and device import targets before probing them", async () => {
     let probes = 0;
     const realLstat = fs.lstat.bind(fs);

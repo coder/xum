@@ -819,11 +819,19 @@ export class BackupService {
         }
         // An alias of an already registered project (resolved during planning) imports into
         // that project without a second registration; create() would otherwise register the
-        // alias as a duplicate when its own duplicate check misses the aliased key.
+        // alias as a duplicate when its own duplicate check misses the aliased key. The
+        // identity is re-read here because project registration is not serialized with this
+        // restore: a project unregistered meanwhile must be registered again, not written
+        // into as if it still existed.
+        const registeredIdentity =
+          plannedRegisteredPath !== null &&
+          this.config.loadConfigOrDefault().projects.has(plannedRegisteredPath)
+            ? plannedRegisteredPath
+            : null;
         // The backed-up name travels with a newly registered project (in the same config
         // write as the registration); an already registered target keeps its local name.
         const created =
-          plannedRegisteredPath === null
+          registeredIdentity === null
             ? await this.projectRegistrar.create(
                 targetPath,
                 candidate.name === getProjectDisplayName(targetPath)
@@ -837,7 +845,7 @@ export class BackupService {
           // Registered since planning (a concurrent registration): resolve against a fresh
           // lookup, since the planning-time one predates it.
           registeredPath =
-            plannedRegisteredPath ??
+            registeredIdentity ??
             this.resolveRegisteredProjectPath(
               targetPath,
               await realpathOrNull(targetPath),
