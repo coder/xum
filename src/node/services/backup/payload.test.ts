@@ -3676,7 +3676,7 @@ describe("project bundle", () => {
     expect(planProjectBundleRestore(bundle, registered).imports).toHaveLength(1);
 
     await writeProjectMemoryOrigin(muxRoot, localDir, sourceEntry.path);
-    const origins = await readProjectMemoryOrigins(muxRoot, registered);
+    const origins = await readProjectMemoryOrigins(muxRoot, registered, [sourceEntry.path]);
     expect(origins.get(sourceEntry.path)).toEqual({
       projectPath: localProject,
       memoryDir: localDir,
@@ -3712,7 +3712,13 @@ describe("project bundle", () => {
     expect(plan.imports.map((item) => item.entry.path)).toEqual([sourceA.path]);
   });
 
-  it("keeps only the newest claim on a source when writing an origin marker", async () => {
+  /** The marker file a source's association is recorded in (keyed by the source's hash). */
+  function originMarkerPath(sourcePath: string): string {
+    const digest = createHash("sha256").update(Buffer.from(sourcePath, "utf-8")).digest("hex");
+    return path.join(muxRoot, "memory", ".backup-origins", `${digest.slice(0, 32)}.json`);
+  }
+
+  it("replaces a source's association when it is imported again elsewhere", async () => {
     const source = "/home/dev/src/alpha";
     const b = "/home/other/b";
     const c = "/home/other/c";
@@ -3721,47 +3727,86 @@ describe("project bundle", () => {
     await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(c), source);
     const registered = new Map([b, c].map((project) => [project, projectMemoryDirName(project)]));
 
-    // B's stale marker was removed when C claimed the source, so re-registering B cannot
-    // revive the older association or make the source ambiguous.
-    expect(
-      await fs
-        .lstat(path.join(muxRoot, "memory", ".backup-origins", `${projectMemoryDirName(b)}.json`))
-        .catch(() => null)
-    ).toBeNull();
-    expect([...(await readProjectMemoryOrigins(muxRoot, registered)).entries()]).toEqual([
+    // One marker per source, so C's import replaced B's claim outright: re-registering B
+    // cannot revive the older association or leave the source claimed twice.
+    expect(await fs.readdir(path.join(muxRoot, "memory", ".backup-origins"))).toEqual([
+      path.basename(originMarkerPath(source)),
+    ]);
+    expect([...(await readProjectMemoryOrigins(muxRoot, registered, [source])).entries()]).toEqual([
       [source, { projectPath: c, memoryDir: projectMemoryDirName(c) }],
     ]);
   });
 
-  it("leaves a source claimed by two registered projects unmatched and ignores broken markers", async () => {
-    const first = "/home/other/a";
-    const second = "/home/other/b";
-    const broken = "/home/other/c";
-    const registered = new Map(
-      [first, second, broken].map((project) => [project, projectMemoryDirName(project)])
-    );
-    // Hand-placed (a copied home): the writer would never leave two claims behind.
-    for (const project of [first, second]) {
-      await writeFixtureFile(
-        muxRoot,
-        `memory/.backup-origins/${projectMemoryDirName(project)}.json`,
-        JSON.stringify({ sourcePath: "/home/dev/src/alpha" })
+  it("keeps the previous association when writing its replacement fails", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const source = "/home/dev/src/alpha";
+    const b = "/home/other/b";
+    const c = "/home/other/c";
+    const registered = new Map([b, c].map((project) => [project, projectMemoryDirName(project)]));
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), source);
+    const originsDir = path.join(muxRoot, "memory", ".backup-origins");
+    await fs.chmod(originsDir, 0o555);
+    try {
+      const error = await captureRejection(
+        writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(c), source)
       );
+      expect((error as NodeJS.ErrnoException).code).toBe("EACCES");
+    } finally {
+      await fs.chmod(originsDir, 0o755);
     }
-    await writeFixtureFile(
-      muxRoot,
-      `memory/.backup-origins/${projectMemoryDirName(broken)}.json`,
-      "{ not json"
+    // The failed import must not have cost the earlier project its association.
+    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
+      projectPath: b,
+      memoryDir: projectMemoryDirName(b),
+    });
+    expect(await fs.readdir(originsDir)).toEqual([path.basename(originMarkerPath(source))]);
+  });
+
+  it("ignores markers that are broken, mis-named, or name an unregistered project", async () => {
+    const registeredProject = "/home/other/a";
+    const registered = new Map([[registeredProject, projectMemoryDirName(registeredProject)]]);
+    const broken = "/home/dev/src/broken";
+    const misnamed = "/home/dev/src/misnamed";
+    const orphaned = "/home/dev/src/orphaned";
+    await fs.mkdir(path.join(muxRoot, "memory", ".backup-origins"), { recursive: true });
+    await fs.writeFile(originMarkerPath(broken), "{ not json", "utf-8");
+    // Sits at one source's name but records another: neither source's marker.
+    await fs.writeFile(
+      originMarkerPath(misnamed),
+      JSON.stringify({ sourcePath: broken, memoryDir: projectMemoryDirName(registeredProject) }),
+      "utf-8"
+    );
+    await fs.writeFile(
+      originMarkerPath(orphaned),
+      JSON.stringify({ sourcePath: orphaned, memoryDir: projectMemoryDirName("/gone") }),
+      "utf-8"
     );
 
-    // Ambiguous: neither project is matched, so a restore re-offers the source as an import
-    // instead of overwriting whichever project happens to sort first.
-    expect((await readProjectMemoryOrigins(muxRoot, registered)).size).toBe(0);
+    const origins = await readProjectMemoryOrigins(muxRoot, registered, [
+      broken,
+      misnamed,
+      orphaned,
+    ]);
+    expect(origins.size).toBe(0);
+  });
+
+  it("refuses a marker the reader's byte cap would reject", async () => {
+    // Past the schema's 1024-character path cap and fully escaped: defensive only, since a
+    // parsed bundle can never carry it, but an import must not succeed with an unreadable marker.
+    const error = await captureRejection(
+      writeProjectMemoryOrigin(
+        muxRoot,
+        projectMemoryDirName("/home/other/a"),
+        "\u0001".repeat(2000)
+      )
+    );
+    expect((error as Error).message).toContain("too large");
   });
 
   it("refuses an origin marker behind a symlinked directory or marker", async () => {
     const localProject = "/home/other/a";
     const localDir = projectMemoryDirName(localProject);
+    const source = "/home/dev/src/alpha";
     const outside = path.join(tempDir, "outside-origins");
     await fs.mkdir(outside, { recursive: true });
     const originsDir = path.join(muxRoot, "memory", ".backup-origins");
@@ -3769,9 +3814,7 @@ describe("project bundle", () => {
 
     // A copied or corrupted Xum home left `.backup-origins` itself as a symlink.
     await fs.symlink(outside, originsDir, "dir");
-    const viaDir = await captureRejection(
-      writeProjectMemoryOrigin(muxRoot, localDir, "/home/dev/src/alpha")
-    );
+    const viaDir = await captureRejection(writeProjectMemoryOrigin(muxRoot, localDir, source));
     expect((viaDir as Error).message).toContain("symlink");
     expect(await fs.readdir(outside)).toEqual([]);
 
@@ -3779,17 +3822,22 @@ describe("project bundle", () => {
     await fs.unlink(originsDir);
     await fs.mkdir(originsDir);
     const victim = path.join(outside, "victim.json");
-    await fs.writeFile(victim, JSON.stringify({ sourcePath: "/home/dev/src/alpha" }), "utf-8");
-    await fs.symlink(victim, path.join(originsDir, `${localDir}.json`));
-    const viaMarker = await captureRejection(
-      writeProjectMemoryOrigin(muxRoot, localDir, "/home/dev/src/planted")
+    await fs.writeFile(
+      victim,
+      JSON.stringify({ sourcePath: source, memoryDir: localDir }),
+      "utf-8"
     );
+    await fs.symlink(victim, originMarkerPath(source));
+    const viaMarker = await captureRejection(writeProjectMemoryOrigin(muxRoot, localDir, source));
     expect((viaMarker as Error).message).toContain("symlink");
     expect(JSON.parse(await fs.readFile(victim, "utf-8"))).toEqual({
-      sourcePath: "/home/dev/src/alpha",
+      sourcePath: source,
+      memoryDir: localDir,
     });
-    // Nor is the linked file's content trusted as this project's origin.
-    const origins = await readProjectMemoryOrigins(muxRoot, new Map([[localProject, localDir]]));
+    // Nor is the linked file's content trusted as this source's origin.
+    const origins = await readProjectMemoryOrigins(muxRoot, new Map([[localProject, localDir]]), [
+      source,
+    ]);
     expect(origins.size).toBe(0);
   });
 

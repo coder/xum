@@ -359,9 +359,13 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       plan: planProjectBundleRestore(
         bundle,
         registered,
-        await readProjectMemoryOrigins(muxRoot, registered)
+        await readProjectMemoryOrigins(muxRoot, registered, bundleSourcePaths(bundle))
       ),
     };
+  }
+
+  function bundleSourcePaths(bundle: BackupProjectBundle): string[] {
+    return bundle.manifest.projects.map((entry) => entry.path);
   }
 
   /** Restore-preview statuses for matched entries, diffed against the local memory files. */
@@ -686,7 +690,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             const plan = planProjectBundleRestore(
               bundle,
               registered,
-              await readProjectMemoryOrigins(muxRoot, registered)
+              await readProjectMemoryOrigins(muxRoot, registered, bundleSourcePaths(bundle))
             );
             const matched = plan.matched.filter((match) => validatedMatched.has(planKey(match)));
             // A validated match that no longer writes — its project unregistered since, or

@@ -1410,6 +1410,12 @@ describe("backup adapters project bundle", () => {
     };
   }
 
+  /** The marker file a source's import association is recorded in (keyed by the source's hash). */
+  function originMarkerPath(sourcePath: string): string {
+    const digest = createHash("sha256").update(Buffer.from(sourcePath, "utf-8")).digest("hex");
+    return path.join(muxRoot, "memory", ".backup-origins", `${digest.slice(0, 32)}.json`);
+  }
+
   async function seedProjectMemory(
     projectPath: string,
     fileName: string,
@@ -2111,9 +2117,7 @@ describe("backup adapters project bundle", () => {
     const targetPath = path.join(tempDir, "projects", "alpha-moved");
     const targetDir = projectMemoryDirName(targetPath);
     // A directory squats on the marker's name, so the marker write fails after the notes landed.
-    await fs.mkdir(path.join(muxRoot, "memory", ".backup-origins", `${targetDir}.json`), {
-      recursive: true,
-    });
+    await fs.mkdir(originMarkerPath(project), { recursive: true });
 
     const importer = await payload.prepareProjectImports({
       repositoryRoot: repository.rootDir,
@@ -2271,8 +2275,12 @@ describe("backup adapters project bundle", () => {
     const targetPath = path.join(tempDir, "projects", "alpha-here");
     const targetDir = projectMemoryDirName(targetPath);
     registerProject(targetPath);
-    const marker = `memory/.backup-origins/${targetDir}.json`;
-    await writeFixtureFile(muxRoot, marker, JSON.stringify({ sourcePath: project }));
+    await fs.mkdir(path.dirname(originMarkerPath(project)), { recursive: true });
+    await fs.writeFile(
+      originMarkerPath(project),
+      JSON.stringify({ sourcePath: project, memoryDir: targetDir }),
+      "utf-8"
+    );
     const validated = await payload.validateRestore({
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,
@@ -2283,9 +2291,8 @@ describe("backup adapters project bundle", () => {
     ]);
 
     // While the restore waits for the memory lock, another import (which writes under that
-    // lock) re-points the project at a different source. The plan validated against the old
-    // marker must not be written: it would overwrite this project with the old source's
-    // notes while its marker names the new one.
+    // lock) moves the source to a different local checkout. The plan validated against the
+    // old marker must not be written: this project is no longer the source's local identity.
     const held = Promise.withResolvers<void>();
     const lockAcquired = Promise.withResolvers<void>();
     const holding = withTargetMutationLock(
@@ -2307,7 +2314,11 @@ describe("backup adapters project bundle", () => {
       })
     );
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await writeFixtureFile(muxRoot, marker, JSON.stringify({ sourcePath: "/elsewhere/other" }));
+    await fs.writeFile(
+      originMarkerPath(project),
+      JSON.stringify({ sourcePath: project, memoryDir: projectMemoryDirName("/elsewhere/other") }),
+      "utf-8"
+    );
     held.resolve();
     await holding;
 

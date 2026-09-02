@@ -154,10 +154,20 @@ export interface BackupProjectImporter {
  * setter because the container constructs BackupService before ProjectService.
  */
 export interface BackupProjectRegistrar {
-  create(
-    projectPath: string,
-    options?: { displayName?: string }
-  ): Promise<Result<{ normalizedPath: string }, string>>;
+  /**
+   * Runs `fn` with project registration held stable — nothing is registered or removed
+   * underneath it — and a `create` that registers inside that window. An import resolves its
+   * target's identity, registers it when needed, and writes its memory within one window, so
+   * a removal cannot land between the registration it checked and the memory it wrote.
+   */
+  withRegistrationLock<T>(
+    fn: (registrar: {
+      create(
+        projectPath: string,
+        options?: { displayName?: string }
+      ): Promise<Result<{ normalizedPath: string }, string>>;
+    }) => Promise<T>
+  ): Promise<T>;
 }
 
 /**
@@ -809,122 +819,132 @@ export class BackupService {
   ): Promise<BackupProjectImportResult[]> {
     const results: BackupProjectImportResult[] = [];
     if (planned.length === 0) return results;
-    // Rebuilt now rather than reused from planning: project registration is not serialized
-    // with this restore, so the registry may have changed in between. A target unregistered
-    // since must be registered again, not written into on its stale identity; one registered
-    // meanwhile — possibly through a different symlinked spelling of the same directory,
-    // which create()'s own duplicate check does not resolve — must not be registered a
-    // second time, which would split the project identity.
-    const registry = await this.registeredProjectLookup();
-    for (const { candidate, targetPath, registeredPath: plannedRegisteredPath } of planned) {
-      // The identity the preflight checked (memory limits, non-file destinations,
-      // permissions) is the only one this import may write to. A different identity now —
-      // the checkout registered under another alias since planning — names a memory scope
-      // nothing has checked, so the candidate fails without a write and stays on offer;
-      // the next preview resolves the new registration and preflights it.
-      const preflightedPath = plannedRegisteredPath ?? targetPath;
-      // Once registration resolves the project identity, failures report that path: it is
-      // where any partially written memory actually lives.
-      let registeredPath: string | null = null;
-      const failed = (
-        message: string,
-        progress: { written: string[]; skipped: string[] } = { written: [], skipped: [] }
-      ): BackupProjectImportResult => ({
+    const registrar = this.projectRegistrar;
+    if (registrar === null) {
+      return planned.map(({ candidate, targetPath }) => ({
         sourcePath: candidate.sourcePath,
-        targetPath: registeredPath ?? targetPath,
+        targetPath,
         name: candidate.name,
         status: "failed",
-        message,
-        writtenFiles: progress.written,
-        skippedFiles: progress.skipped,
-      });
-      const unchecked = (registered: string): BackupProjectImportResult =>
-        failed(
-          `'${targetPath}' is now registered as '${registered}', which this import was not checked against; approve it again`
-        );
-      try {
-        if (this.projectRegistrar === null) {
-          results.push(failed("Project registration is unavailable"));
-          continue;
-        }
-        // Re-verify under the local payload lock: the preflight ran before the snapshot and
-        // the directory may have vanished since.
-        const stat = await fs.lstat(targetPath).catch(() => null);
-        if (!stat?.isDirectory()) {
-          results.push(failed(`'${targetPath}' is not an existing directory`));
-          continue;
-        }
-        // An alias of an already registered project imports into that project without a
-        // second registration; create() would otherwise register the alias as a duplicate
-        // when its own duplicate check misses the aliased key.
-        const registeredIdentity = this.resolveRegisteredProjectPath(
-          targetPath,
-          await realpathOrNull(targetPath),
-          registry
-        );
-        // Checked before create() so a refused candidate leaves no registration behind.
-        if ((registeredIdentity ?? targetPath) !== preflightedPath) {
-          results.push(unchecked(registeredIdentity ?? targetPath));
-          continue;
-        }
-        // The backed-up name travels with a newly registered project (in the same config
-        // write as the registration); an already registered target keeps its local name.
-        const created =
-          registeredIdentity === null
-            ? await this.projectRegistrar.create(
-                targetPath,
-                candidate.name === getProjectDisplayName(targetPath)
-                  ? undefined
-                  : { displayName: candidate.name }
-              )
-            : Err("Project already exists");
-        if (created.success) {
-          registeredPath = created.data.normalizedPath;
-        } else if (created.error === "Project already exists") {
-          // Registered while this loop ran (a concurrent registration): resolve against a
-          // lookup fresher than the one built above.
-          registeredPath =
-            registeredIdentity ??
-            this.resolveRegisteredProjectPath(
-              targetPath,
-              await realpathOrNull(targetPath),
-              await this.registeredProjectLookup()
-            );
-          if (registeredPath === null) {
-            results.push(failed(`'${targetPath}' is already registered under a different path`));
-            continue;
-          }
-          if (registeredPath !== preflightedPath) {
-            results.push(unchecked(registeredPath));
-            continue;
-          }
-        } else {
-          results.push(failed(created.error));
-          continue;
-        }
-        const written = await importer.importProjectMemory({
-          token: candidate.token,
-          targetPath: registeredPath,
-        });
-        results.push({
-          sourcePath: candidate.sourcePath,
-          targetPath: registeredPath,
-          name: candidate.name,
-          status: "imported",
-          writtenFiles: written.writtenFiles,
-          skippedFiles: written.skippedFiles,
-        });
-      } catch (error) {
-        // A write that failed midway already created files; the result must list them or
-        // the user has nothing to clean up by.
-        results.push(
-          error instanceof ProjectMemoryWriteError
-            ? failed(error.message, error)
-            : failed(error instanceof Error ? error.message : String(error))
-        );
-      }
+        message: "Project registration is unavailable",
+        writtenFiles: [],
+        skippedFiles: [],
+      }));
     }
-    return results;
+    // One registration window for the imports: registration is re-read inside it — so a
+    // target unregistered since planning is registered again rather than written into on a
+    // stale identity, and one registered meanwhile through another symlinked spelling is
+    // detected instead of registered twice — and nothing can be registered or removed
+    // between that read and the memory writes, so the project an import wrote into is the
+    // project registered when it reports success.
+    return registrar.withRegistrationLock(async (locked) => {
+      const registry = await this.registeredProjectLookup();
+      for (const { candidate, targetPath, registeredPath: plannedRegisteredPath } of planned) {
+        // The identity the preflight checked (memory limits, non-file destinations,
+        // permissions) is the only one this import may write to. A different identity now —
+        // the checkout registered under another alias since planning — names a memory scope
+        // nothing has checked, so the candidate fails without a write and stays on offer;
+        // the next preview resolves the new registration and preflights it.
+        const preflightedPath = plannedRegisteredPath ?? targetPath;
+        // Once registration resolves the project identity, failures report that path: it is
+        // where any partially written memory actually lives.
+        let registeredPath: string | null = null;
+        const failed = (
+          message: string,
+          progress: { written: string[]; skipped: string[] } = { written: [], skipped: [] }
+        ): BackupProjectImportResult => ({
+          sourcePath: candidate.sourcePath,
+          targetPath: registeredPath ?? targetPath,
+          name: candidate.name,
+          status: "failed",
+          message,
+          writtenFiles: progress.written,
+          skippedFiles: progress.skipped,
+        });
+        const unchecked = (registered: string): BackupProjectImportResult =>
+          failed(
+            `'${targetPath}' is now registered as '${registered}', which this import was not checked against; approve it again`
+          );
+        try {
+          // Re-verify under the local payload lock: the preflight ran before the snapshot and
+          // the directory may have vanished since.
+          const stat = await fs.lstat(targetPath).catch(() => null);
+          if (!stat?.isDirectory()) {
+            results.push(failed(`'${targetPath}' is not an existing directory`));
+            continue;
+          }
+          // An alias of an already registered project imports into that project without a
+          // second registration; create() would otherwise register the alias as a duplicate
+          // when its own duplicate check misses the aliased key.
+          const registeredIdentity = this.resolveRegisteredProjectPath(
+            targetPath,
+            await realpathOrNull(targetPath),
+            registry
+          );
+          // Checked before create() so a refused candidate leaves no registration behind.
+          if ((registeredIdentity ?? targetPath) !== preflightedPath) {
+            results.push(unchecked(registeredIdentity ?? targetPath));
+            continue;
+          }
+          // The backed-up name travels with a newly registered project (in the same config
+          // write as the registration); an already registered target keeps its local name.
+          const created =
+            registeredIdentity === null
+              ? await locked.create(
+                  targetPath,
+                  candidate.name === getProjectDisplayName(targetPath)
+                    ? undefined
+                    : { displayName: candidate.name }
+                )
+              : Err("Project already exists");
+          if (created.success) {
+            registeredPath = created.data.normalizedPath;
+          } else if (created.error === "Project already exists") {
+            // Resolved above, or registered by an earlier candidate of this very loop (the
+            // lock excludes everyone else): the lookup built inside the window predates that.
+            registeredPath =
+              registeredIdentity ??
+              this.resolveRegisteredProjectPath(
+                targetPath,
+                await realpathOrNull(targetPath),
+                await this.registeredProjectLookup()
+              );
+            if (registeredPath === null) {
+              results.push(failed(`'${targetPath}' is already registered under a different path`));
+              continue;
+            }
+            if (registeredPath !== preflightedPath) {
+              results.push(unchecked(registeredPath));
+              continue;
+            }
+          } else {
+            results.push(failed(created.error));
+            continue;
+          }
+          const written = await importer.importProjectMemory({
+            token: candidate.token,
+            targetPath: registeredPath,
+          });
+          results.push({
+            sourcePath: candidate.sourcePath,
+            targetPath: registeredPath,
+            name: candidate.name,
+            status: "imported",
+            writtenFiles: written.writtenFiles,
+            skippedFiles: written.skippedFiles,
+          });
+        } catch (error) {
+          // A write that failed midway already created files; the result must list them or
+          // the user has nothing to clean up by.
+          results.push(
+            error instanceof ProjectMemoryWriteError
+              ? failed(error.message, error)
+              : failed(error instanceof Error ? error.message : String(error))
+          );
+        }
+      }
+      return results;
+    });
   }
 
   /**

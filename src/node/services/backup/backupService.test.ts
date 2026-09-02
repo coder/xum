@@ -128,8 +128,12 @@ function matchedIdentity(projectPath: string): BackupMatchedProject {
 }
 
 /** A registrar mock around the given create(). */
-function registrar(create: BackupProjectRegistrar["create"]): BackupProjectRegistrar {
-  return { create };
+type RegistrarCreate = Parameters<
+  Parameters<BackupProjectRegistrar["withRegistrationLock"]>[0]
+>[0]["create"];
+
+function registrar(create: RegistrarCreate): BackupProjectRegistrar {
+  return { withRegistrationLock: (fn) => fn({ create }) };
 }
 
 function createService(

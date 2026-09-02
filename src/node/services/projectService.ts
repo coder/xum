@@ -434,6 +434,32 @@ export class ProjectService {
     projectPath: string,
     options?: { initGit?: boolean; displayName?: string }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    // Serialized with a settings-backup restore writing project memory: a registration
+    // landing at a backed-up source path mid-restore would change which local project that
+    // entry belongs to (see withProjectRegistrationLock).
+    return withProjectRegistrationLock(this.config.rootDir, () =>
+      this.createUnlocked(projectPath, options)
+    );
+  }
+
+  /**
+   * Registration held stable — no project can be registered or removed underneath `fn` —
+   * with a `create` that registers inside that window. A backup import resolves its target's
+   * identity, registers it when needed, and writes its memory within one such window, so
+   * the project it wrote into is the project registered when it reports success.
+   */
+  withRegistrationLock<T>(
+    fn: (registrar: { create: ProjectService["create"] }) => Promise<T>
+  ): Promise<T> {
+    return withProjectRegistrationLock(this.config.rootDir, () =>
+      fn({ create: (projectPath, options) => this.createUnlocked(projectPath, options) })
+    );
+  }
+
+  private async createUnlocked(
+    projectPath: string,
+    options?: { initGit?: boolean; displayName?: string }
+  ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
     let gitInitClaimKey: string | null = null;
     try {
       // Validate input
@@ -975,14 +1001,17 @@ export class ProjectService {
       }
 
       const projectConfig: ProjectConfig = { workspaces: [] };
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath)) {
-          return freshConfig;
-        }
-        const updatedProjects = new Map(freshConfig.projects);
-        updatedProjects.set(normalizedPath, projectConfig);
-        return { ...freshConfig, projects: updatedProjects };
-      });
+      // A registration like create()'s, serialized with backup restores the same way.
+      await withProjectRegistrationLock(this.config.rootDir, () =>
+        this.config.editConfig((freshConfig) => {
+          if (freshConfig.projects.has(normalizedPath)) {
+            return freshConfig;
+          }
+          const updatedProjects = new Map(freshConfig.projects);
+          updatedProjects.set(normalizedPath, projectConfig);
+          return { ...freshConfig, projects: updatedProjects };
+        })
+      );
 
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
         // Config persistence (editConfig → private saveConfig) logs-and-continues on write

@@ -3095,18 +3095,24 @@ export function matchedProjectWrites(
 }
 
 /**
- * Marker recording which backed-up project an imported memory directory came from, keyed by
- * the local memory directory name. Kept in `memory/.backup-origins/` — beside, not inside,
+ * Marker recording which local project an imported source lives in, keyed by the recorded
+ * source path (hashed) so each source has exactly one marker: a later import of the same
+ * source elsewhere replaces it — the newest explicit association wins — and a restore locates
+ * it without scanning the directory. Kept in `memory/.backup-origins/` — beside, not inside,
  * the project scopes — so no memory path a user or agent can address through MemoryService
  * collides with it, and the core allowlist (which collects only `memory/global`) never
  * exports it. Needs no config schema.
  */
 const PROJECT_MEMORY_ORIGINS_DIR = "memory/.backup-origins";
-const MAX_PROJECT_MEMORY_ORIGIN_BYTES = 4096;
+/**
+ * Bound on a marker's bytes, aligned with what the writer can produce: a schema-capped
+ * 1024-character source path fully `\uXXXX`-escaped (6144 bytes), a 64-character memory
+ * directory name, and the JSON framing.
+ */
+const MAX_PROJECT_MEMORY_ORIGIN_BYTES = 8192;
 
-/** Root-relative, so the checked reader and writer walk every component below the root. */
-function projectMemoryOriginPath(localMemoryDir: string): string {
-  return `${PROJECT_MEMORY_ORIGINS_DIR}/${localMemoryDir}.json`;
+function projectMemoryOriginPath(sourcePath: string): string {
+  return `${PROJECT_MEMORY_ORIGINS_DIR}/${sha256(Buffer.from(sourcePath, "utf-8")).slice(0, 32)}.json`;
 }
 
 export async function writeProjectMemoryOrigin(
@@ -3115,56 +3121,40 @@ export async function writeProjectMemoryOrigin(
   sourcePath: string
 ): Promise<void> {
   const root = await resolveRoot(muxRoot);
-  const relativePath = projectMemoryOriginPath(localMemoryDir);
+  const content = Buffer.from(
+    `${JSON.stringify({ sourcePath, memoryDir: localMemoryDir })}\n`,
+    "utf-8"
+  );
+  // The reader's cap, checked before writing: an import must not report success with a
+  // marker no later restore will read.
+  if (content.length > MAX_PROJECT_MEMORY_ORIGIN_BYTES) {
+    throw new Error("Cannot record the imported project's origin: the marker is too large");
+  }
+  const relativePath = projectMemoryOriginPath(sourcePath);
+  const staging = `${relativePath}.tmp`;
   // Contained and then written through the checked writer, like every other file a restore
   // lands: `.backup-origins` or the marker itself left behind as a symlink (a copied or
   // corrupted Xum home) would otherwise be followed, and an approved import would replace a
   // file outside the memory tree with backup-controlled JSON.
   await resolveContainedPath(root.path, relativePath);
-  // The newest explicit association is the only one kept. A marker left by an earlier
-  // import of this source — its project since unregistered, or still registered — would
-  // otherwise survive as a second claim: re-registering that project later would make the
-  // source ambiguous, or match whichever project sorted first and overwrite its memory in
-  // matched mode without any approval.
-  for (const claim of await listProjectMemoryOriginClaims(root, sourcePath)) {
-    if (claim !== relativePath) await fs.unlink(absolutePathOf(root.path, claim));
+  await resolveContainedPath(root.path, staging);
+  // Staged beside the marker and renamed over it, so the source's previous association is
+  // replaced only by a complete replacement: a write that fails midway (disk full) leaves
+  // the old marker as it was rather than deleting a valid claim for nothing.
+  try {
+    await writeCheckedFile(root, staging, content, false);
+    await fs.rename(absolutePathOf(root.path, staging), absolutePathOf(root.path, relativePath));
+  } catch (error) {
+    await fs.rm(absolutePathOf(root.path, staging), { force: true }).catch(() => undefined);
+    throw error;
   }
-  await writeCheckedFile(
-    root,
-    relativePath,
-    Buffer.from(`${JSON.stringify({ sourcePath })}\n`, "utf-8"),
-    false
-  );
 }
 
-/** Root-relative paths of every marker recording `sourcePath`, whichever project they name. */
-async function listProjectMemoryOriginClaims(
-  root: BackupRoot,
-  sourcePath: string
-): Promise<string[]> {
-  const entries = await fs
-    .readdir(absolutePathOf(root.path, PROJECT_MEMORY_ORIGINS_DIR), { withFileTypes: true })
-    .catch((error: unknown) => {
-      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return [];
-      throw error;
-    });
-  const claims: string[] = [];
-  for (const entry of entries) {
-    // Dirent reports a symlink as neither file nor directory, so links are never read.
-    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const relativePath = `${PROJECT_MEMORY_ORIGINS_DIR}/${entry.name}`;
-    if ((await readProjectMemoryOriginSource(root, relativePath)) === sourcePath) {
-      claims.push(relativePath);
-    }
-  }
-  return claims;
-}
-
-/** The source a marker records, or null for a missing, unreadable, refused, or malformed one. */
-async function readProjectMemoryOriginSource(
+/** A marker's recorded fields, or null for a missing, unreadable, refused, or malformed one. */
+async function readProjectMemoryOriginMarker(
   root: BackupRoot,
   relativePath: string
-): Promise<string | null> {
+): Promise<{ sourcePath: string; memoryDir: string } | null> {
   try {
     // The checked reader refuses a symlinked directory or marker the same way the writer
     // does, so a planted link cannot re-point a project at another source.
@@ -3172,37 +3162,46 @@ async function readProjectMemoryOriginSource(
       if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
     });
     const parsed: unknown = JSON.parse(content.toString("utf-8"));
-    const sourcePath = isPlainObject(parsed) ? parsed.sourcePath : undefined;
-    return typeof sourcePath === "string" && sourcePath !== "" ? sourcePath : null;
+    if (!isPlainObject(parsed)) return null;
+    const { sourcePath, memoryDir } = parsed;
+    return typeof sourcePath === "string" &&
+      sourcePath !== "" &&
+      typeof memoryDir === "string" &&
+      memoryDir !== ""
+      ? { sourcePath, memoryDir }
+      : null;
   } catch {
     return null;
   }
 }
 
 /**
- * Recorded source path → local project, for every registered project whose memory
- * directory carries an origin marker. A source claimed by two registered projects is
- * ambiguous and left unmatched (both are re-offered as imports): the writer removes older
- * claims, so this arises only from a copied home or hand-placed markers, and picking one
- * lexically would overwrite an arbitrary project's memory in matched mode without approval.
+ * Recorded source path → local project, for the given sources (a bundle's entries) whose
+ * marker names a currently registered project. Bounded by the sources asked about, never by
+ * how many markers have accumulated.
  */
 export async function readProjectMemoryOrigins(
   muxRoot: string,
-  registeredDirByPath: ReadonlyMap<string, string>
+  registeredDirByPath: ReadonlyMap<string, string>,
+  sourcePaths: Iterable<string>
 ): Promise<Map<string, ProjectMemoryOrigin>> {
   const root = await resolveRoot(muxRoot);
-  const claims = new Map<string, ProjectMemoryOrigin[]>();
+  // Memory dir → registered project. Two registered projects computing one dir name is all
+  // but impossible (the name carries a hash of the path); should it happen, the dir names
+  // neither, since the marker could not say which project it meant.
+  const projectByDir = new Map<string, string | null>();
   for (const [projectPath, memoryDir] of registeredDirByPath) {
-    const sourcePath = await readProjectMemoryOriginSource(
-      root,
-      projectMemoryOriginPath(memoryDir)
-    );
-    if (sourcePath === null) continue;
-    claims.set(sourcePath, [...(claims.get(sourcePath) ?? []), { projectPath, memoryDir }]);
+    projectByDir.set(memoryDir, projectByDir.has(memoryDir) ? null : projectPath);
   }
   const origins = new Map<string, ProjectMemoryOrigin>();
-  for (const [sourcePath, projects] of claims) {
-    if (projects.length === 1) origins.set(sourcePath, projects[0]);
+  for (const sourcePath of new Set(sourcePaths)) {
+    const marker = await readProjectMemoryOriginMarker(root, projectMemoryOriginPath(sourcePath));
+    // The file is named by the source's hash; the recorded source has to agree, or the
+    // marker is not this source's (a hand-placed or corrupted file).
+    if (marker?.sourcePath !== sourcePath) continue;
+    const projectPath = projectByDir.get(marker.memoryDir);
+    if (projectPath == null) continue;
+    origins.set(sourcePath, { projectPath, memoryDir: marker.memoryDir });
   }
   return origins;
 }

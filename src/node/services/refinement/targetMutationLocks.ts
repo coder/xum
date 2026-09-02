@@ -89,15 +89,17 @@ export function memoryMutationLockKey(muxRoot: string, physicalRoot: string): st
 }
 
 /**
- * Serializes project unregistration (`ProjectService.remove`) with a settings-backup restore
- * that writes matched project memory: the restore decides which projects are registered at
- * its write boundary and must not have one unregistered underneath it before the memory
- * lands, which would leave restored notes in a scope no project reads. Registration takes
- * no memory lock and the restore takes this before the memory lock, so the order is fixed.
+ * Serializes project registration changes (`ProjectService.create`/`clone`/`remove`) with a
+ * settings-backup restore that writes project memory: the restore decides which local
+ * project each backed-up entry belongs to at its write boundary, and neither an
+ * unregistration (restored notes would land in a scope no project reads) nor a registration
+ * at a backed-up source path (the entry would now belong to a different local project) may
+ * land underneath it before the memory does. Registration takes no memory lock and the
+ * restore takes this before the memory lock, so the order is fixed.
  *
  * In-process only, deliberately: config.json is owned by one main process per root, so
  * there is no cross-process writer to exclude, and a restore window can outlast the
- * cross-process leg's fail-fast timeout — a removal should wait for it, not fail.
+ * cross-process leg's fail-fast timeout — a registration change should wait, not fail.
  */
 export function withProjectRegistrationLock<T>(muxRoot: string, fn: () => Promise<T>): Promise<T> {
   return targetMutationLocks.withLock(path.resolve(muxRoot, "config.json#projects"), fn);

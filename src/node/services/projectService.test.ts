@@ -2741,6 +2741,42 @@ exit 1
       expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
     });
 
+    it("lets a backup import register and write inside one registration window", async () => {
+      const existing = "/fake/existing";
+      const target = path.join(tempDir, "imported");
+      await fs.mkdir(target);
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(existing, { workspaces: [] });
+      await config.editConfig(() => cfg);
+
+      const inside = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      let removed = false;
+      const window = service.withRegistrationLock(async ({ create }) => {
+        // create() registers within the window rather than deadlocking on its own lock.
+        const created = await create(target);
+        expect(created.success).toBe(true);
+        inside.resolve();
+        await proceed.promise;
+        // A removal requested meanwhile has not landed: the registry is stable until the
+        // window closes, so an import writing memory here cannot lose its project.
+        expect(removed).toBe(false);
+        expect(config.loadConfigOrDefault().projects.has(existing)).toBe(true);
+      });
+      await inside.promise;
+      const removing = service.remove(existing).then((result) => {
+        removed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      proceed.resolve();
+      await window;
+
+      expect((await removing).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(existing)).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+    });
+
     it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/api";
