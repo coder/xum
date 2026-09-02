@@ -67,9 +67,9 @@ export class RetryManager {
     private readonly onStatusChange: (event: RetryStatusEvent) => void,
     /**
      * Runs the retry fiber fork and its interrupt. The global runtime by
-     * default (the streamManager call site keeps it until the runtime seam
-     * reaches StreamManager); a context-bound runner puts the backoff sleep on
-     * the runtime's `Clock` — a `TestClock` in tests.
+     * default (direct construction in tests); AgentSession passes its stream
+     * manager's runner, so the backoff sleep shares the stream's `Clock` — the
+     * app runtime's in production, a `TestClock` in tests.
      */
     private readonly runner: EffectRunner = defaultEffectRunner
   ) {

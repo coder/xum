@@ -4,7 +4,7 @@ import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { Context } from "effect";
 import { createConfigStores, type ConfigStores } from "@/node/config";
-import * as coreServices from "@/node/services/coreServices";
+import * as agentPluginsMcpConfig from "@/node/services/agentPlugins/mcpConfig";
 import type { CoreServices } from "@/node/services/coreServices";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import {
@@ -157,13 +157,18 @@ describe("createCoreServices", () => {
     // The afterEach pair then exercises the idempotent second close/dispose.
   });
 
-  it("surfaces a throwing graph body as a synchronous throw", () => {
-    const buildSpy = spyOn(coreServices, "buildCoreTail").mockImplementation(() => {
+  it("surfaces a throwing layer body as a synchronous throw", () => {
+    // A throw deep inside a nested stage (MCPConfigLive, S4) must propagate
+    // through the staged composition as the same synchronous throw a service
+    // constructor produces, so the CLI roots' existing startup error paths
+    // apply unchanged.
+    const providerSpy = spyOn(
+      agentPluginsMcpConfig,
+      "createAgentPluginsMcpProvider"
+    ).mockImplementation(() => {
       throw new Error("core boom");
     });
     try {
-      // Same shape as a throwing service constructor, so the CLI roots' existing
-      // startup error paths apply unchanged.
       expect(() =>
         createCoreServices({
           ...stores,
@@ -171,7 +176,7 @@ describe("createCoreServices", () => {
         })
       ).toThrow("core boom");
     } finally {
-      buildSpy.mockRestore();
+      providerSpy.mockRestore();
     }
   });
 
@@ -235,6 +240,42 @@ describe("createCoreServices", () => {
         },
       })
     ).toThrow("already registered");
+
+    // Setter-provided collaborators (the former body's `set*` lines).
+    const workspaceInternals = root.workspaceService as unknown as {
+      mcpServerManager?: unknown;
+      workspaceGoalService?: unknown;
+      agentTaskIntegration?: unknown;
+      memoryConsolidationService?: unknown;
+      workspaceMcpOverridesService?: unknown;
+    };
+    expect(workspaceInternals.mcpServerManager).toBe(root.mcpServerManager);
+    expect(workspaceInternals.workspaceGoalService).toBe(root.workspaceGoalService);
+    expect(workspaceInternals.agentTaskIntegration).toBe(root.taskService);
+    expect(workspaceInternals.memoryConsolidationService).toBe(root.memoryConsolidationService);
+    expect(workspaceInternals.workspaceMcpOverridesService).toBe(
+      root.runtime.get(WorkspaceMcpOverrides)
+    );
+    const taskInternals = root.taskService as unknown as { workspaceTurnManager?: unknown };
+    expect(taskInternals.workspaceTurnManager).toBe(root.workspaceTurnManager);
+
+    // Goal service hooks: activity changes fan out to the workspace service and
+    // a promote interrupts the workspace's stream.
+    const goalInternals = root.workspaceGoalService as unknown as {
+      onActivityChange?: (workspaceId: string, snapshot: unknown) => void;
+      streamInterrupter?: (workspaceId: string) => Promise<void>;
+    };
+    const activitySpy = spyOn(root.workspaceService, "emitWorkspaceActivity").mockImplementation(
+      () => undefined
+    );
+    goalInternals.onActivityChange?.("ws-1", null);
+    expect(activitySpy).toHaveBeenCalledWith("ws-1", null);
+    const interruptSpy = spyOn(root.workspaceService, "interruptStream").mockResolvedValue({
+      success: true,
+      data: undefined,
+    });
+    await goalInternals.streamInterrupter?.("ws-1");
+    expect(interruptSpy).toHaveBeenCalledWith("ws-1");
 
     // streamManager knows the MCP manager (lease acquire/release per stream).
     const streamManagerInternals = root.streamManager as unknown as {

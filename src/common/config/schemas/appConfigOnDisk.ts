@@ -209,6 +209,9 @@ export const AppConfigOnDiskSchema = z
     // Legacy: 1Password integration was removed. Old builds still read/write this
     // key, so it is round-tripped for downgrade compatibility but unused at runtime.
     onePasswordAccountName: z.string().optional(),
+    // A fresh random value per save (see Config.configFileWriteGeneration): lets a reader
+    // tell two writes of the same bytes apart, which no timestamp or inode reliably can.
+    writeId: z.string().optional(),
   })
   .passthrough();
 

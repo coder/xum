@@ -10,9 +10,11 @@ import type { TaskService } from "./taskService";
 import type { WorkspaceService } from "./workspaceService";
 
 /**
- * Cadence on virtual time. The real-timer suite (`heartbeatService.test.ts`)
- * keeps exercising the default runner; this one drives the scheduler fiber
- * through a TestClock-bound `EffectRunner`.
+ * Cadence on virtual time: this suite drives the scheduler fiber through a
+ * TestClock-bound `EffectRunner`. The default-runner smoke in
+ * `heartbeatService.test.ts` ("startup does not fire heartbeats immediately")
+ * keeps the real-clock production path covered; every other real sleep there
+ * waits on Promise settlement or `Date.now()` deadline math, not on the clock.
  */
 describe("HeartbeatService on a TestClock", () => {
   let clock: TestEffectRunner;

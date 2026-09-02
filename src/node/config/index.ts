@@ -86,6 +86,11 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
+import {
+  type ProjectRegistrationLockHandle,
+  tryProjectRegistrationFileLock,
+  withProjectRegistrationFileLock,
+} from "@/node/config/projectRegistrationLock";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
@@ -898,6 +903,26 @@ function normalizeAdvisorPositiveInteger(value: number | null, label: string): n
   return value;
 }
 
+/**
+ * What an edit already holds of the project registration lock when it enters the queue:
+ * `held` (issued inside a window, or re-run under a lock editConfig took for it), or `none`.
+ */
+type RegistrationLockState =
+  | { kind: "held"; lock: ProjectRegistrationLockHandle }
+  | { kind: "none" };
+
+/**
+ * Thrown inside the edit queue when the edit could not take the registration file lock in
+ * its slot; `rerun` is the edit's re-run under the lock, already queued behind the edits
+ * waiting for it (see Config.lockWaiters).
+ */
+class ProjectRegistrationLockContended extends Error {
+  constructor(readonly rerun: Promise<void>) {
+    super("project registration lock held elsewhere");
+    this.name = "ProjectRegistrationLockContended";
+  }
+}
+
 export class Config {
   readonly rootDir: string;
   readonly sessionsDir: string;
@@ -919,6 +944,17 @@ export class Config {
    * edit's failure never wedges later edits).
    */
   private readonly editSemaphore = Semaphore.makeUnsafe(1);
+  /**
+   * The edits that left their queue slot to wait for the registration file lock, as a chain
+   * in slot order; null while none is waiting. The file lock is not fair — waiters poll it,
+   * and two polling independently would acquire in arbitrary order, so the later of two
+   * edits could write first and the earlier one then overwrite it, reversing the order
+   * editConfig promises. Waiting edits therefore re-run one after another off this chain,
+   * and while it is non-empty every edit reaching its slot joins the tail instead of trying
+   * the lock: it would otherwise take a lock that had just been released ahead of an edit
+   * that has been waiting for it since before the later edit was issued.
+   */
+  private lockWaiters: Promise<void> | null = null;
   /** One-shot guard for the queued load-time migration persist; see loadConfigOrDefault. */
   private migrationPersist: Promise<void> | null = null;
 
@@ -1698,7 +1734,7 @@ export class Config {
           // re-applied on every load, so the identity transform re-reads disk, re-runs them,
           // and persists the migrated form under the queue. One-shot guard: while a persist
           // is in flight, the loads it performs internally must not re-schedule.
-          this.migrationPersist = this.enqueueConfigEdit((migratedConfig) => migratedConfig)
+          this.migrationPersist = this.enqueueGatedConfigEdit((migratedConfig) => migratedConfig)
             .catch((error: unknown) => {
               // Keep startup resilient even if persisting migration fails.
               log.warn("Failed to persist migrated config", { error });
@@ -1857,6 +1893,8 @@ export class Config {
       const data: Partial<Record<keyof AppConfigOnDisk, unknown>> & {
         projects: Array<[string, ProjectConfig]>;
       } = {
+        // Stamped by every save; see configFileWriteGeneration.
+        writeId: crypto.randomUUID(),
         projects: Array.from(config.projects.entries()).map(([projectPath, projectConfig]) => {
           const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
           const persistedProjectConfig = {
@@ -2151,6 +2189,42 @@ export class Config {
   }
 
   /**
+   * The config file as a write generation, for a caller that reads the project registry at
+   * two points and needs to know whether anything was written in between — a registration, a
+   * removal, or a removal and a re-registration with identical config, which the registry's
+   * content alone cannot show. Two parts: the `writeId` every save of this class stamps into
+   * the file, a fresh random value that two writes cannot share even when they write the same
+   * bytes (a timestamp can, on a filesystem with coarse mtimes, and so can an inode the
+   * allocator hands out again); and the file's inode, mtime, and size, for writers that do
+   * not stamp (an older build, the config tool), whose writes at least usually change those.
+   * "absent" when there is no file.
+   */
+  async configFileWriteGeneration(): Promise<string> {
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(this.configFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw error;
+    }
+    let writeId = "-";
+    try {
+      const parsed: unknown = JSON.parse(await fs.promises.readFile(this.configFile, "utf-8"));
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        typeof (parsed as { writeId?: unknown }).writeId === "string"
+      ) {
+        writeId = (parsed as { writeId: string }).writeId;
+      }
+    } catch {
+      // Unreadable or not JSON: the stat part still distinguishes most writes, and the
+      // caller's content comparison the rest it cares about.
+    }
+    return `${writeId}:${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+  }
+
+  /**
    * Edit config atomically using a transformation function
    * @param fn Function that takes current config and returns modified config
    *
@@ -2158,9 +2232,70 @@ export class Config {
    * after the previous edit's write has landed. Without this, concurrent edits
    * (e.g. parallel task launches updating taskStatus) read the same snapshot
    * and the later write silently clobbers the earlier one.
+   *
+   * An edit that adds or removes a project key additionally runs under the project
+   * registration lock (see `withProjectRegistrationLock`), whichever service it comes from,
+   * so a settings-backup restore writing project memory never has the project set change
+   * underneath it. A caller already holding that lock passes `withinRegistrationLock`.
    */
-  async editConfig(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
-    return this.enqueueConfigEdit(fn);
+  async editConfig(
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    options: { withinRegistrationLock?: ProjectRegistrationLockHandle } = {}
+  ): Promise<void> {
+    if (options.withinRegistrationLock !== undefined) {
+      return this.enqueueConfigEdit(fn, { kind: "held", lock: options.withinRegistrationLock });
+    }
+    return this.enqueueGatedConfigEdit(fn);
+  }
+
+  /**
+   * The cross-process gate for an edit issued outside any registration window; shared by
+   * editConfig and the load-time migration persist (which must not call the public, commonly
+   * spied editConfig). Every edit persists the whole config, project map included, from the
+   * bytes its transform read, so every edit's read and write have to happen under the
+   * cross-process lock or a registration another process makes in between is silently
+   * dropped by this process's save — even by an edit that never touched the project set.
+   */
+  private async enqueueGatedConfigEdit(
+    fn: (config: ProjectsConfig) => ProjectsConfig
+  ): Promise<void> {
+    // Straight into the queue, in call order: the edit takes its own hold of the file lock
+    // inside its slot, at write time. When the lock is held elsewhere — another process, or
+    // a restore, import, or create window in this one — the edit fails the slot before
+    // writing and is re-run once it has waited for the lock, outside the queue (so an edit
+    // issued inside the window is not held up behind its wait) but behind the edits already
+    // waiting (see lockWaiters). Its first run was discarded: nothing it mutated survives,
+    // since loadConfigOrDefault parses fresh bytes on every call.
+    try {
+      return await this.enqueueConfigEdit(fn, { kind: "none" });
+    } catch (error) {
+      if (!(error instanceof ProjectRegistrationLockContended)) throw error;
+      return error.rerun;
+    }
+  }
+
+  /**
+   * Queues `fn` to re-run under the registration file lock after every edit already waiting
+   * for it, and records the chain's new tail. Called synchronously from the edit's queue
+   * slot, so the chain order is the slot order.
+   */
+  private joinLockWaiters(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+    const rerun = (this.lockWaiters ?? Promise.resolve()).then(() =>
+      withProjectRegistrationFileLock(this.rootDir, (lock) =>
+        this.enqueueConfigEdit(fn, { kind: "held", lock })
+      )
+    );
+    // The tail settles either way, so one edit's failure never wedges the ones behind it.
+    const tail: Promise<void> = rerun.then(
+      () => this.leaveLockWaiters(tail),
+      () => this.leaveLockWaiters(tail)
+    );
+    this.lockWaiters = tail;
+    return rerun;
+  }
+
+  private leaveLockWaiters(tail: Promise<void>): void {
+    if (this.lockWaiters === tail) this.lockWaiters = null;
   }
 
   getClientConfig() {
@@ -2465,7 +2600,10 @@ export class Config {
    * spied/overridden in tests, and the internally scheduled write is an implementation
    * detail rather than a caller-initiated mutation.
    */
-  private enqueueConfigEdit(fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> {
+  private enqueueConfigEdit(
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    registrationLock: RegistrationLockState
+  ): Promise<void> {
     // Defer the fiber start to a microtask: Effect.runPromise executes fibers
     // synchronously on the caller's stack until the first async boundary, but the old
     // promise-chain queue always ran edit bodies on a later microtask.
@@ -2474,7 +2612,9 @@ export class Config {
     // assignment, or a load-time migration would schedule its persist twice.
     // Effect failures reject this promise with the raw error (v4 runPromise does not
     // wrap causes), so callers observe the same rejections as before.
-    return Promise.resolve().then(() => Effect.runPromise(this.enqueueConfigEditEffect(fn)));
+    return Promise.resolve().then(() =>
+      Effect.runPromise(this.enqueueConfigEditEffect(fn, registrationLock))
+    );
   }
 
   /**
@@ -2486,72 +2626,129 @@ export class Config {
    * fiber cancelled while waiting never runs its edit).
    */
   private enqueueConfigEditEffect(
-    fn: (config: ProjectsConfig) => ProjectsConfig
+    fn: (config: ProjectsConfig) => ProjectsConfig,
+    registrationLock: RegistrationLockState
   ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
+    /**
+     * The transform on fresh bytes. Invoked exactly once per edit, since `fn` need not be
+     * pure (callers run their own updaters and record results inside it): only after the
+     * edit holds the lock it will write under, so no invocation's result is discarded.
+     */
+    const transform = (): ProjectsConfig => fn(self.loadConfigOrDefault());
+    const write = Effect.fn(function* (
+      newConfig: ProjectsConfig,
+      lock: ProjectRegistrationLockHandle
+    ) {
+      // Effect.try keeps the pre-Effect contract: a rejected corrupt-file gate reaches the
+      // caller as the raw original error.
+      yield* Effect.try({
+        try: () => self.assertConfigWritable(),
+        catch: (error) => error,
+      });
+      // Every save happens under this process's hold of the registration lock: immediately
+      // before the write, confirm the hold is still ours (see ProjectRegistrationLockHandle).
+      // A whole-config save from a hold another process reclaimed would drop whatever that
+      // process registered meanwhile, whether or not this edit touched the project set.
+      yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
+      // Route through the saveConfig Promise facade (not saveConfigEffect) so test
+      // spies on saveConfig keep intercepting the serialized write.
+      yield* Effect.promise(async () => self.saveConfig(newConfig));
+      // Backend-initiated config edits (for example gateway auth changes) use this signal
+      // so frontend subscribers can refresh derived state without polling.
+      self.notifyConfigChanged();
+    });
     return this.editSemaphore.withPermits(1)(
       Effect.uninterruptible(
         Effect.gen(function* () {
           // Effect.try keeps the pre-Effect contract: a throwing transform or a rejected
           // corrupt-file gate reaches the caller as the raw original error.
-          const newConfig = yield* Effect.try({
+          if (registrationLock.kind === "held") {
+            const newConfig = yield* Effect.try({
+              try: () => {
+                const result = transform();
+                self.assertConfigWritable();
+                return result;
+              },
+              catch: (error) => error,
+            });
+            return yield* write(newConfig, registrationLock.lock);
+          }
+          // The gate runs here, before any lock work, so an unreadable config is refused for
+          // that reason and not for a lockfile it could not create; `write` re-checks it
+          // before saving. The load is what records a failed read for the gate; `fn` is not
+          // invoked until the edit holds the lock.
+          yield* Effect.try({
             try: () => {
-              const config = self.loadConfigOrDefault();
-              const newConfig = fn(config);
-              // If that load failed, writing would replace the corrupt file with defaults. Only
-              // proceed when the bytes on disk right now are the ones with a confirmed sidecar:
-              // no confirmed backup, a concurrent replacement since the load, or an unreadable
-              // file all reject the edit so callers do not treat the mutation as durable (unlike
-              // saveConfig's log-and-swallow of unexpected I/O errors, this skip is deliberate).
-              // A missing file is safe to overwrite. This cannot fully close the cross-process
-              // race (that needs file locking, which editConfig has never had); it binds the
-              // approval to the current bytes and shrinks the window to the atomic write itself.
-              const failureState = configLoadFailureStates.get(self.configFile);
-              if (failureState) {
-                const rejectEdit = (reason: string): never => {
-                  const message = `Skipping config write to ${self.configFile}: ${reason}`;
-                  log.error(message);
-                  throw new Error(message);
-                };
-                if (failureState.backupSignature === null) {
-                  rejectEdit(
-                    "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
-                  );
-                }
-                let currentSignature: string | null = null;
-                try {
-                  const currentBytes = fs.readFileSync(self.configFile);
-                  currentSignature = crypto.createHash("sha256").update(currentBytes).digest("hex");
-                } catch (readError) {
-                  if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
-                    rejectEdit(
-                      `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
-                    );
-                  }
-                }
-                if (
-                  currentSignature !== null &&
-                  currentSignature !== failureState.backupSignature
-                ) {
-                  rejectEdit(
-                    "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
-                  );
-                }
-              }
-              return newConfig;
+              self.loadConfigOrDefault();
+              self.assertConfigWritable();
             },
             catch: (error) => error,
           });
-          // Route through the saveConfig Promise facade (not saveConfigEffect) so test
-          // spies on saveConfig keep intercepting the serialized write.
-          yield* Effect.promise(async () => self.saveConfig(newConfig));
-          // Backend-initiated config edits (for example gateway auth changes) use this signal
-          // so frontend subscribers can refresh derived state without polling.
-          self.notifyConfigChanged();
+          // The file lock is tried here, inside the queue slot so the edit keeps its order.
+          // Held elsewhere — by another process, or by a window in this one — the edit fails
+          // the slot and editConfig waits for the lock outside the queue, behind any edit
+          // already waiting; while one is, the lock is not even tried, since taking it would
+          // put this edit ahead of that one. The transform runs only under the lock, on the
+          // bytes as they are: whoever held it may have written config.json meanwhile.
+          yield* Effect.tryPromise({
+            try: async () => {
+              if (self.lockWaiters !== null) {
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
+              }
+              await using lock = await tryProjectRegistrationFileLock(self.rootDir);
+              if (lock === null)
+                throw new ProjectRegistrationLockContended(self.joinLockWaiters(fn));
+              await Effect.runPromise(write(transform(), lock));
+            },
+            catch: (error) => error,
+          });
         })
       )
     );
+  }
+
+  /**
+   * The corrupt-file gate an edit passes immediately before writing. If the load failed,
+   * writing would replace the corrupt file with defaults. Only proceed when the bytes on
+   * disk right now are the ones with a confirmed sidecar: no confirmed backup, a concurrent
+   * replacement since the load, or an unreadable file all reject the edit so callers do not
+   * treat the mutation as durable (unlike saveConfig's log-and-swallow of unexpected I/O
+   * errors, this skip is deliberate). A missing file is safe to overwrite. This cannot fully
+   * close the cross-process race (that needs file locking, which editConfig has never had);
+   * it binds the approval to the current bytes and shrinks the window to the atomic write
+   * itself.
+   */
+  private assertConfigWritable(): void {
+    const failureState = configLoadFailureStates.get(this.configFile);
+    if (!failureState) return;
+    const rejectEdit = (reason: string): never => {
+      const message = `Skipping config write to ${this.configFile}: ${reason}`;
+      log.error(message);
+      throw new Error(message);
+    };
+    if (failureState.backupSignature === null) {
+      rejectEdit(
+        "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
+      );
+    }
+    let currentSignature: string | null = null;
+    try {
+      const currentBytes = fs.readFileSync(this.configFile);
+      currentSignature = crypto.createHash("sha256").update(currentBytes).digest("hex");
+    } catch (readError) {
+      if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
+        rejectEdit(
+          `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
+        );
+      }
+    }
+    if (currentSignature !== null && currentSignature !== failureState.backupSignature) {
+      rejectEdit(
+        "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
+      );
+    }
   }
 
   getUpdateChannel(): UpdateChannel {

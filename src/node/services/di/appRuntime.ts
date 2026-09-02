@@ -1,40 +1,140 @@
 /**
- * App-lifetime Effect runtime (Effect migration Phase 11).
+ * App-lifetime Effect runtime (Effect migration Phase 11) — and the durable
+ * **DI contract** for the Layer graph it builds.
  *
- * A `ManagedRuntime` built from the process's Layer graph (`./layers/app.ts`
- * for `ServiceContainer` roots). It owns the app-lifetime `Scope`, and its
- * built `Context` is what oRPC Effect-native handlers receive as
- * `"effect/context"`.
+ * A `ManagedRuntime` built from the process's Layer graph: `./layers/app.ts`
+ * (`AppLive`) for `ServiceContainer` roots (desktop, `xum server`, ACP,
+ * tests/ipc), `CoreLive` alone for the headless CLI roots (`xum run`,
+ * `xum workflow`, via `coreServicesRoot.ts`). It owns the app-lifetime
+ * `Scope`, its built `Context<AppTags>` is what oRPC Effect-native handlers
+ * receive as `"effect/context"`, and it is the source of the two runtime seams
+ * described below. Service classes were not rewritten for this: Layers are
+ * thin adapters around the existing constructors, and the former composition
+ * roots' setter/listener wiring lives in `CoreWiringLive`/`DesktopWiringLive`
+ * in the original statement order.
  *
- * DI contract (Phase 11 compatibility rules, not permanent architecture law):
+ * ## Invariants (Phase 11 compatibility contract, not permanent law)
  *
- * - **Synchronous layer bodies.** Every Layer in the graph must build without
+ * - **I1 — Synchronous layer bodies.** Every Layer in the graph builds without
  *   suspending (`Layer.succeed`/`Layer.sync`/`Layer.effect` over sync effects;
  *   `acquireRelease` with a sync acquire is fine). `makeAppRuntime` builds the
  *   graph eagerly with `runSync` and asserts that it completed, so a layer that
  *   suspends fails right here — at construction, exactly where a throwing
- *   service constructor fails today, and therefore inside every entry point's
- *   existing startup catch path (`desktop/main.ts` dialog, `cli/server.ts`/ACP
- *   log-and-exit). Asynchronous acquisition belongs in `initialize()` or a
- *   later explicit async factory root, never silently inside a layer. Eager
- *   building also keeps fibers started through the runtime synchronous up to
- *   their first async boundary (`cachedContext` is set, so `runX` is
- *   `Effect.run…With(context)`), which the deterministic-winner funnels in the
- *   codebase rely on.
- * - **Only the composition root holds the runtime.** Services must not be
- *   handed the `ManagedRuntime`: after `dispose()` every `runX` on it dies with
- *   "ManagedRuntime disposed", and a late worker callback would defect.
- * - **No layer finalizers yet.** Teardown order stays explicit in
- *   `ServiceContainer.dispose()`; layer bodies register no finalizers, so
- *   `disposeAppRuntime` (the last dispose step) reorders nothing. It is wired
- *   now so that later phases (the streamManager engine core) have a fixed,
- *   bounded slot for scope-owned resources.
- * - **Two runtime seams, not one handle.** Workers hold an `EffectRunner`
- *   (`./effectRunner.ts`: context-bound, unsupervised, `R = never`) so they can
- *   run on the runtime's `Clock` without ever holding the runtime; work that
- *   shutdown must await forks into `AppFiberScope` (`./appFiberScope.ts`),
- *   the one supervised resource, closed explicitly early in `dispose()` via
- *   `closeScopeBounded` and re-closed idempotently by `disposeAppRuntime`.
+ *   service constructor failed before, i.e. inside every entry point's
+ *   existing startup catch path (`desktop/main.ts` "Startup Failed" dialog,
+ *   `cli/server.ts`/ACP log-and-exit). Asynchronous acquisition belongs in
+ *   `ServiceContainer.initialize()` / startup effects or a future explicit
+ *   async factory root, never silently inside a layer. Eager building also
+ *   sets `cachedContext`, so every `runtime.runX` is `Effect.run…With(context)`
+ *   and a fiber started through it runs synchronously up to its first async
+ *   boundary (the sync-start fact the codebase's deterministic-winner funnels
+ *   rely on; pinned in `effectRunner.test.ts`).
+ * - **I2 — Services never hold the `ManagedRuntime`.** After `dispose()` every
+ *   `runX` on it dies with "ManagedRuntime disposed", so a late worker callback
+ *   would defect. Workers hold an `EffectRunner` (`./effectRunner.ts`,
+ *   default `defaultEffectRunner` = the global `Effect.runX`) whose `runX` is
+ *   `Effect.run…With(ctx)` — same sync-start semantics, still valid after the
+ *   runtime is gone. Supervision, when needed, is explicit via
+ *   `AppFiberScope` (`./appFiberScope.ts`).
+ * - **I3 — Per-call pipelines are untouched.** `Effect.runPromise(this.effects…)`
+ *   facades and the `memoryConsolidationService` check-and-reserve funnels are
+ *   not routed through DI; no lookup, runner call, or `await` may be inserted
+ *   before `inFlight.set` / `harvestInFlight.set`. Only lifecycle forks in the
+ *   clock-driven workers (heartbeat, idle compaction, retry backoff,
+ *   `StreamManager.schedulePartialWrite`) go through `this.runner.runX`.
+ * - **I4 — Signatures unchanged.** Constructors, Promise facades, private
+ *   methods (spy seams) and module exports keep their shapes; a runner is an
+ *   optional trailing constructor parameter defaulting to `defaultEffectRunner`.
+ * - **I5 — No layer finalizers.** Teardown order stays explicit in
+ *   `ServiceContainer.dispose()`/`shutdown()` and the CLI cleanup lists; layer
+ *   bodies and wiring layers are `Effect.sync`-only and register no finalizers
+ *   or forks, so `disposeAppRuntime` (the last step) reorders nothing. The one
+ *   supervised resource, `AppFiberScope`, is closed at a fixed early position
+ *   (see "Shutdown order").
+ * - **I6 — Construction order is declared, never implied.** Wiring layers
+ *   replay the former roots' setter/listener statements in order; a
+ *   constructor may touch only its *declared* dependencies (built earlier by
+ *   staging). Dependency order is expressed only with `Layer.provide` /
+ *   `Layer.provideMerge` stages — never through `Layer.mergeAll` argument
+ *   order, whose siblings may build in any order.
+ * - **I7 — In-process only.** DI changes no persisted data, IPC wire shapes, or
+ *   oRPC handler bodies (beyond the `effect/context` source).
+ * - **I8 — One set of Layer definitions per service.** Every process root
+ *   builds from the same layers (`CoreLive` is shared by `AppLive` and the CLI
+ *   root). Unit harnesses (`createTestHistoryService`, `createTestToolConfig`,
+ *   `createAgentSessionHarness`, …) intentionally bypass Layers and construct
+ *   services directly.
+ *
+ * **R6 firewall.** In production code `Layer`, `ManagedRuntime` and
+ * `TestClock` are imported only under `src/node/services/di/`, and every
+ * `Context.Service` tag is declared there (`di/tags.ts`, plus the two seam
+ * tags in `effectRunner.ts`/`appFiberScope.ts`; `orpc/effectContext.ts`
+ * re-exports `MemoryMeta` and builds a narrow test-only context), so an effect
+ * RC rename touches one directory. Tests may inject a `TestClock` beneath the
+ * real graph (`serviceContainer.test.ts`) but go through `di/` helpers.
+ *
+ * ## Two seams, deliberately asymmetric
+ *
+ * - `EffectRunner` is **unsupervised**: fibers forked through it belong to the
+ *   worker's own `Scope` (explicit `start()`/`stop()`, which stay synchronous
+ *   because those fibers suspend only on the clock). Neither
+ *   `closeScopeBounded(appFiberScope)` nor `disposeAppRuntime` interrupts or
+ *   awaits them (pinned in `appFiberScope.test.ts`). Its `R = never` signature
+ *   is what makes "not a service locator" a type error rather than a review
+ *   item, and what lets a worker run on a `TestClock` (`./testEffectRunner.ts`).
+ * - `AppFiberScope` is **supervised**: a child of the runtime's layer scope;
+ *   fibers forked into it with `Effect.forkIn` are interrupted *and awaited*
+ *   by `closeScopeBounded` early in `dispose()`, while every dependency they
+ *   might touch during finalization is still alive. No production occupant in
+ *   Phase 11; the first candidate is the streamManager engine core. **Rule for
+ *   occupants:** tolerate interruption at any suspension point, do not depend
+ *   on resources torn down before step 2 below, and never fork long-lived I/O
+ *   work through `EffectRunner` expecting shutdown to await it.
+ *
+ * ## Shutdown order (`ServiceContainer.dispose()`, one shared teardown behind
+ * a latch so concurrent/repeated calls — the desktop's two `before-quit`
+ * listeners, tests' dispose-then-shutdown — await the same sequence)
+ *
+ * 1. `backgroundProcessManager.beginShutdown()` — first; the latch that keeps
+ *    persisted armed-monitor records from being erased by session teardown.
+ * 2. `closeScopeBounded(appFiberScope, APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS)`.
+ * 3. The explicit sequence verbatim (`desktopBridgeServer.stop()` …
+ *    `terminateAll()` … `timelineService.flush()` last), each step timed as a
+ *    `[shutdown] <step> {ms}` debug line (`shutdownStep.ts`).
+ * 4. `disposeAppRuntime(runtime, APP_RUNTIME_DISPOSE_TIMEOUT_MS)` — last; also
+ *    re-closes `AppFiberScope` idempotently as a backstop.
+ * Both bounded teardowns share `boundedTeardown` below: `Effect.uninterruptible`
+ * shell, detached close fiber, `Effect.interruptible` join + `Effect.timeout`,
+ * defects folded into `log.warn`, never rejects. Budget: the two bounds
+ * (`APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS` + `APP_RUNTIME_DISPOSE_TIMEOUT_MS`,
+ * `src/constants/terminationTimeouts.ts`) must add up to less than the callers'
+ * outer quit budgets (`desktop/main.ts` before-quit race, `cli/server.ts`
+ * force-exit timer), which stay the last line of defense. The CLI roots
+ * (`xum run`/`xum workflow`) mirror steps 1, 2 and 4 in
+ * their best-effort cleanup lists (`cli/runCleanup.ts`). `shutdown()` never
+ * touches the runtime or `AppFiberScope`. Crash paths (`uncaughtException`,
+ * SIGKILL) run no finalizers; durable state must stay crash-safe without them.
+ *
+ * ## Cost of the Layer machinery (recorded per PR; R7/R8)
+ *
+ * `[startup] AppRuntime built` grew 4 ms (PR 1, one layer) → 11 ms (PR 3,
+ * coarse core) → 18 → 23 ms (PR 4a/4b, 19 core layers + 8 stages + wiring) and
+ * reads 16–24 ms for the whole graph in `xum server`. Cold `new
+ * ServiceContainer(stores)` went 27 → 35 ms when the six desktop group layers
+ * + three composition nodes replaced the imperative constructor (PR 5:
+ * ≈ +8 ms cold / +0.3 ms warm for ~40 services; a `provideMerge`-only chain
+ * costs the same, so the cost is Effect first-use per layer, not sibling
+ * concurrency). `make typecheck` stayed flat (±4 %). Group layers, not
+ * per-service layers, are therefore the right granularity for tails whose
+ * teardown is hand-tuned anyway.
+ *
+ * ## Deliberately not done in Phase 11
+ *
+ * `initialize()` as a Layer/startup effect (would break I1's failure
+ * semantics), layer finalizers for the existing `dispose()` steps (I5),
+ * `streamBridge` on the runtime, per-service optional tags (optional
+ * cross-cutting services stay optional via `CoreOptionsTag`), the streamManager
+ * engine core as the first `AppFiberScope` occupant.
  */
 import assert from "@/common/utils/assert";
 import { Context, Duration, Effect, Exit, Fiber, ManagedRuntime, Scope } from "effect";

@@ -12,8 +12,9 @@ import {
 } from "./idleCompactionService";
 
 /**
- * Checker cadence on virtual time (the real-timer suite in
- * `idleCompactionService.test.ts` keeps covering the default runner).
+ * Checker cadence on virtual time. The default-runner smoke in
+ * `idleCompactionService.test.ts` ("start/stop on the default runner") keeps
+ * the real-clock production path covered.
  */
 describe("IdleCompactionService on a TestClock", () => {
   let clock: TestEffectRunner;

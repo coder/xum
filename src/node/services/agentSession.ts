@@ -128,6 +128,7 @@ import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { CompactionHandler } from "./compactionHandler";
 import { RetryManager, type RetryFailureError, type RetryStatusEvent } from "./retryManager";
+import type { EffectRunner } from "./di/effectRunner";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
@@ -543,6 +544,13 @@ export interface AgentSessionStreamManager {
   isStreaming(workspaceId: string): boolean;
   getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
   replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
+  /**
+   * The runner the stream manager's clock-driven fibers use; the session's
+   * `RetryManager` schedules its backoff on the same clock. Absent on test
+   * doubles and the AIService fallback, which leaves RetryManager on the
+   * global runtime.
+   */
+  readonly effectRunner?: EffectRunner;
 }
 
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
@@ -952,7 +960,8 @@ export class AgentSession {
       async () => {
         await this.retryActiveStream();
       },
-      (event) => this.handleRetryStatusChange(event)
+      (event) => this.handleRetryStatusChange(event),
+      this.streamManager.effectRunner
     );
 
     this.attachAiListeners();

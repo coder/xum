@@ -198,6 +198,75 @@ export function hasUrlCredentials(repoUrl: string): boolean {
   }
 }
 
+/** Bounds project-bundle manifest parsing work, mirroring the MCP redaction caps. */
+export const MAX_BACKUP_PROJECT_ENTRIES = 256;
+
+/**
+ * A recorded project remote is display-only data on restore, but it still travels through a
+ * repository other people may read, and a crafted bundle could try to smuggle an executable
+ * remote (`ext::`), a local path, or an embedded credential back into the UI. Only plain
+ * `http(s)`, `ssh`, and scp-like `user@host:path` shapes survive; anything else is dropped
+ * rather than rejected, because a remote is a hint and never worth failing an export or a
+ * restore over.
+ */
+export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
+  const url = rawUrl.trim();
+  if (url === "" || url.length > 2048) return undefined;
+  // Control characters and whitespace have no place in a remote URL and are how command
+  // injection into a later shell paste would start.
+  // eslint-disable-next-line no-control-regex
+  if (/[\s\u0000-\u001f\u007f]/.test(url)) return undefined;
+  // Percent-escapes would let a credential pattern hide from the publish-time secret scan
+  // (which sees the manifest text, not its decoded form); real remotes do not need them.
+  if (/%[0-9A-Fa-f]{2}/.test(url)) return undefined;
+  if (hasUrlCredentials(url)) return undefined;
+  if (/^(?:https?|ssh):\/\/[^/]+/i.test(url)) return url;
+  // scp-like `user@host:path`. A scheme prefix was handled above, and a single-letter
+  // prefix would be a Windows drive path rather than a host.
+  if (/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^/][^\s]*$/.test(url) && !url.includes("::")) return url;
+  return undefined;
+}
+
+/**
+ * One project entry in the opt-in project bundle. `path` is the absolute path on the
+ * machine that exported the backup — an import hint only, never a write target on this
+ * one. `memoryDir` records the actual memory directory name of the source install;
+ * restore destinations are always recomputed locally from the target path.
+ */
+// Per-field caps because the manifest is repository-controlled: without them a crafted,
+// otherwise valid manifest could put megabytes into one name or path and push that through
+// hashing, IPC, and renderer text nodes. The bounds are generous for real values — paths
+// beat every platform default and the remote cap matches sanitizeBackupGitRemote's.
+/**
+ * Cap on a recorded project path. Also the cap on an import's target path: the local
+ * recovery copy a later matched restore writes records the local project path in this same
+ * schema, so a target this build could not record would fail every later restore of it.
+ */
+export const MAX_BACKUP_PROJECT_PATH_CHARS = 1024;
+
+export const BackupProjectBundleEntrySchema = z.object({
+  path: z.string().min(1).max(MAX_BACKUP_PROJECT_PATH_CHARS),
+  name: z.string().min(1).max(256),
+  gitRemote: z.string().max(2048).optional(),
+  memoryDir: z.string().min(1),
+});
+
+export const BackupProjectBundleManifestSchema = z.object({
+  schemaVersion: z.literal(1),
+  projects: z.array(BackupProjectBundleEntrySchema).max(MAX_BACKUP_PROJECT_ENTRIES),
+  files: z.array(
+    z.object({
+      // Capped like the entry fields: an unbounded path would reach lstat (whose error
+      // message echoes it) and the renderer before any shape validation ran.
+      path: z.string().min(1).max(1024),
+      sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    })
+  ),
+});
+
+export type BackupProjectBundleEntry = z.infer<typeof BackupProjectBundleEntrySchema>;
+export type BackupProjectBundleManifest = z.infer<typeof BackupProjectBundleManifestSchema>;
+
 /**
  * The persisted schema extends the IPC input schema so config.json cannot hold a value
  * the `getSettings` response rejects, leaving the Backup screen unable to load saved settings.
@@ -222,6 +291,12 @@ export const SettingsBackupInputSchema = z.object({
     .trim()
     .min(1, { message: "Enter a subdirectory inside the repository" })
     .refine(isValidBackupPath, { message: "Enter a subdirectory inside the repository" }),
+  /**
+   * Opt-in: also back up the project list and per-project memories as a `project-bundle/`
+   * sidecar, and allow restores to write project content. Off by default because project
+   * memories are private working notes and the project list reveals local paths.
+   */
+  includeProjects: z.boolean().optional(),
 });
 
 export const SettingsBackupSchema = SettingsBackupInputSchema.extend({

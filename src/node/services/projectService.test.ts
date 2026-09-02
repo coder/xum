@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import { execSync } from "child_process";
@@ -11,6 +11,11 @@ import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { ProjectService, type CloneEvent } from "./projectService";
+import {
+  projectRegistrationLockFilePath,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 async function createLocalGitRepository(rootDir: string, repoName: string): Promise<string> {
   const repoPath = path.join(rootDir, repoName);
@@ -136,6 +141,16 @@ async function collectCloneEvents(
   const clonedUrls = (await fs.readFile(fakeGit.fakeGitArgsLogPath, "utf-8")).trim().split("\n");
   return { events, clonedUrls };
 }
+
+/**
+ * Simulated concurrent registration for create()'s in-transform duplicate re-check. Real
+ * writers are serialized with create() by the registration lock (Config.editConfig takes
+ * it for any project-set change), so the interleaving these tests exercise is reproduced by
+ * marking the edit as a same-window writer; the re-check stays as defense in depth.
+ */
+const REGISTER_CONCURRENTLY = {
+  withinRegistrationLock: { assertStillOwned: () => Promise.resolve() },
+} as const;
 
 describe("ProjectService", () => {
   let tempDir: string;
@@ -267,7 +282,7 @@ describe("ProjectService", () => {
       const registerParent = config.editConfig((cfg) => {
         cfg.projects.set(parentPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(nestedAliasPath, { initGit: true });
       await registerParent;
 
@@ -341,7 +356,7 @@ exit 1
       const registerPlain = config.editConfig((cfg) => {
         cfg.projects.set(projectPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(projectPath, { initGit: true });
       await registerPlain;
 
@@ -402,7 +417,7 @@ exit 1
       const registerDescendant = config.editConfig((cfg) => {
         cfg.projects.set(descendantPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(parentPath, { initGit: true });
       await registerDescendant;
 
@@ -558,7 +573,7 @@ exec ${realGit} "$@"
       const registerPkg = config.editConfig((cfg) => {
         cfg.projects.set(pkgPath, { workspaces: [], parentProjectPath: repoPath });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const api = await service.create(apiPath);
       await registerPkg;
 
@@ -590,7 +605,7 @@ exec ${realGit} "$@"
       const registerRepo = config.editConfig((cfg) => {
         cfg.projects.set(repoPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(pkgPath);
       await registerRepo;
 
@@ -615,7 +630,7 @@ exec ${realGit} "$@"
       const registerDescendant = config.editConfig((cfg) => {
         cfg.projects.set(descendantPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(parentPath);
       await registerDescendant;
 
@@ -2707,6 +2722,371 @@ exit 1
       expect(result.success).toBe(false);
       if (result.success) throw new Error("Expected failure");
       expect(result.error.type).toBe("project_not_found");
+    });
+
+    it("waits for a settings-backup restore holding the registration lock", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, { workspaces: [] });
+      await config.editConfig(() => cfg);
+
+      // A restore writing this project's matched memory holds the lock; the removal must
+      // land after it, never between its registration read and its memory write.
+      const held = Promise.withResolvers<void>();
+      const lockAcquired = Promise.withResolvers<void>();
+      const holding = withProjectRegistrationLock(tempDir, async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      });
+      await lockAcquired.promise;
+
+      let removed = false;
+      const removing = service.remove(projectPath).then((result) => {
+        removed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(removed).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+
+      held.resolve();
+      await holding;
+      expect((await removing).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+    });
+
+    it("lets a backup import register and write inside one registration window", async () => {
+      const existing = "/fake/existing";
+      const target = path.join(tempDir, "imported");
+      await fs.mkdir(target);
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(existing, { workspaces: [] });
+      await config.editConfig(() => cfg);
+
+      const inside = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      let removed = false;
+      const window = service.withRegistrationLock(async ({ create }) => {
+        // create() registers within the window rather than deadlocking on its own lock.
+        const created = await create(target);
+        expect(created.success).toBe(true);
+        inside.resolve();
+        await proceed.promise;
+        // A removal requested meanwhile has not landed: the registry is stable until the
+        // window closes, so an import writing memory here cannot lose its project.
+        expect(removed).toBe(false);
+        expect(config.loadConfigOrDefault().projects.has(existing)).toBe(true);
+      });
+      await inside.promise;
+      const removing = service.remove(existing).then((result) => {
+        removed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      proceed.resolve();
+      await window;
+
+      expect((await removing).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(existing)).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+    });
+
+    it("gates every registration path through Config, not just create and remove", async () => {
+      // setTrust registers a missing entry as a side effect — one of several writers that
+      // add a project key without going through create(). Config.editConfig serializes it
+      // with the restore window all the same — as it does every edit, since each one saves
+      // the whole config.
+      const unregistered = "/fake/trusted-later";
+      const held = Promise.withResolvers<void>();
+      const lockAcquired = Promise.withResolvers<void>();
+      const holding = withProjectRegistrationLock(tempDir, async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      });
+      await lockAcquired.promise;
+
+      let trusted = false;
+      const trusting = service.setTrust(unregistered, true).then(() => {
+        trusted = true;
+      });
+      let valueSaved = false;
+      const valueEdit = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          valueSaved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(trusted).toBe(false);
+      expect(valueSaved).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(unregistered)).toBe(false);
+
+      held.resolve();
+      await holding;
+      await Promise.all([trusting, valueEdit]);
+      expect(config.loadConfigOrDefault().projects.get(unregistered)?.trusted).toBe(true);
+      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
+    });
+
+    it("waits for another process's registration hold and re-reads config under it", async () => {
+      // The cross-process leg, as `mux trust` or a restore in another process would hold it.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let transformRuns = 0;
+      let registered = false;
+      const registering = config
+        .editConfig((cfg) => {
+          transformRuns += 1;
+          cfg.projects.set("/fake/from-this-process", { workspaces: [] });
+          return cfg;
+        })
+        .then(() => {
+          registered = true;
+        });
+      // A window in this process waits too.
+      let windowRan = false;
+      const window = withProjectRegistrationLock(tempDir, () => {
+        windowRan = true;
+        return Promise.resolve();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(registered).toBe(false);
+      expect(windowRan).toBe(false);
+
+      // The other process registers a project while ours waits: our transform must run on
+      // those bytes — once, under the lock — or a pre-wait snapshot would clobber that
+      // registration.
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/from-other-process", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await registering;
+      await window;
+
+      expect(transformRuns).toBe(1);
+      const projects = config.loadConfigOrDefault().projects;
+      expect(projects.has("/fake/from-this-process")).toBe(true);
+      expect(projects.has("/fake/from-other-process")).toBe(true);
+    });
+
+    it("validates a new project without holding the registration lock", async () => {
+      const target = path.join(tempDir, "validated-unlocked");
+      await fs.mkdir(target);
+      // Another process holds the lock throughout the validation. Every config save waits
+      // for that lock, so a create that took it around its stats, realpath, and git probes
+      // would hold up unrelated saves for as long as a slow filesystem keeps it busy.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      // The path resolution is the last filesystem probe of the validation; the registering
+      // write is the first thing the lock covers.
+      const realpath = spyOn(fs, "realpath");
+      const editConfig = spyOn(config, "editConfig");
+      const creating = service.create(target);
+      const deadline = Date.now() + 2_000;
+      while (realpath.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      // Validated while the lock is still held elsewhere, but not yet registering.
+      expect(realpath).toHaveBeenCalledWith(target);
+      expect(editConfig).not.toHaveBeenCalled();
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+
+      await otherProcess[Symbol.asyncDispose]();
+      expect((await creating).success).toBe(true);
+      expect(editConfig).toHaveBeenCalledTimes(1);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+      realpath.mockRestore();
+    });
+
+    it("does not git-initialize a directory an import registers while it waits for the lock", async () => {
+      const target = path.join(tempDir, "imported-empty");
+      await fs.mkdir(target);
+      const initializeGit = spyOn(
+        service as unknown as { initializeGitRepository: () => unknown },
+        "initializeGitRepository"
+      );
+      // A restore window registers the same empty directory as an import target while an
+      // initGit create of it waits for the lock. The create must fail as a duplicate without
+      // having run `git init` there: initializing and rolling back inside a directory that
+      // is the import's by then would touch the imported project's checkout.
+      const windowOpen = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      const window = service.withRegistrationLock(async ({ create }) => {
+        windowOpen.resolve();
+        await proceed.promise;
+        expect((await create(target)).success).toBe(true);
+      });
+      await windowOpen.promise;
+      const creating = service.create(target, { initGit: true });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      proceed.resolve();
+      await window;
+
+      const result = await creating;
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toBe("Project already exists");
+      expect(initializeGit).not.toHaveBeenCalled();
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+    });
+
+    it("rolls back git init when the registering write finds the hold reclaimed", async () => {
+      const target = path.join(tempDir, "reclaimed-init");
+      await fs.mkdir(target);
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        // Displaced while git init runs, by a holder whose pid is dead: the registering
+        // write's ownership check refuses, and the rollback's own hold can reclaim the lock.
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "9999999:reclaimed", "utf-8");
+        return create(target, { initGit: true });
+      });
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("no longer owned");
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+      // Left behind, the .git would fail every retry on the non-empty-directory check.
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect((await service.create(target, { initGit: true })).success).toBe(true);
+    });
+
+    it("keeps a directory registered under another spelling while its hold was reclaimed", async () => {
+      const target = path.join(tempDir, "reclaimed-target");
+      const alias = path.join(tempDir, "reclaimed-alias");
+      await fs.symlink(target, alias, "dir");
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "9999999:reclaimed", "utf-8");
+        // The process that reclaimed the lock registered the same directory through a
+        // symlink: neither spelling create() knows is a registry key.
+        await new Config(tempDir).editConfig((cfg) => {
+          cfg.projects.set(alias, { workspaces: [] });
+          return cfg;
+        }, REGISTER_CONCURRENTLY);
+        return create(target, { initGit: true });
+      });
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("no longer owned");
+      // The directory this request created is the winner's checkout now and stays; only the
+      // .git the request initialized into it goes.
+      expect((await fs.stat(target)).isDirectory()).toBe(true);
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect(config.loadConfigOrDefault().projects.has(alias)).toBe(true);
+    });
+
+    it("refuses to register once another process has displaced the registration lock", async () => {
+      const target = path.join(tempDir, "displaced");
+      await fs.mkdir(target);
+      // A holder frozen past the lease is judged stale and displaced; when it resumes, its
+      // registration must not commit as if it still held the lock.
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "another holder", "utf-8");
+        return create(target);
+      });
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("no longer owned");
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+    });
+
+    it("covers an edit that leaves the project set alone against another process's write", async () => {
+      // Every edit persists the whole config from the bytes it read, so a registration made
+      // by another process between this edit's read and its write would be dropped unless
+      // the edit, too, runs under the cross-process lock.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let saved = false;
+      const saving = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          saved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(saved).toBe(false);
+
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/registered-meanwhile", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await saving;
+
+      const after = config.loadConfigOrDefault();
+      expect(after.llmDebugLogs).toBe(true);
+      expect(after.projects.has("/fake/registered-meanwhile")).toBe(true);
+    });
+
+    it("does not let a value-only edit slip past a foreign hold while another edit waits for it", async () => {
+      // A registration edit waiting for another process's hold must not make a concurrent
+      // value-only edit believe this process holds the lock: both have to wait, or the
+      // value-only edit's whole-config save drops what the other process registers.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let registered = false;
+      const registering = config
+        .editConfig((cfg) => {
+          cfg.projects.set("/fake/waiting-registration", { workspaces: [] });
+          return cfg;
+        })
+        .then(() => {
+          registered = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(registered).toBe(false);
+      let valueSaved = false;
+      const valueEdit = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          valueSaved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(valueSaved).toBe(false);
+
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/from-other-process", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await Promise.all([registering, valueEdit]);
+
+      const after = config.loadConfigOrDefault();
+      expect(after.llmDebugLogs).toBe(true);
+      expect(after.projects.has("/fake/waiting-registration")).toBe(true);
+      expect(after.projects.has("/fake/from-other-process")).toBe(true);
+    });
+
+    it("returns an Err when the registration lock cannot be taken", async () => {
+      const target = path.join(tempDir, "locked-out");
+      await fs.mkdir(target);
+      // The lock directory is a file, so the cross-process leg cannot be created.
+      await fs.mkdir(path.dirname(projectRegistrationLockFilePath(tempDir)), { recursive: true });
+      await fs.rm(path.dirname(projectRegistrationLockFilePath(tempDir)), { recursive: true });
+      await fs.writeFile(path.dirname(projectRegistrationLockFilePath(tempDir)), "file", "utf-8");
+
+      const result = await service.create(target);
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("Failed to create project");
     });
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {

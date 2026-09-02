@@ -8,6 +8,8 @@ import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
 import { BackupService } from "./backupService";
 import { REDACTED_BACKUP_VALUE } from "./payload";
+import { ProjectService } from "@/node/services/projectService";
+import { projectMemoryDirName } from "@/node/services/memoryService";
 import { runGit, writeFixtureFile } from "./testHelpers";
 
 const SECRET_FILES = [
@@ -427,5 +429,61 @@ describe("BackupService against a real repository", () => {
     const missing = { ...settings, repoUrl: path.join(tempDir, "does-not-exist.git") };
     const validated = await service.validate(missing);
     expect(validated.success).toBe(false);
+  });
+
+  it("round-trips the project bundle and reimports a project at a different path", async () => {
+    // Source machine: one registered project with memory.
+    const projectPath = path.join(tempDir, "projects", "rocket");
+    await fs.mkdir(projectPath, { recursive: true });
+    const projectService = new ProjectService(config);
+    const created = await projectService.create(projectPath);
+    if (!created.success) throw new Error(created.error);
+    const sourceDir = projectMemoryDirName(created.data.normalizedPath);
+    await writeFixtureFile(muxRoot, `memory/project/${sourceDir}/notes.md`, "rocket memory\n");
+
+    const withProjects = { ...settings, includeProjects: true };
+    const pushed = await service.push(withProjects);
+    expect(pushed.success).toBe(true);
+
+    const clone = await cloneOrigin("bundle-verify");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/project-bundle/manifest.json");
+    expect(files).toContain(`mux/project-bundle/memory/project/${sourceDir}/notes.md`);
+    // The core manifest stays bundle-free so an old build's reader ignores the sidecar.
+    const coreManifest = await fs.readFile(path.join(clone, "mux", "manifest.json"), "utf-8");
+    expect(coreManifest).not.toContain("project-bundle");
+
+    // Target machine: a fresh Xum root restoring from the same repository.
+    const otherRoot = path.join(tempDir, "other-root");
+    await fs.mkdir(otherRoot, { recursive: true });
+    const otherConfig = new Config(otherRoot);
+    const otherService = new BackupService(otherConfig, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(otherRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config: otherConfig }),
+    });
+    otherService.setProjectService(new ProjectService(otherConfig));
+
+    const preview = await otherService.preview(withProjects);
+    expect(preview.success).toBe(true);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.projectImports).toHaveLength(1);
+    const candidate = preview.data.projectImports[0];
+    expect(candidate.sourcePath).toBe(created.data.normalizedPath);
+
+    const movedPath = path.join(tempDir, "projects", "rocket-moved");
+    await fs.mkdir(movedPath, { recursive: true });
+    const restored = await otherService.restore(withProjects, {
+      projectImports: [{ token: candidate.token, targetPath: movedPath }],
+    });
+    expect(restored.success).toBe(true);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.projectImportResults[0]?.status).toBe("imported");
+
+    const rekeyedDir = projectMemoryDirName(path.resolve(movedPath));
+    expect(rekeyedDir).not.toBe(sourceDir);
+    expect(
+      await fs.readFile(path.join(otherRoot, "memory", "project", rekeyedDir, "notes.md"), "utf-8")
+    ).toBe("rocket memory\n");
+    expect(otherConfig.loadConfigOrDefault().projects.has(path.resolve(movedPath))).toBe(true);
   });
 });

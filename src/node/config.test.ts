@@ -4,6 +4,8 @@ import * as fs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
+import { projectRegistrationLockFilePath } from "./config/projectRegistrationLock";
+import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -507,6 +509,93 @@ describe("Config", () => {
         .loadConfigOrDefault()
         .projects.get("/repo")?.workspaces;
       expect(workspaces?.map((w) => w.taskStatus)).toEqual(["running", "running"]);
+    });
+
+    it("keeps call order for edits that waited for the registration lock", async () => {
+      // Another process holds the registration file lock; edits issued meanwhile step out of
+      // the queue to wait for it. Each polls the lock, which is not fair, so left to
+      // themselves a later edit could take it first and an earlier edit then overwrite it:
+      // rapid true→false preference updates would persist true.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      // Real writes, recorded: each edit spreads a new object, so the recorded arguments
+      // keep the value each write carried.
+      const saveConfig = spyOn(
+        config as unknown as { saveConfig: (cfg: { advisorMaxUsesPerTurn?: number }) => unknown },
+        "saveConfig"
+      );
+      const setUses = (value: number) =>
+        config.editConfig((cfg) => ({ ...cfg, advisorMaxUsesPerTurn: value }));
+      // Three edits while the first is still in its slot, three more once it has stepped out
+      // and is waiting; the order must hold across both.
+      const edits = [setUses(1), setUses(2), setUses(3)];
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(saveConfig).not.toHaveBeenCalled();
+      edits.push(setUses(4), setUses(5), setUses(6));
+      await otherProcess[Symbol.asyncDispose]();
+      await Promise.all(edits);
+
+      expect(saveConfig.mock.calls.map(([cfg]) => cfg.advisorMaxUsesPerTurn)).toEqual([
+        1, 2, 3, 4, 5, 6,
+      ]);
+      expect(new Config(tempDir).loadConfigOrDefault().advisorMaxUsesPerTurn).toBe(6);
+    });
+
+    it("invokes the edit callback exactly once, with or without waiting for the lock", async () => {
+      // Callbacks are not pure: TaskService.editWorkspaceEntry runs a caller-supplied updater
+      // inside one, and others record results into captured state. A discarded first run
+      // would let those side effects escape twice.
+      let calls = 0;
+      const count = (cfg: Parameters<Parameters<Config["editConfig"]>[0]>[0]) => {
+        calls += 1;
+        return cfg;
+      };
+      await config.editConfig(count);
+      expect(calls).toBe(1);
+
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = config.editConfig(count);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls).toBe(1);
+      await otherProcess[Symbol.asyncDispose]();
+      await waiting;
+      expect(calls).toBe(2);
+    });
+  });
+
+  describe("configFileWriteGeneration", () => {
+    it("differs between two saves of the same content", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      const withoutStamp = () => {
+        const { writeId, ...rest } = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+          writeId: unknown;
+        };
+        expect(typeof writeId).toBe("string");
+        return rest;
+      };
+      // The first save also persists load-time migrations; the two compared are steady-state.
+      await flushConfigEdits();
+      await config.editConfig((cfg) => cfg);
+      const first = await config.configFileWriteGeneration();
+      const firstContent = withoutStamp();
+      await config.editConfig((cfg) => cfg);
+      // Nothing but the stamp changed, and the stamp is what tells the two writes apart — a
+      // reader comparing generations around a window sees the second save even where mtime
+      // granularity and inode reuse would make the file look untouched.
+      expect(withoutStamp()).toEqual(firstContent);
+      expect(await config.configFileWriteGeneration()).not.toBe(first);
+      expect(
+        await new Config(
+          fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-"))
+        ).configFileWriteGeneration()
+      ).toBe("absent");
     });
   });
 
