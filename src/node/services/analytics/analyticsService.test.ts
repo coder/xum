@@ -120,4 +120,30 @@ describe("AnalyticsService.dispose", () => {
     await disposePromise;
     expect(disposed).toBe(true);
   });
+
+  test("dispose does not wait on a worker that already exited", async () => {
+    const service = new AnalyticsService({ rootDir: "/tmp/unused" } as unknown as Config);
+    const fakeWorker = new EventEmitter() as EventEmitter & {
+      postMessage: (message: unknown) => void;
+      unref: () => void;
+    };
+    fakeWorker.postMessage = () => undefined;
+    fakeWorker.unref = () => undefined;
+    const internals = service as unknown as {
+      worker: unknown;
+      onWorkerExit: (code: number) => void;
+    };
+    internals.worker = fakeWorker;
+    fakeWorker.on("exit", internals.onWorkerExit);
+    // The worker crashed earlier; nothing is left to close and no exit event will follow.
+    fakeWorker.emit("exit", 1);
+
+    let disposed = false;
+    const disposePromise = service.dispose().then(() => {
+      disposed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposed).toBe(true);
+    await disposePromise;
+  });
 });

@@ -3719,6 +3719,89 @@ describe("TaskService", () => {
     expect(internals.activeWorkspaceTurnHandleByWorkspaceId.get(childTaskId)).toBeUndefined();
   });
 
+  test("initialize does not overwrite an execution handle a client installed during reconciliation", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const childTaskId = "child-replaced-during-reconcile";
+    const oldHandleId = "wst_replaced_old";
+    const newHandleId = "wst_replaced_new";
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push(
+        projectWorkspace(projectPath, "child-replaced", childTaskId, {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          taskExecutionId: oldHandleId,
+          taskExecutionStatus: "running",
+        })
+      );
+      return cfg;
+    });
+    const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
+    const { aiService } = createAIServiceMocks(config, { isStreaming });
+    const { taskService } = createTaskServiceHarness(config, { aiService });
+    const internals = taskService as unknown as {
+      taskHandleStore: TaskHandleStore;
+      workspaceTurnManager: WorkspaceTurnManager;
+      activeWorkspaceTurnHandleByWorkspaceId: Map<
+        string,
+        { handleId: string; ownerWorkspaceId: string; accepted: boolean }
+      >;
+    };
+    await internals.taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, childTaskId, oldHandleId, "running", {
+        turnId: "turn-replaced-old",
+        createdAt: "2026-08-10T00:00:01.000Z",
+        updatedAt: "2026-08-10T00:00:01.000Z",
+      })
+    );
+
+    // While reconciliation awaits the old handle's liveness check, a client reawakens the child
+    // under a new handle: it persists the new record, repoints the mirror, and registers the new
+    // handle under its own settlement lock. The old record itself is untouched.
+    const manager = internals.workspaceTurnManager;
+    const originalNormalize = manager.normalizeWorkspaceTurnRecord.bind(manager);
+    spyOn(manager, "normalizeWorkspaceTurnRecord").mockImplementation(async (record, options) => {
+      const normalized = await originalNormalize(record, options);
+      if (normalized?.handleId === oldHandleId) {
+        await internals.taskHandleStore.upsertWorkspaceTurn(
+          workspaceTurnRecord(parentId, childTaskId, newHandleId, "running", {
+            turnId: "turn-replaced-new",
+            createdAt: "2026-08-10T00:00:03.000Z",
+            updatedAt: "2026-08-10T00:00:03.000Z",
+          })
+        );
+        await config.editConfig((cfg) => {
+          const child = cfg.projects
+            .get(projectPath)
+            ?.workspaces.find((workspace) => workspace.id === childTaskId);
+          if (child) {
+            child.taskExecutionId = newHandleId;
+            child.taskExecutionStatus = "running";
+          }
+          return cfg;
+        });
+        internals.activeWorkspaceTurnHandleByWorkspaceId.set(childTaskId, {
+          handleId: newHandleId,
+          ownerWorkspaceId: parentId,
+          accepted: true,
+        });
+      }
+      return normalized;
+    });
+
+    await taskService.initialize();
+
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toBe(newHandleId);
+    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.get(childTaskId)?.handleId).toBe(
+      newHandleId
+    );
+  });
+
   test("initialize does not reload config.json per completed-report task", async () => {
     const countConfigLoadsDuringInitialize = async (reportedTaskCount: number): Promise<number> => {
       const runRootDir = path.join(rootDir, `run-${reportedTaskCount}`);

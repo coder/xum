@@ -22,12 +22,3 @@ export const APP_RUNTIME_DISPOSE_TIMEOUT_MS = 2 * 1000;
  * bound this fits inside the same 5 s quit budgets.
  */
 export const APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS = 2 * 1000;
-
-/**
- * Bounds how long `AnalyticsService.dispose()` waits for the analytics worker to finish
- * in-flight DuckDB work and exit. The worker closes DuckDB only after queued ETL tasks
- * complete, so exiting the process before it does tears the thread down mid-query and aborts
- * the process (Napi::Error -> SIGABRT). Sized to fit inside the 5 s quit budgets alongside the
- * runtime and fiber-scope bounds above.
- */
-export const ANALYTICS_WORKER_SHUTDOWN_TIMEOUT_MS = 2 * 1000;

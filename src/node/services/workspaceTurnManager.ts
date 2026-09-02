@@ -4832,26 +4832,42 @@ export class WorkspaceTurnManager {
 
         const taskId = task.id;
         const { handleId, ownerWorkspaceId, status } = normalized;
-        // This pass can run while clients are connected, and normalizeWorkspaceTurnRecord awaited:
-        // a task_stop may have settled this handle in the meantime. Settlement persists the record
-        // and its mirror under the per-handle settlement lock, so compare-and-set under that same
-        // lock; writing the pre-await snapshot would restore an active taskExecutionStatus (and a
-        // live registration) for a child that was just stopped.
+        // This pass can run while clients are connected, and normalizeWorkspaceTurnRecord awaited,
+        // so two things may have changed underneath the snapshot: a task_stop may have settled
+        // this handle (settlement persists the record and its mirror under the per-handle
+        // settlement lock, so compare-and-set the record status under that same lock), or a
+        // client may have installed a different handle for this task, which writes the mirror
+        // under its own handle's lock and leaves this record untouched, so the mirror pointer
+        // itself is compare-and-set against the snapshot as well. Writing the stale snapshot in
+        // either case would restore an active status or registration the live state has moved
+        // past.
         await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
           const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
           if (current?.status !== status) {
             return;
           }
+          let mirrorUpdated = false;
           await this.taskHost.editWorkspaceEntry(
             taskId,
             (workspace) => {
+              if (workspace.taskExecutionId !== task.taskExecutionId) {
+                return;
+              }
               workspace.taskExecutionId = handleId;
               workspace.taskExecutionStatus = status;
+              mirrorUpdated = true;
             },
             { allowMissing: true }
           );
+          if (!mirrorUpdated) {
+            return;
+          }
           await this.taskHost.emitWorkspaceMetadata(taskId);
-          if (isActiveWorkspaceTurnTaskStatus(status)) {
+          const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(taskId);
+          if (
+            isActiveWorkspaceTurnTaskStatus(status) &&
+            (live == null || live.handleId === handleId)
+          ) {
             this.activeWorkspaceTurnHandleByWorkspaceId.set(taskId, {
               handleId,
               ownerWorkspaceId,
