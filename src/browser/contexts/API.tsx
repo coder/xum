@@ -534,14 +534,11 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
           recordSlowObservation(rtt);
           return;
         }
+        // A rejection is a prompt answer, not slowness: it never feeds the latency indicator.
         consecutiveRejectedProbesRef.current += 1;
-        if (
-          consecutiveRejectedProbesRef.current >= REJECTED_PROBES_FOR_RECONNECT &&
-          forceReconnect(`Liveness probe rejected ${consecutiveRejectedProbesRef.current} times`)
-        ) {
-          return;
+        if (consecutiveRejectedProbesRef.current >= REJECTED_PROBES_FOR_RECONNECT) {
+          forceReconnect(`Liveness probe rejected ${consecutiveRejectedProbesRef.current} times`);
         }
-        recordSlowObservation(rtt);
       };
 
       client.general.ping("liveness").then(

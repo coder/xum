@@ -785,6 +785,8 @@ describe("API reconnection", () => {
         },
         { timeout: 16000 }
       );
+      // Prompt rejections are not slowness either: no "slow to respond" indicator on the way.
+      expect(states.some((s) => s.status === "degraded")).toBe(false);
 
       act(() => {
         MockWebSocket.lastInstance()!.simulateOpen();
