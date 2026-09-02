@@ -334,7 +334,11 @@ export function resolveEffectiveThinkingLevel(
 ): ThinkingLevel {
   const level = requested ?? THINKING_LEVEL_OFF;
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  return anthropicRejectsDisabledThinking(capabilityModel) || isGlm53Model(capabilityModel)
+  // Gemini 3.8 Flash rejects "minimal", so an unset/"off" level must clamp here too;
+  // otherwise the tracked level would say "off" while the adapter sends "low".
+  return anthropicRejectsDisabledThinking(capabilityModel) ||
+    isGlm53Model(capabilityModel) ||
+    isGeminiFlashMinimalRejectingModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
 }

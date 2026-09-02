@@ -489,6 +489,19 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash but not older Flash", () => {
+    // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
+    // request envelope and debug snapshots agree with what the Google adapter sends.
+    for (const model of ["google:gemini-3.8-flash", "mux-gateway:google/gemini-3.8-flash"]) {
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "high")).toBe("high");
+    }
+    // Older Flash tiers still express "off" as minimal, so nothing is forced.
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.7-flash", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.8-flash-lite", undefined)).toBe("off");
+  });
+
   test("resolveEffectiveThinkingLevel resolves mappedToModel aliases before the Mythos check", () => {
     // A configured alias entry mapped to a Mythos-class model must follow the same
     // no-disabled-thinking rule as the canonical id, matching buildProviderOptions'
