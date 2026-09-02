@@ -155,12 +155,37 @@ describe("ServiceContainer", () => {
     await taskInitCalledPromise;
     expect(callOrder).toEqual(["workspace", "task"]);
     expect(recoverySettled).toBe(false);
-    expect(taskInitializeSpy).toHaveBeenCalledWith(preListenSnapshot);
+    expect(taskInitializeSpy.mock.calls[0]?.[0]).toBe(preListenSnapshot);
     expect(loadConfigSpy).not.toHaveBeenCalled();
 
     releaseTaskInit?.();
     await recovery;
     expect(recoverySettled).toBe(true);
+  });
+
+  it("dispose cancels an in-flight startup recovery before the periodic services start", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    let releaseTaskInit: (() => void) | undefined;
+    spyOn(services.taskService, "initialize").mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseTaskInit = resolve;
+        })
+    );
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+
+    await services.initializeCore();
+    const recovery = services.runStartupRecovery();
+    // Task recovery is mid-flight when the process shuts down.
+    const disposed = services.dispose();
+    releaseTaskInit?.();
+    await recovery;
+    await disposed;
+
+    expect(heartbeatStart).not.toHaveBeenCalled();
+    expect(idleCompactionStart).not.toHaveBeenCalled();
   });
 
   it("runStartupRecovery starts the periodic services even when task recovery rejects", async () => {

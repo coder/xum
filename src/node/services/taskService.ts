@@ -2285,8 +2285,15 @@ export class TaskService implements AgentTaskIntegration {
    *   binds its listener before running recovery, clients may already be creating tasks; judging
    *   stale-`starting` recovery from this snapshot keeps those fresh tasks out of scope.
    */
-  async initialize(startupConfigSnapshot?: ProjectsConfig): Promise<void> {
+  async initialize(
+    startupConfigSnapshot?: ProjectsConfig,
+    options?: { signal?: AbortSignal }
+  ): Promise<void> {
     const startupStartedAt = Date.now();
+    // Server-mode recovery runs after the listener is bound and can be cancelled by dispose();
+    // the size-dependent loops below check this between tasks so teardown is not delayed by
+    // (or raced with) recovery work against disposed services.
+    const cancelled = (): boolean => options?.signal?.aborted === true;
     const startupConfig = startupConfigSnapshot ?? this.config.loadConfigOrDefault();
     const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) => task.taskStatus === "queued" && typeof task.id === "string"
@@ -2456,6 +2463,21 @@ export class TaskService implements AgentTaskIntegration {
         skippedRunningNoLongerRunning += 1;
         continue;
       }
+      // The restart nudge additionally requires no blocking active descendants; a client can
+      // spawn one after `taskIndex` was captured, so the probe re-derives that gate from fresh
+      // config at admission as well (pending guidance replays regardless, see above).
+      const restartNudgeAdmissionStale = (): boolean => {
+        const freshConfig = this.config.loadConfigOrDefault();
+        if (findWorkspaceEntry(freshConfig, taskId)?.workspace.taskStatus !== "running") {
+          return true;
+        }
+        return (
+          this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(
+            this.buildAgentTaskIndex(freshConfig),
+            taskId
+          ).length > 0
+        );
+      };
 
       const pendingGuidance = task.taskPendingGuidance ?? [];
       if (pendingGuidance.length > 0) {
@@ -2556,7 +2578,7 @@ export class TaskService implements AgentTaskIntegration {
           reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           experiments: task.taskExperiments,
         },
-        { synthetic: true, agentInitiated: true, admissionStale }
+        { synthetic: true, agentInitiated: true, admissionStale: restartNudgeAdmissionStale }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
@@ -2603,6 +2625,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const patchGenerationRecoveryStartedAt = Date.now();
     for (const task of completedReportTasks) {
+      if (cancelled()) break;
       if (!task.parentWorkspaceId) continue;
       try {
         // Pass the loop snapshot: reloading config.json per reported task made this pass scale
@@ -2654,6 +2677,7 @@ export class TaskService implements AgentTaskIntegration {
     // since clients may have reactivated or re-parented a task since the snapshot.
     let cleanupConfig = config;
     for (const task of completedReportTasks) {
+      if (cancelled()) break;
       if (!task.id) continue;
       const removedCount = await this.cleanupReportedLeafTask(task.id, { config: cleanupConfig });
       if (removedCount > 0) {

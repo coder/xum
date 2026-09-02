@@ -195,6 +195,9 @@ export class ServiceContainer {
   // reports every step and the total wall time from the start of core init.
   private startupStartedAt: number | undefined;
   private readonly startupStepDurationsMs: Record<string, number> = {};
+  // Aborted by dispose(): background startup recovery must stop at its next step boundary and
+  // never start periodic services against services that are being torn down.
+  private readonly startupRecoveryAbort = new AbortController();
 
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
@@ -670,6 +673,7 @@ export class ServiceContainer {
   async runStartupRecovery(
     startupConfig: ProjectsConfig = this.config.loadConfigOrDefault()
   ): Promise<void> {
+    const signal = this.startupRecoveryAbort.signal;
     // Recovery is best-effort and runs while the server may already be serving requests: a
     // failing recovery step must not skip the periodic services below (startup-time rule:
     // never let background housekeeping take the app down).
@@ -681,12 +685,20 @@ export class ServiceContainer {
     } catch (error: unknown) {
       log.error("[startup] WorkspaceService recovery failed", { error });
     }
+    if (signal.aborted) {
+      log.info("[startup] Startup recovery cancelled by dispose before task recovery");
+      return;
+    }
     try {
       await this.recordStartupStep("taskService.initialize", () =>
-        this.taskService.initialize(startupConfig)
+        this.taskService.initialize(startupConfig, { signal })
       );
     } catch (error: unknown) {
       log.error("[startup] TaskService recovery failed", { error });
+    }
+    if (signal.aborted) {
+      log.info("[startup] Startup recovery cancelled by dispose before periodic services");
+      return;
     }
 
     const idleCompactionStartedAt = Date.now();
@@ -843,6 +855,9 @@ export class ServiceContainer {
   }
 
   private async disposeOnce(): Promise<void> {
+    // Background startup recovery (server mode) must not start periodic services or keep
+    // issuing recovery work against the services torn down below.
+    this.startupRecoveryAbort.abort();
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.

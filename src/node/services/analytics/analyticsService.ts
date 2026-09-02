@@ -877,6 +877,14 @@ export class AnalyticsService {
     // aborts the whole process. Deliberately unbounded: an ETL that outlives a local timeout
     // would still be mid-query when the caller exits, so the hard-exit decision belongs to the
     // outer quit budgets in cli/server.ts and desktop/main.ts, which race the whole dispose.
+    // Keep an error listener until exit: onWorkerError was detached above, and a worker
+    // `error` with no listener is rethrown by the parent EventEmitter, which would turn a
+    // failing DuckDB close into a crash of the shutting-down process.
+    worker.on("error", (error: Error) => {
+      log.warn("[AnalyticsService] Analytics worker error during shutdown", {
+        error: getErrorMessage(error),
+      });
+    });
     const exited = new Promise<void>((resolve) => {
       worker.once("exit", () => resolve());
     });

@@ -170,6 +170,8 @@ async function main(): Promise<void> {
   });
 
   // Recovery is best-effort background work; a failure must not take the listening server down.
+  // serviceContainer.dispose() cancels it (recovery stops at its next task/step boundary), so
+  // shutdown during recovery never starts periodic services against disposed dependencies.
   void serviceContainer.runStartupRecovery(startupRecoveryConfig).catch((error: unknown) => {
     log.error("[startup] Background startup recovery failed", { error });
   });
