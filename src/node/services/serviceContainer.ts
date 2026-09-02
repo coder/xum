@@ -178,7 +178,15 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
-  private runtimeDisposed = false;
+  /**
+   * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
+   * so a concurrent or repeated dispose() (the desktop's two before-quit
+   * paths, tests' dispose-then-shutdown) awaits the one sequence instead of
+   * re-running steps — in particular it cannot observe the AppFiberScope as
+   * already closed and start tearing down dependencies while the first call
+   * is still awaiting the scope's fibers.
+   */
+  private disposePromise: Promise<void> | null = null;
 
   constructor(stores: ConfigStores) {
     // Built eagerly and synchronously (a layer body that throws fails the
@@ -774,9 +782,15 @@ export class ServiceContainer {
 
   /**
    * Dispose all services. Called on app quit to clean up resources.
-   * Terminates all background processes to prevent orphans.
+   * Terminates all background processes to prevent orphans. Idempotent:
+   * concurrent and repeated calls share one teardown (see `disposePromise`).
    */
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    this.disposePromise ??= this.disposeOnce();
+    return this.disposePromise;
+  }
+
+  private async disposeOnce(): Promise<void> {
     // Must run before any session teardown: AgentSession.dispose() triggers
     // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
     // armed-monitor registry records that drive post-restart "monitor lost" wakes.
@@ -816,12 +830,7 @@ export class ServiceContainer {
     await this.timelineService.flush();
     // Last: close the Effect runtime's scope. No layer owns finalizers yet, so
     // this only releases the runtime; the position (after every explicit
-    // teardown step) is fixed now for later scope-owned occupants. Latched so
-    // the concurrent before-quit paths and dispose-then-shutdown callers cannot
-    // race a second close into the bounded wait.
-    if (!this.runtimeDisposed) {
-      this.runtimeDisposed = true;
-      await disposeAppRuntime(this.runtime.managed);
-    }
+    // teardown step) is fixed now for later scope-owned occupants.
+    await disposeAppRuntime(this.runtime.managed);
   }
 }

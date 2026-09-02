@@ -186,6 +186,36 @@ describe("ServiceContainer", () => {
     expect(services.appFiberScope.state._tag).toBe("Closed");
   });
 
+  it("shares one teardown across concurrent dispose() calls", async () => {
+    services = new ServiceContainer(stores);
+    const steps: string[] = [];
+    // An occupant whose finalization is asynchronous: the first dispose() is
+    // still awaiting it when the second dispose() arrives. Without a shared
+    // teardown the second call would find the scope already marked closed and
+    // proceed to the explicit steps while this finalizer is still running.
+    services.runtime.managed.runSync(
+      Effect.forkIn(
+        Effect.callback<void>(() => Effect.void).pipe(
+          Effect.ensuring(
+            Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 30))).pipe(
+              Effect.andThen(Effect.sync(() => steps.push("occupant-finalized")))
+            )
+          )
+        ),
+        services.appFiberScope
+      )
+    );
+    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+      steps.push("bridge-stop");
+      return Promise.resolve(undefined);
+    });
+
+    await Promise.all([services.dispose(), services.dispose()]);
+
+    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+    expect(steps).toEqual(["occupant-finalized", "bridge-stop"]);
+  });
+
   it("runs the clock-driven workers on the runtime's clock", async () => {
     // Inject a TestClock beneath the real graph: EffectRunnerLive captures it,
     // so the workers' lifecycle fibers sleep on virtual time if (and only if)
