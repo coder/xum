@@ -5,7 +5,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
-import { MessageQueue } from "./messageQueue";
+import { MessageQueue, type ToolEndQueueClaim } from "./messageQueue";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 const WORKSPACE_TURN_CORRELATION = {
@@ -1414,6 +1414,77 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       releaseSync();
       stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a delayed pre-stream abort does not settle a replacement claim", async () => {
+    const workspaceId = "queue-dispatch-delayed-abort-claim";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({ workspaceId });
+    let markAbortUpdateStarted: () => void = () => undefined;
+    const abortUpdateStarted = new Promise<void>((resolve) => {
+      markAbortUpdateStarted = resolve;
+    });
+    let releaseAbortUpdate: () => void = () => undefined;
+    const abortUpdateRelease = new Promise<void>((resolve) => {
+      releaseAbortUpdate = resolve;
+    });
+    const makeQueueClaim = (): ToolEndQueueClaim => {
+      const controller = new AbortController();
+      return {
+        userAuthored: true,
+        admissionSignal: controller.signal,
+        commit: mock(() => true),
+        restoreCancellation: mock(() => undefined),
+        cancelAdmission: mock((reason: string) => controller.abort(reason)),
+        requeueAdmission: mock(() => false),
+        release: mock(() => undefined),
+      };
+    };
+    const interruptedQueueClaim = makeQueueClaim();
+    const replacementQueueClaim = makeQueueClaim();
+    const claimNextToolEndEntry = spyOn(MessageQueue.prototype, "claimNextToolEndEntry")
+      .mockReturnValueOnce(interruptedQueueClaim)
+      .mockReturnValueOnce(replacementQueueClaim);
+    interface TestQueuedClaim {
+      queueClaim: ToolEndQueueClaim;
+    }
+    const internalSession = session as unknown as {
+      queuedToolEndClaim?: TestQueuedClaim;
+      setTurnPhase(phase: "preparing"): void;
+      claimQueuedToolEndMessage(source: "sdk" | "provider"): TestQueuedClaim | undefined;
+      releaseQueuedToolEndClaim(activeClaim: TestQueuedClaim): void;
+      updateStartupAutoRetryAbandonFromAbort(
+        abortReason: "system" | "user" | undefined,
+        userMessageId?: string
+      ): Promise<void>;
+    };
+    internalSession.updateStartupAutoRetryAbandonFromAbort = async () => {
+      markAbortUpdateStarted();
+      await abortUpdateRelease;
+    };
+
+    try {
+      internalSession.setTurnPhase("preparing");
+      const interruptedClaim = internalSession.claimQueuedToolEndMessage("sdk");
+      expect(interruptedClaim).toBeDefined();
+
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "user"));
+      await abortUpdateStarted;
+
+      internalSession.releaseQueuedToolEndClaim(interruptedClaim!);
+      const replacementClaim = internalSession.claimQueuedToolEndMessage("sdk");
+      expect(replacementClaim).toBeDefined();
+
+      releaseAbortUpdate();
+      expect(
+        await waitForCondition(() => internalSession.queuedToolEndClaim === replacementClaim)
+      ).toBe(true);
+      expect(replacementQueueClaim.admissionSignal.aborted).toBe(false);
+    } finally {
+      releaseAbortUpdate();
+      claimNextToolEndEntry.mockRestore();
       session.dispose();
       await cleanup();
     }

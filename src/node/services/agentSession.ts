@@ -4989,7 +4989,7 @@ export class AgentSession {
     if (isHardInterrupt) {
       this.hardInterruptClaimSettlementPending = false;
       const interruptedClaim = this.queuedToolEndClaim;
-      this.settleQueuedToolEndClaimAfterUserInterrupt();
+      this.settleQueuedToolEndClaimAfterUserInterrupt(interruptedClaim);
       if (
         interruptedClaim?.admissionIrreversible === true &&
         !interruptedClaim.queueClaim.userAuthored
@@ -6078,6 +6078,7 @@ export class AgentSession {
         });
 
         const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+        const interruptedClaim = this.queuedToolEndClaim;
         if (this.turnPhase === TurnPhase.PREPARING) {
           this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
@@ -6094,7 +6095,9 @@ export class AgentSession {
         );
 
         if (preStreamAbortReason === "user") {
-          this.settleQueuedToolEndClaimAfterUserInterrupt();
+          // The awaits above can let Send now start a replacement claim. Settle only the
+          // claim that this abort observed, so the old event cannot cancel the new entry.
+          this.settleQueuedToolEndClaimAfterUserInterrupt(interruptedClaim);
         } else {
           this.restoreQueuedToolEndClaim();
         }
@@ -7050,11 +7053,13 @@ export class AgentSession {
     this.syncBackgroundQueuedMessageSignal();
   }
 
-  private settleQueuedToolEndClaimAfterUserInterrupt(): void {
+  private settleQueuedToolEndClaimAfterUserInterrupt(activeClaim = this.queuedToolEndClaim): void {
     if (this.hardInterruptClaimSettlementPending) {
       return;
     }
-    const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim == null || this.queuedToolEndClaim !== activeClaim) {
+      return;
+    }
     if (activeClaim?.admissionIrreversible) {
       // A hard Stop must not start a synthetic provider turn. Keep its durable row for
       // producer settlement, but abort admission so the request path excludes it.

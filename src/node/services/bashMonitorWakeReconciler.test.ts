@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { BashMonitorWakeDisplayRecord } from "@/common/types/message";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 import type {
   BashMonitorRegistryRecord,
@@ -60,6 +61,7 @@ describe("BashMonitorWakeReconciler", () => {
   let removedOwners: string[];
   let dropped: string[];
   let droppedGenerations: Array<string | undefined>;
+  let providerExcludedWakeRecords: BashMonitorWakeDisplayRecord[];
   let reconciler: BashMonitorWakeReconciler;
 
   beforeEach(async () => {
@@ -74,6 +76,7 @@ describe("BashMonitorWakeReconciler", () => {
     removedOwners = [];
     dropped = [];
     droppedGenerations = [];
+    providerExcludedWakeRecords = [];
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
@@ -107,6 +110,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      listProviderExcludedWakeRecords: () => Promise.resolve(providerExcludedWakeRecords),
       onWake: (dispatch) => {
         dispatches.push(dispatch);
         return dispatchOutcome;
@@ -141,6 +145,59 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
+  test("consumes a provider-excluded wake after restart", async () => {
+    live = [liveSnapshot()];
+    providerExcludedWakeRecords = [
+      {
+        processId: "proc",
+        wakeUpdatedAt: CREATED_AT + ":12",
+        kind: "match",
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      },
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toEqual([]);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+
+    providerExcludedWakeRecords = [];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toEqual([]);
+  });
+
+  test("dispatches new records beside a provider-excluded wake", async () => {
+    live = [
+      liveSnapshot(),
+      liveSnapshot({
+        processId: "fresh",
+        taskId: "bash:fresh",
+        createdAt: "2026-08-31T12:01:00.000Z",
+        match: { throughOffset: 5, lines: ["FRESH"], totalMatches: 1 },
+      }),
+    ];
+    providerExcludedWakeRecords = [
+      {
+        processId: "proc",
+        wakeUpdatedAt: CREATED_AT + ":12",
+        kind: "match",
+        displayName: "CI watcher",
+        filter: "READY",
+        filterExclude: false,
+      },
+    ];
+
+    await reconciler.reconcile(OWNER);
+
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records[0]?.processId).toBe("fresh");
+    expect(dispatches[0].prompt).toContain("FRESH");
+    expect(dispatches[0].prompt).not.toContain("> READY");
+  });
+
   test("superseding a queued wake uses a distinct queue key", async () => {
     const queuedKeys = new Set<string>();
     const queuedDispatches: BashMonitorWakeDispatch[] = [];
@@ -157,6 +214,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      listProviderExcludedWakeRecords: () => Promise.resolve(providerExcludedWakeRecords),
       onWake: (dispatch) => {
         if (queuedKeys.has(dispatch.dedupeKey)) return "deferred";
         queuedKeys.add(dispatch.dedupeKey);
@@ -313,6 +371,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      listProviderExcludedWakeRecords: () => Promise.resolve(providerExcludedWakeRecords),
       onWake: (dispatch) => {
         restartedDispatches.push(dispatch);
         return "in-flight";
@@ -395,6 +454,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      listProviderExcludedWakeRecords: () => Promise.resolve(providerExcludedWakeRecords),
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
         return "in-flight";
@@ -661,6 +721,7 @@ describe("BashMonitorWakeReconciler", () => {
         },
         recordTerminal: () => undefined,
       },
+      listProviderExcludedWakeRecords: () => Promise.resolve(providerExcludedWakeRecords),
       onWake: (dispatch) => {
         afterRestart.push(dispatch);
         return "in-flight";
@@ -800,6 +861,7 @@ describe("BashMonitorWakeReconciler", () => {
         remove: () => undefined,
         recordTerminal: () => undefined,
       },
+      listProviderExcludedWakeRecords: () => Promise.resolve(providerExcludedWakeRecords),
       onWake: (dispatch) => {
         retryDispatches.push(dispatch);
         return "in-flight";

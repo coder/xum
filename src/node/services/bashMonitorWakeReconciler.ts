@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-import type { MuxMessageMetadata } from "@/common/types/message";
+import type { BashMonitorWakeDisplayRecord, MuxMessageMetadata } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { BASH_MONITOR_WAKE_HEADINGS } from "@/common/utils/machineTurnPrompts";
 import type {
@@ -167,6 +167,21 @@ interface ReconcileState {
 
 function signalKey(processId: string, createdAt: string): string {
   return processId + "\u0000" + createdAt;
+}
+
+function wakeRecordKey(record: BashMonitorWakeDisplayRecord): string | undefined {
+  if (record.processId == null || record.wakeUpdatedAt == null) {
+    return undefined;
+  }
+  return record.processId + "\u0000" + record.wakeUpdatedAt;
+}
+
+function signalWakeRecordKey(signal: DerivedSignal): string {
+  const wakeUpdatedAt =
+    signal.lost?.failedAt ??
+    signal.terminal?.settledAt ??
+    (signal.matchOffset != null ? signal.createdAt + ":" + signal.matchOffset : signal.createdAt);
+  return signal.processId + "\u0000" + wakeUpdatedAt;
 }
 
 function normalizedTerminalStatus(
@@ -367,6 +382,9 @@ export class BashMonitorWakeReconciler {
       sessionsDir: string;
       processManager: BashMonitorWakeReconcilerProcessManager;
       registry: BashMonitorWakeReconcilerRegistry;
+      listProviderExcludedWakeRecords(
+        ownerWorkspaceId: string
+      ): Promise<readonly BashMonitorWakeDisplayRecord[]>;
       onWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome> | BashMonitorWakeDispatchOutcome;
@@ -513,15 +531,35 @@ export class BashMonitorWakeReconciler {
       await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, collected.autoConsumed);
       await this.cleanup(collected.autoConsumed);
 
+      // A hard Stop can persist provider exclusion before the wake producer advances its
+      // watermark. Treat that durable row as settlement after restart, so the same process
+      // output cannot return in a new provider turn. Match records independently because a
+      // later reconciliation can batch the stopped wake with newer output.
+      const providerExcludedRecords =
+        collected.signals.length > 0
+          ? await this.args.listProviderExcludedWakeRecords(ownerWorkspaceId)
+          : [];
+      const providerExcludedRecordKeys = new Set(
+        providerExcludedRecords.map(wakeRecordKey).filter((key): key is string => key != null)
+      );
+      const providerExcludedSignals = collected.signals.filter((signal) =>
+        providerExcludedRecordKeys.has(signalWakeRecordKey(signal))
+      );
+      await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, providerExcludedSignals);
+      await this.cleanup(providerExcludedSignals);
+      const pendingSignals = collected.signals.filter(
+        (signal) => !providerExcludedRecordKeys.has(signalWakeRecordKey(signal))
+      );
+
       const state = this.state(ownerWorkspaceId);
-      if (collected.signals.length === 0) {
+      if (pendingSignals.length === 0) {
         state.dispatch?.controller.abort();
         state.dispatch = undefined;
         return undefined;
       }
 
       const signature = JSON.stringify(
-        collected.signals.map((signal) => [
+        pendingSignals.map((signal) => [
           signal.key,
           signal.kind,
           signal.matchOffset,
@@ -537,7 +575,7 @@ export class BashMonitorWakeReconciler {
         id: randomUUID(),
         signature,
         controller: new AbortController(),
-        signals: collected.signals,
+        signals: pendingSignals,
         accepted: false,
       };
       state.dispatch = next;

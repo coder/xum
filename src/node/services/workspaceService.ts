@@ -185,6 +185,7 @@ import {
   getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
+  type BashMonitorWakeDisplayRecord,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
@@ -2378,6 +2379,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             : undefined,
       },
       registry: this.bashMonitorRegistryStore,
+      listProviderExcludedWakeRecords: (ownerWorkspaceId) =>
+        this.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId),
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
     if (typeof this.backgroundProcessManager.on === "function") {
@@ -2501,6 +2504,33 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
+  }
+
+  private async listProviderExcludedBashMonitorWakeRecords(
+    ownerWorkspaceId: string
+  ): Promise<BashMonitorWakeDisplayRecord[]> {
+    const records: BashMonitorWakeDisplayRecord[] = [];
+    const result = await this.historyService.iterateFullHistory(
+      ownerWorkspaceId,
+      "backward",
+      (messages) => {
+        for (const message of messages) {
+          const muxMetadata = message.metadata?.muxMetadata;
+          if (
+            message.metadata?.providerExcluded === true &&
+            muxMetadata?.type === "bash-monitor-wake"
+          ) {
+            records.push(...muxMetadata.records);
+          }
+        }
+      }
+    );
+    if (!result.success) {
+      throw new Error(
+        `Failed to read provider-excluded bash monitor wakes for ${ownerWorkspaceId}: ${result.error}`
+      );
+    }
+    return records;
   }
 
   private async dispatchBashMonitorWake(
