@@ -1693,6 +1693,9 @@ describe("BackupService project imports", () => {
         status: "failed",
         message: expect.stringContaining("registered on this machine since the preview") as string,
       });
+      // Not re-offered: only a new preview can present this entry, as a matched one, and
+      // retrying the stale approval could only fail again.
+      expect(result.data.unapprovedProjectImports).toEqual([]);
     }
   });
 

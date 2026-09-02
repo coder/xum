@@ -430,7 +430,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // and none can change between the listing and the bundle that publishes it. Memory
         // is collected under the memory lock so an agent writing memory mid-export cannot
         // produce a torn bundle or trip the collector's identity checks.
-        const bundle = await withProjectRegistrationLock(muxRoot, async () => {
+        const bundle = await withProjectRegistrationLock(muxRoot, async (registration) => {
           const entries = listProjectBundleEntries(remotes);
           const collected = await withMemoryLock(() =>
             collectProjectBundle(
@@ -441,6 +441,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
               { portableMemoryOnly: true }
             )
           );
+          // Before the irreversible write: a hold lost while collecting (this process frozen
+          // past the lease) would mean the list no longer describes the registered projects.
+          await registration.assertStillOwned();
           await writeProjectBundle(path.join(destination, PROJECT_BUNDLE_DIR), collected, {
             ownerOnly: true,
           });

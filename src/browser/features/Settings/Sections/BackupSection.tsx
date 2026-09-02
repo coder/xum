@@ -413,6 +413,11 @@ export function BackupSection() {
     setStatusMessage(null);
     setPreview(null);
     setOverrideSecretScan(false);
+    // The project half of the preview is cleared with the rest of it: left standing through
+    // a failed preview, the old cards would offer a plan the repository no longer describes.
+    setProjectImports([]);
+    setProjectBundleSkipped(false);
+    setProjectImportResults([]);
 
     try {
       const result = await api.backup.preview(savedDraft);

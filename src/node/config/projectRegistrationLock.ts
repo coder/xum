@@ -18,8 +18,8 @@ import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concu
  * own `Config`, and every edit persists the whole file from the bytes it read — so an edit that
  * never touched the project set would still drop a registration another process made in
  * between. `Config.editConfig` therefore commits every edit only while this process holds the
- * file lock (`isProjectRegistrationFileLockHeld`): under a window's hold, or under one it
- * takes for the write itself. Restore and import windows hold both legs; edits issued inside
+ * file lock (`currentProjectRegistrationFileLock`): under a window's hold, or under one it
+ * takes for the write itself, and verifies that hold immediately before saving. Restore and import windows hold both legs; edits issued inside
  * such a window pass `withinRegistrationLock` and take neither, since neither leg is
  * reentrant.
  *
@@ -78,25 +78,31 @@ export interface ProjectRegistrationLockHandle {
 }
 
 /**
- * Roots whose file lock this process currently holds (a count: a window may hold it while
- * an edit inside the window is written). What `Config.editConfig` consults at write time —
- * not whether the mutex is held, which an edit waiting for another process's hold also does
- * without owning anything yet.
+ * The file lock this process currently holds per root, as a stack: a window may hold it while
+ * an edit inside the window is written. What `Config.editConfig` consults at write time — not
+ * whether the mutex is held, which an edit waiting for another process's hold also does
+ * without owning anything yet — and the handle it verifies ownership through before saving.
  */
-const fileLockHolds = new Map<string, number>();
+const fileLockHolds = new Map<string, ProcessFileLock[]>();
 
-export function isProjectRegistrationFileLockHeld(muxRoot: string): boolean {
-  return (fileLockHolds.get(path.resolve(muxRoot)) ?? 0) > 0;
+/** The hold this process has on the root's file lock, if any: its handle, for ownership checks. */
+export function currentProjectRegistrationFileLock(
+  muxRoot: string
+): ProjectRegistrationLockHandle | null {
+  const holds = fileLockHolds.get(path.resolve(muxRoot));
+  return holds === undefined || holds.length === 0 ? null : holds[holds.length - 1];
 }
 
 function recordFileLockHold(muxRoot: string, lock: ProcessFileLock): ProcessFileLock {
   const key = path.resolve(muxRoot);
-  fileLockHolds.set(key, (fileLockHolds.get(key) ?? 0) + 1);
+  const holds = fileLockHolds.get(key) ?? [];
+  holds.push(lock);
+  fileLockHolds.set(key, holds);
   return {
     assertStillOwned: () => lock.assertStillOwned(),
     [Symbol.asyncDispose]: async () => {
-      const remaining = (fileLockHolds.get(key) ?? 1) - 1;
-      if (remaining > 0) fileLockHolds.set(key, remaining);
+      const remaining = (fileLockHolds.get(key) ?? []).filter((held) => held !== lock);
+      if (remaining.length > 0) fileLockHolds.set(key, remaining);
       else fileLockHolds.delete(key);
       await lock[Symbol.asyncDispose]();
     },

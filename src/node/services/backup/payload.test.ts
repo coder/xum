@@ -3817,6 +3817,37 @@ describe("project bundle", () => {
     expect(leftovers).toEqual([]);
   });
 
+  it("keeps the previous association when a re-import was interrupted between its two writes", async () => {
+    const source = "/home/dev/src/alpha";
+    const b = "/home/other/b";
+    const d = "/home/other/d";
+    const registered = new Map([b, d].map((project) => [project, projectMemoryDirName(project)]));
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), source);
+    // A crash after the source's record was replaced but before D's record landed: the
+    // source names D (and B as where it came from), D's record does not exist, B's still
+    // names the source.
+    await fs.writeFile(
+      originMarkerPath(source),
+      JSON.stringify({
+        sourcePath: source,
+        memoryDir: projectMemoryDirName(d),
+        previousMemoryDir: projectMemoryDirName(b),
+      }),
+      "utf-8"
+    );
+
+    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
+      projectPath: b,
+      memoryDir: projectMemoryDirName(b),
+    });
+    // Completing the pair (the retry) moves the association to D.
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(d), source);
+    expect((await readProjectMemoryOrigins(muxRoot, registered, [source])).get(source)).toEqual({
+      projectPath: d,
+      memoryDir: projectMemoryDirName(d),
+    });
+  });
+
   it("ignores markers that are broken, mis-named, or name an unregistered project", async () => {
     const registeredProject = "/home/other/a";
     const registered = new Map([[registeredProject, projectMemoryDirName(registeredProject)]]);

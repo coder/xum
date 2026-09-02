@@ -723,21 +723,23 @@ export class BackupService {
           // does not cover, and their per-candidate results are the user's only undo list, so
           // nothing that can fail may run after them and discard those results.
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });
-          const projectImportResults =
+          const { results: projectImportResults, reclassified } =
             importer === null
-              ? []
+              ? { results: [], reclassified: new Set<string>() }
               : await this.executeProjectImports(importer, plannedImports, registry);
           this.notifyProjectMemoryChanges([], projectImportResults);
           // A candidate whose import failed per-candidate, or landed only partly because
           // existing files conflicted, stays on offer so the user can fix the target or the
           // conflicts and retry without another preview; its token is still current, and a
           // conflicted import records no origin, so the source is still an import candidate.
+          // Not one whose source became a registered project here: only a new preview can
+          // present it, as a matched entry, so offering it again would only fail.
           const stillOfferedTokens = new Set(
-            projectImportResults.flatMap((result, index) =>
-              result.status === "failed" || result.skippedFiles.length > 0
-                ? [plannedImports[index]?.candidate.token]
-                : []
-            )
+            projectImportResults.flatMap((result, index) => {
+              const token = plannedImports[index]?.candidate.token;
+              if (token === undefined || reclassified.has(token)) return [];
+              return result.status === "failed" || result.skippedFiles.length > 0 ? [token] : [];
+            })
           );
           return Ok({
             commit: remoteCommit,
@@ -887,21 +889,26 @@ export class BackupService {
     importer: BackupProjectImporter,
     planned: readonly PlannedProjectImport[],
     planningRegistry: RegisteredProjectLookup | null
-  ): Promise<BackupProjectImportResult[]> {
+  ): Promise<{ results: BackupProjectImportResult[]; reclassified: Set<string> }> {
     const results: BackupProjectImportResult[] = [];
-    if (planned.length === 0) return results;
+    /** Tokens refused because their source is a registered project now; not retryable. */
+    const reclassified = new Set<string>();
+    if (planned.length === 0) return { results, reclassified };
     const registrar = this.projectRegistrar;
     if (registrar === null) {
-      return planned.map(({ candidate, targetPath }) => ({
-        sourcePath: candidate.sourcePath,
-        targetPath,
-        name: candidate.name,
-        status: "failed",
-        message: "Project registration is unavailable",
-        writtenFiles: [],
-        skippedFiles: [],
-        registered: false,
-      }));
+      return {
+        results: planned.map(({ candidate, targetPath }) => ({
+          sourcePath: candidate.sourcePath,
+          targetPath,
+          name: candidate.name,
+          status: "failed",
+          message: "Project registration is unavailable",
+          writtenFiles: [],
+          skippedFiles: [],
+          registered: false,
+        })),
+        reclassified,
+      };
     }
     // One registration window for the imports: registration is re-read inside it — so a
     // target unregistered since planning is registered again rather than written into on a
@@ -956,6 +963,7 @@ export class BackupService {
           // registration lock, where this cannot change again before the write; the next
           // preview shows the entry as matched.
           if (registry.keys.has(candidate.sourcePath)) {
+            reclassified.add(candidate.token);
             results.push(
               failed(
                 `'${candidate.sourcePath}' was registered on this machine since the preview and is now restored directly; preview again`
@@ -1072,7 +1080,7 @@ export class BackupService {
           );
         }
       }
-      return results;
+      return { results, reclassified };
     });
   }
 

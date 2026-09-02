@@ -87,7 +87,7 @@ import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import {
-  isProjectRegistrationFileLockHeld,
+  currentProjectRegistrationFileLock,
   isProjectRegistrationMutexHeld,
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
@@ -2597,7 +2597,7 @@ export class Config {
     };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
-      lock: ProjectRegistrationLockHandle | null
+      lock: ProjectRegistrationLockHandle
     ) {
       // Effect.try keeps the pre-Effect contract: a rejected corrupt-file gate reaches the
       // caller as the raw original error.
@@ -2605,14 +2605,11 @@ export class Config {
         try: () => self.assertConfigWritable(),
         catch: (error) => error,
       });
-      // A project-set change commits under the registration lock: immediately before the
-      // write, confirm this process still holds it (see ProjectRegistrationLockHandle). Other
-      // edits under the lock are covered against concurrent writers by holding it; a lost
-      // hold would cost them at most the same overwrite the lock exists to prevent for
-      // registrations, and re-verifying every edit is not worth a lockfile read each.
-      if (lock !== null) {
-        yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
-      }
+      // Every save happens under this process's hold of the registration lock: immediately
+      // before the write, confirm the hold is still ours (see ProjectRegistrationLockHandle).
+      // A whole-config save from a hold another process reclaimed would drop whatever that
+      // process registered meanwhile, whether or not this edit touched the project set.
+      yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write.
       yield* Effect.promise(async () => self.saveConfig(newConfig));
@@ -2636,10 +2633,7 @@ export class Config {
             catch: (error) => error,
           });
           if (registrationLock.kind === "held") {
-            return yield* write(
-              first.newConfig,
-              first.changesProjects ? registrationLock.lock : null
-            );
+            return yield* write(first.newConfig, registrationLock.lock);
           }
           // Changing the project set while a window runs in this process is not allowed:
           // the edit fails the slot before writing and editConfig re-runs it under the full
@@ -2647,9 +2641,11 @@ export class Config {
           if (first.changesProjects && isProjectRegistrationMutexHeld(self.rootDir)) {
             return yield* Effect.fail(new ProjectRegistrationLockRequired());
           }
-          // Under a hold this process already has (a window's), the write is covered.
-          if (isProjectRegistrationFileLockHeld(self.rootDir)) {
-            return yield* write(first.newConfig, null);
+          // Under a hold this process already has (a window's), the write is covered by it
+          // and verified through it.
+          const currentHold = currentProjectRegistrationFileLock(self.rootDir);
+          if (currentHold !== null) {
+            return yield* write(first.newConfig, currentHold);
           }
           // Otherwise the cross-process leg is tried here, inside the queue slot so the edit
           // keeps its order. Held by another process, the edit fails the slot and editConfig
@@ -2662,7 +2658,7 @@ export class Config {
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null) throw new ProjectRegistrationLockContended();
               const fresh = transform();
-              await Effect.runPromise(write(fresh.newConfig, fresh.changesProjects ? lock : null));
+              await Effect.runPromise(write(fresh.newConfig, lock));
             },
             catch: (error) => error,
           });
