@@ -21,10 +21,7 @@ import { log } from "./log";
 
 export function shutdownStep(name: string, run: () => Promise<void>): Promise<void>;
 export function shutdownStep(name: string, run: () => void): void;
-export function shutdownStep(
-  name: string,
-  run: () => void | Promise<void>
-): void | Promise<void> {
+export function shutdownStep(name: string, run: () => void | Promise<void>): void | Promise<void> {
   const startedAt = performance.now();
   const done = () => {
     log.debug(`[shutdown] ${name}`, { ms: Math.round(performance.now() - startedAt) });
