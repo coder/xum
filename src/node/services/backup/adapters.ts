@@ -670,7 +670,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // is taken first (the fixed order; `ProjectService.remove` takes only it) and holds
         // project unregistration off for the same window, so the registration read below
         // stays true until the matched memory has landed.
-        core = await withProjectRegistrationLock(muxRoot, () =>
+        core = await withProjectRegistrationLock(muxRoot, (registration) =>
           withMemoryLock(async () => {
             // The plan is recomputed at the write boundary, from registration and the origin
             // markers as they are now: origin markers are written under the memory lock (by
@@ -718,12 +718,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
                 { portable: false, ownerOnly: true }
               );
             }
+            // Before each irreversible step: this process must still hold the registration
+            // lock, or the registration read above may no longer describe the project set.
+            await registration.assertStillOwned();
             const coreResult = await restoreCore();
             // Matched entries restore verbatim, exactly what the preview promised. Imports
             // are executed separately by the service, after project registration.
             for (const match of matched) {
               let written: string[];
               try {
+                await registration.assertStillOwned();
                 written = (
                   await writeProjectMemoryFiles(muxRoot, matchedProjectWrites(match), {
                     addOnly: false,

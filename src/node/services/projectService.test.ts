@@ -148,7 +148,9 @@ async function collectCloneEvents(
  * it for any project-set change), so the interleaving these tests exercise is reproduced by
  * marking the edit as a same-window writer; the re-check stays as defense in depth.
  */
-const REGISTER_CONCURRENTLY = { withinRegistrationLock: true } as const;
+const REGISTER_CONCURRENTLY = {
+  withinRegistrationLock: { assertStillOwned: () => Promise.resolve() },
+} as const;
 
 describe("ProjectService", () => {
   let tempDir: string;
@@ -2857,7 +2859,7 @@ exit 1
           cfg.projects.set("/fake/from-other-process", { workspaces: [] });
           return cfg;
         },
-        { withinRegistrationLock: true }
+        { withinRegistrationLock: otherProcess }
       );
       await otherProcess[Symbol.asyncDispose]();
       await registering;
@@ -2867,6 +2869,21 @@ exit 1
       const projects = config.loadConfigOrDefault().projects;
       expect(projects.has("/fake/from-this-process")).toBe(true);
       expect(projects.has("/fake/from-other-process")).toBe(true);
+    });
+
+    it("refuses to register once another process has displaced the registration lock", async () => {
+      const target = path.join(tempDir, "displaced");
+      await fs.mkdir(target);
+      // A holder frozen past the lease is judged stale and displaced; when it resumes, its
+      // registration must not commit as if it still held the lock.
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "another holder", "utf-8");
+        return create(target);
+      });
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("no longer owned");
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
     });
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {

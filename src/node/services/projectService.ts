@@ -54,7 +54,10 @@ import {
   syncProjectCodeWorkspace,
 } from "@/node/worktree/codeWorkspaceSync";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
+import {
+  type ProjectRegistrationLockHandle,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 
 function orderWorkspacesForCascadeRemoval(
@@ -437,28 +440,36 @@ export class ProjectService {
     // Config.editConfig would take the registration lock for the registering write anyway;
     // taken here, around the whole operation, so withRegistrationLock can hand out a create
     // that registers inside a window the caller already holds.
-    return withProjectRegistrationLock(this.config.rootDir, () =>
-      this.createUnlocked(projectPath, options)
+    return withProjectRegistrationLock(this.config.rootDir, (lock) =>
+      this.createUnlocked(projectPath, options, lock)
     );
   }
 
   /**
    * Registration held stable — no project can be registered or removed underneath `fn` —
-   * with a `create` that registers inside that window. A backup import resolves its target's
-   * identity, registers it when needed, and writes its memory within one such window, so
-   * the project it wrote into is the project registered when it reports success.
+   * with a `create` that registers inside that window and the lock's own ownership check.
+   * A backup import resolves its target's identity, registers it when needed, and writes its
+   * memory within one such window, so the project it wrote into is the project registered
+   * when it reports success.
    */
   withRegistrationLock<T>(
-    fn: (registrar: { create: ProjectService["create"] }) => Promise<T>
+    fn: (registrar: {
+      create: ProjectService["create"];
+      assertStillOwned: ProjectRegistrationLockHandle["assertStillOwned"];
+    }) => Promise<T>
   ): Promise<T> {
-    return withProjectRegistrationLock(this.config.rootDir, () =>
-      fn({ create: (projectPath, options) => this.createUnlocked(projectPath, options) })
+    return withProjectRegistrationLock(this.config.rootDir, (lock) =>
+      fn({
+        create: (projectPath, options) => this.createUnlocked(projectPath, options, lock),
+        assertStillOwned: () => lock.assertStillOwned(),
+      })
     );
   }
 
   private async createUnlocked(
     projectPath: string,
-    options?: { initGit?: boolean; displayName?: string }
+    options: { initGit?: boolean; displayName?: string } | undefined,
+    lock: ProjectRegistrationLockHandle
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
     let gitInitClaimKey: string | null = null;
     try {
@@ -742,7 +753,7 @@ export class ProjectService {
           return freshConfig;
           // create() (or a withRegistrationLock caller) already holds the registration lock.
         },
-        { withinRegistrationLock: true }
+        { withinRegistrationLock: lock }
       );
 
       // Do NOT clean up the created directory when a concurrent registration claims

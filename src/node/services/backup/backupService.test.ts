@@ -133,7 +133,9 @@ type RegistrarCreate = Parameters<
 >[0]["create"];
 
 function registrar(create: RegistrarCreate): BackupProjectRegistrar {
-  return { withRegistrationLock: (fn) => fn({ create }) };
+  return {
+    withRegistrationLock: (fn) => fn({ create, assertStillOwned: () => Promise.resolve() }),
+  };
 }
 
 function createService(

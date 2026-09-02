@@ -64,17 +64,29 @@ export function withProjectRegistrationMutex<T>(muxRoot: string, fn: () => Promi
   return previous === undefined ? run() : previous.then(run);
 }
 
+/**
+ * What a holder of the cross-process leg gets to work with. `assertStillOwned` re-reads the
+ * lockfile and throws when this process no longer holds it: a holder frozen past the lease
+ * (a suspended laptop, a stalled event loop) can be judged stale and displaced by another
+ * process, and must not go on committing as if it still held the lock. Called immediately
+ * before every irreversible write made under the lock — a config.json save that changes the
+ * project set, the core restore, each project's memory write.
+ */
+export interface ProjectRegistrationLockHandle {
+  assertStillOwned(): Promise<void>;
+}
+
 /** Cross-process leg only; the caller must already hold the in-process mutex. */
 export async function withProjectRegistrationFileLock<T>(
   muxRoot: string,
-  fn: () => Promise<T>
+  fn: (lock: ProjectRegistrationLockHandle) => Promise<T>
 ): Promise<T> {
-  await using _lock = await acquireProcessFileLock({
+  await using lock = await acquireProcessFileLock({
     lockPath: projectRegistrationLockFilePath(muxRoot),
     timeoutMs: PROJECT_REGISTRATION_FILE_LOCK_TIMEOUT_MS,
     label: "project registration lock",
   });
-  return await fn();
+  return await fn(lock);
 }
 
 /**
@@ -99,6 +111,9 @@ export async function tryProjectRegistrationFileLock(
 }
 
 /** Both legs, in the fixed order: the window a restore or import runs in. */
-export function withProjectRegistrationLock<T>(muxRoot: string, fn: () => Promise<T>): Promise<T> {
+export function withProjectRegistrationLock<T>(
+  muxRoot: string,
+  fn: (lock: ProjectRegistrationLockHandle) => Promise<T>
+): Promise<T> {
   return withProjectRegistrationMutex(muxRoot, () => withProjectRegistrationFileLock(muxRoot, fn));
 }

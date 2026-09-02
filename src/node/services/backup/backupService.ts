@@ -169,6 +169,8 @@ export interface BackupProjectRegistrar {
         projectPath: string,
         options?: { displayName?: string }
       ): Promise<Result<{ normalizedPath: string }, string>>;
+      /** Throws once this process no longer holds the lock; called before each commit. */
+      assertStillOwned(): Promise<void>;
     }) => Promise<T>
   ): Promise<T>;
 }
@@ -990,6 +992,9 @@ export class BackupService {
             results.push(unchecked(registeredIdentity ?? targetPath));
             continue;
           }
+          // Before each irreversible step: this process must still hold the registration
+          // lock, or another process has judged it stale and may be registering meanwhile.
+          await locked.assertStillOwned();
           // The backed-up name travels with a newly registered project (in the same config
           // write as the registration); an already registered target keeps its local name.
           const created =
@@ -1037,6 +1042,7 @@ export class BackupService {
             );
             continue;
           }
+          await locked.assertStillOwned();
           const written = await importer.importProjectMemory({
             token: candidate.token,
             targetPath: registeredPath,

@@ -88,6 +88,7 @@ import { getContainerName as getDockerContainerName } from "@/node/runtime/Docke
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
 import {
   isProjectRegistrationMutexHeld,
+  type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
   withProjectRegistrationLock,
@@ -910,7 +911,10 @@ function normalizeAdvisorPositiveInteger(value: number | null, label: string): n
  * `held` both legs (issued inside a restore or import window), `in-process` the mutex only
  * (editConfig's free path; the file lock is taken in the queue slot if needed), `none`.
  */
-type RegistrationLockState = "held" | "in-process" | "none";
+type RegistrationLockState =
+  | { kind: "held"; lock: ProjectRegistrationLockHandle }
+  | { kind: "in-process" }
+  | { kind: "none" };
 
 /** Thrown inside the edit queue when a transform changes the project set without the lock. */
 class ProjectRegistrationLockRequired extends Error {
@@ -2207,9 +2211,11 @@ export class Config {
    */
   async editConfig(
     fn: (config: ProjectsConfig) => ProjectsConfig,
-    options: { withinRegistrationLock?: boolean } = {}
+    options: { withinRegistrationLock?: ProjectRegistrationLockHandle } = {}
   ): Promise<void> {
-    if (options.withinRegistrationLock === true) return this.enqueueConfigEdit(fn, "held");
+    if (options.withinRegistrationLock !== undefined) {
+      return this.enqueueConfigEdit(fn, { kind: "held", lock: options.withinRegistrationLock });
+    }
     return this.enqueueGatedConfigEdit(fn);
   }
 
@@ -2230,11 +2236,11 @@ export class Config {
     if (!isProjectRegistrationMutexHeld(this.rootDir)) {
       return withProjectRegistrationMutex(this.rootDir, async () => {
         try {
-          return await this.enqueueConfigEdit(fn, "in-process");
+          return await this.enqueueConfigEdit(fn, { kind: "in-process" });
         } catch (error) {
           if (!(error instanceof ProjectRegistrationLockContended)) throw error;
-          return withProjectRegistrationFileLock(this.rootDir, () =>
-            this.enqueueConfigEdit(fn, "held")
+          return withProjectRegistrationFileLock(this.rootDir, (lock) =>
+            this.enqueueConfigEdit(fn, { kind: "held", lock })
           );
         }
       });
@@ -2245,10 +2251,12 @@ export class Config {
     // discarded — nothing it mutated survives, since loadConfigOrDefault parses fresh bytes
     // on every call — and it waits outside the queue, so no other edit is held up behind it.
     try {
-      return await this.enqueueConfigEdit(fn, "none");
+      return await this.enqueueConfigEdit(fn, { kind: "none" });
     } catch (error) {
       if (!(error instanceof ProjectRegistrationLockRequired)) throw error;
-      return withProjectRegistrationLock(this.rootDir, () => this.enqueueConfigEdit(fn, "held"));
+      return withProjectRegistrationLock(this.rootDir, (lock) =>
+        this.enqueueConfigEdit(fn, { kind: "held", lock })
+      );
     }
   }
 
@@ -2596,13 +2604,21 @@ export class Config {
         changesProjects: !sameProjectKeys(projectKeysBefore, newConfig.projects),
       };
     };
-    const write = Effect.fn(function* (newConfig: ProjectsConfig) {
+    const write = Effect.fn(function* (
+      newConfig: ProjectsConfig,
+      lock: ProjectRegistrationLockHandle | null
+    ) {
       // Effect.try keeps the pre-Effect contract: a rejected corrupt-file gate reaches the
       // caller as the raw original error.
       yield* Effect.try({
         try: () => self.assertConfigWritable(),
         catch: (error) => error,
       });
+      // A project-set change commits under the registration lock: immediately before the
+      // write, confirm this process still holds it (see ProjectRegistrationLockHandle).
+      if (lock !== null) {
+        yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
+      }
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write.
       yield* Effect.promise(async () => self.saveConfig(newConfig));
@@ -2625,12 +2641,15 @@ export class Config {
             },
             catch: (error) => error,
           });
-          if (registrationLock === "held" || !first.changesProjects) {
-            return yield* write(first.newConfig);
+          if (!first.changesProjects) {
+            return yield* write(first.newConfig, null);
+          }
+          if (registrationLock.kind === "held") {
+            return yield* write(first.newConfig, registrationLock.lock);
           }
           // The project set changes. Before the write, so the permit is released and
           // editConfig retries this edit under the full lock; see editConfig.
-          if (registrationLock === "none") {
+          if (registrationLock.kind === "none") {
             return yield* Effect.fail(new ProjectRegistrationLockRequired());
           }
           // The in-process mutex is held; the cross-process leg is tried here, inside the
@@ -2644,7 +2663,7 @@ export class Config {
               await using lock = await tryProjectRegistrationFileLock(self.rootDir);
               if (lock === null) throw new ProjectRegistrationLockContended();
               const fresh = transform();
-              await Effect.runPromise(write(fresh.newConfig));
+              await Effect.runPromise(write(fresh.newConfig, lock));
             },
             catch: (error) => error,
           });
