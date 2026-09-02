@@ -1523,14 +1523,18 @@ describe("backup adapters project bundle", () => {
     const repository = await gitRepo.prepare(settings);
 
     // Remotes are discovered outside the registration lock; the listing waits for it. While
-    // it waits, the project is removed and another checkout registered at the same path.
+    // it waits, the project is removed and another checkout registered at the same path with
+    // the very same config — indistinguishable in the registry's content, so the write
+    // itself (the test double keeps the registry in memory; a real Config rewrites the file
+    // on every save) is what has to be seen.
     const held = Promise.withResolvers<void>();
     const lockAcquired = Promise.withResolvers<void>();
     const holding = withProjectRegistrationLock(muxRoot, async () => {
       lockAcquired.resolve();
       await held.promise;
       config.state.projects.delete(project);
-      config.state.projects.set(project, { workspaces: [], displayName: "replacement" });
+      config.state.projects.set(project, { workspaces: [] });
+      await fs.writeFile(path.join(muxRoot, "config.json"), "{}\n", "utf-8");
     });
     await lockAcquired.promise;
     const exporting = payload.exportTo({
@@ -1548,12 +1552,10 @@ describe("backup adapters project bundle", () => {
         path.join(repository.rootDir, settings.path, "project-bundle", "manifest.json"),
         "utf-8"
       )
-    ) as { projects: Array<{ path: string; name: string; gitRemote?: string }> };
+    ) as { projects: Array<{ path: string; gitRemote?: string }> };
     // The entry is the new registration's; the removed project's remote does not travel
     // with it.
-    expect(
-      manifest.projects.map(({ path: entryPath, name }) => ({ path: entryPath, name }))
-    ).toEqual([{ path: project, name: "replacement" }]);
+    expect(manifest.projects.map((entry) => entry.path)).toEqual([project]);
     expect(manifest.projects[0]?.gitRemote).toBeUndefined();
   });
 

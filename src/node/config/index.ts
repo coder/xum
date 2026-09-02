@@ -2187,6 +2187,24 @@ export class Config {
   }
 
   /**
+   * The config file as a write generation: its inode, mtime, and size, which every save
+   * changes — a save renames a fresh file into place — even when the bytes written are the
+   * ones already there, and whichever process wrote it. For a caller that reads the project
+   * registry at two points and needs to know whether anything happened in between: a
+   * registration, a removal, or a removal and a re-registration with identical config, which
+   * the registry's content alone cannot show. "absent" when there is no file.
+   */
+  async configFileWriteGeneration(): Promise<string> {
+    try {
+      const stat = await fs.promises.stat(this.configFile);
+      return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw error;
+    }
+  }
+
+  /**
    * Edit config atomically using a transformation function
    * @param fn Function that takes current config and returns modified config
    *

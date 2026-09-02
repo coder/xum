@@ -308,12 +308,15 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * The registry as a remote-discovery pass saw it. Remote hints are keyed by path and found
    * outside the registration lock; a project removed and another registered at the same path
    * during discovery would otherwise carry the removed project's remote into the new
-   * project's entry. The listing under the lock uses the hints only if the registry has not
-   * changed since — conservatively, since config records no registration identity: churn
-   * anywhere in the project set costs this export its hints, never gives an entry a wrong one.
+   * project's entry. The listing under the lock uses the hints only if nothing has been
+   * written to the registry since: the config file's write generation changes on every save
+   * — so a removal and a re-registration with identical config, invisible in the content, is
+   * seen — and the content is compared too. Conservative by design, since config records no
+   * per-registration identity: any write in the window costs this export its hints, never
+   * gives an entry a wrong one.
    */
-  function registrySnapshot(): string {
-    return JSON.stringify(userProjects());
+  async function registrySnapshot(): Promise<string> {
+    return `${await options.config.configFileWriteGeneration()}\0${JSON.stringify(userProjects())}`;
   }
 
   /**
@@ -332,7 +335,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         `Settings backup: not backing up project '${projectPath.slice(0, 80)}…': its path is longer than ${MAX_BACKUP_PROJECT_PATH_CHARS} characters`
       );
     }
-    const registry = registrySnapshot();
+    const registry = await registrySnapshot();
     const projects = userProjects();
     // Before any lookup: an over-limit config would otherwise run every remote probe
     // only to be refused by the bundle collector afterwards.
@@ -370,16 +373,16 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
    * discovery began; a project added since carries no remote hint, one removed since is
    * gone along with its memory.
    */
-  function listProjectBundleEntries(discovered: {
+  async function listProjectBundleEntries(discovered: {
     remotes: ReadonlyMap<string, string | undefined>;
     registry: string;
-  }): BackupProjectBundleEntry[] {
+  }): Promise<BackupProjectBundleEntry[]> {
     const projects = userProjects();
     if (projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
       throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
     }
-    // See registrySnapshot: hints found for a registry that has since changed are dropped.
-    const remotes = discovered.registry === registrySnapshot() ? discovered.remotes : null;
+    // See registrySnapshot: hints found for a registry written to since are dropped.
+    const remotes = discovered.registry === (await registrySnapshot()) ? discovered.remotes : null;
     if (remotes === null) {
       log.debug("Settings backup: projects changed during remote discovery; omitting remote hints");
     }
@@ -483,7 +486,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         // is collected under the memory lock so an agent writing memory mid-export cannot
         // produce a torn bundle or trip the collector's identity checks.
         const bundle = await withProjectRegistrationLock(muxRoot, async (registration) => {
-          const entries = listProjectBundleEntries(discovered);
+          const entries = await listProjectBundleEntries(discovered);
           const collected = await withMemoryLock(() =>
             collectProjectBundle(
               muxRoot,
