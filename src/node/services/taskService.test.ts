@@ -20089,7 +20089,7 @@ describe("TaskService", () => {
     ).toHaveLength(1);
   });
 
-  test("pre-listen recovery, not housekeeping, finalizes ready best-of partials before cleanup rechecks", async () => {
+  test("initialize finalizes ready best-of partials before cleanup rechecks", async () => {
     const config = await createTestConfig(rootDir);
 
     const projectPath = path.join(rootDir, "repo");
@@ -20182,10 +20182,12 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
 
-    const readParentTaskToolPart = async () => {
-      const parentPartial = await partialService.readPartial(parentId);
-      expect(parentPartial).not.toBeNull();
-      return parentPartial?.parts.find(
+    await taskService.initialize();
+
+    const updatedParentPartial = await partialService.readPartial(parentId);
+    expect(updatedParentPartial).not.toBeNull();
+    if (updatedParentPartial) {
+      const toolPart = updatedParentPartial.parts.find(
         (p) =>
           p &&
           typeof p === "object" &&
@@ -20198,23 +20200,14 @@ describe("TaskService", () => {
             output?: unknown;
           }
         | undefined;
-    };
-
-    // Rewriting a parent's partial races any parent turn a client starts once the listener is
-    // open, so the post-listen housekeeping phase must leave it alone.
-    await taskService.runStartupHousekeeping();
-    expect((await readParentTaskToolPart())?.state).toBe("input-available");
-
-    await taskService.recoverInterruptedTasks();
-
-    const toolPart = await readParentTaskToolPart();
-    expect(toolPart?.toolName).toBe("task");
-    expect(toolPart?.state).toBe("output-available");
-    const outputJson = JSON.stringify(toolPart?.output);
-    expect(outputJson).toContain(childOneId);
-    expect(outputJson).toContain(childTwoId);
-    expect(outputJson).toContain("Report from child one");
-    expect(outputJson).toContain("Report from child two");
+      expect(toolPart?.toolName).toBe("task");
+      expect(toolPart?.state).toBe("output-available");
+      const outputJson = JSON.stringify(toolPart?.output);
+      expect(outputJson).toContain(childOneId);
+      expect(outputJson).toContain(childTwoId);
+      expect(outputJson).toContain("Report from child one");
+      expect(outputJson).toContain("Report from child two");
+    }
 
     const remainingTaskIds = Array.from(config.loadConfigOrDefault().projects.values())
       .flatMap((project) => project.workspaces)
@@ -20224,6 +20217,118 @@ describe("TaskService", () => {
     expect(remainingTaskIds).toContain(childTwoId);
 
     expect(remove).not.toHaveBeenCalled();
+  });
+  test("startup best-of finalization never lands on a partial a live parent turn replaced", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-best-of-superseded";
+    const childOneId = "child-best-of-superseded-1";
+    const childTwoId = "child-best-of-superseded-2";
+    const partialTimestamp = Date.now();
+    const currentCreatedAt = new Date(partialTimestamp + 60_000).toISOString();
+    const bestOf = { groupId: "best-of-superseded", index: 0, total: 2 } as const;
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child-1", childOneId, {
+          name: "agent_explore_child_1",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          createdAt: currentCreatedAt,
+          bestOf,
+        }),
+        projectWorkspace(projectPath, "child-2", childTwoId, {
+          name: "agent_explore_child_2",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          createdAt: currentCreatedAt,
+          bestOf: { ...bestOf, index: 1 },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const crashPartial = createMuxMessage(
+      "assistant-parent-best-of-superseded-crash",
+      "assistant",
+      "Waiting on best-of subagents…",
+      { timestamp: partialTimestamp },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "task-best-of-superseded-call",
+          toolName: "task",
+          input: { subagent_type: "explore", prompt: "compare options", title: "Best of 2", n: 2 },
+          state: "input-available",
+        },
+      ]
+    );
+    expect((await partialService.writePartial(parentId, crashPartial)).success).toBe(true);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
+    for (const [childTaskId, reportMarkdown] of [
+      [childOneId, "Report from child one"],
+      [childTwoId, "Report from child two"],
+    ] as const) {
+      await upsertSubagentReportArtifact({
+        workspaceId: parentId,
+        workspaceSessionDir: parentSessionDir,
+        childTaskId,
+        parentWorkspaceId: parentId,
+        ancestorWorkspaceIds: [parentId],
+        reportMarkdown,
+        nowMs: Date.now(),
+      });
+    }
+
+    // A parent turn that starts while finalization is still assembling the grouped output
+    // commits the crash partial and writes its own under a new message id. Finalization reads
+    // the crash partial once to resolve the group and once more to finalize; the turn lands
+    // right after that second read.
+    const liveTurnPartial = createMuxMessage(
+      "assistant-parent-best-of-superseded-live-turn",
+      "assistant",
+      "Working on the follow-up…",
+      { timestamp: partialTimestamp + 120_000 },
+      []
+    );
+    const originalReadPartial = partialService.readPartial.bind(partialService);
+    let crashPartialReads = 0;
+    const readPartialSpy = spyOn(partialService, "readPartial").mockImplementation(
+      async (workspaceId: string) => {
+        const current = await originalReadPartial(workspaceId);
+        if (workspaceId === parentId && current?.id === crashPartial.id) {
+          crashPartialReads += 1;
+          if (crashPartialReads === 2) {
+            await partialService.writePartial(parentId, liveTurnPartial);
+          }
+        }
+        return current;
+      }
+    );
+    try {
+      await taskService.runStartupHousekeeping();
+    } finally {
+      readPartialSpy.mockRestore();
+    }
+
+    const parentPartial = await partialService.readPartial(parentId);
+    expect(parentPartial?.id).toBe(liveTurnPartial.id);
+    expect(
+      parentPartial?.parts.some((p) => (p as { type?: unknown }).type === "dynamic-tool")
+    ).toBe(false);
   });
 
   test("initialize finalizes ready legacy variants partials", async () => {

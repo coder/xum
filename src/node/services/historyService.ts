@@ -1868,41 +1868,74 @@ export class HistoryService {
    * Write a partial message to disk.
    */
   async writePartial(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.writePartialUnlocked(workspaceId, message)
+    );
+  }
+
+  /**
+   * Read-modify-write the partial under the per-workspace lock, only while it still belongs to
+   * `messageId`. Returns false (writing nothing) when the partial is missing, belongs to another
+   * message, or `updater` declines. Callers that assembled an update from an earlier read use this
+   * so a stream started in between (commit of that partial, then a new one under the fresh
+   * message id) is never resurrected or overwritten.
+   */
+  async updatePartialIfMessageIdMatches(
+    workspaceId: string,
+    messageId: string,
+    updater: (current: MuxMessage) => MuxMessage | null
+  ): Promise<Result<boolean>> {
     return this.fileLocks.withLock(workspaceId, async () => {
-      try {
-        // r66: partial flushes ride the cross-process history lock with an
-        // in-lock removal-tombstone gate — a foreign backend's active stream
-        // survives the remover's process-local cancellation, and its next
-        // delta's ensurePrivateDir would otherwise recreate the deleted
-        // session directory (removal holds this same lock across its
-        // tombstone+delete critical section). Truncation recovery is skipped:
-        // partial.json is not part of the archive/chat transaction.
-        return await this.withHistoryWriteFileLock(workspaceId, async () => {
-          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
-            return Err(`workspace ${workspaceId} was removed; refusing partial write`);
-          }
-          const workspaceDir = this.getSessionDir(workspaceId);
-          await ensurePrivateDir(workspaceDir);
-          const partialPath = this.getPartialPath(workspaceId);
-
-          const partialMessage: MuxMessage = {
-            ...message,
-            metadata: {
-              ...message.metadata,
-              partial: true,
-            },
-          };
-
-          // Atomic write: writes to temp file then renames, preventing corruption
-          // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
-          await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
-          return Ok(undefined);
-        });
-      } catch (error) {
-        const errorMessage = getErrorMessage(error);
-        return Err(`Failed to write partial: ${errorMessage}`);
+      const current = await this.readPartial(workspaceId);
+      if (current?.id !== messageId) {
+        return Ok(false);
       }
+      const updated = updater(current);
+      if (updated == null) {
+        return Ok(false);
+      }
+      const writeResult = await this.writePartialUnlocked(workspaceId, updated);
+      return writeResult.success ? Ok(true) : writeResult;
     });
+  }
+
+  private async writePartialUnlocked(
+    workspaceId: string,
+    message: MuxMessage
+  ): Promise<Result<void>> {
+    try {
+      // r66: partial flushes ride the cross-process history lock with an
+      // in-lock removal-tombstone gate — a foreign backend's active stream
+      // survives the remover's process-local cancellation, and its next
+      // delta's ensurePrivateDir would otherwise recreate the deleted
+      // session directory (removal holds this same lock across its
+      // tombstone+delete critical section). Truncation recovery is skipped:
+      // partial.json is not part of the archive/chat transaction.
+      return await this.withHistoryWriteFileLock(workspaceId, async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+          return Err(`workspace ${workspaceId} was removed; refusing partial write`);
+        }
+        const workspaceDir = this.getSessionDir(workspaceId);
+        await ensurePrivateDir(workspaceDir);
+        const partialPath = this.getPartialPath(workspaceId);
+
+        const partialMessage: MuxMessage = {
+          ...message,
+          metadata: {
+            ...message.metadata,
+            partial: true,
+          },
+        };
+
+        // Atomic write: writes to temp file then renames, preventing corruption
+        // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
+        await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
+        return Ok(undefined);
+      });
+    } catch (error) {
+      const errorMessage = getErrorMessage(error);
+      return Err(`Failed to write partial: ${errorMessage}`);
+    }
   }
 
   /**
