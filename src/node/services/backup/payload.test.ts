@@ -3718,6 +3718,12 @@ describe("project bundle", () => {
     return path.join(muxRoot, "memory", ".backup-origins", `${digest.slice(0, 32)}.json`);
   }
 
+  /** The project-side record of the same association (keyed by the memory dir's hash). */
+  function originTargetPath(memoryDir: string): string {
+    const digest = createHash("sha256").update(Buffer.from(memoryDir, "utf-8")).digest("hex");
+    return path.join(muxRoot, "memory", ".backup-origins", `target-${digest.slice(0, 32)}.json`);
+  }
+
   it("replaces a source's association when it is imported again elsewhere", async () => {
     const source = "/home/dev/src/alpha";
     const b = "/home/other/b";
@@ -3727,13 +3733,26 @@ describe("project bundle", () => {
     await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(c), source);
     const registered = new Map([b, c].map((project) => [project, projectMemoryDirName(project)]));
 
-    // One marker per source, so C's import replaced B's claim outright: re-registering B
+    // One record per source, so C's import replaced B's claim outright: re-registering B
     // cannot revive the older association or leave the source claimed twice.
-    expect(await fs.readdir(path.join(muxRoot, "memory", ".backup-origins"))).toEqual([
-      path.basename(originMarkerPath(source)),
-    ]);
     expect([...(await readProjectMemoryOrigins(muxRoot, registered, [source])).entries()]).toEqual([
       [source, { projectPath: c, memoryDir: projectMemoryDirName(c) }],
+    ]);
+  });
+
+  it("voids a project's previous source when another source is imported into it", async () => {
+    const a = "/home/dev/src/alpha";
+    const c = "/home/dev/src/gamma";
+    const b = "/home/other/b";
+    const registered = new Map([[b, projectMemoryDirName(b)]]);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), a);
+    await writeProjectMemoryOrigin(muxRoot, projectMemoryDirName(b), c);
+
+    // A's own record still names B, but B's record now names C: without the project's side
+    // confirming it, A would match B and overwrite it in matched mode on the next restore,
+    // or manifest order would pick which of the two claimed B.
+    expect([...(await readProjectMemoryOrigins(muxRoot, registered, [a, c])).entries()]).toEqual([
+      [c, { projectPath: b, memoryDir: projectMemoryDirName(b) }],
     ]);
   });
 
@@ -3759,7 +3778,12 @@ describe("project bundle", () => {
       projectPath: b,
       memoryDir: projectMemoryDirName(b),
     });
-    expect(await fs.readdir(originsDir)).toEqual([path.basename(originMarkerPath(source))]);
+    // Nothing half-written: the source's record, B's record, and no staging leftovers.
+    expect((await fs.readdir(originsDir)).sort()).toEqual(
+      [originMarkerPath(source), originTargetPath(projectMemoryDirName(b))]
+        .map((file) => path.basename(file))
+        .sort()
+    );
   });
 
   it("ignores markers that are broken, mis-named, or name an unregistered project", async () => {
@@ -3781,11 +3805,23 @@ describe("project bundle", () => {
       JSON.stringify({ sourcePath: orphaned, memoryDir: projectMemoryDirName("/gone") }),
       "utf-8"
     );
+    // A source record whose project never confirmed it (an import that failed between the
+    // two writes, or a hand-placed file).
+    const unconfirmed = "/home/dev/src/unconfirmed";
+    await fs.writeFile(
+      originMarkerPath(unconfirmed),
+      JSON.stringify({
+        sourcePath: unconfirmed,
+        memoryDir: projectMemoryDirName(registeredProject),
+      }),
+      "utf-8"
+    );
 
     const origins = await readProjectMemoryOrigins(muxRoot, registered, [
       broken,
       misnamed,
       orphaned,
+      unconfirmed,
     ]);
     expect(origins.size).toBe(0);
   });

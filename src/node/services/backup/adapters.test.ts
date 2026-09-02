@@ -1416,6 +1416,20 @@ describe("backup adapters project bundle", () => {
     return path.join(muxRoot, "memory", ".backup-origins", `${digest.slice(0, 32)}.json`);
   }
 
+  /** The project-side record of the same association (keyed by the memory dir's hash). */
+  function originTargetPath(memoryDir: string): string {
+    const digest = createHash("sha256").update(Buffer.from(memoryDir, "utf-8")).digest("hex");
+    return path.join(muxRoot, "memory", ".backup-origins", `target-${digest.slice(0, 32)}.json`);
+  }
+
+  /** Both halves of an association, as a completed import leaves them. */
+  async function writeOriginRecords(sourcePath: string, memoryDir: string): Promise<void> {
+    const content = JSON.stringify({ sourcePath, memoryDir });
+    await fs.mkdir(path.dirname(originMarkerPath(sourcePath)), { recursive: true });
+    await fs.writeFile(originMarkerPath(sourcePath), content, "utf-8");
+    await fs.writeFile(originTargetPath(memoryDir), content, "utf-8");
+  }
+
   async function seedProjectMemory(
     projectPath: string,
     fileName: string,
@@ -2096,6 +2110,19 @@ describe("backup adapters project bundle", () => {
     expect(
       await fs.readFile(path.join(muxRoot, "memory", "project", targetDir, "conflict.md"), "utf-8")
     ).toBe("local wins\n");
+
+    // Not promoted to a matched project while a conflict was skipped: a matched restore
+    // overwrites, and "local wins" is exactly the file this import promised to leave alone.
+    registerProject(targetPath);
+    const again = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      includeProjects: true,
+    });
+    expect(again.projectImports.map((item) => item.sourcePath)).toEqual([project]);
+    expect(again.changes.map((change) => change.path)).not.toContain(
+      `memory/project/${targetDir}/conflict.md`
+    );
   });
 
   it("keeps reporting written files when the origin marker cannot be written", async () => {
@@ -2275,12 +2302,7 @@ describe("backup adapters project bundle", () => {
     const targetPath = path.join(tempDir, "projects", "alpha-here");
     const targetDir = projectMemoryDirName(targetPath);
     registerProject(targetPath);
-    await fs.mkdir(path.dirname(originMarkerPath(project)), { recursive: true });
-    await fs.writeFile(
-      originMarkerPath(project),
-      JSON.stringify({ sourcePath: project, memoryDir: targetDir }),
-      "utf-8"
-    );
+    await writeOriginRecords(project, targetDir);
     const validated = await payload.validateRestore({
       repositoryRoot: repository.rootDir,
       managedPath: settings.path,

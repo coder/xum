@@ -190,8 +190,14 @@ interface RegisteredProjectLookup {
   byCanonical: ReadonlyMap<string, string>;
 }
 
-/** Bounds on resolving registered projects' real paths; see registeredProjectLookup. */
-const REGISTRY_CANONICALIZE_CONCURRENCY = 8;
+/**
+ * Bounds on resolving registered projects' real paths; see registeredProjectLookup. One probe
+ * in flight, deliberately: Node's fs has no cancellation, so a `realpath` that a timed-out
+ * race stopped waiting for keeps its libuv threadpool worker until the mount answers. With
+ * one at a time, an unavailable mount can hold at most one of the pool's threads, not the
+ * whole pool; the deadline bounds how long the restore itself waits.
+ */
+const REGISTRY_CANONICALIZE_CONCURRENCY = 1;
 const REGISTRY_CANONICALIZE_DEADLINE_MS = 5_000;
 
 /**
@@ -340,8 +346,8 @@ async function realpathOrNull(target: string): Promise<string | null> {
 
 /**
  * `realpathOrNull` bounded by `timeoutMs`: null once the time is up. A resolution still
- * blocked on an unavailable mount then finishes on its own in the threadpool; nothing
- * waits for it.
+ * blocked on an unavailable mount then finishes on its own in the threadpool; nothing waits
+ * for it, and REGISTRY_CANONICALIZE_CONCURRENCY keeps such leftovers to one at a time.
  */
 async function realpathWithin(target: string, timeoutMs: number): Promise<string | null> {
   if (timeoutMs <= 0) return null;
@@ -929,9 +935,13 @@ export class BackupService {
           }
           // The same directory the user approved, not merely one at the same path: a checkout
           // moved away and another created here since would otherwise be registered and
-          // receive the approved source's memory. create() re-resolves the path itself, so
-          // a swap after this check remains a race this pinning narrows rather than closes.
-          if (stat.dev !== targetIdentity.dev || stat.ino !== targetIdentity.ino) {
+          // receive the approved source's memory. Checked again after create() below, which
+          // re-resolves the path itself during its own asynchronous validation.
+          const replaced = (current: { dev: number; ino: number } | null): boolean =>
+            current === null ||
+            current.dev !== targetIdentity.dev ||
+            current.ino !== targetIdentity.ino;
+          if (replaced(stat)) {
             results.push(
               failed(`'${targetPath}' was replaced by a different directory since it was approved`)
             );
@@ -983,6 +993,18 @@ export class BackupService {
             }
           } else {
             results.push(failed(created.error));
+            continue;
+          }
+          // Re-pinned after registration, immediately before the write: a directory swapped
+          // in while create() ran was registered by path, and the approved source's memory
+          // must not follow it into that other checkout. The registration stays (the safety
+          // snapshot cannot revert it) and is reported as this candidate's failure.
+          if (replaced(await fs.lstat(targetPath).catch(() => null))) {
+            results.push(
+              failed(
+                `'${targetPath}' was replaced by a different directory while it was being registered; the registration was kept, nothing was imported`
+              )
+            );
             continue;
           }
           const written = await importer.importProjectMemory({

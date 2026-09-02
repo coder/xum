@@ -1802,6 +1802,55 @@ describe("BackupService project imports", () => {
     }
   });
 
+  test("does not import into a target replaced while it was being registered", async () => {
+    const target = path.join(tempDir, "target");
+    await fs.mkdir(target);
+    const config = new TestBackupConfig(tempDir);
+    const importedTo: string[] = [];
+    const service = createService(tempDir, {
+      config,
+      payload: createPayload({
+        validateRestore: () =>
+          Promise.resolve({
+            hasProjectBundle: true,
+            projectImports: [candidate()],
+            matchedProjects: [],
+          }),
+        prepareProjectImports: () =>
+          Promise.resolve(
+            importsWith((options) => {
+              importedTo.push(options.targetPath);
+              return Promise.resolve({ writtenFiles: [], skippedFiles: [] });
+            })
+          ),
+      }),
+    });
+    // The swap lands during create()'s own asynchronous validation, after the pre-create
+    // identity check passed: registration goes through by path, for the new directory.
+    service.setProjectService(
+      registrar(async (projectPath) => {
+        await fs.rename(target, path.join(tempDir, "target-moved"));
+        await fs.mkdir(target);
+        return Ok({ normalizedPath: projectPath });
+      })
+    );
+
+    const result = await service.restore(
+      { ...SETTINGS, includeProjects: true },
+      { projectImports: [{ token: "candidate-token", targetPath: target }] }
+    );
+
+    expect(result.success).toBe(true);
+    // The approved source's memory must not follow the path into the other checkout.
+    expect(importedTo).toEqual([]);
+    if (result.success) {
+      expect(result.data.projectImportResults[0]).toMatchObject({
+        status: "failed",
+        message: expect.stringContaining("registration was kept") as string,
+      });
+    }
+  });
+
   test("refuses an import into a project that a matched entry restores in the same run", async () => {
     const target = path.join(tempDir, "target");
     await fs.mkdir(target);

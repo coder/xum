@@ -819,7 +819,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             });
             // From now on this project is the local identity of the recorded source: later
             // restores match it and can update its memory instead of re-offering an
-            // add-only import that can never change an existing file.
+            // add-only import that can never change an existing file. Only once every file
+            // landed, though: a matched restore overwrites, so recording the origin over
+            // skipped conflicts would let the next restore replace exactly the local files
+            // this import promised to leave alone. Until the conflicts are resolved, the
+            // source stays an import candidate.
+            if (result.skipped.length > 0) return result;
             try {
               await writeProjectMemoryOrigin(muxRoot, targetDir, entry.path);
             } catch (error) {
