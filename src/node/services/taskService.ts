@@ -2291,8 +2291,8 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<void> {
     const startupStartedAt = Date.now();
     // Server-mode recovery runs after the listener is bound and can be cancelled by dispose();
-    // the size-dependent loops below check this between tasks so teardown is not delayed by
-    // (or raced with) recovery work against disposed services.
+    // every size-dependent step below checks this (and returns) so teardown is neither delayed
+    // by nor raced with recovery work against disposed services.
     const cancelled = (): boolean => options?.signal?.aborted === true;
     const startupConfig = startupConfigSnapshot ?? this.config.loadConfigOrDefault();
     const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
@@ -2578,7 +2578,14 @@ export class TaskService implements AgentTaskIntegration {
           reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
           experiments: task.taskExperiments,
         },
-        { synthetic: true, agentInitiated: true, admissionStale: restartNudgeAdmissionStale }
+        {
+          synthetic: true,
+          agentInitiated: true,
+          // Idle-only: a client turn that entered preflight after the isStreaming() check above
+          // must suppress this stale "Xum restarted" nudge instead of queueing it behind itself.
+          requireIdle: true,
+          admissionStale: restartNudgeAdmissionStale,
+        }
       );
       const durationMs = Date.now() - resumeStartedAt;
       if (!sendResult.success) {
@@ -2625,7 +2632,7 @@ export class TaskService implements AgentTaskIntegration {
 
     const patchGenerationRecoveryStartedAt = Date.now();
     for (const task of completedReportTasks) {
-      if (cancelled()) break;
+      if (cancelled()) return;
       if (!task.parentWorkspaceId) continue;
       try {
         // Pass the loop snapshot: reloading config.json per reported task made this pass scale
@@ -2650,6 +2657,7 @@ export class TaskService implements AgentTaskIntegration {
     // on disk after a restart, there may be no later child stream-end to finalize the pending
     // parent task tool call. Re-run the deferred parent delivery/finalization pass first so
     // cleanup rechecks do not stay blocked forever behind a stale input-available partial.
+    if (cancelled()) return;
     const bestOfRecoveryStartedAt = Date.now();
     const bestOfParentWorkspaceIds = new Set<string>();
     for (const task of completedReportTasks) {
@@ -2665,6 +2673,7 @@ export class TaskService implements AgentTaskIntegration {
       bestOfParentWorkspaceIds.add(parentWorkspaceId);
     }
     for (const parentWorkspaceId of bestOfParentWorkspaceIds) {
+      if (cancelled()) return;
       await this.deliverDeferredBestOfReportsForParent(parentWorkspaceId);
     }
     const bestOfRecoveryMs = Date.now() - bestOfRecoveryStartedAt;
@@ -2677,7 +2686,7 @@ export class TaskService implements AgentTaskIntegration {
     // since clients may have reactivated or re-parented a task since the snapshot.
     let cleanupConfig = config;
     for (const task of completedReportTasks) {
-      if (cancelled()) break;
+      if (cancelled()) return;
       if (!task.id) continue;
       const removedCount = await this.cleanupReportedLeafTask(task.id, { config: cleanupConfig });
       if (removedCount > 0) {
@@ -2685,6 +2694,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     const cleanupReportedTasksMs = Date.now() - cleanupReportedTasksStartedAt;
+    if (cancelled()) return;
 
     // Startup self-heal for leftover workflow task garbage: interrupted-without-report
     // workflow-owned children of inactive runs (both the ones the prepass above just
@@ -2697,6 +2707,7 @@ export class TaskService implements AgentTaskIntegration {
       log.error("Startup workflow task archive sweep failed", { error });
     }
 
+    if (cancelled()) return;
     let queuedTerminalWorkflowRunAttentionCount = 0;
     try {
       queuedTerminalWorkflowRunAttentionCount = await this.sweepWorkflowRunTerminalAttention();
@@ -2715,6 +2726,7 @@ export class TaskService implements AgentTaskIntegration {
       }, WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS);
       this.workflowAttentionSweepTimer.unref?.();
     }
+    if (cancelled()) return;
     const recoveredTerminalWorkspaceTurnNotificationCount =
       await this.getWorkspaceTurnManager().recoverTerminalWorkspaceTurnAttentionNotifications();
     const terminalAttentionDrainStartedAt = Date.now();
@@ -10523,11 +10535,23 @@ export class TaskService implements AgentTaskIntegration {
       {
         synthetic: true,
         agentInitiated: true,
-        // The status check at the top of this method is a one-shot read; a task_stop that lands
-        // during the awaits since then must refuse admission rather than be resurrected.
-        admissionStale: () =>
-          findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
-            .taskStatus !== "awaiting_report",
+        // The status and descendant checks at the top of this method are one-shot reads; a
+        // task_stop or a newly spawned blocking descendant landing during the awaits since then
+        // must refuse admission rather than resume the coordinator.
+        admissionStale: () => {
+          const freshConfig = this.config.loadConfigOrDefault();
+          if (
+            findWorkspaceEntry(freshConfig, workspaceId)?.workspace.taskStatus !== "awaiting_report"
+          ) {
+            return true;
+          }
+          return (
+            this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(
+              this.buildAgentTaskIndex(freshConfig),
+              workspaceId
+            ).length > 0
+          );
+        },
       }
     );
     const durationMs = Date.now() - startedAt;
