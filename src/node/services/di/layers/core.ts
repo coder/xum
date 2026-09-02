@@ -1,14 +1,17 @@
 import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { secretsToRecord } from "@/common/types/secrets";
+import { isMultiProject } from "@/common/utils/multiProject";
+import { STAGING_DIR_NAME, readMutationEpochToken } from "@/node/services/agentPlugins/journals";
+import {
+  PLUGIN_SERVER_KEY_PREFIX,
+  createAgentPluginsMcpProvider,
+} from "@/node/services/agentPlugins/mcpConfig";
 import { AIService } from "@/node/services/aiService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import {
-  buildCoreTail,
-  type CoreOptions,
-  type CoreServices,
-  type CoreServicesOptions,
-} from "@/node/services/coreServices";
+import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive } from "@/node/services/di/effectRunner";
 import {
@@ -46,15 +49,23 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import { InitStateManager } from "@/node/services/initStateManager";
+import { log } from "@/node/services/log";
+import { MCPConfigService } from "@/node/services/mcpConfigService";
+import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { StreamManager } from "@/node/services/streamManager";
+import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
+import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { WorkspaceService } from "@/node/services/workspaceService";
+import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { StoresFromCoreOptionsLive } from "./stores";
 
 /**
@@ -67,10 +78,9 @@ import { StoresFromCoreOptionsLive } from "./stores";
  * only through what a body yields, and build order only through the explicit
  * stages at the bottom of this file (`Layer.provideMerge` between stages;
  * `Layer.mergeAll` for true siblings within a stage — siblings may build in
- * any order, so nothing may rely on sibling order). The head of the graph
- * (S1–S3, through `AIService`) is staged here; the remainder and the
- * setter/listener wiring still run imperatively (`buildCoreTail`) behind a
- * projection layer until the next PR peels them too.
+ * any order, so nothing may rely on sibling order). The former imperative
+ * body's setter/listener wiring is replayed, in its original order, by
+ * `CoreWiringLive` once every service exists.
  */
 
 /** The core graph's inputs other than the stores (`CoreOptions` in coreServices.ts). */
@@ -162,10 +172,10 @@ export const TerminalAttentionStoreLive = Layer.effect(
 // gets a working dispatcher. Without this, requestContinuationAfterStreamEnd
 // is a no-op and the auto-continuation loop never fires. The dispatcher is
 // also exposed so ServiceContainer can share it with HeartbeatService. Its
-// consumer is registered by the graph's wiring once Task/Workspace exist.
+// consumer is registered by `CoreWiringLive` once Task/Workspace exist.
 export const IdleDispatcherLive = Layer.sync(IdleDispatcherTag, () => new IdleDispatcher());
 
-/** One mutable record per graph build (`sync`, not `succeed`); filled by the graph's wiring. */
+/** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
   TurnRequestBuilderBindingsTag,
   (): TurnRequestBuilderBindings => ({})
@@ -247,55 +257,297 @@ export const AILive = Layer.effect(
 );
 
 // ---------------------------------------------------------------------------
-// Remainder projection (transitional): today's imperative construction of the
-// services after AIService plus all of the graph's wiring (`buildCoreTail`,
-// order unchanged) over the layer-built head, exposed under their tags. The
-// next PR peels it into stages S4–S8 and a `CoreWiringLive`.
+// S4 — need AIService (S3).
 // ---------------------------------------------------------------------------
 
-/** What `buildCoreTail` produces. */
-export type CoreTailTags =
-  | MemoryConsolidation
-  | MCPConfig
-  | MCPServerManagerTag
-  | Workspace
-  | Task
-  | WorkspaceTurnManagerTag;
-
-const CoreTailProjectionLive: Layer.Layer<
-  CoreTailTags,
-  never,
-  Exclude<CoreTags, CoreTailTags> | CoreInputTags
-> = Layer.effectContext(
+// Background dream consolidation (memory-consolidation experiment). Without
+// an ExperimentsService (CLI/test contexts) the service stays inert.
+export const MemoryConsolidationLive = Layer.effect(
+  MemoryConsolidation,
   Effect.gen(function* () {
-    const tail = buildCoreTail({
-      config: yield* ConfigTag,
-      secretsStore: yield* SecretsStoreTag,
-      providersConfigStore: yield* ProvidersConfigStoreTag,
-      options: yield* CoreOptionsTag,
-      historyService: yield* History,
-      initStateManager: yield* InitStateManagerTag,
-      backgroundProcessManager: yield* BackgroundProcessManagerTag,
-      sessionUsageService: yield* SessionUsage,
-      extensionMetadata: yield* ExtensionMetadata,
-      workspaceGoalService: yield* WorkspaceGoal,
-      idleDispatcher: yield* IdleDispatcherTag,
-      streamManager: yield* StreamManagerTag,
-      aiService: yield* AI,
-      memoryService: yield* Memory,
-      memoryMetaService: yield* MemoryMeta,
-      turnRequestBuilderBindings: yield* TurnRequestBuilderBindingsTag,
-      workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
-      terminalAttentionStore: yield* TerminalAttentionStoreTag,
-    });
-    return Context.empty().pipe(
-      Context.add(MemoryConsolidation, tail.memoryConsolidationService),
-      Context.add(MCPConfig, tail.mcpConfigService),
-      Context.add(MCPServerManagerTag, tail.mcpServerManager),
-      Context.add(Workspace, tail.workspaceService),
-      Context.add(Task, tail.taskService),
-      Context.add(WorkspaceTurnManagerTag, tail.workspaceTurnManager)
+    const opts = yield* CoreOptionsTag;
+    return new MemoryConsolidationService(
+      yield* ConfigTag,
+      yield* Memory,
+      yield* MemoryMeta,
+      yield* History,
+      yield* AI,
+      opts.experimentsService ?? { isExperimentEnabled: () => false },
+      yield* SessionUsage
     );
+  })
+);
+
+export const MCPConfigLive = Layer.effect(
+  MCPConfig,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    const config = yield* ConfigTag;
+    // MCP: allow callers to override which Config provides server definitions
+    const mcpConfig = opts.mcpConfig ?? config;
+    // Agent Plugins (agent-plugins experiment): read-only plugin MCP servers are
+    // merged into listings; without an ExperimentsService the provider is inert.
+    return new MCPConfigService(mcpConfig, {
+      agentPluginsMcpProvider: createAgentPluginsMcpProvider({
+        xumHome: mcpConfig.rootDir,
+        isEnabled: () =>
+          opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS) === true,
+      }),
+      policyService: opts.policyService,
+      telemetryService: opts.telemetryService,
+      workspaceMetadataProvider: yield* AI,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// S5 — MCPServerManager needs MCPConfig (S4).
+// ---------------------------------------------------------------------------
+
+export const MCPServerManagerLive = Layer.effect(
+  MCPServerManagerTag,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    const config = yield* ConfigTag;
+    const mcpConfig = opts.mcpConfig ?? config;
+    const workspaceMcpOverridesService = yield* WorkspaceMcpOverrides;
+    return new MCPServerManager(
+      yield* MCPConfig,
+      {
+        // A plugin update/uninstall in a sibling process (desktop app alongside
+        // `xum server`) bumps the installer's mutation epoch; managers retire
+        // cached plugin instances before serving them again. The sibling's
+        // uninstall also pruned plugin keys from workspace override files, so
+        // the sweep refreshes cached override snapshots from disk.
+        config,
+        telemetryService: opts.telemetryService,
+        pluginInvalidation: {
+          keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
+          readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
+          readWorkspaceOverrides: async (workspaceId: string) =>
+            (await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)).overrides,
+        },
+        ...opts.mcpServerManagerOptions,
+      },
+      opts.policyService
+    );
+  })
+);
+
+// ---------------------------------------------------------------------------
+// S6 — WorkspaceService. Its constructor needs nothing beyond S3 (the MCP
+// manager and memory consolidation collaborators arrive through setters in
+// CoreWiringLive); it is staged after MCPServerManager only to keep the former
+// body's construction order, not because of a dependency.
+// ---------------------------------------------------------------------------
+
+// The constructor subscribes to its declared dependencies (backgroundProcessManager,
+// aiService, initStateManager, extensionMetadata) and starts the bash-monitor
+// recovery pass; it touches none of its setter-provided collaborators (I6).
+export const WorkspaceLive = Layer.effect(
+  Workspace,
+  Effect.gen(function* () {
+    const opts = yield* CoreOptionsTag;
+    return new WorkspaceService(
+      yield* ConfigTag,
+      yield* History,
+      yield* AI,
+      yield* InitStateManagerTag,
+      yield* ExtensionMetadata,
+      yield* BackgroundProcessManagerTag,
+      yield* SessionUsage,
+      opts.policyService,
+      opts.telemetryService,
+      opts.experimentsService,
+      opts.sessionTimingService,
+      yield* StreamManagerTag,
+      yield* SecretsStoreTag,
+      yield* ProvidersConfigStoreTag
+    );
+  })
+);
+
+// ---------------------------------------------------------------------------
+// S7 — TaskService needs Workspace (S6).
+// ---------------------------------------------------------------------------
+
+// The constructor subscribes to aiService stream events after WorkspaceService's
+// own subscriptions — guaranteed by staging, since it depends on Workspace (I6).
+export const TaskLive = Layer.effect(
+  Task,
+  Effect.gen(function* () {
+    return new TaskService(
+      yield* ConfigTag,
+      yield* History,
+      yield* AI,
+      yield* Workspace,
+      yield* InitStateManagerTag,
+      yield* SessionUsage,
+      yield* WorkspaceGoal,
+      yield* SecretsStoreTag,
+      yield* TerminalAttentionStoreTag
+    );
+  })
+);
+
+// ---------------------------------------------------------------------------
+// S8 — WorkspaceTurnManager needs TaskService (S7).
+// ---------------------------------------------------------------------------
+
+export const WorkspaceTurnManagerLive = Layer.effect(
+  WorkspaceTurnManagerTag,
+  Effect.gen(function* () {
+    return new WorkspaceTurnManager(
+      yield* ConfigTag,
+      yield* History,
+      yield* AI,
+      yield* Workspace,
+      yield* InitStateManagerTag,
+      yield* Task,
+      yield* TerminalAttentionStoreTag,
+      yield* StreamManagerTag
+    );
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Wiring — the former construction body's setter/listener lines, in their
+// original order, once every service exists. Synchronous statements only: no
+// finalizers, no forks (I5), so `dispose()` order stays explicit elsewhere.
+// ---------------------------------------------------------------------------
+
+export const CoreWiringLive: Layer.Layer<
+  never,
+  never,
+  CoreTags | ConfigTag | SecretsStoreTag | CoreOptionsTag | WorkspaceMcpOverrides
+> = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* ConfigTag;
+    const opts = yield* CoreOptionsTag;
+    const secretsStore = yield* SecretsStoreTag;
+    const extensionMetadata = yield* ExtensionMetadata;
+    const workspaceGoalService = yield* WorkspaceGoal;
+    const workspaceMcpOverridesService = yield* WorkspaceMcpOverrides;
+    const turnRequestBuilderBindings = yield* TurnRequestBuilderBindingsTag;
+    const streamManager = yield* StreamManagerTag;
+    const aiService = yield* AI;
+    const memoryService = yield* Memory;
+    const memoryConsolidationService = yield* MemoryConsolidation;
+    const mcpServerManager = yield* MCPServerManagerTag;
+    const workspaceService = yield* Workspace;
+    const taskService = yield* Task;
+    const workspaceTurnManager = yield* WorkspaceTurnManagerTag;
+    const idleDispatcher = yield* IdleDispatcherTag;
+
+    // Write tombstones are process-local removal knowledge; the shared config
+    // is the authority (with XUM_ALLOW_MULTIPLE_INSTANCES a downgraded backend
+    // can legitimately re-register a deterministic legacy id this process
+    // pruned). Without this probe, a tombstoned id that becomes active again
+    // would have every metadata write and broadcast suppressed until an
+    // activity bootstrap happens to run. Raw view first (cheap; complete when
+    // every persisted entry carries an inline id); only id-less legacy entries
+    // require the authoritative enumeration. Throws propagate: unknowable
+    // registration keeps the tombstone.
+    extensionMetadata.setRegistrationProbe(async (workspaceId) => {
+      const evidence = config.readPersistedWorkspaceIdEvidence();
+      if (evidence.ids.has(workspaceId)) {
+        return true;
+      }
+      if (!evidence.hasWorkspaceEntriesWithoutIds) {
+        return false;
+      }
+      // Targeted lenient positive first: a POSITIVE identity match needs no
+      // completeness, so a re-registered workspace whose own compatibility
+      // metadata is healthy must not stay write-suppressed because an
+      // UNRELATED legacy entry's metadata is malformed (the strict
+      // enumeration below throws on the first such entry, and the tombstone
+      // would then pin every one of the target's writes as transient
+      // indefinitely). A lenient scan only skips unreadable entries — it
+      // never fabricates a match.
+      if (config.findWorkspace(workspaceId) != null) {
+        return true;
+      }
+      // Negatives keep requiring the complete strict view: a lenient miss is
+      // indistinguishable from an identity hidden by a read failure. Alias
+      // ids: a second resolvable compatibility file's identity stays
+      // registered for findWorkspace even though it is not any entry's
+      // primary id — refusing its writes/deletions requires knowing it here.
+      const legacyAliasIds = new Set<string>();
+      const registered = (
+        await config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })
+      ).some((metadata) => metadata.id === workspaceId);
+      return registered || legacyAliasIds.has(workspaceId);
+    });
+
+    turnRequestBuilderBindings.memoryService = memoryService;
+
+    turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
+    streamManager.setMCPServerManager(mcpServerManager);
+    // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
+    // resolve credentials from current configuration.
+    mcpServerManager.setSecretsResolver(async (workspaceId, projectPath) => {
+      const metadataResult = await aiService.getWorkspaceMetadata(workspaceId);
+      const metadata = metadataResult.success ? metadataResult.data : null;
+      const secrets =
+        metadata && isMultiProject(metadata)
+          ? mergeMultiProjectSecrets(metadata, secretsStore)
+          : secretsStore.getEffectiveSecrets(projectPath);
+      return secretsToRecord(secrets);
+    });
+
+    turnRequestBuilderBindings.workspaceHeartbeatService = workspaceService;
+    // Tool-started workflows share the same sidebar activity cache as ORPC-started workflows,
+    // so terminal updates must prune active run counts regardless of launch path.
+    turnRequestBuilderBindings.onWorkflowRunStatusChanged = (event) =>
+      workspaceService.emitWorkflowRunActivity(event);
+    turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
+    workspaceService.setMemoryConsolidationService(memoryConsolidationService);
+    if (opts.devToolsService) {
+      // DevTools debug-log cleanup when workspaces are archived/removed.
+      workspaceService.setDevToolsService(opts.devToolsService);
+    }
+    workspaceService.setMCPServerManager(mcpServerManager);
+    // Plugin override keys must be pruned from a workspace's override files when
+    // registering a preserved checkout (desktop create/fork, task
+    // materialization, and headless `xum run`/`xum workflow` registration) and
+    // during removal: a stale enable in a kept .xum/mcp.local.jsonc could
+    // otherwise re-activate a same-name reinstall's server.
+    workspaceService.setWorkspaceMcpOverridesService(workspaceMcpOverridesService);
+    workspaceService.setWorkspaceGoalService(workspaceGoalService);
+    workspaceGoalService.setOnActivityChange((workspaceId, snapshot) => {
+      workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
+    });
+    // Wire user-initiated `promoteUpcomingGoal` through `interruptStream`
+    // so promoting mid-stream cleanly aborts the in-flight turn before
+    // the new active goal lands. Without this, the goal service would
+    // proceed without aborting and the tail of the current stream could
+    // leak token usage into the newly-promoted goal's accounting (the
+    // earlier Codex P1 concern). Soft hand-off here means a queued
+    // message stays in the user's input box; the next `sendMessage`
+    // will start fresh against the promoted goal.
+    workspaceGoalService.setStreamInterrupter(async (workspaceId) => {
+      const result = await workspaceService.interruptStream(workspaceId);
+      if (!result.success) {
+        // The goal service logs + falls back; we just surface a warning
+        // here so production paths flag the rare error.
+        log.warn("coreServices: promote interrupt failed", { workspaceId, error: result.error });
+      }
+    });
+
+    taskService.setWorkspaceTurnManager(workspaceTurnManager);
+    turnRequestBuilderBindings.taskService = taskService;
+    turnRequestBuilderBindings.workspaceTurnManager = workspaceTurnManager;
+    workspaceService.setAgentTaskIntegration(taskService);
+
+    workspaceGoalService.registerGoalContinuationConsumer(idleDispatcher, {
+      hasActiveDescendantTasks: (workspaceId) =>
+        taskService.hasActiveDescendantAgentTasksForWorkspace(workspaceId),
+      getRuntimeState: (workspaceId) =>
+        workspaceService.getGoalContinuationRuntimeState(workspaceId),
+      executeGoalContinuation: (input) => workspaceService.executeGoalContinuation(input),
+      getKickoffSendOptions: (workspaceId) =>
+        workspaceService.getGoalContinuationKickoffSendOptions(workspaceId),
+    });
   })
 );
 
@@ -318,6 +570,11 @@ const S1 = Layer.mergeAll(
 const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
+const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive).pipe(Layer.provideMerge(S3));
+const S5 = MCPServerManagerLive.pipe(Layer.provideMerge(S4));
+const S6 = WorkspaceLive.pipe(Layer.provideMerge(S5));
+const S7 = TaskLive.pipe(Layer.provideMerge(S6));
+const S8 = WorkspaceTurnManagerLive.pipe(Layer.provideMerge(S7));
 
 /**
  * The whole core graph, wired. The roots provide `CoreInputTags` beneath it
@@ -328,7 +585,7 @@ export const CoreLive: Layer.Layer<
   Exclude<CoreTags, MemoryMeta>,
   never,
   CoreInputTags
-> = CoreTailProjectionLive.pipe(Layer.provideMerge(S3));
+> = CoreWiringLive.pipe(Layer.provideMerge(S8));
 
 /** Tagged context → the plain `CoreServices` object the roots hand out. */
 export function coreServicesFromContext(context: Context.Context<CoreTags>): CoreServices {

@@ -4,7 +4,7 @@ import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { Context } from "effect";
 import { createConfigStores, type ConfigStores } from "@/node/config";
-import * as coreServices from "@/node/services/coreServices";
+import * as agentPluginsMcpConfig from "@/node/services/agentPlugins/mcpConfig";
 import type { CoreServices } from "@/node/services/coreServices";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import {
@@ -157,13 +157,18 @@ describe("createCoreServices", () => {
     // The afterEach pair then exercises the idempotent second close/dispose.
   });
 
-  it("surfaces a throwing graph body as a synchronous throw", () => {
-    const buildSpy = spyOn(coreServices, "buildCoreTail").mockImplementation(() => {
+  it("surfaces a throwing layer body as a synchronous throw", () => {
+    // A throw deep inside a nested stage (MCPConfigLive, S4) must propagate
+    // through the staged composition as the same synchronous throw a service
+    // constructor produces, so the CLI roots' existing startup error paths
+    // apply unchanged.
+    const providerSpy = spyOn(
+      agentPluginsMcpConfig,
+      "createAgentPluginsMcpProvider"
+    ).mockImplementation(() => {
       throw new Error("core boom");
     });
     try {
-      // Same shape as a throwing service constructor, so the CLI roots' existing
-      // startup error paths apply unchanged.
       expect(() =>
         createCoreServices({
           ...stores,
@@ -171,7 +176,7 @@ describe("createCoreServices", () => {
         })
       ).toThrow("core boom");
     } finally {
-      buildSpy.mockRestore();
+      providerSpy.mockRestore();
     }
   });
 
