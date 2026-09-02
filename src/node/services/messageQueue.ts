@@ -123,6 +123,11 @@ export type QueueCutCutter =
   | { stage: "dispatching"; muxMetadata: unknown }
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
 
+export interface QueueAdmissionCancelState {
+  canceledBeforeAcceptance: boolean;
+  providerExcludedAfterAcceptance?: boolean;
+}
+
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
   agentInitiated?: boolean;
@@ -144,7 +149,7 @@ interface QueuedMessageInternalOptions {
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
   /** Mutable dispatch outcome shared with sendQueuedMessages. */
-  cancelState?: { canceledBeforeAcceptance: boolean };
+  cancelState?: QueueAdmissionCancelState;
   /** Cancels a queued entry even after it has been dequeued into PREPARING. */
   cancelSignal?: AbortSignal;
   /**
@@ -209,7 +214,7 @@ interface QueueEntry {
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-  cancelState?: { canceledBeforeAcceptance: boolean };
+  cancelState?: QueueAdmissionCancelState;
   cancelSignal?: AbortSignal;
   /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
   preTurnMessages?: MuxMessage[];

@@ -665,6 +665,26 @@ describe("WorkspaceGoalService", () => {
     expect(reconciled).toMatchObject({ status: "active" });
   });
 
+  test("chat-tail reconciliation ignores provider-excluded goal continuations", async () => {
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Keep the stopped goal paused",
+      status: "paused",
+    });
+    await appendUserHistoryMessage(historyService, workspaceId, "Canceled continuation", {
+      timestamp: Date.now(),
+      synthetic: true,
+      uiVisible: true,
+      kind: GOAL_CONTINUATION_KIND,
+      goalId: created.goalId,
+      providerExcluded: true,
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "paused" });
+  });
+
   test("pause appends a hidden user boundary so the chat tail no longer marks the goal active", async () => {
     await setGoalOk(service, { workspaceId, objective: "Pause from continuation" });
     await appendUserHistoryMessage(historyService, workspaceId, "Continue goal", {

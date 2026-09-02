@@ -25,6 +25,7 @@ import {
 import type { GoalBoardEntry, GoalBoardSnapshot, GoalBoardV1 } from "@/common/types/goal";
 import {
   createMuxMessage,
+  isProviderExcludedMessage,
   isSyntheticSnapshotUserMessage,
   pickStartupRetrySendOptions,
 } from "@/common/types/message";
@@ -745,7 +746,11 @@ export class WorkspaceGoalService {
     let crossedOtherGoalHistory = false;
     for (let index = historyResult.data.length - 1; index >= 0; index -= 1) {
       const message = historyResult.data[index];
-      if (message.role !== "user" || isSyntheticSnapshotUserMessage(message)) {
+      if (
+        message.role !== "user" ||
+        isProviderExcludedMessage(message) ||
+        isSyntheticSnapshotUserMessage(message)
+      ) {
         continue;
       }
 

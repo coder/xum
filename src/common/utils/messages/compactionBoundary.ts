@@ -6,7 +6,7 @@ import {
 import { isPositiveInteger } from "@/common/utils/numbers";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
 
-import type { MuxMessage } from "@/common/types/message";
+import { isProviderExcludedMessage, type MuxMessage } from "@/common/types/message";
 
 export { CONTEXT_BOUNDARY_KINDS, type ContextBoundaryKind };
 
@@ -129,7 +129,7 @@ export function sliceMessagesFromLatestCompactionBoundary(messages: MuxMessage[]
 }
 
 export function isProviderEligibleMessage(message: MuxMessage): boolean {
-  if (isDurableContextResetBoundaryMarker(message)) {
+  if (isProviderExcludedMessage(message) || isDurableContextResetBoundaryMarker(message)) {
     return false;
   }
 

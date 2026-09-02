@@ -17626,6 +17626,58 @@ describe("WorkspaceService interruptStream", () => {
       getOrCreateSessionSpy.mockRestore();
     }
   });
+
+  test("restores the queue when hard-interrupt cleanup fails", async () => {
+    const workspaceId = "ws-interrupt-cleanup-failure-111";
+    const mockConfig: MockWorkspaceConfig = {
+      srcDir: "/tmp/test",
+      sessionsDir: "/tmp/test/sessions",
+      generateStableId: mock(() => "test-id"),
+      findWorkspace: mock(() => null),
+    };
+    const mockAIService = {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false, error: "not found" })),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+    const workspaceService = createWorkspaceServiceForTest({
+      config: mockConfig,
+      historyService,
+      aiService: mockAIService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const restoreQueueToInput = mock(() => undefined);
+    const fakeSession = {
+      interruptStream: mock(() => Promise.resolve(Ok(undefined))),
+      sendNextUserQueuedMessage: mock(() => true),
+      restoreQueueToInput,
+    };
+    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
+      fakeSession as unknown as AgentSession
+    );
+    const deletePartialSpy = spyOn(historyService, "deletePartial").mockRejectedValueOnce(
+      new Error("disk unavailable")
+    );
+
+    try {
+      const result = await workspaceService.interruptStream(workspaceId, {
+        abandonPartial: true,
+      });
+
+      expect(result).toEqual({
+        success: false,
+        error: "Failed to interrupt stream: disk unavailable",
+      });
+      expect(restoreQueueToInput).toHaveBeenCalledTimes(1);
+    } finally {
+      deletePartialSpy.mockRestore();
+      getOrCreateSessionSpy.mockRestore();
+    }
+  });
 });
 
 // --- Pure helper tests (no mocks needed) ---

@@ -28,7 +28,11 @@ import type {
 } from "@ai-sdk/provider";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import { filterOrphanedMcpPromptSnapshots, type MuxMessage } from "@/common/types/message";
+import {
+  filterOrphanedMcpPromptSnapshots,
+  filterProviderExcludedMessages,
+  type MuxMessage,
+} from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -194,7 +198,9 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
   const wireProviderName = inputs.wireProviderName ?? deriveWireProviderName(inputs.modelString);
 
   // AgentSession.streamWithHistory → AIService.streamMessage, in order.
-  const filteredMessages = filterOrphanedMcpPromptSnapshots(inputs.historyMessages);
+  const filteredMessages = filterOrphanedMcpPromptSnapshots(
+    filterProviderExcludedMessages(inputs.historyMessages)
+  );
   // Refusal fallback: production builds the fallback request from history plus
   // the refused attempt's partial continuation (same helper, same order).
   const requestMessages =

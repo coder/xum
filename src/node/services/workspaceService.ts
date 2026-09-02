@@ -11399,6 +11399,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
+    let deferredQueueSettlementSession: AgentSession | undefined;
     try {
       this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
@@ -11416,7 +11417,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const session = this.getOrCreateSession(workspaceId);
-      const stopResult = await session.interruptStream(options);
+      const stopResult = await session.interruptStream({
+        ...options,
+        deferQueueSettlement: options?.soft !== true,
+      });
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11424,6 +11428,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         log.error("Failed to stop stream:", stopResult.error);
         return Err(stopResult.error);
+      }
+      if (!options?.soft) {
+        deferredQueueSettlementSession = session;
       }
 
       // For hard interrupts, delete partial immediately. For soft interrupts,
@@ -11465,9 +11472,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // Restore queued messages to input box for user-initiated interrupts
         session.restoreQueueToInput();
       }
+      deferredQueueSettlementSession = undefined;
 
       return Ok(undefined);
     } catch (error) {
+      try {
+        deferredQueueSettlementSession?.restoreQueueToInput();
+      } catch (settlementError) {
+        log.error("Failed to release deferred queue settlement after interrupt failure", {
+          workspaceId,
+          error: settlementError,
+        });
+      }
       if (!options?.soft) {
         // Keep suppression state consistent if interrupt setup/stop throws.
         this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);

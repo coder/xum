@@ -2692,6 +2692,64 @@ export class HistoryService {
   }
 
   /**
+   * Atomically exclude recent active-history rows from all provider requests.
+   * A hard Stop uses this after a synthetic turn crosses its rollback boundary.
+   */
+  async markMessagesProviderExcluded(
+    workspaceId: string,
+    messageIds: readonly string[]
+  ): Promise<Result<void>> {
+    assert(messageIds.length > 0, "markMessagesProviderExcluded requires message IDs");
+    const ids = new Set(messageIds);
+    assert(ids.size === messageIds.length, "markMessagesProviderExcluded requires unique IDs");
+
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to exclude messages from provider requests",
+      async () => {
+        try {
+          const messages = await this.readChatHistory(workspaceId);
+          const foundIds = new Set(
+            messages.filter((message) => ids.has(message.id)).map((message) => message.id)
+          );
+          const missingIds = messageIds.filter((messageId) => !foundIds.has(messageId));
+          if (missingIds.length > 0) {
+            return Err(`Messages not found in active history: ${missingIds.join(", ")}`);
+          }
+          const invalidIds = messages
+            .filter(
+              (message) =>
+                ids.has(message.id) &&
+                (message.metadata?.synthetic !== true ||
+                  message.metadata.contextBoundaryKind != null ||
+                  message.metadata.compactionBoundary === true)
+            )
+            .map((message) => message.id);
+          if (invalidIds.length > 0) {
+            return Err(`Messages are not excludable synthetic rows: ${invalidIds.join(", ")}`);
+          }
+
+          const updatedMessages = messages.map((message) =>
+            ids.has(message.id)
+              ? {
+                  ...message,
+                  metadata: { ...message.metadata, providerExcluded: true },
+                }
+              : message
+          );
+          await writeFileAtomic(
+            this.getChatHistoryPath(workspaceId),
+            this.serializeHistoryEntries(updatedMessages, workspaceId)
+          );
+          return Ok(undefined);
+        } catch (error) {
+          return Err(`Failed to exclude messages: ${getErrorMessage(error)}`);
+        }
+      }
+    );
+  }
+
+  /**
    * Delete a single message by ID while preserving the rest of the history.
    *
    * This is safer than truncateAfterMessage for cleanup paths where subsequent

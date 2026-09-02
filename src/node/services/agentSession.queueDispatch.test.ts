@@ -985,19 +985,36 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("allows a provider dispatch to finish after acceptance starts", async () => {
+  test("excludes a provider dispatch when hard Stop lands during acceptance", async () => {
     const workspaceId = "queue-dispatch-provider-claim-preparing-stop";
-    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const streamMessage = mock((_options: Parameters<AIService["streamMessage"]>[0]) =>
+      Promise.resolve(Ok(createStartedTurnHandle()))
+    );
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
         streamMessage: streamMessage as unknown as AIService["streamMessage"],
       },
     });
-    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    let stopCallCount = 0;
+    let releaseHardStop: () => void = () => undefined;
+    const hardStopRelease = new Promise<void>((resolve) => {
+      releaseHardStop = resolve;
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockImplementation(async () => {
+      stopCallCount += 1;
+      if (stopCallCount === 2) {
+        await hardStopRelease;
+      }
+      return Ok(undefined);
+    });
     let markAcceptanceStarted: () => void = () => undefined;
     const acceptanceStarted = new Promise<void>((resolve) => {
       markAcceptanceStarted = resolve;
+    });
+    let markAcceptanceFinished: () => void = () => undefined;
+    const acceptanceFinished = new Promise<void>((resolve) => {
+      markAcceptanceFinished = resolve;
     });
     let releaseAcceptance: () => void = () => undefined;
     const acceptanceRelease = new Promise<void>((resolve) => {
@@ -1028,6 +1045,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           onAccepted: async () => {
             markAcceptanceStarted();
             await acceptanceRelease;
+            markAcceptanceFinished();
           },
         }
       );
@@ -1046,17 +1064,35 @@ describe("AgentSession queued message tool-call dispatch", () => {
       aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
       await acceptanceStarted;
 
-      expect((await session.interruptStream({ sendQueuedImmediately: true })).success).toBe(true);
-      expect(session.sendNextUserQueuedMessage()).toBe(true);
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(streamMessage).toHaveBeenCalledTimes(1);
+      const interruptPromise = session.interruptStream({
+        sendQueuedImmediately: true,
+        deferQueueSettlement: true,
+      });
+      expect(await waitForCondition(() => stopCallCount === 2)).toBe(true);
       releaseAcceptance();
+      await acceptanceFinished;
+      await Promise.resolve();
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(session.hasQueuedMessages()).toBe(true);
+
+      releaseHardStop();
+      expect((await interruptPromise).success).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+
+      expect(session.sendNextUserQueuedMessage()).toBe(true);
 
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
-      expect(session.hasQueuedMessages()).toBe(true);
+      const requestMessages = streamMessage.mock.calls[1]?.[0].messages ?? [];
+      const requestText = requestMessages
+        .flatMap((message) => message.parts)
+        .map((part) => (part.type === "text" ? part.text : ""));
+      expect(requestText).toContain("User send now");
+      expect(requestText).not.toContain("Background monitor wake");
+      expect(session.hasQueuedMessages()).toBe(false);
       expect(session.isPreparingTurn()).toBe(false);
     } finally {
       releaseAcceptance();
+      releaseHardStop();
       stopStream.mockRestore();
       session.dispose();
       await cleanup();
@@ -1165,7 +1201,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("finishes an irreversible synthetic claim before a Send now user", async () => {
+  test("excludes an irreversible synthetic claim before a Send now user", async () => {
     const workspaceId = "queue-dispatch-irrevocable-synthetic-send-now";
     let claimQueuedToolEndMessage: (() => boolean) | undefined;
     const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
@@ -1193,6 +1229,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
       syncGoalModeWithChatTail,
       recordStreamStarted: mock(() => undefined),
+      takePendingContinuationCandidateForManualUserMessage: mock(() => undefined),
+      acknowledgeUser: mock(() => Promise.resolve(null)),
+      clearPendingContinuationForManualUserMessage: mock(() => undefined),
     } as unknown as WorkspaceGoalService;
     const { session, cleanup, aiEmitter, aiService, historyService } =
       await createAgentSessionHarness({
@@ -1256,15 +1295,22 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       expect(await waitForCondition(() => accepted)).toBe(true);
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
-      // The exact synthetic turn starts first. The user entry remains queued for its stream-end.
-      expect(session.hasQueuedMessages()).toBe(true);
+      const requestMessages = streamMessage.mock.calls[1]?.[0].messages ?? [];
+      const requestText = requestMessages
+        .flatMap((message) => message.parts)
+        .map((part) => (part.type === "text" ? part.text : ""));
+      expect(requestText).toContain("User send now");
+      expect(requestText).not.toContain("Background monitor wake");
+      expect(session.hasQueuedMessages()).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
       if (history.success) {
-        const text = history.data
-          .flatMap((message) => message.parts)
-          .map((part) => (part.type === "text" ? part.text : ""));
-        expect(text).toContain("Background monitor wake");
+        const wake = history.data.find((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Background monitor wake"
+          )
+        );
+        expect(wake?.metadata?.providerExcluded).toBe(true);
       }
     } finally {
       releaseSync();

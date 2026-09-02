@@ -89,6 +89,8 @@ import {
   dedupeAgentSkillRefs,
   dedupeMcpPromptRefs,
   filterOrphanedMcpPromptSnapshots,
+  filterProviderExcludedMessages,
+  isProviderExcludedMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
   isCompactionSummaryMetadata,
@@ -114,7 +116,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue } from "./messageQueue";
-import type { QueueCutCutter, ToolEndQueueClaim } from "./messageQueue";
+import type { QueueAdmissionCancelState, QueueCutCutter, ToolEndQueueClaim } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -655,6 +657,7 @@ interface QueuedToolEndClaim {
   dispatchStarted: boolean;
   dispatchDeferredByHardInterrupt: boolean;
   admissionIrreversible: boolean;
+  persistedMessageIds: string[];
   retryAfterCancellation: boolean;
   admissionHold?: {
     promise: Promise<void>;
@@ -707,6 +710,8 @@ export class AgentSession {
   // provider response, so the SDK's between-step stopWhen hook cannot preempt after them.
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedToolEndClaim: QueuedToolEndClaim | undefined;
+  // Fail closed in this process if the durable provider-exclusion rewrite cannot complete.
+  private readonly providerExcludedHistoryMessageIds = new Set<string>();
   // A hard Stop blocks late SDK and provider callbacks until a new stream starts.
   private hardInterruptPendingStreamStart = false;
   // Hold a claimed admission while a hard interrupt waits for its stop result.
@@ -1696,6 +1701,9 @@ export class AgentSession {
       if (candidate.role === "system") {
         continue;
       }
+      if (isProviderExcludedMessage(candidate)) {
+        continue;
+      }
       if (this.isSyntheticGoalPauseBoundaryMessage(candidate)) {
         continue;
       }
@@ -1910,6 +1918,9 @@ export class AgentSession {
 
   private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
     if (message.role !== "user") {
+      return false;
+    }
+    if (isProviderExcludedMessage(message)) {
       return false;
     }
 
@@ -3043,7 +3054,7 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
+      cancelState?: QueueAdmissionCancelState;
       cancelSignal?: AbortSignal;
       /**
        * For queue-dispatched sends: when the user last added to the queued
@@ -3105,7 +3116,9 @@ export class AgentSession {
       /** Wait for a hard-stop cascade before this queued admission can become irreversible. */
       waitForAdmissionRelease?: () => Promise<void>;
       /** Record that persisted turn rows have crossed their rollback boundary. */
-      onAdmissionIrreversible?: () => void;
+      onAdmissionIrreversible?: (persistedMessageIds: readonly string[]) => void;
+      /** Exclude a claimed synthetic turn when a hard Stop cancels it after the boundary. */
+      excludeIrreversibleAdmissionOnCancel?: boolean;
     }
   ): Promise<AgentSessionResult<void>> {
     this.assertNotDisposed("sendMessage");
@@ -3973,7 +3986,7 @@ export class AgentSession {
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
-      internal?.onAdmissionIrreversible?.();
+      internal?.onAdmissionIrreversible?.(persistedCancelableMessageIds);
     }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -4077,6 +4090,17 @@ export class AgentSession {
         this.activeTurnThinkingOverride = null;
       }
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
+    }
+
+    if (
+      cancellationDisabled &&
+      cancelSignal?.aborted === true &&
+      internal?.excludeIrreversibleAdmissionOnCancel === true
+    ) {
+      if (internal.cancelState != null) {
+        internal.cancelState.providerExcludedAfterAcceptance = true;
+      }
+      return Ok(undefined);
     }
 
     let acceptedPreStreamFailureNotified = false;
@@ -4893,6 +4917,8 @@ export class AgentSession {
     soft?: boolean;
     abandonPartial?: boolean;
     sendQueuedImmediately?: boolean;
+    /** Keep queue drains blocked until WorkspaceService completes descendant cleanup. */
+    deferQueueSettlement?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
 
@@ -4946,7 +4972,19 @@ export class AgentSession {
 
     if (isHardInterrupt) {
       this.hardInterruptClaimSettlementPending = false;
+      const interruptedClaim = this.queuedToolEndClaim;
       this.settleQueuedToolEndClaimAfterUserInterrupt();
+      // A synthetic acceptance callback can already be running and cannot wait on the new hold.
+      // Keep its completion from draining later entries before the workspace-level policy runs.
+      this.hardInterruptClaimSettlementPending = options?.deferQueueSettlement === true;
+      await this.excludeCanceledIrreversibleClaim(interruptedClaim);
+      if (
+        options?.deferQueueSettlement !== true &&
+        interruptedClaim?.admissionIrreversible === true &&
+        !interruptedClaim.queueClaim.userAuthored
+      ) {
+        this.resumeQueuedToolEndClaimAdmission(interruptedClaim);
+      }
       this.preserveQueuedToolEndClaimForImmediateSend = false;
     }
 
@@ -5108,9 +5146,15 @@ export class AgentSession {
       );
     }
 
-    // A crash between snapshot and user-row appends can leave orphaned prompt
-    // expansions on disk; exclude them from every provider request.
-    let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
+    // A crash between snapshot and user-row appends can leave orphaned prompt expansions on disk.
+    // A failed exclusion rewrite also stays blocked in memory for this process.
+    const filterRequestMessages = (messages: MuxMessage[]): MuxMessage[] =>
+      filterOrphanedMcpPromptSnapshots(
+        filterProviderExcludedMessages(messages).filter(
+          (message) => !this.providerExcludedHistoryMessageIds.has(message.id)
+        )
+      );
+    let requestMessages = filterRequestMessages(historyResult.data);
 
     if (requestMessages.length === 0) {
       return await this.handleStreamWithHistoryFailure(
@@ -5138,7 +5182,7 @@ export class AgentSession {
       await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
       const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (refreshed.success) {
-        requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+        requestMessages = filterRequestMessages(refreshed.data);
       }
     }
 
@@ -6569,7 +6613,7 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
+      cancelState?: QueueAdmissionCancelState;
       cancelSignal?: AbortSignal;
       /** Synthetic assistant rows persisted just before the dispatched turn's user row. */
       preTurnMessages?: MuxMessage[];
@@ -6931,6 +6975,7 @@ export class AgentSession {
       dispatchStarted: false,
       dispatchDeferredByHardInterrupt: false,
       admissionIrreversible: false,
+      persistedMessageIds: [],
       retryAfterCancellation: false,
     };
     this.queuedToolEndClaim = activeClaim;
@@ -6980,7 +7025,11 @@ export class AgentSession {
     }
     const activeClaim = this.queuedToolEndClaim;
     if (activeClaim?.admissionIrreversible) {
-      // The durable row must finish its exact turn. Otherwise, a later request consumes it.
+      // A hard Stop must not start a synthetic provider turn. Keep its durable row for
+      // producer settlement, but abort admission so the request path excludes it.
+      if (!activeClaim.queueClaim.userAuthored) {
+        activeClaim.queueClaim.cancelAdmission("Queue dispatch canceled by user interrupt.");
+      }
       return;
     }
     if (
@@ -7013,6 +7062,45 @@ export class AgentSession {
       activeClaim.retryAfterCancellation = false;
     }
     this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
+  }
+
+  private async excludeCanceledIrreversibleClaim(
+    activeClaim: QueuedToolEndClaim | undefined
+  ): Promise<void> {
+    if (
+      activeClaim?.admissionIrreversible !== true ||
+      activeClaim.queueClaim.userAuthored ||
+      !activeClaim.queueClaim.admissionSignal.aborted
+    ) {
+      return;
+    }
+
+    const messageIds = activeClaim.persistedMessageIds;
+    for (const messageId of messageIds) {
+      this.providerExcludedHistoryMessageIds.add(messageId);
+    }
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    const exclusionResult = await this.historyService.markMessagesProviderExcluded(
+      this.workspaceId,
+      messageIds
+    );
+    if (exclusionResult.success) {
+      return;
+    }
+
+    // Keep the hard Stop fail-closed. Deletion is a safe fallback when the marker rewrite fails.
+    const deleteResult = await this.historyService.deleteMessages(this.workspaceId, messageIds);
+    if (!deleteResult.success) {
+      log.error("Failed to persist provider exclusion for a canceled synthetic admission", {
+        workspaceId: this.workspaceId,
+        messageIds,
+        exclusionError: exclusionResult.error,
+        deleteError: deleteResult.error,
+      });
+    }
   }
 
   private pauseQueuedToolEndClaimAdmission(): void {
@@ -7107,6 +7195,7 @@ export class AgentSession {
    */
   restoreQueueToInput(): void {
     this.assertNotDisposed("restoreQueueToInput");
+    this.hardInterruptClaimSettlementPending = false;
     const activeClaim = this.queuedToolEndClaim;
     if (activeClaim?.admissionIrreversible === true && activeClaim.admissionHold != null) {
       // WorkspaceService calls this after descendant cleanup, even when no queue entry remains.
@@ -7158,6 +7247,7 @@ export class AgentSession {
    */
   sendNextUserQueuedMessage(): boolean {
     this.assertNotDisposed("sendNextUserQueuedMessage");
+    this.hardInterruptClaimSettlementPending = false;
     const activeClaim = this.queuedToolEndClaim;
     const didPrioritizeUserEntry = this.messageQueue.prioritizeNextUserEntry();
     if (
@@ -7263,9 +7353,11 @@ export class AgentSession {
                 (dispatchClaim.queueClaim.admissionSignal.aborted ||
                   internal?.admissionStale?.() === true),
               waitForAdmissionRelease: () => this.waitForQueuedToolEndClaimAdmission(dispatchClaim),
-              onAdmissionIrreversible: () => {
+              onAdmissionIrreversible: (persistedMessageIds: readonly string[]) => {
                 dispatchClaim.admissionIrreversible = true;
+                dispatchClaim.persistedMessageIds = [...persistedMessageIds];
               },
+              excludeIrreversibleAdmissionOnCancel: !dispatchClaim.queueClaim.userAuthored,
               onCanceled: async (reason: string) => {
                 if (!dispatchClaim.retryAfterCancellation) {
                   await internal?.onCanceled?.(reason);
@@ -7285,10 +7377,20 @@ export class AgentSession {
                       : "Queue dispatch canceled by user interrupt."
                   );
                 }
-                // The callback makes monitor acceptance irreversible. Release first so a
-                // concurrent Stop lets the accepted dispatch finish instead of losing output.
-                this.releaseQueuedToolEndClaim(dispatchClaim);
-                await internal?.onAccepted?.();
+                if (dispatchClaim.queueClaim.userAuthored) {
+                  this.releaseQueuedToolEndClaim(dispatchClaim);
+                  await internal?.onAccepted?.();
+                  return;
+                }
+                // Keep a synthetic claim visible through its acceptance callback. A concurrent
+                // hard Stop can then mark its durable rows provider-excluded before startup.
+                try {
+                  await internal?.onAccepted?.();
+                } finally {
+                  // A hard Stop can install the hold while the producer callback runs.
+                  await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
+                  this.releaseQueuedToolEndClaim(dispatchClaim);
+                }
               },
             };
       this.dispatchingQueuedEntry = true;
@@ -7332,11 +7434,15 @@ export class AgentSession {
             this.sendQueuedMessages();
             return;
           }
-          if (dispatchCancelState?.canceledBeforeAcceptance === true) {
+          if (
+            dispatchCancelState?.canceledBeforeAcceptance === true ||
+            dispatchCancelState?.providerExcludedAfterAcceptance === true
+          ) {
             if (dispatchClaim != null) {
               this.releaseQueuedToolEndClaim(dispatchClaim);
             }
             if (
+              dispatchCancelState.canceledBeforeAcceptance === true &&
               !dispatchClaim?.retryAfterCancellation &&
               internal?.onCanceled == null &&
               internal?.onAcceptedPreStreamFailure != null

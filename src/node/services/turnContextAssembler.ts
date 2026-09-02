@@ -7,7 +7,7 @@ import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
 import { ADVISOR_USAGE_GUIDANCE } from "@/common/constants/advisor";
-import type { MuxMessage } from "@/common/types/message";
+import { filterProviderExcludedMessages, type MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import {
@@ -66,7 +66,9 @@ export function prepareProviderRequestMessages(
   contextBoundarySlicedCount: number;
 } {
   // Workflow display rows are durable UI history, not main-agent context.
-  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages);
+  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(
+    filterProviderExcludedMessages(messages)
+  );
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
     sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
