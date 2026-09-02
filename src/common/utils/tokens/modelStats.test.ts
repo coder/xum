@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { modelsExtra } from "./models-extra";
 import { getModelStats, getModelStatsResolved, type ModelStats } from "./modelStats";
 
 const DEFAULT_IMAGE_MODEL = "openai:gpt-image-2";
@@ -97,32 +98,18 @@ describe("getModelStats", () => {
     }
   );
 
-  test("resolves the pre-release GPT-6 Astra placeholder with Sol-equivalent assumptions", () => {
-    // Every value is an assumption carried forward from GPT-5.6 Sol until OpenAI
-    // publishes the model page; the entry must at least resolve so the model is
-    // usable (context meter, compaction, pricing) and be structurally consistent.
+  test("resolves the pre-release GPT-6 Astra placeholder as Sol-equivalent stats", () => {
+    // The documented pre-release assumption is "carry GPT-5.6 Sol's limits and
+    // pricing forward until OpenAI publishes the model page". Assert that
+    // relationship rather than the literals: if Sol's rates move (e.g. a price
+    // cut), this forces a decision about whether the placeholder follows.
     const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
-    const sol = expectStats(KNOWN_MODELS.GPT.id);
-    expect(astra.max_input_tokens).toBe(1050000);
-    expect(astra.max_output_tokens).toBe(128000);
-    expect(astra.input_cost_per_token).toBe(0.000005);
-    expect(astra.output_cost_per_token).toBe(0.00003);
-    expect(astra.cache_read_input_token_cost).toBe(0.0000005);
-    expect(astra.cache_creation_input_token_cost).toBe(0.00000625);
-    expect(astra.tiered_pricing_threshold_tokens).toBe(272000);
-    // Long-context tier multipliers mirror the GPT-5.6 family (2x in / 1.5x out).
-    expect(astra.input_cost_per_token_above_200k_tokens).toBeCloseTo(
-      astra.input_cost_per_token * 2,
-      12
-    );
-    expect(astra.output_cost_per_token_above_200k_tokens).toBeCloseTo(
-      astra.output_cost_per_token * 1.5,
-      12
-    );
-    // The placeholder must not be a Sol alias: it needs its own entry so a
-    // launch-day correction touches Astra alone.
-    expect(astra).not.toBe(sol);
-    // Dated and gateway-prefixed ids fall back to the canonical entry.
+    expect(astra).toEqual(expectStats(KNOWN_MODELS.GPT.id));
+    // ...but it must be its own entry, not a Sol alias, so a launch-day
+    // correction touches Astra alone.
+    expect(modelsExtra["gpt-6-astra"]).toBeDefined();
+    expect(modelsExtra["gpt-6-astra"]).not.toBe(modelsExtra["gpt-5.6-sol"]);
+    // Dated and gateway-prefixed ids normalize to the canonical entry.
     expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
     expect(expectStats("mux-gateway:openai/gpt-6-astra")).toEqual(astra);
     // Named variants are unknown until published.

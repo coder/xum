@@ -119,6 +119,18 @@ describe("openaiSupportsNativeMaxEffort", () => {
     expect(isGpt6AstraModel("openai:gpt-5.6-sol")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6")).toBe(false);
   });
+
+  test("accepts only dated Astra snapshots, not numeric-prefixed qualifiers", () => {
+    expect(isGpt6AstraModel("gpt-6-astra-2026-09-30")).toBe(true);
+    expect(isGpt6AstraModel("gpt-6-astra-20260930")).toBe(true);
+    // Numeric-prefixed qualifiers are not dated snapshots and must not inherit the
+    // assumed max/none efforts.
+    expect(isGpt6AstraModel("gpt-6-astra-2-mini")).toBe(false);
+    expect(isGpt6AstraModel("gpt-6-astra-2026-preview")).toBe(false);
+    expect(isGpt6AstraModel("gpt-6-astra-2026-09-30-preview")).toBe(false);
+    expect(isGpt6AstraModel("gpt-6-astra-2026")).toBe(false);
+    expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra-2-mini")).toBe(false);
+  });
 });
 
 describe("openaiSupportsProMode", () => {

@@ -267,13 +267,16 @@ export function isGpt56FamilyModel(modelString: string): boolean {
 
 /**
  * GPT-6 Astra matcher: OpenAI's announced next major model, ASSUMED to ship
- * under the API id `gpt-6-astra` (pre-release; no id has been published). The
- * `\b` + lookaheads tolerate version-date suffixes (e.g. gpt-6-astra-2026-09-30)
- * while rejecting hypothetical named variants (e.g. gpt-6-astra-mini).
+ * under the API id `gpt-6-astra` (pre-release; no id has been published).
+ * Accepts only the bare id or a dated snapshot (`-YYYY-MM-DD` / `-YYYYMMDD`,
+ * e.g. gpt-6-astra-2026-09-30) and is anchored so any other qualifier —
+ * named (`gpt-6-astra-mini`) or numeric (`gpt-6-astra-2-mini`,
+ * `gpt-6-astra-2026-preview`) — stays outside the assumption. A false match
+ * would send the assumed `max`/`none` efforts to a model that may reject them.
  */
 export function isGpt6AstraModel(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /^gpt-6-astra\b(?!\.)(?!-[a-z])/.test(withoutPrefix);
+  return /^gpt-6-astra(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
 
 /**
