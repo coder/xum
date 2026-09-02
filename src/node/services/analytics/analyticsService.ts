@@ -26,6 +26,7 @@ import { ensurePrivateDir } from "@/node/utils/fs";
 import type { Config } from "@/node/config";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
+import { ANALYTICS_WORKER_SHUTDOWN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import type { RawQueryResult } from "./queries";
 
 interface WorkerRequest {
@@ -840,13 +841,11 @@ export class AnalyticsService {
   }
 
   dispose(): Promise<void> {
-    this.disposePromise ??= Promise.resolve().then(() => {
-      this.disposeInternal();
-    });
+    this.disposePromise ??= Promise.resolve().then(() => this.disposeInternal());
     return this.disposePromise;
   }
 
-  private disposeInternal(): void {
+  private async disposeInternal(): Promise<void> {
     this.isDisposed = true;
 
     const disposedError = new Error("Analytics service is shutting down");
@@ -865,14 +864,35 @@ export class AnalyticsService {
     worker.off("error", this.onWorkerError);
     worker.off("exit", this.onWorkerExit);
 
-    // Shut down DuckDB from inside the worker thread first. The worker is
-    // already unref'd, so process shutdown does not wait for this cleanup.
+    // Shut down DuckDB from inside the worker thread first. The worker is unref'd, so the
+    // process would not wait for it on its own; wait (bounded) for it to exit here because
+    // the worker closes DuckDB only after in-flight ETL finishes, and exiting the process
+    // mid-sync (e.g. Ctrl-C during the startup sync) tears the thread down inside native
+    // DuckDB code and aborts the whole process.
+    const exited = new Promise<void>((resolve) => {
+      worker.once("exit", () => resolve());
+      worker.once("error", () => resolve());
+    });
     try {
       worker.postMessage({ type: "shutdown" } satisfies WorkerShutdownMessage);
     } catch (error) {
       log.warn("[AnalyticsService] Failed to post graceful shutdown message to analytics worker", {
         error: getErrorMessage(error),
       });
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), ANALYTICS_WORKER_SHUTDOWN_TIMEOUT_MS);
+    });
+    try {
+      if (await Promise.race([exited.then(() => false), timedOut])) {
+        log.warn("[AnalyticsService] Analytics worker did not exit before the shutdown timeout", {
+          timeoutMs: ANALYTICS_WORKER_SHUTDOWN_TIMEOUT_MS,
+        });
+      }
+    } finally {
+      clearTimeout(timer);
     }
   }
 
