@@ -2130,14 +2130,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * a follow-up redispatched from within the originating send's own turn
    * (e.g. its on-send compaction completing) must not veto itself, and once
    * handed off the session's own queue/turn-phase state governs visibility.
-   * Tickets are kept in arrival order (ticket -> supersedable) so a send can tell
-   * whether an EARLIER send is still in preflight (sendMessage queues behind it)
-   * without two simultaneous arrivals each deferring to the other. Supersedable
-   * tickets are maintenance sends that yield to user input (requireIdle skips and
-   * queue-mode heartbeats): they never count as "earlier" for anyone, and they yield
-   * to a manual send in preflight through preflightSendCounts.
+   * Tickets are kept in arrival order so a send can tell whether an EARLIER send is
+   * still in preflight (sendMessage queues behind it) without two simultaneous
+   * arrivals each deferring to the other, and so sends reach their queue-or-direct
+   * decision in arrival order (a later arrival must not enqueue first because its
+   * preflight awaits finished sooner). Supersedable tickets are maintenance sends that
+   * yield to user input (requireIdle skips and queue-mode heartbeats): they never count
+   * as "earlier" for anyone, nobody waits on them, and they yield to a manual send in
+   * preflight through preflightSendCounts.
    */
-  private readonly sessionInvisiblePreflights = new Map<string, Map<number, boolean>>();
+  private readonly sessionInvisiblePreflights = new Map<
+    string,
+    Map<number, { supersedable: boolean; decided: Promise<void>; markDecided: () => void }>
+  >();
   private nextSessionInvisiblePreflightTicket = 0;
 
   private hasSessionInvisiblePreflight(workspaceId: string): boolean {
@@ -2146,49 +2151,64 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /**
    * See sessionInvisiblePreflights. Release is idempotent. Disposal (scope exit of the
-   * service call) also drains messages queued behind this preflight when no blocking
-   * ticket preceded it (it was the head of the line that others queue behind): those
-   * entries have no stream end to drain them if this send settled without a turn
-   * (refused, rejected, startup failed). A younger send that settles first must not
-   * drain, or it would dispatch entries ahead of the older still-live preflight; the
-   * older send drains when it settles, and the drain is a no-op when a turn was
-   * handed off (the session is busy).
+   * service call) also drains messages queued behind this preflight when it is a
+   * blocking ticket with no blocking ticket before it (the head of the line that others
+   * queue behind): those entries have no stream end to drain them if this send settled
+   * without a turn (refused, rejected, startup failed). A younger send that settles
+   * first must not drain, or it would dispatch entries ahead of the older still-live
+   * preflight; the older send drains when it settles. Supersedable tickets never drain
+   * because nothing queues behind them, and the drain is a no-op when a turn was handed
+   * off (the session is busy).
    */
   private armSessionInvisiblePreflight(
     workspaceId: string,
     options?: { supersedable?: boolean }
-  ): { release: () => void; hasEarlierPreflight: () => boolean } & Disposable {
+  ): {
+    release: () => void;
+    hasEarlierPreflight: () => boolean;
+    /** Resolve once every earlier blocking ticket has reached its queue-or-direct decision. */
+    awaitEarlierDecisions: () => Promise<void>;
+    markDecided: () => void;
+  } & Disposable {
     const ticket = this.nextSessionInvisiblePreflightTicket++;
+    const supersedable = options?.supersedable === true;
     let tickets = this.sessionInvisiblePreflights.get(workspaceId);
     if (tickets == null) {
       tickets = new Map();
       this.sessionInvisiblePreflights.set(workspaceId, tickets);
     }
-    tickets.set(ticket, options?.supersedable === true);
+    let markDecided!: () => void;
+    const decided = new Promise<void>((resolve) => {
+      markDecided = resolve;
+    });
+    tickets.set(ticket, { supersedable, decided, markDecided });
     let released = false;
     let releasedAsHead = false;
     // Map iteration follows insertion order, so tickets before this one arrived earlier.
-    const hasEarlierPreflight = () => {
+    const earlierBlockingTickets = () => {
+      const earlier: Array<{ decided: Promise<void> }> = [];
       if (released) {
-        return false;
+        return earlier;
       }
-      for (const [liveTicket, supersedable] of this.sessionInvisiblePreflights.get(workspaceId) ??
-        []) {
+      for (const [liveTicket, entry] of this.sessionInvisiblePreflights.get(workspaceId) ?? []) {
         if (liveTicket === ticket) {
-          return false;
+          break;
         }
-        if (!supersedable) {
-          return true;
+        if (!entry.supersedable) {
+          earlier.push(entry);
         }
       }
-      return false;
+      return earlier;
     };
+    const hasEarlierPreflight = () => earlierBlockingTickets().length > 0;
     const release = () => {
       if (released) {
         return;
       }
-      releasedAsHead = !hasEarlierPreflight();
+      releasedAsHead = !supersedable && !hasEarlierPreflight();
       released = true;
+      // A send that leaves before deciding must not keep later arrivals waiting.
+      markDecided();
       const live = this.sessionInvisiblePreflights.get(workspaceId);
       live?.delete(ticket);
       if (live?.size === 0) {
@@ -2198,6 +2218,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return {
       release,
       hasEarlierPreflight,
+      awaitEarlierDecisions: async () => {
+        await Promise.all(earlierBlockingTickets().map((entry) => entry.decided));
+      },
+      markDecided,
       [Symbol.dispose]: () => {
         release();
         if (releasedAsHead) {
@@ -10745,6 +10769,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Persist last-used model + thinking level for cross-device consistency.
       await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
 
+      // Decide queue-or-direct in arrival order: a later send whose awaits above finished
+      // first would otherwise enqueue ahead of an earlier one. The decision below runs
+      // synchronously up to queueMessage / the session handoff.
+      await sessionInvisiblePreflight.awaitEarlierDecisions();
+      sessionInvisiblePreflight.markDecided();
+
       // A send between service entry and the session's PREPARING claim is invisible to
       // isBusy(). A later send admitted against that idle snapshot reaches StreamManager
       // while the earlier turn is streaming, and ensureStreamSafety aborts the earlier turn
@@ -11167,6 +11197,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         },
       };
       using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
+      // A resume never queues, so later sends must not wait on its decision.
+      sessionInvisiblePreflight.markDecided();
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       if (!this.config.findWorkspace(workspaceId)) {

@@ -8640,12 +8640,52 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
     expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
 
+    // Codex P1 (PRRT_kwDOPxxmWM6ebqSE): the maintenance send settling first (it yields to the
+    // manual send in preflight) must not drain either: "second" is queued behind "first",
+    // which is still live, and dispatching it now would start it ahead of "first".
+    maintenancePreflight.resolve();
+    expect((await maintenanceResult).success).toBe(false);
+    expect(fakeSession.drainQueuedMessagesIfIdle).not.toHaveBeenCalled();
+
     firstManual.resolve(Err({ type: "unknown", raw: "rejected before the turn was accepted" }));
     expect((await firstManualResult).success).toBe(false);
     expect(fakeSession.drainQueuedMessagesIfIdle).toHaveBeenCalledTimes(1);
+  });
 
-    maintenancePreflight.resolve();
-    await maintenanceResult;
+  test("sends reach the queue in arrival order even when a later one finishes preflight first", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6ebqSR): with "first" in preflight, "third" can finish its
+    // pricing/settings awaits before "second"; enqueueing on completion order would make the
+    // user's third prompt dispatch before the second.
+    fakeSession.isBusy.mockReturnValue(false);
+    const persistSettings = (
+      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
+    ).maybePersistAISettingsFromOptions;
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    const firstSend = createDeferred<Result<void, SendMessageError>>();
+    fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
+    const firstResult = workspaceService.sendMessage("test-workspace", "first", sendOptions);
+    await waitForCondition(() => fakeSession.sendMessage.mock.calls.length === 1);
+
+    const secondPreflight = createDeferred<void>();
+    persistSettings.mockImplementationOnce(() => secondPreflight.promise);
+    const secondResult = workspaceService.sendMessage("test-workspace", "second", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 2);
+    const thirdResult = workspaceService.sendMessage("test-workspace", "third", sendOptions);
+    await waitForCondition(() => persistSettings.mock.calls.length === 3);
+    await drainPendingDispatches();
+    // "third" finished its awaits but must wait for "second" to decide.
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+
+    secondPreflight.resolve();
+    expect((await secondResult).success).toBe(true);
+    expect((await thirdResult).success).toBe(true);
+    expect((fakeSession.queueMessage.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+      "second",
+      "third",
+    ]);
+
+    firstSend.resolve(Ok(undefined));
+    expect((await firstResult).success).toBe(true);
   });
 
   test("a queue-mode heartbeat in preflight yields quietly to manual input instead of racing it", async () => {

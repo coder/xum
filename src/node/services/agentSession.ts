@@ -4830,6 +4830,9 @@ export class AgentSession {
       }
     } finally {
       this.midStreamCompactionPending = false;
+      // Preflight drains deferred to this pending compaction have no other retry: if the
+      // compaction request never became a turn, release the queue now (no-op when it did).
+      this.drainQueuedMessagesIfIdle();
     }
   }
 

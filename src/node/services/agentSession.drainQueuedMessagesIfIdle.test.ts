@@ -10,6 +10,7 @@ import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
+import { Err } from "@/common/types/result";
 
 /**
  * drainQueuedMessagesIfIdle is the release valve for messages queued behind a
@@ -22,6 +23,8 @@ const WORKSPACE_ID = "workspace-drain-if-idle-test";
 interface PrivateSessionAccess {
   midStreamCompactionPending: boolean;
   autoRetryStarting: boolean;
+  activeStreamContext?: { modelString: string; options?: unknown; providersConfig: null };
+  interruptForCompaction: () => Promise<void>;
 }
 
 describe("AgentSession.drainQueuedMessagesIfIdle", () => {
@@ -116,6 +119,29 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
     agentSession.drainQueuedMessagesIfIdle();
 
     expect(dispatch).toHaveBeenCalledTimes(expectedDispatches);
+  });
+
+  test("a mid-stream compaction that never becomes a turn releases the queue it held", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6ebqSN): a drain deferred to the pending compaction has no
+    // other retry, so the compaction's exit must drain when its request failed to start.
+    const agentSession = await createSession();
+    const dispatch = spyOn(agentSession, "sendQueuedMessages").mockImplementation(() => undefined);
+    const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
+    agentSession.queueMessage("queued during the interrupted stream", sendOptions);
+    const privateSession = agentSession as unknown as PrivateSessionAccess;
+    privateSession.activeStreamContext = {
+      modelString: sendOptions.model,
+      options: sendOptions,
+      providersConfig: null,
+    };
+    spyOn(agentSession, "sendMessage").mockResolvedValue(
+      Err({ type: "unknown", raw: "compaction request rejected before admission" })
+    );
+
+    await privateSession.interruptForCompaction();
+
+    expect(privateSession.midStreamCompactionPending).toBe(false);
+    expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
   test("an empty queue never dispatches", async () => {
