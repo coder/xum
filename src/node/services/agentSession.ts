@@ -6979,6 +6979,10 @@ export class AgentSession {
       return;
     }
     const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim?.admissionIrreversible) {
+      // The durable row must finish its exact turn. Otherwise, a later request consumes it.
+      return;
+    }
     if (
       this.preserveQueuedToolEndClaimForImmediateSend &&
       activeClaim?.queueClaim.userAuthored === true
@@ -7103,6 +7107,11 @@ export class AgentSession {
    */
   restoreQueueToInput(): void {
     this.assertNotDisposed("restoreQueueToInput");
+    const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim?.admissionIrreversible === true && activeClaim.admissionHold != null) {
+      // WorkspaceService calls this after descendant cleanup, even when no queue entry remains.
+      this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    }
     if (this.messageQueue.isEmpty()) {
       return;
     }
@@ -7261,13 +7270,12 @@ export class AgentSession {
               },
               onAccepted: async () => {
                 await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
-                if (dispatchClaim.queueClaim.admissionSignal.aborted) {
+                if (
+                  dispatchClaim.queueClaim.admissionSignal.aborted &&
+                  !dispatchClaim.admissionIrreversible
+                ) {
                   const reason: unknown = dispatchClaim.queueClaim.admissionSignal.reason;
                   this.releaseQueuedToolEndClaim(dispatchClaim);
-                  if (dispatchClaim.admissionIrreversible) {
-                    // The row is durable. Settle its producer before refusing provider startup.
-                    await internal?.onAccepted?.();
-                  }
                   throw new Error(
                     typeof reason === "string"
                       ? reason

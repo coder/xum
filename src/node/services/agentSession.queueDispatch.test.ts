@@ -1165,7 +1165,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("settles an irreversible synthetic claim before blocking startup", async () => {
+  test("finishes an irreversible synthetic claim after descendant cleanup", async () => {
     const workspaceId = "queue-dispatch-irrevocable-synthetic-stop";
     let claimQueuedToolEndMessage: (() => boolean) | undefined;
     const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
@@ -1241,11 +1241,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await syncStarted;
 
       expect((await session.interruptStream()).success).toBe(true);
+      session.restoreQueueToInput();
       releaseSync();
 
       expect(await waitForCondition(() => accepted)).toBe(true);
-      expect(await waitForCondition(() => !session.isPreparingTurn())).toBe(true);
-      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
       if (history.success) {
