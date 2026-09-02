@@ -187,6 +187,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { hasInProcessWorkflowWork } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   isActiveWorkspaceTurnTaskStatus,
   isWorkspaceTurnTaskId,
@@ -683,6 +684,8 @@ interface WorkflowTaskOwner {
 interface InactiveWorkflowTaskOwner {
   ownerTaskId: string;
   runId: string;
+  /** Workspace hosting the run; undefined when the owner has no parent workspace. */
+  runWorkspaceId?: string;
   status?: WorkflowRunStatus;
   reason: string;
 }
@@ -1546,6 +1549,7 @@ export class TaskService implements AgentTaskIntegration {
         return {
           ownerTaskId: owner.taskId,
           runId: workflowTask.runId,
+          runWorkspaceId: parentWorkspaceId,
           status: run.status,
           reason: `workflow run belongs to ${run.workspaceId}, not ${parentWorkspaceId}`,
         };
@@ -1556,6 +1560,7 @@ export class TaskService implements AgentTaskIntegration {
       return {
         ownerTaskId: owner.taskId,
         runId: workflowTask.runId,
+        runWorkspaceId: parentWorkspaceId,
         status: run.status,
         reason: `workflow run is ${run.status}`,
       };
@@ -1563,6 +1568,7 @@ export class TaskService implements AgentTaskIntegration {
       return {
         ownerTaskId: owner.taskId,
         runId: workflowTask.runId,
+        runWorkspaceId: parentWorkspaceId,
         reason: `workflow run is unavailable: ${getErrorMessage(error)}`,
       };
     }
@@ -1727,10 +1733,23 @@ export class TaskService implements AgentTaskIntegration {
 
     let interrupted = false;
     let transitionedToInterrupted = false;
+    let resumeInFlight = false;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
       taskId,
       (ws) => {
+        // Startup recovery can run while clients are connected, and the run-store read above
+        // awaited. A workflow resume admitted since then owns this child's fate: it holds a
+        // workflow admission (see workflowArchiveAdmission) from its synchronous entry until the
+        // run settles, so checking it inside this synchronous edit cannot miss an in-flight
+        // resume. Leave the entry untouched in that case.
+        if (
+          inactiveOwner.runWorkspaceId != null &&
+          hasInProcessWorkflowWork(inactiveOwner.runWorkspaceId)
+        ) {
+          resumeInFlight = true;
+          return;
+        }
         const previousStatus = ws.taskStatus;
         parentWorkspaceId = ws.parentWorkspaceId;
         interrupted = this.applyInterruptedTaskStatus(ws) === "interrupted";
@@ -1738,6 +1757,15 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    if (resumeInFlight) {
+      log.debug("Skipping workflow-owned task recovery; owner workflow is being resumed", {
+        taskId,
+        trigger,
+        ownerTaskId: inactiveOwner.ownerTaskId,
+        workflowRunId: inactiveOwner.runId,
+      });
+      return true;
+    }
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }

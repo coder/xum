@@ -411,6 +411,19 @@ export class GitPatchArtifactService {
       return;
     }
 
+    if (options?.config != null) {
+      // The caller's snapshot can predate a client removing this task. The updater below leaves an
+      // existing artifact untouched, so only a task with no artifact yet would get a fresh pending
+      // marker; re-read config for exactly those before creating one for a removed task.
+      const existing = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
+      if (
+        existing == null &&
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId) == null
+      ) {
+        return;
+      }
+    }
+
     const pendingProjectArtifacts = buildPendingProjectArtifacts({
       projectPath: childEntry.projectPath,
       projects: childEntry.workspace.projects,

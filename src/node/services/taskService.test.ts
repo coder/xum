@@ -47,6 +47,7 @@ import {
 } from "@/node/services/taskHandleStore";
 import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { acquireWorkflowArchiveAdmission } from "@/node/services/workflows/workflowArchiveAdmission";
 import { log } from "@/node/services/log";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import type { WorkspaceForkParams } from "@/node/runtime/Runtime";
@@ -13694,6 +13695,63 @@ describe("TaskService", () => {
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
     }
     expect(findWorkspaceInConfig(config, queuedChildId)?.taskPrompt).toBe("queued work");
+  });
+
+  test("initialize leaves workflow-owned children alone while their run is being resumed", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const runtimeConfig = { type: "local" as const };
+    const parentId = "parent-workflow-resuming";
+    const runningChildId = "child-workflow-resuming-running";
+    const workflowRunId = "wfr_interrupted_but_resuming";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId, { runtimeConfig }),
+        projectWorkspace(projectPath, "running", runningChildId, {
+          name: "agent_explore_running",
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: defaultModel,
+          runtimeConfig,
+          workflowTask: { runId: workflowRunId, stepId: "running" },
+        }),
+      ],
+      testTaskSettings(10, 3)
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: path.join(config.sessionsDir, parentId) });
+    await runStore.createRun({
+      id: workflowRunId,
+      workspaceId: parentId,
+      workflow: {
+        name: "interrupted",
+        description: "Interrupted",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus(workflowRunId, "interrupted", "2026-05-29T00:00:01.000Z");
+
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => false) });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    // A client resumed the owning run while recovery was reading it as interrupted: the resume
+    // holds a workflow admission until the run settles, and recovery must neither interrupt the
+    // child (the resumed run owns it) nor nudge it as an orphaned running task.
+    using _resumeAdmission = acquireWorkflowArchiveAdmission(parentId);
+    await taskService.initialize();
+
+    expect(findWorkspaceInConfig(config, runningChildId)?.taskStatus).toBe("running");
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("initialize recovers parent tasks after interrupting inactive workflow children", async () => {

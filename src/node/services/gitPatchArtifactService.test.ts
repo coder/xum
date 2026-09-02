@@ -95,6 +95,7 @@ describe("GitPatchArtifactService coordination", () => {
     const parentId = "parent";
     const childId = "child-reported";
     const freshChildId = "child-fresh";
+    const removedChildId = "child-removed-since-snapshot";
     const execChild = (id: string) => ({
       path: path.join(projectPath, id),
       id,
@@ -110,6 +111,7 @@ describe("GitPatchArtifactService coordination", () => {
           { path: projectPath, id: parentId, name: "parent", runtimeConfig: { type: "local" } },
           execChild(childId),
           execChild(freshChildId),
+          execChild(removedChildId),
         ],
       });
       return cfg;
@@ -168,6 +170,19 @@ describe("GitPatchArtifactService coordination", () => {
     await service.maybeStartGeneration(parentId, unknownChildId, onComplete, { config: snapshot });
     expect(loadConfigSpy).not.toHaveBeenCalled();
     expect(await readSubagentGitPatchArtifact(parentSessionDir, unknownChildId)).toBeNull();
+    expect(completedChildIds).toEqual([]);
+
+    // A snapshot child that a client removed since the snapshot must not get a fresh pending
+    // artifact: creating one re-reads config first (an existing artifact would not need this).
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      if (project) {
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== removedChildId);
+      }
+      return cfg;
+    });
+    await service.maybeStartGeneration(parentId, removedChildId, onComplete, { config: snapshot });
+    expect(await readSubagentGitPatchArtifact(parentSessionDir, removedChildId)).toBeNull();
     expect(completedChildIds).toEqual([]);
 
     // A snapshot child without an artifact still takes the normal generation path (pending
