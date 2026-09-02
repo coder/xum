@@ -702,6 +702,8 @@ export class AgentSession {
   private queuedToolEndClaim: QueuedToolEndClaim | undefined;
   // A hard Stop blocks late SDK and provider callbacks until a new stream starts.
   private hardInterruptPendingStreamStart = false;
+  // Send now preserves a claimed user entry for the immediate queue drain.
+  private preserveQueuedToolEndClaimForImmediateSend = false;
   private readonly activeToolCallIds = new Set<string>();
 
   private idleWaiters: Array<() => void> = [];
@@ -4871,6 +4873,7 @@ export class AgentSession {
   async interruptStream(options?: {
     soft?: boolean;
     abandonPartial?: boolean;
+    sendQueuedImmediately?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
 
@@ -4880,6 +4883,7 @@ export class AgentSession {
     const isHardInterrupt = options?.soft !== true;
     if (isHardInterrupt) {
       this.hardInterruptPendingStreamStart = true;
+      this.preserveQueuedToolEndClaimForImmediateSend = options?.sendQueuedImmediately === true;
       this.activeToolCallIds.clear();
     }
 
@@ -4890,6 +4894,7 @@ export class AgentSession {
       const deleteResult = await this.historyService.deletePartial(this.workspaceId);
       if (!deleteResult.success) {
         this.hardInterruptPendingStreamStart = false;
+        this.preserveQueuedToolEndClaimForImmediateSend = false;
         this.restoreQueuedToolEndClaim();
         return Err(deleteResult.error);
       }
@@ -4902,13 +4907,15 @@ export class AgentSession {
     if (!stopResult.success) {
       if (isHardInterrupt) {
         this.hardInterruptPendingStreamStart = false;
+        this.preserveQueuedToolEndClaimForImmediateSend = false;
         this.restoreQueuedToolEndClaim();
       }
       return Err(stopResult.error);
     }
 
     if (isHardInterrupt) {
-      this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
+      this.settleQueuedToolEndClaimAfterUserInterrupt();
+      this.preserveQueuedToolEndClaimForImmediateSend = false;
     }
 
     return Ok(undefined);
@@ -5807,6 +5814,7 @@ export class AgentSession {
     forward("stream-start", (payload) => {
       if (payload.type === "stream-start") {
         this.hardInterruptPendingStreamStart = false;
+        this.preserveQueuedToolEndClaimForImmediateSend = false;
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
@@ -5979,7 +5987,7 @@ export class AgentSession {
         );
 
         if (preStreamAbortReason === "user") {
-          this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
+          this.settleQueuedToolEndClaimAfterUserInterrupt();
         } else {
           this.restoreQueuedToolEndClaim();
         }
@@ -6860,7 +6868,7 @@ export class AgentSession {
 
     if (!shouldDispatch) {
       if (abortReason === "user") {
-        this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
+        this.settleQueuedToolEndClaimAfterUserInterrupt();
       } else {
         this.restoreQueuedToolEndClaim();
       }
@@ -6917,6 +6925,14 @@ export class AgentSession {
       this.emitQueuedMessageChanged();
     }
     this.syncBackgroundQueuedMessageSignal();
+  }
+
+  private settleQueuedToolEndClaimAfterUserInterrupt(): void {
+    if (this.preserveQueuedToolEndClaimForImmediateSend) {
+      this.restoreQueuedToolEndClaim();
+      return;
+    }
+    this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
   }
 
   private releaseQueuedToolEndClaim(activeClaim: QueuedToolEndClaim): void {
@@ -7063,8 +7079,8 @@ export class AgentSession {
       return;
     }
 
-    // Keep one claimed entry in PREPARING until its acceptance callback settles.
-    if (this.queuedToolEndClaim?.dispatchStarted === true) {
+    // A dequeued entry owns admission until stream start or explicit failure cleanup.
+    if (this.dispatchingQueuedEntry || this.queuedToolEndClaim?.dispatchStarted === true) {
       return;
     }
     const dispatchClaim = this.commitQueuedToolEndClaim();

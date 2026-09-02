@@ -614,6 +614,53 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("preserves a claimed user entry for Send now", async () => {
+    const workspaceId = "queue-dispatch-claimed-user-send-now";
+    let claimQueuedToolEndMessage: (() => boolean) | undefined;
+    const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
+      claimQueuedToolEndMessage ??= options.claimQueuedToolEndMessage;
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockImplementation(async () => {
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "user"));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return Ok(undefined);
+    });
+
+    try {
+      expect(
+        (
+          await session.sendMessage("Start work", {
+            model: TEST_MODEL,
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage("User send now", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+
+      expect(claimQueuedToolEndMessage?.()).toBe(true);
+      expect((await session.interruptStream({ sendQueuedImmediately: true })).success).toBe(true);
+      expect(session.sendNextUserQueuedMessage()).toBe(true);
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("soft-stops after a provider-executed tool result and dispatches after abort", async () => {
     const workspaceId = "queue-dispatch-provider-tool";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -816,6 +863,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
           },
         }
       );
+      session.queueMessage("User send now", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
 
       aiEmitter.emit("tool-call-end", {
         ...toolCallEndEvent(workspaceId),
@@ -826,10 +878,14 @@ describe("AgentSession queued message tool-call dispatch", () => {
       aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
       await acceptanceStarted;
 
-      expect((await session.interruptStream()).success).toBe(true);
+      expect((await session.interruptStream({ sendQueuedImmediately: true })).success).toBe(true);
+      expect(session.sendNextUserQueuedMessage()).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
       releaseAcceptance();
 
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(session.hasQueuedMessages()).toBe(true);
       expect(session.isPreparingTurn()).toBe(false);
     } finally {
       releaseAcceptance();
