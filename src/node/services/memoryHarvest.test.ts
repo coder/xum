@@ -322,6 +322,34 @@ describe("runMemoryHarvest", () => {
     expect(prompt).toContain("&lt;/message><message");
   });
 
+  it("excludes stopped synthetic rows from harvest evidence", async () => {
+    using fixture = createFixture();
+    fixture.messages = [
+      createMuxMessage("stopped-wake", "user", "Untrusted stopped process output", {
+        historySequence: 0,
+        synthetic: true,
+        providerExcluded: true,
+      }),
+      createMuxMessage("retained", "user", "Continue with the requested work", {
+        historySequence: 1,
+      }),
+    ];
+    let prompt = "";
+
+    await runHarvest(
+      fixture,
+      new MockLanguageModelV3({
+        doStream: (options) => {
+          prompt = userPromptText(options);
+          return Promise.resolve({ stream: simulateReadableStream({ chunks: [finishChunk()] }) });
+        },
+      })
+    );
+
+    expect(prompt).toContain("Continue with the requested work");
+    expect(prompt).not.toContain("Untrusted stopped process output");
+  });
+
   it("chunks oversized epochs before calling the model", async () => {
     using fixture = createFixture();
     fixture.messages = Array.from({ length: 12 }, (_, index) =>

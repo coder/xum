@@ -216,6 +216,19 @@ describe("buildAbandonedBranchTranscript", () => {
     // Clamped from the end: the newest content survives.
     expect(transcript.endsWith("TAIL-MARKER")).toBe(true);
   });
+
+  test("excludes stopped synthetic rows", () => {
+    const stoppedWake = createMuxMessage("stopped-wake", "user", "untrusted stopped output", {
+      synthetic: true,
+      providerExcluded: true,
+    });
+    const retained = createMuxMessage("retained", "user", "continue the requested work");
+
+    const transcript = buildAbandonedBranchTranscript([stoppedWake, retained]);
+
+    expect(transcript).toContain("continue the requested work");
+    expect(transcript).not.toContain("untrusted stopped output");
+  });
 });
 
 describe("getSideChannelModelCandidates (r23: provider confinement)", () => {

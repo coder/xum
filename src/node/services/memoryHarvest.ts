@@ -3,7 +3,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import type { MuxMessage } from "@/common/types/message";
+import { filterProviderExcludedMessages, type MuxMessage } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import assert from "@/common/utils/assert";
@@ -261,7 +261,7 @@ export async function runMemoryHarvest(args: {
     },
   });
 
-  const chunks = buildHarvestChunks(args.messages);
+  const chunks = buildHarvestChunks(filterProviderExcludedMessages(args.messages));
   const streamErrors: string[] = [];
   let usage: MemoryHarvestResult["usage"];
   for (const [index, chunk] of chunks.entries()) {

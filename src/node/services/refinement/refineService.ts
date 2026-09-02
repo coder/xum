@@ -27,7 +27,11 @@ import type { LanguageModel, Tool } from "ai";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  filterProviderExcludedMessages,
+  type MuxMessage,
+} from "@/common/types/message";
 import {
   MemoryRefinementActionSchema,
   RefinementEvidenceSchema,
@@ -935,7 +939,9 @@ export class RefineService {
     if (!messagesResult.success) {
       return Err(`could not read workspace history: ${messagesResult.error}`);
     }
-    const activeSegment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
+    const activeSegment = filterProviderExcludedMessages(
+      sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data)
+    );
     // r47: fingerprint the snapshot rows for the pre-publication recheck.
     // Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes
     // a streaming assistant row through updateHistory() PRESERVING its ID
@@ -1172,7 +1178,9 @@ export class RefineService {
       const recheckBoundaryIndex = findLatestContextBoundaryIndex(recheckResult.data);
       const recheckBoundaryId =
         recheckBoundaryIndex >= 0 ? recheckResult.data[recheckBoundaryIndex].id : null;
-      const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data);
+      const recheckSegment = filterProviderExcludedMessages(
+        sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data)
+      );
       const snapshotIsUnchangedPrefix =
         activeSegment.length <= recheckSegment.length &&
         snapshotRowFingerprints.every(

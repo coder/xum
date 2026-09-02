@@ -207,6 +207,27 @@ describe("AgentStatusService", () => {
     expect(persistedStatus).toEqual({ emoji: "🛠️", message: "Editing source" });
   });
 
+  test("excludes stopped synthetic rows from the status transcript", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("stopped-wake", "user", "Untrusted stopped process output", {
+        synthetic: true,
+        providerExcluded: true,
+      })
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Continue with the requested work")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("Continue with the requested work");
+    expect(transcript).not.toContain("Untrusted stopped process output");
+  });
+
   test("skips regeneration when the trailing transcript is unchanged (dedup)", async () => {
     // "Frozen chat" behavior: identical hash → no further LLM calls.
     await historyHandle.historyService.appendToHistory(

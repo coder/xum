@@ -1099,6 +1099,105 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("retains a synthetic claim until startup accepts cancellation", async () => {
+    const workspaceId = "queue-dispatch-provider-claim-startup-stop";
+    const streamMessage = mock((_options: Parameters<AIService["streamMessage"]>[0]) =>
+      Promise.resolve(Ok(createStartedTurnHandle()))
+    );
+    const { session, cleanup, aiEmitter, aiService, historyService } =
+      await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        },
+      });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    let markCommitStarted: () => void = () => undefined;
+    const commitStarted = new Promise<void>((resolve) => {
+      markCommitStarted = resolve;
+    });
+    let releaseCommit: () => void = () => undefined;
+    const commitRelease = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    const accepted = mock(() => undefined);
+
+    try {
+      expect(
+        (
+          await session.sendMessage("Start work", {
+            model: TEST_MODEL,
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const originalCommit = historyService.commitPartial.bind(historyService);
+      const commitPartial = spyOn(historyService, "commitPartial").mockImplementationOnce(
+        async (...args) => {
+          markCommitStarted();
+          await commitRelease;
+          return originalCommit(...args);
+        }
+      );
+      try {
+        session.queueMessage(
+          "Background monitor wake",
+          {
+            model: TEST_MODEL,
+            agentId: "exec",
+            queueDispatchMode: "tool-end",
+            muxMetadata: { type: "bash-monitor-wake", records: [] },
+          },
+          { synthetic: true, agentInitiated: true, onAccepted: accepted }
+        );
+        session.queueMessage("User send now", {
+          model: TEST_MODEL,
+          agentId: "exec",
+          queueDispatchMode: "tool-end",
+        });
+
+        aiEmitter.emit("tool-call-end", {
+          ...toolCallEndEvent(workspaceId),
+          toolName: "web_search",
+          providerExecuted: true,
+        });
+        expect(await waitForCondition(() => stopStream.mock.calls.length === 1)).toBe(true);
+        aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+        await commitStarted;
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+
+        expect(
+          (
+            await session.interruptStream({
+              sendQueuedImmediately: true,
+              deferQueueSettlement: true,
+            })
+          ).success
+        ).toBe(true);
+        expect(session.sendNextUserQueuedMessage()).toBe(true);
+        releaseCommit();
+
+        expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+        const requestMessages = streamMessage.mock.calls[1]?.[0].messages ?? [];
+        const requestText = requestMessages
+          .flatMap((message) => message.parts)
+          .map((part) => (part.type === "text" ? part.text : ""));
+        expect(requestText).toContain("User send now");
+        expect(requestText).not.toContain("Background monitor wake");
+      } finally {
+        releaseCommit();
+        commitPartial.mockRestore();
+      }
+    } finally {
+      releaseCommit();
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("cancels a claimed synthetic dispatch before Send now", async () => {
     const workspaceId = "queue-dispatch-provider-claim-pre-acceptance-send-now";
     const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));

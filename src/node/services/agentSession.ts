@@ -4092,14 +4092,17 @@ export class AgentSession {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
-    if (
+    const isIrreversibleAdmissionCanceled = (): boolean =>
       cancellationDisabled &&
       cancelSignal?.aborted === true &&
-      internal?.excludeIrreversibleAdmissionOnCancel === true
-    ) {
-      if (internal.cancelState != null) {
+      internal?.excludeIrreversibleAdmissionOnCancel === true;
+    const markProviderExcludedAfterAcceptance = (): void => {
+      if (internal?.cancelState != null) {
         internal.cancelState.providerExcludedAfterAcceptance = true;
       }
+    };
+    if (isIrreversibleAdmissionCanceled()) {
+      markProviderExcludedAfterAcceptance();
       return Ok(undefined);
     }
 
@@ -4175,9 +4178,17 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          async () => {
+            await internal?.waitForAdmissionRelease?.();
+            return !isIrreversibleAdmissionCanceled();
+          }
         );
-        if (streamResult.success && preparedTurnAbortController.signal.aborted) {
+        if (
+          streamResult.success &&
+          preparedTurnAbortController.signal.aborted &&
+          !isIrreversibleAdmissionCanceled()
+        ) {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError(
               "Accepted stream startup was canceled during preparation."
@@ -4239,7 +4250,12 @@ export class AgentSession {
 
     // Non-edit sends preserve the old behavior so pre-stream startup failures still propagate to
     // synchronous callers (draft restore, interrupted-task rollback, etc.).
-    return await startPreparedStream();
+    const streamResult = await startPreparedStream();
+    if (isIrreversibleAdmissionCanceled()) {
+      markProviderExcludedAfterAcceptance();
+      return Ok(undefined);
+    }
+    return streamResult;
   }
 
   async resumeStream(
@@ -4974,6 +4990,12 @@ export class AgentSession {
       this.hardInterruptClaimSettlementPending = false;
       const interruptedClaim = this.queuedToolEndClaim;
       this.settleQueuedToolEndClaimAfterUserInterrupt();
+      if (
+        interruptedClaim?.admissionIrreversible === true &&
+        !interruptedClaim.queueClaim.userAuthored
+      ) {
+        this.activePreparedTurnAbortController?.abort();
+      }
       // A synthetic acceptance callback can already be running and cannot wait on the new hold.
       // Keep its completion from draining later entries before the workspace-level policy runs.
       this.hardInterruptClaimSettlementPending = options?.deferQueueSettlement === true;
@@ -5073,7 +5095,9 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    /** Wait for a claimed turn to retain provider-start permission. */
+    waitForProviderStartAdmission?: () => Promise<boolean>
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
@@ -5281,6 +5305,13 @@ export class AgentSession {
     // emit an error event for fire-and-forget senders and then return Err;
     // collect them so the Err path resolves each exactly once.
     const preStartErrors: StreamErrorPayload[] = [];
+    const providerStartAdmitted = await waitForProviderStartAdmission?.();
+    if (isStartupAbortRequested() || providerStartAdmitted === false) {
+      this.activeCompactionRequest = undefined;
+      this.resetActiveStreamState();
+      return Ok(undefined);
+    }
+
     const streamResult = await this.aiService.streamMessage({
       messages: requestMessages,
       workspaceId: this.workspaceId,
@@ -7389,7 +7420,6 @@ export class AgentSession {
                 } finally {
                   // A hard Stop can install the hold while the producer callback runs.
                   await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
-                  this.releaseQueuedToolEndClaim(dispatchClaim);
                 }
               },
             };
@@ -7471,6 +7501,11 @@ export class AgentSession {
               this.setTurnPhase(TurnPhase.IDLE);
             }
             this.sendQueuedMessages();
+            return;
+          }
+          if (dispatchClaim != null) {
+            // Keep synthetic ownership until StreamManager accepts the abort signal.
+            this.releaseQueuedToolEndClaim(dispatchClaim);
           }
         })
         .catch(async (error: unknown) => {
