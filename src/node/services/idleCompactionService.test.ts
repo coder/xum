@@ -98,6 +98,22 @@ describe("IdleCompactionService", () => {
     await cleanup();
   });
 
+  describe("start/stop on the default runner", () => {
+    // Default-runner smoke (cadence itself is covered on virtual time in
+    // idleCompactionService.testClock.test.ts): with no runner injected the
+    // checker sleeps on Effect's default clock, so nothing may run this early
+    // in INITIAL_CHECK_DELAY_MS, and stop() must close the scope synchronously.
+    test("start() arms the checker on the real clock without an early sweep", async () => {
+      service.start();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(mockConfig.loadConfigOrDefault).not.toHaveBeenCalled();
+      expect(executeIdleCompactionMock).not.toHaveBeenCalled();
+      service.stop();
+    });
+  });
+
   describe("checkEligibility", () => {
     const threshold24h = 24 * oneHourMs;
 

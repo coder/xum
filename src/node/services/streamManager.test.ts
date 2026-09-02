@@ -1059,56 +1059,102 @@ describe("StreamManager - stream resource scope", () => {
     // A debounced partial flush scheduled during streaming is tied to the
     // stream's resource scope. Once the stream ends, the pending flush must be
     // interrupted with the scope — a late write would resurrect partial state
-    // for a dead stream.
-    const workspaceId = "scope-debounce-interrupt-workspace";
+    // for a dead stream. The debounce sleeps on the injected runner's
+    // TestClock, so "later" is a virtual-time adjust, not a real wait.
+    const testRunner = makeTestEffectRunner();
+    try {
+      const workspaceId = "scope-debounce-interrupt-workspace";
+      const streamManager = new StreamManager(
+        historyService,
+        undefined,
+        undefined,
+        undefined,
+        testRunner.runner
+      );
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      Reflect.set(streamManager, "createTempDirForStream", () =>
+        Promise.resolve("/tmp/phase10-scope-tempdir")
+      );
+      Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+
+      const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+      const streamInfoForTests = () =>
+        workspaceStreams.get(workspaceId) as
+          | { lastPartialWriteTime?: number; partialWriteFiber?: unknown }
+          | undefined;
+
+      let debounceArmedBeforeFinish = false;
+      Reflect.set(streamManager, "createStreamResult", () =>
+        createStreamResultForTests(
+          (async function* () {
+            // First delta writes immediately (lastPartialWriteTime starts at 0).
+            yield { type: "text-delta", text: "first" };
+            // Wait until that write stamps the throttle clock so the second
+            // delta deterministically lands inside the throttle window.
+            while ((streamInfoForTests()?.lastPartialWriteTime ?? 0) === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            yield { type: "text-delta", text: "second" };
+            // The consumer fully processed the second delta before pulling the
+            // next part, and the debounce arms synchronously.
+            debounceArmedBeforeFinish = streamInfoForTests()?.partialWriteFiber != null;
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      );
+      const writePartialSpy = spyOn(historyService, "writePartial");
+
+      const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
+      if (typeof throttleMs !== "number") {
+        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
+      }
+
+      await runLifecycleStreamForTests(streamManager, workspaceId);
+
+      expect(debounceArmedBeforeFinish).toBe(true);
+      const writesAtStreamEnd = writePartialSpy.mock.calls.length;
+      await testRunner.adjust(throttleMs * 2);
+      // A flush that survived the scope close would settle on the next macrotask.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(writePartialSpy.mock.calls.length).toBe(writesAtStreamEnd);
+    } finally {
+      await testRunner.dispose();
+    }
+  });
+
+  test("a debounced partial write lands on the real clock through the default runner", async () => {
+    // Default-runner smoke: with nothing injected the debounce sleeps on
+    // Effect's default clock (a real setTimeout), so a short remaining window
+    // must flush by itself.
     const streamManager = new StreamManager(historyService);
-    Reflect.set(streamManager, "tokenTracker", {
-      setModel: () => Promise.resolve(undefined),
-      countTokens: () => Promise.resolve(0),
-    });
-    Reflect.set(streamManager, "createTempDirForStream", () =>
-      Promise.resolve("/tmp/phase10-scope-tempdir")
-    );
-    Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
-
-    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
-    const streamInfoForTests = () =>
-      workspaceStreams.get(workspaceId) as
-        | { lastPartialWriteTime?: number; partialWriteFiber?: unknown }
-        | undefined;
-
-    let debounceArmedBeforeFinish = false;
-    Reflect.set(streamManager, "createStreamResult", () =>
-      createStreamResultForTests(
-        (async function* () {
-          // First delta writes immediately (lastPartialWriteTime starts at 0).
-          yield { type: "text-delta", text: "first" };
-          // Wait until that write stamps the throttle clock so the second
-          // delta deterministically lands inside the throttle window.
-          while ((streamInfoForTests()?.lastPartialWriteTime ?? 0) === 0) {
-            await new Promise((resolve) => setTimeout(resolve, 5));
-          }
-          yield { type: "text-delta", text: "second" };
-          // The consumer fully processed the second delta before pulling the
-          // next part, and the debounce arms synchronously.
-          debounceArmedBeforeFinish = streamInfoForTests()?.partialWriteFiber != null;
-          yield { type: "finish", finishReason: "stop" };
-        })()
-      )
-    );
-    const writePartialSpy = spyOn(historyService, "writePartial");
-
+    const workspaceId = "default-runner-debounce-workspace";
     const throttleMs: unknown = Reflect.get(streamManager, "PARTIAL_WRITE_THROTTLE_MS");
     if (typeof throttleMs !== "number") {
       throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
     }
+    // Inside the throttle window with ~20 ms of it left.
+    const streamInfo = createStreamInfoForTests({
+      lastPartialWriteTime: Date.now() - (throttleMs - 20),
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+    const schedulePartialWrite = getPrivateMethodForTests<
+      (workspaceId: string, streamInfo: Record<string, unknown>) => Promise<void>
+    >(streamManager, "schedulePartialWrite");
+    const writePartialSpy = spyOn(historyService, "writePartial");
 
-    await runLifecycleStreamForTests(streamManager, workspaceId);
+    await schedulePartialWrite.call(streamManager, workspaceId, streamInfo);
+    expect(streamInfo.partialWriteFiber).toBeDefined();
+    expect(writePartialSpy).not.toHaveBeenCalled();
 
-    expect(debounceArmedBeforeFinish).toBe(true);
-    const writesAtStreamEnd = writePartialSpy.mock.calls.length;
-    await new Promise((resolve) => setTimeout(resolve, throttleMs + 200));
-    expect(writePartialSpy.mock.calls.length).toBe(writesAtStreamEnd);
+    const deadline = Date.now() + 2_000;
+    while (writePartialSpy.mock.calls.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(writePartialSpy).toHaveBeenCalledTimes(1);
+    expect(streamInfo.partialWriteFiber).toBeUndefined();
   });
 
   test("runs the partial-write debounce on the injected runner's clock", async () => {

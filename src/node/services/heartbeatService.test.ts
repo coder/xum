@@ -1115,6 +1115,9 @@ describe("HeartbeatService", () => {
     });
 
     test("startup does not fire heartbeats immediately", async () => {
+      // Default-runner smoke: the scheduler sleeps STARTUP_DELAY_MS on Effect's
+      // default (real) clock, so nothing may fire this early. Cadence itself is
+      // covered on virtual time in heartbeatService.testClock.test.ts.
       service.start();
 
       await new Promise((resolve) => setTimeout(resolve, 100));
