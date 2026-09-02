@@ -6931,8 +6931,7 @@ export class AgentSession {
     const activeClaim = this.queuedToolEndClaim;
     if (
       this.preserveQueuedToolEndClaimForImmediateSend &&
-      activeClaim?.dispatchStarted === false &&
-      activeClaim.queueClaim.userAuthored
+      activeClaim?.queueClaim.userAuthored === true
     ) {
       this.restoreQueuedToolEndClaim();
       return;
@@ -7178,6 +7177,23 @@ export class AgentSession {
           if (dispatchCancelState?.canceledBeforeAcceptance === true) {
             if (dispatchClaim != null) {
               this.releaseQueuedToolEndClaim(dispatchClaim);
+            }
+            if (internal?.onCanceled == null && internal?.onAcceptedPreStreamFailure != null) {
+              const reason: unknown = effectiveInternal?.cancelSignal?.reason;
+              try {
+                await internal.onAcceptedPreStreamFailure(
+                  createUnknownSendMessageError(
+                    typeof reason === "string"
+                      ? reason
+                      : "Queued message canceled before acceptance."
+                  )
+                );
+              } catch (error: unknown) {
+                log.error("Canceled queue admission callback failed", {
+                  workspaceId: this.workspaceId,
+                  error: getErrorMessage(error),
+                });
+              }
             }
             this.dispatchingQueuedEntry = false;
             this.dispatchingQueuedEntryMuxMetadata = undefined;

@@ -661,6 +661,84 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("lets an admitted user claim finish during Send now", async () => {
+    const workspaceId = "queue-dispatch-admitted-user-send-now";
+    let claimQueuedToolEndMessage: (() => boolean) | undefined;
+    const streamMessage = mock((options: Parameters<AIService["streamMessage"]>[0]) => {
+      claimQueuedToolEndMessage ??= options.claimQueuedToolEndMessage;
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup, aiEmitter, aiService, historyService } =
+      await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: {
+          streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        },
+      });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    let markAppendStarted: () => void = () => undefined;
+    const appendStarted = new Promise<void>((resolve) => {
+      markAppendStarted = resolve;
+    });
+    let releaseAppend: () => void = () => undefined;
+    const appendRelease = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+
+    try {
+      expect(
+        (
+          await session.sendMessage("Start work", {
+            model: TEST_MODEL,
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendToHistory = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args) => {
+          markAppendStarted();
+          await appendRelease;
+          return originalAppend(...args);
+        }
+      );
+      try {
+        session.queueMessage("User send now", {
+          model: TEST_MODEL,
+          agentId: "exec",
+          queueDispatchMode: "tool-end",
+        });
+
+        expect(claimQueuedToolEndMessage?.()).toBe(true);
+        session.sendQueuedMessages();
+        await appendStarted;
+
+        expect((await session.interruptStream({ sendQueuedImmediately: true })).success).toBe(true);
+        expect(session.sendNextUserQueuedMessage()).toBe(false);
+        releaseAppend();
+
+        expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (history.success) {
+          const text = history.data
+            .flatMap((message) => message.parts)
+            .map((part) => (part.type === "text" ? part.text : ""));
+          expect(text).toContain("User send now");
+        }
+      } finally {
+        releaseAppend();
+        appendToHistory.mockRestore();
+      }
+    } finally {
+      releaseAppend();
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("soft-stops after a provider-executed tool result and dispatches after abort", async () => {
     const workspaceId = "queue-dispatch-provider-tool";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -936,7 +1014,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
       try {
         const cancelState = { canceledBeforeAcceptance: false };
-        const onCanceled = mock(() => undefined);
+        const onAcceptedPreStreamFailure = mock(() => undefined);
         session.queueMessage(
           "Background monitor wake",
           {
@@ -945,7 +1023,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
             queueDispatchMode: "tool-end",
             muxMetadata: { type: "bash-monitor-wake", records: [] },
           },
-          { synthetic: true, agentInitiated: true, cancelState, onCanceled }
+          {
+            synthetic: true,
+            agentInitiated: true,
+            cancelState,
+            onAcceptedPreStreamFailure,
+          }
         );
         session.queueMessage("User send now", {
           model: TEST_MODEL,
@@ -966,7 +1049,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
         expect(session.sendNextUserQueuedMessage()).toBe(true);
         releaseAppend();
 
-        expect(await waitForCondition(() => onCanceled.mock.calls.length === 1)).toBe(true);
+        expect(
+          await waitForCondition(() => onAcceptedPreStreamFailure.mock.calls.length === 1)
+        ).toBe(true);
         expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
         expect(cancelState.canceledBeforeAcceptance).toBe(true);
         expect(session.hasPendingBashMonitorWakeContinuation()).toBe(false);
