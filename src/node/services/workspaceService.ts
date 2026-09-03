@@ -1870,8 +1870,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
   private readonly bashOutputShownListener = (
     workspaceId: string,
-    _payload: OutputShownPayload
+    payload: OutputShownPayload
   ): void => {
+    if (this.removingWorkspaces.has(workspaceId)) return;
+    this.bashMonitorWakeReconciler
+      .outputShown(workspaceId, payload.processId)
+      .catch((error: unknown) => {
+        log.debug("Bash monitor output-shown revalidation failed", { workspaceId, error });
+      });
     this.scheduleBashMonitorWakeReconcile(workspaceId);
   };
   private readonly bashMonitorMatchListener = (
@@ -11860,7 +11866,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * The bash-monitor wake level: a wake the workspace has not seen yet, or a wake turn
    * admitted but not yet streaming (AgentSession.hasPendingBashMonitorWakeTurn — the
    * reconciler level is already consumed there). A stream that ended with "tool-calls"
-   * while this is high yielded to the wake and will be continued by it.
+   * while this is high yielded to the wake and will be continued by it. Deliberately not
+   * the session's cut latch: a wake retracted after the cut (monitor canceled) has no
+   * continuation, and settlement must not defer on it (AgentSession.getQueueCutCutter
+   * names the cause instead).
    */
   async hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean> {
     const id = workspaceId.trim();

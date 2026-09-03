@@ -456,15 +456,32 @@ export class BashMonitorWakeReconciler {
     processId: string,
     createdAt: string
   ): Promise<void> {
+    await this.forgetDispatchFor(
+      ownerWorkspaceId,
+      (signal) => signal.processId === processId && signal.createdAt === createdAt
+    );
+  }
+
+  /**
+   * A model-visible read advanced this process's shown frontier (or showed its terminal
+   * status). A wake already handed to the owner may now describe lines the owner has seen:
+   * the owner could have run a manual turn and returned idle while the wake was still
+   * resolving send options, so the reconcile that would re-derive it is queued behind that
+   * very hand-off. Forget the dispatch so its isCurrent() turns false at every admission
+   * gate; whatever still derives is re-handed by the reconcile scheduled here (Codex P2
+   * PRRT_kwDOPxxmWM6fEQIa).
+   */
+  async outputShown(ownerWorkspaceId: string, processId: string): Promise<void> {
+    await this.forgetDispatchFor(ownerWorkspaceId, (signal) => signal.processId === processId);
+  }
+
+  private async forgetDispatchFor(
+    ownerWorkspaceId: string,
+    covers: (signal: DerivedSignal) => boolean
+  ): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, () => {
       const state = this.states.get(ownerWorkspaceId);
-      if (
-        state?.dispatch?.signals.some(
-          (signal) => signal.processId === processId && signal.createdAt === createdAt
-        ) === true
-      ) {
-        state.dispatch = undefined;
-      }
+      if (state?.dispatch?.signals.some(covers) === true) state.dispatch = undefined;
       return Promise.resolve();
     });
     this.scheduleReconcile(ownerWorkspaceId);

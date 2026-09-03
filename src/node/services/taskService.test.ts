@@ -23908,6 +23908,72 @@ describe("TaskService", () => {
     });
   });
 
+  test("a wake retracted after the cut settles the handle as a wake cut instead of deferring", async () => {
+    // The stream yielded to the wake level, then the operator canceled the monitor before
+    // this stream-end was processed: the level is low and no wake turn was admitted, so no
+    // continuation will ever arrive. Deferring would hang the owner's wait; the session's
+    // cut attribution settles it as a wake cut (not a truncation failure).
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      hasOutstandingBashMonitorWake: mock(() => Promise.resolve(false)),
+    });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
+      stage: "bash-monitor-wake" as const,
+    }));
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_retracted_wake_cut",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: workspaceTurnMuxMetadata(parentId),
+      },
+      parts: [{ type: "text", text: "Waiting on the build" }],
+    });
+
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "interrupted",
+      messageId: "msg_retracted_wake_cut",
+      error:
+        "Workspace turn yielded at a tool boundary to a bash-monitor wake that was retracted before delivery; the target workspace is idle and this delegated turn did not complete",
+    });
+  });
+
+  test("a failing wake probe settles the handle instead of leaving it running", async () => {
+    // The probe is advisory: its I/O failing must not escape finalization with the terminal
+    // stream-end already consumed (the handle would stay running until the waiter timed out).
+    const { parentId, taskService } = await startWorkspaceTurnForTest({
+      hasOutstandingBashMonitorWake: mock(() => Promise.reject(new Error("watermark read failed"))),
+    });
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_probe_failed",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: workspaceTurnMuxMetadata(parentId),
+      },
+      parts: [{ type: "text", text: "Kicked off verification" }],
+    });
+
+    const settled = await workspaceTurnSnapshot(taskService, parentId);
+    expect(settled?.status).not.toBe("running");
+    expect(settled).toMatchObject({ messageId: "msg_probe_failed" });
+  });
+
   test("nested agent progress preserves workspace-turn correlation", async () => {
     const hasPendingWorkspaceTurnContinuation = mock(
       (

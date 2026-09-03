@@ -200,6 +200,28 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].isCurrent()).toBe(true);
   });
 
+  test("a shown-frontier advance retires a handed-out wake so a stale send is refused", async () => {
+    // The owner ran a manual turn that task_await-ed the monitored process while this wake
+    // was still resolving send options: the reconcile that would re-derive it is queued
+    // behind the hand-off, so the frontier transition must invalidate the dispatch itself.
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].isCurrent()).toBe(true);
+
+    await reconciler.outputShown(OWNER, "someone-else");
+    expect(dispatches[0].isCurrent()).toBe(true);
+
+    deliveryState = { status: "settled", shownThroughOffset: 12, terminalStatusShown: false };
+    await reconciler.outputShown(OWNER, "proc");
+    expect(dispatches[0].isCurrent()).toBe(false);
+
+    // Nothing derives any more: the lines were shown, so no replacement wake is handed out.
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+  });
+
   test("disposal lowers the published level and retires the in-flight wake", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

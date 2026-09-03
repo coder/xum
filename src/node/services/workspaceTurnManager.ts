@@ -282,6 +282,17 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
 /**
+ * Reason persisted when the target stream yielded at a tool boundary to a bash-monitor
+ * wake that was then retracted (monitor canceled) before the wake turn was sent. No
+ * continuation follows, so deferring would leave the owner's wait hanging; settling as a
+ * truncation would misreport the delegated work as failed output. Same supersede family
+ * as new-input cuts: self-heal eligible should a late correlated continuation prove the
+ * turn went on after all.
+ */
+const WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR =
+  "Workspace turn yielded at a tool boundary to a bash-monitor wake that was retracted before delivery; the target workspace is idle and this delegated turn did not complete";
+
+/**
  * Reason prefix persisted when the owner's OWN follow-up turn (task
  * kind="workspace", mode="existing", tool-end dispatch) cut its active
  * delegated turn at a tool boundary. The full reason names the successor
@@ -331,7 +342,8 @@ function isSupersededWorkspaceTurnInterrupt(
 ): boolean {
   return (
     (record.status === "interrupted" &&
-      record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR) ||
+      (record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR ||
+        record.error === WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR)) ||
     isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record)
   );
 }
@@ -378,6 +390,7 @@ function ownerFollowUpSupersedeSkipsDirectParent(
 type QueueCutSupersedeEvidence =
   | { kind: "same_owner_follow_up"; successorHandleId: string }
   | { kind: "other_input" }
+  | { kind: "retracted_wake" }
   | { kind: "preserved"; error: string }
   | null;
 
@@ -4091,7 +4104,9 @@ export class WorkspaceTurnManager {
           ? buildOwnerFollowUpSupersededError(evidence.successorHandleId)
           : evidence.kind === "preserved"
             ? evidence.error
-            : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
+            : evidence.kind === "retracted_wake"
+              ? WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR
+              : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
       return {
         ...baseRecord,
         status: "interrupted",
@@ -4324,8 +4339,19 @@ export class WorkspaceTurnManager {
     }
     // A stream that ended with "tool-calls" while a wake is outstanding yielded to that
     // wake; the wake turn inherits this correlation (inheritOpenWorkspaceTurnMetadata).
-    if (await this.workspaceService.hasOutstandingBashMonitorWake(event.workspaceId)) {
-      return true;
+    // The probe is advisory: if its I/O fails, settle through the normal path rather
+    // than leave the handle running with its terminal stream-end already consumed (a
+    // late correlated continuation can still self-heal it) (Codex P2 PRRT_kwDOPxxmWM6fEQIr).
+    try {
+      if (await this.workspaceService.hasOutstandingBashMonitorWake(event.workspaceId)) {
+        return true;
+      }
+    } catch (error) {
+      log.warn("Bash monitor wake probe failed during workspace turn settlement", {
+        workspaceId: event.workspaceId,
+        taskHandleId: correlation.taskHandleId,
+        error,
+      });
     }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
     if (activeStream == null || activeStream.messageId === event.messageId) {
@@ -4400,6 +4426,11 @@ export class WorkspaceTurnManager {
       return cutter.dispatchMode === "tool-end"
         ? classifyMetadata(cutter.muxMetadata)
         : { kind: "other_input" };
+    }
+    // The stream yielded to the wake level and the caller found no continuation
+    // (level low, no wake turn admitted): the wake was retracted after the cut.
+    if (cutter?.stage === "bash-monitor-wake") {
+      return { kind: "retracted_wake" };
     }
     // Residual legacy positives (e.g. hasPendingAutoRetry with an empty queue)
     // stay generic supersede evidence.

@@ -257,6 +257,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
     const discardProcess = mock(() => Promise.resolve());
+    const outputShown = mock(() => Promise.resolve());
     const upsert = mock(() => Promise.resolve());
     const remove = mock(() => Promise.resolve());
     const recordTerminal = mock(() => Promise.resolve());
@@ -265,6 +266,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       bashMonitorWakeReconciler: {
         scheduleReconcile: typeof scheduleReconcile;
         discardProcess: typeof discardProcess;
+        outputShown: typeof outputShown;
       };
       bashMonitorRegistryStore: {
         upsert: typeof upsert;
@@ -274,7 +276,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
+      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess, outputShown };
       internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
       const armed = {
         processId: "proc",
@@ -286,7 +288,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         createdAt: "2026-08-31T12:00:00.000Z",
       };
       events.emit("monitor:match", "owner", {});
-      events.emit("output:shown", "owner", {});
+      events.emit("output:shown", "owner", { processId: "proc", shownThroughOffset: 12 });
       events.emit("monitor:armed", "owner", armed);
       events.emit("monitor:stopped", "owner", {
         processId: "proc",
@@ -302,6 +304,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // registry row goes, so its captured output is never sent as a turn.
       expect(discardProcess).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
+      // A shown-frontier advance revalidates any wake already handed out for the process.
+      expect(outputShown).toHaveBeenCalledWith("owner", "proc");
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
       await cleanup();

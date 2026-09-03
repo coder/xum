@@ -98,12 +98,15 @@ export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMod
  * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
  * engaged stage is reported even when its metadata is undefined (manual
  * message) so callers cannot misattribute the cut to an entry queued behind
- * the engaged one.
+ * the engaged one. "bash-monitor-wake" is the stream yielding to the wake level
+ * with no input holding the session: the wake turn, if it still arrives, is a
+ * separate idle-only send, so this stage carries no metadata.
  */
 export type QueueCutCutter =
   | { stage: "preparing"; muxMetadata: unknown }
   | { stage: "dispatching"; muxMetadata: unknown }
-  | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
+  | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode }
+  | { stage: "bash-monitor-wake"; muxMetadata?: undefined };
 
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;

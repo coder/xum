@@ -665,9 +665,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("a stream cut for the wake level stays a pending wake turn until a turn is admitted", async () => {
+  test("a stream cut for the wake level is attributed as the cutter until a turn is admitted", async () => {
     // Settlement of a delegated turn runs after the cut; an operator canceling the monitor in
-    // between lowers the level, so the cut itself must remain the evidence.
+    // between lowers the level, so the cut itself must name its cause. It is attribution
+    // only: a continuation is read live (hasPendingBashMonitorWakeTurn stays false), so a
+    // retracted wake settles the handle instead of deferring it forever.
     const workspaceId = "queue-dispatch-wake-cut-latch";
     let level = false;
     let markStreamRequested: () => void = () => undefined;
@@ -691,20 +693,22 @@ describe("AgentSession queued message tool-call dispatch", () => {
     });
     let disposed = false;
     try {
+      expect(session.getQueueCutCutter()).toBeUndefined();
       level = true;
       expect(await session.hasPendingToolEndInput()).toBe(true);
       level = false;
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+      expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
       // Reading a low level later does not retract the recorded cut.
       expect(await session.hasPendingToolEndInput()).toBe(false);
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+      expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
 
       // Whatever turn is admitted next settles the cut — here a manual send, which is not
       // itself a wake turn.
       const sendPromise = session.sendMessage("hello", { model: TEST_MODEL, agentId: "exec" });
       await streamRequested;
       expect(session.isBusy()).toBe(true);
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      expect(session.getQueueCutCutter()).toEqual({ stage: "preparing", muxMetadata: undefined });
       session.dispose();
       disposed = true;
       releaseStream();
@@ -716,16 +720,38 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("a queued tool-end head is not recorded as a wake cut", async () => {
+  test("a queued head is not recorded as a wake cut", async () => {
     const workspaceId = "queue-dispatch-queue-cut-not-wake";
+    let releaseLevel: () => void = () => undefined;
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId,
-      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+      hasOutstandingBashMonitorWake: () =>
+        new Promise<boolean>((resolve) => {
+          releaseLevel = () => resolve(true);
+        }),
     });
     try {
+      // A message queued while the level is being read arbitrates like one queued before:
+      // a turn-end head means no cut (and no wake attribution), a tool-end head cuts as
+      // queued input.
+      const pendingTurnEnd = session.hasPendingToolEndInput();
+      session.queueMessage("later", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      releaseLevel();
+      expect(await pendingTurnEnd).toBe(false);
+      expect(session.getQueueCutCutter()).toMatchObject({ stage: "queued" });
+      session.clearQueue();
+
+      const pendingToolEnd = session.hasPendingToolEndInput();
       session.queueMessage("now", { model: TEST_MODEL, agentId: "exec" });
-      expect(await session.hasPendingToolEndInput()).toBe(true);
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      releaseLevel();
+      expect(await pendingToolEnd).toBe(true);
+      expect(session.getQueueCutCutter()).toMatchObject({ stage: "queued" });
+      session.clearQueue();
+      expect(session.getQueueCutCutter()).toBeUndefined();
     } finally {
       session.dispose();
       await cleanup();

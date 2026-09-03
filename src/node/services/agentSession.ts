@@ -873,12 +873,13 @@ export class AgentSession {
   private preparingBashMonitorWake = false;
   /**
    * The last stream cut itself for the wake level (hasPendingToolEndInput returned true
-   * from the level) and no turn has been admitted since. Delegated-turn settlement needs the
-   * cut's cause, not the live level: an operator canceling the monitor between the cut and
-   * the stream-end handler lowers the level, and the "tool-calls" end would otherwise read as
-   * ended-before-completion instead of the same deferral a still-high level produces. A wake
-   * that never arrives is recovered by the turn manager's stale-deferred path (Codex P2
-   * PRRT_kwDOPxxmWM6fDmpR).
+   * from the level) and no turn has been admitted since. This is cut *attribution*
+   * (getQueueCutCutter), not a continuation marker: whether the wake still arrives is read
+   * live from the level / the admitted wake turn. An operator canceling the monitor between
+   * the cut and the stream-end handler lowers the level with no wake turn to follow, so
+   * settlement must not defer on it (the parent's wait would hang until timeout); the
+   * attribution lets it settle the "tool-calls" end as a wake cut instead of a truncation
+   * failure (Codex P2 PRRT_kwDOPxxmWM6fDmpR, PRRT_kwDOPxxmWM6fEQIf).
    */
   private streamYieldedToBashMonitorWake = false;
 
@@ -6579,6 +6580,10 @@ export class AgentSession {
     if (this.hasOutstandingBashMonitorWake == null) return false;
     try {
       const outstanding = await this.hasOutstandingBashMonitorWake();
+      // A message queued during the level read arbitrates the same way: the stream-end
+      // drain would dispatch it whatever the level says (Codex P2 PRRT_kwDOPxxmWM6fEQIk).
+      const modeAfterRead = this.messageQueue.getNextDispatchableMode();
+      if (modeAfterRead != null) return modeAfterRead === "tool-end";
       // The SDK only asks when the loop would otherwise continue, so a true here IS the cut.
       if (outstanding) this.streamYieldedToBashMonitorWake = true;
       return outstanding;
@@ -6674,7 +6679,7 @@ export class AgentSession {
    * so delegated-turn settlement must still see the continuation.
    */
   hasPendingBashMonitorWakeTurn(): boolean {
-    if (this.preparingBashMonitorWake || this.streamYieldedToBashMonitorWake) return true;
+    if (this.preparingBashMonitorWake) return true;
     const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
     return dispatching?.type === "bash-monitor-wake";
   }
@@ -6729,7 +6734,10 @@ export class AgentSession {
       return { stage: "dispatching", muxMetadata: this.dispatchingQueuedEntryMuxMetadata };
     }
     const candidate = this.messageQueue.getNextQueueCutCandidate();
-    return candidate != null ? { stage: "queued", ...candidate } : undefined;
+    if (candidate != null) return { stage: "queued", ...candidate };
+    // No input holds the session: the stream itself yielded to the wake level. Settlement
+    // reads whether the wake still arrives from the level; this only names the cause.
+    return this.streamYieldedToBashMonitorWake ? { stage: "bash-monitor-wake" } : undefined;
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */
