@@ -4039,11 +4039,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       },
       // The stranded resume starts a stream from inside the session, so it re-applies the
-      // stream-start guards WorkspaceService.resumeStream enforces (removal, archive) and, for a
-      // delegated turn, checks the owner still has it running: a task_stop or lifecycle interrupt
-      // that found the cut stream already completed had no abort to withdraw the marker with.
+      // stream-start guards WorkspaceService.resumeStream enforces (rename, removal, archive)
+      // and, for a delegated turn, checks the owner still has it running: a task_stop or
+      // lifecycle interrupt that found the cut stream already completed had no abort to
+      // withdraw the marker with.
       admitStrandedTurnResume: async (correlation) => {
         const workspaceRefused = (): boolean =>
+          this.renamingWorkspaces.has(workspaceId) ||
           this.removingWorkspaces.has(workspaceId) ||
           this.archivingWorkspaces.has(workspaceId) ||
           this.isWorkspaceArchivedInConfig(workspaceId);

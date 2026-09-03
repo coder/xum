@@ -1850,6 +1850,30 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a task hard stop on the stranded delegated turn settles the turn it had advertised", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-hard-stop";
+    const harness = await strandDelegatedTurnBehindClosedGate(workspaceId);
+    const { session, cleanup, streamMessage, settleForfeited } = harness;
+
+    try {
+      // The stop found the cut stream completed, so the queue clear is the only boundary the
+      // session sees; the owner deferred on the marker and no stream event will reach it.
+      session.clearQueue("task stopped", { hardStop: true });
+      expect(settleForfeited).toHaveBeenCalledTimes(1);
+      expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
+      harness.openGate();
+      session.drainQueuedMessagesIfIdle();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("disposing the session settles the delegated turn it had advertised", async () => {
     const workspaceId = "queue-dispatch-stranded-delegated-dispose";
     const harness = await strandDelegatedTurnBehindClosedGate(workspaceId);

@@ -6851,9 +6851,12 @@ export class AgentSession {
     // stream has already completed or has not registered yet, so the queue clear is the only
     // session-visible boundary at which the owed continuation and a pending provider-tool soft
     // stop can be forfeited. A user clearing the queue keeps them: the cut turn still resumes.
+    // Forfeit rather than withdraw: with the stream already completed, the owner that deferred on
+    // the marker gets no stream event, so this settles the delegated turn (a no-op when the stop
+    // already did).
     if (options?.hardStop === true) {
       this.queuedProviderToolEndAbortInFlight = false;
-      this.withdrawStrandedTurnResume();
+      this.forfeitStrandedTurnResume("Stranded turn resume dropped: task hard stop.");
     }
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
