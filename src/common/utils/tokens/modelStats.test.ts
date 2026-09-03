@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { modelsExtra } from "./models-extra";
 import { getModelStats, getModelStatsResolved, type ModelStats } from "./modelStats";
 
 const DEFAULT_IMAGE_MODEL = "openai:gpt-image-2";
@@ -72,6 +71,7 @@ describe("getModelStats", () => {
     ["openai:gpt-5.6-sol", 0.000005, 0.00003, 0.0000005, 0.00000625],
     ["openai:gpt-5.6-terra", 0.000002, 0.000012, 0.0000002, 0.0000025],
     ["openai:gpt-5.6-luna", 0.0000002, 0.0000012, 0.00000002, 0.00000025],
+    ["openai:gpt-6-astra", 0.00001, 0.00005, 0.000001, 0.0000125],
   ] as const)(
     "resolves %s with the GA pricing and limits",
     (model, input, output, cacheRead, cacheCreation) => {
@@ -98,21 +98,11 @@ describe("getModelStats", () => {
     }
   );
 
-  test("resolves the pre-release GPT-6 Astra placeholder as Sol-equivalent stats", () => {
-    // The documented pre-release assumption is "carry GPT-5.6 Sol's limits and
-    // pricing forward until OpenAI publishes the model page". Assert that
-    // relationship rather than the literals: if Sol's rates move (e.g. a price
-    // cut), this forces a decision about whether the placeholder follows.
+  test("resolves GPT-6 Astra by alias, dated snapshot, and gateway prefix", () => {
     const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
-    expect(astra).toEqual(expectStats(KNOWN_MODELS.GPT.id));
-    // ...but it must be its own entry, not a Sol alias, so a launch-day
-    // correction touches Astra alone.
-    expect(modelsExtra["gpt-6-astra"]).toBeDefined();
-    expect(modelsExtra["gpt-6-astra"]).not.toBe(modelsExtra["gpt-5.6-sol"]);
-    // Dated and gateway-prefixed ids normalize to the canonical entry.
     expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
     expect(expectStats("mux-gateway:openai/gpt-6-astra")).toEqual(astra);
-    // Named variants are unknown until published.
+    // OpenAI has published no Astra variants; do not resolve unknown ids to it.
     expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
   });
 

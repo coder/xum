@@ -23,6 +23,7 @@ import {
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
+  openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   stripModelProviderPrefixes,
   type ThinkingLevel,
@@ -82,8 +83,8 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
  * - openai:gpt-5.2 / openai:gpt-5.5 → ["off", "low", "medium", "high", "xhigh"]
  * - openai:gpt-5.6 family (Sol/Terra/Luna and the bare alias) →
  *   ["off", "low", "medium", "high", "xhigh", "max"] (6 levels; native max at GA)
- * - openai:gpt-6-astra → same 6 levels (pre-release ASSUMPTION that Astra keeps the
- *   GPT-5.6 reasoning surface; see openaiSupportsNativeMaxEffort)
+ * - openai:gpt-6-astra → ["low", "medium", "high", "xhigh", "max"] (native max; the API
+ *   rejects "none", so reasoning cannot be disabled)
  * - openai:gpt-5.2-pro / openai:gpt-5.5-pro → ["medium", "high", "xhigh"] (3 levels)
  * - openai:gpt-5-pro → ["high"] (only supported level, legacy)
  * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
@@ -165,10 +166,14 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh"];
   }
 
+  // GPT-6 Astra cannot disable reasoning: the API rejects effort "none" with a 400
+  // and lists no "minimal", so "off" is not offered and requests for it clamp up to "low".
+  if (openaiRejectsDisabledReasoning(withoutProviderNamespace)) {
+    return ["low", "medium", "high", "xhigh", "max"];
+  }
+
   // The GPT-5.6 family (Sol/Terra/Luna and the bare gpt-5.6 alias) supports
-  // the native "max" reasoning effort introduced at GA; GPT-6 Astra is assumed
-  // to keep it. Astra keeps "off" too (mapped to the explicit "none" effort), so
-  // it needs no forced-thinking entry in resolveEffectiveThinkingLevel.
+  // the native "max" reasoning effort introduced at GA.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
@@ -338,10 +343,12 @@ export function resolveEffectiveThinkingLevel(
 ): ThinkingLevel {
   const level = requested ?? THINKING_LEVEL_OFF;
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  // Gemini 3.8 Flash rejects "minimal", so an unset/"off" level must clamp here too;
-  // otherwise the tracked level would say "off" while the adapter sends "low".
+  // Gemini 3.8 Flash rejects "minimal" and GPT-6 Astra rejects "none", so an
+  // unset/"off" level must clamp here too; otherwise the tracked level would say
+  // "off" while the adapter sends "low".
   return anthropicRejectsDisabledThinking(capabilityModel) ||
     isGlm53Model(capabilityModel) ||
+    openaiRejectsDisabledReasoning(capabilityModel) ||
     isGeminiFlashMinimalRejectingModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;

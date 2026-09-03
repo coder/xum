@@ -37,11 +37,11 @@ describe("Known Models Integration", () => {
     expect(MODEL_ABBREVIATIONS["gpt-5.5"]).toBeUndefined();
   });
 
-  test("astra aliases resolve to the pre-release GPT-6 Astra entry without moving gpt", () => {
+  test("astra aliases resolve to the GPT-6 Astra entry without moving gpt", () => {
     expect(MODEL_ABBREVIATIONS.astra).toBe("openai:gpt-6-astra");
     expect(MODEL_ABBREVIATIONS["gpt-6-astra"]).toBe("openai:gpt-6-astra");
-    // Astra is additive: the flagship alias keeps tracking the GA GPT-5.6 tier
-    // until launch, and the unreleased model is not warmed at startup.
+    // Astra is additive: the flagship alias keeps tracking the cheaper GPT-5.6
+    // Sol, and Astra is not warmed at startup (its tokenizer is warmed via GPT).
     expect(MODEL_ABBREVIATIONS.gpt).toBe(KNOWN_MODELS.GPT.id);
     expect(KNOWN_MODELS.GPT_6_ASTRA.warm).toBeUndefined();
     // Sol must stay ahead of Astra: compaction "switch model" suggestions pick the

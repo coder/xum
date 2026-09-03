@@ -1394,11 +1394,10 @@ describe("buildProviderOptions - OpenAI", () => {
     });
   });
 
-  // Pre-release: Astra is ASSUMED to keep the GPT-5.6 reasoning surface (native
-  // max, explicit none) but NOT pro mode; these tests pin that split so the
-  // launch-day verification can flip exactly the seams that turn out wrong.
-  describe("GPT-6 Astra (pre-release) reasoning options", () => {
-    test("maps max to the native max effort and off to the explicit none effort", () => {
+  // Astra keeps the GPT-5.6 native max effort but rejects "none" (HTTP 400) and has
+  // no documented pro mode; these tests pin exactly that split.
+  describe("GPT-6 Astra reasoning options", () => {
+    test("maps max to the native max effort and clamps off to low instead of none", () => {
       expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "max"))).toMatchObject({
         reasoningEffort: "max",
         reasoningSummary: "detailed",
@@ -1408,7 +1407,7 @@ describe("buildProviderOptions - OpenAI", () => {
         reasoningEffort: "xhigh",
       });
       expect(getOpenAIOptions(buildProviderOptions("openai:gpt-6-astra", "off"))).toMatchObject({
-        reasoningEffort: "none",
+        reasoningEffort: "low",
       });
     });
 
@@ -1419,7 +1418,7 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(getOpenAIOptions(result)?.reasoningEffort).toBe("max");
     });
 
-    test("degrades max to xhigh and omits none through the Copilot-routed gateway", () => {
+    test("degrades max to xhigh and keeps the low clamp through the Copilot-routed gateway", () => {
       const build = (level: Parameters<typeof buildProviderOptions>[1]) =>
         buildProviderOptions(
           "openai:gpt-6-astra",
@@ -1433,7 +1432,7 @@ describe("buildProviderOptions - OpenAI", () => {
           "github-copilot"
         );
       expect(build("max")).toEqual({ "github-copilot": { reasoningEffort: "xhigh" } });
-      expect(build("off")).toEqual({});
+      expect(build("off")).toEqual({ "github-copilot": { reasoningEffort: "low" } });
     });
 
     test("withholds pro mode even when requested on the direct Responses route", () => {
@@ -1473,7 +1472,7 @@ describe("buildProviderOptions - OpenAI", () => {
           )
         );
       expect(build("max")?.reasoningEffort).toBe("max");
-      expect(build("off")?.reasoningEffort).toBe("none");
+      expect(build("off")?.reasoningEffort).toBe("low");
     });
 
     test("keeps named Astra variants on the legacy OpenAI mapping", () => {

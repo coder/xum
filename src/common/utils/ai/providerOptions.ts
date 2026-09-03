@@ -451,14 +451,14 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: native-max models (the GPT-5.6 family and, by pre-release
-    // assumption, GPT-6 Astra — see openaiSupportsNativeMaxEffort) map
-    // ThinkingLevel "max" to the native "max" effort; other OpenAI models keep the
-    // max -> "xhigh" downgrade. Use capabilityModel so mapped aliases
-    // (mappedToModel) inherit their target's native effort. @ai-sdk/openai 4.0.11
-    // accepts native max on both Responses and Chat Completions, so both wire
-    // formats now preserve the selected level. Their "off" remains explicit
-    // "none" because omission defaults to medium.
+    // Model-aware: native-max models (the GPT-5.6 family and GPT-6 Astra, see
+    // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
+    // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
+    // capabilityModel so mapped aliases (mappedToModel) inherit their target's
+    // native effort. @ai-sdk/openai 4.0.11 accepts native max on both Responses
+    // and Chat Completions, so both wire formats now preserve the selected level.
+    // GPT-5.6 "off" remains explicit "none" because omission defaults to medium;
+    // Astra rejects "none", so its "off" clamps to "low".
     const reasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
@@ -713,8 +713,8 @@ export function buildProviderOptions(
     // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
     // Copilot's Chat Completions upstream has not published native-max or
     // explicit-none support, so degrade native-max models' (GPT-5.6 family, GPT-6
-    // Astra) "max" to xhigh (the pre-5.6 top effort) and "none" back to omission
-    // instead of risking a rejection.
+    // Astra) "max" to xhigh (the pre-5.6 top effort) and GPT-5.6's "none" back to
+    // omission instead of risking a rejection.
     const nativeReasoningEffort = getOpenAIReasoningEffort(effectiveThinking, capabilityModel);
     const reasoningEffort =
       nativeReasoningEffort === "max"

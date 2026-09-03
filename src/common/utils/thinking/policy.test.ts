@@ -256,17 +256,17 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
-  // Pre-release assumption: GPT-6 Astra keeps the GPT-5.6 reasoning surface
-  // (native max, off allowed). Named variants and other GPT-6 ids stay outside it.
-  test("returns 6 levels including max for gpt-6-astra (direct, gateway, dated)", () => {
-    const sixLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
-    expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(sixLevels);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-6-astra")).toEqual(sixLevels);
+  // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"
+  // is not offered. Named variants and other GPT-6 ids stay outside the rule.
+  test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {
+    const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-6-astra")).toEqual(fiveLevels);
     expect(getThinkingPolicyForModel("openrouter:openai/gpt-6-astra-2026-09-30")).toEqual(
-      sixLevels
+      fiveLevels
     );
     expect(enforceThinkingPolicy("openai:gpt-6-astra", "max")).toBe("max");
-    expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("off");
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
   test("gpt-6-astra named variants and other GPT-6 ids fall through to the default policy", () => {
@@ -276,12 +276,13 @@ describe("getThinkingPolicyForModel", () => {
     expect(enforceThinkingPolicy("openai:gpt-6-astra-mini", "max")).toBe("high");
   });
 
-  test("gpt-6-astra keeps off as its effective level (no forced thinking)", () => {
-    // Unlike Mythos/GLM/3.8 Flash, Astra's "off" is a real level (wire effort
-    // "none"), so an unset/off request must not be clamped up.
-    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("off");
-    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("off");
+  test("gpt-6-astra clamps unset/off to low (forced thinking, like Mythos/GLM/3.8 Flash)", () => {
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("mux-gateway:openai/gpt-6-astra", null)).toBe("low");
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "max")).toBe("max");
+    // Sol keeps a real "off" (wire effort "none"); the clamp is Astra-specific.
+    expect(resolveEffectiveThinkingLevel("openai:gpt-5.6-sol", undefined)).toBe("off");
     // Recognized reasoning model: default medium floor applies like the GPT-5.6 family.
     expect(getDefaultMinimumThinkingLevel("openai:gpt-6-astra")).toBe("medium");
     expect(getAvailableThinkingLevels("openai:gpt-6-astra", "medium")).toEqual([
@@ -292,7 +293,7 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
-  test("mappedToModel aliases inherit gpt-6-astra's 6-level ladder", () => {
+  test("mappedToModel aliases inherit gpt-6-astra's 5-level ladder", () => {
     const providersConfig: ProvidersConfigMap = {
       openai: {
         apiKeySet: true,
@@ -301,8 +302,17 @@ describe("getThinkingPolicyForModel", () => {
         models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
       },
     };
-    expect(getThinkingPolicyForModel("openai:team-astra", providersConfig)).toContain("max");
+    expect(getThinkingPolicyForModel("openai:team-astra", providersConfig)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
     expect(enforceThinkingPolicy("openai:team-astra", "max", null, providersConfig)).toBe("max");
+    expect(resolveEffectiveThinkingLevel("openai:team-astra", undefined, providersConfig)).toBe(
+      "low"
+    );
     expect(getDefaultMinimumThinkingLevel("openai:team-astra", providersConfig)).toBe("medium");
     // Without providers config the alias is unknown: default 4-level policy clamps max down.
     expect(enforceThinkingPolicy("openai:team-astra", "max")).toBe("high");
