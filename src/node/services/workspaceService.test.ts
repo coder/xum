@@ -931,6 +931,12 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(onDeferred).toHaveBeenCalledTimes(1);
 
+      // Already withdrawn at dispatch: never reaches the send, so nothing can be enqueued.
+      expect(await dispatch(controller.signal)).toBe("deferred");
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(onDeferred).toHaveBeenCalledTimes(1);
+
       expect(await dispatch(new AbortController().signal)).toBe("in-flight");
       expect(queuedModes).toEqual(["tool-end", "tool-end"]);
     } finally {
@@ -9169,6 +9175,35 @@ describe("WorkspaceService sendMessage status clearing", () => {
     } else {
       expect(resetAutoResumeCount).not.toHaveBeenCalled();
     }
+  });
+
+  test("refuses to queue a send whose cancel signal already fired", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    const controller = new AbortController();
+    controller.abort("monitor withdrawn");
+    const onCanceled = mock(() => undefined);
+    const cancelState = { canceledBeforeAcceptance: false };
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "wake",
+      { model: "openai:gpt-4o-mini", agentId: "exec" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        cancelSignal: controller.signal,
+        cancelState,
+        onCanceled,
+        queueDedupeKey: "bash-monitor-wake:test-workspace:1",
+        removableQueueDedupeKey: true,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+    expect(onCanceled).toHaveBeenCalledTimes(1);
+    expect(onCanceled).toHaveBeenCalledWith("monitor withdrawn");
+    expect(cancelState.canceledBeforeAcceptance).toBe(true);
   });
 
   test("strips stale workspace-turn correlation behind an earlier queued entry", async () => {

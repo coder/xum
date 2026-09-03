@@ -113,7 +113,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { MessageQueue } from "./messageQueue";
+import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
@@ -3170,12 +3170,8 @@ export class AgentSession {
         }
       }
 
-      const reason =
-        typeof cancelSignal.reason === "string"
-          ? cancelSignal.reason
-          : "Queued message canceled before acceptance.";
       cancellationHandled = true;
-      await internal?.onCanceled?.(reason);
+      await internal?.onCanceled?.(cancelReasonBeforeAcceptance(cancelSignal));
       if (internal?.cancelState != null) {
         internal.cancelState.canceledBeforeAcceptance = true;
       }
@@ -6525,12 +6521,16 @@ export class AgentSession {
     }
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process queued messages
-    // only for tool-end dispatches.
+    // only for tool-end dispatches. Return the same mode so the caller's foreground
+    // task waits follow the entry that will actually run, not a withdrawn FIFO head.
+    const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
+      nextDispatchableMode === "tool-end"
     );
-    return this.messageQueue.getNextQueueDispatchMode();
+    // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
+    // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
+    return nextDispatchableMode ?? null;
   }
 
   clearQueue(cancelReason = "Queued message cleared before dispatch."): void {

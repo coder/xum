@@ -93,6 +93,13 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 
+/** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
+export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
+  return typeof signal.reason === "string"
+    ? signal.reason
+    : "Queued message canceled before acceptance.";
+}
+
 /**
  * Input poised to take over a session at a queue cut (see
  * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
