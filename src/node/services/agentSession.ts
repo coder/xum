@@ -403,6 +403,12 @@ function buildStrandedTurnResume(context: {
   return {
     options: {
       ...resumeOptions,
+      // Not durable retry state (the picker omits it), but this continuation is the same turn in
+      // memory: the resumed stream must see the live scratchpad snapshot the cut stream did, not
+      // whatever the renderer's save had persisted by then.
+      ...(context.options?.additionalSystemContext != null
+        ? { additionalSystemContext: context.options.additionalSystemContext }
+        : {}),
       model: context.modelString,
       ...(context.thinkingLevelAtCut != null ? { thinkingLevel: context.thinkingLevelAtCut } : {}),
       muxMetadata:

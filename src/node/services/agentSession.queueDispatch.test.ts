@@ -1938,6 +1938,29 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("the resume keeps the live scratchpad snapshot the cut stream was sent with", async () => {
+    const workspaceId = "queue-dispatch-stranded-scratchpad";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { additionalSystemContext: "live scratchpad" },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      expect(harness.latestRequest().additionalSystemContext).toBe("live scratchpad");
+      const wake = harness.queueCancelableWake();
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      wake.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      // Falling back to the persisted scratchpad mid-turn would change the model's instructions.
+      expect(harness.latestRequest().additionalSystemContext).toBe("live scratchpad");
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("a thinking change still pending at the cut carries into the resume", async () => {
     const workspaceId = "queue-dispatch-stranded-pending-thinking";
     const harness = await createStreamingTurnHarness(workspaceId, {
