@@ -5023,9 +5023,13 @@ export class AgentSession {
     // up its replacement's holder. Absent for internal retry paths.
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride
   ): Promise<AgentSessionResult<void>> {
-    const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
+    // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
+    // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
+    // detection, or history reads, and must not reach the provider afterwards.
+    const isStreamStartAborted = (): boolean =>
+      this.disposed || this.shuttingDown || abortSignal?.aborted === true;
 
-    if (this.disposed || this.shuttingDown || isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5054,7 +5058,7 @@ export class AgentSession {
       );
     }
 
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5067,7 +5071,7 @@ export class AgentSession {
     // abort or append failure therefore re-detects the same change (nothing is
     // dropped), while a successful append cannot produce a duplicate row.
     const fileChangeDetection = await this.fileChangeTracker.getChangedAttachments();
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
     if (fileChangeDetection.attachments.length > 0) {
@@ -5084,7 +5088,7 @@ export class AgentSession {
     }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5145,7 +5149,7 @@ export class AgentSession {
       options
     );
 
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5154,7 +5158,7 @@ export class AgentSession {
       disablePostCompactionAttachments === true
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 

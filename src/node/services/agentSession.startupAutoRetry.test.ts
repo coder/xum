@@ -271,6 +271,32 @@ describe("AgentSession startup auto-retry recovery", () => {
     session.dispose();
   });
 
+  test("beginShutdown during pre-stream awaits stops the stream before the provider", async () => {
+    const workspaceId = "startup-retry-shutdown-mid-prepare";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle("assistant-1"))));
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
+      streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+    });
+    cleanups.push(cleanup);
+
+    // Shutdown lands while the stream start is already past its entry check, awaiting disk I/O.
+    const commitPartial = historyService.commitPartial.bind(historyService);
+    spyOn(historyService, "commitPartial").mockImplementation(async (id) => {
+      const result = await commitPartial(id);
+      session.beginShutdown();
+      return result;
+    });
+
+    const sendResult = await session.sendMessage("hello", {
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    expect(sendResult.success).toBe(true);
+    expect(streamMessage).not.toHaveBeenCalled();
+
+    session.dispose();
+  });
+
   test("visible completed subagent report cards do not schedule startup auto-retry", async () => {
     const workspaceId = "startup-retry-subagent-report-card";
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
