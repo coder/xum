@@ -5,6 +5,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { MemoryFileInfo } from "@/common/orpc/schemas/memory";
 import { MemorySection } from "./MemorySection.js";
 import { SettingsSectionStory } from "./settingsStoryUtils.js";
+import { NOW } from "@/browser/stories/storyTime";
 
 // Settings → Memory only manages the global scope (no workspace context),
 // so the fixture is global files only — incl. a nested path, a pinned file,
@@ -16,7 +17,7 @@ const GLOBAL_MEMORY_FILES: MemoryFileInfo[] = [
     description: "Coding style and tooling preferences",
     pinned: true,
     accessCount: 12,
-    lastAccessedAt: Date.now() - 3_600_000,
+    lastAccessedAt: NOW - 3_600_000,
   },
   {
     path: "/memories/global/people/reviewers.md",
@@ -24,7 +25,7 @@ const GLOBAL_MEMORY_FILES: MemoryFileInfo[] = [
     description: "Preferred reviewers per code area",
     pinned: false,
     accessCount: 3,
-    lastAccessedAt: Date.now() - 86_400_000,
+    lastAccessedAt: NOW - 86_400_000,
   },
   {
     path: "/memories/global/glossary.md",

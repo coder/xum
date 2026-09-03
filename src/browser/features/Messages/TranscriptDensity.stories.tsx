@@ -15,7 +15,7 @@ import {
   createProposePlanTool,
   createWebSearchTool,
 } from "@/browser/stories/mocks/tools";
-import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { NOW, STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import { TRANSCRIPT_DENSITY_KEY, type TranscriptDensity } from "@/common/constants/storage";
 
 const meta = { ...appMeta, title: "App/Chat/Transcript Density" };
@@ -200,7 +200,9 @@ export const HyperEdgeCaseGallery: AppStory = {
       setup={() => {
         collapseLeftSidebar();
         setDensity("hyper");
-        const activeStartedAt = Date.now() - 39_000;
+        // Base on NOW (not STABLE_TIMESTAMP) so the active bundle stays ~39s old and
+        // renders seconds rather than crossing into "1m …" elapsed formatting.
+        const activeStartedAt = NOW - 39_000;
         return setupSimpleChatStory({
           messages: [
             // Scenario 1: critical events remain visible in hyper density.

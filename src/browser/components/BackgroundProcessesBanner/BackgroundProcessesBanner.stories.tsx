@@ -3,7 +3,7 @@ import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createTerminalTool } from "@/browser/stories/mocks/tools";
-import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { NOW, STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 
 const meta = {
   ...appMeta,
@@ -49,7 +49,7 @@ export const BackgroundProcesses: AppStory = {
               script:
                 "export NODE_ENV=development\nexport PORT=3000\nnpm run dev -- --host 0.0.0.0 --port $PORT",
               displayName: "Dev Server",
-              startTime: Date.now() - 45000, // 45 seconds ago
+              startTime: NOW - 45000, // 45 seconds ago
               monitor: {
                 filter: "FAILED|ERROR",
                 filter_exclude: false,
@@ -67,14 +67,14 @@ export const BackgroundProcesses: AppStory = {
               pid: 12346,
               script: "npm test -- --watch",
               displayName: "Test Runner",
-              startTime: Date.now() - 30000, // 30 seconds ago
+              startTime: NOW - 30000, // 30 seconds ago
               status: "running",
             },
             {
               id: "bash_3",
               pid: 12347,
               script: "tail -f /var/log/app.log",
-              startTime: Date.now() - 120000, // 2 minutes ago
+              startTime: NOW - 120000, // 2 minutes ago
               status: "running",
             },
           ],

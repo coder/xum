@@ -72,7 +72,16 @@ interface LeftSidebarStoryOverrides {
 
 // Vite re-evaluates this module on story edits; use a fresh token so the shell
 // can deterministically remount provider state after each hot update.
-const MODULE_RENDER_TOKEN = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+const MODULE_RENDER_TOKEN = (() => {
+  // Vite HMR re-evaluates this module; bump hot.data so provider trees remount
+  // after edits. Pixel/CI has no import.meta.hot, so the token stays stable.
+  if (import.meta.hot) {
+    const nextGeneration = (Number(import.meta.hot.data.renderGeneration) || 0) + 1;
+    import.meta.hot.data.renderGeneration = nextGeneration;
+    return `storybook-left-sidebar-${NOW}-hmr-${nextGeneration}`;
+  }
+  return `storybook-left-sidebar-${NOW}`;
+})();
 
 function LeftSidebarStoryScene(props: { leftSidebarProps?: LeftSidebarStoryOverrides }) {
   const { userProjects } = useProjectContext();

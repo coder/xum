@@ -48,6 +48,7 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ComponentType, ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import { RightSidebar } from "./RightSidebar.js";
+import { NOW } from "@/browser/stories/storyTime";
 
 const meta: Meta = {
   title: "Features/RightSidebar/RightSidebar",
@@ -637,7 +638,7 @@ export const ReviewTabSortByLastEdit: Story = {
         // Clear persisted layout to ensure review tab appears in fresh default layout
         const workspaceId = "ws-review-sort";
         localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
-        const now = Date.now();
+        const now = NOW;
 
         // Set up first-seen timestamps for hunks (oldest to newest: format -> button -> client)
         // We use placeholder IDs since exact hash depends on content
@@ -1330,7 +1331,7 @@ export const CompactionModelWarning: Story = {
  * Helper to create realistic output log entries with mixed levels and locations.
  */
 function createOutputLogEntries() {
-  const now = Date.now();
+  const now = NOW;
 
   return [
     {

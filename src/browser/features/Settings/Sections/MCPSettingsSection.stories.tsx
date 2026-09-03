@@ -16,6 +16,7 @@ import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { Secret } from "@/common/types/secrets";
 
 import { MCPSettingsSection } from "./MCPSettingsSection";
+import { NOW } from "@/browser/stories/storyTime";
 
 const MOCK_TOOLS = [
   "file_read",
@@ -72,7 +73,7 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     for (const [serverName, tools] of Object.entries(options.testResults)) {
       cachedResults[serverName] = {
         result: { success: true, tools },
-        testedAt: Date.now(),
+        testedAt: NOW,
       };
     }
 
@@ -400,7 +401,7 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
                 serverUrl: "https://example.com/mcp",
                 isLoggedIn: true,
                 hasRefreshToken: true,
-                updatedAtMs: Date.now() - 60_000,
+                updatedAtMs: NOW - 60_000,
               },
             ],
           ]),

@@ -11,6 +11,7 @@ import type {
 } from "@/common/orpc/schemas/memory";
 
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { NOW } from "@/browser/stories/storyTime";
 import { MemoryTab } from "./MemoryTab";
 
 const meta: Meta<typeof MemoryTab> = {
@@ -27,6 +28,8 @@ const STORY_WORKSPACE_ID = "ws-story-memorytab";
 // Multi-file fixture covering every row permutation the tree cares about:
 // all three scopes, root files, a dir with multiple files, two-level nesting,
 // a pinned file, with/without descriptions, and used/never-used usage stats.
+// Use the storybook NOW fixture (preview also stubs Date.now) so relative
+// access labels stay stable even if a path bypasses the stub.
 const MEMORY_FILES: MemoryFileInfo[] = [
   {
     path: "/memories/global/preferences.md",
@@ -34,7 +37,7 @@ const MEMORY_FILES: MemoryFileInfo[] = [
     description: "Coding style and tooling preferences",
     pinned: true,
     accessCount: 12,
-    lastAccessedAt: Date.now() - 3_600_000,
+    lastAccessedAt: NOW - 3_600_000,
   },
   {
     path: "/memories/global/people/reviewers.md",
@@ -42,7 +45,7 @@ const MEMORY_FILES: MemoryFileInfo[] = [
     description: "Preferred reviewers per code area",
     pinned: false,
     accessCount: 3,
-    lastAccessedAt: Date.now() - 86_400_000,
+    lastAccessedAt: NOW - 86_400_000,
   },
   {
     path: "/memories/global/people/teammates.md",
@@ -58,7 +61,7 @@ const MEMORY_FILES: MemoryFileInfo[] = [
     description: "High-level architecture notes",
     pinned: false,
     accessCount: 5,
-    lastAccessedAt: Date.now() - 600_000,
+    lastAccessedAt: NOW - 600_000,
   },
   {
     path: "/memories/project/conventions.md",
@@ -66,7 +69,7 @@ const MEMORY_FILES: MemoryFileInfo[] = [
     description: "Repo conventions distilled from AGENTS.md",
     pinned: false,
     accessCount: 7,
-    lastAccessedAt: Date.now() - 7_200_000,
+    lastAccessedAt: NOW - 7_200_000,
   },
   {
     path: "/memories/project/testing.md",
@@ -82,12 +85,12 @@ const MEMORY_FILES: MemoryFileInfo[] = [
     description: "Notes for the current branch work",
     pinned: false,
     accessCount: 1,
-    lastAccessedAt: Date.now() - 60_000,
+    lastAccessedAt: NOW - 60_000,
   },
 ];
 
 const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
-  lastRunAt: Date.now() - 30 * 60 * 1000,
+  lastRunAt: NOW - 30 * 60 * 1000,
   trigger: "manual",
   summary: "Merged duplicate project notes",
   ops: [{ command: "delete", path: "/memories/project/duplicate.md", applied: true }],
@@ -107,8 +110,8 @@ function renderTab(width: string) {
           globalRecord: CONSOLIDATION_RECORD,
           latestHarvestRecord: {
             status: "completed",
-            startedAt: Date.now() - 45 * 60 * 1000,
-            completedAt: Date.now() - 44 * 60 * 1000,
+            startedAt: NOW - 45 * 60 * 1000,
+            completedAt: NOW - 44 * 60 * 1000,
             attemptCount: 1,
             boundaryKey: "summary-story",
             compactionEpoch: 3,

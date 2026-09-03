@@ -3,7 +3,7 @@ import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
+import { NOW, createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 
 const PROJECT_PATH = "/home/user/projects/my-app";
 
@@ -238,7 +238,7 @@ export const WorkflowRunGroups: AppStory = {
           reviewRun("wf-claims", "claims", {
             title: "Extract claims",
             taskStatus: "reported",
-            createdAt: new Date(Date.now() - 8 * 60_000).toISOString(),
+            createdAt: new Date(NOW - 8 * 60_000).toISOString(),
           }),
           createWorkspace({
             id: "wf-tests",
@@ -247,13 +247,13 @@ export const WorkflowRunGroups: AppStory = {
             title: "Run test matrix",
             parentWorkspaceId: "ws-main",
             taskStatus: "running",
-            createdAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+            createdAt: new Date(NOW - 6 * 60_000).toISOString(),
             workflowTask: { runId: "wfr_legacy567890", stepId: "tests" },
           }),
           reviewRun("wf-verify", "verify", {
             title: "Verify claims",
             taskStatus: "running",
-            createdAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+            createdAt: new Date(NOW - 5 * 60_000).toISOString(),
           }),
           createWorkspace({
             id: "candidate-review-a",

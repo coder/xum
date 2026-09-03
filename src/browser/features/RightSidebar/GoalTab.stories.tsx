@@ -12,6 +12,7 @@ import type {
 } from "@/common/types/goal";
 
 import { GoalTab } from "./GoalTab";
+import { NOW } from "@/browser/stories/storyTime";
 
 const meta: Meta<typeof GoalTab> = {
   title: "Features/RightSidebar/GoalTab",
@@ -64,7 +65,7 @@ const STATE_VARIANTS: GalleryVariant[] = [
       costCents: 0,
       turnsUsed: 0,
       turnCap: null,
-      startedAtMs: Date.now(),
+      startedAtMs: NOW,
     },
   },
   {
@@ -77,7 +78,7 @@ const STATE_VARIANTS: GalleryVariant[] = [
       costCents: 125,
       turnsUsed: 3,
       turnCap: 10,
-      startedAtMs: Date.now() - 90_000,
+      startedAtMs: NOW - 90_000,
     },
   },
   {
@@ -90,7 +91,7 @@ const STATE_VARIANTS: GalleryVariant[] = [
       costCents: 125,
       turnsUsed: 3,
       turnCap: null,
-      startedAtMs: Date.now(),
+      startedAtMs: NOW,
     },
   },
   {
@@ -103,7 +104,7 @@ const STATE_VARIANTS: GalleryVariant[] = [
       costCents: 525,
       turnsUsed: 4,
       turnCap: 10,
-      startedAtMs: Date.now() - 120_000,
+      startedAtMs: NOW - 120_000,
     },
   },
   {
@@ -117,7 +118,7 @@ const STATE_VARIANTS: GalleryVariant[] = [
       turnsUsed: 5,
       turnCap: null,
       completionSummary: "The lifecycle controls shipped with persistence and tests.",
-      startedAtMs: Date.now(),
+      startedAtMs: NOW,
     },
   },
   {
@@ -130,7 +131,7 @@ const STATE_VARIANTS: GalleryVariant[] = [
       costCents: 150,
       turnsUsed: 2,
       turnCap: null,
-      startedAtMs: Date.now() - 30_000,
+      startedAtMs: NOW - 30_000,
     },
   },
 ];
@@ -167,7 +168,6 @@ export const States: Story = {
 // ─────────────────────────────────────────────────────────────────────────
 
 const STORY_WORKSPACE_ID = "ws-story-goaltab";
-const NOW = Date.UTC(2026, 4, 20, 12, 0, 0);
 
 function makeBoardGoal(
   overrides: Partial<GoalRecordV1> & Pick<GoalRecordV1, "goalId">
