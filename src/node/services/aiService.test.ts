@@ -1421,6 +1421,46 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
+  it("a stream continuing a cut turn keeps that turn's fallback chain, not its model's", async () => {
+    using xumHome = new DisposableTempDir("ai-service-fallback-continuation");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-fallback-continuation";
+    const requestedModel = KNOWN_MODELS.SONNET.id;
+    const cutModel = KNOWN_MODELS.GPT.id;
+    const nextModel = KNOWN_MODELS.GEMINI_FLASH.id;
+    // The resumed model has a chain of its own that would lead back to the model that refused.
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: {
+        [requestedModel]: { models: [cutModel, nextModel] },
+        [cutModel]: { models: [requestedModel] },
+      },
+    });
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath),
+      { useRequestedModelString: true }
+    );
+    const progress = {
+      requestedModel,
+      refusedModels: [requestedModel],
+      chain: [cutModel, nextModel],
+    };
+
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
+      workspaceId,
+      modelString: cutModel,
+      thinkingLevel: "off",
+      modelFallbackProgress: progress,
+    });
+    expect(result.success).toBe(true);
+
+    expect(harness.startStreamCalls[0]?.modelFallback?.chain).toEqual([cutModel, nextModel]);
+    expect(harness.startStreamCalls[0]?.modelFallbackProgress).toEqual(progress);
+  });
+
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {
     using xumHome = new DisposableTempDir("ai-service-startup-breadcrumbs");
     const projectPath = path.join(xumHome.path, "project");

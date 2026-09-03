@@ -1079,6 +1079,67 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a resumed turn continues the cut stream's fallback chain", async () => {
+    const workspaceId = "queue-dispatch-stranded-fallback-chain";
+    const harness = await createStreamingTurnHarness(workspaceId);
+    const { session, cleanup, aiEmitter, aiService, streamMessage } = harness;
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+    // The requested model refused and the cut reached its first fallback.
+    const progress = {
+      requestedModel: TEST_MODEL,
+      refusedModels: [TEST_MODEL],
+      chain: ["openai:gpt-5-fallback", "google:gemini-fallback"],
+    };
+
+    try {
+      expect(harness.latestRequest().modelFallbackProgress).toBeUndefined();
+
+      // Cut by the loop's stop condition: the resume runs on the fallback under the cut turn's
+      // chain, not a chain of the fallback's own.
+      harness.latestRequest().onQueuedMessageStop?.({
+        modelString: "openai:gpt-5-fallback",
+        stepsRemaining: 7,
+        modelFallbackProgress: progress,
+      });
+      harness.queueCancelableWake().abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(harness.latestRequest().modelString).toBe("openai:gpt-5-fallback");
+      expect(harness.latestRequest().modelFallbackProgress).toEqual(progress);
+
+      // Cut by a provider-tool soft stop: the abort reports the chain state the next stream gets.
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, dedupeKey: "wake:1" }
+      );
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).toHaveBeenCalledTimes(1);
+      expect(session.removeQueuedMessagesByDedupeKeyPrefix("wake:", "superseded")).toBe(1);
+      const abortedProgress = { ...progress, refusedModels: [TEST_MODEL, "openai:gpt-5-fallback"] };
+      aiEmitter.emit("stream-abort", {
+        ...streamAbortEvent(workspaceId, "queued-message", 3),
+        metadata: {
+          duration: 1,
+          stepsRemaining: 3,
+          model: "google:gemini-fallback",
+          modelFallbackProgress: abortedProgress,
+        },
+      });
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 3)).toBe(true);
+      expect(harness.latestRequest().modelString).toBe("google:gemini-fallback");
+      expect(harness.latestRequest().modelFallbackProgress).toEqual(abortedProgress);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("an auto-retry runs under what the failed resumed attempt left of the step budget", async () => {
     const workspaceId = "queue-dispatch-stranded-retry-step-budget";
     const aiEmitter = new EventEmitter();
@@ -2677,6 +2738,81 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(streamMessage).toHaveBeenCalledTimes(1);
       expect(session.isBusy()).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a late owner claim after the continuation already ran and ended still defers", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-late-claim";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      const wake = harness.queueCancelableWake();
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
+      wake.abort("monitor consumed");
+      // The owner is behind its event lock and has not asked about assistant-1 when the resume
+      // starts, runs, and ends.
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(harness.latestRequest().muxMetadata).toEqual(WORKSPACE_TURN_CORRELATION);
+      aiEmitter.emit("stream-end", { ...streamEndEvent(workspaceId), messageId: "assistant-2" });
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+
+      // The successor's own events settle the turn; the late claim on the cut must not settle it
+      // as failed first. The evidence is spent by that one claim.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a queued entry whose durable row outlives its failed startup supersedes the continuation", async () => {
+    const workspaceId = "queue-dispatch-stranded-durable-cutter";
+    const harness = await createStreamingTurnHarness(workspaceId);
+    const { session, cleanup, aiEmitter, streamMessage, historyService } = harness;
+
+    try {
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
+      // An unrelated synthetic entry cuts the turn; its acceptance hook fails after its row is
+      // durable, so no stream of its own starts.
+      session.queueMessage(
+        "peer follow-up",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          onAccepted: () => {
+            throw new Error("acceptance exploded");
+          },
+        }
+      );
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // The cut turn must not run the follow-up's row as its own continuation.
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(session.isBusy()).toBe(false);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        const last = history.data[history.data.length - 1];
+        expect(last?.role).toBe("user");
+        expect(
+          last?.parts.some((part) => part.type === "text" && part.text === "peer follow-up")
+        ).toBe(true);
+      }
     } finally {
       session.dispose();
       await cleanup();

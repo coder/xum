@@ -323,6 +323,12 @@ export const StreamLifecycleEventSchema = StreamLifecycleSnapshotSchema.extend({
   workspaceId: z.string(),
 });
 
+// Refusal-fallback chain a turn runs under and how far along it is. A stream that resumes a cut
+// turn continues this chain instead of resolving one from the model it resumes on.
+export const ModelFallbackProgressSchema = ModelFallbackRecordSchema.extend({
+  chain: z.array(z.string()),
+});
+
 export const StreamAbortEventSchema = z.object({
   type: z.literal("stream-abort"),
   workspaceId: z.string(),
@@ -344,6 +350,8 @@ export const StreamAbortEventSchema = z.object({
       // Steps left under the stream's ceiling at the abort; a turn cut for a queued message
       // resumes under this budget rather than a fresh one.
       stepsRemaining: z.number().int().nonnegative().optional(),
+      // Fallback chain state at the abort, carried into the resumed stream for the same reason.
+      modelFallbackProgress: ModelFallbackProgressSchema.optional(),
     })
     .optional()
     .meta({

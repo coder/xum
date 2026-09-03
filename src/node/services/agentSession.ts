@@ -117,6 +117,7 @@ import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueClearCallbacks, QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
+  type ModelFallbackProgress,
   type RuntimeStatusEvent,
   type StreamAbortReason,
   type StreamEndEvent,
@@ -235,6 +236,9 @@ interface CompactionRequestMetadata {
 
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 
+/** Consumed continuation cuts kept for a late owner claim (see consumedContinuationCuts). */
+const MAX_RETAINED_CONTINUATION_CUTS = 8;
+
 interface AutoRetryResumeRequest {
   // Same-session auto-retry must preserve the full normalized request because
   // ACP correlation/delegation lives in transient send options that are
@@ -247,6 +251,7 @@ interface AutoRetryResumeRequest {
   stepBudget?: number;
   /** The retried stream was admitted under resumeStream's revalidation; the retry repeats it. */
   revalidateAdmission?: boolean;
+  modelFallbackProgress?: ModelFallbackProgress;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -372,11 +377,18 @@ interface StrandedTurnResume {
   options: SendMessageOptions;
   /** Assistant message id of the stream the cut ended (claimWorkspaceTurnContinuation). */
   cutMessageId: string;
+  /** The owner already deferred on this cut's stream-end; no late claim is coming for it. */
+  claimed?: boolean;
   /**
    * Steps the cut stream had left under its ceiling; the resumed stream runs under this budget
    * so a chain of cuts and resumes spends one turn's steps, not a fresh cap per resume.
    */
   stepBudget?: number;
+  /**
+   * Fallback chain the cut stream ran under, with the refusals so far: the resumed stream continues
+   * it, rather than the chain its own (possibly fallback) model would resolve.
+   */
+  modelFallbackProgress?: ModelFallbackProgress;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
@@ -397,6 +409,7 @@ function buildStrandedTurnResume(context: {
   modelString: string;
   cutMessageId: string;
   stepBudget?: number;
+  modelFallbackProgress?: ModelFallbackProgress;
   options?: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
@@ -428,6 +441,9 @@ function buildStrandedTurnResume(context: {
     },
     cutMessageId: context.cutMessageId,
     ...(context.stepBudget != null ? { stepBudget: context.stepBudget } : {}),
+    ...(context.modelFallbackProgress != null
+      ? { modelFallbackProgress: context.modelFallbackProgress }
+      : {}),
     ...(context.agentInitiated != null ? { agentInitiated: context.agentInitiated } : {}),
     ...(context.goalKind != null ? { goalKind: context.goalKind } : {}),
     ...(context.goalId != null ? { goalId: context.goalId } : {}),
@@ -801,6 +817,13 @@ export class AgentSession {
   // Set while the sweep's resume is running (claim through stream end); aborting it cancels only
   // the pre-stream window, since StreamManager unlinks the signal once a stream registers.
   private strandedTurnResumeInFlight: AbortController | null = null;
+  /**
+   * Cuts of delegated turns whose continuation already ran, keyed by the cut stream's message id.
+   * The owner settles a correlated tool-calls stream-end under its own event lock, so it can ask
+   * about a cut after the successor stream has come and gone; the successor's own events settle
+   * the turn, and this evidence keeps the late claim from settling it as failed first.
+   */
+  private readonly consumedContinuationCuts = new Map<string, WorkspaceTurnMuxMetadata>();
   /** Owner settlements for forfeited continuations that have not landed yet (settleOwedForfeits). */
   private readonly owedForfeitSettlements = new Map<
     string,
@@ -981,6 +1004,8 @@ export class AgentSession {
     goalId?: string;
     /** Step ceiling this stream runs under when it continues a cut turn (see StrandedTurnResume). */
     stepBudget?: number;
+    /** Fallback chain this stream continues when it continues a cut turn (see StrandedTurnResume). */
+    modelFallbackProgress?: ModelFallbackProgress;
     /** Admitted under resumeStream's revalidation; in-session retries of this stream repeat it. */
     revalidateAdmission?: boolean;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
@@ -1407,7 +1432,8 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
     stepBudget?: number,
-    revalidateAdmission?: boolean
+    revalidateAdmission?: boolean,
+    modelFallbackProgress?: ModelFallbackProgress
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1421,6 +1447,7 @@ export class AgentSession {
       ...(goalId != null ? { goalId } : {}),
       ...(stepBudget != null ? { stepBudget } : {}),
       ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
+      ...(modelFallbackProgress != null ? { modelFallbackProgress } : {}),
     };
   }
 
@@ -1456,6 +1483,7 @@ export class AgentSession {
         goalId: request.goalId,
         stepBudget: request.stepBudget,
         revalidateAdmission: request.revalidateAdmission,
+        modelFallbackProgress: request.modelFallbackProgress,
       });
       if (result.success) {
         if (result.data.refusedBy != null) {
@@ -4088,6 +4116,14 @@ export class AgentSession {
     if (cancelSignal != null) {
       cancellationDisabled = true;
     }
+    // The durable row of anything but a continuation of the cut turn (a wake, or the same
+    // delegated turn) supersedes the owed continuation from here on: a failure below leaves the
+    // row in place, and the cut turn must not resume over it with its own identity.
+    if (!this.continuesOwedTurn(typedMuxMetadata)) {
+      this.forfeitStrandedTurnResume(
+        "Stranded turn resume dropped: superseded by a later durable message."
+      );
+    }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
@@ -4170,8 +4206,6 @@ export class AgentSession {
     // Synthetic/system sends (mid-stream compaction, task recovery prompts, etc.)
     // must not silently opt users back into auto-retry after they've disabled it.
     if (isManualUserMessage) {
-      // The user's own message supersedes any continuation owed to a stranded turn.
-      this.withdrawStrandedTurnResume();
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
       await this.clearStartupAutoRetryAbandon();
@@ -4349,6 +4383,8 @@ export class AgentSession {
       revalidateAdmission?: boolean;
       /** Step ceiling for the resumed stream when it continues a cut turn (StrandedTurnResume). */
       stepBudget?: number;
+      /** Fallback chain the resumed stream continues when it continues a cut turn. */
+      modelFallbackProgress?: ModelFallbackProgress;
     }
   ): Promise<AgentSessionResult<{ started: boolean; refusedBy?: "goal" | "workspace-turn" }>> {
     this.assertNotDisposed("resumeStream");
@@ -4386,7 +4422,8 @@ export class AgentSession {
       internal?.goalKind,
       internal?.goalId,
       internal?.stepBudget,
-      internal?.revalidateAdmission
+      internal?.revalidateAdmission,
+      internal?.modelFallbackProgress
     );
     // Claim the turn before any await: the admission gates below do I/O, and a manual send
     // entering meanwhile must see a busy session rather than start a stream this resume
@@ -4449,7 +4486,8 @@ export class AgentSession {
         turnThinkingOverride,
         refuseStreamStart,
         internal?.stepBudget,
-        internal?.revalidateAdmission
+        internal?.revalidateAdmission,
+        internal?.modelFallbackProgress
       );
       if (!result.success) {
         return result;
@@ -5253,7 +5291,8 @@ export class AgentSession {
     // the signal is, and by StreamManager right before the stream registers.
     refuseStreamStart?: () => boolean,
     stepBudget?: number,
-    revalidateAdmission?: boolean
+    revalidateAdmission?: boolean,
+    modelFallbackProgress?: ModelFallbackProgress
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean =>
       abortSignal?.aborted === true || refuseStreamStart?.() === true;
@@ -5277,6 +5316,7 @@ export class AgentSession {
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
       ...(stepBudget != null ? { stepBudget } : {}),
+      ...(modelFallbackProgress != null ? { modelFallbackProgress } : {}),
       ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
       providersConfig,
     };
@@ -5484,6 +5524,7 @@ export class AgentSession {
       abortSignal,
       refuseStreamStart,
       stepBudget,
+      modelFallbackProgress,
       thinkingLevel: effectiveThinkingLevel,
       // Orthogonal to thinking level; buildRequestHeaders gates it per model.
       reasoningMode: options?.reasoningMode,
@@ -5511,13 +5552,14 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
-      onQueuedMessageStop: ({ modelString: stoppedModelString, stepsRemaining }) => {
+      onQueuedMessageStop: (stop) => {
         if (this.activeStreamContext != null && this.activeStreamMessageId != null) {
           this.strandedTurnResume = buildStrandedTurnResume({
             ...this.activeStreamContext,
-            modelString: stoppedModelString,
+            modelString: stop.modelString,
             cutMessageId: this.activeStreamMessageId,
-            stepBudget: stepsRemaining,
+            stepBudget: stop.stepsRemaining,
+            modelFallbackProgress: stop.modelFallbackProgress,
             thinkingLevelAtCut:
               activeTurnThinkingOverride?.pending ?? activeTurnThinkingOverride?.applied,
           });
@@ -5787,6 +5829,7 @@ export class AgentSession {
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
     const retryStepBudget = this.activeStreamContext?.stepBudget;
+    const retryModelFallbackProgress = this.activeStreamContext?.modelFallbackProgress;
     const retryRevalidateAdmission = this.activeStreamContext?.revalidateAdmission;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
@@ -5824,7 +5867,8 @@ export class AgentSession {
       retryGoalKind,
       retryGoalId,
       retryStepBudget,
-      retryRevalidateAdmission
+      retryRevalidateAdmission,
+      retryModelFallbackProgress
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
@@ -5844,7 +5888,8 @@ export class AgentSession {
         undefined,
         retryAdmission.refuseStreamStart,
         retryStepBudget,
-        retryRevalidateAdmission
+        retryRevalidateAdmission,
+        retryModelFallbackProgress
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -5966,7 +6011,8 @@ export class AgentSession {
         undefined,
         retryAdmission.refuseStreamStart,
         context.stepBudget,
-        context.revalidateAdmission
+        context.revalidateAdmission,
+        context.modelFallbackProgress
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -6437,7 +6483,8 @@ export class AgentSession {
         abortedStreamContext,
         payload.metadata?.model,
         payload.messageId,
-        payload.metadata?.stepsRemaining
+        payload.metadata?.stepsRemaining,
+        payload.metadata?.modelFallbackProgress
       );
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
@@ -6720,6 +6767,16 @@ export class AgentSession {
     if (next === TurnPhase.STREAMING) {
       // Any stream that actually starts is the continuation the stranded turn was waiting
       // for. PREPARING is not enough: a dequeued entry can still be canceled before acceptance.
+      const consumed = this.strandedTurnResume;
+      const consumedCorrelation = getWorkspaceTurnMuxMetadata(consumed?.options.muxMetadata);
+      if (consumed != null && consumed.claimed !== true && consumedCorrelation != null) {
+        this.consumedContinuationCuts.set(consumed.cutMessageId, consumedCorrelation);
+        // Bounded like the recovery decisions: unclaimed cuts (owner gone) must not accumulate.
+        for (const key of this.consumedContinuationCuts.keys()) {
+          if (this.consumedContinuationCuts.size <= MAX_RETAINED_CONTINUATION_CUTS) break;
+          this.consumedContinuationCuts.delete(key);
+        }
+      }
       this.strandedTurnResume = undefined;
       // "Consecutive" counts only resume attempts that never got this far: a stream that starts
       // (the resume's own included) consumed the marker, so a later stranding is new work.
@@ -7059,6 +7116,22 @@ export class AgentSession {
   }
 
   /**
+   * Whether a send with this metadata continues the owed cut turn (a wake inherits its
+   * correlation from history; a workspace-turn entry must carry the same correlation) rather than
+   * supersede it. Vacuously true when nothing is owed.
+   */
+  private continuesOwedTurn(muxMetadata: MuxMessageMetadata | undefined): boolean {
+    const owed = this.strandedTurnResume;
+    if (owed == null || muxMetadata?.type === "bash-monitor-wake") {
+      return true;
+    }
+    return hasSameWorkspaceTurnCorrelation(
+      getWorkspaceTurnMuxMetadata(muxMetadata),
+      getWorkspaceTurnMuxMetadata(owed.options.muxMetadata)
+    );
+  }
+
+  /**
    * Runs removed entries' cancellation and sweeps for the owed continuation only once it has
    * settled, as the dequeue path does: a canceled workspace-turn entry settles its handle in
    * onCanceled, and a sweep admitted before that lands would resume against an interrupted
@@ -7201,6 +7274,19 @@ export class AgentSession {
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
     streamEndMessageId: string
   ): boolean {
+    const deferred = this.answerWorkspaceTurnContinuationClaim(metadata, streamEndMessageId);
+    // The owner claims each stream-end once, so a cut it deferred on here needs no evidence
+    // retained for a late claim (consumedContinuationCuts).
+    if (deferred && this.strandedTurnResume?.cutMessageId === streamEndMessageId) {
+      this.strandedTurnResume.claimed = true;
+    }
+    return deferred;
+  }
+
+  private answerWorkspaceTurnContinuationClaim(
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
+  ): boolean {
     if (hasSameWorkspaceTurnCorrelation(this.preparingWorkspaceTurnMetadata, metadata)) {
       return true;
     }
@@ -7229,6 +7315,16 @@ export class AgentSession {
     // the queue head continues the turn even though the entry carries no correlation itself.
     if (this.hasPendingBashMonitorWakeContinuation()) {
       return true;
+    }
+
+    // The continuation of this exact cut already ran (and may already have ended): its own
+    // stream events settle the turn, so the late claim defers rather than settling it as failed.
+    const consumedCorrelation = this.consumedContinuationCuts.get(streamEndMessageId);
+    if (consumedCorrelation != null) {
+      this.consumedContinuationCuts.delete(streamEndMessageId);
+      if (hasSameWorkspaceTurnCorrelation(consumedCorrelation, metadata)) {
+        return true;
+      }
     }
 
     const owed = this.strandedTurnResume;
@@ -7426,7 +7522,8 @@ export class AgentSession {
     abortedStreamContext: AgentSession["activeStreamContext"],
     abortedModelString: string | undefined,
     abortedMessageId: string,
-    abortedStepsRemaining: number | undefined
+    abortedStepsRemaining: number | undefined,
+    abortedModelFallbackProgress: ModelFallbackProgress | undefined
   ): boolean {
     this.queuedProviderToolEndAbortInFlight = false;
     if (!isQueuedProviderToolEndAbort || this.deferQueuedFlushUntilAfterEdit) {
@@ -7447,6 +7544,7 @@ export class AgentSession {
         modelString: abortedModelString ?? abortedStreamContext.modelString,
         cutMessageId: abortedMessageId,
         stepBudget: abortedStepsRemaining,
+        modelFallbackProgress: abortedModelFallbackProgress,
         thinkingLevelAtCut:
           this.activeTurnThinkingOverride?.pending ?? this.activeTurnThinkingOverride?.applied,
       });
@@ -7512,6 +7610,7 @@ export class AgentSession {
       abortSignal: inFlight.signal,
       revalidateAdmission: true,
       stepBudget: resume.stepBudget,
+      modelFallbackProgress: resume.modelFallbackProgress,
     })
       .then((result) => {
         if (!result.success) {

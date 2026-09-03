@@ -253,6 +253,7 @@ export {
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
   LanguageModelV2UsageSchema,
+  ModelFallbackProgressSchema,
   OnChatDowngradeReasonSchema,
   QueuedMessageChangedEventSchema,
   ReasoningDeltaEventSchema,

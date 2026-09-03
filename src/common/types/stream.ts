@@ -11,6 +11,7 @@ import type {
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
   ErrorEventSchema,
+  ModelFallbackProgressSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
   StreamAbortReasonSchema,
@@ -45,6 +46,7 @@ export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;
+export type ModelFallbackProgress = z.infer<typeof ModelFallbackProgressSchema>;
 export type StreamLifecyclePhase = z.infer<typeof StreamLifecyclePhaseSchema>;
 export type StreamLifecycleSnapshot = z.infer<typeof StreamLifecycleSnapshotSchema>;
 export type StreamLifecycleEvent = z.infer<typeof StreamLifecycleEventSchema>;

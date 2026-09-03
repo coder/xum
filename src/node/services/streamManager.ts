@@ -35,6 +35,7 @@ import type {
   ReasoningDeltaEvent,
   ReasoningEndEvent,
   CompletedMessagePart,
+  ModelFallbackProgress,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
 
@@ -242,6 +243,17 @@ export function createTurnCompletionController(): TurnCompletionController {
   };
 }
 
+/**
+ * What a stream reports when its loop stops on behalf of a queued tool-end message: the model
+ * that reached the cut (a configured fallback may have swapped mid-turn), the steps left under
+ * its ceiling, and the fallback chain it was running under, for the resumed stream to continue.
+ */
+export interface QueuedMessageStop {
+  modelString: string;
+  stepsRemaining: number;
+  modelFallbackProgress?: ModelFallbackProgress;
+}
+
 // Request-construction options shared by the primary turn and model-fallback
 // hops (fallbacks rebuild these from the prepared fallback request).
 interface StreamRequestOptions {
@@ -255,8 +267,9 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  onQueuedMessageStop?: (stop: { modelString: string; stepsRemaining: number }) => void;
+  onQueuedMessageStop?: (stop: QueuedMessageStop) => void;
   stepBudget?: number;
+  modelFallbackProgress?: ModelFallbackProgress;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -309,17 +322,20 @@ interface StreamRequestConfig {
   /**
    * Invoked when the loop stops on behalf of a queued tool-end message (and not
    * because a required tool completed). The session uses it to resume the turn
-   * if that queued message is later withdrawn instead of starting a turn. Carries the
-   * model that reached the cut, which a configured fallback may have swapped mid-turn, and
-   * the steps left under this request's budget for the resumed stream to run under.
+   * if that queued message is later withdrawn instead of starting a turn.
    */
-  onQueuedMessageStop?: (stop: { modelString: string; stepsRemaining: number }) => void;
+  onQueuedMessageStop?: (stop: QueuedMessageStop) => void;
   /**
    * Step ceiling for this stream instead of MAX_STREAM_STEPS. A stream resuming a turn cut
    * for a queued message inherits the cut stream's remaining steps, so cut plus resumes
    * share one turn's ceiling; without it, every resume would restart the full cap.
    */
   stepBudget?: number;
+  /**
+   * Fallback chain state this request runs under (the fallback's request replaces the
+   * original's), reported at a queued-message cut so the resumed stream continues the chain.
+   */
+  modelFallbackProgress?: ModelFallbackProgress;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -437,6 +453,19 @@ export interface ModelFallbackOptions {
     nextModelString: string,
     options?: ModelFallbackPrepareOptions
   ) => Promise<Result<PreparedModelFallback, string>>;
+}
+
+/** Snapshot of a stream's fallback chain state for a resumed stream to continue from. */
+function modelFallbackProgressOf(
+  state: WorkspaceStreamInfo["modelFallback"]
+): ModelFallbackProgress | undefined {
+  return state == null
+    ? undefined
+    : {
+        requestedModel: state.requestedModel,
+        refusedModels: [...state.refusedModels],
+        chain: state.options.chain,
+      };
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -1974,6 +2003,7 @@ export class StreamManager {
         contextProviderMetadata,
         model: streamInfo.model,
         stepsRemaining: this.remainingStepBudget(streamInfo),
+        modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
       },
       abortReason,
       abandonPartial,
@@ -2114,6 +2144,7 @@ export class StreamManager {
       hasQueuedMessages,
       onQueuedMessageStop,
       stepBudget,
+      modelFallbackProgress,
       headers,
       onChunk,
       onStepMessages,
@@ -2167,6 +2198,7 @@ export class StreamManager {
       hasQueuedMessages,
       onQueuedMessageStop,
       stepBudget,
+      modelFallbackProgress,
       onChunk,
       onStepMessages,
       toolPolicy,
@@ -2181,7 +2213,12 @@ export class StreamManager {
   private createStopWhenCondition(
     request: Pick<
       StreamRequestConfig,
-      "hasQueuedMessages" | "onQueuedMessageStop" | "toolPolicy" | "modelString" | "stepBudget"
+      | "hasQueuedMessages"
+      | "onQueuedMessageStop"
+      | "toolPolicy"
+      | "modelString"
+      | "stepBudget"
+      | "modelFallbackProgress"
     >
   ): Array<ReturnType<typeof stepCountIs>> {
     const stepBudget = request.stepBudget ?? MAX_STREAM_STEPS;
@@ -2239,6 +2276,7 @@ export class StreamManager {
         request.onQueuedMessageStop?.({
           modelString: request.modelString,
           stepsRemaining: stepBudget - stepsSpent,
+          modelFallbackProgress: request.modelFallbackProgress,
         });
       }
       return true;
@@ -2442,8 +2480,23 @@ export class StreamManager {
     } = options;
     const stepTracker: StepMessageTracker = {};
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
+    // A stream continuing a cut turn picks the chain up where the cut left it: the requested
+    // model and refusals are the cut turn's, and a refusal here moves on to the next entry.
+    const carried = options.modelFallbackProgress;
+    const modelFallbackState: WorkspaceStreamInfo["modelFallback"] =
+      modelFallback && modelFallback.chain.length > 0
+        ? {
+            options: modelFallback,
+            requestedModel: carried?.requestedModel ?? normalizeToCanonical(modelString),
+            refusedModels: [...(carried?.refusedModels ?? [])],
+            // Pre-wrap inputs (NOT request.maxOutputTokens, which may already
+            // carry call-settings overrides for the original model).
+            original: { maxOutputTokens },
+          }
+        : undefined;
     const request = this.buildStreamRequestConfig({
       ...options,
+      modelFallbackProgress: modelFallbackProgressOf(modelFallbackState),
       onToolExecutionStart: (toolCallId) =>
         this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
     });
@@ -2477,22 +2530,22 @@ export class StreamManager {
       model: modelString,
       metadataModel,
       thinkingLevel,
-      initialMetadata,
+      // The resumed message answers on a fallback because the cut turn's requested model
+      // refused; record that as the swap would have.
+      initialMetadata:
+        modelFallbackState != null && modelFallbackState.refusedModels.length > 0
+          ? {
+              ...initialMetadata,
+              modelFallback: {
+                requestedModel: modelFallbackState.requestedModel,
+                refusedModels: [...modelFallbackState.refusedModels],
+              },
+            }
+          : initialMetadata,
       toolModelUsages: [],
       didRetryPreviousResponseIdAtStep: false,
       didRetryAfterEmptyOutput: false,
-      ...(modelFallback && modelFallback.chain.length > 0
-        ? {
-            modelFallback: {
-              options: modelFallback,
-              requestedModel: normalizeToCanonical(modelString),
-              refusedModels: [],
-              // Pre-wrap inputs (NOT request.maxOutputTokens, which may already
-              // carry call-settings overrides for the original model).
-              original: { maxOutputTokens },
-            },
-          }
-        : {}),
+      ...(modelFallbackState != null ? { modelFallback: modelFallbackState } : {}),
       stepTracker,
       receivedTerminalEvent: false,
       currentStepStartIndex: 0,
@@ -3232,6 +3285,7 @@ export class StreamManager {
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
       onQueuedMessageStop: streamInfo.request.onQueuedMessageStop,
       stepBudget,
+      modelFallbackProgress: modelFallbackProgressOf(fallbackState),
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,

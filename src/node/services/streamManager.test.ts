@@ -8,6 +8,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
+  ModelFallbackProgress,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
   ToolCallStartEvent,
@@ -1862,6 +1863,137 @@ describe("StreamManager - fallback construction callbacks", () => {
       failStreamConstruction: true,
     });
     expect(onFailure).not.toHaveBeenCalled();
+  });
+});
+
+describe("StreamManager - fallback chain continuation", () => {
+  const requestedModel = KNOWN_MODELS.SONNET.id;
+  const cutModel = KNOWN_MODELS.GPT.id;
+  const nextModel = KNOWN_MODELS.GEMINI_FLASH.id;
+  // The requested model refused and the turn was cut while running on the first fallback.
+  const progress: ModelFallbackProgress = {
+    requestedModel,
+    refusedModels: [requestedModel],
+    chain: [cutModel, nextModel],
+  };
+
+  async function runContinuationForTests(
+    workspaceId: string,
+    streams: Array<() => AsyncGenerator<unknown, void, unknown>>
+  ) {
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/fallback-continuation-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => undefined);
+    const errorEvents: unknown[] = [];
+    const streamEndEvents: Array<{
+      metadata?: {
+        model?: string;
+        modelFallback?: { requestedModel: string; refusedModels: string[] };
+      };
+    }> = [];
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
+      streamEndEvents.push(data as (typeof streamEndEvents)[number]);
+    });
+
+    const messageId = `${workspaceId}-message`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const createStreamResult = mock(
+      (_request: { modelFallbackProgress?: ModelFallbackProgress }) => {
+        const nextStream = streams.shift();
+        if (nextStream == null) {
+          throw new Error("createStreamResult called more often than the test provided streams");
+        }
+        return createStreamResultForTests(nextStream(), {
+          inputTokens: 5,
+          outputTokens: 3,
+          totalTokens: 8,
+        });
+      }
+    );
+    expect(Reflect.set(streamManager, "createStreamResult", createStreamResult)).toBe(true);
+    const prepare = mock((nextModelString: string) =>
+      Promise.resolve(
+        Ok({
+          model: createTestLanguageModel(`fallback-${nextModelString}`),
+          modelString: nextModelString,
+          messages: [],
+          system: "fallback system",
+          tools: undefined,
+        })
+      )
+    );
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel("cut-model"),
+        modelString: cutModel,
+        tools: {},
+        modelFallback: { chain: progress.chain, prepare },
+        modelFallbackProgress: progress,
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected the continuation stream to start");
+    }
+    await result.data.completion;
+    return { errorEvents, streamEndEvents, createStreamResult, prepare };
+  }
+
+  const refusal = () =>
+    (async function* () {
+      await Promise.resolve();
+      yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+    })();
+  const answer = () =>
+    (async function* () {
+      await Promise.resolve();
+      yield { type: "text-delta", text: "answer" };
+      yield { type: "finish", finishReason: "stop" };
+    })();
+
+  test("a refusal on the resumed stream moves on to the entry after the resumed model", async () => {
+    const run = await runContinuationForTests("fallback-continuation-refusal-workspace", [
+      refusal,
+      answer,
+    ]);
+
+    expect(run.errorEvents).toHaveLength(0);
+    // Not back to the chain's first entry (the resumed model itself) or a chain of its own.
+    expect(run.prepare.mock.calls.map((call) => call[0])).toEqual([nextModel]);
+    // Each request carries the chain state a further cut would report: the cut turn's at
+    // first, then the hop's.
+    expect(run.createStreamResult.mock.calls[0]?.[0].modelFallbackProgress).toEqual(progress);
+    expect(run.createStreamResult.mock.calls[1]?.[0].modelFallbackProgress).toEqual({
+      ...progress,
+      refusedModels: [requestedModel, cutModel],
+    });
+    expect(run.streamEndEvents[0]?.metadata?.model).toBe(nextModel);
+    expect(run.streamEndEvents[0]?.metadata?.modelFallback).toEqual({
+      requestedModel,
+      refusedModels: [requestedModel, cutModel],
+    });
+  });
+
+  test("a resumed stream that answers records the cut turn's fallback", async () => {
+    const run = await runContinuationForTests("fallback-continuation-answer-workspace", [answer]);
+
+    expect(run.errorEvents).toHaveLength(0);
+    expect(run.prepare).not.toHaveBeenCalled();
+    expect(run.streamEndEvents[0]?.metadata?.model).toBe(cutModel);
+    expect(run.streamEndEvents[0]?.metadata?.modelFallback).toEqual({
+      requestedModel,
+      refusedModels: [requestedModel],
+    });
   });
 });
 
