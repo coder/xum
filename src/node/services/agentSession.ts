@@ -516,6 +516,7 @@ export async function clearProviderConfigFixableAbandonMarkers(
  */
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
+const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
@@ -3485,6 +3486,9 @@ export class AgentSession {
       if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
         return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       }
+      if (this.shuttingDown) {
+        return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
+      }
 
       // Idle (or preempted to idle) now: hold busy-ness from here until the
       // turn phase takes over, so concurrent sends queue instead of racing the
@@ -3811,6 +3815,11 @@ export class AgentSession {
     // backstops for entry-accounting bypasses.
     if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    }
+    // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
+    // while streamWithHistory's own latch check keeps its stream from ever running.
+    if (this.shuttingDown) {
+      return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
     }
 
     // Persist snapshots only when this turn will be sent immediately.

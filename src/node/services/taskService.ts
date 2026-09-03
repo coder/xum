@@ -12799,6 +12799,22 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
 
+    // The artifact reads above awaited disk I/O, during which a client can reawaken a sibling
+    // whose old report is already in `reports`; re-read live state once more before handing out.
+    const liveSiblings = this.listBestOfSiblingTasks({
+      parentWorkspaceId: params.parentWorkspaceId,
+      groupId: params.groupId,
+    });
+    if (
+      liveSiblings.length !== siblings.length ||
+      liveSiblings.some(
+        (sibling) =>
+          sibling.taskId !== params.reportingTaskId && this.isBestOfSiblingExecutingAgain(sibling)
+      )
+    ) {
+      return null;
+    }
+
     const output = {
       status: "completed" as const,
       taskIds: siblings.map((sibling) => sibling.taskId),

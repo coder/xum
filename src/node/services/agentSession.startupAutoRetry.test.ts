@@ -240,7 +240,7 @@ describe("AgentSession startup auto-retry recovery", () => {
   test("beginShutdown cancels the pending retry and stops re-arming or streaming", async () => {
     const workspaceId = "startup-retry-shutdown";
     const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle("assistant-1"))));
-    const { session, events, cleanup } = await createSessionBundle(workspaceId, {
+    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId, {
       streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
     });
     cleanups.push(cleanup);
@@ -260,13 +260,16 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(events.filter((event) => event.type === "auto-retry-scheduled").length).toBe(
       scheduledBefore
     );
-    // Not disposed: the session still answers, but nothing reaches the provider.
+    // Not disposed, but sends are refused before any row lands: a follow-up row persisted here
+    // would read as a dispatched turn on the next startup while its stream never ran.
     const sendResult = await session.sendMessage("hello", {
       model: "anthropic:claude-sonnet-4-5",
       agentId: "exec",
     });
-    expect(sendResult.success).toBe(true);
+    expect(sendResult.success).toBe(false);
     expect(streamMessage).not.toHaveBeenCalled();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
 
     session.dispose();
   });

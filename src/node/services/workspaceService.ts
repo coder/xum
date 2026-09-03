@@ -5536,6 +5536,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     const persistedWorkspace = this.config.findWorkspace(workspaceId);
+    // Startup recovery or a queued dispatch can be one await from starting a stream that the single
+    // stopStream() below cannot see, and the entry stays present and unarchived until removal has
+    // finished with the runtime. Hold admission for the whole removal: success disposes the session,
+    // failure releases the hold so the workspace stays usable.
+    const admissionHolds = [
+      this.sessions.get(workspaceId),
+      this.transientStartupRecoverySessions.get(workspaceId),
+    ]
+      .filter((session): session is AgentSession => session != null)
+      .map((session) => session.holdTurnAdmission());
 
     // Try to remove from runtime (filesystem)
     try {
@@ -6213,6 +6223,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      for (const hold of admissionHolds) {
+        hold[Symbol.dispose]();
+      }
       this.removingWorkspaces.delete(workspaceId);
     }
   }

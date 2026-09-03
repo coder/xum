@@ -16862,6 +16862,87 @@ describe("WorkspaceService init cancellation", () => {
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
     }
   });
+  test("remove() holds turn admission on the session until removal settles", async () => {
+    const workspaceId = "ws-remove-holds-admission";
+    const projectPath = "/tmp/proj";
+
+    let releases = 0;
+    let releasesWhenRuntimeDeleted = -1;
+    const deleteWorkspaceMock = mock(() => {
+      releasesWhenRuntimeDeleted = releases;
+      return Promise.resolve({ success: false as const, error: "dirty" });
+    });
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace: deleteWorkspaceMock,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+
+    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ws-remove-hold-"));
+    try {
+      const mockAIService = {
+        ...createStreamLifecycleMocks(),
+        isStreaming: mock(() => false),
+        stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve(
+            Ok({
+              id: workspaceId,
+              name: "ws",
+              projectPath,
+              projectName: "proj",
+              runtimeConfig: { type: "local" },
+            })
+          )
+        ),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        on: mock(() => {}),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        off: mock(() => {}),
+      } as unknown as AIService;
+      const mockConfig: MockWorkspaceConfig = {
+        rootDir: path.join(tempRoot, "root"),
+        srcDir: "/tmp/src",
+        sessionsDir: tempRoot,
+        removeWorkspace: mock(() => Promise.resolve()),
+        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      };
+      const workspaceService = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        mockInitStateManager as InitStateManager,
+        mockExtensionMetadataService as ExtensionMetadataService,
+        mockBackgroundProcessManager as BackgroundProcessManager
+      );
+
+      // A session whose startup recovery may be one await away from dispatching.
+      const holdTurnAdmission = mock(() => ({
+        [Symbol.dispose]: () => {
+          releases += 1;
+        },
+      }));
+      const dispose = mock(() => undefined);
+      (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        workspaceId,
+        {
+          holdTurnAdmission,
+          dispose,
+        } as unknown as AgentSession
+      );
+
+      const result = await workspaceService.remove(workspaceId, false);
+      expect(result.success).toBe(false);
+      expect(holdTurnAdmission).toHaveBeenCalledTimes(1);
+      // Held across the runtime deletion, released once the failed removal settles so the
+      // still-configured workspace stays usable.
+      expect(releasesWhenRuntimeDeleted).toBe(0);
+      expect(releases).toBe(1);
+      expect(dispose).not.toHaveBeenCalled();
+    } finally {
+      createRuntimeSpy.mockRestore();
+      await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
   test("remove() calls runtime.deleteWorkspace when force=true", async () => {
     const workspaceId = "ws-remove-runtime-delete";
     const projectPath = "/tmp/proj";
