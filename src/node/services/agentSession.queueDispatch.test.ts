@@ -1079,6 +1079,159 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("an auto-retry runs under what the failed resumed attempt left of the step budget", async () => {
+    const workspaceId = "queue-dispatch-stranded-retry-step-budget";
+    const aiEmitter = new EventEmitter();
+    let streams = 0;
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      streams += 1;
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      // The resumed stream spends steps, then fails with a retryable error.
+      return Promise.resolve(
+        Ok(
+          streams === 2
+            ? {
+                messageId: "assistant-2",
+                completion: Promise.resolve({
+                  status: "failed" as const,
+                  streamError: {
+                    messageId: "assistant-2",
+                    error: "provider closed the connection",
+                    errorType: "api" as const,
+                  },
+                  stepsRemaining: 2,
+                }),
+              }
+            : createStartedTurnHandle(`assistant-${streams}`)
+        )
+      );
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+    });
+
+    try {
+      const sent = await session.sendMessage("run the checks", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(sent.success).toBe(true);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-1", "assistant", "ran the checks", { timestamp: Date.now() })
+      );
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelState: { canceledBeforeAcceptance: false },
+          cancelSignal: controller.signal,
+          onCanceled: () => undefined,
+        }
+      );
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({
+        modelString: TEST_MODEL,
+        stepsRemaining: 5,
+      });
+      controller.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(streamMessage.mock.calls[1]?.[0].stepBudget).toBe(5);
+
+      // The retry continues the same logical turn under the 2 steps the failed attempt left, not
+      // the 5 it started with.
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 3, 4_000)).toBe(true);
+      expect(streamMessage.mock.calls[2]?.[0].stepBudget).toBe(2);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("an auto-retry is abandoned when the failed resumed attempt spent the step budget", async () => {
+    const workspaceId = "queue-dispatch-stranded-retry-step-budget-spent";
+    const aiEmitter = new EventEmitter();
+    let streams = 0;
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      streams += 1;
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      return Promise.resolve(
+        Ok(
+          streams === 2
+            ? {
+                messageId: "assistant-2",
+                completion: Promise.resolve({
+                  status: "failed" as const,
+                  streamError: {
+                    messageId: "assistant-2",
+                    error: "provider closed the connection",
+                    errorType: "api" as const,
+                  },
+                  stepsRemaining: 0,
+                }),
+              }
+            : createStartedTurnHandle(`assistant-${streams}`)
+        )
+      );
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+    });
+    const abandoned: string[] = [];
+    const unsubscribe = session.onChatEvent((event) => {
+      if (event.message.type === "auto-retry-abandoned") {
+        abandoned.push(event.message.reason);
+      }
+    });
+
+    try {
+      const sent = await session.sendMessage("run the checks", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(sent.success).toBe(true);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-1", "assistant", "ran the checks", { timestamp: Date.now() })
+      );
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelState: { canceledBeforeAcceptance: false },
+          cancelSignal: controller.signal,
+          onCanceled: () => undefined,
+        }
+      );
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({
+        modelString: TEST_MODEL,
+        stepsRemaining: 1,
+      });
+      controller.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+
+      // The failed attempt spent the turn's last step: the ceiling ended the turn, no retry runs.
+      expect(await waitForCondition(() => abandoned.length === 1, 4_000)).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(2);
+      expect(session.isBusy()).toBe(false);
+    } finally {
+      unsubscribe();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("caps resume attempts that never start a stream", async () => {
     const workspaceId = "queue-dispatch-stranded-cap";
     let gateOpen = true;
@@ -1999,6 +2152,75 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a launch refused after the [CONTINUE] sentinel landed removes the sentinel", async () => {
+    const workspaceId = "queue-dispatch-stranded-refused-sentinel";
+    // Admitted on read; the stop lands while the resume appends its sentinel.
+    let stale = false;
+    const admitStrandedTurnResume = mock((_correlation: unknown) =>
+      Promise.resolve({ admissible: true, admissionStale: () => stale })
+    );
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      return Promise.resolve(Ok(createStartedTurnHandle("assistant-1")));
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+      admitStrandedTurnResume,
+    });
+    const append = historyService.appendToHistory.bind(historyService);
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
+      async (targetWorkspaceId, message) => {
+        const result = await append(targetWorkspaceId, message);
+        if (
+          message.role === "user" &&
+          message.parts.some((part) => part.type === "text" && part.text === "[CONTINUE]")
+        ) {
+          stale = true;
+        }
+        return result;
+      }
+    );
+
+    try {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-0", "user", "delegated prompt", {
+          timestamp: Date.now(),
+          muxMetadata: WORKSPACE_TURN_CORRELATION,
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-0", "assistant", "working", {
+          timestamp: Date.now(),
+          finishReason: "tool-calls",
+          muxMetadata: WORKSPACE_TURN_CORRELATION,
+        })
+      );
+      const resumed = await session.resumeStream(
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { agentInitiated: true, revalidateAdmission: true }
+      );
+      expect(resumed).toEqual(Ok({ started: false, refusedBy: "workspace-turn" }));
+      expect(streamMessage).not.toHaveBeenCalled();
+
+      // The sentinel was appended for a launch that never happened; a later unrelated turn must
+      // not send it to the provider.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.map((message) => message.id)).toEqual(["user-0", "assistant-0"]);
+      }
+    } finally {
+      appendSpy.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("a user Stop during the resume's admission gate cancels it", async () => {
     const workspaceId = "queue-dispatch-stranded-stop-in-admission";
     let releaseGate: () => void = () => undefined;
@@ -2260,6 +2482,54 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(
         session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
       ).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("clearing the queued continuation of the delegated turn settles it before any sweep", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-continuation-cleared";
+    const settleForfeited = mock((_metadata: unknown, _reason: string) => Promise.resolve());
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      harness: { settleForfeitedWorkspaceTurnContinuation: settleForfeited },
+      sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      // The owner queued a continuation of the same turn; its onCanceled is the owner's settlement
+      // of that turn and takes its time (task-store I/O).
+      let finishCancel: () => void = () => undefined;
+      const canceled = new Promise<void>((resolve) => {
+        finishCancel = resolve;
+      });
+      session.queueMessage(
+        "continue the turn",
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { agentInitiated: true, onCanceled: () => canceled }
+      );
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+      // Admission is held across the stream end (a history mutation), so the entry stays queued
+      // on an idle session instead of dispatching.
+      const hold = session.holdTurnAdmission();
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+
+      // The user clears the queue: the continuation is that turn's terminal path, so nothing is
+      // owed to the cut anymore, whatever the sweep that runs next reads from the handle.
+      session.clearQueue("queue cleared by user");
+      expect(settleForfeited).toHaveBeenCalledTimes(1);
+      expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+      hold[Symbol.dispose]();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      finishCancel();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(session.isBusy()).toBe(false);
     } finally {
       session.dispose();
       await cleanup();

@@ -114,7 +114,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
-import type { QueueCutCutter } from "./messageQueue";
+import type { QueueClearCallbacks, QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -1440,6 +1440,11 @@ export class AgentSession {
       const request = this.lastAutoRetryResumeRequest;
       if (!request) {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+        return;
+      }
+      if (request.stepBudget != null && request.stepBudget <= 0) {
+        // The failed attempt spent the turn's last step; the ceiling ends the turn here.
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "step_budget_spent" });
         return;
       }
 
@@ -5171,6 +5176,12 @@ export class AgentSession {
         // A disposed session must not persist retry/goal state post-teardown.
         if (outcome.status !== "failed" || this.disposed) return;
 
+        // A retry continues the same logical turn: it runs under what the failed attempt left
+        // of the ceiling, not the budget the attempt started with.
+        const retryRequest = this.lastAutoRetryResumeRequest;
+        if (retryRequest?.stepBudget != null && outcome.stepsRemaining != null) {
+          this.lastAutoRetryResumeRequest = { ...retryRequest, stepBudget: outcome.stepsRemaining };
+        }
         try {
           await this.handleStreamError(outcome.streamError);
         } finally {
@@ -5294,6 +5305,7 @@ export class AgentSession {
     // [CONTINUE] sentinel so the model has a valid conversation to respond to. This is
     // defense-in-depth; callers should prefer sendMessage() which persists a real user message.
     const lastMsg = requestMessages[requestMessages.length - 1];
+    let sentinelMessageId: string | undefined;
     if (lastMsg?.role === "assistant" && !lastMsg.metadata?.partial) {
       log.warn("streamWithHistory: trailing non-partial assistant detected, injecting [CONTINUE]", {
         workspaceId: this.workspaceId,
@@ -5304,11 +5316,29 @@ export class AgentSession {
         synthetic: true,
       });
       await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
+      sentinelMessageId = sentinelMessage.id;
       const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (refreshed.success) {
         requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
       }
     }
+    // A launch refused or withdrawn after the sentinel landed would leave it as an orphan that the
+    // next unrelated turn sends to the provider; it goes with the launch it was appended for.
+    const abortStartup = async (): Promise<AgentSessionResult<void>> => {
+      if (sentinelMessageId != null) {
+        const removed = await this.historyService.deleteMessage(
+          this.workspaceId,
+          sentinelMessageId
+        );
+        if (!removed.success) {
+          log.warn("Failed to remove the [CONTINUE] sentinel of a refused launch", {
+            workspaceId: this.workspaceId,
+            error: removed.error,
+          });
+        }
+      }
+      return Ok(undefined);
+    };
 
     // Capture the current user message id so retries are stable across assistant message ids.
     // Retry-eligible rows only: startup recovery matches this persisted ID
@@ -5328,7 +5358,7 @@ export class AgentSession {
     );
 
     if (isStartupAbortRequested()) {
-      return Ok(undefined);
+      return await abortStartup();
     }
 
     // Check if post-compaction attachments should be injected.
@@ -5337,7 +5367,7 @@ export class AgentSession {
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
     if (isStartupAbortRequested()) {
-      return Ok(undefined);
+      return await abortStartup();
     }
 
     this.activeStreamHadPostCompactionInjection =
@@ -5467,6 +5497,11 @@ export class AgentSession {
       );
     }
 
+    // stream-start moves the turn to STREAMING synchronously inside startStream, so a turn still
+    // PREPARING here was refused or withdrawn at the launch boundary and registered nothing.
+    if (this.turnPhase === TurnPhase.PREPARING && isStartupAbortRequested()) {
+      return await abortStartup();
+    }
     this.consumeTurnCompletion(streamResult.data);
     return Ok(undefined);
   }
@@ -6858,14 +6893,12 @@ export class AgentSession {
       this.queuedProviderToolEndAbortInFlight = false;
       this.forfeitStrandedTurnResume("Stranded turn resume dropped: task hard stop.");
     }
+    const heldOwedContinuation = this.queueHoldsOwedTurnContinuation();
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
-    for (const callbacks of callbackSets) {
-      this.notifyQueuedMessageCleared(callbacks, cancelReason);
-    }
-    this.resumeStrandedTurnIfIdle();
+    this.cancelRemovedEntries(callbackSets, cancelReason, heldOwedContinuation);
   }
 
   setQueuedMessageDispatchMode(mode: "tool-end" | "turn-end"): boolean {
@@ -6891,7 +6924,7 @@ export class AgentSession {
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
     },
     cancelReason: string
-  ): void {
+  ): Promise<void> {
     const notify = async () => {
       if (callbacks.onCanceled != null) {
         await callbacks.onCanceled(cancelReason);
@@ -6899,7 +6932,7 @@ export class AgentSession {
       }
       await callbacks.onAcceptedPreStreamFailure?.(createUnknownSendMessageError(cancelReason));
     };
-    notify().catch((error: unknown) => {
+    return notify().catch((error: unknown) => {
       log.error("Queued message clear callback failed", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
@@ -6907,9 +6940,42 @@ export class AgentSession {
     });
   }
 
+  /**
+   * Whether the queue holds an entry continuing the owed marker's delegated turn. The owner
+   * defers that turn's settlement on such an entry (claimWorkspaceTurnContinuation), and the
+   * entry's onCanceled settles the handle if it is removed unstarted.
+   */
+  private queueHoldsOwedTurnContinuation(): boolean {
+    const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
+    return correlation != null && this.messageQueue.hasWorkspaceTurn(correlation.taskHandleId);
+  }
+
+  /**
+   * Runs removed entries' cancellation and sweeps for the owed continuation only once it has
+   * settled, as the dequeue path does: a canceled workspace-turn entry settles its handle in
+   * onCanceled, and a sweep admitted before that lands would resume against an interrupted
+   * handle. An entry that continued the owed turn was that turn's terminal path, so the
+   * continuation is forfeited before its cancellation runs.
+   */
+  private cancelRemovedEntries(
+    callbackSets: QueueClearCallbacks[],
+    cancelReason: string,
+    heldOwedContinuation: boolean
+  ): void {
+    if (heldOwedContinuation && !this.queueHoldsOwedTurnContinuation()) {
+      this.forfeitStrandedTurnResume(
+        "Stranded turn resume dropped: its queued continuation was canceled."
+      );
+    }
+    void Promise.all(
+      callbackSets.map((callbacks) => this.notifyQueuedMessageCleared(callbacks, cancelReason))
+    ).then(() => this.resumeStrandedTurnIfIdle());
+  }
+
   removeQueuedMessagesByDedupeKeyPrefix(prefix: string, cancelReason: string): number {
     this.assertNotDisposed("removeQueuedMessagesByDedupeKeyPrefix");
     assert(prefix.length > 0, "removeQueuedMessagesByDedupeKeyPrefix requires prefix");
+    const heldOwedContinuation = this.queueHoldsOwedTurnContinuation();
     const removal = this.messageQueue.removeByDedupeKeyPrefix(prefix);
     if (removal.removedCount === 0) {
       return 0;
@@ -6919,10 +6985,7 @@ export class AgentSession {
       this.workspaceId,
       this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
-    for (const callbacks of removal.callbacks) {
-      this.notifyQueuedMessageCleared(callbacks, cancelReason);
-    }
-    this.resumeStrandedTurnIfIdle();
+    this.cancelRemovedEntries(removal.callbacks, cancelReason, heldOwedContinuation);
     return removal.removedCount;
   }
 
@@ -6939,6 +7002,7 @@ export class AgentSession {
   removeQueuedWorkspaceTurn(handleId: string, cancelReason: string): boolean {
     this.assertNotDisposed("removeQueuedWorkspaceTurn");
     assert(handleId.length > 0, "removeQueuedWorkspaceTurn requires handleId");
+    const heldOwedContinuation = this.queueHoldsOwedTurnContinuation();
     const callbacks = this.messageQueue.removeWorkspaceTurn(handleId);
     if (callbacks == null) {
       return false;
@@ -6948,8 +7012,7 @@ export class AgentSession {
       this.workspaceId,
       this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
-    this.notifyQueuedMessageCleared(callbacks, cancelReason);
-    this.resumeStrandedTurnIfIdle();
+    this.cancelRemovedEntries([callbacks], cancelReason, heldOwedContinuation);
     return true;
   }
 

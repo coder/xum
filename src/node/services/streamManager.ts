@@ -206,7 +206,15 @@ export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<voi
 export type TurnCompletion =
   | { status: "completed" }
   | { status: "aborted"; abortReason: StreamAbortReason }
-  | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
+  | {
+      status: "failed";
+      streamError: StreamErrorPayload & { errorType: StreamErrorType };
+      /**
+       * Steps left under the stream's ceiling after the failed attempt; a retry runs under it.
+       * Absent when the attempt failed before its loop ran a step.
+       */
+      stepsRemaining?: number;
+    };
 
 export interface TurnStreamHandle {
   messageId: string;
@@ -1965,10 +1973,7 @@ export class StreamManager {
         providerMetadata,
         contextProviderMetadata,
         model: streamInfo.model,
-        stepsRemaining: Math.max(
-          0,
-          (streamInfo.request.stepBudget ?? MAX_STREAM_STEPS) - Math.max(1, streamInfo.stepCount)
-        ),
+        stepsRemaining: this.remainingStepBudget(streamInfo),
       },
       abortReason,
       abandonPartial,
@@ -4198,7 +4203,19 @@ export class StreamManager {
 
     const errorPayload = this.buildStreamErrorPayload(streamInfo, error);
     const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+    streamInfo.terminalCompletion = {
+      status: "failed",
+      streamError: persistedPayload,
+      stepsRemaining: this.remainingStepBudget(streamInfo),
+    };
+  }
+
+  /** Steps left under the stream's ceiling when it ends early; the step it was in is spent. */
+  private remainingStepBudget(streamInfo: WorkspaceStreamInfo): number {
+    return Math.max(
+      0,
+      (streamInfo.request.stepBudget ?? MAX_STREAM_STEPS) - Math.max(1, streamInfo.stepCount)
+    );
   }
 
   private buildStreamErrorPayload(
@@ -5471,7 +5488,11 @@ export class StreamManager {
     });
     // Debug-injected failures bypass handleStreamFailure, so record the failed
     // completion here or cleanup would never settle the turn handle.
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+    streamInfo.terminalCompletion = {
+      status: "failed",
+      streamError: persistedPayload,
+      stepsRemaining: this.remainingStepBudget(streamInfo),
+    };
 
     // Wait for the stream processing to complete (cleanup)
     await streamInfo.processingPromise;

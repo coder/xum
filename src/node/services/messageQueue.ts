@@ -153,7 +153,7 @@ interface QueuedMessageInternalOptions {
   admissionStale?: () => boolean;
 }
 
-type QueueClearCallbacks = Pick<
+export type QueueClearCallbacks = Pick<
   QueuedMessageInternalOptions,
   "onCanceled" | "onAcceptedPreStreamFailure"
 >;
