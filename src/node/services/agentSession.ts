@@ -871,6 +871,16 @@ export class AgentSession {
    * this marker is what keeps the wake continuation visible across that window.
    */
   private preparingBashMonitorWake = false;
+  /**
+   * The last stream cut itself for the wake level (hasPendingToolEndInput returned true
+   * from the level) and no turn has been admitted since. Delegated-turn settlement needs the
+   * cut's cause, not the live level: an operator canceling the monitor between the cut and
+   * the stream-end handler lowers the level, and the "tool-calls" end would otherwise read as
+   * ended-before-completion instead of the same deferral a still-high level produces. A wake
+   * that never arrives is recovered by the turn manager's stale-deferred path (Codex P2
+   * PRRT_kwDOPxxmWM6fDmpR).
+   */
+  private streamYieldedToBashMonitorWake = false;
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
@@ -5718,6 +5728,8 @@ export class AgentSession {
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
         this.preparingBashMonitorWake = false;
+        // A live stream is the continuation (or a superseding turn) the cut waited for.
+        this.streamYieldedToBashMonitorWake = false;
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
         // setGoal deferral meaningful again — clear the goal service's settled
@@ -6556,12 +6568,20 @@ export class AgentSession {
    * tool-end message is an edge we hold; a bash-monitor wake is a level read from the
    * reconciler, so a wake whose lines this very step showed (task_await on the monitored
    * process) is already gone by the time the SDK asks — the stream keeps going.
+   *
+   * A non-empty queue arbitrates alone: its head runs next whatever the level says (the
+   * wake dispatcher waits for an empty queue), so cutting for the wake behind a turn-end
+   * head would only promote that entry to tool-end (Codex P2 PRRT_kwDOPxxmWM6fDmpV).
    */
   async hasPendingToolEndInput(): Promise<boolean> {
-    if (this.hasQueuedMessages("tool-end")) return true;
+    const nextMode = this.messageQueue.getNextDispatchableMode();
+    if (nextMode != null) return nextMode === "tool-end";
     if (this.hasOutstandingBashMonitorWake == null) return false;
     try {
-      return await this.hasOutstandingBashMonitorWake();
+      const outstanding = await this.hasOutstandingBashMonitorWake();
+      // The SDK only asks when the loop would otherwise continue, so a true here IS the cut.
+      if (outstanding) this.streamYieldedToBashMonitorWake = true;
+      return outstanding;
     } catch (error) {
       log.debug("hasPendingToolEndInput: wake level read failed; not yielding", {
         workspaceId: this.workspaceId,
@@ -6582,16 +6602,16 @@ export class AgentSession {
   }
 
   /**
-   * Tool-end yield flag = queue head is tool-end ∪ wake level. `queueHeadToolEnd` lets
-   * stream-end / clear paths assert the queue contribution is gone before the queue itself
-   * is observed empty.
+   * Tool-end yield flag = queue head is tool-end ∪ (queue empty ∧ wake level), mirroring
+   * hasPendingToolEndInput's arbitration. `queueHeadToolEnd` lets stream-end / clear paths
+   * assert the queue contribution is gone before the queue itself is observed empty.
    */
   private syncToolEndYieldRequested(
     queueHeadToolEnd = this.messageQueue.getNextDispatchableMode() === "tool-end"
   ): void {
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      queueHeadToolEnd || this.bashMonitorWakeOutstanding
+      queueHeadToolEnd || (this.bashMonitorWakeOutstanding && this.messageQueue.isEmpty())
     );
   }
 
@@ -6642,6 +6662,8 @@ export class AgentSession {
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(muxMetadata);
     this.preparingBashMonitorWake =
       (muxMetadata as MuxMessageMetadata | undefined)?.type === "bash-monitor-wake";
+    // Whatever is admitted now (the wake turn, or input superseding it) settles the cut.
+    this.streamYieldedToBashMonitorWake = false;
     this.setTurnPhase(TurnPhase.PREPARING);
   }
 
@@ -6652,7 +6674,7 @@ export class AgentSession {
    * so delegated-turn settlement must still see the continuation.
    */
   hasPendingBashMonitorWakeTurn(): boolean {
-    if (this.preparingBashMonitorWake) return true;
+    if (this.preparingBashMonitorWake || this.streamYieldedToBashMonitorWake) return true;
     const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
     return dispatching?.type === "bash-monitor-wake";
   }

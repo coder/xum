@@ -887,18 +887,28 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       runtimeConfig: { type: "local" },
     });
     let sentOptions: { queueDispatchMode?: string; muxMetadata?: unknown } | undefined;
+    let sentInternal:
+      | { requireIdle?: boolean; admissionStale?: () => boolean; onCanceled?: unknown }
+      | undefined;
     const sendMessage = mock(
       (
         _workspaceId: string,
         _prompt: string,
         options: { queueDispatchMode?: string; muxMetadata?: unknown },
-        internal?: { onAccepted?: () => Promise<void> }
+        internal?: {
+          onAccepted?: () => Promise<void>;
+          requireIdle?: boolean;
+          admissionStale?: () => boolean;
+          onCanceled?: unknown;
+        }
       ) => {
         sentOptions = options;
+        sentInternal = internal;
         return internal?.onAccepted?.().then(() => Ok(undefined)) ?? Promise.resolve(Ok(undefined));
       }
     );
     const onAccepted = mock(() => Promise.resolve());
+    let current = true;
     const internal = service as unknown as {
       aiService: { isStreaming(workspaceId: string): boolean };
       hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
@@ -925,7 +935,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
-        isCurrent: () => true,
+        isCurrent: () => current,
         onAccepted,
         onDeferred: () => Promise.resolve(),
       });
@@ -935,6 +945,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(sentOptions?.queueDispatchMode).toBeUndefined();
       expect(sentOptions?.muxMetadata).toEqual({ type: "bash-monitor-wake", records: [] });
       expect(onAccepted).toHaveBeenCalledTimes(1);
+      // The wake is never queued (a racing manual send makes it a skip instead), and the
+      // admission probe tracks the wake's validity through every pre-durability gate so a
+      // monitor canceled mid-admission refuses the send.
+      expect(sentInternal?.requireIdle).toBe(true);
+      expect(sentInternal?.onCanceled).toBeUndefined();
+      expect(sentInternal?.admissionStale?.()).toBe(false);
+      current = false;
+      expect(sentInternal?.admissionStale?.()).toBe(true);
     } finally {
       await cleanup();
     }
@@ -1044,6 +1062,63 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("a wake skipped by a manual send that won the race re-arms instead of queuing", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "skipped-wake-owner";
+    await config.addWorkspace("/tmp/skipped-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "skipped-wake-project",
+      projectPath: "/tmp/skipped-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    // requireIdle skip: the send never queued and onAccepted never fired.
+    const sendMessage = mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown", raw: "Workspace is busy; idle-only send was skipped." })
+      )
+    );
+    const afterIdle = mock(() => undefined);
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    try {
+      internal.aiService = { isStreaming: () => false };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => false;
+      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
+      internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
+      internal.sendMessage = sendMessage;
+
+      const outcome = await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => true,
+        onAccepted: () => Promise.resolve(),
+        onDeferred: () => Promise.resolve(),
+      });
+
+      expect(outcome).toBe("deferred");
+      expect(afterIdle).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a wake turn in PREPARING keeps the outstanding level visible to turn settlement", async () => {
     const { service, cleanup } = await createWakeWiringService();
     const workspaceId = "preparing-wake-owner";
@@ -1095,21 +1170,16 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           },
         ])
       );
-      let shownThroughOffset = 0;
+      let shownThroughOffset = 12;
       processManager.getMonitorWakeDeliveryState.mockImplementation(() =>
         Promise.resolve({ status: "settled", shownThroughOffset, terminalStatusShown: false })
       );
 
-      // Match not yet shown: the boundary yields and bash long-polls return early.
-      expect(await session.hasPendingToolEndInput()).toBe(true);
-      expect(processManager.setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
-      expect(session.hasQueuedMessages()).toBe(false);
-
       // task_await showed the lines before the SDK asked: no yield, no wake turn.
-      shownThroughOffset = 12;
       expect(await session.hasPendingToolEndInput()).toBe(false);
-      expect(processManager.setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
+      expect(processManager.setMessageQueued).not.toHaveBeenCalledWith(workspaceId, true);
       expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(false);
+      expect(session.hasQueuedMessages()).toBe(false);
 
       // A queued tool-end message still yields on its own.
       session.queueMessage("follow up", {
@@ -1118,6 +1188,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         queueDispatchMode: "tool-end",
       });
       expect(await session.hasPendingToolEndInput()).toBe(true);
+      session.clearQueue();
+
+      // Match not shown (a different process, or a filtered read): the boundary yields,
+      // bash long-polls return early, and the cut stays visible to turn settlement.
+      shownThroughOffset = 0;
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      expect(processManager.setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
+      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(true);
     } finally {
       session.dispose();
       await cleanup();

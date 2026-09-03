@@ -645,8 +645,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       level = () => Promise.reject(new Error("watermark read failed"));
       expect(await session.hasPendingToolEndInput()).toBe(false);
 
-      // Queue head decides independently of the level, and only for tool-end.
-      level = () => Promise.resolve(false);
+      // A non-empty queue arbitrates alone: a turn-end head is not promoted to tool-end by
+      // a high wake level (the wake dispatcher waits for the queue to drain anyway).
+      level = () => Promise.resolve(true);
       session.queueMessage("later", {
         model: TEST_MODEL,
         agentId: "exec",
@@ -654,8 +655,77 @@ describe("AgentSession queued message tool-call dispatch", () => {
       });
       expect(await session.hasPendingToolEndInput()).toBe(false);
       session.clearQueue();
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      level = () => Promise.resolve(false);
       session.queueMessage("now", { model: TEST_MODEL, agentId: "exec" });
       expect(await session.hasPendingToolEndInput()).toBe(true);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a stream cut for the wake level stays a pending wake turn until a turn is admitted", async () => {
+    // Settlement of a delegated turn runs after the cut; an operator canceling the monitor in
+    // between lowers the level, so the cut itself must remain the evidence.
+    const workspaceId = "queue-dispatch-wake-cut-latch";
+    let level = false;
+    let markStreamRequested: () => void = () => undefined;
+    const streamRequested = new Promise<void>((resolve) => {
+      markStreamRequested = resolve;
+    });
+    let releaseStream: () => void = () => undefined;
+    const streamRelease = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(level),
+      aiServiceOverrides: {
+        streamMessage: mock(async () => {
+          markStreamRequested();
+          await streamRelease;
+          return Ok(createStartedTurnHandle("test-assistant-message"));
+        }),
+      },
+    });
+    let disposed = false;
+    try {
+      level = true;
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      level = false;
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+      // Reading a low level later does not retract the recorded cut.
+      expect(await session.hasPendingToolEndInput()).toBe(false);
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+
+      // Whatever turn is admitted next settles the cut — here a manual send, which is not
+      // itself a wake turn.
+      const sendPromise = session.sendMessage("hello", { model: TEST_MODEL, agentId: "exec" });
+      await streamRequested;
+      expect(session.isBusy()).toBe(true);
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      session.dispose();
+      disposed = true;
+      releaseStream();
+      await sendPromise;
+    } finally {
+      releaseStream();
+      if (!disposed) session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a queued tool-end head is not recorded as a wake cut", async () => {
+    const workspaceId = "queue-dispatch-queue-cut-not-wake";
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+    });
+    try {
+      session.queueMessage("now", { model: TEST_MODEL, agentId: "exec" });
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
     } finally {
       session.dispose();
       await cleanup();
@@ -688,6 +758,19 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(lastFlag()).toBe(true);
       session.setBashMonitorWakeOutstanding(false);
       expect(lastFlag()).toBe(false);
+
+      // A turn-end head owns the next dispatch: the level must not pull the early-return
+      // lever for it (mirrors hasPendingToolEndInput's arbitration).
+      session.setBashMonitorWakeOutstanding(true);
+      session.queueMessage("later", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(lastFlag()).toBe(false);
+      session.clearQueue();
+      expect(lastFlag()).toBe(true);
+      session.setBashMonitorWakeOutstanding(false);
     } finally {
       session.dispose();
       await cleanup();

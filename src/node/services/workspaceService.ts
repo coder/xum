@@ -2574,6 +2574,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
+          // Never queue: a manual send racing past the idle checks above would otherwise
+          // park this wake behind it, out of reach of the level (a later monitor cancel
+          // could not retract it). requireIdle turns that race into a skip (Err), and the
+          // admission probe re-validates the wake at every gate before the user row is
+          // durable; both fall through to the after-idle re-arm below (Codex P2
+          // PRRT_kwDOPxxmWM6fDmpJ).
+          requireIdle: true,
+          admissionStale: () => !dispatch.isCurrent(),
           onAccepted: async () => {
             accepted = true;
             await dispatch.onAccepted();
@@ -2581,14 +2589,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           },
           onAcceptedPreStreamFailure: async () => {
             if (accepted) await dispatch.onAccepted();
-          },
-          // Idle owner, so this send does not queue; still, a manual send racing past the
-          // idle checks above can push it into the queue and clear it before dispatch.
-          onCanceled: async () => {
-            if (!accepted) {
-              await dispatch.onDeferred();
-              this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
-            }
           },
         }
       );
