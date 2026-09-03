@@ -1140,6 +1140,35 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a send's launch-boundary admission probe reaches the stream request", async () => {
+    const workspaceId = "queue-dispatch-send-launch-probe";
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      return Promise.resolve(Ok(createStartedTurnHandle("assistant-1")));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+    });
+
+    try {
+      const refuseStreamStart = () => false;
+      const sent = await session.sendMessage(
+        "Continue",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, refuseStreamStart }
+      );
+      expect(sent.success).toBe(true);
+      // StreamManager rechecks this probe right before the stream registers (see resumeStream).
+      expect(streamMessage.mock.calls[0]?.[0].refuseStreamStart).toBe(refuseStreamStart);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("an auto-retry runs under what the failed resumed attempt left of the step budget", async () => {
     const workspaceId = "queue-dispatch-stranded-retry-step-budget";
     const aiEmitter = new EventEmitter();

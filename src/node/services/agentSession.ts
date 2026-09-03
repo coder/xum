@@ -3201,6 +3201,12 @@ export class AgentSession {
       modelFallbackProgress?: ModelFallbackProgress;
       /** For a send continuing an interrupted turn: it ran under resumeStream's revalidation. */
       revalidateAdmission?: boolean;
+      /**
+       * Launch-boundary admission probe (goal and delegated-turn state), rechecked by
+       * StreamManager right before the stream registers; unlike admissionStale it must not
+       * observe this send's own turn.
+       */
+      refuseStreamStart?: () => boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
@@ -4315,7 +4321,7 @@ export class AgentSession {
           goalKind,
           internal?.goalId,
           turnThinkingOverride,
-          undefined,
+          internal?.refuseStreamStart,
           internal?.stepBudget,
           internal?.revalidateAdmission,
           internal?.modelFallbackProgress
@@ -7441,19 +7447,39 @@ export class AgentSession {
    */
   private forfeitStrandedTurnResume(reason: string): void {
     const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
-    const settlementOwed =
-      correlation != null && this.settleForfeitedWorkspaceTurnContinuation != null;
-    if (settlementOwed) {
-      // Retain the owner's only terminal path before dropping the marker that advertised it.
-      this.owedForfeitSettlements.set(
-        `${correlation.ownerWorkspaceId}/${correlation.taskHandleId}/${correlation.turnId}`,
-        { correlation, reason, inFlight: false }
-      );
-    }
+    // Retain the owner's only terminal path before dropping the marker that advertised it.
+    const settlementOwed = this.recordOwedForfeit(correlation, reason);
     this.withdrawStrandedTurnResume();
     if (settlementOwed) {
       this.settleOwedForfeits();
     }
+  }
+
+  /**
+   * A delegated turn given up outside the marker (a dropped compaction follow-up that continued
+   * it): the same settlement, since nothing else will end the turn for its owner.
+   */
+  private forfeitWorkspaceTurnContinuation(
+    correlation: WorkspaceTurnMuxMetadata | undefined,
+    reason: string
+  ): void {
+    if (this.recordOwedForfeit(correlation, reason)) {
+      this.settleOwedForfeits();
+    }
+  }
+
+  private recordOwedForfeit(
+    correlation: WorkspaceTurnMuxMetadata | undefined,
+    reason: string
+  ): boolean {
+    if (correlation == null || this.settleForfeitedWorkspaceTurnContinuation == null) {
+      return false;
+    }
+    this.owedForfeitSettlements.set(
+      `${correlation.ownerWorkspaceId}/${correlation.taskHandleId}/${correlation.turnId}`,
+      { correlation, reason, inFlight: false }
+    );
+    return true;
   }
 
   /**
@@ -8150,6 +8176,37 @@ export class AgentSession {
       return false;
     }
 
+    // The delegated turn this follow-up continues, if any: stamped on the follow-up itself by
+    // mid-stream compaction, or beside a wake follow-up by on-send compaction.
+    const continuedTurn =
+      getWorkspaceTurnMuxMetadata(followUp.muxMetadata) ?? followUp.workspaceTurnMetadata;
+    // Same raw JSON boundary: the interrupted turn's remainder is optional and dropped if malformed
+    // (the follow-up then runs under the default ceiling and its model's own chain).
+    const persistedStepBudget =
+      typeof followUp.stepBudget === "number" && Number.isInteger(followUp.stepBudget)
+        ? Math.max(0, followUp.stepBudget)
+        : undefined;
+    const persistedFallbackProgress =
+      followUp.modelFallbackProgress != null
+        ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)
+        : undefined;
+    const persistedRevalidateAdmission = followUp.revalidateAdmission === true;
+    // The interrupted turn spent its last step before compaction: the ceiling ended it, and the
+    // loop's stop condition is only evaluated after a step, so a follow-up would run one more. A
+    // delegated turn ends here with no successor stream, so its owner settles it.
+    if (persistedStepBudget === 0) {
+      log.info("Discarding pending follow-up: the interrupted turn's step budget is spent", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      this.forfeitWorkspaceTurnContinuation(
+        continuedTurn,
+        "Compaction follow-up dropped: the interrupted turn's step budget is spent."
+      );
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
+
     // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): goal-loop follow-ups were originally
     // requireIdle sends — enforce the idle rule for them unconditionally so a
     // user message queued during the compaction stream wins the race instead
@@ -8210,10 +8267,39 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           goalKind: persistedGoalKind,
         });
+        this.forfeitWorkspaceTurnContinuation(
+          continuedTurn,
+          "Compaction follow-up dropped: goal no longer admits it."
+        );
         await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
       }
       goalAdmissionStale = admission.admissionStale;
+    }
+
+    // A follow-up continuing a delegated turn, or a turn that ran under a stranded resume's
+    // revalidation, is admitted like that resume (admitResumeLaunch): the workspace must still
+    // accept streams and the turn's owner must still have it running. The probe rides along to
+    // the launch boundary below; a refusal ends the delegated turn with no successor stream.
+    let turnAdmissionStale: (() => boolean) | undefined;
+    if ((persistedRevalidateAdmission || continuedTurn != null) && this.admitStrandedTurnResume) {
+      const admission = await this.admitStrandedTurnResume(continuedTurn);
+      if (!admission.admissible) {
+        log.info(
+          "Skipping pending follow-up: the workspace or delegated turn no longer admits it",
+          {
+            workspaceId: this.workspaceId,
+            summaryMessageId: lastMessage.id,
+          }
+        );
+        this.forfeitWorkspaceTurnContinuation(
+          continuedTurn,
+          "Compaction follow-up dropped: the workspace or delegated turn no longer admits it."
+        );
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+        return false;
+      }
+      turnAdmissionStale = admission.admissionStale;
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cQt3j): the queue/busy sample above ages
@@ -8228,9 +8314,14 @@ export class AgentSession {
           this.hasExternalSendPreflight?.() === true ||
           (this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING)
       : undefined;
+    // Launch-safe probes only (the idle rule would trip on this send's own PREPARING turn).
+    const launchAdmissionStale =
+      goalAdmissionStale != null || turnAdmissionStale != null
+        ? () => goalAdmissionStale?.() === true || turnAdmissionStale?.() === true
+        : undefined;
     const followUpAdmissionStale =
-      idleRuleStale != null || goalAdmissionStale != null
-        ? () => idleRuleStale?.() === true || goalAdmissionStale?.() === true
+      idleRuleStale != null || launchAdmissionStale != null
+        ? () => idleRuleStale?.() === true || launchAdmissionStale?.() === true
         : undefined;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
@@ -8301,28 +8392,6 @@ export class AgentSession {
       options.muxMetadata = metadata;
     }
 
-    // Same raw JSON boundary: the interrupted turn's remainder is optional and dropped if malformed
-    // (the follow-up then runs under the default ceiling and its model's own chain).
-    const persistedStepBudget =
-      typeof followUp.stepBudget === "number" && Number.isInteger(followUp.stepBudget)
-        ? Math.max(0, followUp.stepBudget)
-        : undefined;
-    const persistedFallbackProgress =
-      followUp.modelFallbackProgress != null
-        ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)
-        : undefined;
-    const persistedRevalidateAdmission = followUp.revalidateAdmission === true;
-    // The interrupted turn spent its last step before compaction: the ceiling ended it, and the
-    // loop's stop condition is only evaluated after a step, so a follow-up would run one more.
-    if (persistedStepBudget === 0) {
-      log.info("Discarding pending follow-up: the interrupted turn's step budget is spent", {
-        workspaceId: this.workspaceId,
-        summaryMessageId: lastMessage.id,
-      });
-      await this.clearPendingFollowUpFromSummary(lastMessage);
-      return false;
-    }
-
     // The compaction summary is now the source of truth for the next live resume
     // request. Pre-arm retry state from the reconstructed follow-up so failures
     // before stream startup do not fall back to the already-completed compact turn.
@@ -8353,6 +8422,7 @@ export class AgentSession {
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
+      refuseStreamStart: launchAdmissionStale,
       stepBudget: persistedStepBudget,
       modelFallbackProgress: persistedFallbackProgress?.success
         ? persistedFallbackProgress.data
@@ -8360,6 +8430,20 @@ export class AgentSession {
       revalidateAdmission: persistedRevalidateAdmission,
     });
     if (!sendResult.success) {
+      // The workspace or the delegated turn stopped admitting the follow-up during its
+      // preflight: no successor stream, so the turn is settled and the follow-up dropped.
+      if (turnAdmissionStale?.() === true) {
+        log.info("Pending follow-up refused at send admission: workspace or delegated turn", {
+          workspaceId: this.workspaceId,
+          summaryMessageId: lastMessage.id,
+        });
+        this.forfeitWorkspaceTurnContinuation(
+          continuedTurn,
+          "Compaction follow-up dropped: the workspace or delegated turn no longer admits it."
+        );
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+        return false;
+      }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
       // same skip path as the pre-send check instead of throwing.

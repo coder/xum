@@ -33,6 +33,7 @@ interface SendInternal {
   stepBudget?: number;
   modelFallbackProgress?: unknown;
   revalidateAdmission?: boolean;
+  refuseStreamStart?: () => boolean;
 }
 
 interface SessionInternals {
@@ -161,7 +162,13 @@ describe("AgentSession continue-message agentId fallback", () => {
     historyCleanup = undefined;
   });
 
-  const createSession = async (messages: MuxMessage[] = []) => {
+  const createSession = async (
+    messages: MuxMessage[] = [],
+    turnOptions?: Pick<
+      ConstructorParameters<typeof AgentSession>[0],
+      "admitStrandedTurnResume" | "settleForfeitedWorkspaceTurnContinuation"
+    >
+  ) => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     for (const message of messages) {
@@ -175,6 +182,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       aiService: createAiService(),
       initStateManager: createInitStateManager(),
       backgroundProcessManager: createBackgroundProcessManager(),
+      ...turnOptions,
     });
     sessions.push(session);
 
@@ -315,26 +323,105 @@ describe("AgentSession continue-message agentId fallback", () => {
     });
   });
 
+  const DELEGATED_TURN = {
+    type: "workspace-turn-task",
+    taskHandleId: "wst_follow_up",
+    ownerWorkspaceId: "owner-ws",
+    turnId: "turn-follow-up",
+  } as const;
+
   test("dispatchPendingFollowUp discards a follow-up whose interrupted turn spent its step budget", async () => {
-    const { internals, historyService } = await createSession([
-      compactionSummaryMessage("summary-spent", {
-        text: "Continue",
-        model: "openai:gpt-4o",
-        agentId: "exec",
-        stepBudget: 0,
-      }),
-    ]);
+    const settle = mock((_correlation: unknown, _reason: string) => Promise.resolve());
+    const { internals, historyService } = await createSession(
+      [
+        compactionSummaryMessage("summary-spent", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          stepBudget: 0,
+          muxMetadata: DELEGATED_TURN,
+        }),
+      ],
+      { settleForfeitedWorkspaceTurnContinuation: settle }
+    );
     const sendMessage = mock(() => Promise.resolve({ success: true as const }));
     internals.sendMessage = sendMessage;
 
     expect(await internals.dispatchPendingFollowUp()).toBe(false);
 
-    // The ceiling ended the turn; the follow-up is dropped rather than left to redispatch later.
+    // The ceiling ended the turn; the follow-up is dropped rather than left to redispatch later,
+    // and the delegated turn it continued is settled since no successor stream will end it.
     expect(sendMessage).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
     const tail = await historyService.getLastMessages("ws", 1);
     expect(tail.success).toBe(true);
     const summary = tail.success ? tail.data[0] : undefined;
     expect(summary?.id).toBe("summary-spent");
+    expect(summary?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
+  });
+
+  test("dispatchPendingFollowUp admits a delegated turn's follow-up like a stranded resume", async () => {
+    const settle = mock((_correlation: unknown, _reason: string) => Promise.resolve());
+    let stale = false;
+    const admit = mock((_correlation: unknown) =>
+      Promise.resolve({ admissible: true, admissionStale: () => stale })
+    );
+    const dispatched: SendInternal[] = [];
+    const { internals } = await createSession(
+      [
+        compactionSummaryMessage("summary-delegated", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          muxMetadata: DELEGATED_TURN,
+        }),
+      ],
+      { admitStrandedTurnResume: admit, settleForfeitedWorkspaceTurnContinuation: settle }
+    );
+    internals.sendMessage = mock(
+      (_message: string, _options?: SendOptions, internal?: SendInternal) => {
+        dispatched.push(internal ?? {});
+        return Promise.resolve({ success: true as const });
+      }
+    );
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(true);
+
+    // Admitted against the delegated turn, with the handle probe carried to the launch boundary.
+    expect(admit.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
+    expect(dispatched[0]?.refuseStreamStart?.()).toBe(false);
+    stale = true;
+    expect(dispatched[0]?.refuseStreamStart?.()).toBe(true);
+    expect(settle).not.toHaveBeenCalled();
+  });
+
+  test("dispatchPendingFollowUp settles and drops a delegated turn's follow-up its owner no longer admits", async () => {
+    const settle = mock((_correlation: unknown, _reason: string) => Promise.resolve());
+    const { internals, historyService } = await createSession(
+      [
+        compactionSummaryMessage("summary-refused", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          muxMetadata: DELEGATED_TURN,
+        }),
+      ],
+      {
+        admitStrandedTurnResume: mock(() => Promise.resolve({ admissible: false })),
+        settleForfeitedWorkspaceTurnContinuation: settle,
+      }
+    );
+    const sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = sendMessage;
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
+    const tail = await historyService.getLastMessages("ws", 1);
+    const summary = tail.success ? tail.data[0] : undefined;
     expect(summary?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
   });
 
