@@ -112,10 +112,12 @@ export interface BashMonitorWakeDispatch {
   prompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }>;
   /**
-   * False once a full-history clear or disposal retired the signals behind this wake
-   * while it was in the receiver's hands. The receiver re-checks it after taking its own
-   * locks (the clear runs under the same history lock) and before sending, so a stale
-   * prompt is never appended to freshly cleared history.
+   * False once a full-history clear, disposal, monitor cancel, or shown-frontier advance
+   * retired the signals behind this wake while it was in the receiver's hands — until
+   * `onAccepted` runs, after which it stays true (the prompt is durable and the signals
+   * consumed). The receiver re-checks it after taking its own locks (the clear runs under
+   * the same history lock), before sending, and at every send-admission gate, so a stale
+   * prompt is never appended to history and an accepted one always gets its stream.
    */
   isCurrent(): boolean;
   onAccepted(): Promise<void>;
@@ -575,7 +577,13 @@ export class BashMonitorWakeReconciler {
         ownerWorkspaceId,
         prompt: buildPrompt(dispatch.signals),
         muxMetadata: buildMetadata(dispatch.signals),
-        isCurrent: () => this.states.get(ownerWorkspaceId)?.dispatch === dispatch,
+        // Validity freezes at acceptance: the prompt row is durable and the signals are
+        // consumed, so a cancel/shown/clear landing in the owner's remaining pre-stream
+        // awaits must let the turn finish admission (refusing there would leave the row
+        // in history with no stream, to be replayed by a later manual turn) (Codex P2
+        // PRRT_kwDOPxxmWM6fFJ4K).
+        isCurrent: () =>
+          dispatch.accepted || this.states.get(ownerWorkspaceId)?.dispatch === dispatch,
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
       });

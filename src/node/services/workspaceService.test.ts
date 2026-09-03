@@ -231,6 +231,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   async function createWakeWiringService() {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const events = new EventEmitter();
+    // The yield flag is a real mirror so hasQueuedMessage reflects the session's arbitration.
+    const yieldFlags = new Map<string, boolean>();
     const backgroundProcessManager = Object.assign(events, {
       notifyMonitorWakeStateChanged: mock(() => undefined),
       getActiveMonitorCount: mock(() => 0),
@@ -238,7 +240,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
-      setMessageQueued: mock(() => undefined),
+      setMessageQueued: mock((workspaceId: string, queued: boolean) => {
+        yieldFlags.set(workspaceId, queued);
+      }),
+      hasQueuedMessage: (workspaceId: string) => yieldFlags.get(workspaceId) === true,
       cleanup: mock(() => Promise.resolve()),
     }) as unknown as BackgroundProcessManager;
     const service = createWorkspaceServiceForTest({
@@ -1136,6 +1141,55 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // the session marker is what keeps the continuation visible until stream start.
       sessionInternal.hasPendingBashMonitorWakeTurn = () => true;
       expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(true);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a high level backgrounds foreground waits only when it pulls the yield lever", async () => {
+    // A turn-end queue head suppresses the wake cut (hasPendingToolEndInput arbitration), so
+    // the same level must not end a foreground task_await early either: the stream would
+    // not cut and the agent would simply get another model step.
+    const { service, cleanup } = await createWakeWiringService();
+    const workspaceId = "level-background-waits-owner";
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ backgroundForegroundWaitsForWorkspace })
+    );
+    const internal = service as unknown as {
+      backgroundProcessManager: { pullMonitorWakeSignals: ReturnType<typeof mock> };
+      bashMonitorWakeReconciler: { hasOutstandingWake: (owner: string) => Promise<boolean> };
+    };
+    const session = service.getOrCreateSession(workspaceId);
+    try {
+      internal.backgroundProcessManager.pullMonitorWakeSignals.mockImplementation(() =>
+        Promise.resolve([
+          {
+            processId: "proc",
+            taskId: "bash:proc",
+            ownerWorkspaceId: workspaceId,
+            filter: "READY",
+            filterExclude: false,
+            script: "run",
+            createdAt: "2026-08-31T12:00:00.000Z",
+            match: { throughOffset: 12, lines: ["READY"], totalMatches: 1 },
+            retired: false,
+          },
+        ])
+      );
+
+      session.queueMessage("later", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(await internal.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId)).toBe(true);
+      expect(backgroundForegroundWaitsForWorkspace).not.toHaveBeenCalled();
+
+      session.clearQueue();
+      expect(await internal.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId)).toBe(true);
+      expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith(workspaceId);
     } finally {
       session.dispose();
       await cleanup();

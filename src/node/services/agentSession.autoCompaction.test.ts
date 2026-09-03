@@ -6,6 +6,7 @@ import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type MuxMessage,
+  type MuxMessageMetadata,
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
@@ -311,6 +312,40 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // RLM off: byte-identical request metadata (no stamp).
     const unstamped = await runCase({ workspaceId: "ws-auto-compaction-rlm-stamp-off" });
     expect(unstamped).toBeUndefined();
+  });
+
+  test("bash-monitor wake follow-ups keep their idle-only admission across compaction", async () => {
+    // The wake was sent with requireIdle; a manual message queued during the compaction
+    // stream must still win over the re-dispatched continuation (dispatchPendingFollowUp).
+    const { session } = await createSessionHarness({
+      workspaceId: "ws-auto-compaction-wake-require-idle",
+    });
+    const build = (
+      session as unknown as {
+        buildAutoCompactionFollowUp: (params: {
+          messageText: string;
+          options: SendMessageOptions;
+          modelForStream: string;
+          muxMetadata?: MuxMessageMetadata;
+        }) => CompactionFollowUpRequest;
+      }
+    ).buildAutoCompactionFollowUp.bind(session);
+
+    const wakeFollowUp = build({
+      messageText: "READY",
+      options: { model: "openai:gpt-4o", agentId: "exec" },
+      modelForStream: "openai:gpt-4o",
+      muxMetadata: { type: "bash-monitor-wake", records: [] },
+    });
+    expect(wakeFollowUp.dispatchOptions?.requireIdle).toBe(true);
+
+    const plainFollowUp = build({
+      messageText: "hello",
+      options: { model: "openai:gpt-4o", agentId: "exec" },
+      modelForStream: "openai:gpt-4o",
+    });
+    expect(plainFollowUp.dispatchOptions?.requireIdle).toBeUndefined();
+    session.dispose();
   });
 
   test("preserves goal kind and goal identity on auto-compaction follow-up requests", async () => {

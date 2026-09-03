@@ -222,6 +222,20 @@ describe("BashMonitorWakeReconciler", () => {
     expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
   });
 
+  test("an accepted wake stays current through a later cancel or shown advance", async () => {
+    // Acceptance runs before the owner's final send-admission gate; a cancel landing in
+    // between must not make that gate refuse a turn whose row is already durable.
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    await dispatches[0].onAccepted();
+    expect(dispatches[0].isCurrent()).toBe(true);
+
+    await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
+    await reconciler.outputShown(OWNER, "proc");
+    expect(dispatches[0].isCurrent()).toBe(true);
+  });
+
   test("disposal lowers the published level and retires the in-flight wake", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

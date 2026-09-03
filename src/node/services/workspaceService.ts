@@ -2401,7 +2401,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // disposal after the session went away), so drop it directly.
           this.backgroundProcessManager.setMessageQueued(ownerWorkspaceId, false);
         }
-        if (outstanding) {
+        // Background foreground waits only when the level actually pulls the yield lever:
+        // the session's mirror applies the queue-head arbitration (a turn-end head means
+        // the stream will not cut for this wake, so ending the wait early would just hand
+        // the agent another model step) (Codex P2 PRRT_kwDOPxxmWM6fFJ4Q).
+        if (
+          outstanding &&
+          session != null &&
+          typeof this.backgroundProcessManager.hasQueuedMessage === "function" &&
+          this.backgroundProcessManager.hasQueuedMessage(ownerWorkspaceId)
+        ) {
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(ownerWorkspaceId);
         }
       },

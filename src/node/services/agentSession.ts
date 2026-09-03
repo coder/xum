@@ -4487,6 +4487,16 @@ export class AgentSession {
 
     if (params.muxMetadata) {
       followUp.muxMetadata = params.muxMetadata;
+      // A bash-monitor wake is an idle-only send (WorkspaceService.dispatchBashMonitorWake
+      // sends it with requireIdle). The compaction hand-off must keep that rule so a manual
+      // message queued or in preflight during the compaction stream still wins over the
+      // wake continuation (dispatchPendingFollowUp). A skipped wake follow-up is lost — its
+      // signals were consumed at acceptance — which is the bounded cost of letting the
+      // user's correction go first; the process output stays readable via task_await
+      // (Codex P2 PRRT_kwDOPxxmWM6fFJ4N).
+      if (params.muxMetadata.type === "bash-monitor-wake") {
+        followUp.dispatchOptions = { ...followUp.dispatchOptions, requireIdle: true };
+      }
     }
 
     if (params.workspaceTurnMetadata) {
