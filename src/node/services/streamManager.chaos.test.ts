@@ -9,7 +9,9 @@
  * stream afterwards.
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
+import { Scope } from "effect";
 import { StreamManager, type TurnEngineEvent } from "./streamManager";
+import { closeScopeBounded } from "./di/appRuntime";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -218,6 +220,125 @@ describe("StreamManager chaos", () => {
         }
       }
 
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  }, 120_000);
+
+  test(`with an engine scope closed at a random iteration, every stream settles exactly once (seed=${SEED})`, async () => {
+    // Shutdown variant: the manager is constructed with an engine scope (the
+    // app's AppFiberScope), streams before the close are hostile and settle on
+    // their own, the stream at the close point flows then blocks until its
+    // AbortSignal fires (so the close has something to interrupt) and may race a
+    // user stop, and streams after the close start into a closed scope.
+    // Invariant under all of it: one terminal event per messageId and every
+    // completion promise settles.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const rng = mulberry32(SEED);
+      const closeAt = randInt(rng, ITERATIONS);
+      const stopRacesClose = rng() < 0.5;
+      const engineScope = Scope.makeUnsafe("parallel");
+      const events: TurnEngineEvent[] = [];
+      const streamManager = new StreamManager(
+        historyService,
+        undefined,
+        undefined,
+        (event) => {
+          events.push(event);
+        },
+        undefined,
+        engineScope
+      );
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(),
+        countTokens: () => Promise.resolve(0),
+      });
+      let nextFullStream: (signal: AbortSignal) => AsyncGenerator<unknown, void, unknown> = () =>
+        randomFullStream(rng);
+      Reflect.set(
+        streamManager,
+        "createStreamResult",
+        (_request: unknown, abortController: AbortController) => ({
+          fullStream: nextFullStream(abortController.signal),
+          totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
+          usage: Promise.resolve(undefined),
+          providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
+          steps: Promise.resolve([]),
+        })
+      );
+
+      const started: Array<{ messageId: string; completion: Promise<{ status: string }> }> = [];
+      for (let iter = 0; iter < ITERATIONS; iter++) {
+        const workspaceId = `chaos-scope-ws-${iter}`;
+        const messageId = `chaos-scope-msg-${iter}`;
+        const appendResult = await historyService.appendToHistory(workspaceId, {
+          id: messageId,
+          role: "assistant",
+          metadata: { historySequence: 1, partial: true },
+          parts: [],
+        });
+        expect(appendResult.success).toBe(true);
+
+        nextFullStream =
+          iter === closeAt
+            ? (signal) =>
+                (async function* () {
+                  yield { type: "text-delta", text: randomFragmentString(rng) };
+                  await new Promise<void>((resolve) => {
+                    if (signal.aborted) return resolve();
+                    signal.addEventListener("abort", () => resolve(), { once: true });
+                  });
+                })()
+            : () => randomFullStream(rng);
+
+        const result = await streamManager.startStream({
+          workspaceId,
+          messageId,
+          model: createTestLanguageModel(),
+          messages: [{ role: "user", content: "hello" }],
+          modelString: "openai:gpt-4.1-mini",
+          historySequence: 1,
+          system: "system",
+          runtime: LOCAL_TEST_RUNTIME,
+          providedRuntimeTempDir: "",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) continue;
+        started.push({ messageId, completion: result.data.completion });
+
+        if (iter === closeAt) {
+          await Promise.all([
+            stopRacesClose ? streamManager.stopStream(workspaceId) : Promise.resolve(),
+            closeScopeBounded(engineScope),
+          ]);
+          expect(engineScope.state._tag).toBe("Closed");
+        }
+      }
+
+      const completions = await Promise.race([
+        Promise.all(started.map((entry) => entry.completion)),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("a supervised stream never settled")), 15_000)
+        ),
+      ]);
+      for (const completion of completions) {
+        expect(["completed", "failed", "aborted"]).toContain(completion.status);
+      }
+      // Let the last abort deliveries and finally blocks settle.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      for (const { messageId } of started) {
+        const terminal = events.filter(
+          (event) =>
+            ["stream-end", "error", "stream-abort"].includes(event.type) &&
+            "messageId" in event &&
+            event.messageId === messageId
+        );
+        expect(terminal).toHaveLength(1);
+      }
       expect(unhandled).toEqual([]);
     } finally {
       process.off("unhandledRejection", onUnhandled);
