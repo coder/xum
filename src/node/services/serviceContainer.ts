@@ -1,6 +1,8 @@
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
+import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
+import { STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import type { CoreServices } from "@/node/services/coreServices";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
@@ -57,6 +59,7 @@ import {
 } from "@/node/services/di/appRuntime";
 import { AppLive } from "@/node/services/di/layers/app";
 import { shutdownStep } from "@/node/services/shutdownStep";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
   AgentBrowserSessionDiscovery,
   AgentPluginInstall,
@@ -211,6 +214,17 @@ export class ServiceContainer {
   public readonly idleDispatcher: IdleDispatcher;
   public readonly heartbeatService: HeartbeatService;
   public readonly agentStatusService: AgentStatusService;
+  // Shared between initializeCore() and runStartupHousekeeping() so the completion log still
+  // reports every step and the total wall time from the start of core init.
+  private startupStartedAt: number | undefined;
+  private readonly startupStepDurationsMs: Record<string, number> = {};
+  // Aborted by dispose(): background startup housekeeping must stop at its next step boundary
+  // and never start periodic services against services that are being torn down.
+  private readonly startupHousekeepingAbort = new AbortController();
+  // Retained so dispose() can wait for the in-flight housekeeping step to settle (bounded)
+  // before tearing down the services it is using.
+  private startupHousekeepingSettled: Promise<void> | null = null;
+
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
    * so a concurrent or repeated dispose() (the desktop's two before-quit
@@ -295,43 +309,109 @@ export class ServiceContainer {
   }
 
   async initialize(): Promise<void> {
-    const startupStartedAt = Date.now();
-    const stepDurationsMs: Record<string, number> = {};
-    const recordStep = async <T>(name: string, fn: () => Promise<T>): Promise<T> => {
-      const stepStartedAt = Date.now();
-      try {
-        return await fn();
-      } finally {
-        stepDurationsMs[name] = Date.now() - stepStartedAt;
-      }
-    };
+    await this.initializeCore();
+    await this.runStartupHousekeeping();
+  }
+
+  private async recordStartupStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const stepStartedAt = Date.now();
+    try {
+      return await fn();
+    } finally {
+      this.startupStepDurationsMs[name] = Date.now() - stepStartedAt;
+    }
+  }
+
+  /**
+   * Everything request handling depends on, plus agent-task restart recovery. The server entry
+   * point awaits this before binding its listener: task recovery must finish before any client
+   * can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and it is
+   * bounded by the number of active tasks rather than by deployment size. The per-workspace
+   * housekeeping lives in runStartupHousekeeping().
+   */
+  async initializeCore(): Promise<void> {
+    this.startupStartedAt = Date.now();
 
     log.info("[startup] ServiceContainer.initialize starting");
 
-    await recordStep("extensionMetadata.initialize", () => this.extensionMetadata.initialize());
+    await this.recordStartupStep("extensionMetadata.initialize", () =>
+      this.extensionMetadata.initialize()
+    );
     // Initialize telemetry service
-    await recordStep("telemetryService.initialize", () => this.telemetryService.initialize());
+    await this.recordStartupStep("telemetryService.initialize", () =>
+      this.telemetryService.initialize()
+    );
 
     // Initialize policy service (startup gating)
-    await recordStep("policyService.initialize", () => this.policyService.initialize());
+    await this.recordStartupStep("policyService.initialize", () => this.policyService.initialize());
 
-    await recordStep("experimentsService.initialize", () => this.experimentsService.initialize());
-    // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.initialize().
-    await recordStep("workspaceService.initialize", () => this.workspaceService.initialize());
-    await recordStep("taskService.initialize", () => this.taskService.initialize());
+    await this.recordStartupStep("experimentsService.initialize", () =>
+      this.experimentsService.initialize()
+    );
+
+    await this.recordStartupStep("taskService.recoverInterruptedTasks", () =>
+      this.taskService.recoverInterruptedTasks()
+    );
+  }
+
+  /**
+   * Startup housekeeping that scales with the number of workspaces (chat restart retries and
+   * orphan sweeps, reported-task patch and cleanup passes, terminal-attention sweeps), then the
+   * periodic services. The server runs it after its listener is bound, so every step re-checks
+   * live state before mutating; dispose() cancels it at the next step boundary and waits
+   * (bounded) for the step in flight to settle.
+   */
+  runStartupHousekeeping(): Promise<void> {
+    const housekeeping = this.runStartupHousekeepingSteps();
+    this.startupHousekeepingSettled = housekeeping.then(
+      () => undefined,
+      () => undefined
+    );
+    return housekeeping;
+  }
+
+  private async runStartupHousekeepingSteps(): Promise<void> {
+    const signal = this.startupHousekeepingAbort.signal;
+    // Housekeeping is best-effort and may run while the server is already serving requests: a
+    // failing step must not skip the periodic services below (startup-time rule: never let
+    // background housekeeping take the app down).
+    // Kick off non-task chat restart recovery eagerly; task workspaces recover in TaskService.
+    try {
+      await this.recordStartupStep("workspaceService.initialize", () =>
+        this.workspaceService.initialize({ signal })
+      );
+    } catch (error: unknown) {
+      log.error("[startup] WorkspaceService recovery failed", { error });
+    }
+    if (signal.aborted) {
+      log.info("[startup] Startup housekeeping cancelled by dispose before task housekeeping");
+      return;
+    }
+    try {
+      await this.recordStartupStep("taskService.runStartupHousekeeping", () =>
+        this.taskService.runStartupHousekeeping({ signal })
+      );
+    } catch (error: unknown) {
+      log.error("[startup] TaskService housekeeping failed", { error });
+    }
+    if (signal.aborted) {
+      log.info("[startup] Startup housekeeping cancelled by dispose before periodic services");
+      return;
+    }
 
     const idleCompactionStartedAt = Date.now();
     // Start idle compaction checker
     this.idleCompactionService.start();
-    stepDurationsMs["idleCompactionService.start"] = Date.now() - idleCompactionStartedAt;
+    this.startupStepDurationsMs["idleCompactionService.start"] =
+      Date.now() - idleCompactionStartedAt;
 
     const heartbeatStartedAt = Date.now();
     this.heartbeatService.start();
-    stepDurationsMs["heartbeatService.start"] = Date.now() - heartbeatStartedAt;
+    this.startupStepDurationsMs["heartbeatService.start"] = Date.now() - heartbeatStartedAt;
 
     const agentStatusStartedAt = Date.now();
     this.agentStatusService.start();
-    stepDurationsMs["agentStatusService.start"] = Date.now() - agentStatusStartedAt;
+    this.startupStepDurationsMs["agentStatusService.start"] = Date.now() - agentStatusStartedAt;
 
     // Dream launch sweep (PRD #3534): consolidate memory for workspaces idle
     // ≥24h with writes since their last run. Fire-and-forget after the await
@@ -355,10 +435,13 @@ export class ServiceContainer {
       log.warn("Background xum SSH config setup failed", { error });
     });
 
-    log.info("[startup] ServiceContainer.initialize completed", {
-      totalMs: Date.now() - startupStartedAt,
-      stepDurationsMs,
-    });
+    const totalMs = Date.now() - (this.startupStartedAt ?? Date.now());
+    const completedPayload = { totalMs, stepDurationsMs: this.startupStepDurationsMs };
+    if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
+      log.warn("[startup] ServiceContainer.initialize completed", completedPayload);
+    } else {
+      log.info("[startup] ServiceContainer.initialize completed", completedPayload);
+    }
   }
 
   /**
@@ -478,12 +561,34 @@ export class ServiceContainer {
   private async disposeOnce(): Promise<void> {
     const disposeStartedAt = performance.now();
     log.debug("[shutdown] ServiceContainer.dispose starting");
-    // Must run before any session teardown: AgentSession.dispose() triggers
-    // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
-    // armed-monitor registry records that drive post-restart "monitor lost" wakes.
+    // Must run before any session teardown, including the recovery-session sweep below:
+    // AgentSession.dispose() triggers backgroundProcessManager.cleanup(), which would otherwise
+    // erase the persisted armed-monitor registry records that drive post-restart "monitor lost"
+    // wakes.
     shutdownStep("backgroundProcessManager.beginShutdown", () =>
       this.backgroundProcessManager.beginShutdown()
     );
+    // Background startup housekeeping (server mode) must not start periodic services or keep
+    // issuing work against the services torn down below. Its steps only observe the abort at
+    // their boundaries, so give the one in flight a bounded chance to settle first.
+    this.startupHousekeepingAbort.abort();
+    // Chat recovery that housekeeping scheduled runs past its own promise and observes neither the
+    // abort nor the join, so latch every session before the wait: nothing may start a stream inside
+    // it, and nothing may dispatch through the provider/runtime services torn down below.
+    shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
+    const housekeepingSettled = this.startupHousekeepingSettled;
+    if (housekeepingSettled != null) {
+      await shutdownStep("startupHousekeeping.join", async () => {
+        const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+          timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+        });
+        if (joined.kind === "timeout") {
+          log.warn("[shutdown] startup housekeeping still running; teardown continues", {
+            timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+          });
+        }
+      });
+    }
     // Interrupt and await the runtime's supervised fibers while every dependency
     // they might touch during finalization is still alive. Fixed here (before
     // the explicit teardown) so later occupants do not re-derive the position;

@@ -95,11 +95,11 @@ async function main(): Promise<void> {
   launchProjectPath = null;
 
   // Keepalive interval to prevent premature process exit during async initialization.
-  // During startup, taskService.initialize() may resume running tasks by calling
-  // sendMessage(), which spawns background AI streams. Between the completion of
-  // serviceContainer.initialize() and the HTTP server starting to listen, there can
-  // be a brief moment where no ref'd handles exist, causing Node to exit with code 0.
-  // This interval ensures the event loop stays alive until the server is listening.
+  // During startup, initializeCore() may resume running tasks by calling sendMessage(),
+  // which spawns background AI streams. Between its completion and the HTTP server
+  // starting to listen, there can be a brief moment where no ref'd handles exist,
+  // causing Node to exit with code 0. This interval ensures the event loop stays alive
+  // until the server is listening.
   const startupKeepalive = setInterval(() => {
     // Intentionally empty - keeps event loop alive during startup
   }, 1000);
@@ -116,9 +116,9 @@ async function main(): Promise<void> {
   }
 
   // Early lockfile check: detect an existing server BEFORE initializing services.
-  // serviceContainer.initialize() resumes queued/running tasks (via TaskService),
-  // so we must fail fast here to avoid orphaned side effects when another server
-  // already holds the lock. ServerService.startServer() re-checks as defense-in-depth.
+  // initializeCore() resumes queued/running tasks (via TaskService), so we must fail fast
+  // here to avoid orphaned side effects when another server already holds the lock.
+  // ServerService.startServer() re-checks as defense-in-depth.
   const xumHome = getXumHome();
   const earlyLockfile = new ServerLockfile(xumHome);
   const existing = await earlyLockfile.read();
@@ -133,7 +133,10 @@ async function main(): Promise<void> {
   const serviceContainer = new ServiceContainer(stores);
   // Headless server has no interactive host-key dialog
   setOpenSSHHostKeyPolicyMode("headless-fallback");
-  await serviceContainer.initialize();
+  // Core init (including agent-task recovery, which must finish before any client can act on
+  // tasks) gates the listener; the housekeeping that scales with the number of workspaces runs
+  // in the background once the server is accepting connections.
+  await serviceContainer.initializeCore();
   serviceContainer.windowService.setMainWindow(mockWindow);
 
   if (ADD_PROJECT_PATH) {
@@ -161,6 +164,14 @@ async function main(): Promise<void> {
     authToken: resolved.token,
     serveStatic: true,
     allowHttpOrigin: ALLOW_HTTP_ORIGIN,
+  });
+
+  // Housekeeping is best-effort background work; a failure must not take the listening server
+  // down. serviceContainer.dispose() cancels it at its next task/step boundary and waits
+  // (bounded) for the step in flight, so shutdown during housekeeping never starts periodic
+  // services against disposed dependencies.
+  void serviceContainer.runStartupHousekeeping().catch((error: unknown) => {
+    log.error("[startup] Background startup housekeeping failed", { error });
   });
 
   // Server is now listening - clear the startup keepalive since httpServer keeps the loop alive

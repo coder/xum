@@ -22,3 +22,11 @@ export const APP_RUNTIME_DISPOSE_TIMEOUT_MS = 2 * 1000;
  * bound this fits inside the same 5 s quit budgets.
  */
 export const APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS = 2 * 1000;
+
+/**
+ * Bounds how long `ServiceContainer.dispose()` waits for in-flight background
+ * startup housekeeping (server mode) to reach its cancellation checkpoint before
+ * tearing down the services it uses. Sized to leave the two bounds above room
+ * inside the same 5 s quit budgets.
+ */
+export const STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS = 500;

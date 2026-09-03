@@ -10,6 +10,7 @@ import {
 // Persisted task snapshots stamp the legacy exclusive mirror so downgraded
 // builds resume tasks in the exclusive posture (see withLegacyPtcExclusiveMirror).
 import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
+import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -2259,14 +2260,32 @@ export class TaskService implements AgentTaskIntegration {
     return found;
   }
 
+  /**
+   * Restart recovery for agent tasks followed by the startup housekeeping passes. The server
+   * entry point runs the two halves separately around its listener bind (see
+   * ServiceContainer.initializeCore / runStartupHousekeeping); desktop startup runs them back to back.
+   */
   async initialize(): Promise<void> {
+    await this.recoverInterruptedTasks();
+    await this.runStartupHousekeeping();
+  }
+
+  /**
+   * Re-establishes the tasks that were active when the process last exited: execution-handle
+   * mirrors, stale `starting` tasks, the queue drain, and the restart prompts for
+   * `awaiting_report`/`running` tasks. Bounded by the number of active tasks, not by deployment
+   * size. Must finish before any client can act on tasks: a stop, resume, or send racing these
+   * transitions would be overwritten or would resurrect a task the client just stopped, so the
+   * server binds its listener only after this resolves.
+   */
+  async recoverInterruptedTasks(): Promise<void> {
     const startupStartedAt = Date.now();
     const startupConfig = this.config.loadConfigOrDefault();
     const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) => task.taskStatus === "queued" && typeof task.id === "string"
     ).length;
 
-    log.info("[startup] TaskService.initialize starting", {
+    log.info("[startup] TaskService.recoverInterruptedTasks starting", {
       queuedTaskCountAtStartup,
     });
 
@@ -2397,6 +2416,7 @@ export class TaskService implements AgentTaskIntegration {
 
     let resumedRunningCount = 0;
     let skippedRunningDueToActiveDescendants = 0;
+    let skippedRunningAlreadyStreaming = 0;
     let failedRunningCount = 0;
 
     for (const task of runningTasks) {
@@ -2460,6 +2480,13 @@ export class TaskService implements AgentTaskIntegration {
           continue;
         }
         resumedRunningCount += 1;
+        continue;
+      }
+
+      // The queue drain above can have launched this task already; nudging it again would queue
+      // a spurious "Xum restarted" turn behind its first stream.
+      if (this.aiService.isStreaming(task.id)) {
+        skippedRunningAlreadyStreaming += 1;
         continue;
       }
 
@@ -2536,8 +2563,35 @@ export class TaskService implements AgentTaskIntegration {
       // Startup queue draining already ran before these interruptions freed slots.
       // Run it once more after recovery prompts so unrelated queued work is not stranded.
       await this.maybeStartQueuedTasks();
-      config = this.config.loadConfigOrDefault();
     }
+
+    log.info("[startup] TaskService.recoverInterruptedTasks completed", {
+      totalMs: Date.now() - startupStartedAt,
+      maybeStartQueuedTasksMs,
+      awaitingReportTaskCount: awaitingReportTasks.length,
+      resumedAwaitingReportCount,
+      skippedAwaitingReportDueToActiveDescendants,
+      failedAwaitingReportCount,
+      runningTaskCount: runningTasks.length,
+      resumedRunningCount,
+      skippedRunningDueToActiveDescendants,
+      skippedRunningAlreadyStreaming,
+      failedRunningCount,
+    });
+  }
+
+  /**
+   * Startup passes over every reported task and session directory: pending patch-artifact
+   * generation, reported-task cleanup, workflow garbage sweeps, and terminal-attention delivery.
+   * Scales with deployment size, so the server runs it after its listener is bound. Clients may
+   * therefore already be acting: every step re-checks live state before it mutates, and
+   * `options.signal` (aborted by dispose) stops the pass at the next step boundary so teardown
+   * neither waits for nor races housekeeping against disposed services.
+   */
+  async runStartupHousekeeping(options?: { signal?: AbortSignal }): Promise<void> {
+    const startupStartedAt = Date.now();
+    const cancelled = (): boolean => options?.signal?.aborted === true;
+    const config = this.config.loadConfigOrDefault();
 
     // Restart-safety for git patch artifacts:
     // - If xum crashed mid-generation, patch artifacts can be left "pending".
@@ -2549,12 +2603,19 @@ export class TaskService implements AgentTaskIntegration {
 
     const patchGenerationRecoveryStartedAt = Date.now();
     for (const task of completedReportTasks) {
+      if (cancelled()) return;
       if (!task.parentWorkspaceId) continue;
+      // A reported task that is streaming again (a client reactivated it) may be committing;
+      // the continuation refresh that runs when that turn ends generates its artifact.
+      if (this.aiService.isStreaming(task.id!)) continue;
       try {
+        // Pass the loop snapshot: reloading config.json per reported task made this pass scale
+        // with (reported tasks x config size) on large deployments.
         await this.gitPatchArtifactService.maybeStartGeneration(
           task.parentWorkspaceId,
           task.id!,
-          (wsId) => this.requestReportedTaskCleanupRecheck(wsId)
+          (wsId) => this.requestReportedTaskCleanupRecheck(wsId),
+          { config }
         );
       } catch (error: unknown) {
         log.error("Failed to resume subagent git patch generation on startup", {
@@ -2570,6 +2631,9 @@ export class TaskService implements AgentTaskIntegration {
     // on disk after a restart, there may be no later child stream-end to finalize the pending
     // parent task tool call. Re-run the deferred parent delivery/finalization pass first so
     // cleanup rechecks do not stay blocked forever behind a stale input-available partial.
+    // A parent turn (client or resumed child) may start meanwhile; the finalization write is a
+    // compare-and-set on the partial's identity, so it never lands on a live turn's partial.
+    if (cancelled()) return;
     const bestOfRecoveryStartedAt = Date.now();
     const bestOfParentWorkspaceIds = new Set<string>();
     for (const task of completedReportTasks) {
@@ -2585,17 +2649,28 @@ export class TaskService implements AgentTaskIntegration {
       bestOfParentWorkspaceIds.add(parentWorkspaceId);
     }
     for (const parentWorkspaceId of bestOfParentWorkspaceIds) {
+      if (cancelled()) return;
       await this.deliverDeferredBestOfReportsForParent(parentWorkspaceId);
     }
     const bestOfRecoveryMs = Date.now() - bestOfRecoveryStartedAt;
 
     // Best-effort completed-report ancestor recheck after restart.
     const cleanupReportedTasksStartedAt = Date.now();
+    // Reuse one config snapshot across tasks to screen out the (usual) ineligible majority without
+    // a config parse each; reload it only after a removal changed the tree. The snapshot never
+    // decides a deletion: canCleanupReportedTask re-evaluates any positive verdict on fresh config,
+    // since clients may have reactivated or re-parented a task since the snapshot.
+    let cleanupConfig = config;
     for (const task of completedReportTasks) {
+      if (cancelled()) return;
       if (!task.id) continue;
-      await this.cleanupReportedLeafTask(task.id);
+      const removedCount = await this.cleanupReportedLeafTask(task.id, { config: cleanupConfig });
+      if (removedCount > 0) {
+        cleanupConfig = this.config.loadConfigOrDefault();
+      }
     }
     const cleanupReportedTasksMs = Date.now() - cleanupReportedTasksStartedAt;
+    if (cancelled()) return;
 
     // Startup self-heal for leftover workflow task garbage: interrupted-without-report
     // workflow-owned children of inactive runs (both the ones the prepass above just
@@ -2608,6 +2683,7 @@ export class TaskService implements AgentTaskIntegration {
       log.error("Startup workflow task archive sweep failed", { error });
     }
 
+    if (cancelled()) return;
     let queuedTerminalWorkflowRunAttentionCount = 0;
     try {
       queuedTerminalWorkflowRunAttentionCount = await this.sweepWorkflowRunTerminalAttention();
@@ -2626,6 +2702,7 @@ export class TaskService implements AgentTaskIntegration {
       }, WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS);
       this.workflowAttentionSweepTimer.unref?.();
     }
+    if (cancelled()) return;
     const recoveredTerminalWorkspaceTurnNotificationCount =
       await this.getWorkspaceTurnManager().recoverTerminalWorkspaceTurnAttentionNotifications();
     const terminalAttentionDrainStartedAt = Date.now();
@@ -2633,17 +2710,9 @@ export class TaskService implements AgentTaskIntegration {
       await this.schedulePendingTerminalAttentionOwnerDrains();
     const terminalAttentionDrainMs = Date.now() - terminalAttentionDrainStartedAt;
 
-    log.info("[startup] TaskService.initialize completed", {
-      totalMs: Date.now() - startupStartedAt,
-      maybeStartQueuedTasksMs,
-      awaitingReportTaskCount: awaitingReportTasks.length,
-      resumedAwaitingReportCount,
-      skippedAwaitingReportDueToActiveDescendants,
-      failedAwaitingReportCount,
-      runningTaskCount: runningTasks.length,
-      resumedRunningCount,
-      skippedRunningDueToActiveDescendants,
-      failedRunningCount,
+    const totalMs = Date.now() - startupStartedAt;
+    const completedPayload = {
+      totalMs,
       completedReportTaskCount: completedReportTasks.length,
       patchGenerationRecoveryMs,
       bestOfParentRecoveryCount: bestOfParentWorkspaceIds.size,
@@ -2653,7 +2722,12 @@ export class TaskService implements AgentTaskIntegration {
       pendingTerminalAttentionOwnerWorkspaceCount,
       terminalAttentionDrainMs,
       cleanupReportedTasksMs,
-    });
+    };
+    if (totalMs > SLOW_STARTUP_WARN_THRESHOLD_MS) {
+      log.warn("[startup] TaskService.runStartupHousekeeping completed", completedPayload);
+    } else {
+      log.info("[startup] TaskService.runStartupHousekeeping completed", completedPayload);
+    }
   }
 
   private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
@@ -12585,6 +12659,7 @@ export class TaskService implements AgentTaskIntegration {
     agentId?: string;
     agentType?: string;
     taskStatus?: WorkspaceConfigEntry["taskStatus"];
+    taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
   }> {
     const cfg = this.config.loadConfigOrDefault();
     const siblings: Array<{
@@ -12593,6 +12668,7 @@ export class TaskService implements AgentTaskIntegration {
       agentId?: string;
       agentType?: string;
       taskStatus?: WorkspaceConfigEntry["taskStatus"];
+      taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
     }> = [];
 
     for (const project of cfg.projects.values()) {
@@ -12617,6 +12693,7 @@ export class TaskService implements AgentTaskIntegration {
           agentId: coerceNonEmptyString(workspace.agentId),
           agentType: coerceNonEmptyString(workspace.agentType),
           taskStatus: workspace.taskStatus,
+          taskExecutionStatus: workspace.taskExecutionStatus,
         });
       }
     }
@@ -12641,10 +12718,27 @@ export class TaskService implements AgentTaskIntegration {
     return siblings;
   }
 
+  /**
+   * A reported sibling that a client reawakened (workspace-turn continuation) or that is streaming
+   * still owns its previous report artifact. Finalizing the parent on that artifact would freeze the
+   * grouped result on a report the child is replacing, so its group waits for the new report.
+   */
+  private isBestOfSiblingExecutingAgain(sibling: {
+    taskId: string;
+    taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
+  }): boolean {
+    return (
+      isActiveWorkspaceTurnTaskStatus(sibling.taskExecutionStatus) ||
+      this.aiService.isStreaming(sibling.taskId)
+    );
+  }
+
   private async buildBestOfCompletedTaskToolOutput(params: {
     parentWorkspaceId: string;
     groupId: string;
     total: number;
+    /** The sibling whose report is being delivered right now; its execution is live by construction. */
+    reportingTaskId?: string;
   }): Promise<z.infer<typeof TaskToolResultSchema> | null> {
     const siblings = this.listBestOfSiblingTasks({
       parentWorkspaceId: params.parentWorkspaceId,
@@ -12680,6 +12774,13 @@ export class TaskService implements AgentTaskIntegration {
     }> = [];
 
     for (const sibling of siblings) {
+      if (
+        sibling.taskId !== params.reportingTaskId &&
+        this.isBestOfSiblingExecutingAgain(sibling)
+      ) {
+        return null;
+      }
+
       const artifact = await readSubagentReportArtifact(parentSessionDir, sibling.taskId);
       if (!artifact) {
         return null;
@@ -12696,6 +12797,22 @@ export class TaskService implements AgentTaskIntegration {
         modelString: artifact.model,
         thinkingLevel: artifact.thinkingLevel,
       });
+    }
+
+    // The artifact reads above awaited disk I/O, during which a client can reawaken a sibling
+    // whose old report is already in `reports`; re-read live state once more before handing out.
+    const liveSiblings = this.listBestOfSiblingTasks({
+      parentWorkspaceId: params.parentWorkspaceId,
+      groupId: params.groupId,
+    });
+    if (
+      liveSiblings.length !== siblings.length ||
+      liveSiblings.some(
+        (sibling) =>
+          sibling.taskId !== params.reportingTaskId && this.isBestOfSiblingExecutingAgain(sibling)
+      )
+    ) {
+      return null;
     }
 
     const output = {
@@ -12782,7 +12899,8 @@ export class TaskService implements AgentTaskIntegration {
         sibling.taskStatus === "queued" ||
         sibling.taskStatus === "starting" ||
         sibling.taskStatus === "running" ||
-        sibling.taskStatus === "awaiting_report"
+        sibling.taskStatus === "awaiting_report" ||
+        this.isBestOfSiblingExecutingAgain(sibling)
       );
     });
     if (hasRecoverableSibling) {
@@ -13058,6 +13176,7 @@ export class TaskService implements AgentTaskIntegration {
           parentWorkspaceId: workspaceId,
           groupId: bestOf.groupId,
           total: bestOf.total,
+          reportingTaskId: childWorkspaceId,
         });
         if (!groupedOutput) {
           return { kind: "not_ready" };
@@ -13067,22 +13186,46 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
 
-    const updated: MuxMessage = {
-      ...partial,
-      parts: partial.parts.map((part) => {
-        if (!isDynamicToolPart(part)) return part;
-        if (part.toolCallId !== toolCallId) return part;
-        if (part.toolName !== "task") return part;
-        if (part.state === "output-available") return part;
-        return { ...part, state: "output-available" as const, output: finalizedOutput };
-      }),
-    };
-
-    const writeResult = await this.historyService.writePartial(workspaceId, updated);
+    // The grouped output above was assembled from disk reads that a parent turn can overtake:
+    // its commitPartial moves this partial into history and its stream writes a fresh one under a
+    // new message id. Apply the finalization only while the partial is still this message with
+    // this call pending, and never under a stream that has already started.
+    const writeResult = await this.historyService.updatePartialIfMessageIdMatches(
+      workspaceId,
+      partial.id,
+      (current) => {
+        if (this.aiService.isStreaming(workspaceId)) return null;
+        const stillPending = current.parts.some(
+          (part) =>
+            isDynamicToolPart(part) &&
+            part.toolCallId === toolCallId &&
+            part.toolName === "task" &&
+            part.state === "input-available"
+        );
+        if (!stillPending) return null;
+        return {
+          ...current,
+          parts: current.parts.map((part) => {
+            if (!isDynamicToolPart(part)) return part;
+            if (part.toolCallId !== toolCallId) return part;
+            if (part.toolName !== "task") return part;
+            if (part.state === "output-available") return part;
+            return { ...part, state: "output-available" as const, output: finalizedOutput };
+          }),
+        };
+      }
+    );
     if (!writeResult.success) {
       log.error("Failed to write finalized task tool output to partial", {
         workspaceId,
         error: writeResult.error,
+      });
+      return { kind: "failed" };
+    }
+    if (!writeResult.data) {
+      log.debug("tryFinalizePendingTaskToolCallInPartial: partial superseded before finalization", {
+        workspaceId,
+        messageId: partial.id,
       });
       return { kind: "failed" };
     }
@@ -13092,7 +13235,7 @@ export class TaskService implements AgentTaskIntegration {
       message: {
         type: "tool-call-end",
         workspaceId,
-        messageId: updated.id,
+        messageId: partial.id,
         toolCallId,
         toolName: "task",
         result: finalizedOutput,
@@ -13111,11 +13254,11 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async canCleanupReportedTask(
-    workspaceId: string
+    workspaceId: string,
+    config: ProjectsConfig = this.config.loadConfigOrDefault()
   ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
     assert(workspaceId.length > 0, "canCleanupReportedTask: workspaceId must be non-empty");
 
-    const config = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(config, workspaceId);
     if (!entry) {
       return { ok: false, reason: "workspace_not_found" };
@@ -13128,6 +13271,12 @@ export class TaskService implements AgentTaskIntegration {
 
     if (!hasCompletedAgentReport(entry.workspace)) {
       return { ok: false, reason: "task_not_reported" };
+    }
+
+    // A reported task reactivated through an existing-workspace turn keeps taskStatus "reported"
+    // while its execution mirror is already starting or running, before any stream registers.
+    if (isActiveWorkspaceTurnTaskStatus(entry.workspace.taskExecutionStatus)) {
+      return { ok: false, reason: "workspace_turn_active" };
     }
 
     const bestOf = this.getEffectiveTaskGroup(workspaceId, entry.workspace);
@@ -13179,42 +13328,77 @@ export class TaskService implements AgentTaskIntegration {
     return { ok: true, parentWorkspaceId };
   }
 
-  private async cleanupReportedLeafTask(workspaceId: string): Promise<void> {
+  /**
+   * @param options.config - config snapshot used only to screen the first (depth 0) candidate
+   *   cheaply; deletion eligibility is always confirmed on fresh config inside remove()'s
+   *   lifecycle lock, and every later depth re-evaluates the parent after a removal changed the tree.
+   * @returns the number of workspaces removed.
+   */
+  private async cleanupReportedLeafTask(
+    workspaceId: string,
+    options?: { config?: ProjectsConfig }
+  ): Promise<number> {
     assert(workspaceId.length > 0, "cleanupReportedLeafTask: workspaceId must be non-empty");
 
     // Lineage reduction: each iteration removes exactly one completed leaf, then re-evaluates
     // the parent on fresh config. The structural-leaf gate in canCleanupReportedTask ensures
     // ancestors are only deleted after every child has been pruned.
     let currentWorkspaceId = workspaceId;
+    let removedCount = 0;
     const visited = new Set<string>();
     for (let depth = 0; depth < 32; depth++) {
       if (visited.has(currentWorkspaceId)) {
         log.error("cleanupReportedLeafTask: possible parentWorkspaceId cycle", {
           workspaceId: currentWorkspaceId,
         });
-        return;
+        return removedCount;
       }
       visited.add(currentWorkspaceId);
 
-      const cleanupEligibility = await this.canCleanupReportedTask(currentWorkspaceId);
-      if (!cleanupEligibility.ok) {
-        return;
+      const targetWorkspaceId = currentWorkspaceId;
+      // Screen outside any lock (with the caller's snapshot at depth 0) so the (usual) ineligible
+      // majority returns without a lock acquisition or config parse.
+      const screened = await this.canCleanupReportedTask(
+        targetWorkspaceId,
+        depth === 0 ? options?.config : undefined
+      );
+      if (!screened.ok) {
+        return removedCount;
       }
-
-      const removeResult = await this.workspaceService.remove(currentWorkspaceId, true);
+      // Deletion is decided on live state inside the task-tree lifecycle lock that remove()
+      // holds: reactivation, re-parenting, and task_stop all mutate under that lock, so a task
+      // confirmed eligible there cannot change underneath the removal. remove() is the only lock
+      // acquisition on this path: runtime callers reach it under the workspace event lock
+      // (stream-end finalization, cleanup rechecks), nesting event -> task-tree, the inverse of
+      // the send path's task-tree -> event. That nesting predates the live recheck.
+      let confirmed: { ok: true; parentWorkspaceId: string } | undefined;
+      const removeResult = await this.workspaceService.remove(targetWorkspaceId, true, {
+        beforeRemove: async () => {
+          const live = await this.canCleanupReportedTask(targetWorkspaceId);
+          confirmed = live.ok ? live : undefined;
+          return live.ok;
+        },
+      });
       if (!removeResult.success) {
         log.error("Failed to auto-delete completed task workspace", {
           workspaceId: currentWorkspaceId,
           error: removeResult.error,
         });
-        return;
+        return removedCount;
       }
+      if (confirmed == null) {
+        return removedCount;
+      }
+      removedCount += 1;
 
-      currentWorkspaceId = cleanupEligibility.parentWorkspaceId;
+      // The removal just made this parent a candidate, so follow the parent the live check saw
+      // (a client may have re-parented the task since the screen).
+      currentWorkspaceId = confirmed.parentWorkspaceId;
     }
 
     log.error("cleanupReportedLeafTask: exceeded max parent traversal depth", {
       workspaceId,
     });
+    return removedCount;
   }
 }

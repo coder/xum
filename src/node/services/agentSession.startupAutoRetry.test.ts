@@ -50,7 +50,10 @@ interface SessionBundle {
   cleanup: () => Promise<void>;
 }
 
-async function createSessionBundle(workspaceId: string): Promise<SessionBundle> {
+async function createSessionBundle(
+  workspaceId: string,
+  aiServiceOverrides?: Partial<AgentSessionAIService>
+): Promise<SessionBundle> {
   const workspaceMetadata: WorkspaceMetadata = {
     id: workspaceId,
     name: workspaceId,
@@ -69,6 +72,7 @@ async function createSessionBundle(workspaceId: string): Promise<SessionBundle> 
     workspaceId,
     aiServiceOverrides: {
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      ...aiServiceOverrides,
     },
     initStateManagerOverrides: {
       replayInit: mock(() => Promise.resolve()),
@@ -137,6 +141,161 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.agentId).toBe(WORKSPACE_DEFAULTS.agentId);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: ".*", action: "disable" }]);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
+
+    session.dispose();
+  });
+
+  test("startup auto-retry does not dispatch once the workspace is archived on disk", async () => {
+    const workspaceId = "startup-retry-archived";
+    const { session, config, historyService, events, cleanup } =
+      await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted before the archive", {
+        timestamp: Date.now(),
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    // The archive lands while the check is still reading history (a regular session the client
+    // created is not disposed by archive, so only the durable state can stop the dispatch).
+    const getLastMessages = historyService.getLastMessages.bind(historyService);
+    spyOn(historyService, "getLastMessages").mockImplementation(async (id, count) => {
+      const result = await getLastMessages(id, count);
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/tmp/project", {
+          workspaces: [
+            {
+              id: workspaceId,
+              path: `/tmp/project/${workspaceId}`,
+              name: workspaceId,
+              archivedAt: new Date().toISOString(),
+            },
+          ],
+        });
+        return cfg;
+      });
+      return result;
+    });
+
+    const privateSession = session as unknown as {
+      startupAutoRetryCheckPromise: Promise<void> | null;
+      startupAutoRetryCheckScheduled: boolean;
+    };
+    session.ensureStartupAutoRetryCheck();
+    await privateSession.startupAutoRetryCheckPromise;
+
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    // Completed rather than deferred: nothing reruns the check for an archived workspace.
+    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
+
+    session.dispose();
+  });
+
+  test("auto-retry abandons instead of resuming once the workspace is archived on disk", async () => {
+    const workspaceId = "startup-retry-archived-before-timer";
+    const { session, config, events, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const privateSession = session as unknown as RetryableSessionForTests;
+    privateSession.lastAutoRetryResumeRequest = {
+      options: { model: "anthropic:claude-sonnet-4-5", agentId: "exec" },
+    };
+    const resumeStreamMock = mock((_options: SendMessageOptions) =>
+      Promise.resolve({ success: true as const, data: { started: true } })
+    );
+    privateSession.resumeStream = resumeStreamMock;
+
+    // The archive lands during the backoff countdown; only the durable state can stop the timer.
+    await config.editConfig((cfg) => {
+      cfg.projects.set("/tmp/project", {
+        workspaces: [
+          {
+            id: workspaceId,
+            path: `/tmp/project/${workspaceId}`,
+            name: workspaceId,
+            archivedAt: new Date().toISOString(),
+          },
+        ],
+      });
+      return cfg;
+    });
+
+    await privateSession.retryActiveStream();
+
+    expect(resumeStreamMock).not.toHaveBeenCalled();
+    const abandonedReasons = events
+      .filter(
+        (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+          event.type === "auto-retry-abandoned"
+      )
+      .map((event) => event.reason);
+    expect(abandonedReasons).toEqual(["workspace_archived"]);
+
+    session.dispose();
+  });
+
+  test("beginShutdown cancels the pending retry and stops re-arming or streaming", async () => {
+    const workspaceId = "startup-retry-shutdown";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle("assistant-1"))));
+    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId, {
+      streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+    });
+    cleanups.push(cleanup);
+
+    const privateSession = session as unknown as {
+      handleStreamFailureForAutoRetry: (error: { type: string; message?: string }) => Promise<void>;
+    };
+    await privateSession.handleStreamFailureForAutoRetry({ type: "unknown", message: "boom" });
+    expect(session.shouldRetainAfterStartupRecovery()).toBe(true);
+    const scheduledBefore = events.filter((event) => event.type === "auto-retry-scheduled").length;
+    expect(scheduledBefore).toBe(1);
+
+    session.beginShutdown();
+
+    expect(session.shouldRetainAfterStartupRecovery()).toBe(false);
+    await privateSession.handleStreamFailureForAutoRetry({ type: "unknown", message: "boom" });
+    expect(events.filter((event) => event.type === "auto-retry-scheduled").length).toBe(
+      scheduledBefore
+    );
+    // Not disposed, but sends are refused before any row lands: a follow-up row persisted here
+    // would read as a dispatched turn on the next startup while its stream never ran.
+    const sendResult = await session.sendMessage("hello", {
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    expect(sendResult.success).toBe(false);
+    expect(streamMessage).not.toHaveBeenCalled();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
+
+    session.dispose();
+  });
+
+  test("beginShutdown during pre-stream awaits stops the stream before the provider", async () => {
+    const workspaceId = "startup-retry-shutdown-mid-prepare";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle("assistant-1"))));
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
+      streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+    });
+    cleanups.push(cleanup);
+
+    // Shutdown lands while the stream start is already past its entry check, awaiting disk I/O.
+    const commitPartial = historyService.commitPartial.bind(historyService);
+    spyOn(historyService, "commitPartial").mockImplementation(async (id) => {
+      const result = await commitPartial(id);
+      session.beginShutdown();
+      return result;
+    });
+
+    const sendResult = await session.sendMessage("hello", {
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    expect(sendResult.success).toBe(true);
+    expect(streamMessage).not.toHaveBeenCalled();
 
     session.dispose();
   });
