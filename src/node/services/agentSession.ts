@@ -245,6 +245,8 @@ interface AutoRetryResumeRequest {
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
   stepBudget?: number;
+  /** The retried stream was admitted under resumeStream's revalidation; the retry repeats it. */
+  revalidateAdmission?: boolean;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -1402,7 +1404,8 @@ export class AgentSession {
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
     goalId?: string,
-    stepBudget?: number
+    stepBudget?: number,
+    revalidateAdmission?: boolean
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1415,6 +1418,7 @@ export class AgentSession {
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
       ...(stepBudget != null ? { stepBudget } : {}),
+      ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
     };
   }
 
@@ -1444,8 +1448,17 @@ export class AgentSession {
         goalKind: request.goalKind,
         goalId: request.goalId,
         stepBudget: request.stepBudget,
+        revalidateAdmission: request.revalidateAdmission,
       });
       if (result.success) {
+        if (result.data.refusedBy != null) {
+          // The goal or delegated turn ended during the backoff; no retry can readmit it.
+          this.emitRetryEvent({
+            type: "auto-retry-abandoned",
+            reason: `${result.data.refusedBy}_admission_refused`,
+          });
+          return;
+        }
         if (!result.data.started) {
           // resumeStream can defer when a turn is still PREPARING/COMPLETING.
           // Treat this as retriable so auto-retry keeps progressing instead of
@@ -4365,7 +4378,8 @@ export class AgentSession {
       internal?.agentInitiated,
       internal?.goalKind,
       internal?.goalId,
-      internal?.stepBudget
+      internal?.stepBudget,
+      internal?.revalidateAdmission
     );
     // Claim the turn before any await: the admission gates below do I/O, and a manual send
     // entering meanwhile must see a busy session rather than start a stream this resume
@@ -7063,8 +7077,9 @@ export class AgentSession {
     if (this.owedStrandedTurnResume() == null) {
       return false;
     }
-    // Nothing else queued to take the turn: the stranded resume will carry this correlation.
-    if (this.messageQueue.isEmpty() && !this.dispatchingQueuedEntry) {
+    // Nothing dispatchable queued to take the turn (withdrawn entries drain as no-ops): the
+    // stranded resume will carry this correlation.
+    if (this.messageQueue.getNextDispatchableMode() == null && !this.dispatchingQueuedEntry) {
       return true;
     }
     // A queued or dispatching entry that failed the checks above supersedes the turn; the

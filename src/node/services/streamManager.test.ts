@@ -256,6 +256,7 @@ function createStreamInfoForTests(
     didRetryPreviousResponseIdAtStep: false,
     receivedTerminalEvent: false,
     currentStepStartIndex: 0,
+    stepCount: 0,
     stepTracker: {},
     ...overrides,
   };
@@ -3732,6 +3733,100 @@ describe("StreamManager - empty stream completions", () => {
     expect(swappedRequest.system).toBe("fallback system");
   });
 
+  test("a fallback hop runs under the refused stream's remaining step budget, none once spent", async () => {
+    const runRefusalWithFallback = async (stepBudget: number) => {
+      const streamManager = new StreamManager(historyService);
+      const errorEvents: unknown[] = [];
+      onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+
+      const workspaceId = `fallback-step-budget-${stepBudget}-workspace`;
+      const messageId = "fallback-step-budget-message";
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
+
+      const createStreamResult = mock((_request: { stepBudget?: number }) =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "fallback answer" };
+            yield { type: "finish", finishReason: "stop" };
+          })(),
+          { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
+        )
+      );
+      expect(Reflect.set(streamManager, "createStreamResult", createStreamResult)).toBe(true);
+      const prepare = mock((nextModelString: string) =>
+        Promise.resolve(
+          Ok({
+            model: createTestLanguageModel("fallback-model"),
+            modelString: nextModelString,
+            messages: [],
+            system: "fallback system",
+            tools: {},
+            thinkingLevel: "off",
+          })
+        )
+      );
+
+      const startTime = Date.now() - 250;
+      const streamInfo = createStreamInfoForTests({
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            // The refused step is a step the turn spent.
+            yield { type: "start-step" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 30, outputTokens: 0, totalTokens: 30 },
+            };
+            yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+          })(),
+          { inputTokens: 30, outputTokens: 0, totalTokens: 30 }
+        ),
+        messageId,
+        startTime,
+        lastPartTimestamp: startTime,
+        model: KNOWN_MODELS.SONNET.id,
+        metadataModel: KNOWN_MODELS.SONNET.id,
+        historySequence: 1,
+        initialMetadata: { agentId: "plan" },
+        runtime,
+        request: {
+          model: createTestLanguageModel("refused-model"),
+          messages: [],
+          providerOptions: undefined,
+          stepBudget,
+        },
+        modelFallback: {
+          options: { chain: [KNOWN_MODELS.GPT.id], prepare },
+          requestedModel: KNOWN_MODELS.SONNET.id,
+          refusedModels: [],
+          original: { maxOutputTokens: undefined },
+        },
+      });
+
+      await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, 1);
+      return { errorEvents, prepare, createStreamResult };
+    };
+
+    // Three steps allowed and one spent on the refusal: the hop's own loop gets the other two.
+    const hop = await runRefusalWithFallback(3);
+    expect(hop.errorEvents).toHaveLength(0);
+    expect(hop.createStreamResult).toHaveBeenCalledTimes(1);
+    expect(hop.createStreamResult.mock.calls[0]?.[0].stepBudget).toBe(2);
+
+    // The refusal spent the last step: the ceiling ended the turn, so no hop is bought.
+    const spent = await runRefusalWithFallback(1);
+    expect(spent.prepare).not.toHaveBeenCalled();
+    expect(spent.createStreamResult).not.toHaveBeenCalled();
+    expect(spent.errorEvents).toHaveLength(1);
+    expect(spent.errorEvents[0]).toMatchObject({ errorType: "model_refusal" });
+  });
+
   test("partial refusal with a configured fallback continues from cloned partial output", async () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: unknown[] = [];
@@ -5297,6 +5392,7 @@ describe("StreamManager - previousResponseId recovery", () => {
       stepTracker: { latestMessages: stepMessages },
       didRetryPreviousResponseIdAtStep: false,
       currentStepStartIndex: 1,
+      stepCount: 1,
       request: {
         model,
         messages: [{ role: "user", content: "original" }],

@@ -272,12 +272,17 @@ export class MessageQueue {
   }
 
   /**
-   * Dispatch mode of the first entry whose cancel signal has not fired, or undefined
-   * when none remains. Aborted entries still drain FIFO (as no-ops that fire
-   * onCanceled), but they are not pending work and must not arm a tool-end stop.
+   * The first entry whose cancel signal has not fired. Aborted entries still drain FIFO (as
+   * no-ops that fire onCanceled), but they are not pending work: they must not arm a tool-end
+   * stop, count as a turn's continuation, or be attributed a cut.
    */
+  private nextDispatchableEntry(): QueueEntry | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
+  /** Dispatch mode of the next dispatchable entry, or undefined when none remains. */
   getNextDispatchableMode(): QueueDispatchMode | undefined {
-    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true)?.dispatchMode;
+    return this.nextDispatchableEntry()?.dispatchMode;
   }
 
   /**
@@ -306,14 +311,14 @@ export class MessageQueue {
   }
 
   /**
-   * Whether the next entry continues the exact workspace turn correlation.
+   * Whether the next dispatchable entry continues the exact workspace turn correlation.
    */
   hasNextWorkspaceTurnContinuation(
     taskHandleId: string,
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    const metadata = this.entries[0]?.muxMetadata;
+    const metadata = this.nextDispatchableEntry()?.muxMetadata;
     return (
       isWorkspaceTurnMetadata(metadata) &&
       metadata.taskHandleId === taskHandleId &&
@@ -323,7 +328,7 @@ export class MessageQueue {
   }
 
   /**
-   * FIFO head entry's cut-attribution view: its first muxMetadata plus dispatch mode.
+   * Next dispatchable entry's cut-attribution view: its first muxMetadata plus dispatch mode.
    *
    * Soundness of metadata-based cut attribution rests on the sealing invariant
    * (see class docblock): workspace-turn entries are sealed at add time and
@@ -334,7 +339,7 @@ export class MessageQueue {
   getNextQueueCutCandidate():
     | { muxMetadata: unknown; dispatchMode: QueueDispatchMode }
     | undefined {
-    const head = this.entries[0];
+    const head = this.nextDispatchableEntry();
     if (head == null) {
       return undefined;
     }
@@ -342,13 +347,13 @@ export class MessageQueue {
   }
 
   /**
-   * Whether the next entry to dispatch is a bash-monitor wake. Wake sends are
+   * Whether the next dispatchable entry is a bash-monitor wake. Wake sends are
    * the only queued input that continues an open delegated workspace turn
    * (see AgentSession.inheritOpenWorkspaceTurnMetadata); any other head entry
    * supersedes the turn when it dispatches.
    */
   isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
+    const muxMetadata = this.nextDispatchableEntry()?.muxMetadata;
     if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
     return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
   }

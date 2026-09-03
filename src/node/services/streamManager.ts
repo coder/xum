@@ -645,8 +645,9 @@ interface WorkspaceStreamInfo {
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
 
-  // Steps started so far, the in-progress one included: the budget left at an abort counts a
-  // step the model already began.
+  // Steps started by the current SDK loop, the in-progress one included: the budget left at
+  // an abort counts a step the model already began. Reset when the loop restarts under
+  // request.stepBudget (restartStepBudget).
   stepCount: number;
 
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
@@ -3155,6 +3156,14 @@ export class StreamManager {
       };
     }
 
+    const stepBudget = this.restartStepBudget(streamInfo);
+    if (stepBudget == null) {
+      return {
+        kind: "terminal",
+        terminalNote: "Model fallback was skipped because the turn's step budget is spent.",
+      };
+    }
+
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     // A throw out of prepare() must not escape to the generic stream-error path:
     // it would be categorized as a retryable api/unknown error and re-enter the
@@ -3217,7 +3226,7 @@ export class StreamManager {
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
       onQueuedMessageStop: streamInfo.request.onQueuedMessageStop,
-      stepBudget: streamInfo.request.stepBudget,
+      stepBudget,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
@@ -3308,10 +3317,21 @@ export class StreamManager {
     // refused model (e.g. an OpenAI WS transport socket) would leak per hop.
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
+    streamInfo.stepCount = 0;
     streamInfo.streamResult = nextStreamResult;
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
 
     return { kind: "swapped" };
+  }
+
+  /**
+   * Step ceiling for an SDK loop restarted under this stream (fallback swap, same-model
+   * retry): the new loop counts its steps from zero, so it inherits what the stream has
+   * left rather than a fresh ceiling. Undefined when the budget is spent.
+   */
+  private restartStepBudget(streamInfo: WorkspaceStreamInfo): number | undefined {
+    const remaining = (streamInfo.request.stepBudget ?? MAX_STREAM_STEPS) - streamInfo.stepCount;
+    return remaining > 0 ? remaining : undefined;
   }
 
   private async handleTruncatedStreamCompletion(
@@ -3364,6 +3384,11 @@ export class StreamManager {
       return false;
     }
 
+    const stepBudget = this.restartStepBudget(streamInfo);
+    if (stepBudget == null) {
+      return false;
+    }
+
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     workspaceLog.warn("Retrying stream after empty-output completion", {
       messageId: streamInfo.messageId,
@@ -3379,6 +3404,8 @@ export class StreamManager {
       workspaceLog,
     });
     streamInfo.currentStepStartIndex = 0;
+    streamInfo.request = { ...streamInfo.request, stepBudget };
+    streamInfo.stepCount = 0;
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
@@ -4542,6 +4569,11 @@ export class StreamManager {
       return false;
     }
 
+    const stepBudget = this.restartStepBudget(streamInfo);
+    if (stepBudget == null) {
+      return false;
+    }
+
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     this.recordLostResponseIdIfApplicable(workspaceId, error, streamInfo, workspaceLog);
 
@@ -4571,7 +4603,9 @@ export class StreamManager {
       ...streamInfo.request,
       ...(stepMessages ? { messages: stepMessages } : {}),
       providerOptions,
+      stepBudget,
     };
+    streamInfo.stepCount = 0;
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
