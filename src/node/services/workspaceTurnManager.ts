@@ -4307,22 +4307,21 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * Whether a continuation of this exact delegated turn is pending or streaming.
-   * Pending entries must carry the same correlation metadata as the ended stream.
+   * Whether a continuation of this exact delegated turn is pending or streaming. The
+   * session's answer is binding: a false claim voids the continuation it owed to this cut, so
+   * the settlement made here cannot be followed by an orphaned resume of the same turn.
    */
   private hasSameTurnContinuation(
     event: StreamEndEvent,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
   ): boolean {
     if (
-      this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
-        type: "workspace-turn-task",
-        ...correlation,
-      })
+      this.workspaceService.claimWorkspaceTurnContinuation(
+        event.workspaceId,
+        { type: "workspace-turn-task", ...correlation },
+        event.messageId
+      )
     ) {
-      return true;
-    }
-    if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
       return true;
     }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);

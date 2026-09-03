@@ -347,8 +347,7 @@ describe("TaskService", () => {
       isStreaming?: ReturnType<typeof mock>;
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
-      hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
-      hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
+      claimWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
@@ -23855,11 +23854,11 @@ describe("TaskService", () => {
     // A queued bash-monitor wake cuts the correlated stream at a tool boundary
     // (finishReason "tool-calls") while the child seamlessly continues the
     // same turn — the handle must stay running.
-    const hasPendingBashMonitorWakeContinuation = mock(
+    const claimWorkspaceTurnContinuation = mock(
       (workspaceId: string) => workspaceId === "childworkspace"
     );
     const { parentId, taskService } = await startWorkspaceTurnForTest({
-      hasPendingBashMonitorWakeContinuation,
+      claimWorkspaceTurnContinuation,
     });
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
@@ -23882,6 +23881,12 @@ describe("TaskService", () => {
     const running = await workspaceTurnSnapshot(taskService, parentId);
     expect(running).toMatchObject({ status: "running", workspaceId: "childworkspace" });
     expect(running?.error).toBeUndefined();
+    // The claim is bound to the exact cut it settles.
+    expect(claimWorkspaceTurnContinuation).toHaveBeenCalledWith(
+      "childworkspace",
+      correlation,
+      "msg_queue_cut"
+    );
 
     // The continuation stream inherits the correlation metadata (see
     // AgentSession.inheritOpenWorkspaceTurnMetadata); its terminal stream-end
@@ -23908,7 +23913,7 @@ describe("TaskService", () => {
   });
 
   test("nested agent progress preserves workspace-turn correlation", async () => {
-    const hasPendingWorkspaceTurnContinuation = mock(
+    const claimWorkspaceTurnContinuation = mock(
       (
         workspaceId: string,
         metadata: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
@@ -23918,7 +23923,7 @@ describe("TaskService", () => {
         metadata.turnId === "turn"
     );
     const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      hasPendingWorkspaceTurnContinuation,
+      claimWorkspaceTurnContinuation,
     });
     const correlation = workspaceTurnMuxMetadata(parentId);
 

@@ -317,8 +317,7 @@ describe("WorkspaceTurnManager", () => {
       isStreaming?: ReturnType<typeof mock>;
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
-      hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
-      hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
+      claimWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;

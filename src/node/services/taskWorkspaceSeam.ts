@@ -402,10 +402,10 @@ export interface TurnAdmissionHost {
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   hasPendingAutoRetry(workspaceId: string): boolean;
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
-  hasPendingWorkspaceTurnContinuation(
+  claimWorkspaceTurnContinuation(
     workspaceId: string,
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
   ): boolean;
   hasQueuedWorkspaceTurn(workspaceId: string, handleId: string): boolean;
   removeQueuedWorkspaceTurn(

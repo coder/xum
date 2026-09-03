@@ -367,6 +367,8 @@ function getWorkspaceTurnMuxMetadata(muxMetadata: unknown): WorkspaceTurnMuxMeta
 
 interface StrandedTurnResume {
   options: SendMessageOptions;
+  /** Assistant message id of the stream the cut ended (claimWorkspaceTurnContinuation). */
+  cutMessageId: string;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
@@ -385,6 +387,7 @@ interface StrandedTurnResume {
 function buildStrandedTurnResume(context: {
   /** Model that reached the cut: a configured fallback may differ from the requested one. */
   modelString: string;
+  cutMessageId: string;
   options?: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
@@ -414,6 +417,7 @@ function buildStrandedTurnResume(context: {
       muxMetadata:
         context.workspaceTurnMetadata ?? getWorkspaceTurnMuxMetadata(context.options?.muxMetadata),
     },
+    cutMessageId: context.cutMessageId,
     ...(context.agentInitiated != null ? { agentInitiated: context.agentInitiated } : {}),
     ...(context.goalKind != null ? { goalKind: context.goalKind } : {}),
     ...(context.goalId != null ? { goalId: context.goalId } : {}),
@@ -861,6 +865,8 @@ export class AgentSession {
 
   /** Tracks the user message id that initiated the currently active stream (for retry guards). */
   private activeStreamUserMessageId?: string;
+  /** Assistant message id of the active stream, from its stream-start event. */
+  private activeStreamMessageId?: string;
 
   /** Track user message ids that already retried without post-compaction injection. */
   private readonly postCompactionRetryAttempts = new Set<string>();
@@ -5374,10 +5380,11 @@ export class AgentSession {
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
       onQueuedMessageStop: ({ modelString: stoppedModelString }) => {
-        if (this.activeStreamContext != null) {
+        if (this.activeStreamContext != null && this.activeStreamMessageId != null) {
           this.strandedTurnResume = buildStrandedTurnResume({
             ...this.activeStreamContext,
             modelString: stoppedModelString,
+            cutMessageId: this.activeStreamMessageId,
             thinkingLevelAtCut:
               activeTurnThinkingOverride?.pending ?? activeTurnThinkingOverride?.applied,
           });
@@ -5881,6 +5888,7 @@ export class AgentSession {
     this.activeToolCallIds.clear();
     this.activeStreamContext = undefined;
     this.activeStreamUserMessageId = undefined;
+    this.activeStreamMessageId = undefined;
     this.activeStreamStartedAtMs = undefined;
     this.activeStreamHadPostCompactionInjection = false;
     this.activeStreamHadAnyDelta = false;
@@ -5965,6 +5973,7 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
+        this.activeStreamMessageId = payload.messageId;
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
         // setGoal deferral meaningful again — clear the goal service's settled
@@ -6219,7 +6228,8 @@ export class AgentSession {
       const dispatchedQueuedMessage = this.dispatchQueuedProviderToolEndMessageAfterAbort(
         isQueuedProviderToolEndAbort && this.queuedProviderToolEndAbortInFlight,
         abortedStreamContext,
-        payload.metadata?.model
+        payload.metadata?.model,
+        payload.messageId
       );
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
@@ -6925,13 +6935,12 @@ export class AgentSession {
    * Whether a bash-monitor-wake continuation is pending dispatch: the next
    * queued entry is a wake, or a dequeued wake is mid-dispatch (dequeue →
    * stream start). Wake sends are the only input that inherits an open
-   * delegated workspace turn's correlation, so TaskService uses this — not
-   * generic queued/preparing state — to decide whether a correlated
-   * "tool-calls" queue cut will be continued rather than superseded. Once the
-   * wake's stream starts, TaskService matches the active stream's inherited
-   * correlation instead (see hasSameTurnWakeContinuation).
+   * delegated workspace turn's correlation, so claimWorkspaceTurnContinuation
+   * treats one as the turn's continuation rather than a superseding entry. Once
+   * the wake's stream starts, the owner matches the active stream's inherited
+   * correlation instead.
    */
-  hasPendingBashMonitorWakeContinuation(): boolean {
+  private hasPendingBashMonitorWakeContinuation(): boolean {
     if (this.messageQueue.isNextEntryBashMonitorWake()) {
       return true;
     }
@@ -6940,10 +6949,16 @@ export class AgentSession {
   }
 
   /**
-   * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
+   * The delegated turn owner's settlement decision for a correlated "tool-calls" stream-end:
+   * true when a continuation of that exact turn is pending (the owner defers), false when the
+   * cut superseded it (the owner settles the turn now). A false answer binds the owed
+   * continuation: the marker for that cut is voided here, so the turn cannot resume as orphaned
+   * work no matter how the superseding entry later leaves the queue. The owner reads under its
+   * own event lock, so this is the only point where its view and the marker are the same.
    */
-  hasPendingWorkspaceTurnContinuation(
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  claimWorkspaceTurnContinuation(
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
   ): boolean {
     if (hasSameWorkspaceTurnCorrelation(this.preparingWorkspaceTurnMetadata, metadata)) {
       return true;
@@ -6969,17 +6984,40 @@ export class AgentSession {
       return true;
     }
 
-    // A stop owed a continuation with nothing else queued to take the turn: the stranded
-    // resume will carry this correlation, so the owner must not settle the turn at the cut.
-    // A queued or dispatching entry that failed the checks above supersedes it instead.
-    return (
-      this.messageQueue.isEmpty() &&
-      !this.dispatchingQueuedEntry &&
-      hasSameWorkspaceTurnCorrelation(
-        getWorkspaceTurnMuxMetadata(this.owedStrandedTurnResume()?.options.muxMetadata),
+    // A wake send inherits the open delegated turn's correlation from history, so a wake at
+    // the queue head continues the turn even though the entry carries no correlation itself.
+    if (this.hasPendingBashMonitorWakeContinuation()) {
+      return true;
+    }
+
+    const owed = this.strandedTurnResume;
+    if (
+      owed == null ||
+      !hasSameWorkspaceTurnCorrelation(
+        getWorkspaceTurnMuxMetadata(owed.options.muxMetadata),
         metadata
       )
-    );
+    ) {
+      return false;
+    }
+    // A marker from a later cut of this turn proves a continuation already ran after the
+    // stream-end being settled (the owner is processing an older event): defer, and leave the
+    // newer cut's continuation to its own stream-end.
+    if (owed.cutMessageId !== streamEndMessageId) {
+      return true;
+    }
+    // Past the retry cap the marker is no longer advertised; the sweep forfeits it.
+    if (this.owedStrandedTurnResume() == null) {
+      return false;
+    }
+    // Nothing else queued to take the turn: the stranded resume will carry this correlation.
+    if (this.messageQueue.isEmpty() && !this.dispatchingQueuedEntry) {
+      return true;
+    }
+    // A queued or dispatching entry that failed the checks above supersedes the turn; the
+    // owner settles it on this answer, so the continuation must not outlive that entry.
+    this.withdrawStrandedTurnResume();
+    return false;
   }
 
   /**
@@ -6996,7 +7034,7 @@ export class AgentSession {
   /**
    * The continuation is given up with no successor stream (sweep cap or goal refusal, context
    * discard, session disposal). A delegated turn's owner may have deferred its stream-end on the
-   * strength of this marker (hasPendingWorkspaceTurnContinuation), and no later stream-end will
+   * strength of this marker (claimWorkspaceTurnContinuation), and no later stream-end will
    * arrive for it, so the owner settles that turn here.
    */
   private forfeitStrandedTurnResume(reason: string): void {
@@ -7098,7 +7136,8 @@ export class AgentSession {
   private dispatchQueuedProviderToolEndMessageAfterAbort(
     isQueuedProviderToolEndAbort: boolean,
     abortedStreamContext: AgentSession["activeStreamContext"],
-    abortedModelString: string | undefined
+    abortedModelString: string | undefined,
+    abortedMessageId: string
   ): boolean {
     this.queuedProviderToolEndAbortInFlight = false;
     if (!isQueuedProviderToolEndAbort || this.deferQueuedFlushUntilAfterEdit) {
@@ -7111,6 +7150,7 @@ export class AgentSession {
       this.strandedTurnResume = buildStrandedTurnResume({
         ...abortedStreamContext,
         modelString: abortedModelString ?? abortedStreamContext.modelString,
+        cutMessageId: abortedMessageId,
         thinkingLevelAtCut:
           this.activeTurnThinkingOverride?.pending ?? this.activeTurnThinkingOverride?.applied,
       });
@@ -7370,23 +7410,6 @@ export class AgentSession {
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
 
     if (!this.messageQueue.isEmpty()) {
-      // A queued entry that is not the stranded delegated turn's own continuation takes the
-      // turn from it: the owner settles that turn at the cut (hasPendingWorkspaceTurnContinuation
-      // reports no continuation), so it must not resume later as orphaned work even if this
-      // entry never starts a stream.
-      const owedCorrelation = getWorkspaceTurnMuxMetadata(
-        this.strandedTurnResume?.options.muxMetadata
-      );
-      if (
-        owedCorrelation != null &&
-        !this.messageQueue.hasNextWorkspaceTurnContinuation(
-          owedCorrelation.taskHandleId,
-          owedCorrelation.ownerWorkspaceId,
-          owedCorrelation.turnId
-        )
-      ) {
-        this.strandedTurnResume = undefined;
-      }
       // Entries dispatch one at a time (FIFO): special sends (compaction, agent
       // skills, workspace-turn follow-ups) own their turn, and anything queued
       // behind them dispatches on a later drain instead of batching into them.

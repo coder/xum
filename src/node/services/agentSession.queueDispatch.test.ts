@@ -114,12 +114,12 @@ async function createStreamingTurnHarness(
     createMuxMessage("assistant-1", "assistant", "ran the checks", { timestamp: Date.now() })
   );
 
-  /** Queue a synthetic wake whose cancel signal the caller controls. */
-  const queueCancelableWake = (): AbortController => {
+  /** Queue a synthetic tool-end entry whose cancel signal the caller controls. */
+  const queueCancelable = (message: string, muxMetadata?: MuxMessageMetadata): AbortController => {
     const controller = new AbortController();
     harness.session.queueMessage(
-      "Background monitor wake",
-      { model: TEST_MODEL, agentId: "exec" },
+      message,
+      { model: TEST_MODEL, agentId: "exec", muxMetadata },
       {
         synthetic: true,
         agentInitiated: true,
@@ -130,6 +130,10 @@ async function createStreamingTurnHarness(
     );
     return controller;
   };
+  // A real wake is typed so a delegated turn's owner recognizes it as the turn's continuation.
+  const queueCancelableWake = (): AbortController =>
+    queueCancelable("Background monitor wake", { type: "bash-monitor-wake", records: [] });
+  const queueCancelableUnrelatedEntry = (): AbortController => queueCancelable("peer follow-up");
   const latestRequest = (): StreamMessageOptions => {
     const call = streamMessage.mock.calls[streamMessage.mock.calls.length - 1];
     if (call == null) {
@@ -138,7 +142,13 @@ async function createStreamingTurnHarness(
     return call[0];
   };
 
-  return { ...harness, streamMessage, queueCancelableWake, latestRequest };
+  return {
+    ...harness,
+    streamMessage,
+    queueCancelableWake,
+    queueCancelableUnrelatedEntry,
+    latestRequest,
+  };
 }
 
 async function waitForCondition(condition: () => boolean, timeoutMs = 500): Promise<boolean> {
@@ -159,8 +169,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
         hasQueuedOrDispatchingEntry(
           continuationMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
         ): boolean;
-        hasPendingWorkspaceTurnContinuation(
-          continuationMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+        claimWorkspaceTurnContinuation(
+          continuationMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+          streamEndMessageId: string
         ): boolean;
       };
     } = {};
@@ -184,12 +195,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
           }) === true,
         uncorrelated: session?.hasQueuedOrDispatchingEntry() === true,
         pendingSameTurn:
-          session?.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION) === true,
+          session?.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1") ===
+          true,
         pendingDifferentTurn:
-          session?.hasPendingWorkspaceTurnContinuation({
-            ...WORKSPACE_TURN_CORRELATION,
-            turnId: "turn-different",
-          }) === true,
+          session?.claimWorkspaceTurnContinuation(
+            { ...WORKSPACE_TURN_CORRELATION, turnId: "turn-different" },
+            "assistant-1"
+          ) === true,
       };
       return Promise.resolve(Ok(createStartedTurnHandle()));
     });
@@ -1013,7 +1025,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       // Nothing owed yet: a tool-calls cut with an empty queue is a plain interruption.
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
 
       const wake = harness.queueCancelableWake();
       harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
@@ -1023,19 +1037,23 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       // The owner's settlement runs synchronously with stream-end; it must already see the
       // continuation, and only for this correlation.
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
       expect(
-        session.hasPendingWorkspaceTurnContinuation({
-          ...WORKSPACE_TURN_CORRELATION,
-          turnId: "another-turn",
-        })
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+      expect(
+        session.claimWorkspaceTurnContinuation(
+          { ...WORKSPACE_TURN_CORRELATION, turnId: "another-turn" },
+          "assistant-1"
+        )
       ).toBe(false);
 
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
       expect(harness.latestRequest().muxMetadata).toEqual(WORKSPACE_TURN_CORRELATION);
       // Consumed by the resumed stream.
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
     } finally {
       session.dispose();
       await cleanup();
@@ -1052,7 +1070,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
       session.queueMessage("user follow-up", { model: TEST_MODEL, agentId: "exec" });
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
     } finally {
       session.dispose();
       await cleanup();
@@ -1102,9 +1122,14 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const wake = harness.queueCancelableWake();
       harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
       wake.abort("monitor consumed");
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      // Owed whether the owner asks while the wake is still queued or after it is cleared.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
       session.clearQueue("monitor consumed");
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
 
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
@@ -1472,7 +1497,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
     harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
     harness.queueCancelableWake().abort("monitor consumed");
     session.clearQueue("monitor consumed");
-    expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
+    expect(session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")).toBe(
+      true
+    );
     aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
     expect(await waitForCondition(() => !session.isBusy())).toBe(true);
     return { ...harness, settleForfeited };
@@ -1489,11 +1516,15 @@ describe("AgentSession queued message tool-call dispatch", () => {
       // advertised and the owner is told to settle the turn it deferred at the cut.
       session.drainQueuedMessagesIfIdle();
       expect(await waitForCondition(() => !session.isBusy())).toBe(true);
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
       expect(settleForfeited).not.toHaveBeenCalled();
       session.drainQueuedMessagesIfIdle();
       expect(await waitForCondition(() => !session.isBusy())).toBe(true);
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
       session.drainQueuedMessagesIfIdle();
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(streamMessage).toHaveBeenCalledTimes(1);
@@ -1517,7 +1548,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(discarded.success).toBe(true);
       expect(settleForfeited).toHaveBeenCalledTimes(1);
       expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
       session.drainQueuedMessagesIfIdle();
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(streamMessage).toHaveBeenCalledTimes(1);
@@ -1671,18 +1704,132 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup, aiEmitter, streamMessage } = harness;
 
     try {
-      const wake = harness.queueCancelableWake();
+      const entry = harness.queueCancelableUnrelatedEntry();
       harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
-      // The queued wake is not this turn's continuation: the owner settles the delegated turn.
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      // The queued entry is not this turn's continuation: the owner settles the delegated turn.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
-      // The wake is withdrawn after dequeue, before acceptance; the settled turn must stay cut.
-      wake.abort("monitor consumed");
+      // The entry is withdrawn after dequeue, before acceptance; the settled turn must stay cut.
+      entry.abort("superseded");
 
       expect(await waitForCondition(() => !session.isBusy())).toBe(true);
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(streamMessage).toHaveBeenCalledTimes(1);
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("an unrelated entry cleared before dispatch does not revive the superseded delegated turn", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-orphan-cleared";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      harness.queueCancelableUnrelatedEntry();
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      // The owner settles the turn on this answer. The entry then leaves the queue without ever
+      // dispatching (user clears the queue), which must not bring the settled turn back.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
+      session.clearQueue("queue cleared by user");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      // With the queue empty, only a surviving marker could answer true here.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("an unrelated entry removed before the owner's claim leaves the continuation owed", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-removed-before-claim";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      harness.queueCancelableUnrelatedEntry();
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      session.clearQueue("queue cleared by user");
+      // Nothing supersedes the turn by the time the owner asks: it defers, and the resume runs.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(harness.latestRequest().muxMetadata).toEqual(WORKSPACE_TURN_CORRELATION);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a delegated turn cut by a wake withdrawn after dequeue resumes", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-wake-after-dequeue";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      const wake = harness.queueCancelableWake();
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      // A wake inherits the turn's correlation when it sends, so the owner defers on it even
+      // though the queued entry carries none; the continuation stays owed behind it.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      // Withdrawn after dequeue, before acceptance: the deferred turn must resume, not hang.
+      wake.abort("monitor consumed");
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(harness.latestRequest().muxMetadata).toEqual(WORKSPACE_TURN_CORRELATION);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("an older stream-end's claim does not void a newer cut's continuation", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-stale-claim";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      harness.queueCancelableUnrelatedEntry();
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      // The owner is still settling an earlier stream of this turn: that a later cut owes a
+      // continuation proves the turn went on, so it defers without touching the marker.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-0")
+      ).toBe(true);
+      session.clearQueue("queue cleared by user");
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
     } finally {
       session.dispose();
       await cleanup();
@@ -2206,13 +2353,17 @@ describe("AgentSession queued message tool-call dispatch", () => {
       controller.abort("monitor consumed");
       session.clearQueue("monitor consumed");
       // The owner defers this stream-end on the strength of the advertised continuation.
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
       // The Pause refuses the resume: no successor stream will ever settle that deferral.
       expect(await waitForCondition(() => settleForfeited.mock.calls.length === 1)).toBe(true);
       expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
       expect(streamMessage).toHaveBeenCalledTimes(1);
     } finally {
       session.dispose();

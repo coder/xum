@@ -11847,24 +11847,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
-  /**
-   * Whether a bash-monitor-wake continuation is queued next or mid-dispatch.
-   * See AgentSession.hasPendingBashMonitorWakeContinuation for semantics.
-   */
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean {
-    const session = this.sessions.get(workspaceId.trim());
-    return session?.hasPendingBashMonitorWakeContinuation() ?? false;
-  }
-
-  /**
-   * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
-   */
-  hasPendingWorkspaceTurnContinuation(
+  /** See AgentSession.claimWorkspaceTurnContinuation for semantics. */
+  claimWorkspaceTurnContinuation(
     workspaceId: string,
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
   ): boolean {
     const session = this.sessions.get(workspaceId.trim());
-    return session?.hasPendingWorkspaceTurnContinuation(metadata) ?? false;
+    return session?.claimWorkspaceTurnContinuation(metadata, streamEndMessageId) ?? false;
   }
 
   /**
