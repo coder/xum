@@ -1924,6 +1924,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const persist = async (): Promise<boolean> => {
       if (payload.reason === "canceled") {
         if (createdAt == null) return false;
+        await this.bashMonitorWakeReconciler.discardProcess(
+          workspaceId,
+          payload.processId,
+          createdAt
+        );
         await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
         return true;
       }
@@ -2556,6 +2561,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
         return "deferred";
       }
+      // Re-checked after the awaits above: a monitor canceled meanwhile (discardProcess) must
+      // not have its captured stdout submitted as an agent-initiated turn.
+      if (!dispatch.isCurrent()) return "deferred";
 
       let accepted = false;
       const sendResult = await this.sendMessage(

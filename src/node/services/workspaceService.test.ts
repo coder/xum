@@ -256,6 +256,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
+    const discardProcess = mock(() => Promise.resolve());
     const upsert = mock(() => Promise.resolve());
     const remove = mock(() => Promise.resolve());
     const recordTerminal = mock(() => Promise.resolve());
@@ -263,6 +264,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: {
         scheduleReconcile: typeof scheduleReconcile;
+        discardProcess: typeof discardProcess;
       };
       bashMonitorRegistryStore: {
         upsert: typeof upsert;
@@ -272,7 +274,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
       internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
       const armed = {
         processId: "proc",
@@ -296,6 +298,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       }
 
       expect(upsert).toHaveBeenCalledWith(armed);
+      // Cancellation retires any wake already handed out for this process before the
+      // registry row goes, so its captured output is never sent as a turn.
+      expect(discardProcess).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
@@ -510,6 +515,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: {
         scheduleReconcile: typeof scheduleReconcile;
+        discardProcess(workspaceId: string, processId: string, createdAt: string): Promise<void>;
       };
       bashMonitorRegistryStore: {
         upsert: typeof upsert;
@@ -520,7 +526,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
+      internal.bashMonitorWakeReconciler = {
+        scheduleReconcile,
+        discardProcess: () => Promise.resolve(),
+      };
       internal.bashMonitorRegistryStore = {
         upsert,
         remove,
@@ -926,6 +935,61 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(sentOptions?.queueDispatchMode).toBeUndefined();
       expect(sentOptions?.muxMetadata).toEqual({ type: "bash-monitor-wake", records: [] });
       expect(onAccepted).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a monitor canceled while send options resolve retires the wake before it is sent", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "canceled-mid-dispatch-wake-owner";
+    await config.addWorkspace("/tmp/canceled-mid-dispatch-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "canceled-mid-dispatch-project",
+      projectPath: "/tmp/canceled-mid-dispatch-project",
+      runtimeConfig: { type: "local" },
+    });
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
+    let current = true;
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    try {
+      internal.aiService = { isStreaming: () => false };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => false;
+      // The operator cancels the monitor (discardProcess) while the continuation options
+      // are being resolved: the wake passed the entry check but must not reach sendMessage.
+      internal.getDelegatedTurnContinuationSendOptions = () => {
+        current = false;
+        return Promise.resolve({});
+      };
+      internal.sendMessage = sendMessage;
+
+      const outcome = await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => current,
+        onAccepted: () => Promise.resolve(),
+        onDeferred: () => Promise.resolve(),
+      });
+
+      expect(outcome).toBe("deferred");
+      expect(sendMessage).not.toHaveBeenCalled();
     } finally {
       await cleanup();
     }

@@ -176,6 +176,30 @@ describe("BashMonitorWakeReconciler", () => {
     expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
   });
 
+  test("canceling a monitor retires a wake carrying its output and re-derives the rest", async () => {
+    live = [liveSnapshot()];
+    rows = [registryRecord()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].isCurrent()).toBe(true);
+
+    // The wake combines the live match and the dead registry row. Canceling the live
+    // monitor must retire the whole handed-out wake (its prompt embeds that output)...
+    await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
+    expect(dispatches[0].isCurrent()).toBe(false);
+
+    // ...and the unrelated dead-process signal comes back on its own in a fresh wake.
+    live = [];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].prompt).not.toContain("READY");
+    expect(dispatches[1].isCurrent()).toBe(true);
+
+    // Canceling an unrelated process leaves the current wake alone.
+    await reconciler.discardProcess(OWNER, "someone-else", CREATED_AT);
+    expect(dispatches[1].isCurrent()).toBe(true);
+  });
+
   test("disposal lowers the published level and retires the in-flight wake", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

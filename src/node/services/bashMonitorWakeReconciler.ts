@@ -446,6 +446,30 @@ export class BashMonitorWakeReconciler {
     return snapshot.pendingWakeKinds.get(processId);
   }
 
+  /**
+   * The operator canceled a monitor: a wake already handed to the owner that carries this
+   * process's output must not be sent (its isCurrent() turns false). Its other signals, if
+   * any, re-derive on the next reconcile.
+   */
+  async discardProcess(
+    ownerWorkspaceId: string,
+    processId: string,
+    createdAt: string
+  ): Promise<void> {
+    await this.locks.withLock(ownerWorkspaceId, () => {
+      const state = this.states.get(ownerWorkspaceId);
+      if (
+        state?.dispatch?.signals.some(
+          (signal) => signal.processId === processId && signal.createdAt === createdAt
+        ) === true
+      ) {
+        state.dispatch = undefined;
+      }
+      return Promise.resolve();
+    });
+    this.scheduleReconcile(ownerWorkspaceId);
+  }
+
   async beginFullHistoryClear(ownerWorkspaceId: string): Promise<BashMonitorFullHistoryClearToken> {
     await this.consumeCurrent(ownerWorkspaceId);
     return { ownerWorkspaceId };
