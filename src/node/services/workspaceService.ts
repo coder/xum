@@ -4012,6 +4012,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      settleForfeitedWorkspaceTurnContinuation: async (metadata, reason) => {
+        await this.agentTaskIntegration?.settleWorkspaceTurnContinuationFailure(
+          workspaceId,
+          metadata,
+          "interrupted",
+          reason
+        );
+      },
     });
   }
 
@@ -11674,10 +11682,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; hardStop?: boolean }
+  ): Result<void> {
     try {
       const session = this.getOrCreateSession(workspaceId);
-      session.clearQueue(options?.cancelReason);
+      session.clearQueue(options?.cancelReason, { hardStop: options?.hardStop });
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);

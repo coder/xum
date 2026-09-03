@@ -638,7 +638,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   ): XumToolScope;
 }
 
-interface AgentSessionOptions {
+export interface AgentSessionOptions {
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
@@ -680,6 +680,15 @@ interface AgentSessionOptions {
    * to yield to a manual send that is still awaiting pricing/settings.
    */
   hasExternalSendPreflight?: () => boolean;
+  /**
+   * Settles a delegated workspace turn whose owner deferred its stream-end because this session
+   * advertised an owed continuation that is now forfeited without a successor stream (goal no
+   * longer admits it, resume retry cap): no later stream-end will arrive for that turn.
+   */
+  settleForfeitedWorkspaceTurnContinuation?: (
+    metadata: WorkspaceTurnMuxMetadata,
+    reason: string
+  ) => Promise<void>;
 }
 
 enum TurnPhase {
@@ -721,6 +730,7 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly settleForfeitedWorkspaceTurnContinuation?: AgentSessionOptions["settleForfeitedWorkspaceTurnContinuation"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -970,6 +980,7 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       hasExternalSendPreflight,
+      settleForfeitedWorkspaceTurnContinuation,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -998,6 +1009,7 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.settleForfeitedWorkspaceTurnContinuation = settleForfeitedWorkspaceTurnContinuation;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -5872,6 +5884,9 @@ export class AgentSession {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
     this.queuedProviderToolEndAbortInFlight = false;
+    // A stop decided for a queued message can still end as a stream error; the error path
+    // (auto-retry or a terminal error row) owns what happens next, not the stranded resume.
+    this.withdrawStrandedTurnResume();
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
@@ -6191,8 +6206,11 @@ export class AgentSession {
       }
       await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
+      // Re-read the in-flight flag: a hard stop that landed during the awaits above (synthetic
+      // system abort while COMPLETING, or a task hard stop clearing the queue) reset it and
+      // withdrew the marker, so the soft stop sampled at entry no longer owes a continuation.
       const dispatchedQueuedMessage = this.dispatchQueuedProviderToolEndMessageAfterAbort(
-        isQueuedProviderToolEndAbort,
+        isQueuedProviderToolEndAbort && this.queuedProviderToolEndAbortInFlight,
         abortedStreamContext,
         payload.metadata?.model
       );
@@ -6734,8 +6752,20 @@ export class AgentSession {
     return effectiveDispatchMode;
   }
 
-  clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
+  clearQueue(
+    cancelReason = "Queued message cleared before dispatch.",
+    options?: { hardStop?: boolean }
+  ): void {
     this.assertNotDisposed("clearQueue");
+    // A task hard stop (task_stop, interrupt cascade, workflow timeout) clears the queue and
+    // then stops the stream through StreamManager directly. That stop emits nothing when the
+    // stream has already completed or has not registered yet, so the queue clear is the only
+    // session-visible boundary at which the owed continuation and a pending provider-tool soft
+    // stop can be forfeited. A user clearing the queue keeps them: the cut turn still resumes.
+    if (options?.hardStop === true) {
+      this.queuedProviderToolEndAbortInFlight = false;
+      this.withdrawStrandedTurnResume();
+    }
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
@@ -6953,6 +6983,27 @@ export class AgentSession {
   }
 
   /**
+   * The sweep gives the continuation up with no successor stream. A delegated turn's owner may
+   * have deferred its stream-end on the strength of this marker (hasPendingWorkspaceTurnContinuation),
+   * and no later stream-end will arrive for it, so the owner settles that turn here.
+   */
+  private forfeitStrandedTurnResume(reason: string): void {
+    const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
+    this.strandedTurnResume = undefined;
+    if (correlation == null || this.settleForfeitedWorkspaceTurnContinuation == null) {
+      return;
+    }
+    void this.settleForfeitedWorkspaceTurnContinuation(correlation, reason).catch(
+      (error: unknown) => {
+        log.warn("Failed to settle forfeited workspace turn continuation", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    );
+  }
+
+  /**
    * Nothing is owed anymore (user Stop, superseding input, context discard): drop the marker and
    * cancel a resume still in its pre-stream window, which already copied the marker.
    */
@@ -7067,11 +7118,11 @@ export class AgentSession {
     const resume = this.owedStrandedTurnResume();
     if (resume == null) {
       if (this.strandedTurnResume != null) {
-        this.strandedTurnResume = undefined;
         log.warn("Leaving stranded turn idle: consecutive resume cap reached", {
           workspaceId: this.workspaceId,
           cap: MAX_CONSECUTIVE_STRANDED_TURN_RESUMES,
         });
+        this.forfeitStrandedTurnResume("Stranded turn resume gave up: retry cap reached.");
       }
       return;
     }
@@ -7119,11 +7170,11 @@ export class AgentSession {
         }
         if (result.data.goalRefused === true) {
           // A Pause or terminal transition landed while the goal turn ran: nothing is owed to it.
-          this.strandedTurnResume = undefined;
           log.info("Dropping stranded goal turn: goal no longer admits it", {
             workspaceId: this.workspaceId,
             goalKind: resume.goalKind,
           });
+          this.forfeitStrandedTurnResume("Stranded turn resume dropped: goal no longer admits it.");
           return false;
         }
         if (!result.data.started) {

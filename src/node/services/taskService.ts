@@ -5378,7 +5378,7 @@ export class TaskService implements AgentTaskIntegration {
             });
           }
 
-          const clearQueueResult = this.workspaceService.clearQueue(id);
+          const clearQueueResult = this.workspaceService.clearQueue(id, { hardStop: true });
           if (!clearQueueResult.success) {
             log.debug("stopDescendantAgentTask: clearQueue failed", {
               taskId: id,
@@ -5857,7 +5857,7 @@ export class TaskService implements AgentTaskIntegration {
             // Best-effort: clear queue first. AgentSession stream-end cleanup auto-flushes
             // queued messages, so descendants must not keep pending input after a hard interrupt.
             try {
-              const clearQueueResult = this.workspaceService.clearQueue(id);
+              const clearQueueResult = this.workspaceService.clearQueue(id, { hardStop: true });
               if (!clearQueueResult.success) {
                 log.debug("terminateAllDescendantAgentTasks: clearQueue failed", {
                   taskId: id,
@@ -8207,7 +8207,7 @@ export class TaskService implements AgentTaskIntegration {
         return;
       }
       try {
-        const clearQueueResult = this.workspaceService.clearQueue(taskId);
+        const clearQueueResult = this.workspaceService.clearQueue(taskId, { hardStop: true });
         if (!clearQueueResult.success) {
           log.debug("failAgentTaskForHardTimeout: clearQueue failed", {
             taskId,
@@ -9562,6 +9562,19 @@ export class TaskService implements AgentTaskIntegration {
     return blocking;
   }
 
+  async settleWorkspaceTurnContinuationFailure(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    status: "interrupted" | "error",
+    error: string
+  ): Promise<void> {
+    await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+      workspaceId,
+      muxMetadata,
+      status,
+      error
+    );
+  }
   async noteWorkspaceUnarchived(workspaceId: string): Promise<void> {
     assert(workspaceId.length > 0, "noteWorkspaceUnarchived requires workspaceId");
     // Archived owners park workflow terminal wakes unsettled (the drain drops the in-memory
