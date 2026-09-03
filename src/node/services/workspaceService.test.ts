@@ -238,6 +238,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
+      setMessageQueued: mock(() => undefined),
     }) as unknown as BackgroundProcessManager;
     const service = createWorkspaceServiceForTest({
       config,
@@ -838,6 +839,100 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(queuedMode).toBe("tool-end");
       expect(queuedCancelState).toEqual({ canceledBeforeAcceptance: false });
       expect(afterIdle).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("withdrawing a queued monitor wake removes it and releases its dedupe key", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "withdrawn-wake-owner";
+    await config.addWorkspace("/tmp/withdrawn-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "withdrawn-wake-project",
+      projectPath: "/tmp/withdrawn-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    const session = service.getOrCreateSession(workspaceId);
+    const queuedModes: Array<"tool-end" | "turn-end" | null> = [];
+    // The real sendMessage queues behind a busy session; mirror only that branch.
+    const sendMessage = mock(
+      (
+        _workspaceId: string,
+        prompt: string,
+        options: SendMessageOptions,
+        internal?: {
+          synthetic?: boolean;
+          agentInitiated?: boolean;
+          queueDedupeKey?: string;
+          removableQueueDedupeKey?: boolean;
+          cancelState?: { canceledBeforeAcceptance: boolean };
+          cancelSignal?: AbortSignal;
+          onCanceled?: (reason: string) => Promise<void> | void;
+        }
+      ) => {
+        queuedModes.push(
+          session.queueMessage(prompt, options, {
+            synthetic: internal?.synthetic,
+            agentInitiated: internal?.agentInitiated,
+            dedupeKey: internal?.queueDedupeKey,
+            removableDedupeKey: internal?.removableQueueDedupeKey,
+            cancelState: internal?.cancelState,
+            cancelSignal: internal?.cancelSignal,
+            onCanceled: internal?.onCanceled,
+          })
+        );
+        return Promise.resolve(Ok(undefined));
+      }
+    );
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        dedupeKey: string;
+        cancelSignal: AbortSignal;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    const dedupeKey = "bash-monitor-wake:" + workspaceId + ":dispatch-1";
+    const onDeferred = mock(() => Promise.resolve());
+    const dispatch = (cancelSignal: AbortSignal) =>
+      internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        dedupeKey,
+        cancelSignal,
+        onAccepted: () => Promise.resolve(),
+        onDeferred,
+      });
+    try {
+      internal.aiService = { isStreaming: () => true };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => true;
+      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
+      internal.sendMessage = sendMessage;
+
+      const controller = new AbortController();
+      expect(await dispatch(controller.signal)).toBe("in-flight");
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+
+      controller.abort("output already shown");
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, dedupeKey)).toEqual(Ok(0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(onDeferred).toHaveBeenCalledTimes(1);
+
+      expect(await dispatch(new AbortController().signal)).toBe("in-flight");
+      expect(queuedModes).toEqual(["tool-end", "tool-end"]);
     } finally {
       await cleanup();
     }
