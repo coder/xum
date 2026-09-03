@@ -1206,6 +1206,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleArchiveWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
+      // The keyboard shortcut bypasses the row's disabled state, so guard here as well.
+      if (archivingWorkspaceIds.has(workspaceId)) return;
       const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
       const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
       const isStreaming = hasActiveStream(workspaceId);
@@ -1238,6 +1240,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       await performArchiveWorkspace(workspaceId, buttonElement);
     },
     [
+      archivingWorkspaceIds,
       hasActiveStream,
       performArchiveWorkspace,
       preflightArchiveWorkspace,

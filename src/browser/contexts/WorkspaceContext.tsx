@@ -555,6 +555,38 @@ interface WorkspaceProviderProps {
 }
 
 /**
+ * Keeps `workspaceId` in the archiving set while `run` is outstanding. Requests for one
+ * workspace can overlap (the sidebar shortcut fires while a header-started archive is still
+ * in flight), so the id is reference-counted and only removed when the last one settles.
+ */
+async function trackArchivingRequest<T>(
+  counts: Map<string, number>,
+  setArchivingWorkspaceIds: React.Dispatch<React.SetStateAction<ReadonlySet<string>>>,
+  workspaceId: string,
+  run: () => Promise<T>
+): Promise<T> {
+  counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
+  setArchivingWorkspaceIds((prev) =>
+    prev.has(workspaceId) ? prev : new Set(prev).add(workspaceId)
+  );
+  try {
+    return await run();
+  } finally {
+    const remaining = (counts.get(workspaceId) ?? 1) - 1;
+    if (remaining > 0) {
+      counts.set(workspaceId, remaining);
+    } else {
+      counts.delete(workspaceId);
+      setArchivingWorkspaceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(workspaceId);
+        return next;
+      });
+    }
+  }
+}
+
+/**
  * Startup auto-navigation should yield once the user already has meaningful route state.
  * Desktop launch-project is the exception: its first pass may override a restored
  * file:// route when the backend reports explicit startup intent.
@@ -1647,22 +1679,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
     () => new Set()
   );
-
-  const withArchivingIndicator = useCallback(
-    async <T,>(workspaceId: string, run: () => Promise<T>): Promise<T> => {
-      setArchivingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
-      try {
-        return await run();
-      } finally {
-        setArchivingWorkspaceIds((prev) => {
-          const next = new Set(prev);
-          next.delete(workspaceId);
-          return next;
-        });
-      }
-    },
-    []
-  );
+  const archivingRequestCounts = useRef(new Map<string, number>());
 
   const preflightArchiveWorkspace = useCallback(
     async (
@@ -1671,8 +1688,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await withArchivingIndicator(workspaceId, () =>
-          api.workspace.preflightArchive({ workspaceId })
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
+          workspaceId,
+          () => api.workspace.preflightArchive({ workspaceId })
         );
         if (result.success) {
           return { success: true, data: result.data };
@@ -1682,7 +1702,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api, withArchivingIndicator]
+    [api]
   );
 
   const archiveWorkspace = useCallback(
@@ -1693,11 +1713,15 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await withArchivingIndicator(workspaceId, () =>
-          api.workspace.archive({
-            workspaceId,
-            acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
-          })
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
+          workspaceId,
+          () =>
+            api.workspace.archive({
+              workspaceId,
+              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+            })
         );
         if (result.success) {
           // Older mocks/story fixtures may still return `{ success: true }` without the newer
@@ -1739,7 +1763,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api, withArchivingIndicator]
+    [api]
   );
 
   const unarchiveWorkspace = useCallback(

@@ -919,6 +919,51 @@ describe("WorkspaceContext", () => {
       });
       expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
     });
+
+    test("keeps the workspace marked until the last overlapping request settles", async () => {
+      const workspaceId = "ws-archive-overlap";
+      let settleArchive: (() => void) | undefined;
+      let settlePreflight: (() => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((resolve) => {
+              settlePreflight = () =>
+                resolve({ success: true as const, data: { kind: "ready" as const } });
+            }),
+        },
+      });
+
+      const ctx = await setup();
+
+      // Header-started archive in flight, then the sidebar shortcut fires a preflight.
+      let archivePromise: Promise<unknown> | undefined;
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      // The first request to finish must not clear the indicator while the other is running.
+      await act(async () => {
+        settlePreflight?.();
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+    });
   });
 
   test("treats legacy archive success without data as archived", async () => {
