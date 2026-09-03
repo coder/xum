@@ -2811,6 +2811,45 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     }
   });
 
+  test("refuses registration when the caller's admission probe turns stale during setup", async () => {
+    const workspaceId = "test-workspace-refuse-before-create";
+
+    let createCalled = false;
+    let streamStartEmitted = false;
+    let refused = false;
+
+    onTurnEngineEvent(streamManager, "stream-start", () => {
+      streamStartEmitted = true;
+    });
+    Reflect.set(streamManager, "createTempDirForStream", (): Promise<string> => {
+      // A goal Pause lands during startup I/O: nothing aborts the signal, only the probe knows.
+      refused = true;
+      return Promise.resolve("/tmp/mock-stream-temp");
+    });
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => undefined);
+    Reflect.set(streamManager, "createStreamAtomically", (): never => {
+      createCalled = true;
+      throw new Error("createStreamAtomically should not be called");
+    });
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-refuse",
+        model: createTestLanguageModel(),
+        runtime,
+        refuseStreamStart: () => refused,
+        tools: {},
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(createCalled).toBe(false);
+    expect(streamStartEmitted).toBe(false);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
   test("should honor abortSignal before atomic stream creation", async () => {
     const workspaceId = "test-workspace-abort-before-create";
 

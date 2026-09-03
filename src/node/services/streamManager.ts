@@ -265,6 +265,8 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   runtime: Runtime;
   messageId: string;
   abortSignal?: AbortSignal;
+  /** Startup-only admission probe; a true answer at registration time refuses the stream like an abort. */
+  refuseStreamStart?: () => boolean;
   initialMetadata?: Partial<MuxMetadata>;
   providedStreamToken?: StreamToken;
   workspaceName?: string;
@@ -4771,6 +4773,7 @@ export class StreamManager {
       runtime,
       messageId,
       abortSignal,
+      refuseStreamStart,
       providedStreamToken,
       providedRuntimeTempDir,
       onStreamConstructed,
@@ -4862,7 +4865,9 @@ export class StreamManager {
           )
         );
 
-        if (streamAbortController.signal.aborted) {
+        // The caller's pull-based admission probe (goal state) has no signal to abort; this is
+        // its last read before the stream becomes real.
+        if (streamAbortController.signal.aborted || refuseStreamStart?.() === true) {
           return settleStartupAbort();
         }
 

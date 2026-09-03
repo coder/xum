@@ -275,6 +275,11 @@ export interface StreamMessageOptions {
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   /** Fires when the model loop stops solely on behalf of a queued tool-end message. */
   onQueuedMessageStop?: (stop: { modelString: string }) => void;
+  /**
+   * Pull-based startup refusal (a goal admission probe with no push into abortSignal), rechecked
+   * by StreamManager right before the stream registers.
+   */
+  refuseStreamStart?: () => boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -740,6 +745,7 @@ export class TurnRequestBuilder {
       disableWorkspaceAgents,
       hasQueuedMessages,
       onQueuedMessageStop,
+      refuseStreamStart,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -2861,6 +2867,7 @@ export class TurnRequestBuilder {
       providedStreamToken: streamToken,
       hasQueuedMessages,
       onQueuedMessageStop,
+      refuseStreamStart,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

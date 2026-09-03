@@ -1718,6 +1718,191 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  /**
+   * Strand a turn whose resume parks on its first pre-stream I/O (commitPartial) until the
+   * caller releases it, so an event can land while the resume is PREPARING with no stream
+   * registered for StreamManager to abort.
+   */
+  async function strandWithResumeParkedInPreStreamIo(workspaceId: string) {
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendInternal: { synthetic: true, agentInitiated: true },
+    });
+    const { historyService } = harness;
+    const originalCommitPartial = historyService.commitPartial.bind(historyService);
+    let releaseIo: () => void = () => undefined;
+    let ioReached = false;
+    const commitPartial = spyOn(historyService, "commitPartial").mockImplementation(
+      async (...args) => {
+        ioReached = true;
+        await new Promise<void>((resolve) => {
+          releaseIo = resolve;
+        });
+        return originalCommitPartial(...args);
+      }
+    );
+    const wake = harness.queueCancelableWake();
+    harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+    wake.abort("monitor consumed");
+    harness.aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+    expect(await waitForCondition(() => ioReached)).toBe(true);
+    expect(harness.session.isBusy()).toBe(true);
+    return {
+      ...harness,
+      releaseIo: () => releaseIo(),
+      restore: () => commitPartial.mockRestore(),
+    };
+  }
+
+  test("a goal transition during the resume's pre-stream I/O drops the resume", async () => {
+    const workspaceId = "queue-dispatch-stranded-goal-stale-in-io";
+    let stale = false;
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      buildGoalRedispatchAdmission: mock(() =>
+        Promise.resolve({ admissible: true as const, admissionStale: () => stale })
+      ),
+      recordStreamAccounting: mock(() => Promise.resolve()),
+      applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+      requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+      recordStreamStarted: mock(() => Promise.resolve()),
+      syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+      completeGoalFromSilentContinuation: mock(() => Promise.resolve(false)),
+    } as unknown as WorkspaceGoalService;
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      return Promise.resolve(Ok(createStartedTurnHandle("assistant-1")));
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+      workspaceGoalService,
+    });
+    const originalCommitPartial = historyService.commitPartial.bind(historyService);
+    let armed = false;
+    const commitPartial = spyOn(historyService, "commitPartial").mockImplementation((...args) => {
+      // The Pause lands after the resume's admission read, inside the stream's own pre-start I/O.
+      if (armed) {
+        stale = true;
+      }
+      return originalCommitPartial(...args);
+    });
+
+    try {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-0", "user", "keep going", { timestamp: Date.now() })
+      );
+      const resumed = await session.resumeStream(
+        { model: TEST_MODEL, agentId: "exec" },
+        { agentInitiated: true, goalKind: GOAL_CONTINUATION_KIND, goalId: "goal-1" }
+      );
+      expect(resumed.success).toBe(true);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-1", "assistant", "ran the checks", { timestamp: Date.now() })
+      );
+
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelState: { canceledBeforeAcceptance: false },
+          cancelSignal: controller.signal,
+          onCanceled: () => undefined,
+        }
+      );
+      armed = true;
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      controller.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      commitPartial.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("disposing the session during the resume's pre-stream I/O cancels it", async () => {
+    const workspaceId = "queue-dispatch-stranded-dispose-in-io";
+    const harness = await strandWithResumeParkedInPreStreamIo(workspaceId);
+    const { session, cleanup, streamMessage } = harness;
+
+    try {
+      // Workspace removal tears the session down while the resume is past streamWithHistory's
+      // disposed check and StreamManager has no stream to stop.
+      session.dispose();
+      harness.releaseIo();
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      harness.restore();
+      await cleanup();
+    }
+  });
+
+  test("a system hard stop with no registered stream cancels a preparing resume", async () => {
+    const workspaceId = "queue-dispatch-stranded-system-stop-in-io";
+    const harness = await strandWithResumeParkedInPreStreamIo(workspaceId);
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      // task_stop / interrupt cascade: clears the queue and hard-stops through aiService while
+      // the resume is still preparing, so StreamManager emits a synthetic pre-stream abort.
+      session.clearQueue("task stopped");
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      harness.releaseIo();
+
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      session.drainQueuedMessagesIfIdle();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      harness.restore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a thinking change still pending at the cut carries into the resume", async () => {
+    const workspaceId = "queue-dispatch-stranded-pending-thinking";
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      sendOptions: { thinkingLevel: "low" },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      const original = harness.latestRequest();
+      expect(original.thinkingLevel).toBe("low");
+      // The user raised the level while a tool was running; the boundary was cut before any
+      // prepareStep could apply it.
+      expect(session.setActiveTurnThinkingLevel("high").accepted).toBe(true);
+      expect(original.activeTurnThinkingOverride?.applied).toBeUndefined();
+
+      const wake = harness.queueCancelableWake();
+      original.onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      wake.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(harness.latestRequest().thinkingLevel).toBe("high");
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("rollback failure preserves the wake and continues acceptance", async () => {
     const workspaceId = "queue-dispatch-cancel-rollback-failure";
     const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });

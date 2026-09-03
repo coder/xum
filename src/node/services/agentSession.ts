@@ -390,8 +390,12 @@ function buildStrandedTurnResume(context: {
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
-  /** Effective level after a mid-turn thinking change; the request's own level is stale then. */
-  appliedThinkingLevel?: ThinkingLevel;
+  /**
+   * Level a mid-turn thinking change left in effect at the cut: still pending when the boundary
+   * was cut during a tool call (no prepareStep consumed it), else the last applied one. The
+   * request's own level is stale then; streamWithHistory re-clamps against the model floor.
+   */
+  thinkingLevelAtCut?: ThinkingLevel;
 }): StrandedTurnResume {
   const resumeOptions = pickStartupRetrySendOptions(
     context.options ?? { model: context.modelString, agentId: WORKSPACE_DEFAULTS.agentId }
@@ -400,9 +404,7 @@ function buildStrandedTurnResume(context: {
     options: {
       ...resumeOptions,
       model: context.modelString,
-      ...(context.appliedThinkingLevel != null
-        ? { thinkingLevel: context.appliedThinkingLevel }
-        : {}),
+      ...(context.thinkingLevelAtCut != null ? { thinkingLevel: context.thinkingLevelAtCut } : {}),
       muxMetadata:
         context.workspaceTurnMetadata ?? getWorkspaceTurnMuxMetadata(context.options?.muxMetadata),
     },
@@ -1039,6 +1041,9 @@ export class AgentSession {
 
     this.activePreparedTurnAbortController?.abort();
     this.activePreparedTurnAbortController = null;
+    // A resume parked in its pre-stream I/O passed streamWithHistory's disposed check already;
+    // its abort signal is the only thing that stops it registering a stream after teardown.
+    this.withdrawStrandedTurnResume();
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -4344,12 +4349,24 @@ export class AgentSession {
         goalAdmissionStale = admission.admissionStale;
       }
       // Last admission check before the stream's own pre-start I/O, like sendMessage's PREPARING
-      // gate: a withdrawal or goal transition that landed during the awaits above refuses the
-      // turn here; the abort signal covers the history reads that follow.
+      // gate: a withdrawal that landed during the awaits above refuses the turn here; the abort
+      // signal covers the history reads that follow.
       if (withdrawn()) {
         return Ok({ started: false });
       }
-      if (goalAdmissionStale?.() === true) {
+      // The goal probe rides along to the stream-admission boundary: a Pause or goal replacement
+      // landing during the history reads and request construction below has no stream to
+      // interrupt, so the launch itself rechecks it (StreamManager last, right before
+      // registration). Sticky so the return value matches what refused the launch.
+      let goalRefused = false;
+      const refuseStreamStart =
+        goalAdmissionStale != null
+          ? (): boolean => {
+              goalRefused ||= goalAdmissionStale();
+              return goalRefused;
+            }
+          : undefined;
+      if (refuseStreamStart?.() === true) {
         return Ok({ started: false, goalRefused: true });
       }
 
@@ -4364,10 +4381,14 @@ export class AgentSession {
         internal?.abortSignal,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        refuseStreamStart
       );
       if (!result.success) {
         return result;
+      }
+      if (goalRefused) {
+        return Ok({ started: false, goalRefused: true });
       }
 
       // A withdrawal inside streamWithHistory returns Ok before any stream registers, so the
@@ -5091,9 +5112,13 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    // Pull-based admission probe (goal state) with no push into abortSignal; checked wherever
+    // the signal is, and by StreamManager right before the stream registers.
+    refuseStreamStart?: () => boolean
   ): Promise<AgentSessionResult<void>> {
-    const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
+    const isStartupAbortRequested = (): boolean =>
+      abortSignal?.aborted === true || refuseStreamStart?.() === true;
 
     if (this.disposed || isStartupAbortRequested()) {
       return Ok(undefined);
@@ -5298,6 +5323,7 @@ export class AgentSession {
       workspaceId: this.workspaceId,
       modelString,
       abortSignal,
+      refuseStreamStart,
       thinkingLevel: effectiveThinkingLevel,
       // Orthogonal to thinking level; buildRequestHeaders gates it per model.
       reasoningMode: options?.reasoningMode,
@@ -5330,7 +5356,8 @@ export class AgentSession {
           this.strandedTurnResume = buildStrandedTurnResume({
             ...this.activeStreamContext,
             modelString: stoppedModelString,
-            appliedThinkingLevel: activeTurnThinkingOverride?.applied,
+            thinkingLevelAtCut:
+              activeTurnThinkingOverride?.pending ?? activeTurnThinkingOverride?.applied,
           });
         }
       },
@@ -6066,6 +6093,15 @@ export class AgentSession {
         });
 
         const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+        // A hard stop with no registered stream (task_stop / interrupt cascade through
+        // aiService.stopStream while a stranded resume is still in its pre-stream I/O) must
+        // withdraw that resume here: StreamManager had nothing to abort, and the STREAMING
+        // branch below never runs for it. Only the queued-message soft stop keeps its obligation.
+        if (
+          !(preStreamAbortReason === "queued-message" && this.queuedProviderToolEndAbortInFlight)
+        ) {
+          this.withdrawStrandedTurnResume();
+        }
         if (this.turnPhase === TurnPhase.PREPARING) {
           this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
@@ -7010,7 +7046,8 @@ export class AgentSession {
       this.strandedTurnResume = buildStrandedTurnResume({
         ...abortedStreamContext,
         modelString: abortedModelString ?? abortedStreamContext.modelString,
-        appliedThinkingLevel: this.activeTurnThinkingOverride?.applied,
+        thinkingLevelAtCut:
+          this.activeTurnThinkingOverride?.pending ?? this.activeTurnThinkingOverride?.applied,
       });
     }
     if (!this.hasQueuedMessages()) {
