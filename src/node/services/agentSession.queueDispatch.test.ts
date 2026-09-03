@@ -890,31 +890,76 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("caps consecutive stranded resumes", async () => {
-    const workspaceId = "queue-dispatch-stranded-cap";
+  test("a turn stranded after each of several awaited monitors resumes every time", async () => {
+    const workspaceId = "queue-dispatch-stranded-chain";
     const harness = await createStreamingTurnHarness(workspaceId);
     const { session, cleanup, aiEmitter, streamMessage } = harness;
 
     try {
+      // Each cut follows a completed step whose task_await consumed the monitor's wake (dogfood
+      // UAT: four sequential background+await calls in one prompt); the cap must not end it.
       const strandTurn = () => {
         harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
         harness.queueCancelableWake().abort("monitor consumed");
         aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       };
 
-      for (let resumes = 1; resumes <= 3; resumes += 1) {
+      for (let resumes = 1; resumes <= 4; resumes += 1) {
         strandTurn();
         expect(await waitForCondition(() => streamMessage.mock.calls.length === resumes + 1)).toBe(
           true
         );
         expect(session.isBusy()).toBe(true);
       }
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
 
-      strandTurn();
+  test("caps resume attempts that never start a stream", async () => {
+    const workspaceId = "queue-dispatch-stranded-cap";
+    let gateOpen = true;
+    const pricingGate = mock(() =>
+      Promise.resolve(gateOpen ? Ok(undefined) : Err({ type: "unknown", raw: "gate closed" }))
+    );
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: pricingGate,
+      recordStreamAccounting: mock(() => Promise.resolve()),
+      applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+      requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+      recordStreamStarted: mock(() => Promise.resolve()),
+      syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      harness: { workspaceGoalService },
+      sendInternal: { synthetic: true, agentInitiated: true },
+    });
+    const { session, cleanup, aiEmitter, streamMessage } = harness;
+
+    try {
+      gateOpen = false;
+      const wake = harness.queueCancelableWake();
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      wake.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      const attemptsBefore = pricingGate.mock.calls.length;
+
+      // Each idle poke retries the failing resume until the cap, then the marker is dropped and
+      // further pokes do nothing.
+      for (let poke = 1; poke <= 4; poke += 1) {
+        session.drainQueuedMessagesIfIdle();
+        expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      }
       await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(streamMessage).toHaveBeenCalledTimes(4);
-      expect(session.isBusy()).toBe(false);
+      expect(pricingGate.mock.calls.length - attemptsBefore).toBe(2);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+
+      gateOpen = true;
+      session.drainQueuedMessagesIfIdle();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
     } finally {
       session.dispose();
       await cleanup();
@@ -1397,35 +1442,44 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("stops advertising the delegated continuation once the resume cap is exhausted", async () => {
     const workspaceId = "queue-dispatch-stranded-delegated-cap";
+    let gateOpen = true;
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() =>
+        Promise.resolve(gateOpen ? Ok(undefined) : Err({ type: "unknown", raw: "gate closed" }))
+      ),
+      recordStreamAccounting: mock(() => Promise.resolve()),
+      applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+      requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+      recordStreamStarted: mock(() => Promise.resolve()),
+      syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
     const harness = await createStreamingTurnHarness(workspaceId, {
+      harness: { workspaceGoalService },
       sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
+      sendInternal: { synthetic: true, agentInitiated: true },
     });
     const { session, cleanup, aiEmitter, streamMessage } = harness;
 
     try {
-      const strandTurn = () => {
-        harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
-        harness.queueCancelableWake().abort("monitor consumed");
-        session.clearQueue("monitor consumed");
-      };
-
-      for (let resumes = 1; resumes <= 3; resumes += 1) {
-        strandTurn();
-        expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
-        aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
-        expect(await waitForCondition(() => streamMessage.mock.calls.length === resumes + 1)).toBe(
-          true
-        );
-      }
-
-      // No resume will follow this cut, so the owner must settle the turn here instead of
-      // deferring to a continuation that never starts.
-      strandTurn();
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      gateOpen = false;
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.queueCancelableWake().abort("monitor consumed");
+      session.clearQueue("monitor consumed");
+      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+
+      // The resume keeps failing before its stream starts; while attempts remain the owner
+      // defers settlement, and once the cap is exhausted the continuation is no longer
+      // advertised so the owner settles the turn at the cut.
+      session.drainQueuedMessagesIfIdle();
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
+      session.drainQueuedMessagesIfIdle();
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
       await new Promise((resolve) => setTimeout(resolve, 25));
-      expect(streamMessage).toHaveBeenCalledTimes(4);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
     } finally {
       session.dispose();
       await cleanup();

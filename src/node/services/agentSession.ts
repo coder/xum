@@ -568,8 +568,11 @@ const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
 /**
- * Runaway guard for pathological queue flapping (stop for a queued message, withdraw it,
- * repeat): after this many back-to-back stranded resumes the turn is left idle.
+ * Retry bound for a stranded resume that keeps failing before its stream starts (pricing gate,
+ * history read, refused admission): after this many attempts with no stream the marker is
+ * dropped. Resumes that do start are not counted; each later stranding follows a completed
+ * model step of real work and is a fresh obligation, so a legitimate turn that awaits several
+ * monitored processes in a row resumes every time.
  */
 const MAX_CONSECUTIVE_STRANDED_TURN_RESUMES = 3;
 
@@ -6475,11 +6478,9 @@ export class AgentSession {
       // Any stream that actually starts is the continuation the stranded turn was waiting
       // for. PREPARING is not enough: a dequeued entry can still be canceled before acceptance.
       this.strandedTurnResume = undefined;
-      // "Consecutive" means uninterrupted by any other stream: a wake, user, or goal turn
-      // starting in between restores the runaway budget.
-      if (!this.strandedTurnResumeInFlight) {
-        this.consecutiveStrandedResumes = 0;
-      }
+      // "Consecutive" counts only resume attempts that never got this far: a stream that starts
+      // (the resume's own included) consumed the marker, so a later stranding is new work.
+      this.consecutiveStrandedResumes = 0;
     }
 
     if (next === TurnPhase.IDLE) {
@@ -6941,7 +6942,7 @@ export class AgentSession {
   }
 
   /**
-   * The continuation still owed to a stranded turn. Past the runaway cap the marker is
+   * The continuation still owed to a stranded turn. Past the retry cap the marker is
    * forfeited: nothing may advertise it (the owner would defer settlement for a resume that
    * never starts) and the next sweep drops it.
    */
