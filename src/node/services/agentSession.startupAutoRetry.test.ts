@@ -141,6 +141,55 @@ describe("AgentSession startup auto-retry recovery", () => {
     session.dispose();
   });
 
+  test("startup auto-retry does not dispatch once the workspace is archived on disk", async () => {
+    const workspaceId = "startup-retry-archived";
+    const { session, config, historyService, events, cleanup } =
+      await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted before the archive", {
+        timestamp: Date.now(),
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    // The archive lands while the check is still reading history (a regular session the client
+    // created is not disposed by archive, so only the durable state can stop the dispatch).
+    const getLastMessages = historyService.getLastMessages.bind(historyService);
+    spyOn(historyService, "getLastMessages").mockImplementation(async (id, count) => {
+      const result = await getLastMessages(id, count);
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/tmp/project", {
+          workspaces: [
+            {
+              id: workspaceId,
+              path: `/tmp/project/${workspaceId}`,
+              name: workspaceId,
+              archivedAt: new Date().toISOString(),
+            },
+          ],
+        });
+        return cfg;
+      });
+      return result;
+    });
+
+    const privateSession = session as unknown as {
+      startupAutoRetryCheckPromise: Promise<void> | null;
+      startupAutoRetryCheckScheduled: boolean;
+    };
+    session.ensureStartupAutoRetryCheck();
+    await privateSession.startupAutoRetryCheckPromise;
+
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    // Completed rather than deferred: nothing reruns the check for an archived workspace.
+    expect(privateSession.startupAutoRetryCheckScheduled).toBe(true);
+
+    session.dispose();
+  });
+
   test("visible completed subagent report cards do not schedule startup auto-retry", async () => {
     const workspaceId = "startup-retry-subagent-report-card";
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
