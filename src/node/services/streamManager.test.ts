@@ -1236,8 +1236,9 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
    */
   function createSupervisedStreamManagerForTests(
     fullStream: (signal: AbortSignal) => AsyncGenerator<unknown, void, unknown>,
-    engineScope: Scope.Closeable | undefined = Scope.makeUnsafe("parallel")
+    options: { supervised: boolean } = { supervised: true }
   ) {
+    const engineScope = Scope.makeUnsafe("parallel");
     const events: TurnEngineEvent[] = [];
     const streamManager = new StreamManager(
       historyService,
@@ -1247,7 +1248,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
         events.push(event);
       },
       undefined,
-      engineScope
+      options.supervised ? engineScope : undefined
     );
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -1328,7 +1329,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(streamManager.isStreaming(workspaceId)).toBe(true);
 
     // What ServiceContainer.dispose() does at step 2: interrupt + await.
-    await closeScopeBounded(engineScope!);
+    await closeScopeBounded(engineScope);
 
     // The finalizer routed through the user-stop path: the streamed text was
     // flushed (with usage stamping) before the abort was delivered ...
@@ -1360,7 +1361,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     // cleanupAbortedStream waits for the loop, which waits on the provider that
     // never returns; the close must still resolve at the bound, and never reject.
     const startedAt = Date.now();
-    await closeScopeBounded(engineScope!, 100);
+    await closeScopeBounded(engineScope, 100);
     expect(Date.now() - startedAt).toBeLessThan(2_000);
   });
 
@@ -1368,7 +1369,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     const workspaceId = "supervised-late-start-workspace";
     const { streamManager, events, engineScope } =
       createSupervisedStreamManagerForTests(flowingThenBlockedStream);
-    await closeScopeBounded(engineScope!);
+    await closeScopeBounded(engineScope);
 
     const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
 
@@ -1391,7 +1392,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
           yield { type: "text-delta", text: "final answer" };
           yield { type: "finish", finishReason: "stop" };
         })(),
-      undefined
+      { supervised: false }
     );
     let stopPromise: Promise<unknown> | undefined;
     const realUpdateHistory = historyService.updateHistory.bind(historyService);
@@ -1441,7 +1442,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     // Both cancellers enter cancelStreamSafely in the same tick; the latch is
     // taken synchronously, so the second joins the first's cleanup.
     const stopPromise = streamManager.stopStream(workspaceId, { abortReason: "user" });
-    const closePromise = closeScopeBounded(engineScope!);
+    const closePromise = closeScopeBounded(engineScope);
     await Promise.all([stopPromise, closePromise]);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -1473,7 +1474,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     expect(events.filter((event) => event.type === "stream-end")).toHaveLength(50);
 
-    await closeScopeBounded(engineScope!);
+    await closeScopeBounded(engineScope);
 
     expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);

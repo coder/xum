@@ -1820,7 +1820,8 @@ export class StreamManager {
     // supervisor's "system" cancel): the latch is checked and assigned here,
     // synchronously, with no suspension before it — an await ahead of this
     // point would let both callers reach cleanupAbortedStream and emit two
-    // stream-aborts. Later callers join the first cancel (its abortReason wins).
+    // stream-aborts. Later callers join the first cancel; its abortReason and
+    // abandonPartial are the ones delivered.
     if (streamInfo.cancelPromise) {
       return streamInfo.cancelPromise;
     }

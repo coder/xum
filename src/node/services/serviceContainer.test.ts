@@ -482,14 +482,15 @@ describe("ServiceContainer", () => {
     );
     Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
     services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
-      steps.push(`stream-abort:${event.abortReason}`);
+      steps.push(`stream-abort:${event.abortReason ?? "none"}`);
     });
     const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
       steps.push("bridge-stop");
       return Promise.resolve(undefined);
     });
 
-    const appendResult = await services.historyService.appendToHistory(workspaceId, {
+    const historyService = services.runtime.get(History);
+    const appendResult = await historyService.appendToHistory(workspaceId, {
       id: messageId,
       role: "assistant",
       metadata: { historySequence: 1, partial: true },
@@ -518,7 +519,7 @@ describe("ServiceContainer", () => {
     if (!started.success) throw new Error("expected the stream to start");
     // Wait for the delta to reach partial.json so there is something to commit.
     const deadline = Date.now() + 5_000;
-    while ((await services.historyService.readPartial(workspaceId)) === null) {
+    while ((await historyService.readPartial(workspaceId)) === null) {
       if (Date.now() > deadline) throw new Error("partial never written");
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
@@ -535,8 +536,8 @@ describe("ServiceContainer", () => {
     // interrupted turn is) committed to chat.jsonl with its streamed text —
     // instead of an empty placeholder row plus an orphan partial.json that only
     // the next load would reconcile.
-    expect(await services.historyService.readPartial(workspaceId)).toBeNull();
-    const history = await services.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success).toBe(true);
     if (!history.success) throw new Error(history.error);
     const committed = history.data.find((message) => message.id === messageId);
