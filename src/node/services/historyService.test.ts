@@ -5,7 +5,11 @@ import { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
 import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  filterProviderExcludedMessages,
+  type MuxMessage,
+} from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
@@ -102,6 +106,31 @@ describe("HistoryService", () => {
       expect(messages).toHaveLength(2);
       expect(messages[0].id).toBe("msg1");
       expect(messages[1].id).toBe("msg2");
+    });
+
+    it("applies provider exclusion tombstones after restart", async () => {
+      const workspaceId = "provider-exclusion-tombstone";
+      const messageId = "stopped-wake";
+      const appendResult = await service.appendToHistory(
+        workspaceId,
+        createMuxMessage(messageId, "user", "monitor wake", { synthetic: true })
+      );
+      expect(appendResult.success).toBe(true);
+
+      const tombstoneResult = await service.addProviderExclusionTombstones(workspaceId, [
+        messageId,
+      ]);
+      expect(tombstoneResult.success).toBe(true);
+
+      const restarted = new HistoryService(config);
+      const history = await restarted.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) return;
+      expect(history.data[0]?.metadata?.providerExcluded).toBe(true);
+      expect(filterProviderExcludedMessages(history.data)).toEqual([]);
+
+      const fullHistory = await collectFullHistory(restarted, workspaceId);
+      expect(fullHistory[0]?.metadata?.providerExcluded).toBe(true);
     });
 
     it("hydrates legacy cmuxMetadata entries", async () => {

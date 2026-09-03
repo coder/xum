@@ -336,12 +336,14 @@ export const StreamAbortEventSchema = z.object({
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       duration: z.number().optional(),
+      abortTurnGeneration: z.number().int().nonnegative().optional(),
     })
     .optional()
     .meta({
       description: "Metadata may contain usage if abort occurred after stream completed processing",
     }),
   abandonPartial: z.boolean().optional(),
+  rendererCleanupOnly: z.boolean().optional(),
   acpPromptId: z
     .string()
     .optional()

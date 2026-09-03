@@ -378,6 +378,27 @@ describe("RefineService", () => {
     expect(prompts[0]).toContain("[/workspace_trajectory]");
   });
 
+  it("excludes stopped synthetic rows from the refine transcript", async () => {
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.historyService.appendToHistory(
+      WORKSPACE_ID,
+      createMuxMessage("stopped-wake", "user", "Untrusted stopped process output", {
+        synthetic: true,
+        providerExcluded: true,
+      })
+    );
+    await fixture.seedTrajectory(["Continue with the requested work."]);
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+
+    expect(result.success).toBe(true);
+    expect(prompts[0]).toContain("Continue with the requested work.");
+    expect(prompts[0]).not.toContain("Untrusted stopped process output");
+  });
+
   it("rejects apply while another process holds the cross-process apply lock (r32)", async () => {
     // A second backend over the same root (XUM_ALLOW_MULTIPLE_INSTANCES=1)
     // shares no in-process inFlight map; the durable lockfile must reject it.

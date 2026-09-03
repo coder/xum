@@ -979,6 +979,13 @@ export class WorkspaceStore {
     "stream-abort": (workspaceId, aggregator, data) => {
       const streamAbortData = data as StreamAbortEvent;
       applyWorkspaceChatEventToAggregator(aggregator, streamAbortData);
+      if (streamAbortData.rendererCleanupOnly === true) {
+        // This delayed event only closes its old message. Keep replacement stream state intact.
+        this.cancelPendingStreamingBump(workspaceId, streamAbortData.messageId);
+        this.states.bump(workspaceId);
+        this.streamingStatsStore.bump(workspaceId);
+        return;
+      }
       this.releaseStreamingMessageChannel(workspaceId);
 
       // Track stream interruption telemetry (get model from aggregator)
@@ -1735,7 +1742,13 @@ export class WorkspaceStore {
     });
   }
 
-  private cancelPendingStreamingBump(workspaceId: string): void {
+  private cancelPendingStreamingBump(workspaceId: string, messageId?: string): void {
+    if (
+      messageId !== undefined &&
+      this.pendingStreamingMessageBump.get(workspaceId) !== messageId
+    ) {
+      return;
+    }
     this.pendingStreamingMessageBump.delete(workspaceId);
   }
 

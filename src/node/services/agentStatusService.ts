@@ -16,7 +16,7 @@ import {
   AGENT_STATUS_TICK_INTERVAL_MS,
 } from "@/constants/agentStatus";
 import type { Config } from "@/node/config";
-import type { MuxMessage } from "@/common/types/message";
+import { filterProviderExcludedMessages, type MuxMessage } from "@/common/types/message";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { AIService } from "./aiService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -559,7 +559,7 @@ export class AgentStatusService {
     );
     if (!result.success) return "";
 
-    const committedMessages: MuxMessage[] = [...result.data];
+    const committedMessages: MuxMessage[] = filterProviderExcludedMessages(result.data);
     const partial = await this.historyService.readPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees

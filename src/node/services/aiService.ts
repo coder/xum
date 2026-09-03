@@ -940,7 +940,12 @@ export class AIService extends EventEmitter {
 
   async stopStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      abortReason?: StreamAbortReason;
+      abortTurnGeneration?: number;
+    }
   ): Promise<Result<void>> {
     return this.streamManager.stopStream(workspaceId, options);
   }

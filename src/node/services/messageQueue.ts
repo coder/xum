@@ -93,6 +93,26 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 
+/** Cancellation handoff for a claimed tool-end queue cut. */
+export interface ToolEndQueueClaim {
+  /** Whether the claimed entry contains user-authored input. */
+  readonly userAuthored: boolean;
+  /** Metadata for the exact claimed entry. */
+  readonly muxMetadata?: unknown;
+  /** Signal used to stop this exact entry during dispatch admission. */
+  readonly admissionSignal: AbortSignal;
+  /** Move the claimed entry to the dispatch head. */
+  commit(): boolean;
+  /** Restore the entry's cancellation when the requested queue cut does not occur. */
+  restoreCancellation(): void;
+  /** Stop the claimed entry during queue or preparing admission. */
+  cancelAdmission(reason: string): void;
+  /** Put a dequeued entry back at the queue head and stop its current admission. */
+  requeueAdmission(reason: string): boolean;
+  /** Release claim ownership after the entry crosses admission. */
+  release(): void;
+}
+
 /**
  * Input poised to take over a session at a queue cut (see
  * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
@@ -104,6 +124,11 @@ export type QueueCutCutter =
   | { stage: "preparing"; muxMetadata: unknown }
   | { stage: "dispatching"; muxMetadata: unknown }
   | { stage: "queued"; muxMetadata: unknown; dispatchMode: QueueDispatchMode };
+
+export interface QueueAdmissionCancelState {
+  canceledBeforeAcceptance: boolean;
+  providerExcludedAfterAcceptance?: boolean;
+}
 
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
@@ -126,7 +151,7 @@ interface QueuedMessageInternalOptions {
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
   /** Mutable dispatch outcome shared with sendQueuedMessages. */
-  cancelState?: { canceledBeforeAcceptance: boolean };
+  cancelState?: QueueAdmissionCancelState;
   /** Cancels a queued entry even after it has been dequeued into PREPARING. */
   cancelSignal?: AbortSignal;
   /**
@@ -191,7 +216,7 @@ interface QueueEntry {
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-  cancelState?: { canceledBeforeAcceptance: boolean };
+  cancelState?: QueueAdmissionCancelState;
   cancelSignal?: AbortSignal;
   /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
   preTurnMessages?: MuxMessage[];
@@ -259,9 +284,87 @@ export class MessageQueue {
     return entries.some((entry) => entry.dispatchMode === "tool-end") ? "tool-end" : "turn-end";
   }
 
-  /** Dispatch boundary for the FIFO head entry — the only entry the next drain can send. */
+  private getLiveEntries(): QueueEntry[] {
+    return this.entries.filter((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
+  private getNextLiveEntry(): QueueEntry | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true);
+  }
+
+  /** Dispatch boundary for the next live FIFO entry. */
   getNextQueueDispatchMode(): QueueDispatchMode {
-    return this.entries[0]?.dispatchMode ?? "tool-end";
+    return this.getNextLiveEntry()?.dispatchMode ?? "tool-end";
+  }
+
+  /**
+   * Claim the next live entry as the continuation for a tool-end queue cut.
+   *
+   * Once this claim stops the current model step, the original cancellation must not
+   * retract the continuation. A separate admission signal lets a later user Stop
+   * cancel the exact claimed entry through its PREPARING gates.
+   */
+  claimNextToolEndEntry(): ToolEndQueueClaim | undefined {
+    const entry = this.getNextLiveEntry();
+    if (entry?.dispatchMode !== "tool-end") {
+      return undefined;
+    }
+
+    const cancelSignal = entry.cancelSignal;
+    const admissionController = new AbortController();
+    entry.cancelSignal = admissionController.signal;
+    let settled = false;
+    let committed = false;
+    return {
+      userAuthored: entry.userAuthored,
+      muxMetadata: entry.muxMetadata,
+      admissionSignal: admissionController.signal,
+      commit: () => {
+        if (settled || committed) {
+          return false;
+        }
+        committed = true;
+        const index = this.entries.indexOf(entry);
+        if (index === -1) {
+          return false;
+        }
+        if (index > 0) {
+          this.entries.splice(index, 1);
+          this.entries.unshift(entry);
+        }
+        return true;
+      },
+      restoreCancellation: () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        entry.cancelSignal = cancelSignal;
+      },
+      cancelAdmission: (reason) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        admissionController.abort(reason);
+      },
+      requeueAdmission: (reason) => {
+        if (settled || !committed || this.entries.includes(entry)) {
+          return false;
+        }
+        settled = true;
+        admissionController.abort(reason);
+        entry.cancelSignal = cancelSignal;
+        if (entry.cancelState != null) {
+          entry.cancelState = { canceledBeforeAcceptance: false };
+        }
+        this.entries.unshift(entry);
+        return true;
+      },
+      release: () => {
+        settled = true;
+      },
+    };
   }
 
   /**
@@ -275,9 +378,10 @@ export class MessageQueue {
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
+    const liveEntries = this.getLiveEntries();
     return (
-      this.entries.length > 0 &&
-      this.entries.every((entry) => {
+      liveEntries.length > 0 &&
+      liveEntries.every((entry) => {
         const metadata = entry.muxMetadata;
         return (
           isWorkspaceTurnMetadata(metadata) &&
@@ -297,7 +401,7 @@ export class MessageQueue {
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    const metadata = this.entries[0]?.muxMetadata;
+    const metadata = this.getNextLiveEntry()?.muxMetadata;
     return (
       isWorkspaceTurnMetadata(metadata) &&
       metadata.taskHandleId === taskHandleId &&
@@ -307,7 +411,7 @@ export class MessageQueue {
   }
 
   /**
-   * FIFO head entry's cut-attribution view: its first muxMetadata plus dispatch mode.
+   * Next live FIFO entry's cut-attribution view.
    *
    * Soundness of metadata-based cut attribution rests on the sealing invariant
    * (see class docblock): workspace-turn entries are sealed at add time and
@@ -318,11 +422,11 @@ export class MessageQueue {
   getNextQueueCutCandidate():
     | { muxMetadata: unknown; dispatchMode: QueueDispatchMode }
     | undefined {
-    const head = this.entries[0];
-    if (head == null) {
+    const entry = this.getNextLiveEntry();
+    if (entry == null) {
       return undefined;
     }
-    return { muxMetadata: head.muxMetadata, dispatchMode: head.dispatchMode };
+    return { muxMetadata: entry.muxMetadata, dispatchMode: entry.dispatchMode };
   }
 
   /**
@@ -332,7 +436,7 @@ export class MessageQueue {
    * supersedes the turn when it dispatches.
    */
   isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
+    const muxMetadata = this.getNextLiveEntry()?.muxMetadata;
     if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
     return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
   }
@@ -343,7 +447,7 @@ export class MessageQueue {
    * otherwise turn-end. Empty queue reports the tool-end default.
    */
   getQueueDispatchMode(): QueueDispatchMode {
-    return this.getDispatchMode(this.entries);
+    return this.getDispatchMode(this.getLiveEntries());
   }
 
   /**
@@ -910,6 +1014,32 @@ export class MessageQueue {
     this.entries = [];
   }
 
+  /** Remove entries whose cancellation fired before acceptance. */
+  discardCanceledEntries(): Array<QueueClearCallbacks & { cancelReason: string }> {
+    const canceledEntries: Array<QueueClearCallbacks & { cancelReason: string }> = [];
+    this.entries = this.entries.filter((entry) => {
+      if (entry.cancelSignal?.aborted !== true) {
+        return true;
+      }
+
+      if (entry.cancelState != null) {
+        entry.cancelState.canceledBeforeAcceptance = true;
+      }
+      canceledEntries.push({
+        ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+        ...(entry.onAcceptedPreStreamFailure != null
+          ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+          : {}),
+        cancelReason:
+          typeof entry.cancelSignal.reason === "string"
+            ? entry.cancelSignal.reason
+            : "Queued message canceled before acceptance.",
+      });
+      return false;
+    });
+    return canceledEntries;
+  }
+
   /**
    * Check if queue is empty (no pending entries).
    */
@@ -917,13 +1047,18 @@ export class MessageQueue {
     return this.entries.length === 0;
   }
 
+  /** Whether the queue contains an entry that cancellation did not retract. */
+  hasLiveEntries(): boolean {
+    return this.getNextLiveEntry() != null;
+  }
+
   /**
-   * Number of pending entries, including synthetic/internal ones. Archive admission uses
+   * Number of live pending entries, including synthetic/internal ones. Archive admission uses
    * this to compare the queue against the delegated turns it is about to interrupt, so it
    * must count every entry — a "visible" count could hide user work behind synthetic
    * entries.
    */
   entryCount(): number {
-    return this.entries.length;
+    return this.getLiveEntries().length;
   }
 }

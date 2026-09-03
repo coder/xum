@@ -478,6 +478,24 @@ export function filterOrphanedMcpPromptSnapshots(messages: MuxMessage[]): MuxMes
   });
 }
 
+/** Identify a synthetic row that a user Stop canceled after its rollback boundary. */
+export function isProviderExcludedMessage(message: MuxMessage): boolean {
+  return (
+    message.metadata?.providerExcluded === true &&
+    message.metadata.synthetic === true &&
+    message.metadata.contextBoundaryKind == null &&
+    message.metadata.compactionBoundary !== true
+  );
+}
+
+/** Remove durable rows that a user Stop canceled after their rollback boundary. */
+export function filterProviderExcludedMessages(messages: MuxMessage[]): MuxMessage[] {
+  if (!messages.some(isProviderExcludedMessage)) {
+    return messages;
+  }
+  return messages.filter((message) => !isProviderExcludedMessage(message));
+}
+
 export function dedupeMcpPromptRefs(refs: MCPPromptReference[]): MCPPromptReference[] {
   const deduped = new Map<string, MCPPromptReference>();
   for (const ref of refs) {
@@ -929,6 +947,8 @@ export interface MuxMetadata {
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
   partial?: boolean; // Whether this message was interrupted and is incomplete
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
+  /** Keep a canceled durable admission in history, but exclude it from every provider request. */
+  providerExcluded?: boolean;
   /**
    * For queue-dispatched user turns: when the user last added to the queued
    * entry. The row `timestamp` is stamped at dispatch (after the blocking turn

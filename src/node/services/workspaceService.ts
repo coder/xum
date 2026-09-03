@@ -182,9 +182,11 @@ import {
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
+  filterProviderExcludedMessages,
   getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
+  type BashMonitorWakeDisplayRecord,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
@@ -782,7 +784,8 @@ function collectWorkspaceTitleContextTurns(
 ): WorkspaceTitleContextTurn[] {
   const turns: WorkspaceTitleContextTurn[] = [];
 
-  for (const message of messages) {
+  // A hard Stop excludes its synthetic row from every later provider request.
+  for (const message of filterProviderExcludedMessages([...messages])) {
     if (message.role !== "user" && message.role !== "assistant") {
       continue;
     }
@@ -1840,6 +1843,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
+  private readonly providerExcludedBashMonitorWakeRecordsByWorkspace = new Map<
+    string,
+    {
+      changeToken: string;
+      records: Promise<readonly BashMonitorWakeDisplayRecord[]>;
+    }
+  >();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
   // Failed-persistence chains active per process, so a later cancellation (task_stop after a
@@ -2378,6 +2388,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             : undefined,
       },
       registry: this.bashMonitorRegistryStore,
+      listProviderExcludedWakeRecords: (ownerWorkspaceId) =>
+        this.listProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId),
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
     if (typeof this.backgroundProcessManager.on === "function") {
@@ -2501,6 +2513,64 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       });
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
+  }
+
+  private async readProviderExcludedBashMonitorWakeRecords(
+    ownerWorkspaceId: string
+  ): Promise<BashMonitorWakeDisplayRecord[]> {
+    const records: BashMonitorWakeDisplayRecord[] = [];
+    const result = await this.historyService.iterateFullHistory(
+      ownerWorkspaceId,
+      "backward",
+      (messages) => {
+        for (const message of messages) {
+          const muxMetadata = message.metadata?.muxMetadata;
+          if (
+            message.metadata?.providerExcluded === true &&
+            muxMetadata?.type === "bash-monitor-wake"
+          ) {
+            records.push(...muxMetadata.records);
+          }
+        }
+      }
+    );
+    if (!result.success) {
+      throw new Error(
+        `Failed to read provider-excluded bash monitor wakes for ${ownerWorkspaceId}: ${result.error}`
+      );
+    }
+    return records;
+  }
+
+  private async listProviderExcludedBashMonitorWakeRecords(
+    ownerWorkspaceId: string
+  ): Promise<readonly BashMonitorWakeDisplayRecord[]> {
+    const changeToken = await this.historyService.getProviderExclusionChangeToken(ownerWorkspaceId);
+    const cached = this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId);
+    if (cached?.changeToken === changeToken) return cached.records;
+
+    const records = this.readProviderExcludedBashMonitorWakeRecords(ownerWorkspaceId).then(
+      async (result) => {
+        const finalChangeToken =
+          await this.historyService.getProviderExclusionChangeToken(ownerWorkspaceId);
+        if (finalChangeToken !== changeToken) {
+          throw new Error(
+            `Provider exclusion history changed while reading ${ownerWorkspaceId}; retry reconciliation.`
+          );
+        }
+        return result;
+      }
+    );
+    const entry = { changeToken, records };
+    this.providerExcludedBashMonitorWakeRecordsByWorkspace.set(ownerWorkspaceId, entry);
+    try {
+      return await records;
+    } catch (error) {
+      if (this.providerExcludedBashMonitorWakeRecordsByWorkspace.get(ownerWorkspaceId) === entry) {
+        this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(ownerWorkspaceId);
+      }
+      throw error;
+    }
   }
 
   private async dispatchBashMonitorWake(
@@ -4004,6 +4074,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       onPostCompactionStateChange: () => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
       },
+      onProviderExcludedHistoryChange: () => {
+        // The next reconciliation reads the new durable exclusion once, then reuses it.
+        this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
+        this.scheduleBashMonitorWakeReconcile(workspaceId);
+      },
+      settleProviderExcludedWakeRecords: (records) =>
+        this.bashMonitorWakeReconciler.settleProviderExcludedWakeRecords(workspaceId, records),
       // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
       // preflights (manual sends counted but not yet queued or busy) to the
       // session's follow-up idle probes so redispatched synthetic turns yield
@@ -5947,6 +6024,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
         this.bashMonitorWakeReconciler.dispose(workspaceId)
       );
+      this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
 
       // Remove session data
       const sessionDir = path.join(this.config.sessionsDir, workspaceId);
@@ -11399,6 +11477,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
+    let deferredQueueSettlementSession: AgentSession | undefined;
     try {
       this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
@@ -11416,7 +11495,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const session = this.getOrCreateSession(workspaceId);
-      const stopResult = await session.interruptStream(options);
+      const stopResult = await session.interruptStream({
+        ...options,
+        deferQueueSettlement: options?.soft !== true,
+      });
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11424,6 +11506,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         log.error("Failed to stop stream:", stopResult.error);
         return Err(stopResult.error);
+      }
+      if (!options?.soft) {
+        deferredQueueSettlementSession = session;
       }
 
       // For hard interrupts, delete partial immediately. For soft interrupts,
@@ -11465,9 +11550,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // Restore queued messages to input box for user-initiated interrupts
         session.restoreQueueToInput();
       }
+      deferredQueueSettlementSession = undefined;
 
       return Ok(undefined);
     } catch (error) {
+      try {
+        deferredQueueSettlementSession?.restoreQueueToInput();
+      } catch (settlementError) {
+        log.error("Failed to release deferred queue settlement after interrupt failure", {
+          workspaceId,
+          error: settlementError,
+        });
+      }
       if (!options?.soft) {
         // Keep suppression state consistent if interrupt setup/stop throws.
         this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
@@ -11950,7 +12044,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     clear: () => Promise<Result<T>>,
     options?: { discardUnacceptedOnSuccess?: boolean }
   ): Promise<Result<T>> {
-    if (options?.discardUnacceptedOnSuccess !== true) return clear();
+    if (options?.discardUnacceptedOnSuccess !== true) {
+      return clear().then((result) => {
+        if (result.success) {
+          this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
+        }
+        return result;
+      });
+    }
     return this.bashMonitorRecoveryPromise.then(() =>
       this.bashMonitorHistoryLocks.withLock(workspaceId, async () => {
         if (this.removingWorkspaces.has(workspaceId)) {
@@ -11960,6 +12061,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.notifyBashMonitorWakeStateChanged(workspaceId);
         const result = await clear();
         if (result.success) {
+          this.providerExcludedBashMonitorWakeRecordsByWorkspace.delete(workspaceId);
           await this.bashMonitorWakeReconciler.finishFullHistoryClear(clearToken);
           this.notifyBashMonitorWakeStateChanged(workspaceId);
         }

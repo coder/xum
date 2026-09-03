@@ -89,6 +89,8 @@ import {
   dedupeAgentSkillRefs,
   dedupeMcpPromptRefs,
   filterOrphanedMcpPromptSnapshots,
+  filterProviderExcludedMessages,
+  isProviderExcludedMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
   isCompactionSummaryMetadata,
@@ -98,6 +100,7 @@ import {
   type AgentSkillReference,
   isSyntheticSnapshotUserMessage,
   type CompactionFollowUpRequest,
+  type BashMonitorWakeDisplayRecord,
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
@@ -114,7 +117,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue } from "./messageQueue";
-import type { QueueCutCutter } from "./messageQueue";
+import type { QueueAdmissionCancelState, QueueCutCutter, ToolEndQueueClaim } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -539,7 +542,12 @@ interface AgentSessionActiveStreamInfo {
 export interface AgentSessionStreamManager {
   stopStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      abortReason?: StreamAbortReason;
+      abortTurnGeneration?: number;
+    }
   ): Promise<Result<void>>;
   isStreaming(workspaceId: string): boolean;
   getStreamInfo(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
@@ -615,6 +623,12 @@ interface AgentSessionOptions {
   onIdleCompactionOutcome?: (success: boolean) => void;
   /** Called when post-compaction context state may have changed (plan/file edits) */
   onPostCompactionStateChange?: () => void;
+  /** Called after a canceled synthetic turn changes its durable provider exclusion. */
+  onProviderExcludedHistoryChange?: () => void;
+  /** Persists a stopped wake settlement before provider exclusion falls back to deletion. */
+  settleProviderExcludedWakeRecords?: (
+    records: readonly BashMonitorWakeDisplayRecord[]
+  ) => Promise<void>;
   /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRJD-): true while a service-level send is in
    * its preflight (counted in WorkspaceService.preflightSendCounts but not
@@ -649,6 +663,21 @@ interface CachedMemoryContext {
   includesHotMemories: boolean;
 }
 
+interface QueuedToolEndClaim {
+  queueClaim: ToolEndQueueClaim;
+  source: "sdk" | "provider";
+  dispatchStarted: boolean;
+  dispatchDeferredByHardInterrupt: boolean;
+  admissionIrreversible: boolean;
+  persistedMessageIds: string[];
+  providerExcludedWakeRecords: readonly BashMonitorWakeDisplayRecord[];
+  retryAfterCancellation: boolean;
+  admissionHold?: {
+    promise: Promise<void>;
+    release: () => void;
+  };
+}
+
 export class AgentSession {
   private readonly workspaceId: string;
   private readonly config: Config;
@@ -663,6 +692,8 @@ export class AgentSession {
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
+  private readonly onProviderExcludedHistoryChange?: () => void;
+  private readonly settleProviderExcludedWakeRecords?: AgentSessionOptions["settleProviderExcludedWakeRecords"];
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -671,6 +702,7 @@ export class AgentSession {
     [];
   private disposed = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
+  private preparingTurnGeneration = 0;
   /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
   private editAdmissionDepth = 0;
   /**
@@ -693,7 +725,15 @@ export class AgentSession {
   // Provider-executed tools (for example native web_search/web_fetch) complete inside one
   // provider response, so the SDK's between-step stopWhen hook cannot preempt after them.
   // Track known siblings and reserve soft interruption for that native-only boundary.
-  private queuedProviderToolEndAbortInFlight = false;
+  private queuedToolEndClaim: QueuedToolEndClaim | undefined;
+  // Fail closed in this process if the durable provider-exclusion rewrite cannot complete.
+  private readonly providerExcludedHistoryMessageIds = new Set<string>();
+  // A hard Stop blocks late SDK and provider callbacks until a new stream starts.
+  private hardInterruptPendingStreamStart = false;
+  // Hold a claimed admission while a hard interrupt waits for its stop result.
+  private hardInterruptClaimSettlementPending = false;
+  // Send now preserves a claimed user entry for the immediate queue drain.
+  private preserveQueuedToolEndClaimForImmediateSend = false;
   private readonly activeToolCallIds = new Set<string>();
 
   private idleWaiters: Array<() => void> = [];
@@ -902,6 +942,8 @@ export class AgentSession {
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
+      onProviderExcludedHistoryChange,
+      settleProviderExcludedWakeRecords,
       hasExternalSendPreflight,
     } = options;
 
@@ -930,6 +972,8 @@ export class AgentSession {
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
+    this.onProviderExcludedHistoryChange = onProviderExcludedHistoryChange;
+    this.settleProviderExcludedWakeRecords = settleProviderExcludedWakeRecords;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
 
     this.compactionHandler = new CompactionHandler({
@@ -1677,6 +1721,9 @@ export class AgentSession {
       if (candidate.role === "system") {
         continue;
       }
+      if (isProviderExcludedMessage(candidate)) {
+        continue;
+      }
       if (this.isSyntheticGoalPauseBoundaryMessage(candidate)) {
         continue;
       }
@@ -1891,6 +1938,9 @@ export class AgentSession {
 
   private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
     if (message.role !== "user") {
+      return false;
+    }
+    if (isProviderExcludedMessage(message)) {
       return false;
     }
 
@@ -2876,7 +2926,7 @@ export class AgentSession {
         message: {
           type: "queued-message-changed",
           workspaceId: this.workspaceId,
-          hasQueuedMessages: !this.messageQueue.isEmpty(),
+          hasQueuedMessages: this.messageQueue.hasLiveEntries(),
           queuedMessages: this.messageQueue.getVisibleMessages(),
           displayText: this.messageQueue.getVisibleDisplayText(),
           fileParts: this.messageQueue.getVisibleFileParts(),
@@ -3024,7 +3074,7 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
+      cancelState?: QueueAdmissionCancelState;
       cancelSignal?: AbortSignal;
       /**
        * For queue-dispatched sends: when the user last added to the queued
@@ -3083,6 +3133,12 @@ export class AgentSession {
        * these admission gates instead of starting a privileged turn on a stopped target.
        */
       admissionStale?: () => boolean;
+      /** Wait for a hard-stop cascade before this queued admission can become irreversible. */
+      waitForAdmissionRelease?: () => Promise<void>;
+      /** Record that persisted turn rows have crossed their rollback boundary. */
+      onAdmissionIrreversible?: (persistedMessageIds: readonly string[]) => void;
+      /** Exclude a claimed synthetic turn when a hard Stop cancels it after the boundary. */
+      excludeIrreversibleAdmissionOnCancel?: boolean;
     }
   ): Promise<AgentSessionResult<void>> {
     this.assertNotDisposed("sendMessage");
@@ -3940,11 +3996,17 @@ export class AgentSession {
       );
     }
 
+    await internal?.waitForAdmissionRelease?.();
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
     // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
+      internal?.onAdmissionIrreversible?.(persistedCancelableMessageIds);
     }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -4050,6 +4112,20 @@ export class AgentSession {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
+    const isIrreversibleAdmissionCanceled = (): boolean =>
+      cancellationDisabled &&
+      cancelSignal?.aborted === true &&
+      internal?.excludeIrreversibleAdmissionOnCancel === true;
+    const markProviderExcludedAfterAcceptance = (): void => {
+      if (internal?.cancelState != null) {
+        internal.cancelState.providerExcludedAfterAcceptance = true;
+      }
+    };
+    if (isIrreversibleAdmissionCanceled()) {
+      markProviderExcludedAfterAcceptance();
+      return Ok(undefined);
+    }
+
     let acceptedPreStreamFailureNotified = false;
     const notifyAcceptedPreStreamFailure = async (error: SendMessageError): Promise<void> => {
       if (acceptedPreStreamFailureNotified) {
@@ -4086,7 +4162,11 @@ export class AgentSession {
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    if (this.dispatchingQueuedEntry && this.turnPhase === TurnPhase.PREPARING) {
+      this.setTurnPhase(TurnPhase.PREPARING);
+    } else {
+      this.beginPreparingTurn();
+    }
     // From this synchronous point isBusy() reports the turn — release the
     // service-side preflight reservation (see onTurnAdmissionCommitted doc).
     internal?.onTurnAdmissionCommitted?.();
@@ -4122,9 +4202,17 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          async () => {
+            await internal?.waitForAdmissionRelease?.();
+            return !isIrreversibleAdmissionCanceled();
+          }
         );
-        if (streamResult.success && preparedTurnAbortController.signal.aborted) {
+        if (
+          streamResult.success &&
+          preparedTurnAbortController.signal.aborted &&
+          !isIrreversibleAdmissionCanceled()
+        ) {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError(
               "Accepted stream startup was canceled during preparation."
@@ -4186,7 +4274,12 @@ export class AgentSession {
 
     // Non-edit sends preserve the old behavior so pre-stream startup failures still propagate to
     // synchronous callers (draft restore, interrupted-task rollback, etc.).
-    return await startPreparedStream();
+    const streamResult = await startPreparedStream();
+    if (isIrreversibleAdmissionCanceled()) {
+      markProviderExcludedAfterAcceptance();
+      return Ok(undefined);
+    }
+    return streamResult;
   }
 
   async resumeStream(
@@ -4239,7 +4332,7 @@ export class AgentSession {
       internal?.goalId
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.beginPreparingTurn();
     // Open the mid-turn thinking override window for the resumed turn (after
     // setTurnPhase(PREPARING), which clears the holder on the IDLE transition).
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
@@ -4863,14 +4956,24 @@ export class AgentSession {
   async interruptStream(options?: {
     soft?: boolean;
     abandonPartial?: boolean;
+    sendQueuedImmediately?: boolean;
+    /** Keep queue drains blocked until WorkspaceService completes descendant cleanup. */
+    deferQueueSettlement?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
 
     // Explicit user interruption should immediately stop any pending auto-retry loop.
     this.retryManager.cancel();
 
-    if (options?.soft !== true) {
-      this.queuedProviderToolEndAbortInFlight = false;
+    const isHardInterrupt = options?.soft !== true;
+    // Bind Stop to the current claim before partial cleanup or abort delivery can yield.
+    const interruptedClaim = isHardInterrupt ? this.queuedToolEndClaim : undefined;
+    const interruptedTurnGeneration = this.preparingTurnGeneration;
+    if (isHardInterrupt) {
+      this.hardInterruptPendingStreamStart = true;
+      this.hardInterruptClaimSettlementPending = true;
+      this.preserveQueuedToolEndClaimForImmediateSend = options?.sendQueuedImmediately === true;
+      this.pauseQueuedToolEndClaimAdmission();
       this.activeToolCallIds.clear();
     }
 
@@ -4878,18 +4981,64 @@ export class AgentSession {
     // from committing it. For soft interrupts, defer to stream-abort handler since
     // the stream continues running and would recreate the partial.
     if (options?.abandonPartial && !options?.soft) {
-      const deleteResult = await this.historyService.deletePartial(this.workspaceId);
+      let deleteResult: Result<void>;
+      try {
+        deleteResult = await this.historyService.deletePartial(this.workspaceId);
+      } catch (error: unknown) {
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
+        throw error;
+      }
       if (!deleteResult.success) {
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
         return Err(deleteResult.error);
       }
     }
 
-    const stopResult = await this.streamManager.stopStream(this.workspaceId, {
-      ...options,
-      abortReason: "user",
-    });
+    let stopResult: Result<void>;
+    try {
+      stopResult = await this.streamManager.stopStream(this.workspaceId, {
+        ...options,
+        abortReason: "user",
+        ...(isHardInterrupt ? { abortTurnGeneration: interruptedTurnGeneration } : {}),
+      });
+    } catch (error: unknown) {
+      if (isHardInterrupt) {
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
+      }
+      throw error;
+    }
     if (!stopResult.success) {
+      if (isHardInterrupt) {
+        this.resumeQueuedToolEndClaimAfterFailedInterrupt();
+      }
       return Err(stopResult.error);
+    }
+
+    if (isHardInterrupt) {
+      this.hardInterruptClaimSettlementPending = false;
+      this.settleQueuedToolEndClaimAfterUserInterrupt(interruptedClaim);
+      if (
+        interruptedClaim?.admissionIrreversible === true &&
+        !interruptedClaim.queueClaim.userAuthored
+      ) {
+        this.activePreparedTurnAbortController?.abort();
+      }
+      // A synthetic acceptance callback can already be running and cannot wait on the new hold.
+      // Keep its completion from draining later entries before the workspace-level policy runs.
+      this.hardInterruptClaimSettlementPending = options?.deferQueueSettlement === true;
+      const exclusionResult = await this.excludeCanceledIrreversibleClaim(interruptedClaim);
+      if (!exclusionResult.success) {
+        this.preserveQueuedToolEndClaimForImmediateSend = false;
+        return exclusionResult;
+      }
+      if (
+        options?.deferQueueSettlement !== true &&
+        interruptedClaim?.admissionIrreversible === true &&
+        !interruptedClaim.queueClaim.userAuthored
+      ) {
+        this.resumeQueuedToolEndClaimAdmission(interruptedClaim);
+      }
+      this.preserveQueuedToolEndClaimForImmediateSend = false;
     }
 
     return Ok(undefined);
@@ -4977,7 +5126,9 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    /** Wait for a claimed turn to retain provider-start permission. */
+    waitForProviderStartAdmission?: () => Promise<boolean>
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
@@ -5050,9 +5201,15 @@ export class AgentSession {
       );
     }
 
-    // A crash between snapshot and user-row appends can leave orphaned prompt
-    // expansions on disk; exclude them from every provider request.
-    let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
+    // A crash between snapshot and user-row appends can leave orphaned prompt expansions on disk.
+    // A failed exclusion rewrite also stays blocked in memory for this process.
+    const filterRequestMessages = (messages: MuxMessage[]): MuxMessage[] =>
+      filterOrphanedMcpPromptSnapshots(
+        filterProviderExcludedMessages(messages).filter(
+          (message) => !this.providerExcludedHistoryMessageIds.has(message.id)
+        )
+      );
+    let requestMessages = filterRequestMessages(historyResult.data);
 
     if (requestMessages.length === 0) {
       return await this.handleStreamWithHistoryFailure(
@@ -5080,7 +5237,7 @@ export class AgentSession {
       await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
       const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (refreshed.success) {
-        requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+        requestMessages = filterRequestMessages(refreshed.data);
       }
     }
 
@@ -5179,6 +5336,13 @@ export class AgentSession {
     // emit an error event for fire-and-forget senders and then return Err;
     // collect them so the Err path resolves each exactly once.
     const preStartErrors: StreamErrorPayload[] = [];
+    const providerStartAdmitted = await waitForProviderStartAdmission?.();
+    if (isStartupAbortRequested() || providerStartAdmitted === false) {
+      this.activeCompactionRequest = undefined;
+      this.resetActiveStreamState();
+      return Ok(undefined);
+    }
+
     const streamResult = await this.aiService.streamMessage({
       messages: requestMessages,
       workspaceId: this.workspaceId,
@@ -5210,7 +5374,7 @@ export class AgentSession {
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
-      hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      claimQueuedToolEndMessage: () => this.claimQueuedToolEndMessage("sdk") != null,
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -5462,7 +5626,7 @@ export class AgentSession {
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
     );
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.beginPreparingTurn();
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5569,7 +5733,7 @@ export class AgentSession {
 
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.beginPreparingTurn();
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5718,7 +5882,7 @@ export class AgentSession {
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
-    this.queuedProviderToolEndAbortInFlight = false;
+    this.restoreQueuedToolEndClaim();
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
@@ -5787,6 +5951,8 @@ export class AgentSession {
 
     forward("stream-start", (payload) => {
       if (payload.type === "stream-start") {
+        this.hardInterruptPendingStreamStart = false;
+        this.preserveQueuedToolEndClaimForImmediateSend = false;
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
@@ -5796,7 +5962,7 @@ export class AgentSession {
         // fast-path synchronously so a model set_goal in THIS stream queues
         // for its stream-end drain instead of writing goal.json mid-stream.
         this.workspaceGoalService?.recordStreamStarted(this.workspaceId);
-        this.queuedProviderToolEndAbortInFlight = false;
+        this.restoreQueuedToolEndClaim();
         this.activeToolCallIds.clear();
       }
       this.setTurnPhase(TurnPhase.STREAMING);
@@ -5928,6 +6094,25 @@ export class AgentSession {
         this.emitChatEvent(payload);
         return;
       }
+      const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
+      const abortTurnGeneration = payload.metadata?.abortTurnGeneration;
+      if (
+        abortReason === "user" &&
+        abortTurnGeneration != null &&
+        abortTurnGeneration !== this.preparingTurnGeneration
+      ) {
+        log.debug("Ignoring a stale user abort", {
+          workspaceId: this.workspaceId,
+          abortTurnGeneration,
+          preparingTurnGeneration: this.preparingTurnGeneration,
+        });
+        // The renderer still needs the old terminal event to clear that exact stream.
+        this.emitChatEvent({
+          ...payload,
+          rendererCleanupOnly: true,
+        });
+        return;
+      }
 
       // stopStream() emits synthetic aborts even when no real stream is active
       // (e.g., during PREPARING or after COMPLETING). We must still forward the
@@ -5942,7 +6127,7 @@ export class AgentSession {
           turnPhase: this.turnPhase,
         });
 
-        const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+        const preStreamAbortReason = abortReason;
         if (this.turnPhase === TurnPhase.PREPARING) {
           this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
@@ -5958,7 +6143,11 @@ export class AgentSession {
           this.activeStreamUserMessageId
         );
 
-        this.queuedProviderToolEndAbortInFlight = false;
+        // interruptStream owns user claim settlement. StreamManager can deliver this event
+        // after a replacement admission starts, so the event must not inspect queue state.
+        if (preStreamAbortReason !== "user") {
+          this.restoreQueuedToolEndClaim();
+        }
         this.activeToolCallIds.clear();
         this.emitChatEvent(payload);
         return;
@@ -5979,9 +6168,8 @@ export class AgentSession {
 
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
-      const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
       const isQueuedProviderToolEndAbort =
-        this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
+        this.queuedToolEndClaim?.source === "provider" && abortReason !== "user";
       if (abortReason === "user") {
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
@@ -6136,7 +6324,7 @@ export class AgentSession {
         // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
         const hadQueuedMessages = this.hasPendingManualFollowUp();
         if (this.deferQueuedFlushUntilAfterEdit) {
-          this.queuedProviderToolEndAbortInFlight = false;
+          this.restoreQueuedToolEndClaim();
           // Clear the queued-message signal while the edit flow owns the next dispatch.
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
@@ -6271,6 +6459,11 @@ export class AgentSession {
       workspaceId: this.workspaceId,
       message,
     } satisfies AgentSessionChatEvent);
+  }
+
+  private beginPreparingTurn(): void {
+    this.preparingTurnGeneration += 1;
+    this.setTurnPhase(TurnPhase.PREPARING);
   }
 
   private setTurnPhase(next: TurnPhase): void {
@@ -6505,7 +6698,7 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
+      cancelState?: QueueAdmissionCancelState;
       cancelSignal?: AbortSignal;
       /** Synthetic assistant rows persisted just before the dispatched turn's user row. */
       preTurnMessages?: MuxMessage[];
@@ -6523,15 +6716,33 @@ export class AgentSession {
     if (!didEnqueue) {
       return null;
     }
+    if (internal?.cancelSignal != null) {
+      internal.cancelSignal.addEventListener(
+        "abort",
+        () => {
+          if (this.disposed) {
+            return;
+          }
+          this.emitQueuedMessageChanged();
+          this.syncBackgroundQueuedMessageSignal();
+        },
+        { once: true }
+      );
+    }
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process queued messages
     // only for tool-end dispatches.
     const effectiveDispatchMode = this.messageQueue.getNextQueueDispatchMode();
+    this.syncBackgroundQueuedMessageSignal();
+    return effectiveDispatchMode;
+  }
+
+  private syncBackgroundQueuedMessageSignal(): void {
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      effectiveDispatchMode === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
-    return effectiveDispatchMode;
   }
 
   clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
@@ -6557,7 +6768,8 @@ export class AgentSession {
     // user-authored turn-end entry forward to a step boundary.
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     return true;
   }
@@ -6594,7 +6806,8 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
@@ -6622,7 +6835,8 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.hasLiveEntries() &&
+        this.messageQueue.getNextQueueDispatchMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
@@ -6630,7 +6844,7 @@ export class AgentSession {
 
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
     return (
-      !this.messageQueue.isEmpty() &&
+      this.messageQueue.hasLiveEntries() &&
       (dispatchMode == null || this.messageQueue.getNextQueueDispatchMode() === dispatchMode)
     );
   }
@@ -6663,7 +6877,7 @@ export class AgentSession {
       }
     }
 
-    if (!this.messageQueue.isEmpty()) {
+    if (this.messageQueue.hasLiveEntries()) {
       if (continuationMetadata == null) {
         return true;
       }
@@ -6773,20 +6987,25 @@ export class AgentSession {
   private async requestQueuedProviderToolEndDispatch(): Promise<void> {
     if (
       this.turnPhase !== TurnPhase.STREAMING ||
-      this.queuedProviderToolEndAbortInFlight ||
-      this.activeToolCallIds.size > 0 ||
-      !this.hasQueuedMessages("tool-end")
+      this.queuedToolEndClaim != null ||
+      this.activeToolCallIds.size > 0
     ) {
       return;
     }
 
-    this.queuedProviderToolEndAbortInFlight = true;
+    const activeClaim = this.claimQueuedToolEndMessage("provider");
+    if (activeClaim == null) {
+      return;
+    }
+
     const result = await this.streamManager.stopStream(this.workspaceId, {
       soft: true,
       abortReason: "system",
     });
     if (!result.success) {
-      this.queuedProviderToolEndAbortInFlight = false;
+      if (this.queuedToolEndClaim === activeClaim) {
+        this.restoreQueuedToolEndClaim();
+      }
       log.warn("Failed to stop stream after provider-executed tool result", {
         workspaceId: this.workspaceId,
         error: result.error,
@@ -6797,20 +7016,272 @@ export class AgentSession {
   private dispatchQueuedProviderToolEndMessageAfterAbort(
     abortReason: StreamAbortReason | undefined
   ): boolean {
-    if (!this.queuedProviderToolEndAbortInFlight) {
+    if (this.hardInterruptClaimSettlementPending) {
+      if (abortReason !== "user" && this.queuedToolEndClaim?.source === "provider") {
+        this.queuedToolEndClaim.dispatchDeferredByHardInterrupt = true;
+      }
+      return false;
+    }
+    if (this.queuedToolEndClaim == null) {
+      return false;
+    }
+    if (this.queuedToolEndClaim.source !== "provider") {
+      this.restoreQueuedToolEndClaim();
       return false;
     }
 
     const shouldDispatch =
       abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
-    this.queuedProviderToolEndAbortInFlight = false;
 
     if (!shouldDispatch) {
+      if (abortReason === "user") {
+        this.settleQueuedToolEndClaimAfterUserInterrupt();
+      } else {
+        this.restoreQueuedToolEndClaim();
+      }
       return false;
     }
 
     this.sendQueuedMessages();
     return true;
+  }
+
+  private claimQueuedToolEndMessage(source: "sdk" | "provider"): QueuedToolEndClaim | undefined {
+    if (this.hardInterruptPendingStreamStart || this.queuedToolEndClaim != null) {
+      return undefined;
+    }
+    const queueClaim = this.messageQueue.claimNextToolEndEntry();
+    if (queueClaim == null) {
+      return undefined;
+    }
+    const queueMuxMetadata = queueClaim.muxMetadata as MuxMessageMetadata | undefined;
+    const activeClaim = {
+      queueClaim,
+      source,
+      dispatchStarted: false,
+      dispatchDeferredByHardInterrupt: false,
+      admissionIrreversible: false,
+      persistedMessageIds: [],
+      providerExcludedWakeRecords:
+        queueMuxMetadata?.type === "bash-monitor-wake" ? queueMuxMetadata.records : [],
+      retryAfterCancellation: false,
+    };
+    this.queuedToolEndClaim = activeClaim;
+    return activeClaim;
+  }
+
+  private commitQueuedToolEndClaim(): QueuedToolEndClaim | undefined {
+    const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim == null || activeClaim.dispatchStarted) {
+      return undefined;
+    }
+    if (!activeClaim.queueClaim.commit()) {
+      activeClaim.queueClaim.release();
+      this.queuedToolEndClaim = undefined;
+      this.syncBackgroundQueuedMessageSignal();
+      return undefined;
+    }
+    activeClaim.dispatchStarted = true;
+    return activeClaim;
+  }
+
+  private restoreQueuedToolEndClaim(): void {
+    const activeClaim = this.queuedToolEndClaim;
+    this.queuedToolEndClaim = undefined;
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    activeClaim?.queueClaim.restoreCancellation();
+    if (activeClaim != null) {
+      this.emitQueuedMessageChanged();
+    }
+    this.syncBackgroundQueuedMessageSignal();
+  }
+
+  private cancelQueuedToolEndClaim(reason: string): void {
+    const activeClaim = this.queuedToolEndClaim;
+    this.queuedToolEndClaim = undefined;
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    activeClaim?.queueClaim.cancelAdmission(reason);
+    if (activeClaim != null) {
+      this.emitQueuedMessageChanged();
+    }
+    this.syncBackgroundQueuedMessageSignal();
+  }
+
+  private settleQueuedToolEndClaimAfterUserInterrupt(activeClaim = this.queuedToolEndClaim): void {
+    if (this.hardInterruptClaimSettlementPending) {
+      return;
+    }
+    if (activeClaim == null || this.queuedToolEndClaim !== activeClaim) {
+      return;
+    }
+    if (activeClaim?.admissionIrreversible) {
+      // A hard Stop must not start a synthetic provider turn. Keep its durable row for
+      // producer settlement, but abort admission so the request path excludes it.
+      if (!activeClaim.queueClaim.userAuthored) {
+        activeClaim.queueClaim.cancelAdmission("Queue dispatch canceled by user interrupt.");
+      }
+      return;
+    }
+    if (
+      this.preserveQueuedToolEndClaimForImmediateSend &&
+      activeClaim?.queueClaim.userAuthored === true
+    ) {
+      if (!activeClaim.dispatchStarted) {
+        this.restoreQueuedToolEndClaim();
+      }
+      return;
+    }
+    if (
+      activeClaim?.dispatchStarted === true &&
+      activeClaim.queueClaim.userAuthored &&
+      !activeClaim.admissionIrreversible
+    ) {
+      activeClaim.retryAfterCancellation = true;
+      const didRequeue = activeClaim.queueClaim.requeueAdmission(
+        "Queue dispatch canceled by user interrupt."
+      );
+      if (didRequeue) {
+        this.queuedToolEndClaim = undefined;
+        this.resumeQueuedToolEndClaimAdmission(activeClaim);
+        this.emitQueuedMessageChanged();
+        this.syncBackgroundQueuedMessageSignal();
+        // A later service callback cannot recover a dequeued entry. Restore it now.
+        this.restoreQueueToInput();
+        return;
+      }
+      activeClaim.retryAfterCancellation = false;
+    }
+    this.cancelQueuedToolEndClaim("Queue dispatch canceled by user interrupt.");
+  }
+
+  private async excludeCanceledIrreversibleClaim(
+    activeClaim: QueuedToolEndClaim | undefined
+  ): Promise<Result<void>> {
+    if (
+      activeClaim?.admissionIrreversible !== true ||
+      activeClaim.queueClaim.userAuthored ||
+      !activeClaim.queueClaim.admissionSignal.aborted
+    ) {
+      return Ok(undefined);
+    }
+
+    const messageIds = activeClaim.persistedMessageIds;
+    for (const messageId of messageIds) {
+      this.providerExcludedHistoryMessageIds.add(messageId);
+    }
+    if (messageIds.length === 0) {
+      return Ok(undefined);
+    }
+
+    const exclusionResult = await this.historyService.markMessagesProviderExcluded(
+      this.workspaceId,
+      messageIds
+    );
+    if (exclusionResult.success) {
+      this.onProviderExcludedHistoryChange?.();
+      return Ok(undefined);
+    }
+
+    // Persist the exclusion before producer settlement. A crash must never expose
+    // the synthetic row after its producer watermark says that the wake was consumed.
+    const tombstoneResult = await this.historyService.addProviderExclusionTombstones(
+      this.workspaceId,
+      messageIds
+    );
+    if (!tombstoneResult.success) {
+      // Keep the admission hold closed. A later Stop retries both durable writes.
+      return Err(
+        `Cannot stop the synthetic wake safely: ${exclusionResult.error}; ${tombstoneResult.error}`
+      );
+    }
+    this.onProviderExcludedHistoryChange?.();
+
+    const wakeRecords = activeClaim.providerExcludedWakeRecords;
+    if (wakeRecords.length > 0) {
+      if (this.settleProviderExcludedWakeRecords == null) {
+        log.error("Cannot delete a canceled wake without durable producer settlement", {
+          workspaceId: this.workspaceId,
+          messageIds,
+          exclusionError: exclusionResult.error,
+        });
+        return Ok(undefined);
+      }
+      try {
+        // The tombstone keeps the recovery record excluded while this watermark advances.
+        await this.settleProviderExcludedWakeRecords(wakeRecords);
+      } catch (error) {
+        log.error("Failed to settle a canceled wake before provider-exclusion deletion", {
+          workspaceId: this.workspaceId,
+          messageIds,
+          exclusionError: exclusionResult.error,
+          error: getErrorMessage(error),
+        });
+        return Ok(undefined);
+      }
+    }
+
+    // Keep the hard Stop fail-closed. Deletion is a safe fallback when the marker rewrite fails.
+    const deleteResult = await this.historyService.deleteMessages(this.workspaceId, messageIds);
+    if (deleteResult.success) {
+      this.onProviderExcludedHistoryChange?.();
+    } else {
+      log.error("Failed to persist provider exclusion for a canceled synthetic admission", {
+        workspaceId: this.workspaceId,
+        messageIds,
+        exclusionError: exclusionResult.error,
+        deleteError: deleteResult.error,
+      });
+    }
+    return Ok(undefined);
+  }
+
+  private pauseQueuedToolEndClaimAdmission(): void {
+    const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim?.dispatchStarted !== true || activeClaim.admissionHold != null) {
+      return;
+    }
+    let release: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    activeClaim.admissionHold = { promise, release };
+  }
+
+  private resumeQueuedToolEndClaimAdmission(activeClaim?: QueuedToolEndClaim): void {
+    const admissionHold = activeClaim?.admissionHold;
+    if (activeClaim != null) {
+      activeClaim.admissionHold = undefined;
+    }
+    admissionHold?.release();
+  }
+
+  private async waitForQueuedToolEndClaimAdmission(activeClaim: QueuedToolEndClaim): Promise<void> {
+    await activeClaim.admissionHold?.promise;
+  }
+
+  private resumeQueuedToolEndClaimAfterFailedInterrupt(): void {
+    this.hardInterruptClaimSettlementPending = false;
+    this.hardInterruptPendingStreamStart = false;
+    this.preserveQueuedToolEndClaimForImmediateSend = false;
+    const activeClaim = this.queuedToolEndClaim;
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    if (
+      activeClaim?.dispatchStarted !== true &&
+      activeClaim?.dispatchDeferredByHardInterrupt !== true
+    ) {
+      this.restoreQueuedToolEndClaim();
+    }
+    if (this.turnPhase === TurnPhase.IDLE) {
+      this.sendQueuedMessages();
+    }
+  }
+
+  private releaseQueuedToolEndClaim(activeClaim: QueuedToolEndClaim): void {
+    this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    activeClaim.queueClaim.release();
+    if (this.queuedToolEndClaim === activeClaim) {
+      this.queuedToolEndClaim = undefined;
+    }
   }
 
   async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
@@ -6846,7 +7317,7 @@ export class AgentSession {
   }
 
   hasPendingManualFollowUp(): boolean {
-    return !this.messageQueue.isEmpty() || this.pendingExternalManualFollowUps > 0;
+    return this.messageQueue.hasLiveEntries() || this.pendingExternalManualFollowUps > 0;
   }
 
   /**
@@ -6856,6 +7327,12 @@ export class AgentSession {
    */
   restoreQueueToInput(): void {
     this.assertNotDisposed("restoreQueueToInput");
+    this.hardInterruptClaimSettlementPending = false;
+    const activeClaim = this.queuedToolEndClaim;
+    if (activeClaim?.admissionIrreversible === true && activeClaim.admissionHold != null) {
+      // WorkspaceService calls this after descendant cleanup, even when no queue entry remains.
+      this.resumeQueuedToolEndClaimAdmission(activeClaim);
+    }
     if (this.messageQueue.isEmpty()) {
       return;
     }
@@ -6886,7 +7363,7 @@ export class AgentSession {
     this.emitChatEvent({
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
-      hasQueuedMessages: !this.messageQueue.isEmpty(),
+      hasQueuedMessages: this.messageQueue.hasLiveEntries(),
       queuedMessages: this.messageQueue.getVisibleMessages(),
       displayText: this.messageQueue.getVisibleDisplayText(),
       fileParts: this.messageQueue.getVisibleFileParts(),
@@ -6902,7 +7379,20 @@ export class AgentSession {
    */
   sendNextUserQueuedMessage(): boolean {
     this.assertNotDisposed("sendNextUserQueuedMessage");
-    if (!this.messageQueue.prioritizeNextUserEntry()) {
+    this.hardInterruptClaimSettlementPending = false;
+    const activeClaim = this.queuedToolEndClaim;
+    const didPrioritizeUserEntry = this.messageQueue.prioritizeNextUserEntry();
+    if (
+      activeClaim?.dispatchStarted === true &&
+      activeClaim.admissionHold != null &&
+      (activeClaim.queueClaim.userAuthored || activeClaim.admissionIrreversible)
+    ) {
+      // WorkspaceService calls this after descendant cleanup. An irreversible synthetic turn
+      // must finish before the prioritized user entry can start, so release either held turn.
+      this.resumeQueuedToolEndClaimAdmission(activeClaim);
+      return activeClaim.queueClaim.userAuthored || didPrioritizeUserEntry;
+    }
+    if (!didPrioritizeUserEntry) {
       return false;
     }
     this.sendQueuedMessages();
@@ -6950,15 +7440,90 @@ export class AgentSession {
       return;
     }
 
-    this.queuedProviderToolEndAbortInFlight = false;
+    // A hard Stop owns queue admission until WorkspaceService finishes descendant cleanup.
+    if (this.hardInterruptClaimSettlementPending) {
+      if (this.queuedToolEndClaim != null) {
+        this.queuedToolEndClaim.dispatchDeferredByHardInterrupt = true;
+      }
+      return;
+    }
+
+    // A dequeued entry owns admission until stream start or explicit failure cleanup.
+    if (this.dispatchingQueuedEntry || this.queuedToolEndClaim?.dispatchStarted === true) {
+      return;
+    }
+    const dispatchClaim = this.commitQueuedToolEndClaim();
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+
+    const canceledEntries = this.messageQueue.discardCanceledEntries();
+    if (canceledEntries.length > 0) {
+      this.emitQueuedMessageChanged();
+      for (const canceledEntry of canceledEntries) {
+        this.notifyQueuedMessageCleared(canceledEntry, canceledEntry.cancelReason);
+      }
+    }
 
     if (!this.messageQueue.isEmpty()) {
       // Entries dispatch one at a time (FIFO): special sends (compaction, agent
       // skills, workspace-turn follow-ups) own their turn, and anything queued
       // behind them dispatches on a later drain instead of batching into them.
       const { message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
+      const dispatchCancelState =
+        dispatchClaim != null
+          ? (internal?.cancelState ?? { canceledBeforeAcceptance: false })
+          : internal?.cancelState;
+      const effectiveInternal =
+        dispatchClaim == null
+          ? internal
+          : {
+              ...internal,
+              cancelState: dispatchCancelState,
+              cancelSignal: dispatchClaim.queueClaim.admissionSignal,
+              admissionStale: () =>
+                !dispatchClaim.admissionIrreversible &&
+                (dispatchClaim.queueClaim.admissionSignal.aborted ||
+                  internal?.admissionStale?.() === true),
+              waitForAdmissionRelease: () => this.waitForQueuedToolEndClaimAdmission(dispatchClaim),
+              onAdmissionIrreversible: (persistedMessageIds: readonly string[]) => {
+                dispatchClaim.admissionIrreversible = true;
+                dispatchClaim.persistedMessageIds = [...persistedMessageIds];
+              },
+              excludeIrreversibleAdmissionOnCancel: !dispatchClaim.queueClaim.userAuthored,
+              onCanceled: async (reason: string) => {
+                if (!dispatchClaim.retryAfterCancellation) {
+                  await internal?.onCanceled?.(reason);
+                }
+              },
+              onAccepted: async () => {
+                await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
+                if (
+                  dispatchClaim.queueClaim.admissionSignal.aborted &&
+                  !dispatchClaim.admissionIrreversible
+                ) {
+                  const reason: unknown = dispatchClaim.queueClaim.admissionSignal.reason;
+                  this.releaseQueuedToolEndClaim(dispatchClaim);
+                  throw new Error(
+                    typeof reason === "string"
+                      ? reason
+                      : "Queue dispatch canceled by user interrupt."
+                  );
+                }
+                if (dispatchClaim.queueClaim.userAuthored) {
+                  this.releaseQueuedToolEndClaim(dispatchClaim);
+                  await internal?.onAccepted?.();
+                  return;
+                }
+                // Keep a synthetic claim visible through its acceptance callback. A concurrent
+                // hard Stop can then mark its durable rows provider-excluded before startup.
+                try {
+                  await internal?.onAccepted?.();
+                } finally {
+                  // A hard Stop can install the hold while the producer callback runs.
+                  await this.waitForQueuedToolEndClaimAdmission(dispatchClaim);
+                }
+              },
+            };
       this.dispatchingQueuedEntry = true;
       this.dispatchingQueuedEntryMuxMetadata = options?.muxMetadata;
       this.emitQueuedMessageChanged();
@@ -6975,9 +7540,9 @@ export class AgentSession {
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.
       this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
-      this.setTurnPhase(TurnPhase.PREPARING);
+      this.beginPreparingTurn();
 
-      void this.sendMessage(message, options, { ...internal, enqueuedAtMs })
+      void this.sendMessage(message, options, { ...effectiveInternal, enqueuedAtMs })
         .then(async (result) => {
           // Keep the dispatch marker through the dequeue-to-stream-start window. A background
           // send can resolve before startup emits stream-start, and later reports must not claim
@@ -6985,6 +7550,11 @@ export class AgentSession {
           // If sendMessage fails before it can start streaming, ensure we don't
           // leave the session stuck in PREPARING and notify correlated internal callers.
           if (!result.success) {
+            if (dispatchClaim != null) {
+              this.releaseQueuedToolEndClaim(dispatchClaim);
+            }
+            this.dispatchingQueuedEntry = false;
+            this.dispatchingQueuedEntryMuxMetadata = undefined;
             await internal?.onAcceptedPreStreamFailure?.(result.error);
             if (this.turnPhase === TurnPhase.PREPARING) {
               this.setTurnPhase(TurnPhase.IDLE);
@@ -6995,16 +7565,54 @@ export class AgentSession {
             this.sendQueuedMessages();
             return;
           }
-          if (internal?.cancelState?.canceledBeforeAcceptance === true) {
+          if (
+            dispatchCancelState?.canceledBeforeAcceptance === true ||
+            dispatchCancelState?.providerExcludedAfterAcceptance === true
+          ) {
+            if (dispatchClaim != null) {
+              this.releaseQueuedToolEndClaim(dispatchClaim);
+            }
+            if (
+              dispatchCancelState.canceledBeforeAcceptance === true &&
+              !dispatchClaim?.retryAfterCancellation &&
+              internal?.onCanceled == null &&
+              internal?.onAcceptedPreStreamFailure != null
+            ) {
+              const reason: unknown = effectiveInternal?.cancelSignal?.reason;
+              try {
+                await internal.onAcceptedPreStreamFailure(
+                  createUnknownSendMessageError(
+                    typeof reason === "string"
+                      ? reason
+                      : "Queued message canceled before acceptance."
+                  )
+                );
+              } catch (error: unknown) {
+                log.error("Canceled queue admission callback failed", {
+                  workspaceId: this.workspaceId,
+                  error: getErrorMessage(error),
+                });
+              }
+            }
+            this.dispatchingQueuedEntry = false;
+            this.dispatchingQueuedEntryMuxMetadata = undefined;
             // Cancellation can arrive after dequeue while sendMessage is validating or writing
             // history. No stream will start, so release PREPARING and continue with later entries.
             if (this.turnPhase === TurnPhase.PREPARING) {
               this.setTurnPhase(TurnPhase.IDLE);
             }
             this.sendQueuedMessages();
+            return;
+          }
+          if (dispatchClaim != null) {
+            // Keep synthetic ownership until StreamManager accepts the abort signal.
+            this.releaseQueuedToolEndClaim(dispatchClaim);
           }
         })
         .catch(async (error: unknown) => {
+          if (dispatchClaim != null) {
+            this.releaseQueuedToolEndClaim(dispatchClaim);
+          }
           // A REJECTED sendMessage (thrown, not returned Err — e.g. an awaited history or goal
           // service throwing pre-persistence) must reach the same failure hook as the
           // returned-error branch above: peer sends refund their family-message reservation

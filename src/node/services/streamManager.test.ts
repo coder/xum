@@ -1226,7 +1226,7 @@ describe("StreamManager - stream resource scope", () => {
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
   type BuildStopWhenCondition = (request: {
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    claimQueuedToolEndMessage?: () => boolean;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
 
@@ -1239,7 +1239,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   function requiredToolConditionForTests(toolPolicy: ToolPolicy): StopWhenCondition {
     const [, , requiredToolCondition] = buildStopWhenForTests()({
-      hasQueuedMessages: () => false,
+      claimQueuedToolEndMessage: () => false,
       toolPolicy,
     });
     return requiredToolCondition;
@@ -1251,7 +1251,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("returns step-cap and queued-message conditions with no policy", () => {
     let queued = false;
-    const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
+    const stopWhen = buildStopWhenForTests()({ claimQueuedToolEndMessage: () => queued });
     expect(stopWhen).toHaveLength(3);
 
     const [maxStepCondition, queuedMessageCondition, requiredToolCondition] = stopWhen;
@@ -1797,7 +1797,7 @@ describe("StreamManager - sequential tool execution", () => {
     headers?: Record<string, string | undefined>;
     maxOutputTokens?: number;
     streamCallSettings?: Record<string, unknown>;
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    claimQueuedToolEndMessage?: () => boolean;
     toolPolicy?: ToolPolicy;
     toolChoice?: { type: "tool"; toolName: string };
   }
@@ -1906,7 +1906,7 @@ describe("StreamManager - sequential tool execution", () => {
       messages: [{ role: "user", content: "hello" }],
       system: "system",
       tools,
-      hasQueuedMessages: () => false,
+      claimQueuedToolEndMessage: () => false,
     });
     createStreamResult(request, new AbortController());
 
@@ -5724,23 +5724,35 @@ describe("StreamManager - stopStream", () => {
     const streamManager = new StreamManager(historyService);
 
     // Track emitted events
-    const abortEvents: Array<{ workspaceId: string; messageId: string }> = [];
+    const abortEvents: Array<{
+      workspaceId: string;
+      messageId: string;
+      metadata?: { abortTurnGeneration?: number };
+    }> = [];
     onTurnEngineEvent(
       streamManager,
       "stream-abort",
-      (data: { workspaceId: string; messageId: string }) => {
+      (data: {
+        workspaceId: string;
+        messageId: string;
+        metadata?: { abortTurnGeneration?: number };
+      }) => {
         abortEvents.push(data);
       }
     );
 
     // Stop a stream that doesn't exist (simulates interrupt before stream-start)
-    const result = await streamManager.stopStream("test-workspace");
+    const result = await streamManager.stopStream("test-workspace", {
+      abortReason: "user",
+      abortTurnGeneration: 7,
+    });
 
     expect(result.success).toBe(true);
     expect(abortEvents).toHaveLength(1);
     expect(abortEvents[0].workspaceId).toBe("test-workspace");
     // messageId is empty for synthetic abort (no actual stream existed)
     expect(abortEvents[0].messageId).toBe("");
+    expect(abortEvents[0].metadata?.abortTurnGeneration).toBe(7);
   });
 });
 

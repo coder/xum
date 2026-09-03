@@ -112,6 +112,22 @@ async function buildSystemContextForTest(args: {
 }
 
 describe("prepareProviderRequestMessages", () => {
+  test("excludes durable rows canceled after admission", () => {
+    const canceledWake = createMuxMessage("canceled-wake", "user", "untrusted wake output", {
+      historySequence: 1,
+      synthetic: true,
+      providerExcluded: true,
+    });
+    const userMessage = createMuxMessage("user", "user", "continue", {
+      historySequence: 2,
+    });
+
+    const result = prepareProviderRequestMessages([canceledWake, userMessage], "openai", "off");
+
+    expect(result.activeContextMessages.map((message) => message.id)).toEqual(["user"]);
+    expect(result.providerRequestMessages.map((message) => message.id)).toEqual(["user"]);
+  });
+
   test("slices at reset boundaries before filtering empty assistant messages", () => {
     const oldMessage = createMuxMessage("old-user", "user", "old context", {
       historySequence: 1,

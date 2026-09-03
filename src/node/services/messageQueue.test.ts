@@ -600,6 +600,167 @@ describe("MessageQueue", () => {
       expect((candidate?.muxMetadata as MuxMessageMetadata).type).toBe("workspace-turn-task");
     });
 
+    it("keeps a claimed tool-end entry dispatchable after its cancel signal aborts", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal }
+      );
+
+      const claim = queue.claimNextToolEndEntry();
+      controller.abort("task output consumed the wake");
+
+      expect(claim).toBeDefined();
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(claim?.admissionSignal);
+    });
+
+    it("restores cancellation when a claimed tool-end queue cut fails", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal }
+      );
+
+      const claim = queue.claimNextToolEndEntry();
+      controller.abort("task output consumed the wake");
+      claim?.restoreCancellation();
+
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(controller.signal);
+    });
+
+    it("cancels the claimed entry through its admission signal after commit", () => {
+      queue.add("Monitor wake", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+
+      const claim = queue.claimNextToolEndEntry();
+      expect(claim?.commit()).toBe(true);
+      const cancelSignal = queue.dequeueNext().internal?.cancelSignal;
+
+      claim?.cancelAdmission("user stopped the queue dispatch");
+
+      expect(cancelSignal?.aborted).toBe(true);
+      expect(cancelSignal?.reason).toBe("user stopped the queue dispatch");
+    });
+
+    it("requeues a claimed user entry after its admission is canceled", () => {
+      const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      queue.add(
+        "User follow-up",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal, cancelState }
+      );
+
+      const claim = queue.claimNextToolEndEntry();
+      expect(claim?.userAuthored).toBe(true);
+      expect(claim?.commit()).toBe(true);
+      const firstAdmission = queue.dequeueNext();
+      expect(firstAdmission.internal?.cancelSignal).toBe(claim?.admissionSignal);
+
+      expect(claim?.requeueAdmission("user stopped admission")).toBe(true);
+      expect(claim?.admissionSignal.aborted).toBe(true);
+      const retriedAdmission = queue.dequeueNext();
+      expect(retriedAdmission.message).toBe("User follow-up");
+      expect(retriedAdmission.internal?.cancelSignal).toBe(controller.signal);
+      expect(retriedAdmission.internal?.cancelState).toEqual({ canceledBeforeAcceptance: false });
+      expect(retriedAdmission.internal?.cancelState).not.toBe(cancelState);
+    });
+
+    it("does not claim a tool-end entry that cancellation already retracted", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: controller.signal }
+      );
+      controller.abort("task output consumed the wake");
+
+      expect(queue.hasLiveEntries()).toBe(false);
+      expect(queue.isEmpty()).toBe(false);
+      expect(queue.entryCount()).toBe(0);
+      expect(queue.claimNextToolEndEntry()).toBeUndefined();
+    });
+
+    it("commits the claimed entry ahead of a later user reordering", () => {
+      const controller = new AbortController();
+      queue.add(
+        "Monitor wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, cancelSignal: controller.signal }
+      );
+      queue.add("User follow-up", {
+        model: "gpt-4",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+
+      const claim = queue.claimNextToolEndEntry();
+      expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
+      expect(queue.getMessages()).toEqual(["User follow-up", "Monitor wake"]);
+      expect(claim?.commit()).toBe(true);
+
+      expect(queue.dequeueNext().message).toBe("Monitor wake");
+      expect(queue.dequeueNext().message).toBe("User follow-up");
+    });
+
+    it("claims the next live tool-end entry after a canceled head", () => {
+      const canceledController = new AbortController();
+      const liveController = new AbortController();
+      queue.add(
+        "Canceled monitor wake",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          queueDispatchMode: "turn-end",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { cancelSignal: canceledController.signal }
+      );
+      queue.add(
+        "Live follow-up",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { cancelSignal: liveController.signal }
+      );
+      canceledController.abort("task output consumed the first wake");
+
+      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+      expect(queue.isNextEntryBashMonitorWake()).toBe(false);
+      expect(queue.getNextQueueCutCandidate()?.muxMetadata).toBeUndefined();
+      const claim = queue.claimNextToolEndEntry();
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(canceledController.signal);
+      expect(queue.dequeueNext().internal?.cancelSignal).toBe(claim?.admissionSignal);
+    });
+
+    it("finds a live workspace-turn continuation after a canceled predecessor", () => {
+      const canceledController = new AbortController();
+      queue.add(
+        "Canceled predecessor",
+        { model: "gpt-4", agentId: "exec" },
+        { cancelSignal: canceledController.signal }
+      );
+      queue.add("Workspace-turn continuation", {
+        model: "gpt-4",
+        agentId: "exec",
+        muxMetadata: metadata,
+      });
+      canceledController.abort("predecessor became stale");
+
+      expect(
+        queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+      expect((queue.getNextQueueCutCandidate()?.muxMetadata as MuxMessageMetadata).type).toBe(
+        "workspace-turn-task"
+      );
+    });
+
     it("never batches a user message into a sealed workspace-turn entry", () => {
       // Cut attribution reads the head entry's muxMetadata; the sealing
       // invariant guarantees a manual user message queued after a
