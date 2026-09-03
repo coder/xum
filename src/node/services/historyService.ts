@@ -1875,10 +1875,11 @@ export class HistoryService {
 
   /**
    * Read-modify-write the partial under the per-workspace lock, only while it still belongs to
-   * `messageId`. Returns false (writing nothing) when the partial is missing, belongs to another
-   * message, or `updater` declines. Callers that assembled an update from an earlier read use this
-   * so a stream started in between (commit of that partial, then a new one under the fresh
-   * message id) is never resurrected or overwritten.
+   * `messageId` and no commitPartial is in flight for the workspace. Returns false (writing
+   * nothing) when the partial is missing, belongs to another message, is being committed, or
+   * `updater` declines. Callers that assembled an update from an earlier read use this so a
+   * stream started in between (commit of that partial, then a new one under the fresh message
+   * id) is never resurrected or overwritten.
    */
   async updatePartialIfMessageIdMatches(
     workspaceId: string,
@@ -1886,6 +1887,9 @@ export class HistoryService {
     updater: (current: MuxMessage) => MuxMessage | null
   ): Promise<Result<boolean>> {
     return this.fileLocks.withLock(workspaceId, async () => {
+      if (this.partialCommitsInFlight.has(workspaceId)) {
+        return Ok(false);
+      }
       const current = await this.readPartial(workspaceId);
       if (current?.id !== messageId) {
         return Ok(false);
@@ -1986,6 +1990,9 @@ export class HistoryService {
     });
   }
 
+  // Workspaces with a commitPartial in flight (process-local, see commitPartial).
+  private readonly partialCommitsInFlight = new Map<string, number>();
+
   /**
    * Commit any existing partial message to chat history and delete partial.json.
    *
@@ -1994,8 +2001,29 @@ export class HistoryService {
    * - After committing (or if already finalized), partial.json is deleted.
    */
   async commitPartial(workspaceId: string): Promise<Result<void>> {
+    // commitPartial snapshots the partial before its locked history writes and deletes it last,
+    // so an updatePartialIfMessageIdMatches landing in between would be appended pre-update and
+    // then dropped. Mark the commit (process-local) so that CAS yields for its duration; the
+    // snapshot itself is read under the lock so a CAS already mid-write is included in it.
+    this.partialCommitsInFlight.set(
+      workspaceId,
+      (this.partialCommitsInFlight.get(workspaceId) ?? 0) + 1
+    );
     try {
-      let partial = await this.readPartial(workspaceId);
+      return await this.commitPartialUnguarded(workspaceId);
+    } finally {
+      const remaining = (this.partialCommitsInFlight.get(workspaceId) ?? 1) - 1;
+      if (remaining > 0) {
+        this.partialCommitsInFlight.set(workspaceId, remaining);
+      } else {
+        this.partialCommitsInFlight.delete(workspaceId);
+      }
+    }
+  }
+
+  private async commitPartialUnguarded(workspaceId: string): Promise<Result<void>> {
+    try {
+      let partial = await this.fileLocks.withLock(workspaceId, () => this.readPartial(workspaceId));
       if (!partial) {
         return Ok(undefined);
       }

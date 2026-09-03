@@ -69,6 +69,110 @@ describe("HistoryService partial persistence - Error Recovery", () => {
     expect(deletePartial).toHaveBeenCalledWith(workspaceId);
   });
 
+  test("updatePartialIfMessageIdMatches yields to a commitPartial already in flight", async () => {
+    const workspaceId = "test-workspace";
+    const partial: MuxMessage = {
+      id: "msg-1",
+      role: "assistant",
+      metadata: { historySequence: 1, timestamp: Date.now(), model: "test-model" },
+      parts: [{ type: "text", text: "Hello" }],
+    };
+    expect((await partialService.writePartial(workspaceId, partial)).success).toBe(true);
+
+    // Park the commit after it has snapshotted the partial and before its history writes.
+    let releaseHistoryRead: (() => void) | undefined;
+    const historyReadGate = new Promise<void>((resolve) => {
+      releaseHistoryRead = resolve;
+    });
+    const readHistory = partialService.getHistoryFromLatestBoundary.bind(partialService);
+    const historySpy = spyOn(partialService, "getHistoryFromLatestBoundary").mockImplementation(
+      async (targetWorkspaceId: string) => {
+        await historyReadGate;
+        return readHistory(targetWorkspaceId);
+      }
+    );
+    try {
+      const commit = partialService.commitPartial(workspaceId);
+
+      const cas = await partialService.updatePartialIfMessageIdMatches(
+        workspaceId,
+        "msg-1",
+        (current) => ({
+          ...current,
+          parts: [...current.parts, { type: "text", text: " (finalized)" }],
+        })
+      );
+      expect(cas).toEqual(Ok(false));
+
+      releaseHistoryRead?.();
+      expect((await commit).success).toBe(true);
+    } finally {
+      historySpy.mockRestore();
+    }
+
+    // The commit landed exactly what it snapshotted, and the CAS did not write anything.
+    const committed = await partialService.getLastMessages(workspaceId, 1);
+    expect(committed.success && committed.data[0]?.parts).toEqual(partial.parts);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("commitPartial snapshots the partial after an in-flight updatePartialIfMessageIdMatches lands", async () => {
+    const workspaceId = "test-workspace";
+    const partial: MuxMessage = {
+      id: "msg-1",
+      role: "assistant",
+      metadata: { historySequence: 1, timestamp: Date.now(), model: "test-model" },
+      parts: [{ type: "text", text: "Hello" }],
+    };
+    expect((await partialService.writePartial(workspaceId, partial)).success).toBe(true);
+    const finalizedParts = [...partial.parts, { type: "text" as const, text: " (finalized)" }];
+
+    // Park the CAS inside its critical section (after it took the lock, before it writes).
+    let releaseCasRead: (() => void) | undefined;
+    const casReadGate = new Promise<void>((resolve) => {
+      releaseCasRead = resolve;
+    });
+    let casReadReached: (() => void) | undefined;
+    const casReadReachedGate = new Promise<void>((resolve) => {
+      casReadReached = resolve;
+    });
+    const readPartial = partialService.readPartial.bind(partialService);
+    let readCalls = 0;
+    const readSpy = spyOn(partialService, "readPartial").mockImplementation(
+      async (targetWorkspaceId: string) => {
+        if (readCalls++ === 0) {
+          casReadReached?.();
+          await casReadGate;
+        }
+        return readPartial(targetWorkspaceId);
+      }
+    );
+    try {
+      const cas = partialService.updatePartialIfMessageIdMatches(
+        workspaceId,
+        "msg-1",
+        (current) => ({
+          ...current,
+          parts: finalizedParts,
+        })
+      );
+      await casReadReachedGate;
+
+      const commit = partialService.commitPartial(workspaceId);
+      releaseCasRead?.();
+
+      expect(await cas).toEqual(Ok(true));
+      expect((await commit).success).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+
+    // The commit waited for the CAS and committed the finalized partial, not its pre-update state.
+    const committed = await partialService.getLastMessages(workspaceId, 1);
+    expect(committed.success && committed.data[0]?.parts).toEqual(finalizedParts);
+    expect(await partialService.readPartial(workspaceId)).toBeNull();
+  });
+
   test("commitPartial should update existing placeholder when errored partial has more parts", async () => {
     const workspaceId = "test-workspace";
     const erroredPartial: MuxMessage = {
