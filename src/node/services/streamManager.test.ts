@@ -5767,6 +5767,19 @@ describe("StreamManager - categorizeError", () => {
     expect(categorizeErrorForTests(retryError)).toBe("model_not_found");
   });
 
+  test("classifies OpenAI 404 model_not_found by error code", () => {
+    const apiError = createApiCallErrorForTests({
+      message: "The model `gpt-nonexistent` does not exist or you do not have access to it.",
+      statusCode: 404,
+      responseBody:
+        '{"error":{"message":"The model `gpt-nonexistent` does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}',
+      isRetryable: false,
+      data: { error: { type: "invalid_request_error", code: "model_not_found" } },
+    });
+
+    expect(categorizeErrorForTests(apiError)).toBe("model_not_found");
+  });
+
   const categorizeCases: Array<{ name: string; error: unknown; expected: string }> = [
     {
       name: "classifies Anthropic missing message_stop as stream_truncated",

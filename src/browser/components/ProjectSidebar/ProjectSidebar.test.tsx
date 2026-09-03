@@ -219,6 +219,7 @@ function useArchiveActions(
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds: new Set<string>(),
         selectedWorkspace: null,
         setSelectedWorkspace: () => undefined,
         removeWorkspace: () => Promise.resolve({ success: true }),
@@ -537,6 +538,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds: new Set<string>(),
         selectedWorkspace: null,
         setSelectedWorkspace: () => undefined,
         preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
@@ -788,6 +790,7 @@ describe("ProjectSidebar scratch chats", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: {
             workspaceId: workspace.id,
             projectPath: scratchPath,
@@ -1794,6 +1797,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: {
             workspaceId: "done-1",
             projectPath: "/projects/demo-project",
@@ -2624,6 +2628,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
@@ -2737,6 +2742,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>
@@ -2773,6 +2779,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>

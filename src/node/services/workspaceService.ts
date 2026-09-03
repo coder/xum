@@ -42,6 +42,7 @@ import {
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
+import { cancelReasonBeforeAcceptance } from "@/node/services/messageQueue";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
@@ -2532,10 +2533,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return "deferred";
       }
 
+      // Withdrawn while awaiting send options above: the abort listener below would never
+      // fire, and send preflight (which persists AI settings) has nothing left to admit.
+      if (dispatch.cancelSignal.aborted) return "deferred";
+
       let accepted = false;
       // A queued wake can be superseded after dequeue. Share cancellation state so
       // AgentSession can release PREPARING when cancellation wins before acceptance.
       const cancelState = { canceledBeforeAcceptance: false };
+      // Withdrawal (output already shown, process discarded, history cleared) must
+      // free the queue slot now, not at stream end: a lingering entry keeps the
+      // workspace reported busy and its dedupe key held. The key is unique per
+      // dispatch, so this cannot drop a newer wake's entry.
+      dispatch.cancelSignal.addEventListener(
+        "abort",
+        () => {
+          this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, dispatch.dedupeKey, {
+            cancelReason: "Bash monitor wake withdrawn before dispatch.",
+          });
+        },
+        { once: true }
+      );
       const sendResult = await this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
@@ -10862,6 +10880,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       if (shouldQueue) {
+        // Mirrors AgentSession's cancelBeforeAcceptance for the queue path: a send withdrawn
+        // during the preflight awaits above must not occupy a queue slot (and hold its dedupe
+        // key) until the stream drains it. Nothing is persisted yet, so only the handshake runs.
+        if (internal?.cancelSignal?.aborted === true) {
+          await getContinuationSendState().onCanceled?.(
+            cancelReasonBeforeAcceptance(internal.cancelSignal)
+          );
+          if (internal.cancelState != null) {
+            internal.cancelState.canceledBeforeAcceptance = true;
+          }
+          return Ok(undefined);
+        }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued.
         if (internal?.admissionStale?.() === true) {

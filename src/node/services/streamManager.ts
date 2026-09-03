@@ -4649,11 +4649,10 @@ export class StreamManager {
         );
       };
 
-      // OpenAI: 400 with error.code === 'model_not_found'
+      // OpenAI: error.code === 'model_not_found'. The status has flipped between 400 and
+      // 404 over time, so key on the code rather than the status.
       const isOpenAIModelError =
-        error.statusCode === 400 &&
-        hasErrorProperty(error.data) &&
-        error.data.error.code === "model_not_found";
+        hasErrorProperty(error.data) && error.data.error.code === "model_not_found";
 
       // Anthropic: 404 with error.type === 'not_found_error'
       const isAnthropicModelError =

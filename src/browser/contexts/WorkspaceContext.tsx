@@ -485,6 +485,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     options?: { acknowledgedUntrackedPaths?: string[] }
   ) => Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  /**
+   * Workspaces with an archive preflight or archive request in flight. Archive can take tens
+   * of seconds server-side (snapshot + worktree removal), so this lives here rather than in
+   * the component that started it: the sidebar row and the menu bar both show "Archiving..."
+   * no matter which one the user clicked.
+   */
+  archivingWorkspaceIds: ReadonlySet<string>;
   refreshWorkspaceMetadata: () => Promise<void>;
   setWorkspaceMetadata: React.Dispatch<
     React.SetStateAction<Map<string, FrontendWorkspaceMetadata>>
@@ -545,6 +552,38 @@ export const WorkspaceContext = {
 
 interface WorkspaceProviderProps {
   children: ReactNode;
+}
+
+/**
+ * Keeps `workspaceId` in the archiving set while `run` is outstanding. Requests for one
+ * workspace can overlap (the sidebar shortcut fires while a header-started archive is still
+ * in flight), so the id is reference-counted and only removed when the last one settles.
+ */
+async function trackArchivingRequest<T>(
+  counts: Map<string, number>,
+  setArchivingWorkspaceIds: React.Dispatch<React.SetStateAction<ReadonlySet<string>>>,
+  workspaceId: string,
+  run: () => Promise<T>
+): Promise<T> {
+  counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
+  setArchivingWorkspaceIds((prev) =>
+    prev.has(workspaceId) ? prev : new Set(prev).add(workspaceId)
+  );
+  try {
+    return await run();
+  } finally {
+    const remaining = (counts.get(workspaceId) ?? 1) - 1;
+    if (remaining > 0) {
+      counts.set(workspaceId, remaining);
+    } else {
+      counts.delete(workspaceId);
+      setArchivingWorkspaceIds((prev) => {
+        const next = new Set(prev);
+        next.delete(workspaceId);
+        return next;
+      });
+    }
+  }
 }
 
 /**
@@ -1637,6 +1676,11 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api, setWorkspaceMetadata]
   );
 
+  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  );
+  const archivingRequestCounts = useRef(new Map<string, number>());
+
   const preflightArchiveWorkspace = useCallback(
     async (
       workspaceId: string
@@ -1644,7 +1688,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.preflightArchive({ workspaceId });
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
+          workspaceId,
+          () => api.workspace.preflightArchive({ workspaceId })
+        );
         if (result.success) {
           return { success: true, data: result.data };
         }
@@ -1664,10 +1713,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.archive({
+        const result = await trackArchivingRequest(
+          archivingRequestCounts.current,
+          setArchivingWorkspaceIds,
           workspaceId,
-          acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
-        });
+          () =>
+            api.workspace.archive({
+              workspaceId,
+              acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+            })
+        );
         if (result.success) {
           // Older mocks/story fixtures may still return `{ success: true }` without the newer
           // typed archive payload. Treat that legacy success shape as an ordinary archive so
@@ -2030,6 +2085,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,
@@ -2056,6 +2112,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,

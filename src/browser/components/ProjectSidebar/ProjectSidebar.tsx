@@ -690,6 +690,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     setSelectedWorkspace: onSelectWorkspace,
     preflightArchiveWorkspace,
     archiveWorkspace: onArchiveWorkspace,
+    archivingWorkspaceIds,
     removeWorkspace,
     updateWorkspaceTitle: onUpdateTitle,
     setWorkspacePinned,
@@ -915,7 +916,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     }));
   };
 
-  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<Set<string>>(new Set());
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
   const [draftVisibilityByProject, setDraftVisibilityByProject] = useState<
     Record<string, Record<string, boolean>>
@@ -1087,84 +1087,72 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       buttonElement?: HTMLElement,
       acknowledgedUntrackedPaths?: string[]
     ) => {
-      // Mark workspace as being archived for UI feedback
-      setArchivingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
-
-      try {
-        const result = await onArchiveWorkspace(
+      const result = await onArchiveWorkspace(
+        workspaceId,
+        acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+      );
+      if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
+        const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
+        const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
+        const aggregator = workspaceStore.getAggregator(workspaceId);
+        const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
+        const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
+        const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
+        const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
+        const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
+        setArchiveConfirmation({
           workspaceId,
-          acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
-        );
-        if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
-          const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-          const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-          const aggregator = workspaceStore.getAggregator(workspaceId);
-          const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
-          const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
-          const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
-          const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
-          const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-          setArchiveConfirmation({
-            workspaceId,
-            displayTitle,
-            buttonElement,
-            untrackedPaths: result.data.paths,
-            // The retry path already handled any earlier streaming warning. Only surface the
-            // interruption warning again when the archive attempt has not yet been confirmed.
-            isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
-          });
-          return false;
-        }
-        if (!result.success) {
-          if (acknowledgedUntrackedPaths != null) {
-            // Archive may fail if new untracked files appear between confirmation and capture.
-            // Re-run preflight so we can reopen the modal with the latest paths.
-            const preflight = await preflightArchiveWorkspace(workspaceId);
-            if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
-              const pathsChanged = didUntrackedPathSetChange(
-                acknowledgedUntrackedPaths,
-                preflight.data.paths
-              );
-              if (pathsChanged) {
-                const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-                const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-                setArchiveConfirmation({
-                  workspaceId,
-                  displayTitle,
-                  buttonElement,
-                  untrackedPaths: preflight.data.paths,
-                  isStreaming: (() => {
-                    const aggregator = workspaceStore.getAggregator(workspaceId);
-                    if (!aggregator) return false;
-                    const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
-                    const isStarting =
-                      aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
-                    const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-                    return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-                  })(),
-                });
-                return false;
-              }
+          displayTitle,
+          buttonElement,
+          untrackedPaths: result.data.paths,
+          // The retry path already handled any earlier streaming warning. Only surface the
+          // interruption warning again when the archive attempt has not yet been confirmed.
+          isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
+        });
+        return false;
+      }
+      if (!result.success) {
+        if (acknowledgedUntrackedPaths != null) {
+          // Archive may fail if new untracked files appear between confirmation and capture.
+          // Re-run preflight so we can reopen the modal with the latest paths.
+          const preflight = await preflightArchiveWorkspace(workspaceId);
+          if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
+            const pathsChanged = didUntrackedPathSetChange(
+              acknowledgedUntrackedPaths,
+              preflight.data.paths
+            );
+            if (pathsChanged) {
+              const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
+              const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
+              setArchiveConfirmation({
+                workspaceId,
+                displayTitle,
+                buttonElement,
+                untrackedPaths: preflight.data.paths,
+                isStreaming: (() => {
+                  const aggregator = workspaceStore.getAggregator(workspaceId);
+                  if (!aggregator) return false;
+                  const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
+                  const isStarting =
+                    aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
+                  const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
+                  return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
+                })(),
+              });
+              return false;
             }
           }
-
-          const error = result.error ?? "Failed to archive chat";
-          // Archive failures can be long-lived workflow errors (for example, untracked-file safety
-          // checks) that users should notice near the active workspace content, not pinned beside a
-          // left-sidebar row that may be far from their current focus. Use the shared toast fallback
-          // position so archive errors match other top-right UI error surfaces.
-          workspaceArchiveError.showError(workspaceId, error);
-          return false;
         }
-        return true;
-      } finally {
-        // Clear archiving state
-        setArchivingWorkspaceIds((prev) => {
-          const next = new Set(prev);
-          next.delete(workspaceId);
-          return next;
-        });
+
+        const error = result.error ?? "Failed to archive chat";
+        // Archive failures can be long-lived workflow errors (for example, untracked-file safety
+        // checks) that users should notice near the active workspace content, not pinned beside a
+        // left-sidebar row that may be far from their current focus. Use the shared toast fallback
+        // position so archive errors match other top-right UI error surfaces.
+        workspaceArchiveError.showError(workspaceId, error);
+        return false;
       }
+      return true;
     },
     [onArchiveWorkspace, preflightArchiveWorkspace, workspaceArchiveError, workspaceStore]
   );
@@ -1218,6 +1206,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleArchiveWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
+      // The keyboard shortcut bypasses the row's disabled state, so guard here as well.
+      if (archivingWorkspaceIds.has(workspaceId)) return;
       const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
       const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
       const isStreaming = hasActiveStream(workspaceId);
@@ -1250,6 +1240,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       await performArchiveWorkspace(workspaceId, buttonElement);
     },
     [
+      archivingWorkspaceIds,
       hasActiveStream,
       performArchiveWorkspace,
       preflightArchiveWorkspace,
