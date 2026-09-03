@@ -4310,10 +4310,10 @@ export class WorkspaceTurnManager {
    * Whether a continuation of this exact delegated turn is pending or streaming.
    * Pending entries must carry the same correlation metadata as the ended stream.
    */
-  private hasSameTurnContinuation(
+  private async hasSameTurnContinuation(
     event: StreamEndEvent,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
-  ): boolean {
+  ): Promise<boolean> {
     if (
       this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
         type: "workspace-turn-task",
@@ -4322,7 +4322,9 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
+    // A stream that ended with "tool-calls" while a wake is outstanding yielded to that
+    // wake; the wake turn inherits this correlation (inheritOpenWorkspaceTurnMetadata).
+    if (await this.workspaceService.hasOutstandingBashMonitorWake(event.workspaceId)) {
       return true;
     }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
@@ -4480,16 +4482,16 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    // A queued continuation can stop the in-flight stream at a tool boundary with
-    // finishReason "tool-calls" and continue the same delegated turn. Report
-    // wake-ups carry the exact correlation explicitly; bash-monitor wakes inherit
-    // it from history. Defer settlement until the continuation's terminal
+    // A queued continuation (or an outstanding bash-monitor wake) can stop the
+    // in-flight stream at a tool boundary with finishReason "tool-calls" and
+    // continue the same delegated turn. Report wake-ups carry the exact
+    // correlation explicitly; bash-monitor wakes inherit it from history. Defer settlement until the continuation's terminal
     // stream-end instead of reporting a false completion failure to the owner.
     // Any other queued input (manual message, /compact) supersedes the turn and
     // must settle the old outcome here.
     if (
       event.metadata.finishReason === "tool-calls" &&
-      this.hasSameTurnContinuation(event, metadata)
+      (await this.hasSameTurnContinuation(event, metadata))
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;

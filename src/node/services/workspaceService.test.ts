@@ -239,6 +239,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       acknowledgeMonitorWake: mock(() => undefined),
       dropRetiredMonitor: mock(() => undefined),
       setMessageQueued: mock(() => undefined),
+      cleanup: mock(() => Promise.resolve()),
     }) as unknown as BackgroundProcessManager;
     const service = createWorkspaceServiceForTest({
       config,
@@ -255,7 +256,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
-    const discardProcess = mock(() => Promise.resolve());
     const upsert = mock(() => Promise.resolve());
     const remove = mock(() => Promise.resolve());
     const recordTerminal = mock(() => Promise.resolve());
@@ -263,7 +263,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: {
         scheduleReconcile: typeof scheduleReconcile;
-        discardProcess: typeof discardProcess;
       };
       bashMonitorRegistryStore: {
         upsert: typeof upsert;
@@ -273,7 +272,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
       internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
       const armed = {
         processId: "proc",
@@ -297,7 +296,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       }
 
       expect(upsert).toHaveBeenCalledWith(armed);
-      expect(discardProcess).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
@@ -505,7 +503,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   test("cancellation invalidates a scheduled runtime failure persistence retry", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
-    const discardProcess = mock(() => Promise.resolve());
     const upsert = mock(() => Promise.resolve());
     const remove = mock(() => Promise.resolve());
     const recordLost = mock(() => Promise.reject(new Error("transient registry write failure")));
@@ -513,7 +510,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: {
         scheduleReconcile: typeof scheduleReconcile;
-        discardProcess: typeof discardProcess;
       };
       bashMonitorRegistryStore: {
         upsert: typeof upsert;
@@ -524,7 +520,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
+      internal.bashMonitorWakeReconciler = { scheduleReconcile };
       internal.bashMonitorRegistryStore = {
         upsert,
         remove,
@@ -560,11 +556,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(recordLost).toHaveBeenCalledTimes(1);
       expect(upsert).toHaveBeenCalledTimes(1);
       expect(remove).toHaveBeenCalledWith("owner", armMetadata.processId, armMetadata.createdAt);
-      expect(discardProcess).toHaveBeenCalledWith(
-        "owner",
-        armMetadata.processId,
-        armMetadata.createdAt
-      );
       // The invalidated chain must also release its tracking entry so the
       // per-process failure-persist map stays bounded by in-flight chains.
       const tracking = (
@@ -748,8 +739,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
-        cancelSignal: AbortSignal;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
@@ -761,8 +750,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey: "wake",
-        cancelSignal: new AbortController().signal,
         onAccepted,
         onDeferred,
       });
@@ -774,7 +761,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("active session-backed streams queue monitor wakes at tool end", async () => {
+  test("streaming owners never queue a wake: the stream yields on the level instead", async () => {
     const { config, service, cleanup } = await createWakeWiringService();
     const workspaceId = "streaming-wake-owner";
     await config.addWorkspace("/tmp/streaming-wake-project", {
@@ -784,34 +771,18 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       projectPath: "/tmp/streaming-wake-project",
       runtimeConfig: { type: "local" },
     });
-    let queuedMode: string | undefined;
-    let queuedCancelState: { canceledBeforeAcceptance: boolean } | undefined;
-    const sendMessage = mock(
-      (
-        _workspaceId: string,
-        _prompt: string,
-        options: { queueDispatchMode?: string },
-        internal?: { cancelState?: { canceledBeforeAcceptance: boolean } }
-      ) => {
-        queuedMode = options.queueDispatchMode;
-        queuedCancelState = internal?.cancelState;
-        return Promise.resolve(Ok(undefined));
-      }
-    );
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
     const afterIdle = mock(() => undefined);
     const internal = service as unknown as {
       aiService: { isStreaming(workspaceId: string): boolean };
       hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
       isBusyForMessage(workspaceId: string): boolean;
       scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
-      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
       sendMessage: typeof sendMessage;
       dispatchBashMonitorWake(dispatch: {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
-        cancelSignal: AbortSignal;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
@@ -821,71 +792,98 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       internal.hasPendingQueuedOrPreparingTurn = () => false;
       internal.isBusyForMessage = () => true;
       internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
-      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
       internal.sendMessage = sendMessage;
 
       const outcome = await internal.dispatchBashMonitorWake({
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey: "wake",
-        cancelSignal: new AbortController().signal,
         onAccepted: () => Promise.resolve(),
         onDeferred: () => Promise.resolve(),
       });
 
-      expect(outcome).toBe("in-flight");
-      expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(queuedMode).toBe("tool-end");
-      expect(queuedCancelState).toEqual({ canceledBeforeAcceptance: false });
+      expect(outcome).toBe("deferred");
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(afterIdle).toHaveBeenCalledWith(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a stream without a busy session defers without re-arming the idle wait", async () => {
+    // The idle wait resolves immediately when no session is busy, so re-arming here would
+    // spin reconcile → defer → re-arm until the stream ends; stream-end schedules instead.
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "orphan-stream-wake-owner";
+    await config.addWorkspace("/tmp/orphan-stream-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "orphan-stream-wake-project",
+      projectPath: "/tmp/orphan-stream-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const afterIdle = mock(() => undefined);
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    try {
+      internal.aiService = { isStreaming: () => true };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => false;
+      internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
+      internal.sendMessage = sendMessage;
+
+      const outcome = await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        onAccepted: () => Promise.resolve(),
+        onDeferred: () => Promise.resolve(),
+      });
+
+      expect(outcome).toBe("deferred");
+      expect(sendMessage).not.toHaveBeenCalled();
       expect(afterIdle).not.toHaveBeenCalled();
     } finally {
       await cleanup();
     }
   });
 
-  test("withdrawing a queued monitor wake removes it and releases its dedupe key", async () => {
+  test("idle owners receive the wake as a direct synthetic turn", async () => {
     const { config, service, cleanup } = await createWakeWiringService();
-    const workspaceId = "withdrawn-wake-owner";
-    await config.addWorkspace("/tmp/withdrawn-wake-project", {
+    const workspaceId = "idle-wake-owner";
+    await config.addWorkspace("/tmp/idle-wake-project", {
       id: workspaceId,
       name: workspaceId,
-      projectName: "withdrawn-wake-project",
-      projectPath: "/tmp/withdrawn-wake-project",
+      projectName: "idle-wake-project",
+      projectPath: "/tmp/idle-wake-project",
       runtimeConfig: { type: "local" },
     });
-    const session = service.getOrCreateSession(workspaceId);
-    const queuedModes: Array<"tool-end" | "turn-end" | null> = [];
-    // The real sendMessage queues behind a busy session; mirror only that branch.
+    let sentOptions: { queueDispatchMode?: string; muxMetadata?: unknown } | undefined;
     const sendMessage = mock(
       (
         _workspaceId: string,
-        prompt: string,
-        options: SendMessageOptions,
-        internal?: {
-          synthetic?: boolean;
-          agentInitiated?: boolean;
-          queueDedupeKey?: string;
-          removableQueueDedupeKey?: boolean;
-          cancelState?: { canceledBeforeAcceptance: boolean };
-          cancelSignal?: AbortSignal;
-          onCanceled?: (reason: string) => Promise<void> | void;
-        }
+        _prompt: string,
+        options: { queueDispatchMode?: string; muxMetadata?: unknown },
+        internal?: { onAccepted?: () => Promise<void> }
       ) => {
-        queuedModes.push(
-          session.queueMessage(prompt, options, {
-            synthetic: internal?.synthetic,
-            agentInitiated: internal?.agentInitiated,
-            dedupeKey: internal?.queueDedupeKey,
-            removableDedupeKey: internal?.removableQueueDedupeKey,
-            cancelState: internal?.cancelState,
-            cancelSignal: internal?.cancelSignal,
-            onCanceled: internal?.onCanceled,
-          })
-        );
-        return Promise.resolve(Ok(undefined));
+        sentOptions = options;
+        return internal?.onAccepted?.().then(() => Ok(undefined)) ?? Promise.resolve(Ok(undefined));
       }
     );
+    const onAccepted = mock(() => Promise.resolve());
     const internal = service as unknown as {
       aiService: { isStreaming(workspaceId: string): boolean };
       hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
@@ -896,50 +894,92 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
-        cancelSignal: AbortSignal;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
     };
-    const dedupeKey = "bash-monitor-wake:" + workspaceId + ":dispatch-1";
-    const onDeferred = mock(() => Promise.resolve());
-    const dispatch = (cancelSignal: AbortSignal) =>
-      internal.dispatchBashMonitorWake({
-        ownerWorkspaceId: workspaceId,
-        prompt: "wake",
-        muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey,
-        cancelSignal,
-        onAccepted: () => Promise.resolve(),
-        onDeferred,
-      });
     try {
-      internal.aiService = { isStreaming: () => true };
+      internal.aiService = { isStreaming: () => false };
       internal.hasPendingQueuedOrPreparingTurn = () => false;
-      internal.isBusyForMessage = () => true;
+      internal.isBusyForMessage = () => false;
       internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
       internal.sendMessage = sendMessage;
 
-      const controller = new AbortController();
-      expect(await dispatch(controller.signal)).toBe("in-flight");
-      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+      const outcome = await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        onAccepted,
+        onDeferred: () => Promise.resolve(),
+      });
 
-      controller.abort("output already shown");
-      expect(session.hasQueuedMessages()).toBe(false);
-      expect(service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, dedupeKey)).toEqual(Ok(0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(onDeferred).toHaveBeenCalledTimes(1);
-
-      // Already withdrawn at dispatch: never reaches the send, so nothing can be enqueued.
-      expect(await dispatch(controller.signal)).toBe("deferred");
+      expect(outcome).toBe("in-flight");
       expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(session.hasQueuedMessages()).toBe(false);
-      expect(onDeferred).toHaveBeenCalledTimes(1);
-
-      expect(await dispatch(new AbortController().signal)).toBe("in-flight");
-      expect(queuedModes).toEqual(["tool-end", "tool-end"]);
+      expect(sentOptions?.queueDispatchMode).toBeUndefined();
+      expect(sentOptions?.muxMetadata).toEqual({ type: "bash-monitor-wake", records: [] });
+      expect(onAccepted).toHaveBeenCalledTimes(1);
     } finally {
+      await cleanup();
+    }
+  });
+
+  test("the stream yields on the wake level, not on a queued snapshot of it", async () => {
+    // Regression: a monitored bash matched mid-step while the same step's task_await showed
+    // the matched lines. The old queued tool-end wake still cut the stream (finishReason
+    // "tool-calls") and was then withdrawn, ending the turn with no assistant text.
+    const { service, cleanup } = await createWakeWiringService();
+    const workspaceId = "level-yield-owner";
+    const createdAt = "2026-08-31T12:00:00.000Z";
+    const internal = service as unknown as {
+      backgroundProcessManager: {
+        pullMonitorWakeSignals: ReturnType<typeof mock>;
+        getMonitorWakeDeliveryState: ReturnType<typeof mock>;
+        setMessageQueued: ReturnType<typeof mock>;
+      };
+    };
+    const processManager = internal.backgroundProcessManager;
+    const session = service.getOrCreateSession(workspaceId);
+    try {
+      processManager.pullMonitorWakeSignals.mockImplementation(() =>
+        Promise.resolve([
+          {
+            processId: "proc",
+            taskId: "bash:proc",
+            ownerWorkspaceId: workspaceId,
+            filter: "READY",
+            filterExclude: false,
+            script: "run",
+            createdAt,
+            match: { throughOffset: 12, lines: ["READY"], totalMatches: 1 },
+            retired: false,
+          },
+        ])
+      );
+      let shownThroughOffset = 0;
+      processManager.getMonitorWakeDeliveryState.mockImplementation(() =>
+        Promise.resolve({ status: "settled", shownThroughOffset, terminalStatusShown: false })
+      );
+
+      // Match not yet shown: the boundary yields and bash long-polls return early.
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      expect(processManager.setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
+      expect(session.hasQueuedMessages()).toBe(false);
+
+      // task_await showed the lines before the SDK asked: no yield, no wake turn.
+      shownThroughOffset = 12;
+      expect(await session.hasPendingToolEndInput()).toBe(false);
+      expect(processManager.setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
+      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(false);
+
+      // A queued tool-end message still yields on its own.
+      session.queueMessage("follow up", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+    } finally {
+      session.dispose();
       await cleanup();
     }
   });
@@ -9175,35 +9215,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     } else {
       expect(resetAutoResumeCount).not.toHaveBeenCalled();
     }
-  });
-
-  test("refuses to queue a send whose cancel signal already fired", async () => {
-    fakeSession.isBusy.mockReturnValue(true);
-    const controller = new AbortController();
-    controller.abort("monitor withdrawn");
-    const onCanceled = mock(() => undefined);
-    const cancelState = { canceledBeforeAcceptance: false };
-
-    const result = await workspaceService.sendMessage(
-      "test-workspace",
-      "wake",
-      { model: "openai:gpt-4o-mini", agentId: "exec" },
-      {
-        synthetic: true,
-        agentInitiated: true,
-        cancelSignal: controller.signal,
-        cancelState,
-        onCanceled,
-        queueDedupeKey: "bash-monitor-wake:test-workspace:1",
-        removableQueueDedupeKey: true,
-      }
-    );
-
-    expect(result.success).toBe(true);
-    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
-    expect(onCanceled).toHaveBeenCalledTimes(1);
-    expect(onCanceled).toHaveBeenCalledWith("monitor withdrawn");
-    expect(cancelState.canceledBeforeAcceptance).toBe(true);
   });
 
   test("strips stale workspace-turn correlation behind an earlier queued entry", async () => {

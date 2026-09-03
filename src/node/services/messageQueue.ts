@@ -93,13 +93,6 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 
-/** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
-export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
-  return typeof signal.reason === "string"
-    ? signal.reason
-    : "Queued message canceled before acceptance.";
-}
-
 /**
  * Input poised to take over a session at a queue cut (see
  * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
@@ -132,10 +125,6 @@ interface QueuedMessageInternalOptions {
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
-  /** Mutable dispatch outcome shared with sendQueuedMessages. */
-  cancelState?: { canceledBeforeAcceptance: boolean };
-  /** Cancels a queued entry even after it has been dequeued into PREPARING. */
-  cancelSignal?: AbortSignal;
   /**
    * Synthetic rows persisted by AgentSession.sendMessage immediately before the
    * turn's user row (family-message payloads). Deferring them with the trigger
@@ -198,8 +187,6 @@ interface QueueEntry {
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-  cancelState?: { canceledBeforeAcceptance: boolean };
-  cancelSignal?: AbortSignal;
   /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
   preTurnMessages?: MuxMessage[];
   /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
@@ -271,13 +258,9 @@ export class MessageQueue {
     return this.entries[0]?.dispatchMode ?? "tool-end";
   }
 
-  /**
-   * Dispatch mode of the first entry whose cancel signal has not fired, or undefined
-   * when none remains. Aborted entries still drain FIFO (as no-ops that fire
-   * onCanceled), but they are not pending work and must not arm a tool-end stop.
-   */
+  /** Dispatch mode of the FIFO head, or undefined when the queue is empty. */
   getNextDispatchableMode(): QueueDispatchMode | undefined {
-    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true)?.dispatchMode;
+    return this.entries[0]?.dispatchMode;
   }
 
   /**
@@ -339,18 +322,6 @@ export class MessageQueue {
       return undefined;
     }
     return { muxMetadata: head.muxMetadata, dispatchMode: head.dispatchMode };
-  }
-
-  /**
-   * Whether the next entry to dispatch is a bash-monitor wake. Wake sends are
-   * the only queued input that continues an open delegated workspace turn
-   * (see AgentSession.inheritOpenWorkspaceTurnMetadata); any other head entry
-   * supersedes the turn when it dispatches.
-   */
-  isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
-    if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
-    return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
   }
 
   /**
@@ -512,8 +483,7 @@ export class MessageQueue {
     const incomingHasAcceptedCallbacks =
       internal?.onAccepted != null ||
       internal?.onAcceptedPreStreamFailure != null ||
-      internal?.onCanceled != null ||
-      internal?.cancelSignal != null;
+      internal?.onCanceled != null;
     const incomingIsUserAuthored =
       internal?.synthetic !== true && internal?.agentInitiated !== true;
     // Sealed entries must own their turn end-to-end: workspace-turn metadata and
@@ -626,12 +596,6 @@ export class MessageQueue {
             };
     }
 
-    if (internal?.cancelState != null) {
-      entry.cancelState = internal.cancelState;
-    }
-    if (internal?.cancelSignal != null) {
-      entry.cancelSignal = internal.cancelSignal;
-    }
     if (internal?.admissionStale != null) {
       entry.admissionStale = internal.admissionStale;
     }
@@ -891,7 +855,6 @@ export class MessageQueue {
       entry.onAccepted != null ||
       entry.onAcceptedPreStreamFailure != null ||
       entry.onCanceled != null ||
-      entry.cancelSignal != null ||
       entry.admissionStale != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
@@ -899,8 +862,6 @@ export class MessageQueue {
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
           ...(allAddsAreAgentInitiated ? { agentInitiated: true } : {}),
           ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-          ...(entry.cancelState != null ? { cancelState: entry.cancelState } : {}),
-          ...(entry.cancelSignal != null ? { cancelSignal: entry.cancelSignal } : {}),
           ...(entry.onAccepted != null ? { onAccepted: entry.onAccepted } : {}),
           ...(entry.onAcceptedPreStreamFailure != null
             ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }

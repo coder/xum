@@ -322,9 +322,6 @@ export interface SendMessageInternalOptions {
   onAccepted?: () => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-  cancelState?: { canceledBeforeAcceptance: boolean };
-  /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
-  cancelSignal?: AbortSignal;
   /**
    * Synchronous staleness probe from the caller, re-evaluated at the real admission points
    * (the enqueue block and the session's turn-admission gates) in addition to the
@@ -399,7 +396,10 @@ export interface TurnAdmissionHost {
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   hasPendingAutoRetry(workspaceId: string): boolean;
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
+  /** Bash-monitor wake level (see WorkspaceService.hasOutstandingBashMonitorWake). */
+  hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean>;
+  /** Pending input (queued tool-end message or outstanding wake) wants a tool boundary. */
+  isToolEndYieldRequested(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(
     workspaceId: string,
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>

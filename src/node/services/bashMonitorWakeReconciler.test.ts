@@ -130,51 +130,32 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
-  test("re-dispatches unchanged signals after a queued delivery is canceled", async () => {
+  test("re-dispatches unchanged signals after the owner defers an in-flight wake", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);
-    const queued = dispatches[0];
+    const inFlight = dispatches[0];
 
-    await queued.onDeferred();
+    await inFlight.onDeferred();
     await reconciler.reconcile(OWNER);
 
     expect(dispatches).toHaveLength(2);
   });
 
-  test("superseding a queued wake uses a distinct queue key", async () => {
-    const queuedKeys = new Set<string>();
-    const queuedDispatches: BashMonitorWakeDispatch[] = [];
-    const queueing = new BashMonitorWakeReconciler({
-      sessionsDir: root,
-      processManager: {
-        pullMonitorWakeSignals: () => live,
-        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
-        acknowledgeMonitorWake: () => undefined,
-        dropRetiredMonitor: () => undefined,
-      },
-      registry: {
-        listAll: () => Promise.resolve([]),
-        remove: () => undefined,
-        recordTerminal: () => undefined,
-      },
-      onWake: (dispatch) => {
-        if (queuedKeys.has(dispatch.dedupeKey)) return "deferred";
-        queuedKeys.add(dispatch.dedupeKey);
-        queuedDispatches.push(dispatch);
-        return "in-flight";
-      },
-    });
+  test("hands out one wake at a time: a newer match waits for the in-flight acceptance", async () => {
     live = [liveSnapshot()];
-    await queueing.reconcile(OWNER);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+
     live = [
       liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
     ];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
 
-    await queueing.reconcile(OWNER);
-
-    expect(queuedDispatches).toHaveLength(2);
-    expect(queuedKeys.size).toBe(2);
-    expect(queuedDispatches[0].cancelSignal.aborted).toBe(true);
+    await dispatches[0].onAccepted();
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].prompt).toContain("READY again");
   });
 
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
@@ -198,25 +179,83 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(1);
   });
 
-  test("cancels a queued wake when the level no longer has an outstanding signal", async () => {
+  test("hasOutstandingWake reads the level without dispatching", async () => {
     live = [liveSnapshot()];
-    await reconciler.reconcile(OWNER);
-    const queued = dispatches[0];
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(true);
+    expect(dispatches).toHaveLength(0);
 
+    // A same-process blocking read will show the lines itself: not outstanding.
+    deliveryState = { status: "blocked", readSettled: new Promise<void>(() => undefined) };
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+
+    // Shown frontier past the match: the wake is gone, nothing to deliver later either.
     deliveryState = { status: "settled", shownThroughOffset: 12, terminalStatusShown: false };
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
     await reconciler.reconcile(OWNER);
-
-    expect(queued.cancelSignal.aborted).toBe(true);
-    await queued.onAccepted();
-    deliveryState = { status: "settled", shownThroughOffset: 0, terminalStatusShown: false };
-    await reconciler.reconcile(OWNER);
-    expect(dispatches).toHaveLength(1);
+    expect(dispatches).toHaveLength(0);
 
     live = [
       liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
     ];
-    await reconciler.reconcile(OWNER);
-    expect(dispatches).toHaveLength(2);
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(true);
+  });
+
+  test("publishes the level on every read", async () => {
+    const levels: boolean[] = [];
+    const publishing = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve([]),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      onWake: () => "deferred",
+      onOutstandingChanged: (_owner, outstanding) => {
+        levels.push(outstanding);
+      },
+    });
+    live = [liveSnapshot()];
+    await publishing.reconcile(OWNER);
+    deliveryState = { status: "settled", shownThroughOffset: 12, terminalStatusShown: false };
+    await publishing.hasOutstandingWake(OWNER);
+
+    expect(levels).toEqual([true, false]);
+  });
+
+  test("a full-history clear lowers the level without a follow-up read", async () => {
+    const levels: boolean[] = [];
+    const publishing = new BashMonitorWakeReconciler({
+      sessionsDir: root,
+      processManager: {
+        pullMonitorWakeSignals: () => live,
+        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+        acknowledgeMonitorWake: () => undefined,
+        dropRetiredMonitor: () => undefined,
+      },
+      registry: {
+        listAll: () => Promise.resolve([]),
+        remove: () => undefined,
+        recordTerminal: () => undefined,
+      },
+      onWake: () => "deferred",
+      onOutstandingChanged: (_owner, outstanding) => {
+        levels.push(outstanding);
+      },
+    });
+    live = [liveSnapshot()];
+    await publishing.reconcile(OWNER);
+    expect(levels).toEqual([true]);
+
+    // The consume path retires the signals it collects, so it must not republish them as
+    // outstanding (that would leave the owner's tool-end yield flag stuck high).
+    await publishing.beginFullHistoryClear(OWNER);
+    expect(levels).toEqual([true, false]);
   });
 
   test("advances the watermark only on acceptance and later delivers a newer match", async () => {
@@ -329,18 +368,18 @@ describe("BashMonitorWakeReconciler", () => {
     expect(restartedDispatches).toHaveLength(1);
   });
 
-  test("explicit cancellation retracts a queued wake without consuming a later generation", async () => {
+  test("accepting a wake whose processes vanished does not consume a later generation", async () => {
     live = [liveSnapshot()];
     rows = [registryRecord()];
     await reconciler.reconcile(OWNER);
-    const queued = dispatches[0];
+    const inFlight = dispatches[0];
 
     live = [];
     rows = [];
     await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
 
-    expect(queued.cancelSignal.aborted).toBe(true);
-    await queued.onAccepted();
+    await inFlight.onAccepted();
     live = [
       liveSnapshot({
         createdAt: "2026-08-31T12:03:00.000Z",

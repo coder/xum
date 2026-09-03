@@ -1,7 +1,7 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import type { MuxMessageMetadata } from "@/common/types/message";
-import { Err, Ok } from "@/common/types/result";
+import { Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
@@ -372,87 +372,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("withdrawn tool-end entry neither soft-stops nor hides a later entry's mode", async () => {
-    const workspaceId = "queue-dispatch-withdrawn-head";
-    const queuedSignals: boolean[] = [];
-    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
-      workspaceId,
-      backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
-        }),
-      },
-    });
-    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
-
-    try {
-      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-      const controller = new AbortController();
-      session.queueMessage(
-        "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
-        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
-      );
-      expect(session.hasQueuedMessages("tool-end")).toBe(true);
-
-      controller.abort("monitor withdrawn");
-      expect(session.hasQueuedMessages("tool-end")).toBe(false);
-      expect(session.hasQueuedMessages()).toBe(false);
-
-      aiEmitter.emit("tool-call-end", {
-        ...toolCallEndEvent(workspaceId),
-        toolName: "web_search",
-        providerExecuted: true,
-      });
-      expect(stopStream).not.toHaveBeenCalled();
-
-      session.queueMessage("follow up", {
-        model: TEST_MODEL,
-        agentId: "exec",
-        queueDispatchMode: "turn-end",
-      });
-      expect(session.hasQueuedMessages("tool-end")).toBe(false);
-      expect(session.hasQueuedMessages("turn-end")).toBe(true);
-      expect(queuedSignals).toEqual([true, false]);
-    } finally {
-      stopStream.mockRestore();
-      session.dispose();
-      await cleanup();
-    }
-  });
-
-  test.each([
-    ["turn-end", "tool-end"],
-    ["tool-end", "turn-end"],
-  ] as const)(
-    "queueMessage reports the live entry's mode behind a withdrawn %s head",
-    async (withdrawnMode, liveMode) => {
-      const { session, cleanup } = await createAgentSessionHarness({
-        workspaceId: "queue-dispatch-withdrawn-" + withdrawnMode + "-head",
-      });
-      try {
-        const controller = new AbortController();
-        session.queueMessage(
-          "Background monitor wake",
-          { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
-          { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
-        );
-        controller.abort("monitor withdrawn");
-
-        expect(
-          session.queueMessage("follow up", {
-            model: TEST_MODEL,
-            agentId: "exec",
-            queueDispatchMode: liveMode,
-          })
-        ).toBe(liveMode);
-      } finally {
-        session.dispose();
-        await cleanup();
-      }
-    }
-  );
-
   test("waits for every known sibling before stopping after a provider-executed result", async () => {
     const workspaceId = "queue-dispatch-provider-siblings";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
@@ -706,316 +625,70 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("cancel signal retracts a synthetic entry after dequeue while history append is preparing", async () => {
-    const workspaceId = "queue-dispatch-cancel-preparing";
-    const { session, cleanup, historyService, events } = await createAgentSessionHarness({
+  test("hasPendingToolEndInput unions the queued tool-end head with the live wake level", async () => {
+    const workspaceId = "queue-dispatch-pending-tool-end-input";
+    let level: () => Promise<boolean> = () => Promise.resolve(false);
+    const { session, cleanup } = await createAgentSessionHarness({
       workspaceId,
-      captureEvents: true,
+      hasOutstandingBashMonitorWake: () => level(),
     });
-    const originalAppend = historyService.appendToHistory.bind(historyService);
-    let markAppendStarted: () => void = () => undefined;
-    const appendStarted = new Promise<void>((resolve) => {
-      markAppendStarted = resolve;
-    });
-    let releaseAppend: () => void = () => undefined;
-    const appendRelease = new Promise<void>((resolve) => {
-      releaseAppend = resolve;
-    });
-    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
-      async (...args) => {
-        markAppendStarted();
-        await appendRelease;
-        return originalAppend(...args);
-      }
-    );
-
     try {
-      const controller = new AbortController();
-      const cancelState = { canceledBeforeAcceptance: false };
-      const canceledReasons: string[] = [];
-      session.queueMessage(
-        "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          cancelState,
-          cancelSignal: controller.signal,
-          onCanceled: (reason) => {
-            canceledReasons.push(reason);
-          },
-        }
-      );
+      expect(await session.hasPendingToolEndInput()).toBe(false);
 
-      session.sendQueuedMessages();
-      await appendStarted;
-      controller.abort("monitor canceled");
-      releaseAppend();
+      // The level is read live — no snapshot survives from one boundary to the next.
+      level = () => Promise.resolve(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      level = () => Promise.resolve(false);
+      expect(await session.hasPendingToolEndInput()).toBe(false);
 
-      expect(await waitForCondition(() => canceledReasons.length === 1)).toBe(true);
-      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
-      expect(canceledReasons).toEqual(["monitor canceled"]);
+      // A failing level read must not cut the stream.
+      level = () => Promise.reject(new Error("watermark read failed"));
+      expect(await session.hasPendingToolEndInput()).toBe(false);
 
-      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success).toBe(true);
-      if (history.success) {
-        expect(
-          history.data.some((message) =>
-            message.parts.some(
-              (part) => part.type === "text" && part.text === "Background monitor wake"
-            )
-          )
-        ).toBe(false);
-      }
-      expect(
-        events.some(
-          (event) =>
-            event.type === "message" &&
-            event.role === "user" &&
-            event.parts.some(
-              (part) => part.type === "text" && part.text === "Background monitor wake"
-            )
-        )
-      ).toBe(false);
+      // Queue head decides independently of the level, and only for tool-end.
+      level = () => Promise.resolve(false);
+      session.queueMessage("later", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(await session.hasPendingToolEndInput()).toBe(false);
+      session.clearQueue();
+      session.queueMessage("now", { model: TEST_MODEL, agentId: "exec" });
+      expect(await session.hasPendingToolEndInput()).toBe(true);
     } finally {
-      releaseAppend();
-      appendSpy.mockRestore();
       session.dispose();
       await cleanup();
     }
   });
 
-  test("rollback failure preserves the wake and continues acceptance", async () => {
-    const workspaceId = "queue-dispatch-cancel-rollback-failure";
-    const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });
-    const originalAppend = historyService.appendToHistory.bind(historyService);
-    let markAppendStarted: () => void = () => undefined;
-    const appendStarted = new Promise<void>((resolve) => {
-      markAppendStarted = resolve;
-    });
-    let releaseAppend: () => void = () => undefined;
-    const appendRelease = new Promise<void>((resolve) => {
-      releaseAppend = resolve;
-    });
-    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
-      async (...args) => {
-        markAppendStarted();
-        await appendRelease;
-        return originalAppend(...args);
-      }
-    );
-    const deleteMessagesSpy = spyOn(historyService, "deleteMessages").mockResolvedValue(
-      Err("injected rollback failure")
-    );
-
-    try {
-      const controller = new AbortController();
-      const cancelState = { canceledBeforeAcceptance: false };
-      const canceledReasons: string[] = [];
-      let accepted = false;
-      const sendPromise = session.sendMessage(
-        "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          cancelState,
-          cancelSignal: controller.signal,
-          onCanceled: (reason) => {
-            canceledReasons.push(reason);
-          },
-          onAccepted: () => {
-            accepted = true;
-          },
-        }
-      );
-
-      await appendStarted;
-      controller.abort("monitor canceled");
-      releaseAppend();
-      const result = await sendPromise;
-
-      expect(result.success).toBe(true);
-      expect(deleteMessagesSpy).toHaveBeenCalledTimes(1);
-      expect(canceledReasons).toEqual([]);
-      expect(cancelState.canceledBeforeAcceptance).toBe(false);
-      expect(accepted).toBe(true);
-
-      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success).toBe(true);
-      if (history.success) {
-        expect(
-          history.data.some((message) =>
-            message.parts.some(
-              (part) => part.type === "text" && part.text === "Background monitor wake"
-            )
-          )
-        ).toBe(true);
-      }
-    } finally {
-      releaseAppend();
-      deleteMessagesSpy.mockRestore();
-      appendSpy.mockRestore();
-      session.dispose();
-      await cleanup();
-    }
-  });
-
-  test("verifies a committed rollback when batch deletion reports a post-write failure", async () => {
-    const workspaceId = "queue-dispatch-cancel-post-write-failure";
-    const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });
-    const originalAppend = historyService.appendToHistory.bind(historyService);
-    const originalDeleteMessages = historyService.deleteMessages.bind(historyService);
-    let markAppendStarted: () => void = () => undefined;
-    const appendStarted = new Promise<void>((resolve) => {
-      markAppendStarted = resolve;
-    });
-    let releaseAppend: () => void = () => undefined;
-    const appendRelease = new Promise<void>((resolve) => {
-      releaseAppend = resolve;
-    });
-    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
-      async (...args) => {
-        markAppendStarted();
-        await appendRelease;
-        return originalAppend(...args);
-      }
-    );
-    const deleteMessagesSpy = spyOn(historyService, "deleteMessages").mockImplementation(
-      async (...args) => {
-        const result = await originalDeleteMessages(...args);
-        expect(result.success).toBe(true);
-        return Err("injected post-write failure");
-      }
-    );
-
-    try {
-      const controller = new AbortController();
-      const cancelState = { canceledBeforeAcceptance: false };
-      const canceledReasons: string[] = [];
-      let accepted = false;
-      const sendPromise = session.sendMessage(
-        "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          cancelState,
-          cancelSignal: controller.signal,
-          onCanceled: (reason) => {
-            canceledReasons.push(reason);
-          },
-          onAccepted: () => {
-            accepted = true;
-          },
-        }
-      );
-
-      await appendStarted;
-      controller.abort("monitor canceled");
-      releaseAppend();
-      const result = await sendPromise;
-
-      expect(result.success).toBe(true);
-      expect(deleteMessagesSpy).toHaveBeenCalledTimes(1);
-      expect(canceledReasons).toEqual(["monitor canceled"]);
-      expect(cancelState.canceledBeforeAcceptance).toBe(true);
-      expect(accepted).toBe(false);
-
-      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success).toBe(true);
-      if (history.success) {
-        expect(
-          history.data.some((message) =>
-            message.parts.some(
-              (part) => part.type === "text" && part.text === "Background monitor wake"
-            )
-          )
-        ).toBe(false);
-      }
-    } finally {
-      releaseAppend();
-      deleteMessagesSpy.mockRestore();
-      appendSpy.mockRestore();
-      session.dispose();
-      await cleanup();
-    }
-  });
-
-  test("cancellation during goal sync crosses the acceptance point of no return", async () => {
-    const workspaceId = "queue-dispatch-cancel-goal-reconcile";
-    let markInitialSyncStarted: () => void = () => undefined;
-    const initialSyncStarted = new Promise<void>((resolve) => {
-      markInitialSyncStarted = resolve;
-    });
-    let releaseInitialSync: () => void = () => undefined;
-    const initialSyncRelease = new Promise<void>((resolve) => {
-      releaseInitialSync = resolve;
-    });
-    let syncCalls = 0;
-    const syncGoalModeWithChatTail = mock(async () => {
-      syncCalls += 1;
-      if (syncCalls === 1) {
-        markInitialSyncStarted();
-        await initialSyncRelease;
-      }
-      return null;
-    });
-    const workspaceGoalService = {
-      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
-      syncGoalModeWithChatTail,
-    } as unknown as WorkspaceGoalService;
-    const { session, cleanup, historyService } = await createAgentSessionHarness({
+  test("the wake level and the queue head jointly drive the bash early-return flag", async () => {
+    const workspaceId = "queue-dispatch-yield-flag";
+    const flags: boolean[] = [];
+    const { session, cleanup } = await createAgentSessionHarness({
       workspaceId,
-      workspaceGoalService,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: (_workspaceId: string, queued: boolean) => {
+          flags.push(queued);
+        },
+      },
     });
-
+    const lastFlag = () => flags.at(-1);
     try {
-      const controller = new AbortController();
-      const cancelState = { canceledBeforeAcceptance: false };
-      const canceledReasons: string[] = [];
-      let accepted = false;
-      const sendPromise = session.sendMessage(
-        "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          cancelState,
-          cancelSignal: controller.signal,
-          onCanceled: (reason) => {
-            canceledReasons.push(reason);
-          },
-          onAccepted: () => {
-            accepted = true;
-          },
-        }
-      );
+      session.setBashMonitorWakeOutstanding(true);
+      expect(lastFlag()).toBe(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(lastFlag()).toBe(false);
 
-      await initialSyncStarted;
-      controller.abort("monitor canceled");
-      releaseInitialSync();
-      const result = await sendPromise;
-
-      expect(result.success).toBe(true);
-      expect(syncGoalModeWithChatTail).toHaveBeenCalledTimes(1);
-      expect(canceledReasons).toEqual([]);
-      expect(cancelState.canceledBeforeAcceptance).toBe(false);
-      expect(accepted).toBe(true);
-
-      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(history.success).toBe(true);
-      if (history.success) {
-        expect(
-          history.data.some((message) =>
-            message.parts.some(
-              (part) => part.type === "text" && part.text === "Background monitor wake"
-            )
-          )
-        ).toBe(true);
-      }
+      // Clearing the queue while the level is high must not drop the flag.
+      session.queueMessage("follow up", { model: TEST_MODEL, agentId: "exec" });
+      expect(lastFlag()).toBe(true);
+      session.setBashMonitorWakeOutstanding(true);
+      session.clearQueue();
+      expect(lastFlag()).toBe(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(lastFlag()).toBe(false);
     } finally {
-      releaseInitialSync();
       session.dispose();
       await cleanup();
     }
@@ -1047,17 +720,17 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     let disposed = false;
     try {
-      const controller = new AbortController();
-      const cancelState = { canceledBeforeAcceptance: false };
       let accepted = false;
       const sendPromise = session.sendMessage(
         "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec" },
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
         {
           synthetic: true,
           agentInitiated: true,
-          cancelState,
-          cancelSignal: controller.signal,
           onAccepted: () => {
             accepted = true;
           },
@@ -1072,7 +745,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       expect(result.success).toBe(true);
       expect(accepted).toBe(true);
-      expect(cancelState.canceledBeforeAcceptance).toBe(false);
     } finally {
       releaseSync();
       if (!disposed) session.dispose();
@@ -1105,18 +777,18 @@ describe("AgentSession queued message tool-call dispatch", () => {
     });
 
     try {
-      const controller = new AbortController();
-      const cancelState = { canceledBeforeAcceptance: false };
       const canceledReasons: string[] = [];
       let accepted = false;
       const sendPromise = session.sendMessage(
         "Background monitor wake",
-        { model: TEST_MODEL, agentId: "exec" },
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
         {
           synthetic: true,
           agentInitiated: true,
-          cancelState,
-          cancelSignal: controller.signal,
           onCanceled: (reason) => {
             canceledReasons.push(reason);
           },
@@ -1139,7 +811,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       expect(accepted).toBe(true);
       expect(canceledReasons).toEqual([]);
-      expect(cancelState.canceledBeforeAcceptance).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
       if (history.success) {

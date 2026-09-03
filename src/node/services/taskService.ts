@@ -7768,7 +7768,7 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Background any registered foreground waits for the requesting workspace when a
-   * tool-end message is already queued. Shared by both wait-registration paths
+   * tool-end message is already queued or a bash-monitor wake is outstanding. Shared by both wait-registration paths
    * (workspace-turn and task await): the auto-backgrounding signal is edge-triggered
    * on enqueue, so a message queued before the waiter registered must be re-checked
    * here. No-op when backgrounding is disabled or no requesting workspace is set.
@@ -7780,7 +7780,7 @@ export class TaskService implements AgentTaskIntegration {
     if (
       shouldBackgroundOnQueuedMessage &&
       requestingWorkspaceId &&
-      this.workspaceService.hasQueuedMessages(requestingWorkspaceId, "tool-end")
+      this.workspaceService.isToolEndYieldRequested(requestingWorkspaceId)
     ) {
       this.backgroundForegroundWaitsForWorkspace(requestingWorkspaceId);
     }

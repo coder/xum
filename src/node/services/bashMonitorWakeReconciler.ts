@@ -101,12 +101,16 @@ export interface BashMonitorWakeReconcilerRegistry {
 
 export type BashMonitorWakeDispatchOutcome = "in-flight" | "deferred";
 
+/**
+ * A wake handed to the owner. Wakes are a LEVEL derived from process state, never a
+ * queued edge: the receiver either starts a turn from it now (`onAccepted`) or leaves it
+ * pending (`onDeferred` / "deferred") and re-reconciles later. There is nothing to cancel —
+ * a wake whose matched output is shown meanwhile simply stops deriving on the next read.
+ */
 export interface BashMonitorWakeDispatch {
   ownerWorkspaceId: string;
   prompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }>;
-  dedupeKey: string;
-  cancelSignal: AbortSignal;
   onAccepted(): Promise<void>;
   onDeferred(): Promise<void>;
 }
@@ -150,10 +154,8 @@ interface DerivedSignal {
   retired: boolean;
 }
 
+/** A wake handed to `onWake` whose acceptance/deferral has not settled yet. */
 interface DispatchState {
-  id: string;
-  signature: string;
-  controller: AbortController;
   signals: readonly DerivedSignal[];
   accepted: boolean;
 }
@@ -370,8 +372,24 @@ export class BashMonitorWakeReconciler {
       onWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome> | BashMonitorWakeDispatchOutcome;
+      /**
+       * Published on every level read (reconcile, snapshot, hasOutstandingWake) so the
+       * owner can mirror "pending input wants a tool boundary" side effects (early
+       * long-poll return, backgrounding foreground waits) from the level itself.
+       */
+      onOutstandingChanged?(ownerWorkspaceId: string, outstanding: boolean): void;
     }
   ) {}
+
+  /**
+   * The wake level: whether the owner has a wake it has not seen yet. Same-process
+   * blocking reads (deferredReads) are not outstanding — the read shows the lines itself.
+   * Consumers: the stream's tool-boundary stop condition and delegated-turn settlement.
+   */
+  async hasOutstandingWake(ownerWorkspaceId: string): Promise<boolean> {
+    if (this.defunctWorkspaces.has(ownerWorkspaceId)) return false;
+    return (await this.snapshot(ownerWorkspaceId)).pendingWakeKinds.size > 0;
+  }
 
   scheduleReconcile(ownerWorkspaceId: string): void {
     if (this.defunctWorkspaces.has(ownerWorkspaceId)) return;
@@ -421,26 +439,7 @@ export class BashMonitorWakeReconciler {
     return snapshot.pendingWakeKinds.get(processId);
   }
 
-  async discardProcess(
-    ownerWorkspaceId: string,
-    processId: string,
-    createdAt: string
-  ): Promise<void> {
-    await this.locks.withLock(ownerWorkspaceId, () => {
-      const state = this.state(ownerWorkspaceId);
-      if (
-        state.dispatch?.signals.some(
-          (signal) => signal.processId === processId && signal.createdAt === createdAt
-        ) === true
-      ) {
-        state.dispatch.controller.abort();
-        state.dispatch = undefined;
-      }
-      return Promise.resolve();
-    });
-  }
   async beginFullHistoryClear(ownerWorkspaceId: string): Promise<BashMonitorFullHistoryClearToken> {
-    this.abortDispatch(ownerWorkspaceId);
     await this.consumeCurrent(ownerWorkspaceId);
     return { ownerWorkspaceId };
   }
@@ -453,8 +452,6 @@ export class BashMonitorWakeReconciler {
     this.defunctWorkspaces.add(ownerWorkspaceId);
     this.resetRetry(ownerWorkspaceId);
     await this.locks.withLock(ownerWorkspaceId, () => {
-      const state = this.states.get(ownerWorkspaceId);
-      state?.dispatch?.controller.abort();
       this.states.delete(ownerWorkspaceId);
       return Promise.resolve();
     });
@@ -514,32 +511,11 @@ export class BashMonitorWakeReconciler {
       await this.cleanup(collected.autoConsumed);
 
       const state = this.state(ownerWorkspaceId);
-      if (collected.signals.length === 0) {
-        state.dispatch?.controller.abort();
-        state.dispatch = undefined;
-        return undefined;
-      }
-
-      const signature = JSON.stringify(
-        collected.signals.map((signal) => [
-          signal.key,
-          signal.kind,
-          signal.matchOffset,
-          signal.terminal?.settledAt,
-          signal.matchedOutputAlreadyShown,
-        ])
-      );
-      if (state.dispatch?.signature === signature && !state.dispatch.controller.signal.aborted) {
-        return undefined;
-      }
-      state.dispatch?.controller.abort();
-      const next: DispatchState = {
-        id: randomUUID(),
-        signature,
-        controller: new AbortController(),
-        signals: collected.signals,
-        accepted: false,
-      };
+      // A wake already handed to the owner settles on its own (accept → watermarks advance
+      // and a reconcile is scheduled; defer → the owner re-arms a reconcile). Handing out a
+      // second one meanwhile could only duplicate or supersede the first.
+      if (collected.signals.length === 0 || state.dispatch != null) return undefined;
+      const next: DispatchState = { signals: collected.signals, accepted: false };
       state.dispatch = next;
       return next;
     });
@@ -550,18 +526,12 @@ export class BashMonitorWakeReconciler {
         ownerWorkspaceId,
         prompt: buildPrompt(dispatch.signals),
         muxMetadata: buildMetadata(dispatch.signals),
-        dedupeKey: "bash-monitor-wake:" + ownerWorkspaceId + ":" + dispatch.id,
-        cancelSignal: dispatch.controller.signal,
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
       });
       if (outcome === "deferred") await this.defer(ownerWorkspaceId, dispatch);
     } catch (error) {
-      await this.locks.withLock(ownerWorkspaceId, () => {
-        const state = this.state(ownerWorkspaceId);
-        if (state.dispatch === dispatch) state.dispatch = undefined;
-        return Promise.resolve();
-      });
+      await this.defer(ownerWorkspaceId, dispatch);
       throw error;
     }
   }
@@ -575,7 +545,9 @@ export class BashMonitorWakeReconciler {
   }
   private async accept(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
-      if (dispatch.accepted || dispatch.controller.signal.aborted) return;
+      // The prompt reached the model, so its signals are consumed even if a full-history
+      // clear or process discard forgot this dispatch meanwhile.
+      if (dispatch.accepted) return;
       dispatch.accepted = true;
       const watermarks = await this.readWatermarks(ownerWorkspaceId);
       await this.advanceWatermarks(ownerWorkspaceId, watermarks, dispatch.signals);
@@ -586,19 +558,15 @@ export class BashMonitorWakeReconciler {
     this.scheduleReconcile(ownerWorkspaceId);
   }
 
-  private abortDispatch(ownerWorkspaceId: string): void {
-    const state = this.state(ownerWorkspaceId);
-    state.dispatch?.controller.abort();
-    state.dispatch = undefined;
-  }
-
   private async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
-      this.abortDispatch(ownerWorkspaceId);
       const collected = await this.collect(ownerWorkspaceId, false);
       const consumed = [...collected.signals, ...collected.autoConsumed];
       await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
       await this.cleanup(consumed);
+      // Everything collected is consumed, so the level is low by construction; publish it
+      // here because no read follows a consume.
+      this.args.onOutstandingChanged?.(ownerWorkspaceId, false);
     });
   }
 
@@ -674,6 +642,9 @@ export class BashMonitorWakeReconciler {
     signals.sort(
       (a, b) => a.createdAt.localeCompare(b.createdAt) || a.processId.localeCompare(b.processId)
     );
+    // Only level reads publish; the consume path (applyFrontier=false) is about to retire
+    // these very signals and publishes low itself.
+    if (applyFrontier) this.args.onOutstandingChanged?.(ownerWorkspaceId, signals.length > 0);
     return { signals, autoConsumed, deferredReads, watermarks };
   }
 

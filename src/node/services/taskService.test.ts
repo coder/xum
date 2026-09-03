@@ -347,7 +347,7 @@ describe("TaskService", () => {
       isStreaming?: ReturnType<typeof mock>;
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
-      hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
+      hasOutstandingBashMonitorWake?: ReturnType<typeof mock>;
       hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
@@ -14116,7 +14116,7 @@ describe("TaskService", () => {
       expect(count2).toBe(0);
     });
 
-    test("backgrounds waiters when tool-end message was already queued", async () => {
+    test("backgrounds waiters when tool-end input was already pending", async () => {
       const config = await createTestConfig(rootDir);
 
       const parentId = "parent-ws";
@@ -14140,8 +14140,9 @@ describe("TaskService", () => {
         testTaskSettings(2, 3)
       );
 
-      const hasQueuedMessages = mock(() => true);
-      const { workspaceService } = createWorkspaceServiceMocks({ hasQueuedMessages });
+      // The union flag: a queued tool-end message or an outstanding bash-monitor wake.
+      const isToolEndYieldRequested = mock(() => true);
+      const { workspaceService } = createWorkspaceServiceMocks({ isToolEndYieldRequested });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const internal = taskService as unknown as {
         backgroundableForegroundWaitersByWorkspaceId: Map<string, Set<unknown>>;
@@ -14157,7 +14158,7 @@ describe("TaskService", () => {
         .catch((error: unknown) => error);
 
       expect(waitError).toBeInstanceOf(ForegroundWaitBackgroundedError);
-      expect(hasQueuedMessages).toHaveBeenCalledWith(parentId, "tool-end");
+      expect(isToolEndYieldRequested).toHaveBeenCalledWith(parentId);
       expect(taskService.backgroundForegroundWaitsForWorkspace(parentId)).toBe(0);
       expect(internal.backgroundableForegroundWaitersByWorkspaceId.has(parentId)).toBe(false);
       expect(internal.pendingStartWaitersByTaskId.has(childId)).toBe(false);
@@ -23851,15 +23852,15 @@ describe("TaskService", () => {
     expect(snapshot?.reportMarkdown).toBeUndefined();
   });
 
-  test("workspace-turn tool-calls stream-end defers to a queued wake continuation", async () => {
-    // A queued bash-monitor wake cuts the correlated stream at a tool boundary
-    // (finishReason "tool-calls") while the child seamlessly continues the
-    // same turn — the handle must stay running.
-    const hasPendingBashMonitorWakeContinuation = mock(
-      (workspaceId: string) => workspaceId === "childworkspace"
+  test("workspace-turn tool-calls stream-end defers to an outstanding wake", async () => {
+    // An outstanding bash-monitor wake makes the correlated stream yield at a tool
+    // boundary (finishReason "tool-calls"); the wake turn then continues the same
+    // turn — the handle must stay running.
+    const hasOutstandingBashMonitorWake = mock((workspaceId: string) =>
+      Promise.resolve(workspaceId === "childworkspace")
     );
     const { parentId, taskService } = await startWorkspaceTurnForTest({
-      hasPendingBashMonitorWakeContinuation,
+      hasOutstandingBashMonitorWake,
     });
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;

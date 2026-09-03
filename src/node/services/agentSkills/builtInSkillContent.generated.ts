@@ -7721,7 +7721,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Messages to a busy workspace enter its `MessageQueue` (`src/node/services/messageQueue.ts`) and dispatch at a boundary chosen by `queueDispatchMode`:",
       "",
-      '- `tool-end`: the stream\'s stop conditions include `hasQueuedMessages("tool-end")`, evaluated by the AI SDK only after every sibling tool result in the current step settles (`createStopWhenCondition`, `src/node/services/streamManager.ts`); `AgentSession` soft-stops only once `activeToolCallIds` is empty. **A running tool call is never interrupted** — same guarantee as Claude Code.',
+      "- `tool-end`: the stream's stop conditions include `hasPendingToolEndInput()` (a queued tool-end message or an outstanding bash-monitor wake, read live), evaluated by the AI SDK only after every sibling tool result in the current step settles (`createStopWhenCondition`, `src/node/services/streamManager.ts`); `AgentSession` soft-stops only once `activeToolCallIds` is empty. **A running tool call is never interrupted** — same guarantee as Claude Code.",
       "- `turn-end`: dispatches after the current turn completes.",
       "- Idle target: the message starts a new turn immediately.",
       "",

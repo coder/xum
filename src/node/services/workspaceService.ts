@@ -42,7 +42,6 @@ import {
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
-import { cancelReasonBeforeAcceptance } from "@/node/services/messageQueue";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
@@ -1925,11 +1924,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const persist = async (): Promise<boolean> => {
       if (payload.reason === "canceled") {
         if (createdAt == null) return false;
-        await this.bashMonitorWakeReconciler.discardProcess(
-          workspaceId,
-          payload.processId,
-          createdAt
-        );
         await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
         return true;
       }
@@ -2380,6 +2374,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
       registry: this.bashMonitorRegistryStore,
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
+      onOutstandingChanged: (ownerWorkspaceId, outstanding) => {
+        // The level drives the same tool-boundary side effects a queued tool-end message
+        // does: long-polling bash reads return early and foreground agent-task waits are
+        // backgrounded so the stream can reach the boundary where it yields to the wake.
+        this.sessions.get(ownerWorkspaceId)?.setBashMonitorWakeOutstanding(outstanding);
+        if (outstanding) {
+          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(ownerWorkspaceId);
+        }
+      },
     });
     if (typeof this.backgroundProcessManager.on === "function") {
       this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
@@ -2504,6 +2507,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.pendingBashMonitorWakeIdleWaitsByOwner.set(ownerWorkspaceId, promise);
   }
 
+  /**
+   * Start a wake turn from the level, or leave it pending. A wake is never queued as a
+   * message: while the owner streams, the stream itself reads the level at each tool
+   * boundary (AgentSession.hasPendingToolEndInput) and yields with finishReason
+   * "tool-calls"; the after-idle reconcile then lands here again and sends directly.
+   */
   private async dispatchBashMonitorWake(
     dispatch: BashMonitorWakeDispatch
   ): Promise<BashMonitorWakeDispatchOutcome> {
@@ -2515,16 +2524,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
         return "in-flight";
       }
-      const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
-      const hasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
-      const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
-      if (hasPendingTurn || (hasSessionBackedBusyState && !hasAiServiceStream)) {
+      if (
+        this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId) ||
+        this.isBusyForMessage(ownerWorkspaceId)
+      ) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
         return "deferred";
       }
-      if (hasAiServiceStream && !hasSessionBackedBusyState) {
-        return "deferred";
-      }
+      // Streaming without a busy session (teardown window, or no session at all): the
+      // after-idle wait would resolve immediately and spin. The stream-end/abort/error
+      // listeners schedule the next reconcile instead.
+      if (this.aiService.isStreaming(ownerWorkspaceId)) return "deferred";
       const sendOptions =
         (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
         (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
@@ -2533,43 +2543,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return "deferred";
       }
 
-      // Withdrawn while awaiting send options above: the abort listener below would never
-      // fire, and send preflight (which persists AI settings) has nothing left to admit.
-      if (dispatch.cancelSignal.aborted) return "deferred";
-
       let accepted = false;
-      // A queued wake can be superseded after dequeue. Share cancellation state so
-      // AgentSession can release PREPARING when cancellation wins before acceptance.
-      const cancelState = { canceledBeforeAcceptance: false };
-      // Withdrawal (output already shown, process discarded, history cleared) must
-      // free the queue slot now, not at stream end: a lingering entry keeps the
-      // workspace reported busy and its dedupe key held. The key is unique per
-      // dispatch, so this cannot drop a newer wake's entry.
-      dispatch.cancelSignal.addEventListener(
-        "abort",
-        () => {
-          this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, dispatch.dedupeKey, {
-            cancelReason: "Bash monitor wake withdrawn before dispatch.",
-          });
-        },
-        { once: true }
-      );
       const sendResult = await this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
-        {
-          ...sendOptions,
-          queueDispatchMode: "tool-end",
-          muxMetadata: dispatch.muxMetadata,
-        },
+        { ...sendOptions, muxMetadata: dispatch.muxMetadata },
         {
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
-          cancelState,
-          cancelSignal: dispatch.cancelSignal,
-          queueDedupeKey: dispatch.dedupeKey,
-          removableQueueDedupeKey: true,
           onAccepted: async () => {
             accepted = true;
             await dispatch.onAccepted();
@@ -2578,10 +2560,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           onAcceptedPreStreamFailure: async () => {
             if (accepted) await dispatch.onAccepted();
           },
+          // Idle owner, so this send does not queue; still, a manual send racing past the
+          // idle checks above can push it into the queue and clear it before dispatch.
           onCanceled: async () => {
             if (!accepted) {
               await dispatch.onDeferred();
-              this.scheduleBashMonitorWakeReconcile(ownerWorkspaceId);
+              this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
             }
           },
         }
@@ -4030,6 +4014,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      hasOutstandingBashMonitorWake: () =>
+        this.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId),
     });
   }
 
@@ -10766,8 +10752,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
             goalId: internal?.goalId,
-            cancelState: internal?.cancelState,
-            cancelSignal: internal?.cancelSignal,
             onCanceled: internal?.onCanceled,
             onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
@@ -10845,18 +10829,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       if (shouldQueue) {
-        // Mirrors AgentSession's cancelBeforeAcceptance for the queue path: a send withdrawn
-        // during the preflight awaits above must not occupy a queue slot (and hold its dedupe
-        // key) until the stream drains it. Nothing is persisted yet, so only the handshake runs.
-        if (internal?.cancelSignal?.aborted === true) {
-          await getContinuationSendState().onCanceled?.(
-            cancelReasonBeforeAcceptance(internal.cancelSignal)
-          );
-          if (internal.cancelState != null) {
-            internal.cancelState.canceledBeforeAcceptance = true;
-          }
-          return Ok(undefined);
-        }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued.
         if (internal?.admissionStale?.() === true) {
@@ -10945,8 +10917,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
-            cancelState: internal?.cancelState,
-            cancelSignal: internal?.cancelSignal,
             onCanceled: continuationSendState.onCanceled,
             onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
@@ -11045,9 +11015,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // follow-up redispatched from within this very turn (on-send compaction
       // completion) does not veto itself — while the admission awaits between
       // here and the busy claim stay covered. Codex P2 (PRRT_kwDOPxxmWM6cSRkH):
-      // releasing at the handoff itself left AgentSession's
-      // cancelBeforeAcceptance yield observable as idle, letting follow-up
-      // recovery admit an exec turn ahead of the accepted manual send. Refusal
+      // releasing at the handoff itself left AgentSession's pre-acceptance
+      // yield observable as idle, letting follow-up recovery admit an exec
+      // turn ahead of the accepted manual send. Refusal
       // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
@@ -11057,8 +11027,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         goalId: internal?.goalId,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
-        cancelState: internal?.cancelState,
-        cancelSignal: internal?.cancelSignal,
         // Same authoring-time race as the queued path: the goal-creating
         // stream can end during the preflight awaits above, making a fresh
         // goal visible after the user hit enter but before this dispatch.
@@ -11867,12 +11835,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Whether a bash-monitor-wake continuation is queued next or mid-dispatch.
-   * See AgentSession.hasPendingBashMonitorWakeContinuation for semantics.
+   * The bash-monitor wake level: a wake the workspace has not seen yet. A stream that
+   * ended with "tool-calls" while this is high yielded to the wake and will be continued
+   * by it (BashMonitorWakeReconciler.hasOutstandingWake).
    */
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean {
-    const session = this.sessions.get(workspaceId.trim());
-    return session?.hasPendingBashMonitorWakeContinuation() ?? false;
+  hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean> {
+    return this.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId.trim());
+  }
+
+  /**
+   * Whether pending input (queued tool-end message or outstanding wake) wants the active
+   * stream to reach a tool boundary — the union flag long-polling bash reads consult.
+   */
+  isToolEndYieldRequested(workspaceId: string): boolean {
+    return this.backgroundProcessManager.hasQueuedMessage(workspaceId.trim());
   }
 
   /**
