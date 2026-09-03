@@ -561,6 +561,13 @@ export class ServiceContainer {
   private async disposeOnce(): Promise<void> {
     const disposeStartedAt = performance.now();
     log.debug("[shutdown] ServiceContainer.dispose starting");
+    // Must run before any session teardown, including the recovery-session sweep below:
+    // AgentSession.dispose() triggers backgroundProcessManager.cleanup(), which would otherwise
+    // erase the persisted armed-monitor registry records that drive post-restart "monitor lost"
+    // wakes.
+    shutdownStep("backgroundProcessManager.beginShutdown", () =>
+      this.backgroundProcessManager.beginShutdown()
+    );
     // Background startup housekeeping (server mode) must not start periodic services or keep
     // issuing work against the services torn down below. Its steps only observe the abort at
     // their boundaries, so give the one in flight a bounded chance to settle first.
@@ -582,12 +589,6 @@ export class ServiceContainer {
     // before the provider/runtime services they would dispatch through go away.
     shutdownStep("workspaceService.disposeStartupRecoverySessions", () =>
       this.workspaceService.disposeStartupRecoverySessions()
-    );
-    // Must run before any session teardown: AgentSession.dispose() triggers
-    // backgroundProcessManager.cleanup(), which would otherwise erase the persisted
-    // armed-monitor registry records that drive post-restart "monitor lost" wakes.
-    shutdownStep("backgroundProcessManager.beginShutdown", () =>
-      this.backgroundProcessManager.beginShutdown()
     );
     // Interrupt and await the runtime's supervised fibers while every dependency
     // they might touch during finalization is still alive. Fixed here (before
