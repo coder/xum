@@ -572,6 +572,10 @@ export class ServiceContainer {
     // issuing work against the services torn down below. Its steps only observe the abort at
     // their boundaries, so give the one in flight a bounded chance to settle first.
     this.startupHousekeepingAbort.abort();
+    // Chat recovery that housekeeping scheduled runs past its own promise and observes neither the
+    // abort nor the join, so latch every session before the wait: nothing may start a stream inside
+    // it, and nothing may dispatch through the provider/runtime services torn down below.
+    shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
     const housekeepingSettled = this.startupHousekeepingSettled;
     if (housekeepingSettled != null) {
       await shutdownStep("startupHousekeeping.join", async () => {
@@ -585,9 +589,6 @@ export class ServiceContainer {
         }
       });
     }
-    // Chat recovery sessions that housekeeping scheduled run past its own promise; stop them
-    // before the provider/runtime services they would dispatch through go away.
-    shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
     // Interrupt and await the runtime's supervised fibers while every dependency
     // they might touch during finalization is still alive. Fixed here (before
     // the explicit teardown) so later occupants do not re-derive the position;

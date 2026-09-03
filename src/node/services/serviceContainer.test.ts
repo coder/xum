@@ -308,17 +308,15 @@ describe("ServiceContainer", () => {
     // Task housekeeping is mid-flight when the process shuts down.
     const disposed = services.dispose();
     expect(housekeepingSignal?.aborted).toBe(true);
-    // The armed-monitor latch is set synchronously, ahead of the join, so no session disposed
-    // during shutdown can erase registry records. Teardown of the services housekeeping is using
-    // waits for the in-flight step to settle (without the join, the recovery-session sweep would
-    // also run synchronously inside dispose()).
+    // Both latches are set synchronously, ahead of the join: no session disposed during shutdown
+    // can erase registry records, and no recovery chain still running under the join can start a
+    // stream. Only then does teardown wait for the in-flight housekeeping step to settle.
     expect(beginShutdown).toHaveBeenCalledTimes(1);
-    expect(disposeRecoverySessions).not.toHaveBeenCalled();
+    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
     releaseTaskHousekeeping?.();
     await housekeeping;
     await disposed;
 
-    // Recovery sessions housekeeping scheduled are stopped once it has settled, before teardown.
     expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
     expect(beginShutdown).toHaveBeenCalledTimes(1);
     expect(heartbeatStart).not.toHaveBeenCalled();
