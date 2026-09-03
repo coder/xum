@@ -93,6 +93,13 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 // Derive from the Zod schema (SendMessageOptions) to stay in sync automatically.
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 
+/** onCanceled text for a send whose cancel signal fired before the turn was accepted. */
+export function cancelReasonBeforeAcceptance(signal: AbortSignal): string {
+  return typeof signal.reason === "string"
+    ? signal.reason
+    : "Queued message canceled before acceptance.";
+}
+
 /**
  * Input poised to take over a session at a queue cut (see
  * AgentSession.getQueueCutCutter). Engaged stages win over the queue head; an
@@ -262,6 +269,15 @@ export class MessageQueue {
   /** Dispatch boundary for the FIFO head entry — the only entry the next drain can send. */
   getNextQueueDispatchMode(): QueueDispatchMode {
     return this.entries[0]?.dispatchMode ?? "tool-end";
+  }
+
+  /**
+   * Dispatch mode of the first entry whose cancel signal has not fired, or undefined
+   * when none remains. Aborted entries still drain FIFO (as no-ops that fire
+   * onCanceled), but they are not pending work and must not arm a tool-end stop.
+   */
+  getNextDispatchableMode(): QueueDispatchMode | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true)?.dispatchMode;
   }
 
   /**

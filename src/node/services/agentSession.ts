@@ -115,7 +115,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { MessageQueue } from "./messageQueue";
+import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
@@ -3198,12 +3198,8 @@ export class AgentSession {
         }
       }
 
-      const reason =
-        typeof cancelSignal.reason === "string"
-          ? cancelSignal.reason
-          : "Queued message canceled before acceptance.";
       cancellationHandled = true;
-      await internal?.onCanceled?.(reason);
+      await internal?.onCanceled?.(cancelReasonBeforeAcceptance(cancelSignal));
       if (internal?.cancelState != null) {
         internal.cancelState.canceledBeforeAcceptance = true;
       }
@@ -6573,13 +6569,16 @@ export class AgentSession {
     }
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process queued messages
-    // only for tool-end dispatches.
-    const effectiveDispatchMode = this.messageQueue.getNextQueueDispatchMode();
+    // only for tool-end dispatches. Return the same mode so the caller's foreground
+    // task waits follow the entry that will actually run, not a withdrawn FIFO head.
+    const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      effectiveDispatchMode === "tool-end"
+      nextDispatchableMode === "tool-end"
     );
-    return effectiveDispatchMode;
+    // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
+    // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
+    return nextDispatchableMode ?? null;
   }
 
   clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
@@ -6605,7 +6604,7 @@ export class AgentSession {
     // user-authored turn-end entry forward to a step boundary.
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     return true;
   }
@@ -6642,7 +6641,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
@@ -6670,17 +6669,16 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      !this.messageQueue.isEmpty() && this.messageQueue.getNextQueueDispatchMode() === "tool-end"
+      this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
   }
 
+  /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
-    return (
-      !this.messageQueue.isEmpty() &&
-      (dispatchMode == null || this.messageQueue.getNextQueueDispatchMode() === dispatchMode)
-    );
+    const nextMode = this.messageQueue.getNextDispatchableMode();
+    return nextMode != null && (dispatchMode == null || nextMode === dispatchMode);
   }
 
   /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
@@ -6849,8 +6847,11 @@ export class AgentSession {
       return false;
     }
 
+    // Physical check: withdrawn entries must still drain so their onCanceled fires.
     const shouldDispatch =
-      abortReason !== "user" && !this.deferQueuedFlushUntilAfterEdit && this.hasQueuedMessages();
+      abortReason !== "user" &&
+      !this.deferQueuedFlushUntilAfterEdit &&
+      !this.messageQueue.isEmpty();
     this.queuedProviderToolEndAbortInFlight = false;
 
     if (!shouldDispatch) {
@@ -7013,12 +7014,10 @@ export class AgentSession {
 
       // Re-arm dispatch signals for the remaining entries so the stream we are
       // about to start drains them at its next tool end (or stream end).
-      if (!this.messageQueue.isEmpty()) {
-        this.backgroundProcessManager.setMessageQueued(
-          this.workspaceId,
-          this.messageQueue.getNextQueueDispatchMode() === "tool-end"
-        );
-      }
+      this.backgroundProcessManager.setMessageQueued(
+        this.workspaceId,
+        this.messageQueue.getNextDispatchableMode() === "tool-end"
+      );
 
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.

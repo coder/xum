@@ -372,6 +372,87 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("withdrawn tool-end entry neither soft-stops nor hides a later entry's mode", async () => {
+    const workspaceId = "queue-dispatch-withdrawn-head";
+    const queuedSignals: boolean[] = [];
+    const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
+          queuedSignals.push(queued);
+        }),
+      },
+    });
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+      );
+      expect(session.hasQueuedMessages("tool-end")).toBe(true);
+
+      controller.abort("monitor withdrawn");
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      expect(session.hasQueuedMessages()).toBe(false);
+
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).not.toHaveBeenCalled();
+
+      session.queueMessage("follow up", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(session.hasQueuedMessages("tool-end")).toBe(false);
+      expect(session.hasQueuedMessages("turn-end")).toBe(true);
+      expect(queuedSignals).toEqual([true, false]);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test.each([
+    ["turn-end", "tool-end"],
+    ["tool-end", "turn-end"],
+  ] as const)(
+    "queueMessage reports the live entry's mode behind a withdrawn %s head",
+    async (withdrawnMode, liveMode) => {
+      const { session, cleanup } = await createAgentSessionHarness({
+        workspaceId: "queue-dispatch-withdrawn-" + withdrawnMode + "-head",
+      });
+      try {
+        const controller = new AbortController();
+        session.queueMessage(
+          "Background monitor wake",
+          { model: TEST_MODEL, agentId: "exec", queueDispatchMode: withdrawnMode },
+          { synthetic: true, agentInitiated: true, cancelSignal: controller.signal }
+        );
+        controller.abort("monitor withdrawn");
+
+        expect(
+          session.queueMessage("follow up", {
+            model: TEST_MODEL,
+            agentId: "exec",
+            queueDispatchMode: liveMode,
+          })
+        ).toBe(liveMode);
+      } finally {
+        session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
   test("waits for every known sibling before stopping after a provider-executed result", async () => {
     const workspaceId = "queue-dispatch-provider-siblings";
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({

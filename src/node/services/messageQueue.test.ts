@@ -488,6 +488,25 @@ describe("MessageQueue", () => {
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
     });
 
+    it("skips withdrawn entries when reporting the next dispatchable mode", () => {
+      const validOptions: SendMessageOptions = { model: "gpt-4", agentId: "exec" };
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        { ...validOptions, queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, cancelSignal: withdrawn.signal }
+      );
+      expect(queue.getNextDispatchableMode()).toBe("tool-end");
+
+      withdrawn.abort();
+      expect(queue.getNextDispatchableMode()).toBeUndefined();
+      expect(queue.isEmpty()).toBe(false);
+
+      queue.add("follow up", { ...validOptions, queueDispatchMode: "turn-end" });
+      expect(queue.getNextDispatchableMode()).toBe("turn-end");
+      expect(queue.getNextQueueDispatchMode()).toBe("tool-end");
+    });
+
     it("should reset mode to tool-end when cleared", () => {
       queue.add("Follow up", {
         model: "gpt-4",

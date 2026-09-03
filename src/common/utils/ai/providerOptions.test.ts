@@ -1760,6 +1760,46 @@ describe("buildProviderOptions - Google", () => {
     });
   });
 
+  test("clamps Gemini 3.8 Flash off to low thinking because the API rejects minimal", () => {
+    // Policy already excludes "off" for 3.8 Flash; this guards callers that bypass it.
+    expect(buildProviderOptions("google:gemini-3.8-flash", "off")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "low",
+        },
+      },
+    });
+    // Older Flash tiers keep the minimal mapping.
+    expect(buildProviderOptions("google:gemini-3.7-flash", "off")).toEqual({
+      google: { thinkingConfig: { thinkingLevel: "minimal" } },
+    });
+  });
+
+  test("maps Gemini 3.8 Flash low/medium/high to the matching thinkingLevel with thoughts", () => {
+    for (const level of ["low", "medium", "high"] as const) {
+      expect(buildProviderOptions("google:gemini-3.8-flash", level)).toEqual({
+        google: {
+          thinkingConfig: {
+            includeThoughts: true,
+            thinkingLevel: level,
+          },
+        },
+      });
+    }
+  });
+
+  test("maps gateway-routed Gemini 3.8 Flash to thinkingLevel config", () => {
+    expect(buildProviderOptions("mux-gateway:google/gemini-3.8-flash", "high")).toEqual({
+      google: {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: "high",
+        },
+      },
+    });
+  });
+
   test("maps Gemini 3.5 Flash medium to thinkingLevel medium with thoughts", () => {
     expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "medium")).toEqual({
       google: {

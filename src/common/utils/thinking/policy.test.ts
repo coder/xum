@@ -5,6 +5,7 @@ import {
   enforceThinkingPolicy,
   resolveThinkingInput,
   isGeminiFlashThinkingLevelModelName,
+  isGeminiFlashMinimalRejectingModelName,
   getDefaultMinimumThinkingLevel,
   lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
@@ -488,6 +489,19 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash but not older Flash", () => {
+    // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
+    // request envelope and debug snapshots agree with what the Google adapter sends.
+    for (const model of ["google:gemini-3.8-flash", "mux-gateway:google/gemini-3.8-flash"]) {
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "high")).toBe("high");
+    }
+    // Older Flash tiers still express "off" as minimal, so nothing is forced.
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.7-flash", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.8-flash-lite", undefined)).toBe("off");
+  });
+
   test("resolveEffectiveThinkingLevel resolves mappedToModel aliases before the Mythos check", () => {
     // A configured alias entry mapped to a Mythos-class model must follow the same
     // no-disabled-thinking rule as the canonical id, matching buildProviderOptions'
@@ -644,6 +658,21 @@ describe("getThinkingPolicyForModel", () => {
     }
   });
 
+  test("returns low/medium/high (no off) for Gemini 3.8 Flash, which rejects minimal", () => {
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "mux-gateway:google/gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
+      "google:gemini-3.8-flash-001",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
+    }
+    // Still a recognized reasoning model: defaults to the medium floor like other Flash tiers.
+    expect(getDefaultMinimumThinkingLevel("google:gemini-3.8-flash")).toBe("medium");
+  });
+
   test("returns off/low/medium/high for stable Gemini 3.5 Flash behind OpenRouter", () => {
     expect(getThinkingPolicyForModel("openrouter:google/gemini-3.5-flash")).toEqual([
       "off",
@@ -711,6 +740,24 @@ describe("isGeminiFlashThinkingLevelModelName", () => {
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.5-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.6-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.7-flash-lite")).toBe(false);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-lite")).toBe(false);
+  });
+
+  test("classifies stable Gemini 3.8 Flash IDs as Flash thinking-level chat models", () => {
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-001")).toBe(true);
+  });
+});
+
+describe("isGeminiFlashMinimalRejectingModelName", () => {
+  test("matches only Gemini 3.8 Flash chat IDs, not older Flash tiers or Lite variants", () => {
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-001")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-lite")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.7-flash")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3-flash")).toBe(false);
   });
 });
 

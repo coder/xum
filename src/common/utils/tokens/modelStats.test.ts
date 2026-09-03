@@ -107,8 +107,17 @@ describe("getModelStats", () => {
     expect(stats.tiered_pricing_threshold_tokens).toBeUndefined();
   });
 
-  test("resolves Gemini 3.7 Flash with the billed introductory pricing and limits", () => {
+  test("resolves Gemini 3.8 Flash with the billed introductory pricing and limits", () => {
     const stats = expectStats(KNOWN_MODELS.GEMINI_FLASH.id);
+    expect(stats.max_input_tokens).toBe(1048576);
+    expect(stats.max_output_tokens).toBe(65536);
+    expect(stats.input_cost_per_token).toBe(0.00000075);
+    expect(stats.output_cost_per_token).toBe(0.00000375);
+    expect(stats.cache_read_input_token_cost).toBe(0.000000075);
+  });
+
+  test("keeps Gemini 3.7 Flash resolvable as a custom model string with its introductory pricing", () => {
+    const stats = expectStats("google:gemini-3.7-flash");
     expect(stats.max_input_tokens).toBe(1048576);
     expect(stats.max_output_tokens).toBe(65536);
     expect(stats.input_cost_per_token).toBe(0.00000075);

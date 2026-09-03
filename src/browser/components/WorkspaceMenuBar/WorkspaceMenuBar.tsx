@@ -41,6 +41,7 @@ import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
+import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
@@ -98,7 +99,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 }) => {
   const { api } = useAPI();
   const { disableWorkspaceAgents } = useAgent();
-  const { preflightArchiveWorkspace, archiveWorkspace, setWorkspacePinned } = useWorkspaceActions();
+  const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
+    useWorkspaceActions();
+  const isArchiving = archivingWorkspaceIds.has(workspaceId);
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
@@ -151,7 +154,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [archiveUntrackedPaths, setArchiveUntrackedPaths] = useState<string[] | null>(null);
   // Whether the confirmation includes an active-stream interruption warning.
   const [archiveConfirmIsStreaming, setArchiveConfirmIsStreaming] = useState(false);
-  const [isArchiving, setIsArchiving] = useState(false);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
@@ -312,30 +314,25 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
    */
   const executeArchive = useCallback(
     async (anchorEl?: HTMLElement, acknowledgedUntrackedPaths?: string[]) => {
-      setIsArchiving(true);
-      try {
-        const res = await archiveWorkspace(
+      const res = await archiveWorkspace(
+        workspaceId,
+        acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+      );
+      if (res.success && res.data?.kind === "confirm-lossy-untracked-files") {
+        setArchiveUntrackedPaths(res.data.paths);
+        // The retry path already handled any earlier streaming warning. Only surface the
+        // interruption warning again when the archive attempt has not yet been confirmed.
+        setArchiveConfirmIsStreaming(acknowledgedUntrackedPaths == null ? isWorking : false);
+        setArchiveConfirmOpen(true);
+        return;
+      }
+      if (!res.success) {
+        const rect = anchorEl?.getBoundingClientRect();
+        archiveError.showError(
           workspaceId,
-          acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+          res.error ?? "Failed to archive chat",
+          rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
         );
-        if (res.success && res.data?.kind === "confirm-lossy-untracked-files") {
-          setArchiveUntrackedPaths(res.data.paths);
-          // The retry path already handled any earlier streaming warning. Only surface the
-          // interruption warning again when the archive attempt has not yet been confirmed.
-          setArchiveConfirmIsStreaming(acknowledgedUntrackedPaths == null ? isWorking : false);
-          setArchiveConfirmOpen(true);
-          return;
-        }
-        if (!res.success) {
-          const rect = anchorEl?.getBoundingClientRect();
-          archiveError.showError(
-            workspaceId,
-            res.error ?? "Failed to archive chat",
-            rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-          );
-        }
-      } finally {
-        setIsArchiving(false);
       }
     },
     [workspaceId, archiveWorkspace, archiveError, isWorking]
@@ -351,39 +348,30 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     async (anchorEl?: HTMLElement) => {
       if (isArchiving) return;
 
-      // Set the in-flight guard before the async preflight call so duplicate clicks
-      // during the await are rejected.
-      setIsArchiving(true);
-      try {
-        // Run preflight to check for untracked files that can't be preserved.
-        const preflight = await preflightArchiveWorkspace(workspaceId);
-        if (!preflight.success) {
-          const rect = anchorEl?.getBoundingClientRect();
-          archiveError.showError(
-            workspaceId,
-            preflight.error ?? "Failed to check archive readiness",
-            rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-          );
-          return;
-        }
+      // Run preflight to check for untracked files that can't be preserved.
+      const preflight = await preflightArchiveWorkspace(workspaceId);
+      if (!preflight.success) {
+        const rect = anchorEl?.getBoundingClientRect();
+        archiveError.showError(
+          workspaceId,
+          preflight.error ?? "Failed to check archive readiness",
+          rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
+        );
+        return;
+      }
 
-        const preflightData = preflight.data;
-        const untrackedPaths =
-          preflightData?.kind === "confirm-lossy-untracked-files" ? preflightData.paths : null;
-        const streamingNow = isWorking;
+      const preflightData = preflight.data;
+      const untrackedPaths =
+        preflightData?.kind === "confirm-lossy-untracked-files" ? preflightData.paths : null;
+      const streamingNow = isWorking;
 
-        if (untrackedPaths || streamingNow) {
-          // Show a single combined confirmation dialog for all warnings.
-          setArchiveUntrackedPaths(untrackedPaths);
-          setArchiveConfirmIsStreaming(streamingNow);
-          setArchiveConfirmOpen(true);
-        } else {
-          // No warnings — archive immediately. Await so the finally block doesn't
-          // clear isArchiving before the archive call completes.
-          await executeArchive(anchorEl);
-        }
-      } finally {
-        setIsArchiving(false);
+      if (untrackedPaths || streamingNow) {
+        // Show a single combined confirmation dialog for all warnings.
+        setArchiveUntrackedPaths(untrackedPaths);
+        setArchiveConfirmIsStreaming(streamingNow);
+        setArchiveConfirmOpen(true);
+      } else {
+        await executeArchive(anchorEl);
       }
     },
     [workspaceId, preflightArchiveWorkspace, archiveError, isWorking, isArchiving, executeArchive]
@@ -646,6 +634,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <span className="text-muted">{namedWorkspacePath}</span>
           </PopoverContent>
         </Popover>
+        {isArchiving && (
+          <span
+            role="status"
+            className="text-muted flex shrink-0 items-center gap-1 text-xs whitespace-nowrap"
+            data-testid="workspace-archiving-status"
+          >
+            <ArchiveIcon className="h-3 w-3 shrink-0" />
+            Archiving...
+          </span>
+        )}
       </div>
       <div className={cn("flex items-center gap-2", isDesktop && "titlebar-no-drag")}>
         {/* The footer hides these links at this width, so the header carries them. */}

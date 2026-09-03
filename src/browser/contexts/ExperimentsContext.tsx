@@ -186,7 +186,8 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
 
   const persistOverride = useCallback(
     async (experimentId: ExperimentId, enabled: boolean) => {
-      if (apiState.status !== "connected" || !apiState.api) {
+      // A degraded (slow) connection still has a usable api; only a missing api means offline.
+      if (!apiState.api) {
         return;
       }
 
@@ -196,7 +197,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         // Best effort
       }
     },
-    [apiState.status, apiState.api]
+    [apiState.api]
   );
 
   const setExperiment = useCallback(
@@ -209,7 +210,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   );
 
   useEffect(() => {
-    if (apiState.status !== "connected" || !apiState.api) {
+    if (!apiState.api) {
       setBackendOverrides(null);
       return;
     }
@@ -252,7 +253,7 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [apiState.status, apiState.api]);
+  }, [apiState.api]);
 
   return (
     <ExperimentsContext.Provider value={{ setExperiment, backendOverrides }}>
