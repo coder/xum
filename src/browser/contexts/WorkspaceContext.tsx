@@ -485,6 +485,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
     options?: { acknowledgedUntrackedPaths?: string[] }
   ) => Promise<{ success: boolean; error?: string; data?: ArchiveWorkspaceResult }>;
   unarchiveWorkspace: (workspaceId: string) => Promise<{ success: boolean; error?: string }>;
+  /**
+   * Workspaces with an archive preflight or archive request in flight. Archive can take tens
+   * of seconds server-side (snapshot + worktree removal), so this lives here rather than in
+   * the component that started it: the sidebar row and the menu bar both show "Archiving..."
+   * no matter which one the user clicked.
+   */
+  archivingWorkspaceIds: ReadonlySet<string>;
   refreshWorkspaceMetadata: () => Promise<void>;
   setWorkspaceMetadata: React.Dispatch<
     React.SetStateAction<Map<string, FrontendWorkspaceMetadata>>
@@ -1637,6 +1644,26 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     [api, setWorkspaceMetadata]
   );
 
+  const [archivingWorkspaceIds, setArchivingWorkspaceIds] = useState<ReadonlySet<string>>(
+    () => new Set()
+  );
+
+  const withArchivingIndicator = useCallback(
+    async <T,>(workspaceId: string, run: () => Promise<T>): Promise<T> => {
+      setArchivingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
+      try {
+        return await run();
+      } finally {
+        setArchivingWorkspaceIds((prev) => {
+          const next = new Set(prev);
+          next.delete(workspaceId);
+          return next;
+        });
+      }
+    },
+    []
+  );
+
   const preflightArchiveWorkspace = useCallback(
     async (
       workspaceId: string
@@ -1644,7 +1671,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.preflightArchive({ workspaceId });
+        const result = await withArchivingIndicator(workspaceId, () =>
+          api.workspace.preflightArchive({ workspaceId })
+        );
         if (result.success) {
           return { success: true, data: result.data };
         }
@@ -1653,7 +1682,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api]
+    [api, withArchivingIndicator]
   );
 
   const archiveWorkspace = useCallback(
@@ -1664,10 +1693,12 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       if (!api) return { success: false, error: "API not connected" };
 
       try {
-        const result = await api.workspace.archive({
-          workspaceId,
-          acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
-        });
+        const result = await withArchivingIndicator(workspaceId, () =>
+          api.workspace.archive({
+            workspaceId,
+            acknowledgedUntrackedPaths: options?.acknowledgedUntrackedPaths,
+          })
+        );
         if (result.success) {
           // Older mocks/story fixtures may still return `{ success: true }` without the newer
           // typed archive payload. Treat that legacy success shape as an ordinary archive so
@@ -1708,7 +1739,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         return { success: false, error: errorMessage };
       }
     },
-    [api]
+    [api, withArchivingIndicator]
   );
 
   const unarchiveWorkspace = useCallback(
@@ -2030,6 +2061,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,
@@ -2056,6 +2088,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       preflightArchiveWorkspace,
       archiveWorkspace,
       unarchiveWorkspace,
+      archivingWorkspaceIds,
       refreshWorkspaceMetadata,
       setWorkspaceMetadata,
       selectedWorkspace,

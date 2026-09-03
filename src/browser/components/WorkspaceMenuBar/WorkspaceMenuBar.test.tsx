@@ -41,6 +41,7 @@ import {
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
 let workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
+let archivingWorkspaceIds = new Set<string>();
 let cleanupDom: (() => void) | null = null;
 const workspaceId = "workspace-1";
 
@@ -150,6 +151,7 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds,
         preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
         archiveWorkspace: archiveWorkspaceMock,
       }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
@@ -338,6 +340,7 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
     workspaceMetadata = new Map();
+    archivingWorkspaceIds = new Set();
     mockTimelineExperimentEnabled = false;
     cleanupDom = installDom();
     installWorkspaceMenuBarTestDoubles();
@@ -407,6 +410,17 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(scratchMenuProps?.onForkChat).toBeNull();
     expect(scratchMenuProps?.onEnterImmersiveReview).toBeNull();
     expect(scratchMenuProps?.onOpenTouchFullscreenReview).toBeNull();
+  });
+
+  it("shows the archiving status only while this workspace has an archive request in flight", () => {
+    archivingWorkspaceIds = new Set(["some-other-workspace"]);
+    const idle = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(idle.queryByTestId("workspace-archiving-status")).toBeNull();
+    idle.unmount();
+
+    archivingWorkspaceIds = new Set([workspaceId]);
+    const archiving = render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(archiving.getByTestId("workspace-archiving-status")).not.toBeNull();
   });
 
   it("offers fork and immersive review in the More menu for repo-backed workspaces", () => {

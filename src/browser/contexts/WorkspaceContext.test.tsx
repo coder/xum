@@ -869,6 +869,56 @@ describe("WorkspaceContext", () => {
         t1: "still-open",
       });
     });
+
+    test("marks the workspace as archiving only while preflight or archive is in flight", async () => {
+      const workspaceId = "ws-archive-pending";
+      let settleArchive: (() => void) | undefined;
+      let failPreflight: ((error: Error) => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((_resolve, reject) => {
+              failPreflight = reject;
+            }),
+        },
+      });
+
+      const ctx = await setup();
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      let archivePromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      // A failed request must clear the indicator too, or the row would read "Archiving..."
+      // forever after a dropped connection.
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        failPreflight?.(new Error("WebSocket closed"));
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+    });
   });
 
   test("treats legacy archive success without data as archived", async () => {
@@ -1853,6 +1903,10 @@ function createMockAPI(options: MockAPIOptions = {}) {
     archive: mock(
       options.workspace?.archive ??
         (() => Promise.resolve({ success: true as const, data: { kind: "archived" as const } }))
+    ),
+    preflightArchive: mock(
+      options.workspace?.preflightArchive ??
+        (() => Promise.resolve({ success: true as const, data: { kind: "ready" as const } }))
     ),
     unarchive: mock(
       options.workspace?.unarchive ??
