@@ -12189,7 +12189,7 @@ describe("TaskService", () => {
       reason: "timed out",
     });
 
-    expect(clearQueue).toHaveBeenCalledWith(childTaskId);
+    expect(clearQueue).toHaveBeenCalledWith(childTaskId, { hardStop: true });
     expect(stopStream).toHaveBeenCalledWith(childTaskId, {
       abandonPartial: true,
       abortReason: "system",
@@ -12507,8 +12507,8 @@ describe("TaskService", () => {
     const interruptedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
     expect(interruptedTaskIds).toEqual([childTaskId, parentTaskId]);
 
-    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId);
-    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId);
+    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId, { hardStop: true });
+    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId, { hardStop: true });
     expect(stopStream).toHaveBeenNthCalledWith(
       1,
       childTaskId,
