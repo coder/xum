@@ -585,6 +585,7 @@ const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
  * monitored processes in a row resumes every time.
  */
 const MAX_CONSECUTIVE_STRANDED_TURN_RESUMES = 3;
+const FORFEIT_SETTLEMENT_RETRY_DELAY_MS = 1_000;
 
 export interface AgentSessionChatEvent {
   workspaceId: string;
@@ -699,6 +700,14 @@ export interface AgentSessionOptions {
     metadata: WorkspaceTurnMuxMetadata,
     reason: string
   ) => Promise<void>;
+  /**
+   * Admission for a stranded resume, read once the turn is claimed: the workspace still accepts
+   * streams (not being removed or archived) and, for a delegated turn, its owner still has the
+   * turn running. The probe reports a stop that lands after the read (workspace stop epoch).
+   */
+  admitStrandedTurnResume?: (
+    correlation: WorkspaceTurnMuxMetadata | undefined
+  ) => Promise<{ admissible: boolean; admissionStale?: () => boolean }>;
 }
 
 enum TurnPhase {
@@ -741,6 +750,7 @@ export class AgentSession {
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly settleForfeitedWorkspaceTurnContinuation?: AgentSessionOptions["settleForfeitedWorkspaceTurnContinuation"];
+  private readonly admitStrandedTurnResume?: AgentSessionOptions["admitStrandedTurnResume"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -781,6 +791,12 @@ export class AgentSession {
   // Set while the sweep's resume is running (claim through stream end); aborting it cancels only
   // the pre-stream window, since StreamManager unlinks the signal once a stream registers.
   private strandedTurnResumeInFlight: AbortController | null = null;
+  /** Owner settlements for forfeited continuations that have not landed yet (settleOwedForfeits). */
+  private readonly owedForfeitSettlements = new Map<
+    string,
+    { correlation: WorkspaceTurnMuxMetadata; reason: string; inFlight: boolean }
+  >();
+  private owedForfeitSettlementRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private consecutiveStrandedResumes = 0;
 
   private idleWaiters: Array<() => void> = [];
@@ -993,6 +1009,7 @@ export class AgentSession {
       onPostCompactionStateChange,
       hasExternalSendPreflight,
       settleForfeitedWorkspaceTurnContinuation,
+      admitStrandedTurnResume,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1022,6 +1039,7 @@ export class AgentSession {
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.settleForfeitedWorkspaceTurnContinuation = settleForfeitedWorkspaceTurnContinuation;
+    this.admitStrandedTurnResume = admitStrandedTurnResume;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -4295,12 +4313,13 @@ export class AgentSession {
       /** Cancels the pre-stream window (admission gates, history reads) once the resume is withdrawn. */
       abortSignal?: AbortSignal;
       /**
-       * Revalidate a goal turn against durable goal state once the turn is claimed, the same
-       * veto durable goal redispatches apply; a refusal reports `goalRefused`.
+       * Revalidate the resume once the turn is claimed: a goal turn against durable goal state
+       * (the same veto durable goal redispatches apply) and the workspace plus delegated turn
+       * through admitStrandedTurnResume; a refusal reports `refusedBy`.
        */
-      revalidateGoal?: boolean;
+      revalidateAdmission?: boolean;
     }
-  ): Promise<AgentSessionResult<{ started: boolean; goalRefused?: boolean }>> {
+  ): Promise<AgentSessionResult<{ started: boolean; refusedBy?: "goal" | "workspace-turn" }>> {
     this.assertNotDisposed("resumeStream");
 
     assert(options, "resumeStream requires options");
@@ -4361,7 +4380,7 @@ export class AgentSession {
       }
       let goalAdmissionStale: (() => boolean) | undefined;
       if (
-        internal?.revalidateGoal === true &&
+        internal?.revalidateAdmission === true &&
         internal.goalKind != null &&
         internal.goalId != null &&
         this.workspaceGoalService
@@ -4372,9 +4391,19 @@ export class AgentSession {
           internal.goalKind
         );
         if (!admission.admissible) {
-          return Ok({ started: false, goalRefused: true });
+          return Ok({ started: false, refusedBy: "goal" });
         }
         goalAdmissionStale = admission.admissionStale;
+      }
+      let turnAdmissionStale: (() => boolean) | undefined;
+      if (internal?.revalidateAdmission === true && this.admitStrandedTurnResume) {
+        const admission = await this.admitStrandedTurnResume(
+          getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata)
+        );
+        if (!admission.admissible) {
+          return Ok({ started: false, refusedBy: "workspace-turn" });
+        }
+        turnAdmissionStale = admission.admissionStale;
       }
       // Last admission check before the stream's own pre-start I/O, like sendMessage's PREPARING
       // gate: a withdrawal that landed during the awaits above refuses the turn here; the abort
@@ -4382,20 +4411,21 @@ export class AgentSession {
       if (withdrawn()) {
         return Ok({ started: false });
       }
-      // The goal probe rides along to the stream-admission boundary: a Pause or goal replacement
-      // landing during the history reads and request construction below has no stream to
-      // interrupt, so the launch itself rechecks it (StreamManager last, right before
-      // registration). Sticky so the return value matches what refused the launch.
-      let goalRefused = false;
+      // The admission probes ride along to the stream-admission boundary: a Pause, goal
+      // replacement, or workspace stop landing during the history reads and request construction
+      // below has no stream to interrupt, so the launch itself rechecks them (StreamManager last,
+      // right before registration). Sticky so the return value matches what refused the launch.
+      let refusedBy: "goal" | "workspace-turn" | undefined;
       const refuseStreamStart =
-        goalAdmissionStale != null
+        goalAdmissionStale != null || turnAdmissionStale != null
           ? (): boolean => {
-              goalRefused ||= goalAdmissionStale();
-              return goalRefused;
+              refusedBy ??= goalAdmissionStale?.() === true ? "goal" : undefined;
+              refusedBy ??= turnAdmissionStale?.() === true ? "workspace-turn" : undefined;
+              return refusedBy != null;
             }
           : undefined;
       if (refuseStreamStart?.() === true) {
-        return Ok({ started: false, goalRefused: true });
+        return Ok({ started: false, refusedBy });
       }
 
       // Must await here so the finally block runs after streaming completes,
@@ -4415,8 +4445,8 @@ export class AgentSession {
       if (!result.success) {
         return result;
       }
-      if (goalRefused) {
-        return Ok({ started: false, goalRefused: true });
+      if (refusedBy != null) {
+        return Ok({ started: false, refusedBy });
       }
 
       // A withdrawal inside streamWithHistory returns Ok before any stream registers, so the
@@ -7039,18 +7069,64 @@ export class AgentSession {
    */
   private forfeitStrandedTurnResume(reason: string): void {
     const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
+    const settlementOwed =
+      correlation != null && this.settleForfeitedWorkspaceTurnContinuation != null;
+    if (settlementOwed) {
+      // Retain the owner's only terminal path before dropping the marker that advertised it.
+      this.owedForfeitSettlements.set(
+        `${correlation.ownerWorkspaceId}/${correlation.taskHandleId}/${correlation.turnId}`,
+        { correlation, reason, inFlight: false }
+      );
+    }
     this.withdrawStrandedTurnResume();
-    if (correlation == null || this.settleForfeitedWorkspaceTurnContinuation == null) {
+    if (settlementOwed) {
+      this.settleOwedForfeits();
+    }
+  }
+
+  /**
+   * The settlement is the owner's only remaining path to a terminal record for that turn, so a
+   * failed attempt (task store I/O) stays owed and retries on its own (including after session
+   * disposal) as well as from idle sweeps. Settlement is idempotent on the owner's side.
+   */
+  private settleOwedForfeits(): void {
+    const settle = this.settleForfeitedWorkspaceTurnContinuation;
+    if (settle == null) {
       return;
     }
-    void this.settleForfeitedWorkspaceTurnContinuation(correlation, reason).catch(
-      (error: unknown) => {
-        log.warn("Failed to settle forfeited workspace turn continuation", {
-          workspaceId: this.workspaceId,
-          error: getErrorMessage(error),
-        });
+    for (const [key, owed] of this.owedForfeitSettlements) {
+      if (owed.inFlight) {
+        continue;
       }
-    );
+      owed.inFlight = true;
+      void settle(owed.correlation, owed.reason)
+        .then(() => {
+          if (this.owedForfeitSettlements.get(key) === owed) {
+            this.owedForfeitSettlements.delete(key);
+          }
+        })
+        .catch((error: unknown) => {
+          owed.inFlight = false;
+          log.warn("Failed to settle forfeited workspace turn continuation; retrying", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+          this.scheduleOwedForfeitSettlementRetry();
+        });
+    }
+  }
+
+  private scheduleOwedForfeitSettlementRetry(): void {
+    if (this.owedForfeitSettlementRetryTimer != null) {
+      return;
+    }
+    // Do not cancel this on dispose: workspace removal is itself one of the boundaries that can
+    // forfeit a delegated turn, and its owner still requires the terminal task-store write.
+    this.owedForfeitSettlementRetryTimer = setTimeout(() => {
+      this.owedForfeitSettlementRetryTimer = null;
+      this.settleOwedForfeits();
+    }, FORFEIT_SETTLEMENT_RETRY_DELAY_MS);
+    this.owedForfeitSettlementRetryTimer.unref();
   }
 
   /**
@@ -7168,6 +7244,7 @@ export class AgentSession {
    * run from every idle transition and queue removal; only the first eligible call acts.
    */
   private resumeStrandedTurnIfIdle(): void {
+    this.settleOwedForfeits();
     const resume = this.owedStrandedTurnResume();
     if (resume == null) {
       if (this.strandedTurnResume != null) {
@@ -7211,7 +7288,7 @@ export class AgentSession {
       goalKind: resume.goalKind,
       goalId: resume.goalId,
       abortSignal: inFlight.signal,
-      revalidateGoal: true,
+      revalidateAdmission: true,
     })
       .then((result) => {
         if (!result.success) {
@@ -7221,13 +7298,19 @@ export class AgentSession {
           });
           return false;
         }
-        if (result.data.goalRefused === true) {
-          // A Pause or terminal transition landed while the goal turn ran: nothing is owed to it.
-          log.info("Dropping stranded goal turn: goal no longer admits it", {
+        if (result.data.refusedBy != null) {
+          // A Pause or terminal goal transition, or a stop on the workspace or delegated turn,
+          // landed while the cut turn waited: nothing is owed to it anymore.
+          log.info("Dropping stranded turn: no longer admitted", {
             workspaceId: this.workspaceId,
+            refusedBy: result.data.refusedBy,
             goalKind: resume.goalKind,
           });
-          this.forfeitStrandedTurnResume("Stranded turn resume dropped: goal no longer admits it.");
+          this.forfeitStrandedTurnResume(
+            result.data.refusedBy === "goal"
+              ? "Stranded turn resume dropped: goal no longer admits it."
+              : "Stranded turn resume dropped: workspace or delegated turn no longer admits it."
+          );
           return false;
         }
         if (!result.data.started) {

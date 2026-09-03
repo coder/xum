@@ -4020,6 +4020,33 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           reason
         );
       },
+      // The stranded resume starts a stream from inside the session, so it re-applies the
+      // stream-start guards WorkspaceService.resumeStream enforces (removal, archive) and, for a
+      // delegated turn, checks the owner still has it running: a task_stop or lifecycle interrupt
+      // that found the cut stream already completed had no abort to withdraw the marker with.
+      admitStrandedTurnResume: async (correlation) => {
+        const workspaceRefused = (): boolean =>
+          this.removingWorkspaces.has(workspaceId) ||
+          this.archivingWorkspaces.has(workspaceId) ||
+          this.isWorkspaceArchivedInConfig(workspaceId);
+        if (workspaceRefused()) {
+          return { admissible: false };
+        }
+        if (correlation == null || this.agentTaskIntegration == null) {
+          return { admissible: true, admissionStale: workspaceRefused };
+        }
+        const turn = await this.agentTaskIntegration.getWorkspaceTurnContinuationAdmission(
+          workspaceId,
+          correlation
+        );
+        if (!turn.admissible) {
+          return { admissible: false };
+        }
+        return {
+          admissible: true,
+          admissionStale: () => workspaceRefused() || turn.admissionStale(),
+        };
+      },
     });
   }
 
@@ -11844,6 +11871,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     return (
       session.hasQueuedMessages() || session.isPreparingTurn() || session.hasPendingAutoRetry()
+    );
+  }
+
+  private isWorkspaceArchivedInConfig(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return (
+      entry != null && isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
     );
   }
 

@@ -1471,7 +1471,15 @@ describe("AgentSession queued message tool-call dispatch", () => {
    * the owner deferred the cut stream-end on the advertised continuation and the session sits
    * idle with it still owed.
    */
-  async function strandDelegatedTurnBehindClosedGate(workspaceId: string) {
+  async function strandDelegatedTurnBehindClosedGate(
+    workspaceId: string,
+    extra?: {
+      harness?: Partial<Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter">>;
+      settleForfeited?: ReturnType<
+        typeof mock<(metadata: unknown, reason: string) => Promise<void>>
+      >;
+    }
+  ) {
     let gateOpen = true;
     const workspaceGoalService = {
       assertPricedModelForBudgetedGoal: mock(() =>
@@ -1483,11 +1491,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
       recordStreamStarted: mock(() => Promise.resolve()),
       syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
     } as unknown as WorkspaceGoalService;
-    const settleForfeited = mock((_metadata: unknown, _reason: string) => Promise.resolve());
+    const settleForfeited =
+      extra?.settleForfeited ?? mock((_metadata: unknown, _reason: string) => Promise.resolve());
     const harness = await createStreamingTurnHarness(workspaceId, {
       harness: {
         workspaceGoalService,
         settleForfeitedWorkspaceTurnContinuation: settleForfeited,
+        ...extra?.harness,
       },
       sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
       sendInternal: { synthetic: true, agentInitiated: true },
@@ -1502,7 +1512,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
     );
     aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
     expect(await waitForCondition(() => !session.isBusy())).toBe(true);
-    return { ...harness, settleForfeited };
+    return {
+      ...harness,
+      settleForfeited,
+      openGate: () => {
+        gateOpen = true;
+      },
+    };
   }
 
   test("stops advertising the delegated continuation once the resume cap is exhausted", async () => {
@@ -1570,6 +1586,115 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.dispose();
       expect(settleForfeited).toHaveBeenCalledTimes(1);
       expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a forfeited turn's failed settlement stays owed and retries through disposal", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-settle-retry";
+    let settleAttempts = 0;
+    const settleForfeited = mock((_metadata: unknown, _reason: string) => {
+      settleAttempts += 1;
+      return settleAttempts === 1
+        ? Promise.reject(new Error("task store unavailable"))
+        : Promise.resolve();
+    });
+    const harness = await strandDelegatedTurnBehindClosedGate(workspaceId, { settleForfeited });
+    const { session, cleanup } = harness;
+
+    try {
+      // A history clear forfeits the continuation; the owner's store rejects the first settlement.
+      expect((await session.discardAutoRetryForContextMutation()).success).toBe(true);
+      expect(await waitForCondition(() => settleAttempts === 1)).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(settleAttempts).toBe(1);
+
+      // The obligation survives the failure and session teardown: its own retry lands even when
+      // no future idle poke can occur after workspace removal.
+      session.dispose();
+      expect(await waitForCondition(() => settleAttempts === 2, 1_500)).toBe(true);
+      expect(settleForfeited.mock.calls[1]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settleAttempts).toBe(2);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a resume whose workspace or delegated turn no longer admits it settles the turn", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-turn-stopped";
+    let turnActive = true;
+    const admitStrandedTurnResume = mock((_correlation: unknown) =>
+      Promise.resolve({ admissible: turnActive, admissionStale: () => !turnActive })
+    );
+    const settleForfeited = mock((_metadata: unknown, _reason: string) => Promise.resolve());
+    const harness = await strandDelegatedTurnBehindClosedGate(workspaceId, {
+      harness: { admitStrandedTurnResume },
+      settleForfeited,
+    });
+    const { session, cleanup, streamMessage } = harness;
+
+    try {
+      // The pricing gate failed the first resume; the continuation is still advertised.
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(true);
+
+      // task_stop / interrupt_active settled the handle while the cut stream was already
+      // complete: no abort reached the session, only the owner's record changed.
+      turnActive = false;
+      harness.openGate();
+      session.drainQueuedMessagesIfIdle();
+      expect(await waitForCondition(() => settleForfeited.mock.calls.length === 1)).toBe(true);
+      expect(admitStrandedTurnResume.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+      expect(
+        session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
+      ).toBe(false);
+      session.drainQueuedMessagesIfIdle();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a stop landing between admission and launch refuses the resume", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-stop-in-flight";
+    // Admitted on read, but the workspace's stop epoch moved before the stream could launch.
+    const admitStrandedTurnResume = mock((_correlation: unknown) =>
+      Promise.resolve({ admissible: true, admissionStale: () => true })
+    );
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      return Promise.resolve(Ok(createStartedTurnHandle("assistant-1")));
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+      admitStrandedTurnResume,
+    });
+
+    try {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-0", "user", "keep going", {
+          timestamp: Date.now(),
+          muxMetadata: WORKSPACE_TURN_CORRELATION,
+        })
+      );
+      const resumed = await session.resumeStream(
+        { model: TEST_MODEL, agentId: "exec", muxMetadata: WORKSPACE_TURN_CORRELATION },
+        { agentInitiated: true, revalidateAdmission: true }
+      );
+      expect(resumed).toEqual(Ok({ started: false, refusedBy: "workspace-turn" }));
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
     } finally {
       session.dispose();
       await cleanup();

@@ -4903,10 +4903,12 @@ export class StreamManager {
         // stream may already occupy this workspace's slot. Launching
         // processing now would emit stream-start after the abort and its
         // cleanup would later delete that replacement. Bail out; the finally
-        // block releases this never-processed stream's resources.
+        // block releases this never-processed stream's resources. The caller's
+        // admission probe has no signal to abort with, so it is re-read here too.
         if (
           streamAbortController.signal.aborted ||
-          this.workspaceStreams.get(typedWorkspaceId) !== streamInfo
+          this.workspaceStreams.get(typedWorkspaceId) !== streamInfo ||
+          refuseStreamStart?.() === true
         ) {
           if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo) {
             this.workspaceStreams.delete(typedWorkspaceId);

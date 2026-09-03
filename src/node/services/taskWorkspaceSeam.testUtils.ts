@@ -75,6 +75,8 @@ export function makeAgentTaskIntegrationFake(
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
     settleWorkspaceTurnContinuationFailure: () => Promise.resolve(),
+    getWorkspaceTurnContinuationAdmission: () =>
+      Promise.resolve({ admissible: true, admissionStale: () => false }),
     ...overrides,
   };
 }

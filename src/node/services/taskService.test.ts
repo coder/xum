@@ -23912,6 +23912,39 @@ describe("TaskService", () => {
     });
   });
 
+  test("workspace-turn continuation admission tracks the handle and later stops", async () => {
+    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const correlation = workspaceTurnMuxMetadata(parentId);
+
+    // Running handle on this workspace: admitted, and the probe stays fresh until a stop lands.
+    const admitted = await taskService.getWorkspaceTurnContinuationAdmission(
+      "childworkspace",
+      correlation
+    );
+    expect(admitted.admissible).toBe(true);
+    expect(admitted.admissionStale()).toBe(false);
+
+    // A stop on the workspace after the read (interruptWorkspaceTurn bumps the stop epoch inside
+    // its settlement boundary) turns the earlier probe stale and refuses a fresh read.
+    const stopped = await workspaceTurnManagerFor(taskService).interruptWorkspaceTurn(
+      parentId,
+      correlation.taskHandleId
+    );
+    expect(stopped.success).toBe(true);
+    expect(admitted.admissionStale()).toBe(true);
+    const refused = await taskService.getWorkspaceTurnContinuationAdmission(
+      "childworkspace",
+      correlation
+    );
+    expect(refused.admissible).toBe(false);
+
+    // A different workspace or turn never matches the handle.
+    expect(
+      (await taskService.getWorkspaceTurnContinuationAdmission("otherworkspace", correlation))
+        .admissible
+    ).toBe(false);
+  });
+
   test("nested agent progress preserves workspace-turn correlation", async () => {
     const claimWorkspaceTurnContinuation = mock(
       (

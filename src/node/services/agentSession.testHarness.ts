@@ -116,6 +116,7 @@ export interface AgentSessionHarnessOptions {
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   hasExternalSendPreflight?: () => boolean;
   settleForfeitedWorkspaceTurnContinuation?: AgentSessionOptions["settleForfeitedWorkspaceTurnContinuation"];
+  admitStrandedTurnResume?: AgentSessionOptions["admitStrandedTurnResume"];
   captureEvents?: boolean;
 }
 
@@ -162,6 +163,7 @@ export async function createAgentSessionHarness(
     onCompactionComplete: options.onCompactionComplete,
     hasExternalSendPreflight: options.hasExternalSendPreflight,
     settleForfeitedWorkspaceTurnContinuation: options.settleForfeitedWorkspaceTurnContinuation,
+    admitStrandedTurnResume: options.admitStrandedTurnResume,
   });
 
   const events: WorkspaceChatMessage[] = [];

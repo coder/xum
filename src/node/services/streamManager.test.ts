@@ -2850,6 +2850,50 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
 
+  test("refuses processing when the admission probe turns stale during the envelope write", async () => {
+    const workspaceId = "test-workspace-refuse-after-construct";
+
+    let processCalled = false;
+    let streamStartEmitted = false;
+    let refused = false;
+
+    onTurnEngineEvent(streamManager, "stream-start", () => {
+      streamStartEmitted = true;
+    });
+    Reflect.set(
+      streamManager,
+      "createTempDirForStream",
+      (): Promise<string> => Promise.resolve("/tmp/mock-stream-temp")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => undefined);
+    Reflect.set(streamManager, "processStreamWithCleanup", (): Promise<void> => {
+      processCalled = true;
+      return Promise.resolve();
+    });
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-refuse-after-construct",
+        model: createTestLanguageModel(),
+        runtime,
+        refuseStreamStart: () => refused,
+        // The stream is registered by now; a goal Pause lands while the envelope is written.
+        onStreamConstructed: () => {
+          refused = true;
+          return Promise.resolve();
+        },
+        tools: {},
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(processCalled).toBe(false);
+    expect(streamStartEmitted).toBe(false);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
   test("should honor abortSignal before atomic stream creation", async () => {
     const workspaceId = "test-workspace-abort-before-create";
 

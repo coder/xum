@@ -532,6 +532,14 @@ export interface AgentTaskIntegration {
     status: "interrupted" | "error",
     error: string
   ): Promise<void>;
+  /**
+   * Whether the delegated turn is still active on this workspace, with a probe that turns stale
+   * once a stop lands on the workspace after the read.
+   */
+  getWorkspaceTurnContinuationAdmission(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): Promise<{ admissible: boolean; admissionStale: () => boolean }>;
 }
 
 export interface WorkspaceTurnTaskHost {

@@ -9575,6 +9575,30 @@ export class TaskService implements AgentTaskIntegration {
       error
     );
   }
+
+  async getWorkspaceTurnContinuationAdmission(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): Promise<{ admissible: boolean; admissionStale: () => boolean }> {
+    // Every stop on the workspace (interruptWorkspaceTurn, task hard-stop cascades) bumps the
+    // epoch synchronously inside its settlement boundary, before the store write lands.
+    const stopEpoch = this.getWorkspaceStopEpoch(workspaceId);
+    const record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(
+      muxMetadata.ownerWorkspaceId,
+      muxMetadata.taskHandleId
+    );
+    const admissible =
+      record?.workspaceId === workspaceId &&
+      record.turnId === muxMetadata.turnId &&
+      isActiveWorkspaceTurnTaskStatus(record.status) &&
+      !this.isWorkspaceStopInProgress(workspaceId);
+    return {
+      admissible,
+      admissionStale: () =>
+        this.getWorkspaceStopEpoch(workspaceId) !== stopEpoch ||
+        this.isWorkspaceStopInProgress(workspaceId),
+    };
+  }
   async noteWorkspaceUnarchived(workspaceId: string): Promise<void> {
     assert(workspaceId.length > 0, "noteWorkspaceUnarchived requires workspaceId");
     // Archived owners park workflow terminal wakes unsettled (the drain drops the in-memory
