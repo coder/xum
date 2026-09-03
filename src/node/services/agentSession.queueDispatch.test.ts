@@ -694,6 +694,91 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("disposing a session lowers the mirrored wake level", async () => {
+    // The flag lives in BackgroundProcessManager keyed by workspace id and outlives the
+    // session; a stale true would make a re-created session's bash reads return early.
+    const workspaceId = "queue-dispatch-dispose-clears-level";
+    const flags: boolean[] = [];
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManagerOverrides: {
+        setMessageQueued: (_workspaceId: string, queued: boolean) => {
+          flags.push(queued);
+        },
+      },
+    });
+    try {
+      session.setBashMonitorWakeOutstanding(true);
+      expect(flags.at(-1)).toBe(true);
+      session.dispose();
+      expect(flags.at(-1)).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake send in PREPARING is a pending wake turn until it streams or ends", async () => {
+    const workspaceId = "queue-dispatch-preparing-wake-turn";
+    let markStreamRequested: () => void = () => undefined;
+    const streamRequested = new Promise<void>((resolve) => {
+      markStreamRequested = resolve;
+    });
+    let releaseStream: () => void = () => undefined;
+    const streamRelease = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        // Blocks at the provider call: the user row is durable (onAccepted has run, so the
+        // reconciler level is already low) but no stream is observable yet.
+        streamMessage: mock(async () => {
+          markStreamRequested();
+          await streamRelease;
+          return Ok(createStartedTurnHandle("test-assistant-message"));
+        }),
+      },
+    });
+
+    let disposed = false;
+    try {
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      let accepted = false;
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          onAccepted: () => {
+            accepted = true;
+          },
+        }
+      );
+
+      await streamRequested;
+      expect(accepted).toBe(true);
+      expect(session.isBusy()).toBe(true);
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+
+      // Turn end (here: teardown to IDLE) clears it.
+      session.dispose();
+      disposed = true;
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      releaseStream();
+      await sendPromise;
+    } finally {
+      releaseStream();
+      if (!disposed) session.dispose();
+      await cleanup();
+    }
+  });
+
   test("disposed sessions finalize durable wakes after goal sync completes", async () => {
     const workspaceId = "queue-dispatch-disposed-after-goal-sync";
     let markSyncStarted: () => void = () => undefined;

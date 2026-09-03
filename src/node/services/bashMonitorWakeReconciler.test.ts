@@ -158,6 +158,34 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].prompt).toContain("READY again");
   });
 
+  test("a full-history clear retires a wake already in the owner's hands", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].isCurrent()).toBe(true);
+
+    // The owner has not sent yet (it is waiting on its own history lock); the clear
+    // consumes the signals, so the receiver must find the wake stale and drop it.
+    const token = await reconciler.beginFullHistoryClear(OWNER);
+    expect(dispatches[0].isCurrent()).toBe(false);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    await reconciler.finishFullHistoryClear(token);
+
+    // Deferring the stale wake is a no-op, and the level stays low.
+    await dispatches[0].onDeferred();
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+  });
+
+  test("disposal lowers the published level and retires the in-flight wake", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+
+    await reconciler.dispose(OWNER);
+    expect(dispatches[0].isCurrent()).toBe(false);
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+  });
+
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
     rows = [registryRecord()];
 

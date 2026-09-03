@@ -739,6 +739,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
@@ -750,6 +751,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => true,
         onAccepted,
         onDeferred,
       });
@@ -783,6 +785,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
@@ -798,6 +801,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => true,
         onAccepted: () => Promise.resolve(),
         onDeferred: () => Promise.resolve(),
       });
@@ -834,6 +838,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
@@ -849,6 +854,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => true,
         onAccepted: () => Promise.resolve(),
         onDeferred: () => Promise.resolve(),
       });
@@ -894,6 +900,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
       }): Promise<"in-flight" | "deferred">;
@@ -909,6 +916,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => true,
         onAccepted,
         onDeferred: () => Promise.resolve(),
       });
@@ -919,6 +927,74 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(sentOptions?.muxMetadata).toEqual({ type: "bash-monitor-wake", records: [] });
       expect(onAccepted).toHaveBeenCalledTimes(1);
     } finally {
+      await cleanup();
+    }
+  });
+
+  test("a wake retired by a history clear while waiting for the lock is dropped, not sent", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "stale-wake-owner";
+    await config.addWorkspace("/tmp/stale-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "stale-wake-project",
+      projectPath: "/tmp/stale-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const internal = service as unknown as {
+      aiService: { isStreaming(workspaceId: string): boolean };
+      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+      isBusyForMessage(workspaceId: string): boolean;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        isCurrent(): boolean;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    try {
+      internal.aiService = { isStreaming: () => false };
+      internal.hasPendingQueuedOrPreparingTurn = () => false;
+      internal.isBusyForMessage = () => false;
+      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
+      internal.sendMessage = sendMessage;
+
+      const outcome = await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        isCurrent: () => false,
+        onAccepted: () => Promise.resolve(),
+        onDeferred: () => Promise.resolve(),
+      });
+
+      expect(outcome).toBe("deferred");
+      expect(sendMessage).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a wake turn in PREPARING keeps the outstanding level visible to turn settlement", async () => {
+    const { service, cleanup } = await createWakeWiringService();
+    const workspaceId = "preparing-wake-owner";
+    const session = service.getOrCreateSession(workspaceId);
+    const sessionInternal = session as unknown as {
+      hasPendingBashMonitorWakeTurn(): boolean;
+    };
+    try {
+      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(false);
+      // The reconciler level is already low here (onAccepted ran at row persistence);
+      // the session marker is what keeps the continuation visible until stream start.
+      sessionInternal.hasPendingBashMonitorWakeTurn = () => true;
+      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(true);
+    } finally {
+      session.dispose();
       await cleanup();
     }
   });

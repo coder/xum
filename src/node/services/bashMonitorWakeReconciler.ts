@@ -111,6 +111,13 @@ export interface BashMonitorWakeDispatch {
   ownerWorkspaceId: string;
   prompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }>;
+  /**
+   * False once a full-history clear or disposal retired the signals behind this wake
+   * while it was in the receiver's hands. The receiver re-checks it after taking its own
+   * locks (the clear runs under the same history lock) and before sending, so a stale
+   * prompt is never appended to freshly cleared history.
+   */
+  isCurrent(): boolean;
   onAccepted(): Promise<void>;
   onDeferred(): Promise<void>;
 }
@@ -455,6 +462,7 @@ export class BashMonitorWakeReconciler {
       this.states.delete(ownerWorkspaceId);
       return Promise.resolve();
     });
+    this.args.onOutstandingChanged?.(ownerWorkspaceId, false);
   }
 
   revive(ownerWorkspaceId: string): void {
@@ -526,6 +534,7 @@ export class BashMonitorWakeReconciler {
         ownerWorkspaceId,
         prompt: buildPrompt(dispatch.signals),
         muxMetadata: buildMetadata(dispatch.signals),
+        isCurrent: () => this.states.get(ownerWorkspaceId)?.dispatch === dispatch,
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
       });
@@ -560,6 +569,9 @@ export class BashMonitorWakeReconciler {
 
   private async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
+      // A wake already handed to the owner describes signals this consume retires;
+      // forgetting it flips its isCurrent() so the owner drops it instead of sending.
+      this.state(ownerWorkspaceId).dispatch = undefined;
       const collected = await this.collect(ownerWorkspaceId, false);
       const consumed = [...collected.signals, ...collected.autoConsumed];
       await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);

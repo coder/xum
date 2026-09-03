@@ -2378,7 +2378,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // The level drives the same tool-boundary side effects a queued tool-end message
         // does: long-polling bash reads return early and foreground agent-task waits are
         // backgrounded so the stream can reach the boundary where it yields to the wake.
-        this.sessions.get(ownerWorkspaceId)?.setBashMonitorWakeOutstanding(outstanding);
+        const session = this.sessions.get(ownerWorkspaceId);
+        if (session != null) {
+          session.setBashMonitorWakeOutstanding(outstanding);
+        } else if (
+          !outstanding &&
+          // Partial BackgroundProcessManager stubs in tests (see the constructor guards).
+          typeof this.backgroundProcessManager.setMessageQueued === "function"
+        ) {
+          // No session, no queue: the flag can only be a stale mirror (e.g. reconciler
+          // disposal after the session went away), so drop it directly.
+          this.backgroundProcessManager.setMessageQueued(ownerWorkspaceId, false);
+        }
         if (outstanding) {
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(ownerWorkspaceId);
         }
@@ -2518,6 +2529,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ): Promise<BashMonitorWakeDispatchOutcome> {
     return this.bashMonitorHistoryLocks.withLock(dispatch.ownerWorkspaceId, async () => {
       const ownerWorkspaceId = dispatch.ownerWorkspaceId;
+      // A full-history clear (same lock) may have retired these signals while this wake
+      // waited for the lock; sending now would append a stale prompt to cleared history.
+      if (!dispatch.isCurrent()) return "deferred";
       const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), ownerWorkspaceId);
       if (entry == null) {
         await dispatch.onAccepted();
@@ -11835,12 +11849,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * The bash-monitor wake level: a wake the workspace has not seen yet. A stream that
-   * ended with "tool-calls" while this is high yielded to the wake and will be continued
-   * by it (BashMonitorWakeReconciler.hasOutstandingWake).
+   * The bash-monitor wake level: a wake the workspace has not seen yet, or a wake turn
+   * admitted but not yet streaming (AgentSession.hasPendingBashMonitorWakeTurn — the
+   * reconciler level is already consumed there). A stream that ended with "tool-calls"
+   * while this is high yielded to the wake and will be continued by it.
    */
-  hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean> {
-    return this.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId.trim());
+  async hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean> {
+    const id = workspaceId.trim();
+    if (this.sessions.get(id)?.hasPendingBashMonitorWakeTurn() === true) return true;
+    return this.bashMonitorWakeReconciler.hasOutstandingWake(id);
   }
 
   /**

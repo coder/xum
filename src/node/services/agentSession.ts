@@ -865,6 +865,12 @@ export class AgentSession {
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+  /**
+   * The send in the PREPARING phase is a bash-monitor wake. Its `onAccepted` lowers the
+   * reconciler level once the user row is durable, before the stream is observable, so
+   * this marker is what keeps the wake continuation visible across that window.
+   */
+  private preparingBashMonitorWake = false;
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
@@ -991,6 +997,16 @@ export class AgentSession {
 
     this.activePreparedTurnAbortController?.abort();
     this.activePreparedTurnAbortController = null;
+
+    // The bash early-return flag is keyed by workspace id and outlives this session; a
+    // stale wake level would otherwise make a re-created session's long-polling reads
+    // return early forever. (The reconciler's own dispose lowers the level too.) Only
+    // touched when this session raised it: tests dispose sessions built on partial
+    // BackgroundProcessManager stubs.
+    if (this.bashMonitorWakeOutstanding) {
+      this.bashMonitorWakeOutstanding = false;
+      this.syncToolEndYieldRequested(false);
+    }
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -4002,8 +4018,7 @@ export class AgentSession {
 
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(optionsForStream.muxMetadata);
     // From this synchronous point isBusy() reports the turn — release the
     // service-side preflight reservation (see onTurnAdmissionCommitted doc).
     internal?.onTurnAdmissionCommitted?.();
@@ -4155,8 +4170,7 @@ export class AgentSession {
       internal?.goalKind,
       internal?.goalId
     );
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(optionsForStream.muxMetadata);
     // Open the mid-turn thinking override window for the resumed turn (after
     // setTurnPhase(PREPARING), which clears the holder on the IDLE transition).
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
@@ -5376,10 +5390,7 @@ export class AgentSession {
       retryGoalKind,
       retryGoalId
     );
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
-      retryOptionsForResume.muxMetadata
-    );
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(retryOptionsForResume.muxMetadata);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5485,8 +5496,7 @@ export class AgentSession {
     }
 
     // Retry the same request, but without post-compaction injection.
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(context.options?.muxMetadata);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5707,6 +5717,7 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
+        this.preparingBashMonitorWake = false;
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
         // setGoal deferral meaningful again — clear the goal service's settled
@@ -6205,6 +6216,7 @@ export class AgentSession {
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
+      this.preparingBashMonitorWake = false;
       // Turn ended: expire any mid-turn thinking override. Safe unconditionally
       // because a replacement turn (e.g. an edit) only creates its holder after
       // the preempted turn has already been transitioned to IDLE.
@@ -6625,6 +6637,26 @@ export class AgentSession {
     return false;
   }
 
+  /** Claim PREPARING for a send and record what kind of input it carries. */
+  private enterPreparing(muxMetadata: unknown): void {
+    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(muxMetadata);
+    this.preparingBashMonitorWake =
+      (muxMetadata as MuxMessageMetadata | undefined)?.type === "bash-monitor-wake";
+    this.setTurnPhase(TurnPhase.PREPARING);
+  }
+
+  /**
+   * A bash-monitor wake turn between admission and stream start (direct send in PREPARING,
+   * or a dequeued wake entry). The reconciler level is already low here — `onAccepted`
+   * ran when the user row became durable — but no replacement stream is observable yet,
+   * so delegated-turn settlement must still see the continuation.
+   */
+  hasPendingBashMonitorWakeTurn(): boolean {
+    if (this.preparingBashMonitorWake) return true;
+    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
+    return dispatching?.type === "bash-monitor-wake";
+  }
+
   /**
    * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
    */
@@ -6901,8 +6933,7 @@ export class AgentSession {
 
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.
-      this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
-      this.setTurnPhase(TurnPhase.PREPARING);
+      this.enterPreparing(options?.muxMetadata);
 
       void this.sendMessage(message, options, { ...internal, enqueuedAtMs })
         .then(async (result) => {
