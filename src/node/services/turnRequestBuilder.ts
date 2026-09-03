@@ -274,7 +274,7 @@ export interface StreamMessageOptions {
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   /** Fires when the model loop stops solely on behalf of a queued tool-end message. */
-  onQueuedMessageStop?: () => void;
+  onQueuedMessageStop?: (stop: { modelString: string }) => void;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**

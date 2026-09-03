@@ -247,7 +247,7 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  onQueuedMessageStop?: () => void;
+  onQueuedMessageStop?: (stop: { modelString: string }) => void;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -283,6 +283,8 @@ interface StepMessageTracker {
 }
 interface StreamRequestConfig {
   model: LanguageModel;
+  /** Canonical model string of `model` (the fallback's once a fallback request replaces this). */
+  modelString: string;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
@@ -296,9 +298,10 @@ interface StreamRequestConfig {
   /**
    * Invoked when the loop stops on behalf of a queued tool-end message (and not
    * because a required tool completed). The session uses it to resume the turn
-   * if that queued message is later withdrawn instead of starting a turn.
+   * if that queued message is later withdrawn instead of starting a turn. Carries the
+   * model that reached the cut, which a configured fallback may have swapped mid-turn.
    */
-  onQueuedMessageStop?: () => void;
+  onQueuedMessageStop?: (stop: { modelString: string }) => void;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -1940,7 +1943,14 @@ export class StreamManager {
     const abortDelivery = this.emitStreamAbort(
       workspaceId,
       streamInfo.messageId,
-      { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      {
+        usage,
+        contextUsage,
+        duration,
+        providerMetadata,
+        contextProviderMetadata,
+        model: streamInfo.model,
+      },
       abortReason,
       abandonPartial,
       streamInfo.initialMetadata?.acpPromptId
@@ -2118,6 +2128,7 @@ export class StreamManager {
 
     return {
       model,
+      modelString,
       messages,
       system,
       // Keep provider-level parallel tool planning enabled, but serialize sibling
@@ -2142,7 +2153,10 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "onQueuedMessageStop" | "toolPolicy">
+    request: Pick<
+      StreamRequestConfig,
+      "hasQueuedMessages" | "onQueuedMessageStop" | "toolPolicy" | "modelString"
+    >
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2193,7 +2207,7 @@ export class StreamManager {
       // The step cap and a successful required tool result each end the turn on their
       // own; only a stop made purely for the queued message may need resuming later.
       if (state.steps.length < MAX_STREAM_STEPS && !hasSuccessfulRequiredToolResult(state)) {
-        request.onQueuedMessageStop?.();
+        request.onQueuedMessageStop?.({ modelString: request.modelString });
       }
       return true;
     };

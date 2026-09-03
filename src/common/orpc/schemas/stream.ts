@@ -292,7 +292,10 @@ export const StreamEndEventSchema = z.object({
   }),
 });
 
-export const StreamAbortReasonSchema = z.enum(["user", "startup", "system"]);
+// "queued-message": the backend's own soft stop at a provider-executed tool boundary so a queued
+// tool-end message can dispatch; distinct from "system" so a concurrent hard stop cannot be
+// mistaken for it.
+export const StreamAbortReasonSchema = z.enum(["user", "startup", "system", "queued-message"]);
 
 export const StreamLifecyclePhaseSchema = z.enum([
   "idle",
@@ -336,6 +339,8 @@ export const StreamAbortEventSchema = z.object({
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       duration: z.number().optional(),
+      // Model active at the abort (a configured fallback may differ from the requested model)
+      model: z.string().optional(),
     })
     .optional()
     .meta({

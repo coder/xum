@@ -1226,10 +1226,12 @@ describe("StreamManager - stream resource scope", () => {
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
   type BuildStopWhenCondition = (request: {
+    modelString: string;
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-    onQueuedMessageStop?: () => void;
+    onQueuedMessageStop?: (stop: { modelString: string }) => void;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
+  const TEST_MODEL_STRING = "anthropic:claude-sonnet-4-5";
 
   function buildStopWhenForTests(streamManager = new StreamManager(historyService)) {
     return getPrivateMethodForTests<BuildStopWhenCondition>(
@@ -1240,6 +1242,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   function requiredToolConditionForTests(toolPolicy: ToolPolicy): StopWhenCondition {
     const [, , requiredToolCondition] = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
       hasQueuedMessages: () => false,
       toolPolicy,
     });
@@ -1252,7 +1255,10 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("returns step-cap and queued-message conditions with no policy", () => {
     let queued = false;
-    const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
+    const stopWhen = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
+      hasQueuedMessages: () => queued,
+    });
     expect(stopWhen).toHaveLength(3);
 
     const [maxStepCondition, queuedMessageCondition, requiredToolCondition] = stopWhen;
@@ -1270,10 +1276,13 @@ describe("StreamManager - stopWhen configuration", () => {
   test("queued-message stop reports itself only when no required tool completed", () => {
     let queued = false;
     let stopsForQueuedMessage = 0;
+    let stoppedModel: string | undefined;
     const [, queuedMessageCondition] = buildStopWhenForTests()({
+      modelString: "openai:gpt-5-fallback",
       hasQueuedMessages: () => queued,
-      onQueuedMessageStop: () => {
+      onQueuedMessageStop: ({ modelString }) => {
         stopsForQueuedMessage += 1;
+        stoppedModel = modelString;
       },
       toolPolicy: [{ regex_match: "agent_report", action: "require" }],
     });
@@ -1285,6 +1294,8 @@ describe("StreamManager - stopWhen configuration", () => {
     queued = true;
     expect(queuedMessageCondition(bashStep)).toBe(true);
     expect(stopsForQueuedMessage).toBe(1);
+    // The stop names the request's own model, which is the fallback's after a model swap.
+    expect(stoppedModel).toBe("openai:gpt-5-fallback");
 
     expect(queuedMessageCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
       true
@@ -1300,6 +1311,7 @@ describe("StreamManager - stopWhen configuration", () => {
   test("queued-message stop does not report itself once the step cap is reached", () => {
     let stopsForQueuedMessage = 0;
     const [maxStepCondition, queuedMessageCondition] = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
       hasQueuedMessages: () => true,
       onQueuedMessageStop: () => {
         stopsForQueuedMessage += 1;
