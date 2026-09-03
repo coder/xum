@@ -17,6 +17,12 @@ import type { HistoryService } from "./historyService";
 import type { TurnStreamHandle } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
+/** Steps a cut stream reports as left; tests about the budget itself pass their own value. */
+const CUT_STEPS_REMAINING = 1_000;
+const queuedStop = (modelString = TEST_MODEL) => ({
+  modelString,
+  stepsRemaining: CUT_STEPS_REMAINING,
+});
 const WORKSPACE_TURN_CORRELATION = {
   type: "workspace-turn-task",
   taskHandleId: "wst_preparing",
@@ -48,14 +54,15 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
 
 function streamAbortEvent(
   workspaceId: string,
-  abortReason: "system" | "user" | "queued-message"
+  abortReason: "system" | "user" | "queued-message",
+  stepsRemaining = CUT_STEPS_REMAINING
 ): Record<string, unknown> {
   return {
     type: "stream-abort",
     workspaceId,
     messageId: "assistant-1",
     abortReason,
-    metadata: { duration: 1 },
+    metadata: { duration: 1, stepsRemaining },
   };
 }
 
@@ -819,7 +826,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(request.hasQueuedMessages?.("tool-end")).toBe(true);
       // StreamManager stopped the loop for the queued wake; the wake is then withdrawn
       // (its output was consumed another way) before the stream-end drain dispatches it.
-      request.onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      request.onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -860,7 +867,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
@@ -910,21 +917,81 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       // Each cut follows a completed step whose task_await consumed the monitor's wake (dogfood
-      // UAT: four sequential background+await calls in one prompt); the cap must not end it.
-      const strandTurn = () => {
-        harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      // UAT: four sequential background+await calls in one prompt); the failed-start cap must
+      // not end it. What bounds the chain is the turn's step budget, run down by every cut.
+      const strandTurn = (stepsRemaining: number) => {
+        harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL, stepsRemaining });
         harness.queueCancelableWake().abort("monitor consumed");
         aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       };
 
       for (let resumes = 1; resumes <= 4; resumes += 1) {
-        strandTurn();
+        const stepsRemaining = 5 - resumes;
+        strandTurn(stepsRemaining);
         expect(await waitForCondition(() => streamMessage.mock.calls.length === resumes + 1)).toBe(
           true
         );
         expect(session.isBusy()).toBe(true);
+        expect(harness.latestRequest().stepBudget).toBe(stepsRemaining);
       }
     } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a resumed turn runs under the cut stream's remaining step budget", async () => {
+    const workspaceId = "queue-dispatch-stranded-step-budget";
+    const harness = await createStreamingTurnHarness(workspaceId);
+    const { session, cleanup, aiEmitter, aiService, streamMessage } = harness;
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      expect(harness.latestRequest().stepBudget).toBeUndefined();
+
+      // Cut by the loop's stop condition: the resume inherits what that stream had left.
+      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL, stepsRemaining: 7 });
+      harness.queueCancelableWake().abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(harness.latestRequest().stepBudget).toBe(7);
+
+      // Cut by a provider-tool soft stop: the abort reports the budget the next stream gets.
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, dedupeKey: "wake:1" }
+      );
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).toHaveBeenCalledTimes(1);
+      expect(session.removeQueuedMessagesByDedupeKeyPrefix("wake:", "superseded")).toBe(1);
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "queued-message", 3));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 3)).toBe(true);
+      expect(harness.latestRequest().stepBudget).toBe(3);
+
+      // A cut stream that spent its whole ceiling ended the turn: nothing is owed.
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, dedupeKey: "wake:2" }
+      );
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).toHaveBeenCalledTimes(2);
+      expect(session.removeQueuedMessagesByDedupeKeyPrefix("wake:", "superseded")).toBe(1);
+      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "queued-message", 0));
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(3);
+    } finally {
+      stopStream.mockRestore();
       session.dispose();
       await cleanup();
     }
@@ -953,7 +1020,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       gateOpen = false;
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => !session.isBusy())).toBe(true);
@@ -1030,7 +1097,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       ).toBe(false);
 
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       // The entry is gone before the stream ends (dedupe removal / clearQueue shape).
       wake.abort("monitor consumed");
       session.clearQueue("monitor consumed");
@@ -1068,7 +1135,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup } = harness;
 
     try {
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       session.queueMessage("user follow-up", { model: TEST_MODEL, agentId: "exec" });
       expect(
         session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
@@ -1120,7 +1187,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       // Owed whether the owner asks while the wake is still queued or after it is cleared.
       expect(
@@ -1150,7 +1217,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -1192,7 +1259,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       gateOpen = false;
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -1267,7 +1334,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           onCanceled: () => undefined,
         }
       );
-      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.(queuedStop());
       controller.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
@@ -1345,7 +1412,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           onCanceled: () => undefined,
         }
       );
-      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.(queuedStop());
       controller.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -1370,7 +1437,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       // WorkspaceService.interruptStream: hard stop, then restore the queue to the composer.
       expect((await session.interruptStream()).success).toBe(true);
       aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "user"));
@@ -1417,7 +1484,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       gateArmed = true;
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -1449,7 +1516,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(original.delegatedToolNames).toEqual(["bash"]);
 
       const wake = harness.queueCancelableWake();
-      original.onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      original.onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -1504,7 +1571,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     });
     const { session, aiEmitter } = harness;
     gateOpen = false;
-    harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+    harness.latestRequest().onQueuedMessageStop?.(queuedStop());
     harness.queueCancelableWake().abort("monitor consumed");
     session.clearQueue("monitor consumed");
     expect(session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")).toBe(
@@ -1731,7 +1798,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       gateArmed = true;
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => gateReached)).toBe(true);
@@ -1805,7 +1872,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           onCanceled: () => undefined,
         }
       );
-      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.(queuedStop());
       controller.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -1830,7 +1897,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       const entry = harness.queueCancelableUnrelatedEntry();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       // The queued entry is not this turn's continuation: the owner settles the delegated turn.
       expect(
         session.claimWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION, "assistant-1")
@@ -1860,7 +1927,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       harness.queueCancelableUnrelatedEntry();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       // The owner settles the turn on this answer. The entry then leaves the queue without ever
       // dispatching (user clears the queue), which must not bring the settled turn back.
       expect(
@@ -1891,7 +1958,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       harness.queueCancelableUnrelatedEntry();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       session.clearQueue("queue cleared by user");
       // Nothing supersedes the turn by the time the owner asks: it defers, and the resume runs.
       expect(
@@ -1916,7 +1983,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       // A wake inherits the turn's correlation when it sends, so the owner defers on it even
       // though the queued entry carries none; the continuation stays owed behind it.
       expect(
@@ -1943,7 +2010,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       harness.queueCancelableUnrelatedEntry();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       // The owner is still settling an earlier stream of this turn: that a later cut owes a
       // continuation proves the turn went on, so it defers without touching the marker.
       expect(
@@ -1991,7 +2058,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       gateArmed = true;
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
       expect(await waitForCondition(() => gateReached)).toBe(true);
@@ -2024,7 +2091,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const wake = harness.queueCancelableWake();
       // StreamManager reports the request that was running at the stop: a configured fallback
       // model, not the refused primary this stream was sent with.
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: "anthropic:claude-opus-4-8" });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop("anthropic:claude-opus-4-8"));
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -2054,7 +2121,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
 
       const wake = harness.queueCancelableWake();
-      original.onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      original.onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -2124,7 +2191,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     );
     const wake = harness.queueCancelableWake();
-    harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+    harness.latestRequest().onQueuedMessageStop?.(queuedStop());
     wake.abort("monitor consumed");
     harness.aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
     expect(await waitForCondition(() => ioReached)).toBe(true);
@@ -2200,7 +2267,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         }
       );
       armed = true;
-      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.(queuedStop());
       controller.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -2268,7 +2335,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       expect(harness.latestRequest().additionalSystemContext).toBe("live scratchpad");
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -2297,7 +2364,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(original.activeTurnThinkingOverride?.applied).toBeUndefined();
 
       const wake = harness.queueCancelableWake();
-      original.onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      original.onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
 
@@ -2398,7 +2465,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
     try {
       const wake = harness.queueCancelableWake();
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      harness.latestRequest().onQueuedMessageStop?.(queuedStop());
       wake.abort("monitor consumed");
       // The loop ended normally; stream-end cleanup is parked in COMPLETING.
       goal.armDrain();
@@ -2474,7 +2541,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           onCanceled: () => undefined,
         }
       );
-      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.(queuedStop());
       controller.abort("monitor consumed");
       session.clearQueue("monitor consumed");
       // The owner defers this stream-end on the strength of the advertised continuation.
@@ -2549,7 +2616,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           onCanceled: () => undefined,
         }
       );
-      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({ modelString: TEST_MODEL });
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.(queuedStop());
       controller.abort("monitor consumed");
       failFirstStream();
 

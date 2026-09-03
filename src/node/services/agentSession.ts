@@ -244,6 +244,7 @@ interface AutoRetryResumeRequest {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
+  stepBudget?: number;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -369,6 +370,11 @@ interface StrandedTurnResume {
   options: SendMessageOptions;
   /** Assistant message id of the stream the cut ended (claimWorkspaceTurnContinuation). */
   cutMessageId: string;
+  /**
+   * Steps the cut stream had left under its ceiling; the resumed stream runs under this budget
+   * so a chain of cuts and resumes spends one turn's steps, not a fresh cap per resume.
+   */
+  stepBudget?: number;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
@@ -388,6 +394,7 @@ function buildStrandedTurnResume(context: {
   /** Model that reached the cut: a configured fallback may differ from the requested one. */
   modelString: string;
   cutMessageId: string;
+  stepBudget?: number;
   options?: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
@@ -418,6 +425,7 @@ function buildStrandedTurnResume(context: {
         context.workspaceTurnMetadata ?? getWorkspaceTurnMuxMetadata(context.options?.muxMetadata),
     },
     cutMessageId: context.cutMessageId,
+    ...(context.stepBudget != null ? { stepBudget: context.stepBudget } : {}),
     ...(context.agentInitiated != null ? { agentInitiated: context.agentInitiated } : {}),
     ...(context.goalKind != null ? { goalKind: context.goalKind } : {}),
     ...(context.goalId != null ? { goalId: context.goalId } : {}),
@@ -969,6 +977,8 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind;
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
+    /** Step ceiling this stream runs under when it continues a cut turn (see StrandedTurnResume). */
+    stepBudget?: number;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
@@ -1391,7 +1401,8 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
-    goalId?: string
+    goalId?: string,
+    stepBudget?: number
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1403,6 +1414,7 @@ export class AgentSession {
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(stepBudget != null ? { stepBudget } : {}),
     };
   }
 
@@ -1431,6 +1443,7 @@ export class AgentSession {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
         goalId: request.goalId,
+        stepBudget: request.stepBudget,
       });
       if (result.success) {
         if (!result.data.started) {
@@ -4318,6 +4331,8 @@ export class AgentSession {
        * through admitStrandedTurnResume; a refusal reports `refusedBy`.
        */
       revalidateAdmission?: boolean;
+      /** Step ceiling for the resumed stream when it continues a cut turn (StrandedTurnResume). */
+      stepBudget?: number;
     }
   ): Promise<AgentSessionResult<{ started: boolean; refusedBy?: "goal" | "workspace-turn" }>> {
     this.assertNotDisposed("resumeStream");
@@ -4353,7 +4368,8 @@ export class AgentSession {
       optionsForStream,
       internal?.agentInitiated,
       internal?.goalKind,
-      internal?.goalId
+      internal?.goalId,
+      internal?.stepBudget
     );
     // Claim the turn before any await: the admission gates below do I/O, and a manual send
     // entering meanwhile must see a busy session rather than start a stream this resume
@@ -4440,7 +4456,8 @@ export class AgentSession {
         internal?.goalKind,
         internal?.goalId,
         turnThinkingOverride,
-        refuseStreamStart
+        refuseStreamStart,
+        internal?.stepBudget
       );
       if (!result.success) {
         return result;
@@ -5173,7 +5190,8 @@ export class AgentSession {
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
     // Pull-based admission probe (goal state) with no push into abortSignal; checked wherever
     // the signal is, and by StreamManager right before the stream registers.
-    refuseStreamStart?: () => boolean
+    refuseStreamStart?: () => boolean,
+    stepBudget?: number
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean =>
       abortSignal?.aborted === true || refuseStreamStart?.() === true;
@@ -5196,6 +5214,7 @@ export class AgentSession {
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(stepBudget != null ? { stepBudget } : {}),
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
@@ -5382,6 +5401,7 @@ export class AgentSession {
       modelString,
       abortSignal,
       refuseStreamStart,
+      stepBudget,
       thinkingLevel: effectiveThinkingLevel,
       // Orthogonal to thinking level; buildRequestHeaders gates it per model.
       reasoningMode: options?.reasoningMode,
@@ -5409,12 +5429,13 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
-      onQueuedMessageStop: ({ modelString: stoppedModelString }) => {
+      onQueuedMessageStop: ({ modelString: stoppedModelString, stepsRemaining }) => {
         if (this.activeStreamContext != null && this.activeStreamMessageId != null) {
           this.strandedTurnResume = buildStrandedTurnResume({
             ...this.activeStreamContext,
             modelString: stoppedModelString,
             cutMessageId: this.activeStreamMessageId,
+            stepBudget: stepsRemaining,
             thinkingLevelAtCut:
               activeTurnThinkingOverride?.pending ?? activeTurnThinkingOverride?.applied,
           });
@@ -5789,7 +5810,10 @@ export class AgentSession {
         context.agentInitiated,
         undefined,
         context.goalKind,
-        context.goalId
+        context.goalId,
+        undefined,
+        undefined,
+        context.stepBudget
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -6259,7 +6283,8 @@ export class AgentSession {
         isQueuedProviderToolEndAbort && this.queuedProviderToolEndAbortInFlight,
         abortedStreamContext,
         payload.metadata?.model,
-        payload.messageId
+        payload.messageId,
+        payload.metadata?.stepsRemaining
       );
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
@@ -7213,7 +7238,8 @@ export class AgentSession {
     isQueuedProviderToolEndAbort: boolean,
     abortedStreamContext: AgentSession["activeStreamContext"],
     abortedModelString: string | undefined,
-    abortedMessageId: string
+    abortedMessageId: string,
+    abortedStepsRemaining: number | undefined
   ): boolean {
     this.queuedProviderToolEndAbortInFlight = false;
     if (!isQueuedProviderToolEndAbort || this.deferQueuedFlushUntilAfterEdit) {
@@ -7222,11 +7248,18 @@ export class AgentSession {
 
     // The soft stop was made on behalf of the queued message; if that message has been
     // withdrawn (or is withdrawn after dequeue), the interrupted turn must resume instead.
-    if (abortedStreamContext != null) {
+    // Only under the steps the cut stream had left: at zero the ceiling ended the turn, and an
+    // abort that reports no budget must not hand the resume a fresh one.
+    if (
+      abortedStreamContext != null &&
+      abortedStepsRemaining != null &&
+      abortedStepsRemaining > 0
+    ) {
       this.strandedTurnResume = buildStrandedTurnResume({
         ...abortedStreamContext,
         modelString: abortedModelString ?? abortedStreamContext.modelString,
         cutMessageId: abortedMessageId,
+        stepBudget: abortedStepsRemaining,
         thinkingLevelAtCut:
           this.activeTurnThinkingOverride?.pending ?? this.activeTurnThinkingOverride?.applied,
       });
@@ -7289,6 +7322,7 @@ export class AgentSession {
       goalId: resume.goalId,
       abortSignal: inFlight.signal,
       revalidateAdmission: true,
+      stepBudget: resume.stepBudget,
     })
       .then((result) => {
         if (!result.success) {

@@ -341,6 +341,9 @@ export const StreamAbortEventSchema = z.object({
       duration: z.number().optional(),
       // Model active at the abort (a configured fallback may differ from the requested model)
       model: z.string().optional(),
+      // Steps left under the stream's ceiling at the abort; a turn cut for a queued message
+      // resumes under this budget rather than a fresh one.
+      stepsRemaining: z.number().int().nonnegative().optional(),
     })
     .optional()
     .meta({

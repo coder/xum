@@ -1228,7 +1228,8 @@ describe("StreamManager - stopWhen configuration", () => {
   type BuildStopWhenCondition = (request: {
     modelString: string;
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-    onQueuedMessageStop?: (stop: { modelString: string }) => void;
+    onQueuedMessageStop?: (stop: { modelString: string; stepsRemaining: number }) => void;
+    stepBudget?: number;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
   const TEST_MODEL_STRING = "anthropic:claude-sonnet-4-5";
@@ -1325,6 +1326,27 @@ describe("StreamManager - stopWhen configuration", () => {
 
     expect(queuedMessageCondition({ steps: new Array<unknown>(99999).fill({}) })).toBe(true);
     expect(stopsForQueuedMessage).toBe(1);
+  });
+
+  test("a step budget replaces the default ceiling and the cut reports what is left", () => {
+    const stops: number[] = [];
+    const [maxStepCondition, queuedMessageCondition] = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
+      hasQueuedMessages: () => true,
+      onQueuedMessageStop: ({ stepsRemaining }) => {
+        stops.push(stepsRemaining);
+      },
+      stepBudget: 5,
+    });
+
+    expect(maxStepCondition({ steps: new Array<unknown>(4).fill({}) })).toBe(false);
+    expect(maxStepCondition({ steps: new Array<unknown>(5).fill({}) })).toBe(true);
+
+    expect(queuedMessageCondition({ steps: new Array<unknown>(2).fill({}) })).toBe(true);
+    expect(stops).toEqual([3]);
+    // At the budget the ceiling ends the turn; the cut owes nothing.
+    expect(queuedMessageCondition({ steps: new Array<unknown>(5).fill({}) })).toBe(true);
+    expect(stops).toEqual([3]);
   });
 
   const requiredToolCases: Array<{

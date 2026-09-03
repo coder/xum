@@ -247,7 +247,8 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  onQueuedMessageStop?: (stop: { modelString: string }) => void;
+  onQueuedMessageStop?: (stop: { modelString: string; stepsRemaining: number }) => void;
+  stepBudget?: number;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -301,9 +302,16 @@ interface StreamRequestConfig {
    * Invoked when the loop stops on behalf of a queued tool-end message (and not
    * because a required tool completed). The session uses it to resume the turn
    * if that queued message is later withdrawn instead of starting a turn. Carries the
-   * model that reached the cut, which a configured fallback may have swapped mid-turn.
+   * model that reached the cut, which a configured fallback may have swapped mid-turn, and
+   * the steps left under this request's budget for the resumed stream to run under.
    */
-  onQueuedMessageStop?: (stop: { modelString: string }) => void;
+  onQueuedMessageStop?: (stop: { modelString: string; stepsRemaining: number }) => void;
+  /**
+   * Step ceiling for this stream instead of MAX_STREAM_STEPS. A stream resuming a turn cut
+   * for a queued message inherits the cut stream's remaining steps, so cut plus resumes
+   * share one turn's ceiling; without it, every resume would restart the full cap.
+   */
+  stepBudget?: number;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -636,6 +644,10 @@ interface WorkspaceStreamInfo {
   // Needed for reconnect replay filtering because dynamic-tool parts keep their
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
+
+  // Steps started so far, the in-progress one included: the budget left at an abort counts a
+  // step the model already began.
+  stepCount: number;
 
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
   // attachment and apply it as soon as the matching dynamic-tool part lands.
@@ -1952,6 +1964,10 @@ export class StreamManager {
         providerMetadata,
         contextProviderMetadata,
         model: streamInfo.model,
+        stepsRemaining: Math.max(
+          0,
+          (streamInfo.request.stepBudget ?? MAX_STREAM_STEPS) - Math.max(1, streamInfo.stepCount)
+        ),
       },
       abortReason,
       abandonPartial,
@@ -2091,6 +2107,7 @@ export class StreamManager {
       toolPolicy,
       hasQueuedMessages,
       onQueuedMessageStop,
+      stepBudget,
       headers,
       onChunk,
       onStepMessages,
@@ -2143,6 +2160,7 @@ export class StreamManager {
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
       onQueuedMessageStop,
+      stepBudget,
       onChunk,
       onStepMessages,
       toolPolicy,
@@ -2157,9 +2175,10 @@ export class StreamManager {
   private createStopWhenCondition(
     request: Pick<
       StreamRequestConfig,
-      "hasQueuedMessages" | "onQueuedMessageStop" | "toolPolicy" | "modelString"
+      "hasQueuedMessages" | "onQueuedMessageStop" | "toolPolicy" | "modelString" | "stepBudget"
     >
   ): Array<ReturnType<typeof stepCountIs>> {
+    const stepBudget = request.stepBudget ?? MAX_STREAM_STEPS;
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
     // When a marker is present, respect it — success:false means the tool
@@ -2207,18 +2226,19 @@ export class StreamManager {
         return false;
       }
       // The step cap and a successful required tool result each end the turn on their
-      // own; only a stop made purely for the queued message may need resuming later.
-      if (state.steps.length < MAX_STREAM_STEPS && !hasSuccessfulRequiredToolResult(state)) {
-        request.onQueuedMessageStop?.({ modelString: request.modelString });
+      // own; only a stop made purely for the queued message may need resuming later. A cut
+      // spends at least one step, so a chain of cuts and resumes always runs the budget down.
+      const stepsSpent = Math.max(1, state.steps.length);
+      if (stepsSpent < stepBudget && !hasSuccessfulRequiredToolResult(state)) {
+        request.onQueuedMessageStop?.({
+          modelString: request.modelString,
+          stepsRemaining: stepBudget - stepsSpent,
+        });
       }
       return true;
     };
 
-    return [
-      stepCountIs(MAX_STREAM_STEPS),
-      hasQueuedToolEndMessage,
-      hasSuccessfulRequiredToolResult,
-    ];
+    return [stepCountIs(stepBudget), hasQueuedToolEndMessage, hasSuccessfulRequiredToolResult];
   }
 
   /**
@@ -2444,6 +2464,7 @@ export class StreamManager {
       startTime,
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
+      stepCount: 0,
       pendingWorkflowRunAttachments: new Map(),
       pendingNestedCalls: new Map(),
       pendingToolExecutionStarts: new Map(),
@@ -3196,6 +3217,7 @@ export class StreamManager {
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
       onQueuedMessageStop: streamInfo.request.onQueuedMessageStop,
+      stepBudget: streamInfo.request.stepBudget,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
@@ -3412,6 +3434,7 @@ export class StreamManager {
             switch (part.type) {
               case "start-step": {
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
+                streamInfo.stepCount += 1;
                 break;
               }
 
