@@ -5005,11 +5005,18 @@ export class StreamManager {
         // the cancel → settle sequence is visibly atomic under a second interrupt.
         Effect.uninterruptible(
           Effect.promise(async () => {
+            const startedAt = performance.now();
             await this.cancelStreamSafely(workspaceId, streamInfo, "system");
             // Abort delivery (partial commit, downstream stream-abort listeners)
             // settles the completion asynchronously after cancelStreamSafely
             // returns; shutdown must not proceed until it has.
             await streamInfo.completionController.promise;
+            // Per-stream cost inside the AppFiberScope close (shutdownStep style).
+            log.debug("[shutdown] streamManager.abortStream", {
+              workspaceId,
+              messageId: streamInfo.messageId,
+              ms: Math.round(performance.now() - startedAt),
+            });
           })
         )
       ),
