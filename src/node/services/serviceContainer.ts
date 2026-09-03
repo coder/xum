@@ -310,7 +310,12 @@ export class ServiceContainer {
 
     await recordStep("extensionMetadata.initialize", () => this.extensionMetadata.initialize());
     // Initialize telemetry service
-    await recordStep("telemetryService.initialize", () => this.telemetryService.initialize());
+    await recordStep("telemetryService.initialize", async () => {
+      // Repair a crash-split telemetry preference (field written, marker sync
+      // lost) before the enablement gates read either record.
+      await this.config.reconcileTelemetryOptOutMarker();
+      await this.telemetryService.initialize();
+    });
 
     // Initialize policy service (startup gating)
     await recordStep("policyService.initialize", () => this.policyService.initialize());
