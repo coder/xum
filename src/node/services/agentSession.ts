@@ -45,7 +45,7 @@ import {
   SendMessageOptionsSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas";
-import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import { ModelFallbackProgressSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import {
   buildStreamErrorEventData,
@@ -3195,6 +3195,10 @@ export class AgentSession {
       /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
       goalId?: string;
       startStreamInBackground?: boolean;
+      /** For a send continuing an interrupted turn: what that turn had left of its ceiling. */
+      stepBudget?: number;
+      /** For a send continuing an interrupted turn: the fallback chain state it reached. */
+      modelFallbackProgress?: ModelFallbackProgress;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
@@ -4216,7 +4220,15 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      agentInitiated,
+      goalKind,
+      internal?.goalId,
+      internal?.stepBudget,
+      undefined,
+      internal?.modelFallbackProgress
+    );
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -4300,7 +4312,11 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          undefined,
+          internal?.stepBudget,
+          undefined,
+          internal?.modelFallbackProgress
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4809,12 +4825,18 @@ export class AgentSession {
     goalId?: string;
     muxMetadata?: MuxMessageMetadata;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+    stepBudget?: number;
+    modelFallbackProgress?: ModelFallbackProgress;
   }): CompactionFollowUpRequest {
     const followUp: CompactionFollowUpRequest = {
       text: params.messageText,
       model: params.modelForStream,
       agentId: params.options.agentId,
       ...pickPreservedSendOptions(params.options),
+      ...(params.stepBudget != null ? { stepBudget: params.stepBudget } : {}),
+      ...(params.modelFallbackProgress != null
+        ? { modelFallbackProgress: params.modelFallbackProgress }
+        : {}),
     };
 
     if (params.agentInitiated === true) {
@@ -5075,6 +5097,9 @@ export class AgentSession {
         goalId: streamContext.goalId,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
+        // The abort handler left the interrupted stream's remainder on this context.
+        stepBudget: streamContext.stepBudget,
+        modelFallbackProgress: streamContext.modelFallbackProgress,
       });
       // Waterfall hook point: see the on-send compaction.prepare run above.
       await eventSpine.run("compaction.prepare", {
@@ -5258,6 +5283,27 @@ export class AgentSession {
           }
           if (this.activeStreamContext?.stepBudget != null) {
             this.activeStreamContext.stepBudget = outcome.stepsRemaining;
+          }
+        }
+        // Likewise the chain: an attempt that moved down its fallback chain hands the retry the
+        // model it reached and the refusals so far, so no refused hop is attempted again.
+        const progress = outcome.modelFallbackProgress;
+        if (progress != null && progress.refusedModels.length > 0 && outcome.modelString != null) {
+          const retryRequest = this.lastAutoRetryResumeRequest;
+          if (retryRequest != null) {
+            this.lastAutoRetryResumeRequest = {
+              ...retryRequest,
+              options: { ...retryRequest.options, model: outcome.modelString },
+              modelFallbackProgress: progress,
+            };
+          }
+          const context = this.activeStreamContext;
+          if (context != null) {
+            context.modelString = outcome.modelString;
+            context.modelFallbackProgress = progress;
+            if (context.options != null) {
+              context.options = { ...context.options, model: outcome.modelString };
+            }
           }
         }
         try {
@@ -6426,6 +6472,19 @@ export class AgentSession {
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
       const abortedStreamContext = this.activeStreamContext;
+      // Whoever continues the interrupted turn from this context (mid-stream compaction holds a
+      // reference to it) continues under what the aborted stream left of the ceiling and from
+      // the chain state it reached, as a resume or retry would.
+      if (abortedStreamContext != null) {
+        if (payload.metadata?.stepsRemaining != null) {
+          abortedStreamContext.stepBudget = payload.metadata.stepsRemaining;
+        }
+        const abortedProgress = payload.metadata?.modelFallbackProgress;
+        if (abortedProgress != null && payload.metadata?.model != null) {
+          abortedStreamContext.modelFallbackProgress = abortedProgress;
+          abortedStreamContext.modelString = payload.metadata.model;
+        }
+      }
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
       // The soft stop is recognized by its own reason, not by the in-flight flag alone: a hard
       // "system" stop (task_stop, interrupt cascade, workflow timeout) can land while the soft
@@ -8237,6 +8296,17 @@ export class AgentSession {
       options.muxMetadata = metadata;
     }
 
+    // Same raw JSON boundary: the interrupted turn's remainder is optional and dropped if malformed
+    // (the follow-up then runs under the default ceiling and its model's own chain).
+    const persistedStepBudget =
+      typeof followUp.stepBudget === "number" && Number.isInteger(followUp.stepBudget)
+        ? Math.max(0, followUp.stepBudget)
+        : undefined;
+    const persistedFallbackProgress =
+      followUp.modelFallbackProgress != null
+        ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)
+        : undefined;
+
     // The compaction summary is now the source of truth for the next live resume
     // request. Pre-arm retry state from the reconstructed follow-up so failures
     // before stream startup do not fall back to the already-completed compact turn.
@@ -8244,7 +8314,10 @@ export class AgentSession {
       options,
       followUp.agentInitiated,
       persistedGoalKind,
-      persistedGoalId
+      persistedGoalId,
+      persistedStepBudget,
+      undefined,
+      persistedFallbackProgress?.success ? persistedFallbackProgress.data : undefined
     );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
@@ -8264,6 +8337,10 @@ export class AgentSession {
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
+      stepBudget: persistedStepBudget,
+      modelFallbackProgress: persistedFallbackProgress?.success
+        ? persistedFallbackProgress.data
+        : undefined,
     });
     if (!sendResult.success) {
       // A stale-admission refusal is the idle rule (or a goal transition)

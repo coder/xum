@@ -22,6 +22,15 @@ type SendMessageResult =
 interface AutoRetryResumeRequest {
   options: SendMessageOptions;
   agentInitiated?: boolean;
+  stepBudget?: number;
+  modelFallbackProgress?: unknown;
+}
+
+interface SendInternal {
+  synthetic?: boolean;
+  agentInitiated?: boolean;
+  stepBudget?: number;
+  modelFallbackProgress?: unknown;
 }
 
 interface SessionInternals {
@@ -29,7 +38,7 @@ interface SessionInternals {
   sendMessage: (
     message: string,
     options?: SendOptions,
-    internal?: { synthetic?: boolean; agentInitiated?: boolean }
+    internal?: SendInternal
   ) => Promise<SendMessageResult>;
   scheduleStartupRecovery: () => void;
   startupRecoveryPromise: Promise<void> | null;
@@ -264,6 +273,63 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     expect(dispatchedInternal).toMatchObject({ synthetic: true, agentInitiated: true });
     expect(internals.lastAutoRetryResumeRequest?.agentInitiated).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp continues the interrupted turn's step budget and fallback chain", async () => {
+    const progress = {
+      requestedModel: "anthropic:claude-sonnet-4-5",
+      refusedModels: ["anthropic:claude-sonnet-4-5"],
+      chain: ["openai:gpt-4o", "google:gemini-fallback"],
+    };
+    const dispatched: SendInternal[] = [];
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-remainder", {
+        text: "Continue",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        stepBudget: 7,
+        modelFallbackProgress: progress,
+      }),
+    ]);
+    internals.sendMessage = mock(
+      (_message: string, _options?: SendOptions, internal?: SendInternal) => {
+        dispatched.push(internal ?? {});
+        return Promise.resolve({ success: true as const });
+      }
+    );
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatched[0]).toMatchObject({ stepBudget: 7, modelFallbackProgress: progress });
+    expect(internals.lastAutoRetryResumeRequest?.stepBudget).toBe(7);
+    expect(internals.lastAutoRetryResumeRequest?.modelFallbackProgress).toEqual(progress);
+  });
+
+  test("dispatchPendingFollowUp drops a malformed persisted remainder", async () => {
+    const dispatched: SendInternal[] = [];
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-malformed-remainder", {
+        text: "Continue",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        stepBudget: "seven" as unknown as number,
+        modelFallbackProgress: {
+          requestedModel: 1,
+        } as unknown as CompactionFollowUpRequest["modelFallbackProgress"],
+      }),
+    ]);
+    internals.sendMessage = mock(
+      (_message: string, _options?: SendOptions, internal?: SendInternal) => {
+        dispatched.push(internal ?? {});
+        return Promise.resolve({ success: true as const });
+      }
+    );
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.stepBudget).toBeUndefined();
+    expect(dispatched[0]?.modelFallbackProgress).toBeUndefined();
   });
 
   test("dispatchPendingFollowUp forwards strictAgentResolution to the resumed turn", async () => {

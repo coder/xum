@@ -9,6 +9,7 @@ import type {
 } from "@/common/constants/contextBoundary";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { ModelFallbackProgress } from "./stream";
 import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
@@ -220,6 +221,12 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   goalId?: string;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
+  /**
+   * What the turn interrupted for mid-stream compaction had left of its step ceiling, and the
+   * fallback chain state it reached: the follow-up continues that turn, not a fresh one.
+   */
+  stepBudget?: number;
+  modelFallbackProgress?: ModelFallbackProgress;
   /**
    * Open delegated workspace-turn correlation captured before on-send
    * compaction consumed this follow-up (e.g. a bash-monitor wake continuing a

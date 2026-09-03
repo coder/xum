@@ -1214,6 +1214,94 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("an auto-retry continues from the model the failed resumed attempt reached", async () => {
+    const workspaceId = "queue-dispatch-stranded-retry-fallback-chain";
+    const aiEmitter = new EventEmitter();
+    const progressAtCut = {
+      requestedModel: TEST_MODEL,
+      refusedModels: [TEST_MODEL],
+      chain: ["openai:gpt-5-fallback", "google:gemini-fallback"],
+    };
+    // The resumed attempt started on the first fallback, which refused too; the second fallback
+    // then failed with a retryable error.
+    const progressAtFailure = {
+      ...progressAtCut,
+      refusedModels: [TEST_MODEL, "openai:gpt-5-fallback"],
+    };
+    let streams = 0;
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      streams += 1;
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      return Promise.resolve(
+        Ok(
+          streams === 2
+            ? {
+                messageId: "assistant-2",
+                completion: Promise.resolve({
+                  status: "failed" as const,
+                  streamError: {
+                    messageId: "assistant-2",
+                    error: "provider closed the connection",
+                    errorType: "api" as const,
+                  },
+                  stepsRemaining: 2,
+                  modelString: "google:gemini-fallback",
+                  modelFallbackProgress: progressAtFailure,
+                }),
+              }
+            : createStartedTurnHandle(`assistant-${streams}`)
+        )
+      );
+    });
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+    });
+
+    try {
+      const sent = await session.sendMessage("run the checks", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(sent.success).toBe(true);
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-1", "assistant", "ran the checks", { timestamp: Date.now() })
+      );
+      const controller = new AbortController();
+      session.queueMessage(
+        "Background monitor wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          cancelState: { canceledBeforeAcceptance: false },
+          cancelSignal: controller.signal,
+          onCanceled: () => undefined,
+        }
+      );
+      streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({
+        modelString: "openai:gpt-5-fallback",
+        stepsRemaining: 5,
+        modelFallbackProgress: progressAtCut,
+      });
+      controller.abort("monitor consumed");
+      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+      expect(streamMessage.mock.calls[1]?.[0].modelString).toBe("openai:gpt-5-fallback");
+
+      // The retry picks the chain up where the failed attempt left it instead of re-running the
+      // first fallback's refusal.
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 3, 4_000)).toBe(true);
+      expect(streamMessage.mock.calls[2]?.[0].modelString).toBe("google:gemini-fallback");
+      expect(streamMessage.mock.calls[2]?.[0].modelFallbackProgress).toEqual(progressAtFailure);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("an auto-retry is abandoned when the failed resumed attempt spent the step budget", async () => {
     const workspaceId = "queue-dispatch-stranded-retry-step-budget-spent";
     const aiEmitter = new EventEmitter();

@@ -215,6 +215,12 @@ export type TurnCompletion =
        * Absent when the attempt failed before its loop ran a step.
        */
       stepsRemaining?: number;
+      /**
+       * Model the failed attempt ran on and the fallback chain state it reached (a refusal may
+       * have moved it down the chain); a retry continues from there rather than repeating hops.
+       */
+      modelString?: string;
+      modelFallbackProgress?: ModelFallbackProgress;
     };
 
 export interface TurnStreamHandle {
@@ -4261,6 +4267,8 @@ export class StreamManager {
       status: "failed",
       streamError: persistedPayload,
       stepsRemaining: this.remainingStepBudget(streamInfo),
+      modelString: streamInfo.model,
+      modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
     };
   }
 
@@ -5546,6 +5554,8 @@ export class StreamManager {
       status: "failed",
       streamError: persistedPayload,
       stepsRemaining: this.remainingStepBudget(streamInfo),
+      modelString: streamInfo.model,
+      modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
     };
 
     // Wait for the stream processing to complete (cleanup)
