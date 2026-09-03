@@ -701,6 +701,12 @@ interface WorkspaceStreamInfo {
   // first await) so concurrent cancellers — a user stop racing shutdown's
   // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
   cancelPromise?: Promise<void>;
+  // Set by the completion path right before it deletes partial.json and writes
+  // the final message to chat.jsonl. From then on no partial may be written for
+  // this stream: a cancel landing between deletePartial and COMPLETED (the
+  // state flips late, see processStreamWithCleanup) would otherwise resurrect
+  // partial.json through its pre-abort flush.
+  partialRetired?: boolean;
   // Supervisor fiber in the app's AppFiberScope (superviseEngine); set only when
   // the manager was constructed with an engine scope.
   engineFiber?: Fiber.Fiber<void>;
@@ -1209,6 +1215,12 @@ export class StreamManager {
 
     // Cancel any scheduled debounce flush — we're writing now
     this.interruptPartialWriteFiber(streamInfo);
+
+    // The final message owns chat.jsonl now; re-creating partial.json here (a
+    // cancel racing the completion path) would be committed over it on next load.
+    if (streamInfo.partialRetired) {
+      return;
+    }
 
     // Start new write and track the promise
     streamInfo.partialWritePromise = (async () => {
@@ -4028,7 +4040,10 @@ export class StreamManager {
               };
 
               // CRITICAL: Delete partial.json before updating chat.jsonl
-              // On successful completion, partial.json becomes stale and must be removed
+              // On successful completion, partial.json becomes stale and must be removed.
+              // Retire partial writes first: a cancel (user stop, shutdown) landing
+              // between here and COMPLETED must not flush partial.json back to disk.
+              streamInfo.partialRetired = true;
               const deleteResult = await this.historyService.deletePartial(workspaceId as string);
               if (!deleteResult.success) {
                 workspaceLog.warn("Failed to delete partial on stream end", {

@@ -45,6 +45,8 @@ import { SessionUsageService } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { closeScopeBounded } from "./di/appRuntime";
+import { Scope } from "effect";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
@@ -1220,6 +1222,261 @@ describe("StreamManager - stream resource scope", () => {
     } finally {
       await testRunner.dispose();
     }
+  });
+});
+
+describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
+  type StreamAbortEvent = Extract<TurnEngineEvent, { type: "stream-abort" }>;
+
+  /**
+   * A manager whose streams are supervised by `engineScope` (the app runtime's
+   * AppFiberScope in production). `fullStream` receives the stream's own
+   * AbortSignal so scenarios can model a provider that stops on abort — or one
+   * that ignores it.
+   */
+  function createSupervisedStreamManagerForTests(
+    fullStream: (signal: AbortSignal) => AsyncGenerator<unknown, void, unknown>,
+    engineScope: Scope.Closeable | undefined = Scope.makeUnsafe("parallel")
+  ) {
+    const events: TurnEngineEvent[] = [];
+    const streamManager = new StreamManager(
+      historyService,
+      undefined,
+      undefined,
+      (event) => {
+        events.push(event);
+      },
+      undefined,
+      engineScope
+    );
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(
+      streamManager,
+      "createStreamResult",
+      (_request: unknown, abortController: AbortController) =>
+        createStreamResultForTests(fullStream(abortController.signal))
+    );
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/wave4-supervisor-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", () => undefined);
+    return { streamManager, events, engineScope };
+  }
+
+  async function startSupervisedStreamForTests(
+    streamManager: StreamManager,
+    workspaceId: string,
+    historySequence = 1
+  ) {
+    const messageId = `${workspaceId}-msg-${historySequence}`;
+    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        historySequence,
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected stream to start");
+    }
+    return result.data;
+  }
+
+  /** Yields one delta, then blocks until the stream's AbortSignal fires (a well-behaved provider). */
+  function flowingThenBlockedStream(signal: AbortSignal): AsyncGenerator<unknown, void, unknown> {
+    return (async function* () {
+      yield { type: "text-delta", text: "hello" };
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    })();
+  }
+
+  async function waitForPartialText(workspaceId: string, text: string): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const partial = await historyService.readPartial(workspaceId);
+      if (
+        partial?.parts.some((part) => part.type === "text" && part.text.includes(text)) === true
+      ) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`partial for ${workspaceId} never contained ${JSON.stringify(text)}`);
+  }
+
+  function terminalEvents(events: TurnEngineEvent[]): TurnEngineEvent[] {
+    return events.filter((event) => ["stream-end", "stream-abort", "error"].includes(event.type));
+  }
+
+  test("closing the engine scope aborts a flowing stream as 'system', commits its partial and settles it", async () => {
+    const workspaceId = "supervised-flowing-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const writePartialSpy = spyOn(historyService, "writePartial");
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await waitForPartialText(workspaceId, "hello");
+    expect(streamManager.isStreaming(workspaceId)).toBe(true);
+
+    // What ServiceContainer.dispose() does at step 2: interrupt + await.
+    await closeScopeBounded(engineScope!);
+
+    // The finalizer routed through the user-stop path: the streamed text was
+    // flushed (with usage stamping) before the abort was delivered ...
+    const lastWrite = writePartialSpy.mock.calls.at(-1)?.[1];
+    expect(lastWrite?.parts.some((part) => part.type === "text" && part.text === "hello")).toBe(
+      true
+    );
+    // ... exactly one terminal event, an involuntary backend abort, no stream-end ...
+    const terminal = terminalEvents(events);
+    expect(terminal.map((event) => event.type)).toEqual(["stream-abort"]);
+    expect((terminal[0] as StreamAbortEvent).abortReason).toBe("system");
+    // ... and the turn handle plus the registry were settled before the close resolved.
+    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
+  test("a wedged provider (never yields, ignores abort) cannot pin the bounded close", async () => {
+    const workspaceId = "supervised-wedged-workspace";
+    const { streamManager, engineScope } = createSupervisedStreamManagerForTests(() =>
+      (async function* () {
+        await new Promise<never>(() => undefined);
+        yield { type: "text-delta", text: "never" };
+      })()
+    );
+    await startSupervisedStreamForTests(streamManager, workspaceId);
+    expect(streamManager.isStreaming(workspaceId)).toBe(true);
+
+    // cleanupAbortedStream waits for the loop, which waits on the provider that
+    // never returns; the close must still resolve at the bound, and never reject.
+    const startedAt = Date.now();
+    await closeScopeBounded(engineScope!, 100);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  test("a stream started after the engine scope closed is aborted immediately (fail-closed during shutdown)", async () => {
+    const workspaceId = "supervised-late-start-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    await closeScopeBounded(engineScope!);
+
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+
+    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
+  test("a cancel landing after the loop finished but before COMPLETED neither resurrects partial.json nor emits a second terminal event", async () => {
+    // The completion path deletes partial.json, then awaits updateHistory, and
+    // only then flips state to COMPLETED. A cancel (user stop or the shutdown
+    // supervisor) landing inside that window previously re-created partial.json
+    // (pre-abort flush + abort bookkeeping) and emitted stream-abort after
+    // stream-end. No engine scope here: this is the stopStream path itself.
+    const workspaceId = "cancel-after-loop-exit-workspace";
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      () =>
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "final answer" };
+          yield { type: "finish", finishReason: "stop" };
+        })(),
+      undefined
+    );
+    let stopPromise: Promise<unknown> | undefined;
+    const realUpdateHistory = historyService.updateHistory.bind(historyService);
+    const updateHistorySpy = spyOn(historyService, "updateHistory").mockImplementation(
+      async (targetWorkspaceId, message) => {
+        // partial.json is already gone here; state is still STREAMING.
+        stopPromise ??= streamManager.stopStream(targetWorkspaceId);
+        return realUpdateHistory(targetWorkspaceId, message);
+      }
+    );
+    try {
+      const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+
+      expect(await handle.completion).toEqual({ status: "completed" });
+      expect(stopPromise).toBeDefined();
+      expect(await stopPromise).toEqual(Ok(undefined));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-end"]);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      const assistantRows = history.data.filter((message) => message.role === "assistant");
+      expect(assistantRows).toHaveLength(1);
+      expect(assistantRows[0].metadata?.partial).not.toBe(true);
+      expect(
+        assistantRows[0].parts.some((part) => part.type === "text" && part.text === "final answer")
+      ).toBe(true);
+      expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    } finally {
+      updateHistorySpy.mockRestore();
+    }
+  });
+
+  test("stopStream racing the engine-scope close produces exactly one stream-abort and one settle", async () => {
+    const workspaceId = "supervised-stop-vs-close-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await waitForPartialText(workspaceId, "hello");
+    let settleCount = 0;
+    void handle.completion.then(() => {
+      settleCount += 1;
+    });
+
+    // Both cancellers enter cancelStreamSafely in the same tick; the latch is
+    // taken synchronously, so the second joins the first's cleanup.
+    const stopPromise = streamManager.stopStream(workspaceId, { abortReason: "user" });
+    const closePromise = closeScopeBounded(engineScope!);
+    await Promise.all([stopPromise, closePromise]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const aborts = events.filter(
+      (event): event is StreamAbortEvent => event.type === "stream-abort"
+    );
+    expect(aborts).toHaveLength(1);
+    // First canceller's reason wins (the user pressed stop before shutdown reached the stream).
+    expect(aborts[0].abortReason).toBe("user");
+    expect(terminalEvents(events)).toHaveLength(1);
+    expect(settleCount).toBe(1);
+    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
+  test("completed streams leave no supervisor residue: closing the scope after 50 completions aborts nothing", async () => {
+    const workspaceId = "supervised-residue-workspace";
+    const { streamManager, events, engineScope } = createSupervisedStreamManagerForTests(() =>
+      (async function* () {
+        await Promise.resolve();
+        yield { type: "text-delta", text: "done" };
+        yield { type: "finish", finishReason: "stop" };
+      })()
+    );
+    for (let i = 1; i <= 50; i++) {
+      const handle = await startSupervisedStreamForTests(streamManager, workspaceId, i);
+      expect(await handle.completion).toEqual({ status: "completed" });
+    }
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    expect(events.filter((event) => event.type === "stream-end")).toHaveLength(50);
+
+    await closeScopeBounded(engineScope!);
+
+    expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(0);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
 });
 
