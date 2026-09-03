@@ -7,6 +7,7 @@ import { TestClock } from "effect/testing";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createConfigStores, type Config, type ConfigStores } from "@/node/config";
 import type { ORPCContext } from "@/node/orpc/context";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { isInteractiveHostKeyApprovalAvailable } from "@/node/runtime/sshConnectionPool";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
@@ -443,6 +444,107 @@ describe("ServiceContainer", () => {
     expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
     expect(steps).toEqual(["occupant-cancelled", "occupant-finalized", "bridge-stop"]);
     expect(services.appFiberScope.state._tag).toBe("Closed");
+  });
+
+  it("dispose() aborts and awaits an in-flight stream before desktopBridgeServer.stop()", async () => {
+    // The AppFiberScope occupant end to end: a real stream on the container's
+    // StreamManager (wired with the runtime's scope), its provider stubbed to
+    // flow one delta and then block until the stream's AbortSignal fires.
+    // dispose() must abort it as "system", let AIService commit the partial
+    // into chat.jsonl and delete partial.json, and only then stop the bridge.
+    services = new ServiceContainer(stores);
+    const workspaceId = "dispose-in-flight-stream-workspace";
+    const messageId = "dispose-in-flight-stream-message";
+    const steps: string[] = [];
+    Reflect.set(services.streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(
+      services.streamManager,
+      "createStreamResult",
+      (_request: unknown, abortController: AbortController) => ({
+        fullStream: (async function* () {
+          yield { type: "text-delta", text: "hello from a stream shutdown must not lose" };
+          await new Promise<void>((resolve) => {
+            if (abortController.signal.aborted) return resolve();
+            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        })(),
+        totalUsage: Promise.resolve(undefined),
+        usage: Promise.resolve(undefined),
+        providerMetadata: Promise.resolve(undefined),
+        steps: Promise.resolve([]),
+      })
+    );
+    Reflect.set(services.streamManager, "createTempDirForStream", () =>
+      Promise.resolve(path.join(tempDir, "stream-tempdir"))
+    );
+    Reflect.set(services.streamManager, "cleanupStreamTempDir", () => undefined);
+    services.aiService.on("stream-abort", (event: { abortReason?: string }) => {
+      steps.push(`stream-abort:${event.abortReason}`);
+    });
+    const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
+      steps.push("bridge-stop");
+      return Promise.resolve(undefined);
+    });
+
+    const appendResult = await services.historyService.appendToHistory(workspaceId, {
+      id: messageId,
+      role: "assistant",
+      metadata: { historySequence: 1, partial: true },
+      parts: [],
+    });
+    expect(appendResult.success).toBe(true);
+    const started = await services.streamManager.startStream({
+      workspaceId,
+      messageId,
+      model: {
+        specificationVersion: "v3",
+        provider: "test",
+        modelId: "dispose-model",
+        supportedUrls: {},
+        doGenerate: () => Promise.reject(new Error("unused")),
+        doStream: () => Promise.reject(new Error("unused")),
+      },
+      messages: [{ role: "user", content: "hello" }],
+      modelString: "openai:gpt-4.1-mini",
+      historySequence: 1,
+      system: "system",
+      runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
+      providedRuntimeTempDir: "",
+    });
+    expect(started.success).toBe(true);
+    if (!started.success) throw new Error("expected the stream to start");
+    // Wait for the delta to reach partial.json so there is something to commit.
+    const deadline = Date.now() + 5_000;
+    while ((await services.historyService.readPartial(workspaceId)) === null) {
+      if (Date.now() > deadline) throw new Error("partial never written");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(services.streamManager.isStreaming(workspaceId)).toBe(true);
+
+    await services.dispose();
+
+    expect(bridgeStopSpy).toHaveBeenCalledTimes(1);
+    expect(steps).toEqual(["stream-abort:system", "bridge-stop"]);
+    expect(await started.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(services.streamManager.isStreaming(workspaceId)).toBe(false);
+    // Durable outcome at the moment the bridge stopped: partial.json gone, the
+    // interrupted assistant message (still flagged partial, as every
+    // interrupted turn is) committed to chat.jsonl with its streamed text —
+    // instead of an empty placeholder row plus an orphan partial.json that only
+    // the next load would reconcile.
+    expect(await services.historyService.readPartial(workspaceId)).toBeNull();
+    const history = await services.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((message) => message.id === messageId);
+    expect(
+      committed?.parts.some(
+        (part) => part.type === "text" && part.text === "hello from a stream shutdown must not lose"
+      )
+    ).toBe(true);
   });
 
   it("shares one teardown across concurrent dispose() calls", async () => {

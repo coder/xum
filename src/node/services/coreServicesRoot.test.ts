@@ -4,6 +4,7 @@ import * as path from "path";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { Context } from "effect";
 import { createConfigStores, type ConfigStores } from "@/node/config";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
 import * as agentPluginsMcpConfig from "@/node/services/agentPlugins/mcpConfig";
 import type { CoreServices } from "@/node/services/coreServices";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
@@ -155,6 +156,96 @@ describe("createCoreServices", () => {
     await disposeAppRuntime(runtime.managed);
     expect(runtime.managed.cachedContext).toBeUndefined();
     // The afterEach pair then exercises the idempotent second close/dispose.
+  });
+
+  it("the CLI cleanup list's appFiberScope.close aborts and awaits an in-flight stream", async () => {
+    // `xum run`/`xum workflow` mirror ServiceContainer.dispose(): the
+    // appFiberScope.close step runs before session.dispose. With the stream
+    // engine as the scope's occupant, that step must abort a live stream as
+    // "system", commit its partial into chat.jsonl and remove partial.json.
+    root = createCoreServices({
+      ...stores,
+      extensionMetadataPath: path.join(tempDir, "extensionMetadata.json"),
+    });
+    const workspaceId = "cli-cleanup-in-flight-stream-workspace";
+    const messageId = "cli-cleanup-in-flight-stream-message";
+    const abortReasons: string[] = [];
+    Reflect.set(root.streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(
+      root.streamManager,
+      "createStreamResult",
+      (_request: unknown, abortController: AbortController) => ({
+        fullStream: (async function* () {
+          yield { type: "text-delta", text: "cli stream text" };
+          await new Promise<void>((resolve) => {
+            if (abortController.signal.aborted) return resolve();
+            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        })(),
+        totalUsage: Promise.resolve(undefined),
+        usage: Promise.resolve(undefined),
+        providerMetadata: Promise.resolve(undefined),
+        steps: Promise.resolve([]),
+      })
+    );
+    Reflect.set(root.streamManager, "createTempDirForStream", () =>
+      Promise.resolve(path.join(tempDir, "stream-tempdir"))
+    );
+    Reflect.set(root.streamManager, "cleanupStreamTempDir", () => undefined);
+    root.aiService.on("stream-abort", (event: { abortReason?: string }) => {
+      abortReasons.push(event.abortReason ?? "");
+    });
+    const appendResult = await root.historyService.appendToHistory(workspaceId, {
+      id: messageId,
+      role: "assistant",
+      metadata: { historySequence: 1, partial: true },
+      parts: [],
+    });
+    expect(appendResult.success).toBe(true);
+    const started = await root.streamManager.startStream({
+      workspaceId,
+      messageId,
+      model: {
+        specificationVersion: "v3",
+        provider: "test",
+        modelId: "cli-cleanup-model",
+        supportedUrls: {},
+        doGenerate: () => Promise.reject(new Error("unused")),
+        doStream: () => Promise.reject(new Error("unused")),
+      },
+      messages: [{ role: "user", content: "hello" }],
+      modelString: "openai:gpt-4.1-mini",
+      historySequence: 1,
+      system: "system",
+      runtime: createRuntime({ type: "local", srcBaseDir: tempDir }),
+      providedRuntimeTempDir: "",
+    });
+    expect(started.success).toBe(true);
+    if (!started.success) throw new Error("expected the stream to start");
+    const deadline = Date.now() + 5_000;
+    while ((await root.historyService.readPartial(workspaceId)) === null) {
+      if (Date.now() > deadline) throw new Error("partial never written");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await closeScopeBounded(root.appFiberScope);
+
+    expect(abortReasons).toEqual(["system"]);
+    expect(await started.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(root.streamManager.isStreaming(workspaceId)).toBe(false);
+    expect(await root.historyService.readPartial(workspaceId)).toBeNull();
+    const history = await root.historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((message) => message.id === messageId);
+    expect(
+      committed?.parts.some((part) => part.type === "text" && part.text === "cli stream text")
+    ).toBe(true);
+    // Dependencies are still alive for the remaining CLI cleanup steps.
+    expect(root.runtime.managed.cachedContext).toBeDefined();
   });
 
   it("surfaces a throwing layer body as a synchronous throw", () => {
