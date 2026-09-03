@@ -15,7 +15,7 @@ import {
 } from "./agentSession.testHarness";
 import type { AIService, StreamMessageOptions } from "./aiService";
 import type { HistoryService } from "./historyService";
-import type { TurnStreamHandle } from "./streamManager";
+import type { TurnCompletion, TurnStreamHandle } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 /** Steps a cut stream reports as left; tests about the budget itself pass their own value. */
@@ -1715,6 +1715,153 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.isBusy()).toBe(false);
     } finally {
       unsubscribe();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  /**
+   * A stranded goal resume (admitted under revalidation, running under a step budget) whose
+   * stream fails with context_exceeded after post-compaction context was injected, so the
+   * in-session retry without that context is the recovery path; the caller settles the failure.
+   */
+  async function strandGoalResumeIntoPostCompactionRetry(
+    workspaceId: string,
+    buildGoalRedispatchAdmission: ReturnType<
+      typeof mock<WorkspaceGoalService["buildGoalRedispatchAdmission"]>
+    >,
+    stepsRemainingAfterFailure: number
+  ) {
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      buildGoalRedispatchAdmission,
+      recordStreamAccounting: mock(() => Promise.resolve()),
+      applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+      requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+      recordStreamStarted: mock(() => Promise.resolve()),
+      syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+      completeGoalFromSilentContinuation: mock(() => Promise.resolve(false)),
+    } as unknown as WorkspaceGoalService;
+    const aiEmitter = new EventEmitter();
+    let streams = 0;
+    let failResumed: () => void = () => undefined;
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      streams += 1;
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      if (streams !== 2) {
+        return Promise.resolve(Ok(createStartedTurnHandle(`assistant-${streams}`)));
+      }
+      const completion = new Promise<TurnCompletion>((resolve) => {
+        failResumed = () =>
+          resolve({
+            status: "failed",
+            streamError: {
+              messageId: "assistant-2",
+              error: "context window exceeded",
+              errorType: "context_exceeded",
+            },
+            stepsRemaining: stepsRemainingAfterFailure,
+          });
+      });
+      return Promise.resolve(Ok({ messageId: "assistant-2", completion }));
+    });
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+      workspaceGoalService,
+    });
+    const { session, historyService } = harness;
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-0", "user", "keep going", { timestamp: Date.now() })
+    );
+    const resumed = await session.resumeStream(
+      { model: TEST_MODEL, agentId: "exec" },
+      { agentInitiated: true, goalKind: GOAL_CONTINUATION_KIND, goalId: "goal-1" }
+    );
+    expect(resumed.success).toBe(true);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-1", "assistant", "ran the checks", { timestamp: Date.now() })
+    );
+    const controller = new AbortController();
+    session.queueMessage(
+      "Background monitor wake",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        cancelState: { canceledBeforeAcceptance: false },
+        cancelSignal: controller.signal,
+        onCanceled: () => undefined,
+      }
+    );
+    streamMessage.mock.calls[0]?.[0].onQueuedMessageStop?.({
+      modelString: TEST_MODEL,
+      stepsRemaining: 5,
+    });
+    controller.abort("monitor consumed");
+    aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+    expect(await waitForCondition(() => streamMessage.mock.calls.length === 2)).toBe(true);
+    expect(streamMessage.mock.calls[1]?.[0].stepBudget).toBe(5);
+    expect(buildGoalRedispatchAdmission).toHaveBeenCalledTimes(1);
+    // The resumed stream carried post-compaction context (the retry's precondition).
+    Reflect.set(session, "activeStreamHadPostCompactionInjection", true);
+    return { ...harness, streamMessage, failResumed: () => failResumed() };
+  }
+
+  test("the post-compaction retry of a stranded goal resume is admitted by the goal again", async () => {
+    const workspaceId = "queue-dispatch-stranded-goal-post-compaction-retry-admission";
+    const buildGoalRedispatchAdmission = mock(
+      (): ReturnType<WorkspaceGoalService["buildGoalRedispatchAdmission"]> =>
+        Promise.resolve({ admissible: true, admissionStale: () => false })
+    );
+    const harness = await strandGoalResumeIntoPostCompactionRetry(
+      workspaceId,
+      buildGoalRedispatchAdmission,
+      3
+    );
+    const { session, cleanup, streamMessage } = harness;
+
+    try {
+      // The goal is paused before the failure's cleanup finishes: the retry asks the goal again
+      // and, refused, starts nothing.
+      buildGoalRedispatchAdmission.mockImplementation(() => Promise.resolve({ admissible: false }));
+      harness.failResumed();
+      expect(
+        await waitForCondition(() => buildGoalRedispatchAdmission.mock.calls.length === 2)
+      ).toBe(true);
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(2);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("the post-compaction retry of a stranded resume runs under what the failed attempt left", async () => {
+    const workspaceId = "queue-dispatch-stranded-goal-post-compaction-retry-budget";
+    const buildGoalRedispatchAdmission = mock(
+      (): ReturnType<WorkspaceGoalService["buildGoalRedispatchAdmission"]> =>
+        Promise.resolve({ admissible: true, admissionStale: () => false })
+    );
+    const harness = await strandGoalResumeIntoPostCompactionRetry(
+      workspaceId,
+      buildGoalRedispatchAdmission,
+      3
+    );
+    const { session, cleanup, streamMessage } = harness;
+
+    try {
+      harness.failResumed();
+      expect(await waitForCondition(() => streamMessage.mock.calls.length === 3)).toBe(true);
+      // Same logical turn: the retry runs under the 3 steps the failed attempt left, not the 5 it
+      // started with, and the goal admitted it again.
+      expect(streamMessage.mock.calls[2]?.[0].stepBudget).toBe(3);
+      expect(buildGoalRedispatchAdmission).toHaveBeenCalledTimes(2);
+    } finally {
       session.dispose();
       await cleanup();
     }

@@ -981,6 +981,8 @@ export class AgentSession {
     goalId?: string;
     /** Step ceiling this stream runs under when it continues a cut turn (see StrandedTurnResume). */
     stepBudget?: number;
+    /** Admitted under resumeStream's revalidation; in-session retries of this stream repeat it. */
+    revalidateAdmission?: boolean;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
@@ -4409,32 +4411,19 @@ export class AgentSession {
       if (withdrawn()) {
         return Ok({ started: false });
       }
-      let goalAdmissionStale: (() => boolean) | undefined;
-      if (
-        internal?.revalidateAdmission === true &&
-        internal.goalKind != null &&
-        internal.goalId != null &&
-        this.workspaceGoalService
-      ) {
-        const admission = await this.workspaceGoalService.buildGoalRedispatchAdmission(
-          this.workspaceId,
-          internal.goalId,
-          internal.goalKind
-        );
+      let refuseStreamStart: (() => boolean) | undefined;
+      let launchRefusedBy: () => "goal" | "workspace-turn" | undefined = () => undefined;
+      if (internal?.revalidateAdmission === true) {
+        const admission = await this.admitResumeLaunch({
+          goalKind: internal.goalKind,
+          goalId: internal.goalId,
+          muxMetadata: optionsForStream.muxMetadata,
+        });
         if (!admission.admissible) {
-          return Ok({ started: false, refusedBy: "goal" });
+          return Ok({ started: false, refusedBy: admission.refusedBy });
         }
-        goalAdmissionStale = admission.admissionStale;
-      }
-      let turnAdmissionStale: (() => boolean) | undefined;
-      if (internal?.revalidateAdmission === true && this.admitStrandedTurnResume) {
-        const admission = await this.admitStrandedTurnResume(
-          getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata)
-        );
-        if (!admission.admissible) {
-          return Ok({ started: false, refusedBy: "workspace-turn" });
-        }
-        turnAdmissionStale = admission.admissionStale;
+        refuseStreamStart = admission.refuseStreamStart;
+        launchRefusedBy = admission.refusedBy;
       }
       // Last admission check before the stream's own pre-start I/O, like sendMessage's PREPARING
       // gate: a withdrawal that landed during the awaits above refuses the turn here; the abort
@@ -4442,21 +4431,8 @@ export class AgentSession {
       if (withdrawn()) {
         return Ok({ started: false });
       }
-      // The admission probes ride along to the stream-admission boundary: a Pause, goal
-      // replacement, or workspace stop landing during the history reads and request construction
-      // below has no stream to interrupt, so the launch itself rechecks them (StreamManager last,
-      // right before registration). Sticky so the return value matches what refused the launch.
-      let refusedBy: "goal" | "workspace-turn" | undefined;
-      const refuseStreamStart =
-        goalAdmissionStale != null || turnAdmissionStale != null
-          ? (): boolean => {
-              refusedBy ??= goalAdmissionStale?.() === true ? "goal" : undefined;
-              refusedBy ??= turnAdmissionStale?.() === true ? "workspace-turn" : undefined;
-              return refusedBy != null;
-            }
-          : undefined;
       if (refuseStreamStart?.() === true) {
-        return Ok({ started: false, refusedBy });
+        return Ok({ started: false, refusedBy: launchRefusedBy() });
       }
 
       // Must await here so the finally block runs after streaming completes,
@@ -4472,11 +4448,13 @@ export class AgentSession {
         internal?.goalId,
         turnThinkingOverride,
         refuseStreamStart,
-        internal?.stepBudget
+        internal?.stepBudget,
+        internal?.revalidateAdmission
       );
       if (!result.success) {
         return result;
       }
+      const refusedBy = launchRefusedBy();
       if (refusedBy != null) {
         return Ok({ started: false, refusedBy });
       }
@@ -4489,6 +4467,59 @@ export class AgentSession {
         this.setTurnPhase(TurnPhase.IDLE);
       }
     }
+  }
+
+  /**
+   * Revalidates a resume against durable goal state (the veto durable goal redispatches apply)
+   * and the workspace plus delegated turn (admitStrandedTurnResume). The probes ride along to
+   * the stream-admission boundary: a Pause, goal replacement, or workspace stop landing during
+   * the history reads and request construction has no stream to interrupt, so the launch itself
+   * rechecks them (StreamManager last, right before registration). Sticky about what refused it.
+   */
+  private async admitResumeLaunch(input: {
+    goalKind?: GoalSyntheticMessageKind;
+    goalId?: string;
+    muxMetadata: unknown;
+  }): Promise<
+    | { admissible: false; refusedBy: "goal" | "workspace-turn" }
+    | {
+        admissible: true;
+        refuseStreamStart?: () => boolean;
+        refusedBy: () => "goal" | "workspace-turn" | undefined;
+      }
+  > {
+    let goalAdmissionStale: (() => boolean) | undefined;
+    if (input.goalKind != null && input.goalId != null && this.workspaceGoalService) {
+      const admission = await this.workspaceGoalService.buildGoalRedispatchAdmission(
+        this.workspaceId,
+        input.goalId,
+        input.goalKind
+      );
+      if (!admission.admissible) {
+        return { admissible: false, refusedBy: "goal" };
+      }
+      goalAdmissionStale = admission.admissionStale;
+    }
+    let turnAdmissionStale: (() => boolean) | undefined;
+    if (this.admitStrandedTurnResume) {
+      const admission = await this.admitStrandedTurnResume(
+        getWorkspaceTurnMuxMetadata(input.muxMetadata)
+      );
+      if (!admission.admissible) {
+        return { admissible: false, refusedBy: "workspace-turn" };
+      }
+      turnAdmissionStale = admission.admissionStale;
+    }
+    let refusedBy: "goal" | "workspace-turn" | undefined;
+    const refuseStreamStart =
+      goalAdmissionStale != null || turnAdmissionStale != null
+        ? (): boolean => {
+            refusedBy ??= goalAdmissionStale?.() === true ? "goal" : undefined;
+            refusedBy ??= turnAdmissionStale?.() === true ? "workspace-turn" : undefined;
+            return refusedBy != null;
+          }
+        : undefined;
+    return { admissible: true, refuseStreamStart, refusedBy: () => refusedBy };
   }
 
   async setAutoRetryEnabled(
@@ -5177,10 +5208,19 @@ export class AgentSession {
         if (outcome.status !== "failed" || this.disposed) return;
 
         // A retry continues the same logical turn: it runs under what the failed attempt left
-        // of the ceiling, not the budget the attempt started with.
-        const retryRequest = this.lastAutoRetryResumeRequest;
-        if (retryRequest?.stepBudget != null && outcome.stepsRemaining != null) {
-          this.lastAutoRetryResumeRequest = { ...retryRequest, stepBudget: outcome.stepsRemaining };
+        // of the ceiling, not the budget the attempt started with (auto-retry and the in-session
+        // context_exceeded retries alike).
+        if (outcome.stepsRemaining != null) {
+          const retryRequest = this.lastAutoRetryResumeRequest;
+          if (retryRequest?.stepBudget != null) {
+            this.lastAutoRetryResumeRequest = {
+              ...retryRequest,
+              stepBudget: outcome.stepsRemaining,
+            };
+          }
+          if (this.activeStreamContext?.stepBudget != null) {
+            this.activeStreamContext.stepBudget = outcome.stepsRemaining;
+          }
         }
         try {
           await this.handleStreamError(outcome.streamError);
@@ -5212,7 +5252,8 @@ export class AgentSession {
     // Pull-based admission probe (goal state) with no push into abortSignal; checked wherever
     // the signal is, and by StreamManager right before the stream registers.
     refuseStreamStart?: () => boolean,
-    stepBudget?: number
+    stepBudget?: number,
+    revalidateAdmission?: boolean
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean =>
       abortSignal?.aborted === true || refuseStreamStart?.() === true;
@@ -5236,6 +5277,7 @@ export class AgentSession {
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
       ...(stepBudget != null ? { stepBudget } : {}),
+      ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
@@ -5653,6 +5695,41 @@ export class AgentSession {
     return provider === "openai" && modelName?.toLowerCase().startsWith("gpt-");
   }
 
+  /**
+   * Gate for the in-session context_exceeded retries, which relaunch through streamWithHistory
+   * directly: a stream admitted under resumeStream's revalidation is revalidated again (a Pause,
+   * Stop, or delegated-turn interrupt that landed during the cleanup awaits ends the turn rather
+   * than the retry restarting tool-enabled work), and a spent step budget ends it too. Undefined
+   * when the retry must not run; otherwise the launch-boundary probe to pass along.
+   */
+  private async admitInSessionRetry(input: {
+    stepBudget?: number;
+    revalidateAdmission?: boolean;
+    goalKind?: GoalSyntheticMessageKind;
+    goalId?: string;
+    muxMetadata: unknown;
+    retryLabel: string;
+  }): Promise<{ refuseStreamStart?: () => boolean } | undefined> {
+    if (input.stepBudget != null && input.stepBudget <= 0) {
+      log.info(`Skipping ${input.retryLabel}: the turn's step budget is spent`, {
+        workspaceId: this.workspaceId,
+      });
+      return undefined;
+    }
+    if (input.revalidateAdmission !== true) {
+      return {};
+    }
+    const admission = await this.admitResumeLaunch(input);
+    if (!admission.admissible) {
+      log.info(`Skipping ${input.retryLabel}: no longer admitted`, {
+        workspaceId: this.workspaceId,
+        refusedBy: admission.refusedBy,
+      });
+      return undefined;
+    }
+    return { refuseStreamStart: admission.refuseStreamStart };
+  }
+
   private async maybeRetryCompactionOnContextExceeded(data: {
     messageId: string;
     errorType?: string;
@@ -5709,6 +5786,8 @@ export class AgentSession {
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
+    const retryStepBudget = this.activeStreamContext?.stepBudget;
+    const retryRevalidateAdmission = this.activeStreamContext?.revalidateAdmission;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -5727,12 +5806,25 @@ export class AgentSession {
       });
       return false;
     }
+    const retryAdmission = await this.admitInSessionRetry({
+      stepBudget: retryStepBudget,
+      revalidateAdmission: retryRevalidateAdmission,
+      goalKind: retryGoalKind,
+      goalId: retryGoalId,
+      muxMetadata: retryOptionsForResume.muxMetadata,
+      retryLabel: "compaction retry",
+    });
+    if (retryAdmission == null) {
+      return false;
+    }
 
     this.setAutoRetryResumeState(
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
-      retryGoalId
+      retryGoalId,
+      retryStepBudget,
+      retryRevalidateAdmission
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
@@ -5748,7 +5840,11 @@ export class AgentSession {
         retryAgentInitiated,
         undefined,
         retryGoalKind,
-        retryGoalId
+        retryGoalId,
+        undefined,
+        retryAdmission.refuseStreamStart,
+        retryStepBudget,
+        retryRevalidateAdmission
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -5841,6 +5937,17 @@ export class AgentSession {
       );
       return false;
     }
+    const retryAdmission = await this.admitInSessionRetry({
+      stepBudget: context.stepBudget,
+      revalidateAdmission: context.revalidateAdmission,
+      goalKind: context.goalKind,
+      goalId: context.goalId,
+      muxMetadata: context.options?.muxMetadata,
+      retryLabel: "post-compaction retry",
+    });
+    if (retryAdmission == null) {
+      return false;
+    }
 
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
@@ -5857,8 +5964,9 @@ export class AgentSession {
         context.goalKind,
         context.goalId,
         undefined,
-        undefined,
-        context.stepBudget
+        retryAdmission.refuseStreamStart,
+        context.stepBudget,
+        context.revalidateAdmission
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
