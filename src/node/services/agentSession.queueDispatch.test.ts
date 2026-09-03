@@ -1441,8 +1441,12 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("stops advertising the delegated continuation once the resume cap is exhausted", async () => {
-    const workspaceId = "queue-dispatch-stranded-delegated-cap";
+  /**
+   * Strand a delegated turn whose resume fails at the pricing gate before its stream starts:
+   * the owner deferred the cut stream-end on the advertised continuation and the session sits
+   * idle with it still owed.
+   */
+  async function strandDelegatedTurnBehindClosedGate(workspaceId: string) {
     let gateOpen = true;
     const workspaceGoalService = {
       assertPricedModelForBudgetedGoal: mock(() =>
@@ -1463,17 +1467,23 @@ describe("AgentSession queued message tool-call dispatch", () => {
       sendOptions: { muxMetadata: WORKSPACE_TURN_CORRELATION },
       sendInternal: { synthetic: true, agentInitiated: true },
     });
-    const { session, cleanup, aiEmitter, streamMessage } = harness;
+    const { session, aiEmitter } = harness;
+    gateOpen = false;
+    harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
+    harness.queueCancelableWake().abort("monitor consumed");
+    session.clearQueue("monitor consumed");
+    expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
+    aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
+    expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+    return { ...harness, settleForfeited };
+  }
+
+  test("stops advertising the delegated continuation once the resume cap is exhausted", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-cap";
+    const harness = await strandDelegatedTurnBehindClosedGate(workspaceId);
+    const { session, cleanup, streamMessage, settleForfeited } = harness;
 
     try {
-      gateOpen = false;
-      harness.latestRequest().onQueuedMessageStop?.({ modelString: TEST_MODEL });
-      harness.queueCancelableWake().abort("monitor consumed");
-      session.clearQueue("monitor consumed");
-      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(true);
-      aiEmitter.emit("stream-end", streamEndEvent(workspaceId));
-      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
-
       // The resume keeps failing before its stream starts; while attempts remain the owner
       // defers settlement, and once the cap is exhausted the continuation is no longer
       // advertised and the owner is told to settle the turn it deferred at the cut.
@@ -1487,6 +1497,44 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.drainQueuedMessagesIfIdle();
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(settleForfeited).toHaveBeenCalledTimes(1);
+      expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a context-discarding mutation settles the delegated turn it had advertised", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-context-discard";
+    const harness = await strandDelegatedTurnBehindClosedGate(workspaceId);
+    const { session, cleanup, streamMessage, settleForfeited } = harness;
+
+    try {
+      // A history clear admitted on the idle session discards the transcript the continuation
+      // would resume from; no stream follows it to settle the turn the owner deferred.
+      const discarded = await session.discardAutoRetryForContextMutation();
+      expect(discarded.success).toBe(true);
+      expect(settleForfeited).toHaveBeenCalledTimes(1);
+      expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
+      expect(session.hasPendingWorkspaceTurnContinuation(WORKSPACE_TURN_CORRELATION)).toBe(false);
+      session.drainQueuedMessagesIfIdle();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("disposing the session settles the delegated turn it had advertised", async () => {
+    const workspaceId = "queue-dispatch-stranded-delegated-dispose";
+    const harness = await strandDelegatedTurnBehindClosedGate(workspaceId);
+    const { session, cleanup, settleForfeited } = harness;
+
+    try {
+      // Workspace removal tears the idle session down with the continuation still owed.
+      session.dispose();
       expect(settleForfeited).toHaveBeenCalledTimes(1);
       expect(settleForfeited.mock.calls[0]?.[0]).toEqual(WORKSPACE_TURN_CORRELATION);
     } finally {

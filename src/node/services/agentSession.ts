@@ -1064,7 +1064,8 @@ export class AgentSession {
     this.activePreparedTurnAbortController = null;
     // A resume parked in its pre-stream I/O passed streamWithHistory's disposed check already;
     // its abort signal is the only thing that stops it registering a stream after teardown.
-    this.withdrawStrandedTurnResume();
+    // Disposal (workspace removal) also produces no successor stream for a deferred delegated turn.
+    this.forfeitStrandedTurnResume("Stranded turn resume discarded: workspace session disposed.");
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -6567,7 +6568,11 @@ export class AgentSession {
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
-    this.withdrawStrandedTurnResume();
+    // The discarded transcript yields no successor stream, so a delegated turn whose stream-end
+    // the owner deferred on the owed continuation is settled here rather than left running.
+    this.forfeitStrandedTurnResume(
+      "Stranded turn resume discarded: workspace context was mutated."
+    );
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
     if (!deleteResult.success) {
       return Err(deleteResult.error);
@@ -6989,13 +6994,14 @@ export class AgentSession {
   }
 
   /**
-   * The sweep gives the continuation up with no successor stream. A delegated turn's owner may
-   * have deferred its stream-end on the strength of this marker (hasPendingWorkspaceTurnContinuation),
-   * and no later stream-end will arrive for it, so the owner settles that turn here.
+   * The continuation is given up with no successor stream (sweep cap or goal refusal, context
+   * discard, session disposal). A delegated turn's owner may have deferred its stream-end on the
+   * strength of this marker (hasPendingWorkspaceTurnContinuation), and no later stream-end will
+   * arrive for it, so the owner settles that turn here.
    */
   private forfeitStrandedTurnResume(reason: string): void {
     const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
-    this.strandedTurnResume = undefined;
+    this.withdrawStrandedTurnResume();
     if (correlation == null || this.settleForfeitedWorkspaceTurnContinuation == null) {
       return;
     }
@@ -7010,8 +7016,9 @@ export class AgentSession {
   }
 
   /**
-   * Nothing is owed anymore (user Stop, superseding input, context discard): drop the marker and
-   * cancel a resume still in its pre-stream window, which already copied the marker.
+   * Nothing is owed anymore (user Stop, superseding input): drop the marker and cancel a resume
+   * still in its pre-stream window, which already copied the marker. The owner of a delegated
+   * turn learns of it from the stream event or hard stop that caused the withdrawal.
    */
   private withdrawStrandedTurnResume(): void {
     this.strandedTurnResume = undefined;
