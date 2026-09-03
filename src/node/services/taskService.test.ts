@@ -20299,6 +20299,107 @@ describe("TaskService", () => {
 
     expect(remove).not.toHaveBeenCalled();
   });
+  test("startup best-of finalization defers while a reawakened sibling is executing again", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-best-of-reawakened-sibling";
+    const childOneId = "child-best-of-reawakened-sibling-1";
+    const childTwoId = "child-best-of-reawakened-sibling-2";
+    const partialTimestamp = Date.now();
+    const currentCreatedAt = new Date(partialTimestamp + 60_000).toISOString();
+    const bestOf = {
+      groupId: "best-of-reawakened-sibling",
+      index: 0,
+      total: 2,
+    } as const;
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        {
+          path: path.join(projectPath, "child-1"),
+          id: childOneId,
+          name: "agent_explore_child_1",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          createdAt: currentCreatedAt,
+          bestOf,
+        },
+        {
+          // Reported, then reawakened by a client: its old artifact is about to be replaced.
+          path: path.join(projectPath, "child-2"),
+          id: childTwoId,
+          name: "agent_explore_child_2",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          taskExecutionStatus: "running",
+          taskExecutionId: "wst_reawakened_child_2",
+          createdAt: currentCreatedAt,
+          bestOf: { ...bestOf, index: 1 },
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const parentPartial = createMuxMessage(
+      "assistant-parent-best-of-reawakened-sibling",
+      "assistant",
+      "Waiting on best-of subagents…",
+      { timestamp: partialTimestamp },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "task-best-of-reawakened-sibling-call",
+          toolName: "task",
+          input: {
+            subagent_type: "explore",
+            prompt: "compare options",
+            title: "Best of 2",
+            n: 2,
+          },
+          state: "input-available",
+        },
+      ]
+    );
+    expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
+
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
+    for (const [childTaskId, reportMarkdown] of [
+      [childOneId, "Report from child one"],
+      [childTwoId, "Report from child two (pre-continuation)"],
+    ] as const) {
+      await upsertSubagentReportArtifact({
+        workspaceId: parentId,
+        workspaceSessionDir: parentSessionDir,
+        childTaskId,
+        parentWorkspaceId: parentId,
+        ancestorWorkspaceIds: [parentId],
+        reportMarkdown,
+        nowMs: Date.now(),
+      });
+    }
+
+    await taskService.runStartupHousekeeping();
+
+    const updatedParentPartial = await partialService.readPartial(parentId);
+    expect(updatedParentPartial).not.toBeNull();
+    const toolPart = updatedParentPartial?.parts.find(
+      (part) => isDynamicToolPart(part) && part.toolName === "task"
+    );
+    expect(toolPart && "state" in toolPart ? toolPart.state : undefined).toBe("input-available");
+  });
   test("startup best-of finalization never lands on a partial a live parent turn replaced", async () => {
     const config = await createTestConfig(rootDir);
 

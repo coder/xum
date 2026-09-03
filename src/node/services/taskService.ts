@@ -12659,6 +12659,7 @@ export class TaskService implements AgentTaskIntegration {
     agentId?: string;
     agentType?: string;
     taskStatus?: WorkspaceConfigEntry["taskStatus"];
+    taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
   }> {
     const cfg = this.config.loadConfigOrDefault();
     const siblings: Array<{
@@ -12667,6 +12668,7 @@ export class TaskService implements AgentTaskIntegration {
       agentId?: string;
       agentType?: string;
       taskStatus?: WorkspaceConfigEntry["taskStatus"];
+      taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
     }> = [];
 
     for (const project of cfg.projects.values()) {
@@ -12691,6 +12693,7 @@ export class TaskService implements AgentTaskIntegration {
           agentId: coerceNonEmptyString(workspace.agentId),
           agentType: coerceNonEmptyString(workspace.agentType),
           taskStatus: workspace.taskStatus,
+          taskExecutionStatus: workspace.taskExecutionStatus,
         });
       }
     }
@@ -12715,10 +12718,27 @@ export class TaskService implements AgentTaskIntegration {
     return siblings;
   }
 
+  /**
+   * A reported sibling that a client reawakened (workspace-turn continuation) or that is streaming
+   * still owns its previous report artifact. Finalizing the parent on that artifact would freeze the
+   * grouped result on a report the child is replacing, so its group waits for the new report.
+   */
+  private isBestOfSiblingExecutingAgain(sibling: {
+    taskId: string;
+    taskExecutionStatus?: WorkspaceConfigEntry["taskExecutionStatus"];
+  }): boolean {
+    return (
+      isActiveWorkspaceTurnTaskStatus(sibling.taskExecutionStatus) ||
+      this.aiService.isStreaming(sibling.taskId)
+    );
+  }
+
   private async buildBestOfCompletedTaskToolOutput(params: {
     parentWorkspaceId: string;
     groupId: string;
     total: number;
+    /** The sibling whose report is being delivered right now; its execution is live by construction. */
+    reportingTaskId?: string;
   }): Promise<z.infer<typeof TaskToolResultSchema> | null> {
     const siblings = this.listBestOfSiblingTasks({
       parentWorkspaceId: params.parentWorkspaceId,
@@ -12754,6 +12774,13 @@ export class TaskService implements AgentTaskIntegration {
     }> = [];
 
     for (const sibling of siblings) {
+      if (
+        sibling.taskId !== params.reportingTaskId &&
+        this.isBestOfSiblingExecutingAgain(sibling)
+      ) {
+        return null;
+      }
+
       const artifact = await readSubagentReportArtifact(parentSessionDir, sibling.taskId);
       if (!artifact) {
         return null;
@@ -12856,7 +12883,8 @@ export class TaskService implements AgentTaskIntegration {
         sibling.taskStatus === "queued" ||
         sibling.taskStatus === "starting" ||
         sibling.taskStatus === "running" ||
-        sibling.taskStatus === "awaiting_report"
+        sibling.taskStatus === "awaiting_report" ||
+        this.isBestOfSiblingExecutingAgain(sibling)
       );
     });
     if (hasRecoverableSibling) {
@@ -13132,6 +13160,7 @@ export class TaskService implements AgentTaskIntegration {
           parentWorkspaceId: workspaceId,
           groupId: bestOf.groupId,
           total: bestOf.total,
+          reportingTaskId: childWorkspaceId,
         });
         if (!groupedOutput) {
           return { kind: "not_ready" };
