@@ -672,6 +672,7 @@ export class AgentSession {
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
   private disposed = false;
+  private shuttingDown = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
   /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
   private editAdmissionDepth = 0;
@@ -969,6 +970,16 @@ export class AgentSession {
     this.attachAiListeners();
     this.attachInitListeners();
     eventSpine.emit("session.start", { workspaceId: this.workspaceId });
+  }
+
+  /**
+   * Process shutdown for a session that stays alive through teardown (a live stream's partial must
+   * survive for the next startup's recovery, so dispose() and its abandonPartial are wrong here).
+   * Stops the retry timer and makes every internal dispatch boundary below bail like `disposed`.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+    this.retryManager.cancel();
   }
 
   dispose(): void {
@@ -1269,6 +1280,9 @@ export class AgentSession {
       typeof error.type === "string" && error.type.length > 0,
       "handleStreamFailureForAutoRetry requires a non-empty error.type"
     );
+    if (this.shuttingDown) {
+      return;
+    }
 
     // Load persisted preference before scheduling retries so an on-disk opt-out is
     // honored even when the first failure happens before startup recovery runs.
@@ -1313,6 +1327,12 @@ export class AgentSession {
       const request = this.lastAutoRetryResumeRequest;
       if (!request) {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+        return;
+      }
+
+      // Archive only interrupts a live stream; a backoff timer armed before it keeps ticking.
+      if (this.isWorkspaceArchivedOnDisk()) {
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
         return;
       }
 
@@ -2419,7 +2439,7 @@ export class AgentSession {
   }
 
   async runStartupRecovery(): Promise<void> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return;
     }
 
@@ -2458,7 +2478,7 @@ export class AgentSession {
     }
 
     let deferredAttempts = 0;
-    while (!this.disposed) {
+    while (!this.disposed && !this.shuttingDown) {
       let outcome: StartupAutoRetryCheckOutcome;
       try {
         outcome = await this.scheduleStartupAutoRetryIfNeeded();
@@ -5009,7 +5029,7 @@ export class AgentSession {
   ): Promise<AgentSessionResult<void>> {
     const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
 
-    if (this.disposed || isStartupAbortRequested()) {
+    if (this.disposed || this.shuttingDown || isStartupAbortRequested()) {
       return Ok(undefined);
     }
 
@@ -7130,7 +7150,7 @@ export class AgentSession {
    * proof of dispatch (no history rewrite needed).
    */
   private async dispatchPendingFollowUp(summaryMessageId?: string): Promise<boolean> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return false;
     }
 

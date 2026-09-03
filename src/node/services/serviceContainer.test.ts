@@ -300,10 +300,7 @@ describe("ServiceContainer", () => {
         .backgroundProcessManager,
       "beginShutdown"
     );
-    const disposeRecoverySessions = spyOn(
-      services.workspaceService,
-      "disposeStartupRecoverySessions"
-    );
+    const disposeRecoverySessions = spyOn(services.workspaceService, "beginShutdown");
 
     await services.initializeCore();
     const housekeeping = services.runStartupHousekeeping();

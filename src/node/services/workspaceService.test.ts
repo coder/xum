@@ -8348,10 +8348,12 @@ describe("WorkspaceService initialize", () => {
     expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
   });
 
-  test("disposeStartupRecoverySessions stops every transient startup-recovery session", () => {
+  test("beginShutdown disposes transient recovery sessions and halts the rest", () => {
     const dispose = mock(() => undefined);
+    const beginShutdown = mock(() => undefined);
     const startupAccess = workspaceService as unknown as {
       transientStartupRecoverySessions: Map<string, AgentSession>;
+      sessions: Map<string, AgentSession>;
     };
     startupAccess.transientStartupRecoverySessions.set("ws-a", {
       dispose,
@@ -8359,11 +8361,19 @@ describe("WorkspaceService initialize", () => {
     startupAccess.transientStartupRecoverySessions.set("ws-b", {
       dispose,
     } as unknown as AgentSession);
+    // A recovery session promoted with a retry pending, or a client-created session that
+    // housekeeping scheduled recovery on: it may own a live stream, so it is not disposed.
+    startupAccess.sessions.set("ws-promoted", {
+      dispose,
+      beginShutdown,
+    } as unknown as AgentSession);
 
-    workspaceService.disposeStartupRecoverySessions();
+    workspaceService.beginShutdown();
 
     expect(dispose).toHaveBeenCalledTimes(2);
     expect(startupAccess.transientStartupRecoverySessions.size).toBe(0);
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    startupAccess.sessions.delete("ws-promoted");
   });
 
   test("disposes transient startup-recovery sessions that go idle", async () => {

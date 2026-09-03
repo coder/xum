@@ -587,9 +587,7 @@ export class ServiceContainer {
     }
     // Chat recovery sessions that housekeeping scheduled run past its own promise; stop them
     // before the provider/runtime services they would dispatch through go away.
-    shutdownStep("workspaceService.disposeStartupRecoverySessions", () =>
-      this.workspaceService.disposeStartupRecoverySessions()
-    );
+    shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
     // Interrupt and await the runtime's supervised fibers while every dependency
     // they might touch during finalization is still alive. Fixed here (before
     // the explicit teardown) so later occupants do not re-derive the position;

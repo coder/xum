@@ -3183,7 +3183,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let skippedArchivedCount = 0;
 
       // Shutdown may have started during the cleanups above; the (synchronous) loop below must
-      // not spawn recovery sessions that disposeStartupRecoverySessions() has already swept.
+      // not spawn recovery sessions that beginShutdown() has already swept.
       if (options?.signal?.aborted === true) {
         log.info("[startup] WorkspaceService.initialize cancelled before scheduling recovery");
         return;
@@ -3933,14 +3933,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Shutdown: stop startup chat recovery that has not started a stream yet. Their recovery chains
-   * re-check `disposed` before every dispatch, so nothing they still have in flight reaches the
-   * provider or the services being torn down.
+   * Shutdown: stop startup chat recovery before the services it dispatches through go away.
+   * Transient recovery sessions are disposed outright. Sessions that outlived that sweep (promoted
+   * because recovery left a retry pending, or client-created ones housekeeping scheduled recovery
+   * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
    */
-  disposeStartupRecoverySessions(): void {
+  beginShutdown(): void {
     for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
       this.transientStartupRecoverySessions.delete(workspaceId);
       session.dispose();
+    }
+    for (const session of this.sessions.values()) {
+      session.beginShutdown();
     }
   }
 
