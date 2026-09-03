@@ -388,12 +388,97 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     expect(await internals.dispatchPendingFollowUp()).toBe(true);
 
-    // Admitted against the delegated turn, with the handle probe carried to the launch boundary.
+    // Admitted against the delegated turn, with the handle probe carried to the launch boundary,
+    // and retried under revalidation even though the interrupted turn was not a stranded resume.
     expect(admit.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
     expect(dispatched[0]?.refuseStreamStart?.()).toBe(false);
     stale = true;
     expect(dispatched[0]?.refuseStreamStart?.()).toBe(true);
+    expect(dispatched[0]?.revalidateAdmission).toBe(true);
+    expect(internals.lastAutoRetryResumeRequest?.revalidateAdmission).toBe(true);
     expect(settle).not.toHaveBeenCalled();
+  });
+
+  test("dispatchPendingFollowUp settles a delegated turn's follow-up refused at the launch boundary", async () => {
+    const settle = mock((_correlation: unknown, _reason: string) => Promise.resolve());
+    let stale = false;
+    const { internals, historyService } = await createSession(
+      [
+        compactionSummaryMessage("summary-launch-refused", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          muxMetadata: DELEGATED_TURN,
+        }),
+      ],
+      {
+        admitStrandedTurnResume: mock(() =>
+          Promise.resolve({ admissible: true, admissionStale: () => stale })
+        ),
+        settleForfeitedWorkspaceTurnContinuation: settle,
+      }
+    );
+    // The handle is interrupted while the send prepares: StreamManager refuses the launch and the
+    // send still resolves Ok (a startup-aborted handle), so the dispatch must read the probe.
+    internals.sendMessage = mock(() => {
+      stale = true;
+      return Promise.resolve({ success: true as const });
+    });
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
+    const tail = await historyService.getLastMessages("ws", 1);
+    const summary = tail.success ? tail.data[0] : undefined;
+    expect(summary?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
+  });
+
+  test("dispatchPendingFollowUp ignores a malformed persisted correlation", async () => {
+    const admit = mock(() => Promise.resolve({ admissible: false }));
+    const sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    const { internals } = await createSession(
+      [
+        compactionSummaryMessage("summary-malformed-correlation", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          muxMetadata: {
+            type: "workspace-turn-task",
+          } as unknown as CompactionFollowUpRequest["muxMetadata"],
+        }),
+      ],
+      { admitStrandedTurnResume: admit }
+    );
+    internals.sendMessage = sendMessage;
+
+    // Not a delegated turn to admit or settle: the follow-up dispatches as an ordinary one.
+    expect(await internals.dispatchPendingFollowUp()).toBe(true);
+    expect(admit).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("dispatchPendingFollowUp settles a delegated turn's follow-up rejected for malformed goal attribution", async () => {
+    const settle = mock((_correlation: unknown, _reason: string) => Promise.resolve());
+    const sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    const { internals } = await createSession(
+      [
+        compactionSummaryMessage("summary-malformed-goal", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          goalKind: "not-a-goal-kind" as unknown as CompactionFollowUpRequest["goalKind"],
+          muxMetadata: DELEGATED_TURN,
+        }),
+      ],
+      { settleForfeitedWorkspaceTurnContinuation: settle }
+    );
+    internals.sendMessage = sendMessage;
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
   });
 
   test("dispatchPendingFollowUp settles and drops a delegated turn's follow-up its owner no longer admits", async () => {

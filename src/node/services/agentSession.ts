@@ -101,6 +101,7 @@ import {
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
+  parseWorkspaceTurnTaskCorrelation,
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
 } from "@/common/types/message";
@@ -448,6 +449,12 @@ function buildStrandedTurnResume(context: {
     ...(context.goalKind != null ? { goalKind: context.goalKind } : {}),
     ...(context.goalId != null ? { goalId: context.goalId } : {}),
   };
+}
+
+/** A persisted correlation (unchecked chat.jsonl) is used only when well formed. */
+function parsePersistedWorkspaceTurnMetadata(value: unknown): WorkspaceTurnMuxMetadata | undefined {
+  const correlation = parseWorkspaceTurnTaskCorrelation(value);
+  return correlation == null ? undefined : { type: "workspace-turn-task", ...correlation };
 }
 
 function hasSameWorkspaceTurnCorrelation(
@@ -8142,6 +8149,21 @@ export class AgentSession {
       imageParts?: FilePart[];
     };
 
+    // The delegated turn this follow-up continues, if any: stamped on the follow-up itself by
+    // mid-stream compaction, or beside a wake follow-up by on-send compaction. Every drop below
+    // settles it, since the compaction abort and the compact stream end it for nobody.
+    const continuedTurn =
+      parsePersistedWorkspaceTurnMetadata(followUp.muxMetadata) ??
+      parsePersistedWorkspaceTurnMetadata(followUp.workspaceTurnMetadata);
+    const dropFollowUp = async (reason: string): Promise<false> => {
+      this.forfeitWorkspaceTurnContinuation(
+        continuedTurn,
+        `Compaction follow-up dropped: ${reason}`
+      );
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    };
+
     // Compaction summaries are unchecked chat.jsonl. Reject malformed persisted
     // goal attribution instead of forwarding it into goal-service assertions or
     // repeatedly crashing startup recovery on the same row.
@@ -8155,8 +8177,7 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
       });
-      await this.clearPendingFollowUpFromSummary(lastMessage);
-      return false;
+      return dropFollowUp("malformed goal attribution.");
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cS8Bq): pre-upgrade summaries persisted
@@ -8172,14 +8193,9 @@ export class AgentSession {
         summaryMessageId: lastMessage.id,
         goalKind: persistedGoalKind,
       });
-      await this.clearPendingFollowUpFromSummary(lastMessage);
-      return false;
+      return dropFollowUp("legacy goal follow-up without goal identity.");
     }
 
-    // The delegated turn this follow-up continues, if any: stamped on the follow-up itself by
-    // mid-stream compaction, or beside a wake follow-up by on-send compaction.
-    const continuedTurn =
-      getWorkspaceTurnMuxMetadata(followUp.muxMetadata) ?? followUp.workspaceTurnMetadata;
     // Same raw JSON boundary: the interrupted turn's remainder is optional and dropped if malformed
     // (the follow-up then runs under the default ceiling and its model's own chain).
     const persistedStepBudget =
@@ -8190,21 +8206,17 @@ export class AgentSession {
       followUp.modelFallbackProgress != null
         ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)
         : undefined;
-    const persistedRevalidateAdmission = followUp.revalidateAdmission === true;
+    // A follow-up continuing a delegated turn is admitted and retried like a stranded resume even
+    // when the interrupted turn itself was not one (a delegated turn's first compaction).
+    const revalidateAdmission = followUp.revalidateAdmission === true || continuedTurn != null;
     // The interrupted turn spent its last step before compaction: the ceiling ended it, and the
-    // loop's stop condition is only evaluated after a step, so a follow-up would run one more. A
-    // delegated turn ends here with no successor stream, so its owner settles it.
+    // loop's stop condition is only evaluated after a step, so a follow-up would run one more.
     if (persistedStepBudget === 0) {
       log.info("Discarding pending follow-up: the interrupted turn's step budget is spent", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
       });
-      this.forfeitWorkspaceTurnContinuation(
-        continuedTurn,
-        "Compaction follow-up dropped: the interrupted turn's step budget is spent."
-      );
-      await this.clearPendingFollowUpFromSummary(lastMessage);
-      return false;
+      return dropFollowUp("the interrupted turn's step budget is spent.");
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): goal-loop follow-ups were originally
@@ -8267,22 +8279,16 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           goalKind: persistedGoalKind,
         });
-        this.forfeitWorkspaceTurnContinuation(
-          continuedTurn,
-          "Compaction follow-up dropped: goal no longer admits it."
-        );
-        await this.clearPendingFollowUpFromSummary(lastMessage);
-        return false;
+        return dropFollowUp("goal no longer admits it.");
       }
       goalAdmissionStale = admission.admissionStale;
     }
 
-    // A follow-up continuing a delegated turn, or a turn that ran under a stranded resume's
-    // revalidation, is admitted like that resume (admitResumeLaunch): the workspace must still
-    // accept streams and the turn's owner must still have it running. The probe rides along to
-    // the launch boundary below; a refusal ends the delegated turn with no successor stream.
+    // Admitted like a stranded resume (admitResumeLaunch): the workspace must still accept
+    // streams and a delegated turn's owner must still have it running. The probe rides along to
+    // the launch boundary below.
     let turnAdmissionStale: (() => boolean) | undefined;
-    if ((persistedRevalidateAdmission || continuedTurn != null) && this.admitStrandedTurnResume) {
+    if (revalidateAdmission && this.admitStrandedTurnResume) {
       const admission = await this.admitStrandedTurnResume(continuedTurn);
       if (!admission.admissible) {
         log.info(
@@ -8292,12 +8298,7 @@ export class AgentSession {
             summaryMessageId: lastMessage.id,
           }
         );
-        this.forfeitWorkspaceTurnContinuation(
-          continuedTurn,
-          "Compaction follow-up dropped: the workspace or delegated turn no longer admits it."
-        );
-        await this.clearPendingFollowUpFromSummary(lastMessage);
-        return false;
+        return dropFollowUp("the workspace or delegated turn no longer admits it.");
       }
       turnAdmissionStale = admission.admissionStale;
     }
@@ -8401,7 +8402,7 @@ export class AgentSession {
       persistedGoalKind,
       persistedGoalId,
       persistedStepBudget,
-      persistedRevalidateAdmission,
+      revalidateAdmission,
       persistedFallbackProgress?.success ? persistedFallbackProgress.data : undefined
     );
 
@@ -8427,23 +8428,20 @@ export class AgentSession {
       modelFallbackProgress: persistedFallbackProgress?.success
         ? persistedFallbackProgress.data
         : undefined,
-      revalidateAdmission: persistedRevalidateAdmission,
+      revalidateAdmission,
     });
+    // The workspace or the delegated turn stopped admitting the follow-up during its preflight
+    // (an Err) or at the launch boundary (StreamManager refuses as a startup-aborted Ok handle,
+    // like a refused stranded resume): no successor stream, so the turn is settled and the
+    // follow-up dropped.
+    if (turnAdmissionStale?.() === true) {
+      log.info("Pending follow-up refused at admission: workspace or delegated turn", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      return dropFollowUp("the workspace or delegated turn no longer admits it.");
+    }
     if (!sendResult.success) {
-      // The workspace or the delegated turn stopped admitting the follow-up during its
-      // preflight: no successor stream, so the turn is settled and the follow-up dropped.
-      if (turnAdmissionStale?.() === true) {
-        log.info("Pending follow-up refused at send admission: workspace or delegated turn", {
-          workspaceId: this.workspaceId,
-          summaryMessageId: lastMessage.id,
-        });
-        this.forfeitWorkspaceTurnContinuation(
-          continuedTurn,
-          "Compaction follow-up dropped: the workspace or delegated turn no longer admits it."
-        );
-        await this.clearPendingFollowUpFromSummary(lastMessage);
-        return false;
-      }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
       // same skip path as the pre-send check instead of throwing.
