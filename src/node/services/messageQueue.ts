@@ -265,6 +265,15 @@ export class MessageQueue {
   }
 
   /**
+   * Dispatch mode of the first entry whose cancel signal has not fired, or undefined
+   * when none remains. Aborted entries still drain FIFO (as no-ops that fire
+   * onCanceled), but they are not pending work and must not arm a tool-end stop.
+   */
+  getNextDispatchableMode(): QueueDispatchMode | undefined {
+    return this.entries.find((entry) => entry.cancelSignal?.aborted !== true)?.dispatchMode;
+  }
+
+  /**
    * Whether every queued entry continues the exact workspace turn correlation.
    *
    * The caller uses this for a new continuation that has not entered the queue.

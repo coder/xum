@@ -2536,6 +2536,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // A queued wake can be superseded after dequeue. Share cancellation state so
       // AgentSession can release PREPARING when cancellation wins before acceptance.
       const cancelState = { canceledBeforeAcceptance: false };
+      // Withdrawal (output already shown, process discarded, history cleared) must
+      // free the queue slot now, not at stream end: a lingering entry keeps the
+      // workspace reported busy and its dedupe key held. The key is unique per
+      // dispatch, so this cannot drop a newer wake's entry.
+      dispatch.cancelSignal.addEventListener(
+        "abort",
+        () => {
+          this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, dispatch.dedupeKey, {
+            cancelReason: "Bash monitor wake withdrawn before dispatch.",
+          });
+        },
+        { once: true }
+      );
       const sendResult = await this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
