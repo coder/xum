@@ -589,10 +589,13 @@ export class ServiceContainer {
         }
       });
     }
-    // Interrupt and await the runtime's supervised fibers while every dependency
-    // they might touch during finalization is still alive. Fixed here (before
-    // the explicit teardown) so later occupants do not re-derive the position;
-    // bounded and idempotent, and never rejects (di/appRuntime.ts).
+    // Interrupt and await the runtime's supervised fibers — the stream engine's
+    // per-stream supervisors (StreamManager.superviseEngine): every in-flight
+    // stream is aborted as "system" and its partial committed to chat.jsonl —
+    // while every dependency they touch during finalization is still alive.
+    // Fixed here (before the explicit teardown) so clients still receive the
+    // stream-abort over the bridges; bounded and idempotent, and never rejects
+    // (di/appRuntime.ts).
     await closeScopeBounded(this.appFiberScope);
     // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
     await shutdownStep("desktopBridgeServer.stop", () => this.desktopBridgeServer.stop());

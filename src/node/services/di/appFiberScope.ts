@@ -11,13 +11,15 @@
  * later re-closes it idempotently as a backstop.
  *
  * This is the seam for I/O-suspended, long-lived work that shutdown must wait
- * for (the streamManager engine core, in a later phase). It is the counterpart
- * of `EffectRunner` (`./effectRunner.ts`), which is unsupervised: a fiber forked
- * through the runner is interrupted by neither close. Anything forked here must
- * tolerate interruption at any suspension point and must not depend on
- * resources torn down before the close (see the dispose order in
- * `ServiceContainer`). No production occupant yet; the contract is pinned by
- * tests.
+ * for. Its occupant is the stream engine: `StreamManager.superviseEngine`
+ * forks one supervisor fiber per stream into it, whose interruption cancels the
+ * stream (`"system"` abort) and awaits the turn's settlement, so dispose()
+ * commits the partial into chat.jsonl before the bridges stop. It is the
+ * counterpart of `EffectRunner` (`./effectRunner.ts`), which is unsupervised: a
+ * fiber forked through the runner is interrupted by neither close. Anything
+ * forked here must tolerate interruption at any suspension point and must not
+ * depend on resources torn down before the close (see the dispose order in
+ * `ServiceContainer`). The contract is pinned by tests.
  */
 import { Context, Effect, Layer, Scope } from "effect";
 
