@@ -3199,6 +3199,8 @@ export class AgentSession {
       stepBudget?: number;
       /** For a send continuing an interrupted turn: the fallback chain state it reached. */
       modelFallbackProgress?: ModelFallbackProgress;
+      /** For a send continuing an interrupted turn: it ran under resumeStream's revalidation. */
+      revalidateAdmission?: boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
@@ -4226,7 +4228,7 @@ export class AgentSession {
       goalKind,
       internal?.goalId,
       internal?.stepBudget,
-      undefined,
+      internal?.revalidateAdmission,
       internal?.modelFallbackProgress
     );
     try {
@@ -4315,7 +4317,7 @@ export class AgentSession {
           turnThinkingOverride,
           undefined,
           internal?.stepBudget,
-          undefined,
+          internal?.revalidateAdmission,
           internal?.modelFallbackProgress
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
@@ -4827,6 +4829,7 @@ export class AgentSession {
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
     stepBudget?: number;
     modelFallbackProgress?: ModelFallbackProgress;
+    revalidateAdmission?: boolean;
   }): CompactionFollowUpRequest {
     const followUp: CompactionFollowUpRequest = {
       text: params.messageText,
@@ -4837,6 +4840,7 @@ export class AgentSession {
       ...(params.modelFallbackProgress != null
         ? { modelFallbackProgress: params.modelFallbackProgress }
         : {}),
+      ...(params.revalidateAdmission === true ? { revalidateAdmission: true } : {}),
     };
 
     if (params.agentInitiated === true) {
@@ -5100,6 +5104,7 @@ export class AgentSession {
         // The abort handler left the interrupted stream's remainder on this context.
         stepBudget: streamContext.stepBudget,
         modelFallbackProgress: streamContext.modelFallbackProgress,
+        revalidateAdmission: streamContext.revalidateAdmission,
       });
       // Waterfall hook point: see the on-send compaction.prepare run above.
       await eventSpine.run("compaction.prepare", {
@@ -8306,6 +8311,17 @@ export class AgentSession {
       followUp.modelFallbackProgress != null
         ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)
         : undefined;
+    const persistedRevalidateAdmission = followUp.revalidateAdmission === true;
+    // The interrupted turn spent its last step before compaction: the ceiling ended it, and the
+    // loop's stop condition is only evaluated after a step, so a follow-up would run one more.
+    if (persistedStepBudget === 0) {
+      log.info("Discarding pending follow-up: the interrupted turn's step budget is spent", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
 
     // The compaction summary is now the source of truth for the next live resume
     // request. Pre-arm retry state from the reconstructed follow-up so failures
@@ -8316,7 +8332,7 @@ export class AgentSession {
       persistedGoalKind,
       persistedGoalId,
       persistedStepBudget,
-      undefined,
+      persistedRevalidateAdmission,
       persistedFallbackProgress?.success ? persistedFallbackProgress.data : undefined
     );
 
@@ -8341,6 +8357,7 @@ export class AgentSession {
       modelFallbackProgress: persistedFallbackProgress?.success
         ? persistedFallbackProgress.data
         : undefined,
+      revalidateAdmission: persistedRevalidateAdmission,
     });
     if (!sendResult.success) {
       // A stale-admission refusal is the idle rule (or a goal transition)

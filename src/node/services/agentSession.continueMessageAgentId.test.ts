@@ -24,6 +24,7 @@ interface AutoRetryResumeRequest {
   agentInitiated?: boolean;
   stepBudget?: number;
   modelFallbackProgress?: unknown;
+  revalidateAdmission?: boolean;
 }
 
 interface SendInternal {
@@ -31,6 +32,7 @@ interface SendInternal {
   agentInitiated?: boolean;
   stepBudget?: number;
   modelFallbackProgress?: unknown;
+  revalidateAdmission?: boolean;
 }
 
 interface SessionInternals {
@@ -275,7 +277,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(internals.lastAutoRetryResumeRequest?.agentInitiated).toBe(true);
   });
 
-  test("dispatchPendingFollowUp continues the interrupted turn's step budget and fallback chain", async () => {
+  test("dispatchPendingFollowUp continues the interrupted turn's step budget, fallback chain, and admission revalidation", async () => {
     const progress = {
       requestedModel: "anthropic:claude-sonnet-4-5",
       refusedModels: ["anthropic:claude-sonnet-4-5"],
@@ -289,6 +291,7 @@ describe("AgentSession continue-message agentId fallback", () => {
         agentId: "exec",
         stepBudget: 7,
         modelFallbackProgress: progress,
+        revalidateAdmission: true,
       }),
     ]);
     internals.sendMessage = mock(
@@ -300,9 +303,39 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     await internals.dispatchPendingFollowUp();
 
-    expect(dispatched[0]).toMatchObject({ stepBudget: 7, modelFallbackProgress: progress });
-    expect(internals.lastAutoRetryResumeRequest?.stepBudget).toBe(7);
-    expect(internals.lastAutoRetryResumeRequest?.modelFallbackProgress).toEqual(progress);
+    expect(dispatched[0]).toMatchObject({
+      stepBudget: 7,
+      modelFallbackProgress: progress,
+      revalidateAdmission: true,
+    });
+    expect(internals.lastAutoRetryResumeRequest).toMatchObject({
+      stepBudget: 7,
+      modelFallbackProgress: progress,
+      revalidateAdmission: true,
+    });
+  });
+
+  test("dispatchPendingFollowUp discards a follow-up whose interrupted turn spent its step budget", async () => {
+    const { internals, historyService } = await createSession([
+      compactionSummaryMessage("summary-spent", {
+        text: "Continue",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        stepBudget: 0,
+      }),
+    ]);
+    const sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    internals.sendMessage = sendMessage;
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+
+    // The ceiling ended the turn; the follow-up is dropped rather than left to redispatch later.
+    expect(sendMessage).not.toHaveBeenCalled();
+    const tail = await historyService.getLastMessages("ws", 1);
+    expect(tail.success).toBe(true);
+    const summary = tail.success ? tail.data[0] : undefined;
+    expect(summary?.id).toBe("summary-spent");
+    expect(summary?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
   });
 
   test("dispatchPendingFollowUp drops a malformed persisted remainder", async () => {

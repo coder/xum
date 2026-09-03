@@ -1286,14 +1286,18 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       ownerWorkspaceId: "parent-mid-stream-compaction",
       turnId: "turn-mid-stream-compaction",
     } as const;
-    const result = await session.sendMessage(
-      "hello",
+    // The interrupted turn is a revalidated resume (a stranded delegated turn's continuation).
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-hello", "user", "hello", { timestamp: Date.now() })
+    );
+    const result = await session.resumeStream(
       {
         model: "openai:gpt-4o",
         agentId: "exec",
         muxMetadata: workspaceTurnMetadata,
       },
-      { agentInitiated: true }
+      { agentInitiated: true, revalidateAdmission: true }
     );
 
     expect(result.success).toBe(true);
@@ -1326,6 +1330,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       model: "openai:gpt-4o-fallback",
       stepBudget: 7,
       modelFallbackProgress: interruptedProgress,
+      revalidateAdmission: true,
     });
 
     const compactionRequestText =

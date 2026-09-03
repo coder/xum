@@ -222,11 +222,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**
-   * What the turn interrupted for mid-stream compaction had left of its step ceiling, and the
-   * fallback chain state it reached: the follow-up continues that turn, not a fresh one.
+   * What the turn interrupted for mid-stream compaction had left of its step ceiling, the
+   * fallback chain state it reached, and whether it ran under admission revalidation: the
+   * follow-up continues that turn, not a fresh one.
    */
   stepBudget?: number;
   modelFallbackProgress?: ModelFallbackProgress;
+  revalidateAdmission?: boolean;
   /**
    * Open delegated workspace-turn correlation captured before on-send
    * compaction consumed this follow-up (e.g. a bash-monitor wake continuing a
