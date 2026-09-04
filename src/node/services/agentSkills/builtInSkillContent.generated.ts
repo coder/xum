@@ -3902,6 +3902,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| Spark 5.3              | openai:gpt-5.3-codex-spark    | `spark`                                                      |         |",
       "| Codex Mini 5.1         | openai:gpt-5.1-codex-mini     | `codex-mini`                                                 |         |",
       "| Codex Max 5.1          | openai:gpt-5.1-codex-max      | `codex-max`                                                  |         |",
+      "| Daybreak Blue Latest   | openai:daybreak-blue-latest   | —                                                            |         |",
+      "| Daybreak Red Latest    | openai:daybreak-red-latest    | —                                                            |         |",
       "| Gemini 3.1 Pro Preview | google:gemini-3.1-pro-preview | `gemini`, `gemini-pro`                                       |         |",
       "| Gemini 3.8 Flash       | google:gemini-3.8-flash       | `gemini-flash`                                               |         |",
       "| Grok 4.6               | xai:grok-4.6                  | `grok`, `grok-4.6`                                           |         |",

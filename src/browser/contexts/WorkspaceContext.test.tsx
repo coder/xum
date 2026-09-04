@@ -8,6 +8,8 @@ import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectCo
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
+  DEFAULT_MODEL_KEY,
+  HIDDEN_MODELS_KEY,
   LAST_VISITED_ROUTE_KEY,
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -19,6 +21,7 @@ import {
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { RecursivePartial } from "@/browser/testUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
@@ -70,6 +73,37 @@ describe("WorkspaceContext", () => {
     globalThis.localStorage = undefined as unknown as Storage;
 
     currentClientMock = {};
+  });
+
+  test("imports legacy hidden preferences before backend hydration", async () => {
+    const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
+    const legacyHidden = "openrouter:openai/gpt-5";
+    const defaultModel = "openai:gpt-5.6-terra";
+    createMockAPI({
+      localStorage: {
+        [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
+        [DEFAULT_MODEL_KEY]: JSON.stringify(defaultModel),
+      },
+    });
+    const updateModelPreferences = mock(() => Promise.resolve());
+    const cfg = await createMockORPCClient().config.getConfig();
+    currentClientMock.config = {
+      getConfig: () =>
+        Promise.resolve({ ...cfg, hiddenModels: seeded, hiddenModelsInitialized: false }),
+      updateModelPreferences,
+    };
+    await setup();
+    await waitFor(() => {
+      expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual([
+        ...seeded,
+        legacyHidden,
+      ]);
+    });
+    expect(updateModelPreferences).toHaveBeenCalledWith({
+      defaultModel,
+      hiddenModels: [...seeded, legacyHidden],
+    });
+    expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
   });
 
   test("syncs workspace store subscriptions when metadata loads", async () => {

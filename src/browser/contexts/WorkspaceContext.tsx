@@ -77,17 +77,20 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { WorkspaceCreationScope } from "@/common/utils/subProjects";
 
 /**
- * One-time best-effort migration: if the backend doesn't have model preferences yet,
- * persist explicit localStorage values so future port/origin changes keep them.
+ * One-time best-effort migration: when backend preferences are missing or hidden-model
+ * preferences remain uninitialized, persist explicit localStorage values.
  * Called once on startup after backend config is fetched.
  *
  * Exported for focused migration tests.
  */
-export function migrateLocalModelPrefsToBackend(
+export async function migrateLocalModelPrefsToBackend(
   api: APIClient,
-  cfg: { defaultModel?: string; hiddenModels?: string[] }
-): void {
-  if (!api.config.updateModelPreferences) return;
+  cfg: Pick<
+    Awaited<ReturnType<APIClient["config"]["getConfig"]>>,
+    "defaultModel" | "hiddenModels" | "hiddenModelsInitialized"
+  >
+) {
+  if (!api.config.updateModelPreferences) return cfg;
 
   const localDefaultModelRaw = readPersistedString(DEFAULT_MODEL_KEY);
   const localDefaultModel =
@@ -109,18 +112,24 @@ export function migrateLocalModelPrefsToBackend(
   }
 
   if (
-    cfg.hiddenModels === undefined &&
-    Array.isArray(localHiddenModels) &&
-    localHiddenModels.length > 0
+    cfg.hiddenModelsInitialized === false ||
+    (cfg.hiddenModels === undefined &&
+      Array.isArray(localHiddenModels) &&
+      localHiddenModels.length > 0)
   ) {
-    patch.hiddenModels = localHiddenModels;
+    // Backend defaults are not evidence that legacy local preferences were imported.
+    patch.hiddenModels = [
+      ...new Set([
+        ...(cfg.hiddenModels ?? []),
+        ...(Array.isArray(localHiddenModels) ? localHiddenModels : []),
+      ]),
+    ];
   }
 
   if (Object.keys(patch).length > 0) {
-    api.config.updateModelPreferences(patch).catch(() => {
-      // Best-effort only.
-    });
+    await api.config.updateModelPreferences(patch);
   }
+  return { ...cfg, ...patch };
 }
 
 /**
@@ -659,18 +668,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
     void api.config
       .getConfig()
-      .then((cfg) => {
+      .then(async (cfg) => {
+        // Read legacy local preferences before backend hydration can overwrite them.
+        const modelPrefs = await migrateLocalModelPrefsToBackend(api, cfg);
         updatePersistedState(
           AGENT_AI_DEFAULTS_KEY,
           normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
         );
 
         // Seed global model preferences from backend so switching ports doesn't reset the UI.
-        if (cfg.defaultModel !== undefined) {
-          updatePersistedState(DEFAULT_MODEL_KEY, cfg.defaultModel);
+        if (modelPrefs.defaultModel !== undefined) {
+          updatePersistedState(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
         }
-        if (cfg.hiddenModels !== undefined) {
-          updatePersistedState(HIDDEN_MODELS_KEY, cfg.hiddenModels);
+        if (modelPrefs.hiddenModels !== undefined) {
+          updatePersistedState(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
         }
 
         // Seed runtime enablement from backend so switching ports doesn't reset the UI.
@@ -682,10 +693,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (cfg.defaultRuntime !== undefined) {
           updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
         }
-
-        // One-time best-effort migration: if the backend doesn't have model prefs yet,
-        // persist explicit localStorage values so future port changes keep them.
-        migrateLocalModelPrefsToBackend(api, cfg);
 
         // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
         // check if the user had non-default values in the old localStorage keys.
