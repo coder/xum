@@ -5,6 +5,8 @@ import { EventEmitter } from "node:events";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import {
@@ -1170,6 +1172,47 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(harness.latestRequest().modelFallbackProgress).toEqual(abortedProgress);
     } finally {
       stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("an aborted stream is accounted under the model it ran on, not the one requested", async () => {
+    const workspaceId = "queue-dispatch-abort-accounting-effective-model";
+    const recordStreamAccounting = mock((_input: { costUsd: number }) => Promise.resolve());
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      recordStreamAccounting,
+      applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+      requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+      recordStreamStarted: mock(() => Promise.resolve()),
+      syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+    const harness = await createStreamingTurnHarness(workspaceId, {
+      harness: { workspaceGoalService },
+      sendInternal: { synthetic: true, agentInitiated: true },
+    });
+    const { session, cleanup, aiEmitter } = harness;
+
+    try {
+      // The request named TEST_MODEL; a configured fallback ran the stream on a differently
+      // priced model and reported the usage for it.
+      const effectiveModel = "anthropic:claude-opus-4-1";
+      const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+      const effectiveCost = getTotalCost(createDisplayUsage(usage, effectiveModel));
+      const requestedCost = getTotalCost(createDisplayUsage(usage, TEST_MODEL));
+      expect(effectiveCost).toBeGreaterThan(0);
+      expect(effectiveCost).not.toBe(requestedCost);
+
+      aiEmitter.emit("stream-abort", {
+        ...streamAbortEvent(workspaceId, "system"),
+        metadata: { duration: 1, usage, model: effectiveModel },
+      });
+      expect(await waitForCondition(() => recordStreamAccounting.mock.calls.length === 1)).toBe(
+        true
+      );
+      expect(recordStreamAccounting.mock.calls[0]?.[0].costUsd).toBeCloseTo(effectiveCost ?? -1);
+    } finally {
       session.dispose();
       await cleanup();
     }

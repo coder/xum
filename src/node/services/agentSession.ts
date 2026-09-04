@@ -6656,7 +6656,9 @@ export class AgentSession {
       }
 
       this.setTurnPhase(TurnPhase.COMPLETING);
-      const activeModelForAbort = this.activeStreamContext?.modelString;
+      // Price the abort against the model that produced the usage (a configured fallback may
+      // differ from the requested one), as stream-end does; the context still names the request.
+      const activeModelForAbort = payload.metadata?.model ?? this.activeStreamContext?.modelString;
       if (activeModelForAbort) {
         this.updateUsageStateFromModelUsage({
           model: activeModelForAbort,
