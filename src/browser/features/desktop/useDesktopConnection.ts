@@ -140,6 +140,8 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const attemptRef = useRef(0);
   const generationRef = useRef(0);
   const isDisposedRef = useRef(false);
+  const viewerRegistrationRef = useRef<AbortController | null>(null);
+  const viewerReleasedRef = useRef(false);
 
   const connectImplRef = useRef<() => void>(() => undefined);
   const disconnectImplRef = useRef<() => void>(() => undefined);
@@ -176,18 +178,19 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const disconnectCurrentRfb = () => {
     setSharedDesktop(null);
     const currentRfb = rfbRef.current;
+    const registration = viewerRegistrationRef.current;
+    viewerRegistrationRef.current = null;
     setControlling(false);
     inputRef.current?.dispose();
     inputRef.current = null;
     rfbRef.current = null;
-    if (!currentRfb) {
-      return;
-    }
-
     try {
-      currentRfb.disconnect();
+      currentRfb?.disconnect();
     } catch {
       // noVNC disconnect can race with its own close handling; treat teardown as idempotent.
+    } finally {
+      // A normal disconnect/unmount unregisters only after releasing held guest input.
+      registration?.abort();
     }
   };
 
@@ -221,6 +224,7 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   };
 
   connectImplRef.current = () => {
+    if (viewerReleasedRef.current) return;
     void (async () => {
       const generation = generationRef.current + 1;
       generationRef.current = generation;
@@ -291,61 +295,130 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
         if (isDisposedRef.current || generation !== generationRef.current) {
           return;
         }
-        const rfb = new RFB(container, wsUrl);
-        rfb.background = "var(--color-background)";
-        rfb.viewOnly = true;
-        rfb.scaleViewport = scaleToFitRef.current;
-        rfb.resizeSession = false;
+        const sharedTarget = result.capability.sharedDesktop ?? null;
+        const connectRfb = () => {
+          const rfb = new RFB(container, wsUrl);
+          rfb.background = "var(--color-background)";
+          rfb.viewOnly = true;
+          rfb.scaleViewport = scaleToFitRef.current;
+          rfb.resizeSession = false;
 
-        const handleConnect = () => {
-          if (generationRef.current !== generation || isDisposedRef.current) {
-            return;
-          }
-          const canvas = container.querySelector("canvas");
-          assertDesktop(canvas, "Connected desktop is missing its canvas.");
-          inputRef.current = trackDesktopInput(canvas, () => !rfb.viewOnly);
-          hasEverConnectedRef.current = true;
-          attemptRef.current = 0;
-          setState("connected");
-          setReason(null);
-        };
-
-        const handleDisconnect = (event: CustomEvent<{ clean: boolean }>) => {
-          if (generationRef.current !== generation || isDisposedRef.current) {
-            return;
-          }
-          disconnectCurrentRfb();
-          if (hasEverConnectedRef.current) {
-            setState("disconnected");
+          const handleConnect = () => {
+            if (generationRef.current !== generation || isDisposedRef.current) {
+              return;
+            }
+            const canvas = container.querySelector("canvas");
+            assertDesktop(canvas, "Connected desktop is missing its canvas.");
+            inputRef.current = trackDesktopInput(canvas, () => !rfb.viewOnly);
+            hasEverConnectedRef.current = true;
+            attemptRef.current = 0;
+            setState("connected");
             setReason(null);
-            scheduleReconnectRef.current();
-            return;
-          }
-          const cleanSuffix = event.detail.clean ? " cleanly" : " unexpectedly";
-          setState("error");
-          setReason(`Desktop session disconnected${cleanSuffix} before it finished connecting.`);
+          };
+
+          const handleDisconnect = (event: CustomEvent<{ clean: boolean }>) => {
+            if (generationRef.current !== generation || isDisposedRef.current) {
+              return;
+            }
+            disconnectCurrentRfb();
+            if (hasEverConnectedRef.current) {
+              setState("disconnected");
+              setReason(null);
+              scheduleReconnectRef.current();
+              return;
+            }
+            const cleanSuffix = event.detail.clean ? " cleanly" : " unexpectedly";
+            setState("error");
+            setReason(`Desktop session disconnected${cleanSuffix} before it finished connecting.`);
+          };
+
+          const handleSecurityFailure = (
+            event: CustomEvent<{ status: number; reason: string }>
+          ) => {
+            if (generationRef.current !== generation || isDisposedRef.current) {
+              return;
+            }
+            disconnectCurrentRfb();
+            setState("error");
+            const securityReason = event.detail.reason.trim();
+            setReason(
+              securityReason.length > 0
+                ? `Desktop connection failed security checks: ${securityReason}`
+                : "Desktop connection failed security checks."
+            );
+          };
+
+          rfb.addEventListener("connect", handleConnect);
+          rfb.addEventListener("disconnect", handleDisconnect);
+          rfb.addEventListener("securityfailure", handleSecurityFailure);
+          rfbRef.current = rfb;
+          setSharedDesktop(sharedTarget);
+          setState("connecting");
         };
 
-        const handleSecurityFailure = (event: CustomEvent<{ status: number; reason: string }>) => {
-          if (generationRef.current !== generation || isDisposedRef.current) {
-            return;
-          }
-          disconnectCurrentRfb();
-          setState("error");
-          const securityReason = event.detail.reason.trim();
-          setReason(
-            securityReason.length > 0
-              ? `Desktop connection failed security checks: ${securityReason}`
-              : "Desktop connection failed security checks."
-          );
-        };
+        if (typeof window.api !== "undefined") {
+          connectRfb();
+          return;
+        }
 
-        rfb.addEventListener("connect", handleConnect);
-        rfb.addEventListener("disconnect", handleDisconnect);
-        rfb.addEventListener("securityfailure", handleSecurityFailure);
-        rfbRef.current = rfb;
-        setSharedDesktop(result.capability.sharedDesktop ?? null);
+        // A browser viewer must be registered for cooperative release before opening VNC.
+        const registration = new AbortController();
+        viewerRegistrationRef.current = registration;
         setState("connecting");
+        try {
+          const events = await api.desktop.watchViewer(
+            { workspaceId },
+            { signal: registration.signal }
+          );
+          if (
+            registration.signal.aborted ||
+            generationRef.current !== generation ||
+            isDisposedRef.current
+          ) {
+            await events.return?.();
+            return;
+          }
+          let viewerId: string | null = null;
+          for await (const event of events) {
+            if (
+              registration.signal.aborted ||
+              generationRef.current !== generation ||
+              isDisposedRef.current
+            )
+              return;
+            if (event.type === "ready") {
+              assertDesktop(viewerId === null, "Desktop viewer registered more than once.");
+              viewerId = event.viewerId;
+              connectRfb();
+              continue;
+            }
+            assertDesktop(
+              viewerId === event.viewerId,
+              "Desktop release has no matching registration."
+            );
+            viewerReleasedRef.current = true;
+            // disconnectAndWait normally unregisters. Keep this subscription alive until ACK
+            // so the server can still associate that acknowledgment with this viewer.
+            viewerRegistrationRef.current = null;
+            const disconnected = disconnectAndWait();
+            const stoppedGeneration = generationRef.current;
+            try {
+              await disconnected;
+              await api.desktop.acknowledgeViewerRelease({ viewerId });
+            } finally {
+              registration.abort();
+              if (generationRef.current === stoppedGeneration) {
+                setState("unavailable");
+                setReason("The desktop session was closed.");
+              }
+            }
+            return;
+          }
+          if (!registration.signal.aborted) throw new Error("Desktop release subscription ended.");
+        } finally {
+          if (viewerRegistrationRef.current === registration) disconnectCurrentRfb();
+          else registration.abort();
+        }
       } catch (error) {
         if (generationRef.current !== generation || isDisposedRef.current) {
           return;

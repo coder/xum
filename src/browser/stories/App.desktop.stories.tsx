@@ -12,6 +12,7 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { expandProjects, expandRightSidebar } from "./helpers/uiState";
 import { createWorkspace } from "./mocks/workspaces";
+import { watchDesktopViewerFixture } from "@/browser/features/desktop/desktopRfb.test-fixture";
 import DesktopRfb from "./mocks/desktopRfb";
 import { blurActiveElement, waitForChatInputAutofocusDone } from "./storyPlayHelpers";
 
@@ -50,6 +51,8 @@ function setupDesktopStory(phone = false): APIClient {
   });
   // Only bootstrap carries the binding; a capability probe must not determine the viewer's label.
   client.desktop = {
+    watchViewer: watchDesktopViewerFixture,
+    acknowledgeViewerRelease: () => Promise.resolve(),
     openWindow: ({ instanceId }) => Promise.resolve({ instanceId }),
     closeWindow: () => Promise.resolve(),
     getWindow: () => Promise.resolve(null),

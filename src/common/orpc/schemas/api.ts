@@ -3189,7 +3189,20 @@ const DesktopWindowInputSchema = z.object({
 });
 const DesktopWindowStateSchema = z.object({ instanceId: z.string().min(1) });
 
+export const DesktopViewerEventSchema = z.object({
+  type: z.enum(["ready", "release"]),
+  viewerId: z.string().min(1),
+});
+
 export const desktop = {
+  watchViewer: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(DesktopViewerEventSchema),
+  },
+  acknowledgeViewerRelease: {
+    input: z.object({ viewerId: z.string().min(1) }),
+    output: z.void(),
+  },
   openWindow: {
     input: DesktopWindowInputSchema,
     output: DesktopWindowStateSchema,

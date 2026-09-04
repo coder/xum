@@ -1,5 +1,15 @@
 import type { Context } from "react";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { readFile, writeFile, rm } from "node:fs/promises";
@@ -9,7 +19,14 @@ import { fileURLToPath } from "node:url";
 import type { APIClient, UseAPIResult } from "@/browser/contexts/API";
 import { requireTestModule, type RecursivePartial } from "@/browser/testUtils";
 import type * as DesktopModule from "./useDesktopConnection";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
+import type { DesktopViewerEventSchema } from "@/common/orpc/schemas/api";
+import type { z } from "zod";
+
 import DesktopRfbFixture from "./desktopRfb.test-fixture";
+
+type DesktopViewerEvent = z.infer<typeof DesktopViewerEventSchema>;
 
 // Bun's module mocks are process-wide. As in useAIViewKeybinds.test, load an isolated
 // hook/API pair instead of letting the RFB test double leak into other suites.
@@ -51,6 +68,16 @@ describe("useDesktopConnection control ownership", () => {
   };
   let getBootstrap = mock(() => Promise.resolve(bootstrap));
 
+  const watchViewer = mock<APIClient["desktop"]["watchViewer"]>();
+  const acknowledgeViewerRelease = mock<APIClient["desktop"]["acknowledgeViewerRelease"]>();
+  let autoReady = true;
+  const registrations: Array<{
+    queue: ReturnType<typeof createAsyncMessageQueue<DesktopViewerEvent>>;
+    signal: AbortSignal;
+    viewerId: string;
+    failure: Error | null;
+  }> = [];
+
   beforeEach(() => {
     const dom = new GlobalWindow({ url: "http://localhost:3000" }) as unknown as Window &
       typeof globalThis;
@@ -63,6 +90,28 @@ describe("useDesktopConnection control ownership", () => {
     });
     DesktopRfbFixture.instances = [];
     getBootstrap = mock(() => Promise.resolve(bootstrap));
+    registrations.length = 0;
+    autoReady = true;
+    acknowledgeViewerRelease.mockReset();
+    acknowledgeViewerRelease.mockResolvedValue(undefined);
+    watchViewer.mockReset();
+    watchViewer.mockImplementation((_input, { signal } = {}) => {
+      if (!signal) throw new Error("Viewer registration must be abortable");
+      const registration = {
+        queue: createAsyncMessageQueue<DesktopViewerEvent>(),
+        signal,
+        viewerId: `viewer-${registrations.length}`,
+        failure: null as Error | null,
+      };
+      registrations.push(registration);
+      signal.addEventListener("abort", registration.queue.end, { once: true });
+      if (autoReady) registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+      async function* events() {
+        yield* registration.queue.iterate();
+        if (registration.failure) throw registration.failure;
+      }
+      return Promise.resolve(wrapAsyncIterator(events(), {}));
+    });
   });
 
   afterEach(() => {
@@ -76,7 +125,9 @@ describe("useDesktopConnection control ownership", () => {
       desktop = useDesktopConnection("workspace-1");
       return <div ref={desktop.containerRef} />;
     }
-    const client: RecursivePartial<APIClient> = { desktop: { getBootstrap } };
+    const client: RecursivePartial<APIClient> = {
+      desktop: { getBootstrap, watchViewer, acknowledgeViewerRelease },
+    };
     const view = render(
       <APIContext.Provider
         value={{
@@ -257,6 +308,166 @@ describe("useDesktopConnection control ownership", () => {
     } finally {
       globalThis.queueMicrotask = queueMicrotask;
     }
+  });
+
+  test("waits for registered ready before creating a browser VNC connection", async () => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    expect(DesktopRfbFixture.instances).toHaveLength(0);
+    act(() => view.desktop.setControlling(true));
+    expect(view.desktop.controlling).toBe(false);
+    const registration = registrations[0];
+    registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+    await waitFor(() => expect(view.desktop.state).toBe("connected"));
+    expect(DesktopRfbFixture.instances).toHaveLength(1);
+    expect(registration.signal.aborted).toBe(false);
+  });
+
+  test.each(["disconnect", "unmount"])("%s cancels registration before ready", async (action) => {
+    autoReady = false;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    const registration = registrations[0];
+    act(() => {
+      if (action === "unmount") view.unmount();
+      else view.desktop.disconnect();
+    });
+    expect(registration.signal.aborted).toBe(true);
+    registration.queue.push({ type: "ready", viewerId: registration.viewerId });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(DesktopRfbFixture.instances).toHaveLength(0);
+  });
+
+  test("a late subscription from a superseded generation cannot construct another RFB", async () => {
+    const pending =
+      Promise.withResolvers<Awaited<ReturnType<APIClient["desktop"]["watchViewer"]>>>();
+    watchViewer.mockReturnValueOnce(pending.promise);
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(watchViewer).toHaveBeenCalledTimes(1));
+    const oldSignal = watchViewer.mock.calls[0][1]?.signal;
+    const replacement = await connect(view);
+    expect(oldSignal?.aborted).toBe(true);
+    const events = wrapAsyncIterator(
+      (async function* () {
+        yield await Promise.resolve({ type: "ready" as const, viewerId: "stale" });
+      })(),
+      {}
+    );
+    const close = spyOn(events, "return");
+    await act(async () => {
+      pending.resolve(events);
+      await pending.promise;
+    });
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(DesktopRfbFixture.instances).toEqual([replacement]);
+    expect(replacement.disconnectCount).toBe(0);
+  });
+
+  test.each([false, true])(
+    "release drains held input and ACKs before abort (unmount=%s)",
+    async (unmount) => {
+      const ack = Promise.withResolvers<void>();
+      acknowledgeViewerRelease.mockReturnValueOnce(ack.promise);
+      const view = mountConnection();
+      const rfb = await connect(view);
+      act(() => view.desktop.setControlling(true));
+      holdKeysAndDrag(rfb);
+      const registration = registrations[0];
+      registration.queue.push({ type: "release", viewerId: registration.viewerId });
+      await waitFor(() => expect(rfb.disconnectCount).toBe(1));
+      expect(rfb.input.filter((event) => event.type === "keyup")).toHaveLength(2);
+      expect(rfb.input.filter((event) => event.type === "mouseup")).toHaveLength(1);
+      expect(rfb.viewOnly).toBe(true);
+      expect(registration.signal.aborted).toBe(false);
+      expect(acknowledgeViewerRelease).not.toHaveBeenCalled();
+      if (unmount) view.unmount();
+      expect(registration.signal.aborted).toBe(false);
+      rfb.events.dispatchEvent(new Event("disconnect"));
+      await waitFor(() =>
+        expect(acknowledgeViewerRelease).toHaveBeenCalledWith({ viewerId: registration.viewerId })
+      );
+      expect(registration.signal.aborted).toBe(false);
+      ack.resolve();
+      await waitFor(() => expect(registration.signal.aborted).toBe(true));
+      if (!unmount) {
+        await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+        act(() => view.desktop.connect());
+        expect(getBootstrap).toHaveBeenCalledTimes(1);
+      }
+    }
+  );
+
+  test("failed ACK still retires the registration without reconnecting", async () => {
+    acknowledgeViewerRelease.mockImplementationOnce(() => Promise.reject(new Error("ACK failed")));
+    const view = mountConnection();
+    const rfb = await connect(view);
+    const registration = registrations[0];
+    registration.queue.push({ type: "release", viewerId: registration.viewerId });
+    await waitFor(() => expect(rfb.disconnectCount).toBe(1));
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    await waitFor(() => expect(view.desktop.state).toBe("unavailable"));
+    expect(registration.signal.aborted).toBe(true);
+    act(() => view.desktop.connect());
+    expect(getBootstrap).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    [false, "end"],
+    [false, "error"],
+    [true, "end"],
+    [true, "error"],
+  ] as const)("subscription loss releases any socket (ready=%s, %s)", async (ready, failure) => {
+    autoReady = ready;
+    const view = mountConnection();
+    act(() => view.desktop.connect());
+    await waitFor(() => expect(registrations).toHaveLength(1));
+    if (ready) {
+      await waitFor(() => expect(view.desktop.state).toBe("connected"));
+      act(() => view.desktop.setControlling(true));
+      holdKeysAndDrag(DesktopRfbFixture.instances[0]);
+    }
+    const registration = registrations[0];
+    if (failure === "error") registration.failure = new Error("Stream failed");
+    registration.queue.end();
+    await waitFor(() => expect(view.desktop.state).toBe(ready ? "disconnected" : "error"));
+    expect(registration.signal.aborted).toBe(true);
+    if (ready) {
+      const rfb = DesktopRfbFixture.instances[0];
+      expect(rfb.disconnectCount).toBe(1);
+      expect(rfb.viewOnly).toBe(true);
+      expect(rfb.input.filter((event) => event.type === "keyup")).toHaveLength(2);
+      expect(rfb.input.filter((event) => event.type === "mouseup")).toHaveLength(1);
+    } else expect(DesktopRfbFixture.instances).toHaveLength(0);
+    expect(acknowledgeViewerRelease).not.toHaveBeenCalled();
+  });
+
+  test("normal unmount unregisters after releasing held input", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    act(() => view.desktop.setControlling(true));
+    holdKeysAndDrag(rfb);
+    const aborted = mock(() => {
+      expect(rfb.disconnectCount).toBe(1);
+      expect(
+        rfb.input.filter((event) => event.type === "keyup" || event.type === "mouseup")
+      ).toHaveLength(3);
+    });
+    registrations[0].signal.addEventListener("abort", aborted);
+    view.unmount();
+    expect(aborted).toHaveBeenCalledTimes(1);
+  });
+
+  test("Electron retains its native-window cleanup path without a browser registration", async () => {
+    Object.defineProperty(window, "api", { value: {} });
+    const view = mountConnection();
+    await connect(view);
+    expect(watchViewer).not.toHaveBeenCalled();
   });
 
   test("unmount prevents a pending bootstrap from creating a connection", async () => {

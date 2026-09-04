@@ -11,6 +11,7 @@ import {
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
+import { watchDesktopViewerFixture } from "@/browser/features/desktop/desktopRfb.test-fixture";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 
 const WORKSPACE_ID = "ws-desktop-viewer";
@@ -40,6 +41,8 @@ function setupDesktopStory(state: DesktopStoryState, sidebarWidth = 640) {
     root: { type: "tabset", id: "desktop-tabset", tabs: ["desktop"], activeTab: "desktop" },
   } satisfies RightSidebarLayoutState);
   client.desktop = {
+    watchViewer: watchDesktopViewerFixture,
+    acknowledgeViewerRelease: () => Promise.resolve(),
     openWindow: ({ instanceId }) => Promise.resolve({ instanceId }),
     closeWindow: () => Promise.resolve(),
     getWindow: () => Promise.resolve(null),

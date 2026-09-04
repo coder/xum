@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { Config } from "../../../src/node/config";
-import { test as browserTest, type Page, type TestInfo } from "@playwright/test";
-import type { ElectronApplication } from "playwright";
+import {
+  test as browserTest,
+  type BrowserContext,
+  type Page,
+  type TestInfo,
+} from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 
 type HandoffEvent = { type: "send"; bytes: number[] } | { type: "disconnect" | "connect" };
@@ -116,7 +120,7 @@ type DesktopCloseEvent =
   | { type: "window-close" };
 type DesktopCloseProbeWindow = Window & { __desktopCloseEvents?: DesktopCloseEvent[] };
 
-async function observePopoutCleanup(app: ElectronApplication, page: Page) {
+async function observePopoutCleanup(context: BrowserContext, page: Page) {
   const channelName = `desktop-e2e-close:${crypto.randomUUID()}`;
   await page.evaluate((name) => {
     const events: DesktopCloseEvent[] = [];
@@ -124,9 +128,16 @@ async function observePopoutCleanup(app: ElectronApplication, page: Page) {
     const observer = new BroadcastChannel(name);
     observer.onmessage = (event: MessageEvent<DesktopCloseEvent>) => events.push(event.data);
   }, channelName);
-  await app.context().addInitScript((name) => {
-    if (!window.location.pathname.endsWith("/desktop.html")) return;
+  await context.addInitScript((name) => {
+    // Browser popup init can precede its desktop URL; filter sockets, not the initial page URL.
     const observer = new BroadcastChannel(name);
+    const openerEvents = (window.opener as DesktopCloseProbeWindow | null)?.__desktopCloseEvents;
+    const record = (event: DesktopCloseEvent) => {
+      // A browser popup can disappear before its final DevTools events arrive;
+      // retain synchronous observations in the same-origin opener that survives it.
+      if (openerEvents) openerEvents.push(event);
+      else observer.postMessage(event);
+    };
     const NativeWebSocket = window.WebSocket;
     // Observe the real socket before noVNC's close listener; Playwright can lose
     // final frame/close notifications once Electron destroys the child target.
@@ -135,7 +146,7 @@ async function observePopoutCleanup(app: ElectronApplication, page: Page) {
         const socket = Reflect.construct(target, args, newTarget) as WebSocket;
         if (new URL(socket.url).pathname.endsWith("/desktop/ws")) {
           socket.addEventListener("close", (event) =>
-            observer.postMessage({
+            record({
               type: "socket-closed",
               clean: event.wasClean,
               code: event.code,
@@ -153,17 +164,16 @@ async function observePopoutCleanup(app: ElectronApplication, page: Page) {
       const bytes = ArrayBuffer.isView(data)
         ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
         : new Uint8Array(data);
-      observer.postMessage({ type: "send", bytes: Array.from(bytes) });
+      record({ type: "send", bytes: Array.from(bytes) });
     };
     const close = NativeWebSocket.prototype.close;
     NativeWebSocket.prototype.close = function (...args) {
-      if (new URL(this.url).pathname.endsWith("/desktop/ws"))
-        observer.postMessage({ type: "disconnect" });
+      if (new URL(this.url).pathname.endsWith("/desktop/ws")) record({ type: "disconnect" });
       close.apply(this, args);
     };
     const closeWindow = window.close.bind(window);
     window.close = () => {
-      observer.postMessage({ type: "window-close" });
+      record({ type: "window-close" });
       closeWindow();
     };
   }, channelName);
@@ -194,7 +204,7 @@ async function holdDesktopInput(child: Page, readEvents: () => Promise<DesktopCl
     .toBe(1);
 }
 
-function expectReleasedBeforeClose(events: DesktopCloseEvent[]) {
+function expectReleasedBeforeDisconnect(events: DesktopCloseEvent[]) {
   const keyUp = events.findIndex((event) => {
     if (event.type !== "send") return false;
     const key = readKeyEvent(new Uint8Array(event.bytes));
@@ -215,7 +225,13 @@ function expectReleasedBeforeClose(events: DesktopCloseEvent[]) {
   expect(disconnect).toBeGreaterThan(Math.max(keyUp, pointerUp));
   expect(socketClosed).toBeGreaterThan(disconnect);
   expect(events[socketClosed]).toEqual({ type: "socket-closed", clean: true, code: 1005 });
-  expect(events.findIndex((event) => event.type === "window-close")).toBeGreaterThan(socketClosed);
+}
+
+function expectReleasedBeforeClose(events: DesktopCloseEvent[]) {
+  expectReleasedBeforeDisconnect(events);
+  expect(events.findIndex((event) => event.type === "window-close")).toBeGreaterThan(
+    events.findIndex((event) => event.type === "socket-closed")
+  );
 }
 
 test.describe("Electron desktop", () => {
@@ -388,7 +404,7 @@ test.describe("Electron desktop", () => {
     expect(inlineConnections).toHaveLength(2);
     await screenshot(page, testInfo, "inline-after-bring-back");
 
-    const readEvents = await observePopoutCleanup(app, page);
+    const readEvents = await observePopoutCleanup(app.context(), page);
     const nextChildReady = app.waitForEvent("window");
     await page.getByRole("button", { name: "Detach", exact: true }).click();
     const nextChild = await nextChildReady;
@@ -475,7 +491,7 @@ test.describe("Electron desktop", () => {
     assert(capability.available);
     expect(capability.sharedDesktop?.ownerWorkspaceId).toBe(ownerId);
 
-    const readEvents = await observePopoutCleanup(app, page);
+    const readEvents = await observePopoutCleanup(app.context(), page);
     const opening = app.waitForEvent("window");
     await page.getByRole("button", { name: "Detach", exact: true }).click();
     const child = await opening;
@@ -718,11 +734,126 @@ test.describe("Electron desktop", () => {
 // This does not launch or mutate the user's normal Xum instance.
 const browserUrl = process.env.XUM_DESKTOP_E2E_URL;
 const browserWorkspaceId = process.env.XUM_DESKTOP_E2E_WORKSPACE_ID;
+const browserRoot = process.env.XUM_DESKTOP_E2E_ROOT;
 
 browserTest.describe("browser desktop", () => {
   browserTest.skip(
     !browserUrl || !browserWorkspaceId,
     "Set XUM_DESKTOP_E2E_URL and XUM_DESKTOP_E2E_WORKSPACE_ID for an isolated real-VNC server"
+  );
+
+  browserTest(
+    "server-side shared borrower removal releases browser popout input without closing the owner",
+    async ({ page, context }, testInfo) => {
+      browserTest.skip(
+        !browserRoot,
+        "Set XUM_DESKTOP_E2E_ROOT to the isolated browser server root"
+      );
+      assert(browserUrl && browserWorkspaceId && browserRoot);
+      await page.goto(`${browserUrl}/workspace/${encodeURIComponent(browserWorkspaceId)}`);
+      await enableRealDesktop(page, browserWorkspaceId);
+      await page.waitForFunction(() => Boolean(window.__ORPC_CLIENT__));
+      const { borrower, owner } = await page.evaluate(async (ownerId) => {
+        const api = window.__ORPC_CLIENT__;
+        if (!api) throw new Error("E2E API client not initialized");
+        const owner = (await api.workspace.list()).find((entry) => entry.id === ownerId);
+        if (!owner) throw new Error("Browser fixture owner must exist");
+        await api.projects.setTrust({ projectPath: owner.projectPath, trusted: true });
+        const result = await api.workspace.create({
+          projectPath: owner.projectPath,
+          branchName: `browser-borrower-${crypto.randomUUID().slice(0, 8)}`,
+          runtimeConfig: { type: "local" },
+        });
+        if (!result.success) throw new Error(result.error);
+        return { borrower: result.metadata, owner };
+      }, browserWorkspaceId);
+      // Setup only: bind a real child to the owner without launching an unrelated agent turn.
+      await new Config(browserRoot).editConfig((config) => {
+        const entry = config.projects
+          .get(owner.projectPath)
+          ?.workspaces.find((item) => item.id === borrower.id);
+        assert(entry, "Created browser borrower must be registered");
+        entry.parentWorkspaceId = owner.id;
+        entry.taskDesktopOwnerWorkspaceId = owner.id;
+        return config;
+      });
+      await page.goto(`${browserUrl}/workspace/${encodeURIComponent(borrower.id)}`);
+      await page.getByRole("tab", { name: "Desktop", exact: true }).click();
+      await expectConnectedViewOnly(page);
+      const capability = await page.evaluate(async (workspaceId) => {
+        const api = window.__ORPC_CLIENT__;
+        if (!api) throw new Error("E2E API client not initialized");
+        return api.desktop.getCapability({ workspaceId });
+      }, borrower.id);
+      assert(capability.available);
+      expect(capability.sharedDesktop?.ownerWorkspaceId).toBe(owner.id);
+      const readEvents = await observePopoutCleanup(context, page);
+      const opening = page.waitForEvent("popup");
+      await page.getByRole("button", { name: "Detach", exact: true }).click();
+      const popup = await opening;
+      await expectConnectedViewOnly(popup);
+
+      // Navigate within the surviving opener, preserving its synchronous wire recorder.
+      const ownerConnections = observeDesktopConnections(page);
+      await page.keyboard.press("F4");
+      await page.getByRole("combobox", { name: "Command palette" }).fill(owner.name);
+      await page.getByRole("option", { name: owner.title ?? owner.name, exact: true }).click();
+      await page.getByRole("tab", { name: "Desktop", exact: true }).click();
+      await expectConnectedViewOnly(page);
+      expect(ownerConnections).toHaveLength(1);
+      const ownerConnection = ownerConnections[0];
+      assert(ownerConnection);
+      await page.keyboard.press("F4");
+      await page.getByRole("combobox", { name: "Command palette" }).fill(">Remove Workspace");
+      await page.getByRole("option", { name: "Remove Workspace…", exact: true }).click();
+      await page.getByRole("combobox", { name: "Select workspace" }).fill(borrower.name);
+      await page
+        .getByRole("option", { name: `${owner.projectName}/${borrower.name}`, exact: true })
+        .click();
+      const confirmation = page.getByRole("dialog", {
+        name: `Remove workspace ${owner.projectName}/${borrower.name}?`,
+      });
+      await expect(confirmation).toBeVisible();
+      await holdDesktopInput(popup, readEvents);
+      await screenshot(popup, testInfo, "browser-borrower-held-input-before-removal");
+      // The parent initiates backend removal; no Bring back or direct popup-close request.
+      await confirmation.getByRole("button", { name: "Remove", exact: true }).click();
+      await expect
+        .poll(() =>
+          page.evaluate(async (workspaceId) => {
+            const api = window.__ORPC_CLIENT__;
+            if (!api) throw new Error("E2E API client not initialized");
+            return (await api.workspace.list()).some((entry) => entry.id === workspaceId);
+          }, borrower.id)
+        )
+        .toBe(false);
+      await expect
+        .poll(async () => (await readEvents()).some((event) => event.type === "socket-closed"))
+        .toBe(true);
+      const events = await readEvents();
+      expectReleasedBeforeDisconnect(events);
+      expect(ownerConnection.closed).toBe(false);
+      expect(ownerConnections).toHaveLength(1);
+      await expectConnectedViewOnly(page);
+      await page.getByRole("button", { name: "Take control", exact: true }).click();
+      await viewport(page).click();
+      await page.keyboard.press("a");
+      await expect
+        .poll(() => ownerConnection.keys.some((key) => key.keysym === 0x61 && key.down))
+        .toBe(true);
+      await page.getByRole("button", { name: "Release control", exact: true }).click();
+      await screenshot(page, testInfo, "browser-owner-alive-after-borrower-removal");
+      const wirePath = testInfo.outputPath("browser-borrower-removal-wire.json");
+      await writeFile(
+        wirePath,
+        JSON.stringify({ events, ownerConnected: !ownerConnection.closed }, null, 2)
+      );
+      await testInfo.attach("browser-borrower-removal-wire", {
+        path: wirePath,
+        contentType: "application/json",
+      });
+      if (!popup.isClosed()) await popup.close();
+    }
   );
 
   browserTest(

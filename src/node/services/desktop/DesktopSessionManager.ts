@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { asyncIterableFromSubscription } from "@/common/utils/asyncEventIterator";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
-import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
+import { DESKTOP_DEFAULTS, DESKTOP_VIEWER_RELEASE_TIMEOUT_MS } from "@/common/constants/desktop";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   DesktopActionResult,
@@ -9,6 +11,7 @@ import type {
   DesktopCapability,
   DesktopPrereqStatus,
   DesktopScreenshotResult,
+  DesktopViewerEvent,
 } from "@/common/types/desktop";
 import type { Config } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -21,7 +24,17 @@ import {
   PortableDesktopSession,
 } from "./PortableDesktopSession";
 
+interface DesktopViewerRegistration {
+  viewerId: string;
+  workspaceId: string;
+  ownerWorkspaceId: string;
+  push: (event: DesktopViewerEvent) => void;
+  release?: Promise<void>;
+  acknowledge?: () => void;
+}
+
 export class DesktopSessionManager {
+  private readonly viewers = new Map<string, DesktopViewerRegistration>();
   private readonly sessions = new Map<string, PortableDesktopSession>();
   private readonly startupPromises = new Map<string, Promise<PortableDesktopSession>>();
   private readonly inputCoordinator: DesktopInputCoordinator;
@@ -41,6 +54,56 @@ export class DesktopSessionManager {
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
   private disposed = false;
   private closeAllPromise: Promise<void> | undefined;
+
+  watchViewer(workspaceId: string, signal?: AbortSignal): AsyncGenerator<DesktopViewerEvent> {
+    return asyncIterableFromSubscription<DesktopViewerEvent>({
+      signal,
+      subscribe: (push) => {
+        // Admission and registration share one synchronous block: cleanup either sees this
+        // viewer in its snapshot or rejects its registration before sending ready.
+        const target = this.resolveActiveTarget(workspaceId);
+        const viewer: DesktopViewerRegistration = {
+          viewerId: randomUUID(),
+          workspaceId,
+          ownerWorkspaceId: target.ownerWorkspaceId,
+          push,
+        };
+        this.viewers.set(viewer.viewerId, viewer);
+        push({ type: "ready", viewerId: viewer.viewerId });
+        // Deregister even if the generator is paused at a yield when the transport aborts.
+        // Losing the subscription is not proof that held remote input was released:
+        // a pending teardown still waits for its deadline rather than resolving here.
+        const unsubscribe = () => {
+          this.viewers.delete(viewer.viewerId);
+        };
+        signal?.addEventListener("abort", unsubscribe, { once: true });
+        return () => {
+          signal?.removeEventListener("abort", unsubscribe);
+          unsubscribe();
+        };
+      },
+    });
+  }
+
+  acknowledgeViewerRelease(viewerId: string): void {
+    this.viewers.get(viewerId)?.acknowledge?.();
+  }
+
+  private releaseViewer(viewer: DesktopViewerRegistration): Promise<void> {
+    viewer.release ??= new Promise<void>((resolve) => {
+      const complete = () => {
+        clearTimeout(timeout);
+        this.viewers.delete(viewer.viewerId);
+        viewer.acknowledge = undefined;
+        resolve();
+      };
+      const timeout = setTimeout(complete, DESKTOP_VIEWER_RELEASE_TIMEOUT_MS);
+      timeout.unref?.();
+      viewer.acknowledge = complete;
+      viewer.push({ type: "release", viewerId: viewer.viewerId });
+    });
+    return viewer.release;
+  }
 
   setDesktopWindowManager(manager: NonNullable<DesktopSessionManager["windowManager"]>): void {
     this.windowManager = manager;
@@ -312,6 +375,9 @@ export class DesktopSessionManager {
     return (
       (this.sessions.get(workspaceId)?.isAlive() ?? false) ||
       this.startupPromises.has(workspaceId) ||
+      Array.from(this.viewers.values()).some(
+        (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+      ) ||
       this.getWindow(workspaceId) !== null ||
       Array.from(this.pendingWindowOpens).some(
         (request) => request.workspaceId === workspaceId || request.ownerWorkspaceId === workspaceId
@@ -376,6 +442,9 @@ export class DesktopSessionManager {
         this.pendingWindowOpens.delete(request);
       }
     }
+    const browserViewers = Array.from(this.viewers.values()).filter(
+      (viewer) => viewer.workspaceId === workspaceId || viewer.ownerWorkspaceId === workspaceId
+    );
     const viewers = new Set([workspaceId]);
     for (const [requesterId, ownerId] of this.windowOwners) {
       if (requesterId === workspaceId || ownerId === workspaceId) {
@@ -387,12 +456,13 @@ export class DesktopSessionManager {
     // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
     const closing = Promise.resolve().then(async () => {
       try {
-        await Promise.allSettled(
-          Array.from(
+        await Promise.allSettled([
+          ...Array.from(
             viewers,
             (requesterId) => this.windowManager?.closeWorkspace(requesterId) ?? Promise.resolve()
-          )
-        );
+          ),
+          ...browserViewers.map((viewer) => this.releaseViewer(viewer)),
+        ]);
         for (const listener of this.closeListeners) listener(workspaceId);
       } finally {
         await this.closeSession(workspaceId);
@@ -431,8 +501,14 @@ export class DesktopSessionManager {
     this.disposed = true;
     this.pendingWindowOpens.clear();
     this.windowOwners.clear();
+    const browserViewers = Array.from(this.viewers.values());
     this.closeAllPromise ??= Promise.resolve().then(async () => {
-      await this.windowManager?.closeAll();
+      await Promise.allSettled([
+        this.windowManager?.closeAll() ?? Promise.resolve(),
+        ...browserViewers.map((viewer) => this.releaseViewer(viewer)),
+        // A disconnected subscription may have left a release waiting on its deadline.
+        ...this.closingWorkspaces.values(),
+      ]);
       for (const listener of this.closeListeners) listener(null);
       const sessions = Array.from(this.sessions.values());
       const startupPromises = Array.from(this.startupPromises.values());
@@ -441,7 +517,6 @@ export class DesktopSessionManager {
       this.startupPromises.clear();
 
       await Promise.allSettled([
-        ...this.closingWorkspaces.values(),
         ...sessions.map(async (session) => session.close()),
         ...startupPromises.map(async (startupPromise) => {
           await startupPromise.then((session) => session.close()).catch(() => undefined);

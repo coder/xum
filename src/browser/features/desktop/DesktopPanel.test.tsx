@@ -4,9 +4,18 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow, EventTarget, Event, CustomEvent } from "happy-dom";
 import type { APIClient } from "@/browser/contexts/API";
 
+import { watchDesktopViewerFixture } from "./desktopRfb.test-fixture";
+
 const getBootstrap = mock<APIClient["desktop"]["getBootstrap"]>();
 const getWindow = mock<APIClient["desktop"]["getWindow"]>();
-const api = { desktop: { getBootstrap, getWindow } };
+const api = {
+  desktop: {
+    getBootstrap,
+    getWindow,
+    watchViewer: watchDesktopViewerFixture,
+    acknowledgeViewerRelease: () => Promise.resolve(),
+  },
+};
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({ api }),
 }));
@@ -27,7 +36,9 @@ class FakeRfb extends EventTarget {
     this.canvas = container.ownerDocument.createElement("canvas");
     container.appendChild(this.canvas);
     FakeRfb.instances.push(this);
-    queueMicrotask(() => {
+    // Other suites replace queueMicrotask with synchronous execution. Keep the simulated
+    // network event asynchronous so the viewer can register its connection listeners first.
+    void Promise.resolve().then(() => {
       if (!this.disconnected) this.dispatchEvent(new Event("connect"));
     });
   }
@@ -113,16 +124,27 @@ describe("DesktopPanel binding", () => {
     }
   );
 
-  test("browser detach opens its window before the click handler returns", async () => {
-    const open = mock(() => null);
-    window.open = open;
-    const view = render(<DesktopPanel workspaceId="browser-detach-gesture" />);
-    await connectedViewer();
-    act(() => {
-      view.getByRole("button", { name: "Detach" }).click();
-      expect(open).toHaveBeenCalledTimes(1);
-    });
-  });
+  test.each(["native", "synchronous"])(
+    "browser detach opens before the click returns with %s queueMicrotask",
+    async (scheduling) => {
+      const queueMicrotask = globalThis.queueMicrotask;
+      if (scheduling === "synchronous") globalThis.queueMicrotask = (callback) => callback();
+      try {
+        const open = mock(() => null);
+        window.open = open;
+        const view = render(<DesktopPanel workspaceId={`browser-detach-gesture-${scheduling}`} />);
+        await connectedViewer();
+        const detachButton = view.getByRole("button", { name: "Detach" });
+        await waitFor(() => expect(detachButton.hasAttribute("disabled")).toBe(false));
+        act(() => {
+          detachButton.click();
+          expect(open).toHaveBeenCalledTimes(1);
+        });
+      } finally {
+        globalThis.queueMicrotask = queueMicrotask;
+      }
+    }
+  );
 
   test("shows bootstrap binding while connecting with the caller's bridge and token", async () => {
     const view = render(<DesktopPanel workspaceId="caller" />);

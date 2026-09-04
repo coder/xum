@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as os from "os";
 import * as path from "path";
 import { describe, expect, spyOn, test } from "bun:test";
+import type { DesktopViewerEvent } from "@/common/types/desktop";
 import type { Workspace } from "@/common/types/project";
 import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
 import { PortableDesktopSession } from "./PortableDesktopSession";
@@ -405,7 +406,14 @@ async function withWindowHarness(
   }) => Promise<void>
 ) {
   await withDesktopManagerHarness(async ({ tempDir, config }) => {
-    await installPortableDesktopShim({ rootDir: tempDir, config: {} });
+    // Never let an installed host desktop mask an incomplete fixture or start a real desktop.
+    process.env.PATH = "";
+    await installPortableDesktopShim({
+      rootDir: tempDir,
+      config: {
+        startupInfo: createStartupInfo({ display: 24, vncPort: 5914, geometry: "1024x768" }),
+      },
+    });
     await config.editConfig((current) => {
       const project = current.projects.get("/tmp/project-1");
       if (!project) throw new Error("Missing test project");
@@ -435,6 +443,237 @@ async function withWindowHarness(
     }
   });
 }
+
+async function nextViewerEvent(
+  watcher: AsyncGenerator<DesktopViewerEvent>,
+  type: DesktopViewerEvent["type"]
+) {
+  const next = await watcher.next();
+  if (next.done) throw new Error("Viewer watch ended before its event");
+  expect(next.value.type).toBe(type);
+  return next.value;
+}
+
+async function withBrowserViewerHarness(
+  run: (harness: {
+    manager: DesktopSessionManager;
+    config: Config;
+    watch: (workspaceId: string) => AsyncGenerator<DesktopViewerEvent>;
+    abort: () => void;
+  }) => Promise<void>
+) {
+  await withDesktopManagerHarness(async ({ config, tempDir }) => {
+    process.env.PATH = "";
+    await registerSharedWorkspaces(config);
+    await installPortableDesktopShim({
+      rootDir: tempDir,
+      config: {
+        startupInfo: createStartupInfo({ display: 25, vncPort: 5915, geometry: "1024x768" }),
+      },
+    });
+    const manager = new DesktopSessionManager({
+      config,
+      experimentsService: createExperimentsService(true),
+      workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+    });
+    const controller = new AbortController();
+    const watchers: Array<AsyncGenerator<DesktopViewerEvent>> = [];
+    try {
+      await run({
+        manager,
+        config,
+        watch: (workspaceId) => {
+          const watcher = manager.watchViewer(workspaceId, controller.signal);
+          watchers.push(watcher);
+          return watcher;
+        },
+        abort: () => controller.abort(),
+      });
+    } finally {
+      controller.abort();
+      await Promise.all(watchers.map((watcher) => watcher.return(undefined)));
+      await manager.closeAll();
+    }
+  });
+}
+
+describe("DesktopSessionManager browser viewer releases", () => {
+  test("registers before ready and requires the matching ACK before borrower bridge revocation", async () => {
+    if (process.platform === "win32") return;
+    await withBrowserViewerHarness(async ({ manager, watch }) => {
+      const owner = await manager.ensureStarted("owner");
+      const borrower = watch("child");
+      const readyPromise = nextViewerEvent(borrower, "ready");
+      expect(manager.has("child")).toBe(true);
+      const ready = await readyPromise;
+      expect(ready.viewerId.length).toBeGreaterThan(0);
+      const revoked: Array<string | null> = [];
+      const unsubscribe = manager.onWorkspaceClose((id) => revoked.push(id));
+      // An early ACK cannot pre-authorize a future input release.
+      manager.acknowledgeViewerRelease(ready.viewerId);
+      const closing = manager.close("child");
+      expect(manager.close("child")).toBe(closing);
+      expect(await nextViewerEvent(borrower, "release")).toEqual({
+        type: "release",
+        viewerId: ready.viewerId,
+      });
+      manager.acknowledgeViewerRelease("unknown-viewer");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(revoked).toEqual([]);
+      expect(owner.isAlive()).toBe(true);
+      const rejected = watch("child");
+      expect(await rejected.next().catch((error: unknown) => error)).toBeInstanceOf(Error);
+      manager.acknowledgeViewerRelease(ready.viewerId);
+      await closing;
+      expect(revoked).toEqual(["child"]);
+      expect(owner.isAlive()).toBe(true);
+      expect(manager.has("child")).toBe(false);
+      unsubscribe();
+    });
+  });
+
+  test("owner cleanup releases each borrower viewer but leaves unrelated viewers registered", async () => {
+    await withBrowserViewerHarness(async ({ manager, watch }) => {
+      const owner = watch("owner");
+      const child = watch("child");
+      const sibling = watch("child");
+      const isolated = watch("isolated");
+      const registrations = await Promise.all(
+        [owner, child, sibling, isolated].map((watcher) => nextViewerEvent(watcher, "ready"))
+      );
+      expect(new Set(registrations.map((event) => event.viewerId)).size).toBe(4);
+      const revoked: Array<string | null> = [];
+      const unsubscribe = manager.onWorkspaceClose((id) => revoked.push(id));
+      const closing = manager.close("owner");
+      const releases = await Promise.all(
+        [owner, child, sibling].map((watcher) => nextViewerEvent(watcher, "release"))
+      );
+      for (const event of releases.slice(0, 2)) manager.acknowledgeViewerRelease(event.viewerId);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(revoked).toEqual([]);
+      expect(manager.has("isolated")).toBe(true);
+      manager.acknowledgeViewerRelease(releases[2].viewerId);
+      await closing;
+      expect(revoked).toEqual(["owner"]);
+      expect(manager.has("isolated")).toBe(true);
+      unsubscribe();
+    });
+  });
+
+  test("stale ACKs cannot satisfy a replacement viewer's release", async () => {
+    await withBrowserViewerHarness(async ({ manager, watch }) => {
+      const first = watch("child");
+      const previous = await nextViewerEvent(first, "ready");
+      await first.return(undefined);
+      const replacement = watch("child");
+      const current = await nextViewerEvent(replacement, "ready");
+      expect(current.viewerId).not.toBe(previous.viewerId);
+      let completed = false;
+      const closing = manager.close("child").then(() => {
+        completed = true;
+      });
+      await nextViewerEvent(replacement, "release");
+      manager.acknowledgeViewerRelease(previous.viewerId);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(completed).toBe(false);
+      manager.acknowledgeViewerRelease(current.viewerId);
+      await closing;
+      expect(completed).toBe(true);
+    });
+  });
+
+  test.each(["abort", "unsubscribe", "no-ack"])(
+    "%s does not impersonate a release ACK, and shutdown waits for the bounded fallback",
+    async (mode) => {
+      await withBrowserViewerHarness(async ({ manager, watch, abort }) => {
+        const watcher = watch("child");
+        const ready = await nextViewerEvent(watcher, "ready");
+        const revoked: Array<string | null> = [];
+        const unsubscribe = manager.onWorkspaceClose((id) => revoked.push(id));
+        const closing = manager.close("child");
+        await nextViewerEvent(watcher, "release");
+        if (mode === "abort") {
+          abort();
+          expect(manager.has("child")).toBe(false);
+          manager.acknowledgeViewerRelease(ready.viewerId);
+          expect((await watcher.next()).done).toBe(true);
+        }
+        if (mode === "unsubscribe") await watcher.return(undefined);
+        if (mode !== "no-ack") manager.acknowledgeViewerRelease(ready.viewerId);
+        const shutdown = manager.closeAll();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(revoked).toEqual([]);
+        await Promise.all([closing, shutdown]);
+        expect(revoked).toEqual(["child", null]);
+        manager.acknowledgeViewerRelease(ready.viewerId);
+        unsubscribe();
+      });
+    }
+  );
+
+  test("closeAll requests browser and native cleanup concurrently and latches new registrations", async () => {
+    await withBrowserViewerHarness(async ({ manager, watch }) => {
+      const native = createWindowManager();
+      const nativeStarted = deferred();
+      const nativeReleased = deferred();
+      native.closeAll = () => {
+        nativeStarted.resolve();
+        return nativeReleased.promise;
+      };
+      manager.setDesktopWindowManager(native);
+      const watcher = watch("child");
+      const ready = await nextViewerEvent(watcher, "ready");
+      const closing = manager.closeAll();
+      expect(manager.closeAll()).toBe(closing);
+      const late = watch("isolated");
+      expect(await late.next().catch((error: unknown) => error)).toBeInstanceOf(Error);
+      try {
+        await nativeStarted.promise;
+        expect(await nextViewerEvent(watcher, "release")).toEqual({
+          type: "release",
+          viewerId: ready.viewerId,
+        });
+        manager.acknowledgeViewerRelease(ready.viewerId);
+      } finally {
+        nativeReleased.resolve();
+        await closing;
+      }
+    });
+  });
+
+  test("an already-aborted subscription never registers or emits ready", async () => {
+    await withBrowserViewerHarness(async ({ manager, watch, abort }) => {
+      abort();
+      expect((await watch("child").next()).done).toBe(true);
+      expect(manager.has("child")).toBe(false);
+    });
+  });
+
+  test("registration races resolve admission before ready, including delayed iterator consumption", async () => {
+    await withBrowserViewerHarness(async ({ manager, watch }) => {
+      const deferredWatch = watch("child");
+      const closing = manager.close("child");
+      expect(await deferredWatch.next().catch((error: unknown) => error)).toBeInstanceOf(Error);
+      await closing;
+      const admitted = watch("child");
+      const ready = admitted.next();
+      const closingAgain = manager.close("child");
+      const first = await ready;
+      expect(first.done).toBe(false);
+      const release = await nextViewerEvent(admitted, "release");
+      manager.acknowledgeViewerRelease(release.viewerId);
+      await closingAgain;
+      for (const id of ["owner", "child"]) {
+        manager.setWorkspaceArchiveGuard((candidate) => candidate === id);
+        expect(
+          await watch("child")
+            .next()
+            .catch((error: unknown) => error)
+        ).toBeInstanceOf(Error);
+      }
+    });
+  });
+});
 
 describe("DesktopSessionManager windows", () => {
   test("server mode has no window and cannot create one", async () => {
@@ -918,6 +1157,7 @@ describe("DesktopSessionManager", () => {
   }
 
   test("established viewers retain a release channel during admission but not durable invalidation", async () => {
+    if (process.platform === "win32") return;
     await withWindowHarness(async ({ manager, config }) => {
       await registerSharedWorkspaces(config);
       await manager.ensureStarted("owner");

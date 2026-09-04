@@ -35,3 +35,5 @@ export const DESKTOP_POPOUT_CLOSE_POLL_MS = 100;
 
 /** Bound a viewer disconnect while still allowing queued input releases to flush. */
 export const DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS = 500;
+/** Allow browser viewers to release input and acknowledge over the authenticated transport. */
+export const DESKTOP_VIEWER_RELEASE_TIMEOUT_MS = 3_000;

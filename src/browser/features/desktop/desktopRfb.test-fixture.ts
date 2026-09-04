@@ -1,3 +1,20 @@
+import { wrapAsyncIterator } from "@orpc/shared";
+import type { APIClient } from "@/browser/contexts/API";
+
+export const watchDesktopViewerFixture: APIClient["desktop"]["watchViewer"] = (
+  _input,
+  { signal } = {}
+) => {
+  async function* events() {
+    yield { type: "ready" as const, viewerId: "desktop-fixture" };
+    await new Promise<void>((resolve) => {
+      if (signal?.aborted) resolve();
+      else signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+  return Promise.resolve(wrapAsyncIterator(events(), {}));
+};
+
 // Shared noVNC boundary for deterministic hook tests and full-app Storybook fixtures.
 // It deliberately models only the public RFB surface used by the viewer; real input
 // translation and desktop rendering still require the live-desktop dogfood gate.
