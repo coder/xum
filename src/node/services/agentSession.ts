@@ -533,6 +533,8 @@ export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
+/** Retry cadence for a voided wake continuation whose owner-side settlement failed. */
+const UNSETTLED_WAKE_VOID_RETRY_DELAY_MS = 5_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
 
@@ -943,14 +945,25 @@ export class AgentSession {
    *                                                   armed; otherwise false → maybeVoid
    *   level lowered (cancel / shown / clear)        → maybeVoid
    *   maybeVoid: debt ∧ ¬inFlight ∧ ¬level          → void "retracted"
-   *   non-wake input admitted (enterPreparing)      → void "superseded"
+   *   non-wake input accepted (its row durable)     → void "superseded"; a turn with the
+   *     (settleWakeDebtForAcceptedInput)               same correlation continues the debt
+   *                                                   itself (its stream-end settles it)
    *   compaction follow-up with the correlation     → void "abandoned" (before the erase)
    *     dropped (clearPendingFollowUpFromSummary)
    *   dispose / IDLE                                → in-flight false (IDLE keeps the debt:
    *                                                   the wake dispatcher needs an idle session)
+   *
+   * Voiding clears the debt synchronously; the owner hook may fail (handle store, waiter,
+   * cleanup I/O). A failed void is kept in `unsettledWakeVoids` and retried at every later
+   * debt transition and on a timer, so a deferred delegated handle never waits for a restart.
    */
   private wakeContinuationDebt?: { correlation?: WorkspaceTurnMuxMetadata };
   private wakeTurnInFlight = false;
+  private unsettledWakeVoids: Array<{
+    correlation: WorkspaceTurnMuxMetadata;
+    reason: WorkspaceTurnContinuationVoidReason;
+  }> = [];
+  private unsettledWakeVoidRetryTimer?: ReturnType<typeof setTimeout>;
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
@@ -1105,6 +1118,11 @@ export class AgentSession {
     // (workspace teardown settles delegated turns through its own path).
     this.wakeTurnInFlight = false;
     this.wakeContinuationDebt = undefined;
+    this.unsettledWakeVoids = [];
+    if (this.unsettledWakeVoidRetryTimer != null) {
+      clearTimeout(this.unsettledWakeVoidRetryTimer);
+      this.unsettledWakeVoidRetryTimer = undefined;
+    }
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -4026,6 +4044,7 @@ export class AgentSession {
     // accepted even if a later step throws: otherwise the reconciler re-derives the same wake
     // and delivers it twice (startup recovery resumes the durable row without redelivery).
     const finalizeDurableWakeOnFailure = typedMuxMetadata?.type === "bash-monitor-wake";
+    this.settleWakeDebtForAcceptedInput(typedMuxMetadata);
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
@@ -6847,6 +6866,7 @@ export class AgentSession {
   }
 
   private maybeVoidWakeContinuation(): void {
+    this.retryUnsettledWakeVoids();
     if (
       this.wakeContinuationDebt != null &&
       !this.wakeTurnInFlight &&
@@ -6857,21 +6877,68 @@ export class AgentSession {
   }
 
   /**
+   * Input other than the wake has crossed its acceptance boundary (row durable, so the send
+   * can no longer fail without leaving a resumable turn). Only now can it settle the debt: a
+   * send refused earlier — pricing, staleness, persistence — leaves the wake outstanding and
+   * its continuation still owed. Synchronous with the PREPARING reservation this is not:
+   * enterPreparing only reserves the turn.
+   */
+  private settleWakeDebtForAcceptedInput(muxMetadata: unknown): void {
+    if (this.wakeContinuationDebt == null || carriesBashMonitorWake(muxMetadata)) return;
+    if (
+      hasSameWorkspaceTurnCorrelation(
+        getWorkspaceTurnMuxMetadata(muxMetadata),
+        this.wakeContinuationDebt.correlation
+      )
+    ) {
+      this.wakeContinuationDebt = undefined;
+      this.retryUnsettledWakeVoids();
+    } else {
+      this.voidWakeContinuation("superseded");
+    }
+  }
+
+  /**
    * Sync transition; the owner hook runs as a tracked promise (never awaited here — callers
    * sit inside admission and phase transitions).
    */
   private voidWakeContinuation(reason: WorkspaceTurnContinuationVoidReason): void {
     const debt = this.wakeContinuationDebt;
     this.wakeContinuationDebt = undefined;
+    this.retryUnsettledWakeVoids();
     const correlation = debt?.correlation;
-    if (correlation == null || this.onWorkspaceTurnContinuationVoided == null) return;
-    this.onWorkspaceTurnContinuationVoided(correlation, reason).catch((error: unknown) => {
-      log.error("Voided bash-monitor wake continuation could not be settled", {
-        workspaceId: this.workspaceId,
-        reason,
-        error: getErrorMessage(error),
-      });
-    });
+    if (correlation == null) return;
+    this.settleVoidedWakeContinuation({ correlation, reason });
+  }
+
+  /** Runs the owner hook; a failure parks the void for retry instead of dropping it. */
+  private settleVoidedWakeContinuation(voided: {
+    correlation: WorkspaceTurnMuxMetadata;
+    reason: WorkspaceTurnContinuationVoidReason;
+  }): void {
+    if (this.onWorkspaceTurnContinuationVoided == null) return;
+    this.onWorkspaceTurnContinuationVoided(voided.correlation, voided.reason).catch(
+      (error: unknown) => {
+        log.error("Voided bash-monitor wake continuation could not be settled; will retry", {
+          workspaceId: this.workspaceId,
+          reason: voided.reason,
+          error: getErrorMessage(error),
+        });
+        if (this.disposed) return;
+        this.unsettledWakeVoids.push(voided);
+        this.unsettledWakeVoidRetryTimer ??= setTimeout(() => {
+          this.unsettledWakeVoidRetryTimer = undefined;
+          this.retryUnsettledWakeVoids();
+        }, UNSETTLED_WAKE_VOID_RETRY_DELAY_MS);
+      }
+    );
+  }
+
+  private retryUnsettledWakeVoids(): void {
+    if (this.unsettledWakeVoids.length === 0) return;
+    const pending = this.unsettledWakeVoids;
+    this.unsettledWakeVoids = [];
+    for (const voided of pending) this.settleVoidedWakeContinuation(voided);
   }
 
   /**
@@ -6938,25 +7005,12 @@ export class AgentSession {
   }
 
   /**
-   * Claim PREPARING for a send and record what kind of input it carries. Admitting anything
-   * but the wake while a continuation debt is outstanding settles that debt: a turn with the
-   * same correlation continues the delegated turn itself (its stream-end settles it), any
-   * other input supersedes it.
+   * Claim PREPARING for a send and record what kind of input it carries. A reservation only:
+   * an outstanding wake continuation debt is settled when the input is accepted
+   * (settleWakeDebtForAcceptedInput), not when it is admitted.
    */
   private enterPreparing(muxMetadata: unknown): void {
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(muxMetadata);
-    if (!carriesBashMonitorWake(muxMetadata) && this.wakeContinuationDebt != null) {
-      if (
-        hasSameWorkspaceTurnCorrelation(
-          this.preparingWorkspaceTurnMetadata,
-          this.wakeContinuationDebt.correlation
-        )
-      ) {
-        this.wakeContinuationDebt = undefined;
-      } else {
-        this.voidWakeContinuation("superseded");
-      }
-    }
     this.setTurnPhase(TurnPhase.PREPARING);
   }
 

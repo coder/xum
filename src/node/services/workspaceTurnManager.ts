@@ -4354,8 +4354,20 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
-    if (activeStream == null || activeStream.messageId === event.messageId) {
+    return this.hasCorrelatedActiveStream(event.workspaceId, correlation, [event.messageId]);
+  }
+
+  /**
+   * Whether a stream other than `excludeMessageIds` (the ending stream, or streams whose
+   * stream-end this record already deferred) is currently streaming this exact correlation.
+   */
+  private hasCorrelatedActiveStream(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    excludeMessageIds: readonly string[]
+  ): boolean {
+    const activeStream = this.streamManager?.getStreamInfo(workspaceId);
+    if (activeStream == null || excludeMessageIds.includes(activeStream.messageId)) {
       return false;
     }
     const activeCorrelation = this.getWorkspaceTurnMetadataFromValue(activeStream.muxMetadata);
@@ -4688,12 +4700,20 @@ export class WorkspaceTurnManager {
    * the turn itself. `abandoned` drops a compaction follow-up carrying the correlation: the
    * record may still be running behind the compaction stream (whose stream-end is
    * uncorrelated and settles nothing), so any active record settles.
+   *
+   * A void says nothing about OTHER continuations of the same turn: a correlated report
+   * queued after the wake cut (or already streaming) also deferred the stream-end and will
+   * settle the record with its own stream-end. Settling here would interrupt a turn that is
+   * about to continue — and a disposable turn would delete its workspace under that stream.
    */
   async settleVoidedWorkspaceTurnContinuation(
     workspaceId: string,
     muxMetadata: WorkspaceTurnMuxMetadata,
     reason: WorkspaceTurnContinuationVoidReason
   ): Promise<void> {
+    if (this.workspaceService.hasPendingWorkspaceTurnContinuation(workspaceId, muxMetadata)) {
+      return;
+    }
     await this.settleWorkspaceTurnContinuationFailure(
       workspaceId,
       muxMetadata,
@@ -4701,7 +4721,7 @@ export class WorkspaceTurnManager {
       reason === "retracted"
         ? WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR
         : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR,
-      { deferredOnly: reason !== "abandoned" }
+      { deferredOnly: reason !== "abandoned", unlessCorrelatedStreamActive: true }
     );
   }
 
@@ -4712,7 +4732,7 @@ export class WorkspaceTurnManager {
     muxMetadata: WorkspaceTurnMuxMetadata,
     status: "interrupted" | "error",
     error: string,
-    options?: { deferredOnly: boolean }
+    options?: { deferredOnly: boolean; unlessCorrelatedStreamActive: boolean }
   ): Promise<void> {
     const record = await this.taskHandleStore.getWorkspaceTurn(
       muxMetadata.ownerWorkspaceId,
@@ -4722,7 +4742,10 @@ export class WorkspaceTurnManager {
       record?.workspaceId !== workspaceId ||
       record?.turnId !== muxMetadata.turnId ||
       !isActiveWorkspaceTurnTaskStatus(record?.status) ||
-      (options?.deferredOnly === true && (record.deferredMessageIds?.length ?? 0) === 0)
+      (options?.deferredOnly === true && (record.deferredMessageIds?.length ?? 0) === 0) ||
+      (options?.unlessCorrelatedStreamActive === true &&
+        // A correlated stream whose stream-end the record has not deferred settles the turn.
+        this.hasCorrelatedActiveStream(workspaceId, muxMetadata, record.deferredMessageIds ?? []))
     ) {
       return;
     }

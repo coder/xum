@@ -24815,6 +24815,70 @@ describe("TaskService", () => {
     });
   });
 
+  test("a void leaves a record whose turn has another correlated continuation queued", async () => {
+    // A correlated report queued after the wake cut also deferred the stream-end and will
+    // settle the record with its own stream-end. A retracted wake says nothing about that
+    // continuation, so the void must not interrupt the turn under it.
+    const hasBashMonitorWakeContinuation = mock(() => true);
+    let queuedContinuation = false;
+    const hasPendingWorkspaceTurnContinuation = mock(
+      (workspaceId: string, metadata: { taskHandleId: string; turnId: string }) =>
+        queuedContinuation &&
+        workspaceId === "childworkspace" &&
+        metadata.taskHandleId === "wst_handle" &&
+        metadata.turnId === "turn"
+    );
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      hasBashMonitorWakeContinuation,
+      hasPendingWorkspaceTurnContinuation,
+    });
+    const correlation = workspaceTurnMuxMetadata(parentId);
+    workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
+      stage: "bash-monitor-wake" as const,
+    }));
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_deferred_cut",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: correlation,
+      },
+      parts: [{ type: "text", text: "Waiting on the build" }],
+    });
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+      deferredMessageIds: ["msg_deferred_cut"],
+    });
+
+    queuedContinuation = true;
+    await taskService.settleVoidedWorkspaceTurnContinuation(
+      "childworkspace",
+      correlation,
+      "retracted"
+    );
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+      deferredMessageIds: ["msg_deferred_cut"],
+    });
+
+    // With no other continuation left, the same void settles the deferred record.
+    queuedContinuation = false;
+    await taskService.settleVoidedWorkspaceTurnContinuation(
+      "childworkspace",
+      correlation,
+      "superseded"
+    );
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "interrupted",
+    });
+  });
+
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";
 
   function ownerFollowUpCutter(ownerWorkspaceId: string, successorHandleId: string) {

@@ -731,8 +731,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
       expect(voided).toEqual([]);
 
-      // Input that is not the wake supersedes the continuation: the owner is told once, at
-      // admission, and the cutter is now the admitted input.
+      // Input that is not the wake supersedes the continuation: the owner is told once, when
+      // that input's row is durable, and the cutter is now the admitted input.
       const sendPromise = session.sendMessage("hello", { model: TEST_MODEL, agentId: "exec" });
       await streamRequested;
       expect(session.isBusy()).toBe(true);
@@ -972,6 +972,97 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       session.setBashMonitorWakeOutstanding(false);
       expect(voided).toEqual([[DELEGATED_TURN, "retracted"]]);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("other input supersedes the debt only once its own row is durable", async () => {
+    // A superseding send that is refused before anything is persisted changes nothing: the
+    // wake is still outstanding and will still continue the delegated turn. Admission
+    // (PREPARING) is a reservation, not acceptance.
+    const workspaceId = "queue-dispatch-supersede-at-acceptance";
+    const voided: Array<[MuxMessageMetadata, string]> = [];
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+      onWorkspaceTurnContinuationVoided: (correlation, reason) => {
+        voided.push([correlation, reason]);
+        return Promise.resolve();
+      },
+    });
+    try {
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+
+      const refused = await session.sendMessage(
+        "peer message",
+        { model: TEST_MODEL, agentId: "exec" },
+        { admissionStale: () => true }
+      );
+      expect(refused.success).toBe(false);
+      expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
+      expect(session.hasBashMonitorWakeContinuation()).toBe(true);
+      expect(voided).toEqual([]);
+
+      // The same input accepted (row durable) supersedes it exactly once.
+      const accepted = await session.sendMessage("peer message", {
+        model: TEST_MODEL,
+        agentId: "exec",
+      });
+      expect(accepted.success).toBe(true);
+      expect(voided).toEqual([[DELEGATED_TURN, "superseded"]]);
+      expect(session.hasBashMonitorWakeContinuation()).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a void whose owner-side settlement fails is retried at the next debt transition", async () => {
+    // The debt is cleared when it is voided; the settlement itself is I/O on the owner's side
+    // and may fail transiently. The void is kept and retried rather than logged away, so a
+    // delegated handle already deferred on the debt does not wait for a restart.
+    const workspaceId = "queue-dispatch-void-retry";
+    const calls: Array<[MuxMessageMetadata, string]> = [];
+    let failNext = true;
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+      onWorkspaceTurnContinuationVoided: (correlation, reason) => {
+        calls.push([correlation, reason]);
+        if (failNext) {
+          failNext = false;
+          return Promise.reject(new Error("handle store unavailable"));
+        }
+        return Promise.resolve();
+      },
+    });
+    try {
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+
+      session.setBashMonitorWakeOutstanding(false);
+      expect(calls).toEqual([[DELEGATED_TURN, "retracted"]]);
+      // Let the rejection settle; the debt itself stays cleared (the cut is not re-attributed).
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(session.hasBashMonitorWakeContinuation()).toBe(false);
+
+      // Any later level transition retries the parked void with the original reason.
+      session.setBashMonitorWakeOutstanding(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(calls).toEqual([
+        [DELEGATED_TURN, "retracted"],
+        [DELEGATED_TURN, "retracted"],
+      ]);
+      await Promise.resolve();
+      session.setBashMonitorWakeOutstanding(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(calls).toHaveLength(2);
     } finally {
       session.dispose();
       await cleanup();
