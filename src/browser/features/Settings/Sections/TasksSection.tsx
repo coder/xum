@@ -1056,8 +1056,9 @@ export function TasksSection() {
             {agent.id} • {agent.scope} • {renderPolicySummary(agent)}
           </div>
           <div className="text-muted mt-1 text-xs">
-            Unset fields use the calling chat’s Exec settings. Model capabilities are enforced at
-            launch. Enabled and advisor settings stay shared with UI Exec.
+            Unset fields use the calling chat’s Exec settings at task creation, falling back to UI
+            Exec defaults when no chat selection exists. Model capabilities are enforced at launch.
+            Enabled and advisor settings stay shared with UI Exec.
           </div>
         </div>
 
