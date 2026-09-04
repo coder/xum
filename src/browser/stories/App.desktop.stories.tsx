@@ -153,7 +153,7 @@ export const SharedBindingPhone: AppStory = {
   },
   // The test-runner ignores viewport globals; the wrapper exercises the same narrow container.
   render: () => (
-    <div style={{ width: 390, height: 844, overflow: "hidden" }}>
+    <div data-testid="desktop-phone-frame" style={{ width: 390, height: 844, overflow: "hidden" }}>
       <AppWithMocks setup={() => setupDesktopStory(true)} />
     </div>
   ),
@@ -169,8 +169,7 @@ export const SharedBindingPhone: AppStory = {
       if (!sidebar) throw new Error("Missing workspace insights sidebar");
       await expect(getComputedStyle(sidebar).display).toBe("none");
     });
-    const frame = canvasElement.firstElementChild;
-    if (!(frame instanceof HTMLElement)) throw new Error("Missing phone frame");
+    const frame = within(canvasElement).getByTestId("desktop-phone-frame");
     await expect(frame.getBoundingClientRect().width).toBe(390);
     await expect(frame.scrollWidth).toBeLessThanOrEqual(390);
     await waitForChatInputAutofocusDone(canvasElement);
