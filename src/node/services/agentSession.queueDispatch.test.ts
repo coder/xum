@@ -816,6 +816,50 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("the stream-start ledger remembers a correlated continuation after it ended", async () => {
+    // A stream-end handler can run after the turn's next stream already started and ended;
+    // it asks the ledger whether the turn continued after the stream it handles.
+    const workspaceId = "queue-dispatch-stream-ledger";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({ workspaceId });
+    try {
+      const startedAs = (messageId: string, correlation: typeof DELEGATED_TURN | undefined) => {
+        setActiveStreamCorrelation(session, correlation);
+        aiEmitter.emit("stream-start", { ...streamStartEvent(workspaceId), messageId });
+      };
+      startedAs("assistant-delegated-1", DELEGATED_TURN);
+      expect(
+        session.hasCorrelatedStreamStartedAfter(DELEGATED_TURN, ["assistant-delegated-1"])
+      ).toBe(false);
+
+      startedAs("assistant-manual", undefined);
+      expect(
+        session.hasCorrelatedStreamStartedAfter(DELEGATED_TURN, ["assistant-delegated-1"])
+      ).toBe(false);
+
+      startedAs("assistant-delegated-2", DELEGATED_TURN);
+      expect(
+        session.hasCorrelatedStreamStartedAfter(DELEGATED_TURN, ["assistant-delegated-1"])
+      ).toBe(true);
+      // Relative to the continuation itself nothing followed.
+      expect(
+        session.hasCorrelatedStreamStartedAfter(DELEGATED_TURN, ["assistant-delegated-2"])
+      ).toBe(false);
+      // A different turn's correlation never matches.
+      expect(
+        session.hasCorrelatedStreamStartedAfter({ ...DELEGATED_TURN, turnId: "turn-2" }, [
+          "assistant-delegated-1",
+        ])
+      ).toBe(false);
+      // A stream the ledger no longer holds predates everything remembered.
+      expect(session.hasCorrelatedStreamStartedAfter(DELEGATED_TURN, ["assistant-evicted"])).toBe(
+        true
+      );
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("the level lowering with no wake turn in flight voids the debt as retracted", async () => {
     const workspaceId = "queue-dispatch-wake-retracted";
     const voided: Array<[MuxMessageMetadata, string]> = [];

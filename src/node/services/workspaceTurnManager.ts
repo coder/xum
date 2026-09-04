@@ -2118,6 +2118,14 @@ export class WorkspaceTurnManager {
      * it would leak the disposable checkout with no owner left to clean it up.
      */
     disposableOwnershipTransferred?: boolean;
+    /**
+     * Re-evaluated under the settlement lock, after the handle reread and before anything is
+     * written: when it returns true the settlement is abandoned. Callers whose reason to
+     * settle can be invalidated by concurrent admission (a continuation of the turn queued or
+     * started while this call awaited the lock / store) revalidate here, at the commit point,
+     * rather than trusting a snapshot taken before those awaits.
+     */
+    abandonIf?: () => boolean;
   }): Promise<void> {
     assert(
       params.next.handleId === params.record.handleId,
@@ -2196,6 +2204,10 @@ export class WorkspaceTurnManager {
           );
           this.taskHost.markTaskForegroundRelevant(current.handleId);
           return { pendingNotify: null, winningStatus: current.status };
+        }
+
+        if (params.abandonIf?.() === true) {
+          return null;
         }
 
         // Decide the terminal wake-up using persisted policy + the restart-safe dedupe marker.
@@ -4354,13 +4366,31 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    return this.hasCorrelatedActiveStream(event.workspaceId, correlation, [event.messageId]);
+    return this.hasCorrelatedStreamAfter(event.workspaceId, correlation, [event.messageId]);
   }
 
   /**
    * Whether a stream other than `excludeMessageIds` (the ending stream, or streams whose
    * stream-end this record already deferred) is currently streaming this exact correlation.
    */
+  /**
+   * The turn continued after the given stream(s): a correlated stream started later — still
+   * running, or already ended with its own stream-end queued behind this handler on the
+   * workspace event lock. Settling here would pre-empt that stream-end (and, for a disposable
+   * turn, delete the workspace under its work). The session's start ledger is authoritative;
+   * the live stream check covers a session that is not in memory.
+   */
+  private hasCorrelatedStreamAfter(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean {
+    return (
+      this.workspaceService.hasCorrelatedStreamStartedAfter(workspaceId, correlation, messageIds) ||
+      this.hasCorrelatedActiveStream(workspaceId, correlation, messageIds)
+    );
+  }
+
   private hasCorrelatedActiveStream(
     workspaceId: string,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
@@ -4705,8 +4735,9 @@ export class WorkspaceTurnManager {
    * queued after the wake cut (or already streaming) also deferred the stream-end and will
    * settle the record with its own stream-end. Settling here would interrupt a turn that is
    * about to continue — and a disposable turn would delete its workspace under that stream.
-   * That check runs after the record read (`unlessTurnContinues`): a continuation queued
-   * while the handle store was being read must be seen too.
+   * That check runs after the record read and again at the settlement's commit point
+   * (`unlessTurnContinues`): a continuation queued while the handle store or the settlement
+   * lock was being awaited must be seen too.
    */
   async settleVoidedWorkspaceTurnContinuation(
     workspaceId: string,
@@ -4752,19 +4783,18 @@ export class WorkspaceTurnManager {
       });
       return;
     }
-    // Both continuation reads are synchronous and sit after the last await before the
-    // settlement write, so nothing queued or started during the record read is missed.
+    // The turn continues when a correlated continuation is pending, or a correlated stream
+    // whose stream-end the record has not deferred started (it settles the turn itself).
+    // Checked here and again at the commit point inside settleWorkspaceTurn (abandonIf): a
+    // correlated send is invisible during its preflight and can become queued while the
+    // settlement awaits the lock and the store.
+    const turnContinues = () =>
+      this.workspaceService.hasPendingWorkspaceTurnContinuation(workspaceId, muxMetadata) ||
+      this.hasCorrelatedStreamAfter(workspaceId, muxMetadata, record.deferredMessageIds ?? []);
     if (
       !isActiveWorkspaceTurnTaskStatus(record.status) ||
       (options?.deferredOnly === true && (record.deferredMessageIds?.length ?? 0) === 0) ||
-      (options?.unlessTurnContinues === true &&
-        (this.workspaceService.hasPendingWorkspaceTurnContinuation(workspaceId, muxMetadata) ||
-          // A correlated stream whose stream-end the record has not deferred settles the turn.
-          this.hasCorrelatedActiveStream(
-            workspaceId,
-            muxMetadata,
-            record.deferredMessageIds ?? []
-          )))
+      (options?.unlessTurnContinues === true && turnContinues())
     ) {
       return;
     }
@@ -4780,6 +4810,7 @@ export class WorkspaceTurnManager {
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
+      ...(options?.unlessTurnContinues === true ? { abandonIf: turnContinues } : {}),
     });
   }
 

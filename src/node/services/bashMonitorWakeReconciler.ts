@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-import type { MuxMessageMetadata } from "@/common/types/message";
+import type { BashMonitorWakeDisplayRecord, MuxMessageMetadata } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { BASH_MONITOR_WAKE_HEADINGS } from "@/common/utils/machineTurnPrompts";
@@ -362,6 +362,19 @@ function buildPrompt(signals: readonly DerivedSignal[]): string {
   return `${header}\n\n${sections.join("\n\n---\n\n")}\n\n${closingParts.join(" ")}`;
 }
 
+/**
+ * Version of the signal as it appears in the durable wake row (`records[].wakeUpdatedAt`).
+ * Together with processId it identifies a delivered signal after a restart (see
+ * readDeliveredWakeRecords).
+ */
+function wakeUpdatedAtOf(signal: DerivedSignal): string {
+  return (
+    signal.lost?.failedAt ??
+    signal.terminal?.settledAt ??
+    (signal.matchOffset != null ? signal.createdAt + ":" + signal.matchOffset : signal.createdAt)
+  );
+}
+
 function buildMetadata(
   signals: readonly DerivedSignal[]
 ): Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }> {
@@ -369,12 +382,7 @@ function buildMetadata(
     type: "bash-monitor-wake",
     records: signals.map((signal) => ({
       processId: signal.processId,
-      wakeUpdatedAt:
-        signal.lost?.failedAt ??
-        signal.terminal?.settledAt ??
-        (signal.matchOffset != null
-          ? signal.createdAt + ":" + signal.matchOffset
-          : signal.createdAt),
+      wakeUpdatedAt: wakeUpdatedAtOf(signal),
       kind: signal.kind === "monitor-lost" ? "monitor-lost" : "match",
       displayName: signal.displayName ?? signal.processId,
       filter: signal.filter,
@@ -398,6 +406,8 @@ export class BashMonitorWakeReconciler {
   private readonly locks = new MutexMap<string>();
   private readonly states = new Map<string, ReconcileState>();
   private readonly legacyCleanupAttempted = new Set<string>();
+  /** Owners whose durable wake row has been reconciled against derived signals (once per process). */
+  private readonly deliveryRecovered = new Set<string>();
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
   private readonly retryAttempts = new Map<string, number>();
   private readonly defunctWorkspaces = new Set<string>();
@@ -416,6 +426,16 @@ export class BashMonitorWakeReconciler {
        * long-poll return, backgrounding foreground waits) from the level itself.
        */
       onOutstandingChanged?(ownerWorkspaceId: string, outstanding: boolean): void;
+      /**
+       * Records of the owner's most recent durable wake row, if any. The wake row is the
+       * durable acknowledgment: a commit whose watermark write failed and was then lost to a
+       * restart (the in-memory committed lease dies with the process) would otherwise
+       * re-derive and re-dispatch the very signals that row already delivers. Consulted once
+       * per owner, the first time signals derive outstanding in this process.
+       */
+      readDeliveredWakeRecords?(
+        ownerWorkspaceId: string
+      ): Promise<readonly BashMonitorWakeDisplayRecord[] | undefined>;
     }
   ) {}
 
@@ -773,6 +793,26 @@ export class BashMonitorWakeReconciler {
       if (derived.deferredRead != null) deferredReads.push(derived.deferredRead);
       else if (derived.outstanding) signals.push(derived.signal);
       else if (derived.consume) autoConsumed.push(derived.signal);
+    }
+    if (signals.length > 0 && !this.deliveryRecovered.has(ownerWorkspaceId)) {
+      // Signals the durable wake row already delivers are consumed, not re-dispatched. The
+      // watermark advance is written here (not left to the caller): level reads do not
+      // persist autoConsumed, and a recovery that only held in memory would be lost again.
+      const delivered = await this.args.readDeliveredWakeRecords?.(ownerWorkspaceId);
+      const deliveredKeys = new Set(
+        (delivered ?? []).map((record) => record.processId + "\u0000" + record.wakeUpdatedAt)
+      );
+      const recovered = signals.filter((signal) =>
+        deliveredKeys.has(signal.processId + "\u0000" + wakeUpdatedAtOf(signal))
+      );
+      if (recovered.length > 0) {
+        await this.advanceWatermarks(ownerWorkspaceId, watermarks, recovered);
+        for (const signal of recovered) {
+          signals.splice(signals.indexOf(signal), 1);
+          autoConsumed.push(signal);
+        }
+      }
+      this.deliveryRecovered.add(ownerWorkspaceId);
     }
     signals.sort(
       (a, b) => a.createdAt.localeCompare(b.createdAt) || a.processId.localeCompare(b.processId)

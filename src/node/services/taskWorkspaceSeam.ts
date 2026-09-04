@@ -404,6 +404,16 @@ export interface TurnAdmissionHost {
    * AgentSession.hasBashMonitorWakeContinuation). Sync, no I/O.
    */
   hasBashMonitorWakeContinuation(workspaceId: string): boolean;
+  /**
+   * A stream carrying `correlation` started after every stream in `messageIds` — whether it
+   * is still running or already ended (see AgentSession.hasCorrelatedStreamStartedAfter).
+   * Sync, no I/O.
+   */
+  hasCorrelatedStreamStartedAfter(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean;
   /** Pending input (queued tool-end message or outstanding wake) wants a tool boundary. */
   isToolEndYieldRequested(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(

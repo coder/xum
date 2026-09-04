@@ -15,6 +15,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     hasPendingQueuedOrPreparingTurn: () => false,
     hasPendingAutoRetry: () => false,
     hasBashMonitorWakeContinuation: () => false,
+    hasCorrelatedStreamStartedAfter: () => false,
     isToolEndYieldRequested: () => false,
     hasPendingWorkspaceTurnContinuation: () => false,
     hasQueuedWorkspaceTurn: () => false,

@@ -186,6 +186,7 @@ import {
   getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
+  type BashMonitorWakeDisplayRecord,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
@@ -374,6 +375,12 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
+/**
+ * How far back readLastBashMonitorWakeRecords looks for the last durable wake row. A commit
+ * lost to a restart leaves that row at the tail; anything older had a running process (and
+ * its in-memory acknowledgment retries) behind it.
+ */
+const LAST_BASH_MONITOR_WAKE_ROW_SCAN_DEPTH = 50;
 
 /**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
@@ -2390,6 +2397,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
       registry: this.bashMonitorRegistryStore,
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
+      readDeliveredWakeRecords: (ownerWorkspaceId) =>
+        this.readLastBashMonitorWakeRecords(ownerWorkspaceId),
       onOutstandingChanged: (ownerWorkspaceId, outstanding) => {
         // The level drives the same tool-boundary side effects a queued tool-end message
         // does: long-polling bash reads return early and foreground agent-task waits are
@@ -12013,6 +12022,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
+  /** See AgentSession.hasCorrelatedStreamStartedAfter. */
+  hasCorrelatedStreamStartedAfter(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean {
+    return (
+      this.sessions
+        .get(workspaceId.trim())
+        ?.hasCorrelatedStreamStartedAfter(correlation, messageIds) === true
+    );
+  }
+
   /** See AgentSession.hasBashMonitorWakeContinuation. */
   hasBashMonitorWakeContinuation(workspaceId: string): boolean {
     return this.sessions.get(workspaceId.trim())?.hasBashMonitorWakeContinuation() === true;
@@ -12029,6 +12051,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /**
    * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
    */
+  /**
+   * Records of the most recent durable bash-monitor wake row (BashMonitorWakeReconciler
+   * readDeliveredWakeRecords). Only the history tail is scanned: the row this recovers was
+   * committed right before a restart, so it is at or near the end.
+   */
+  private async readLastBashMonitorWakeRecords(
+    ownerWorkspaceId: string
+  ): Promise<readonly BashMonitorWakeDisplayRecord[] | undefined> {
+    const tail = await this.historyService.getLastMessages(
+      ownerWorkspaceId,
+      LAST_BASH_MONITOR_WAKE_ROW_SCAN_DEPTH
+    );
+    if (!tail.success) return undefined;
+    for (const message of tail.data.toReversed()) {
+      const muxMetadata = message.metadata?.muxMetadata;
+      if (muxMetadata?.type === "bash-monitor-wake") return muxMetadata.records;
+    }
+    return undefined;
+  }
+
   hasPendingWorkspaceTurnContinuation(
     workspaceId: string,
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>

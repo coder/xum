@@ -319,6 +319,69 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].prompt).toContain("READY again");
   });
 
+  test("after a restart, the durable wake row acknowledges a commit whose watermark never landed", async () => {
+    // The owner's row landed, then the process died before the watermark write. The in-memory
+    // committed lease is gone; without the row as durable evidence the fresh reconciler would
+    // derive the same signal again and dispatch a duplicate next to the row's own recovery.
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    const deliveredRecords = dispatches[0].muxMetadata.records;
+
+    const restart = (
+      readDeliveredWakeRecords: (() => Promise<typeof deliveredRecords>) | undefined
+    ) => {
+      const restarted: BashMonitorWakeDispatch[] = [];
+      const instance = new BashMonitorWakeReconciler({
+        // A fresh sessions dir: no watermark was ever written.
+        sessionsDir: path.join(root, readDeliveredWakeRecords == null ? "control" : "recovered"),
+        processManager: {
+          pullMonitorWakeSignals: () => live,
+          getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
+          acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
+            acknowledged.push({
+              processId,
+              ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+            });
+          },
+          dropRetiredMonitor: () => undefined,
+        },
+        registry: {
+          listAll: () => Promise.resolve(rows),
+          remove: () => undefined,
+          recordTerminal: () => undefined,
+        },
+        onWake: (dispatch) => {
+          restarted.push(dispatch);
+          return "in-flight";
+        },
+        ...(readDeliveredWakeRecords != null ? { readDeliveredWakeRecords } : {}),
+      });
+      return { instance, restarted };
+    };
+
+    // Control: the same restart without the row re-dispatches the delivered signal.
+    const control = restart(undefined);
+    await control.instance.reconcile(OWNER);
+    expect(control.restarted).toHaveLength(1);
+
+    const recovered = restart(() => Promise.resolve(deliveredRecords));
+    acknowledged = [];
+    await recovered.instance.reconcile(OWNER);
+    expect(recovered.restarted).toHaveLength(0);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    expect(await recovered.instance.hasOutstandingWake(OWNER)).toBe(false);
+
+    // The watermark is durable now: a later read does not consult the row again, and a
+    // newer match still wakes.
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await recovered.instance.reconcile(OWNER);
+    expect(recovered.restarted).toHaveLength(1);
+    expect(recovered.restarted[0].prompt).toContain("READY again");
+  });
+
   test("disposal lowers the published level and retires the in-flight wake", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);

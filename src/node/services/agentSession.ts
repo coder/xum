@@ -458,6 +458,23 @@ function carriesBashMonitorWake(muxMetadata: unknown): boolean {
   return followUpMetadata?.type === "bash-monitor-wake";
 }
 
+/**
+ * The delegated-turn correlation a send / retry will stream under: its own metadata, or —
+ * for an on-send compaction request — the correlation stamped on the follow-up it carries
+ * (the follow-up stream inherits it from the summary).
+ */
+function getCarriedWorkspaceTurnCorrelation(
+  muxMetadata: unknown
+): WorkspaceTurnMuxMetadata | undefined {
+  const meta = muxMetadata as MuxMessageMetadata | undefined;
+  if (!isCompactionRequestMetadata(meta)) return getWorkspaceTurnMuxMetadata(meta);
+  const followUp = meta.parsed.followUpContent;
+  return (
+    followUp?.workspaceTurnMetadata ??
+    getWorkspaceTurnMuxMetadata(followUp?.muxMetadata ?? meta.parsed.continueMessage?.muxMetadata)
+  );
+}
+
 const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
 
 /**
@@ -535,6 +552,8 @@ const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 /** Retry cadence for a voided wake continuation whose owner-side settlement failed. */
 const UNSETTLED_WAKE_VOID_RETRY_DELAY_MS = 5_000;
+/** Stream starts remembered for hasCorrelatedStreamStartedAfter; older ones are evicted. */
+const RECENT_STREAM_STARTS_LIMIT = 16;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
 
@@ -964,6 +983,17 @@ export class AgentSession {
    */
   private wakeContinuationDebt?: { correlation?: WorkspaceTurnMuxMetadata; assumed?: true };
   private wakeTurnInFlight = false;
+  /**
+   * Recent stream starts, oldest first, with the delegated-turn correlation each streamed
+   * under. A stream-end handler runs behind the workspace event lock and may be late: a
+   * same-turn continuation can have started — and finished — after the stream it handles,
+   * leaving nothing pending, in flight, or owed to probe. The ledger answers "did the turn
+   * continue after this stream?" regardless (hasCorrelatedStreamStartedAfter).
+   */
+  private recentStreamStarts: Array<{
+    messageId: string;
+    correlation?: WorkspaceTurnMuxMetadata;
+  }> = [];
   private unsettledWakeVoids: Array<{
     correlation: WorkspaceTurnMuxMetadata;
     reason: WorkspaceTurnContinuationVoidReason;
@@ -5949,6 +5979,13 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
+        this.recentStreamStarts.push({
+          messageId: payload.messageId,
+          correlation: this.activeStreamContext?.workspaceTurnMetadata,
+        });
+        if (this.recentStreamStarts.length > RECENT_STREAM_STARTS_LIMIT) {
+          this.recentStreamStarts.shift();
+        }
         // A stream that shows the wake redeems the continuation debt (see
         // wakeContinuationDebt). Only the wake row's own stream qualifies: an on-send
         // compaction stream's request is the compaction row, and the wake follows it.
@@ -6887,7 +6924,8 @@ export class AgentSession {
       assumed &&
       this.wakeContinuationDebt != null &&
       !hasSameWorkspaceTurnCorrelation(
-        getWorkspaceTurnMuxMetadata(retryMetadata),
+        // A retry of an on-send compaction still starts the correlated follow-up behind it.
+        getCarriedWorkspaceTurnCorrelation(retryMetadata),
         this.wakeContinuationDebt.correlation
       )
     ) {
@@ -7061,6 +7099,33 @@ export class AgentSession {
   /**
    * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
    */
+  /**
+   * Whether a stream carrying `correlation` started after every stream in `messageIds`
+   * (running or already ended). A message id the ledger no longer holds was evicted by
+   * later starts (or predates this session instance), so every remembered start is after it.
+   */
+  hasCorrelatedStreamStartedAfter(
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean {
+    let after = -1;
+    for (const messageId of messageIds) {
+      after = Math.max(
+        after,
+        this.recentStreamStarts.findIndex((entry) => entry.messageId === messageId)
+      );
+    }
+    return this.recentStreamStarts
+      .slice(after + 1)
+      .some(
+        (entry) =>
+          entry.correlation != null &&
+          entry.correlation.taskHandleId === correlation.taskHandleId &&
+          entry.correlation.ownerWorkspaceId === correlation.ownerWorkspaceId &&
+          entry.correlation.turnId === correlation.turnId
+      );
+  }
+
   hasPendingWorkspaceTurnContinuation(
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
   ): boolean {

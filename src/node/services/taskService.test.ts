@@ -348,6 +348,7 @@ describe("TaskService", () => {
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
       hasBashMonitorWakeContinuation?: ReturnType<typeof mock>;
+      hasCorrelatedStreamStartedAfter?: ReturnType<typeof mock>;
       hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
@@ -24459,6 +24460,54 @@ describe("TaskService", () => {
     expect(settled).toMatchObject({ messageId: "msg_manual_cut" });
   });
 
+  test("a same-turn continuation that already ended still defers the predecessor's stream-end", async () => {
+    // The continuation's stream started and finished before this (older) stream-end handler
+    // reached the workspace event lock: nothing is pending, in flight, or owed any more, and
+    // the debt it discharged is gone. Its own stream-end is queued right behind this one and
+    // settles the turn; settling here would pre-empt it (and delete a disposable workspace
+    // under the continuation's work). The session's stream-start ledger is the evidence.
+    const hasCorrelatedStreamStartedAfter = mock(
+      (
+        workspaceId: string,
+        correlation: { taskHandleId: string; turnId: string },
+        messageIds: readonly string[]
+      ) =>
+        workspaceId === "childworkspace" &&
+        correlation.taskHandleId === "wst_handle" &&
+        correlation.turnId === "turn" &&
+        messageIds.includes("msg_fast_continuation_cut")
+    );
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      hasBashMonitorWakeContinuation: mock(() => false),
+      hasCorrelatedStreamStartedAfter,
+    });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
+      stage: "bash-monitor-wake" as const,
+    }));
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_fast_continuation_cut",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: workspaceTurnMuxMetadata(parentId),
+      },
+      parts: [{ type: "text", text: "Waiting on the build" }],
+    });
+
+    expect(hasCorrelatedStreamStartedAfter).toHaveBeenCalled();
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+      deferredMessageIds: ["msg_fast_continuation_cut"],
+    });
+  });
+
   test("a wake retracted after the cut settles the handle as a wake cut instead of deferring", async () => {
     // The stream yielded to the wake level, then the operator canceled the monitor before
     // this stream-end was processed: the session voided its continuation debt (the void's
@@ -24911,13 +24960,16 @@ describe("TaskService", () => {
       deferredMessageIds: ["msg_deferred_cut"],
     });
 
-    // The continuation is queued while the void is reading the handle store: the check must
-    // run after that read, not once up front.
+    // The continuation becomes visible only while the void is already inside the settlement
+    // (its handle reread under the settlement lock): the check must run at that commit
+    // point, not on a snapshot taken before the awaits.
     const store = (taskService as unknown as { taskHandleStore: TaskHandleStore }).taskHandleStore;
     const getWorkspaceTurn = store.getWorkspaceTurn.bind(store);
-    const readSpy = spyOn(store, "getWorkspaceTurn").mockImplementationOnce(async (...args) => {
+    let reads = 0;
+    const readSpy = spyOn(store, "getWorkspaceTurn").mockImplementation(async (...args) => {
       const record = await getWorkspaceTurn(...args);
-      queuedContinuation = true;
+      // First read: the void's own; second: settleWorkspaceTurn's reread under its lock.
+      if (++reads === 2) queuedContinuation = true;
       return record;
     });
     try {
@@ -24929,6 +24981,7 @@ describe("TaskService", () => {
     } finally {
       readSpy.mockRestore();
     }
+    expect(reads).toBeGreaterThanOrEqual(2);
     expect(queuedContinuation).toBe(true);
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
       status: "running",
