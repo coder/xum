@@ -40,6 +40,7 @@ export class DesktopSessionManager {
   private readonly windowOwners = new Map<string, string>();
   private readonly closingWorkspaces = new Map<string, Promise<void>>();
   private disposed = false;
+  private closeAllPromise: Promise<void> | undefined;
 
   setDesktopWindowManager(manager: NonNullable<DesktopSessionManager["windowManager"]>): void {
     this.windowManager = manager;
@@ -80,13 +81,13 @@ export class DesktopSessionManager {
     return window;
   }
 
-  closeWindow(workspaceId: string, instanceId: string): void {
+  closeWindow(workspaceId: string, instanceId: string): Promise<void> {
     for (const request of this.pendingWindowOpens) {
       if (request.workspaceId === workspaceId && request.instanceId === instanceId) {
         this.pendingWindowOpens.delete(request);
       }
     }
-    this.windowManager?.closeWindow(workspaceId, instanceId);
+    return this.windowManager?.closeWindow(workspaceId, instanceId) ?? Promise.resolve();
   }
 
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
@@ -375,17 +376,29 @@ export class DesktopSessionManager {
         this.pendingWindowOpens.delete(request);
       }
     }
+    const viewers = new Set([workspaceId]);
     for (const [requesterId, ownerId] of this.windowOwners) {
       if (requesterId === workspaceId || ownerId === workspaceId) {
-        this.windowManager?.closeWorkspace(requesterId);
+        viewers.add(requesterId);
         this.windowOwners.delete(requesterId);
       }
     }
-    this.windowManager?.closeWorkspace(workspaceId);
-    const closing = this.closeSession(workspaceId);
+    // Latch before entering the async teardown, but leave established bridges alive long enough
+    // for borrower viewers to release held keys/buttons on their owner's still-live desktop.
+    const closing = Promise.resolve().then(async () => {
+      try {
+        await Promise.allSettled(
+          Array.from(
+            viewers,
+            (requesterId) => this.windowManager?.closeWorkspace(requesterId) ?? Promise.resolve()
+          )
+        );
+        for (const listener of this.closeListeners) listener(workspaceId);
+      } finally {
+        await this.closeSession(workspaceId);
+      }
+    });
     this.closingWorkspaces.set(workspaceId, closing);
-    // A shared borrower has no owned session, but cleanup must still revoke its bridge viewers.
-    for (const listener of this.closeListeners) listener(workspaceId);
     return closing;
   }
 
@@ -414,25 +427,28 @@ export class DesktopSessionManager {
     }
   }
 
-  async closeAll(): Promise<void> {
+  closeAll(): Promise<void> {
     this.disposed = true;
     this.pendingWindowOpens.clear();
     this.windowOwners.clear();
-    this.windowManager?.closeAll();
-    for (const listener of this.closeListeners) listener(null);
-    const sessions = Array.from(this.sessions.values());
-    const startupPromises = Array.from(this.startupPromises.values());
+    this.closeAllPromise ??= Promise.resolve().then(async () => {
+      await this.windowManager?.closeAll();
+      for (const listener of this.closeListeners) listener(null);
+      const sessions = Array.from(this.sessions.values());
+      const startupPromises = Array.from(this.startupPromises.values());
 
-    this.sessions.clear();
-    this.startupPromises.clear();
+      this.sessions.clear();
+      this.startupPromises.clear();
 
-    await Promise.allSettled([
-      ...this.closingWorkspaces.values(),
-      ...sessions.map(async (session) => session.close()),
-      ...startupPromises.map(async (startupPromise) => {
-        await startupPromise.then((session) => session.close()).catch(() => undefined);
-      }),
-    ]);
+      await Promise.allSettled([
+        ...this.closingWorkspaces.values(),
+        ...sessions.map(async (session) => session.close()),
+        ...startupPromises.map(async (startupPromise) => {
+          await startupPromise.then((session) => session.close()).catch(() => undefined);
+        }),
+      ]);
+    });
+    return this.closeAllPromise;
   }
 
   /**
@@ -440,14 +456,22 @@ export class DesktopSessionManager {
    * Returns null if no live session exists for the workspace.
    * Used by DesktopBridgeServer to resolve token→VNC-port mappings.
    */
-  getLiveSessionConnection(workspaceId: string): {
+  getLiveSessionConnection(
+    workspaceId: string,
+    mode: "admission" | "established" = "admission"
+  ): {
     ownerWorkspaceId: string;
     sessionId: string;
     vncPort: number;
   } | null {
     let ownerWorkspaceId: string;
     try {
-      ownerWorkspaceId = this.resolveTarget(workspaceId).ownerWorkspaceId;
+      // An established viewer needs its release channel during local lifecycle admission.
+      // Durable archive/removal/owner changes still revoke it through config-based resolution.
+      ownerWorkspaceId =
+        mode === "established"
+          ? this.inputCoordinator.resolveTarget(workspaceId).ownerWorkspaceId
+          : this.resolveActiveTarget(workspaceId).ownerWorkspaceId;
     } catch (error) {
       log.debug("Desktop bridge target unavailable", { workspaceId, error });
       return null;

@@ -89,13 +89,13 @@ export function DesktopViewer(props: {
   workspaceId: string;
   onDetach?: () => void;
   onBringBack?: () => void;
-  attach?: (disconnect: () => void) => () => void;
+  attach?: (disconnect: () => void, disconnectAndWait: () => Promise<void>) => () => void;
   onStartupError?: () => void;
 }) {
   const desktop = useDesktopConnection(props.workspaceId);
 
   useEffect(() => {
-    const detach = props.attach?.(desktop.disconnect);
+    const detach = props.attach?.(desktop.disconnect, desktop.disconnectAndWait);
     desktop.connect();
     return detach;
     // disconnect handled by hook's own cleanup
@@ -155,6 +155,20 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
     window.addEventListener("focus", reconcile);
     return () => window.removeEventListener("focus", reconcile);
   }, [api, popout]);
+  // A new user action supersedes the previous failure, regardless of whether it came
+  // from a button or its keyboard shortcut. Keep open() in the synchronous gesture.
+  const detach = () => {
+    setActionError(null);
+    if (api) popout.open(api.desktop).catch(reportError);
+  };
+  const bringBack = () => {
+    setActionError(null);
+    popout.bringBack();
+  };
+  const recover = () => {
+    setActionError(null);
+    if (api) popout.recover(api.desktop).catch(reportError);
+  };
   const inline = snapshot.state === "inline" || snapshot.state === "opening";
   return (
     <div className="bg-background flex h-full min-h-0 min-w-0 flex-col">
@@ -167,9 +181,7 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
         <DesktopViewer
           workspaceId={props.workspaceId}
           attach={(disconnect) => popout.attach(disconnect)}
-          onDetach={() => {
-            if (api) popout.open(api.desktop).catch(reportError);
-          }}
+          onDetach={detach}
         />
       ) : (
         <div
@@ -183,8 +195,8 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
             ) {
               event.preventDefault();
               stopKeyboardPropagation(event);
-              if (event.key.toLowerCase() === "b") popout.bringBack();
-              else if (api) popout.recover(api.desktop).catch(reportError);
+              if (event.key.toLowerCase() === "b") bringBack();
+              else recover();
             }
           }}
         >
@@ -194,22 +206,10 @@ function WorkspaceDesktopPanel(props: { workspaceId: string }) {
               ? "Checking desktop window…"
               : "Desktop is open in a separate window"}
           </p>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => popout.bringBack()}
-            aria-keyshortcuts="B"
-          >
+          <Button size="sm" variant="outline" onClick={bringBack} aria-keyshortcuts="B">
             Bring back
           </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            aria-keyshortcuts="R"
-            onClick={() => {
-              if (api) popout.recover(api.desktop).catch(reportError);
-            }}
-          >
+          <Button size="sm" variant="ghost" aria-keyshortcuts="R" onClick={recover}>
             Reconnect here
           </Button>
         </div>

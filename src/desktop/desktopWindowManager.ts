@@ -3,11 +3,18 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import {
+  DESKTOP_POPOUT_CLOSE_EVENT,
+  DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS,
+} from "@/common/constants/desktop";
 
 interface DesktopWindowEntry {
   window: BrowserWindow;
   instanceId: string;
   loaded: Promise<void>;
+  trustedUrl: string;
+  closing?: Promise<void>;
+  allowClose: boolean;
 }
 
 /** One desktop viewer per workspace; closing the viewer never stops the desktop session. */
@@ -26,6 +33,7 @@ export class DesktopWindowManager {
 
     const existing = this.windows.get(workspaceId);
     if (existing && !existing.window.isDestroyed()) {
+      if (existing.closing) throw new Error("Desktop window is closing");
       if (existing.window.isMinimized()) existing.window.restore();
       existing.window.focus();
       await existing.loaded;
@@ -53,7 +61,13 @@ export class DesktopWindowManager {
         spellcheck: false,
       },
     });
-    const entry: DesktopWindowEntry = { window, instanceId, loaded: Promise.resolve() };
+    const entry: DesktopWindowEntry = {
+      window,
+      instanceId,
+      loaded: Promise.resolve(),
+      trustedUrl: url.href,
+      allowClose: false,
+    };
     // Reserve before loadURL yields so duplicate opens share this exact instance.
     this.windows.set(workspaceId, entry);
 
@@ -75,7 +89,7 @@ export class DesktopWindowManager {
       window.webContents.on("will-redirect", guardNavigation);
       window.webContents.on("will-attach-webview", (event) => event.preventDefault());
       const closeFailedWindow = (): void => {
-        if (this.windows.get(workspaceId) === entry) this.closeWorkspace(workspaceId);
+        if (this.windows.get(workspaceId) === entry) window.destroy();
       };
       // Manager truth must release a crashed/failed viewer so the embedded viewer can recover.
       window.webContents.on("render-process-gone", closeFailedWindow);
@@ -86,6 +100,13 @@ export class DesktopWindowManager {
           if (isMainFrame && errorCode !== -3) closeFailedWindow();
         }
       );
+      window.on("close", (event) => {
+        if (entry.allowClose) return;
+        // Native/titlebar close and the renderer's early window.close both wait for input
+        // cleanup. Only this manager may retry the close after observing completion.
+        event.preventDefault();
+        this.closeWorkspace(workspaceId).catch(closeFailedWindow);
+      });
       window.on("closed", () => {
         if (this.windows.get(workspaceId) === entry) this.windows.delete(workspaceId);
       });
@@ -94,14 +115,16 @@ export class DesktopWindowManager {
       this.assertCurrent(workspaceId, entry);
       return { instanceId };
     } catch (error) {
-      if (this.windows.get(workspaceId) === entry) this.windows.delete(workspaceId);
-      if (!window.isDestroyed()) window.destroy();
+      if (!entry.closing) {
+        if (this.windows.get(workspaceId) === entry) this.windows.delete(workspaceId);
+        if (!window.isDestroyed()) window.destroy();
+      }
       throw error;
     }
   }
 
   private assertCurrent(workspaceId: string, entry: DesktopWindowEntry): void {
-    if (this.windows.get(workspaceId) !== entry || entry.window.isDestroyed()) {
+    if (this.windows.get(workspaceId) !== entry || entry.window.isDestroyed() || entry.closing) {
       throw new Error(`Desktop window for ${workspaceId} was closed while opening`);
     }
   }
@@ -111,19 +134,76 @@ export class DesktopWindowManager {
     return entry && !entry.window.isDestroyed() ? { instanceId: entry.instanceId } : null;
   }
 
-  closeWindow(workspaceId: string, instanceId: string): void {
-    if (this.windows.get(workspaceId)?.instanceId === instanceId) this.closeWorkspace(workspaceId);
+  closeWindow(workspaceId: string, instanceId: string): Promise<void> {
+    return this.windows.get(workspaceId)?.instanceId === instanceId
+      ? this.closeWorkspace(workspaceId)
+      : Promise.resolve();
   }
 
-  closeWorkspace(workspaceId: string): void {
+  closeWorkspace(workspaceId: string): Promise<void> {
     const entry = this.windows.get(workspaceId);
-    this.windows.delete(workspaceId);
-    // Teardown must not be vetoed by a renderer's beforeunload handler.
-    if (entry && !entry.window.isDestroyed()) entry.window.destroy();
+    if (!entry || entry.window.isDestroyed()) return Promise.resolve();
+    // Reserve before dispatch so a racing open cannot reuse a viewer returning its input.
+    entry.closing ??= Promise.resolve().then(() => this.closeEntry(entry));
+    return entry.closing;
   }
 
-  closeAll(): void {
+  private async closeEntry(entry: DesktopWindowEntry): Promise<void> {
+    const window = entry.window;
+    if (window.isDestroyed()) return;
+    let onClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      onClosed = resolve;
+      window.once("closed", onClosed);
+    });
+    // Leave room for the renderer's bounded VNC disconnect before forcing a stuck viewer.
+    const timeout = setTimeout(() => {
+      if (!window.isDestroyed()) window.destroy();
+      onClosed();
+    }, DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS * 2);
+    timeout.unref?.();
+    try {
+      // SECURITY AUDIT: only the exact trusted viewer may receive this fixed cleanup program.
+      // All interpolated data is JSON-encoded; recheck inside the renderer to close navigation races.
+      const script = `(async () => {
+        if (location.href.split("#")[0] !== ${JSON.stringify(entry.trustedUrl)}) return false;
+        const request = { instanceId: ${JSON.stringify(entry.instanceId)}, handled: false };
+        window.dispatchEvent(new CustomEvent(${JSON.stringify(DESKTOP_POPOUT_CLOSE_EVENT)}, { detail: request }));
+        if (!request.handled || !request.completion) return false;
+        await request.completion;
+        return true;
+      })()`;
+      if (window.webContents.getURL().split("#")[0] !== entry.trustedUrl) {
+        window.destroy();
+        return;
+      }
+      await Promise.race([
+        closed,
+        window.webContents.executeJavaScript(script).then((completed: unknown) => {
+          if (!window.isDestroyed()) {
+            if (completed === true) {
+              entry.allowClose = true;
+              window.close();
+            } else {
+              window.destroy();
+            }
+          }
+          return closed;
+        }),
+      ]);
+    } catch {
+      // A dead renderer or a viewer without its cleanup handler cannot release input itself.
+      if (!window.isDestroyed()) window.destroy();
+    } finally {
+      clearTimeout(timeout);
+      window.off("closed", onClosed);
+    }
+  }
+
+  async closeAll(): Promise<void> {
     this.disposed = true;
-    for (const workspaceId of this.windows.keys()) this.closeWorkspace(workspaceId);
+    await Promise.all(
+      Array.from(this.windows.keys(), (workspaceId) => this.closeWorkspace(workspaceId))
+    );
   }
 }

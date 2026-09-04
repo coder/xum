@@ -5,8 +5,10 @@ import { GlobalWindow, EventTarget, Event, CustomEvent } from "happy-dom";
 import type { APIClient } from "@/browser/contexts/API";
 
 const getBootstrap = mock<APIClient["desktop"]["getBootstrap"]>();
+const getWindow = mock<APIClient["desktop"]["getWindow"]>();
+const api = { desktop: { getBootstrap, getWindow } };
 void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: { desktop: { getBootstrap } } }),
+  useAPI: () => ({ api }),
 }));
 
 class FakeRfb extends EventTarget {
@@ -67,12 +69,59 @@ describe("DesktopPanel binding", () => {
     FakeRfb.instances = [];
     getBootstrap.mockReset();
     getBootstrap.mockResolvedValue(sharedBootstrap);
+    getWindow.mockReset();
+    getWindow.mockResolvedValue(null);
   });
 
   afterEach(() => {
     cleanup();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
+  });
+
+  test.each(["button", "keyboard"])(
+    "successful Electron recovery via %s clears the previous action error",
+    async (interaction) => {
+      Object.defineProperty(window, "api", { configurable: true, value: {} });
+      getWindow.mockRejectedValueOnce(new Error("Initial manager failure"));
+      const view = render(<DesktopPanel workspaceId={`electron-recovery-${interaction}`} />);
+      await waitFor(() =>
+        expect(view.getByRole("alert").textContent).toContain("Initial manager failure")
+      );
+
+      const recover = () => {
+        const button = view.getByRole("button", { name: "Reconnect here" });
+        if (interaction === "button") button.click();
+        else button.dispatchEvent(new window.KeyboardEvent("keydown", { key: "r", bubbles: true }));
+      };
+      getWindow.mockRejectedValueOnce(new Error("Recovery manager failure"));
+      await act(async () => {
+        recover();
+        await Promise.resolve();
+      });
+      expect(getWindow).toHaveBeenCalledTimes(2);
+      expect(view.queryByRole("toolbar", { name: "Desktop controls" })).toBeNull();
+
+      await act(async () => {
+        recover();
+        await Promise.resolve();
+      });
+      await connectedViewer();
+      expect(getWindow).toHaveBeenCalledTimes(3);
+      expect(view.getByRole("toolbar", { name: "Desktop controls" })).toBeTruthy();
+      expect(view.queryByRole("alert")).toBeNull();
+    }
+  );
+
+  test("browser detach opens its window before the click handler returns", async () => {
+    const open = mock(() => null);
+    window.open = open;
+    const view = render(<DesktopPanel workspaceId="browser-detach-gesture" />);
+    await connectedViewer();
+    act(() => {
+      view.getByRole("button", { name: "Detach" }).click();
+      expect(open).toHaveBeenCalledTimes(1);
+    });
   });
 
   test("shows bootstrap binding while connecting with the caller's bridge and token", async () => {

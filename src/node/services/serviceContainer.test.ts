@@ -587,8 +587,7 @@ describe("ServiceContainer", () => {
         services.appFiberScope
       )
     );
-    // desktopBridgeServer.stop() is the first explicit teardown step after the
-    // shutdown latch.
+    // Bridge teardown must still follow supervised-fiber finalization and viewer cleanup.
     const bridgeStopSpy = spyOn(services.desktopBridgeServer, "stop").mockImplementation(() => {
       steps.push("bridge-stop");
       return Promise.resolve(undefined);
@@ -905,10 +904,10 @@ describe("ServiceContainer", () => {
     spyOn(services.telemetryService, "shutdown").mockImplementation(record("telemetry.shutdown"));
 
     await services.dispose();
-    // §5: bridge before sessions; browser bridge before analytics; timeline flush last.
+    // Release desktop input before stopping its bridge; browser bridge precedes analytics.
     expect(order).toEqual([
-      "bridge.stop",
       "sessions.closeAll",
+      "bridge.stop",
       "browserBridge.stop",
       "analytics.dispose",
       "timeline.flush",
@@ -917,8 +916,8 @@ describe("ServiceContainer", () => {
     order.length = 0;
     await services.shutdown();
     expect(order).toEqual([
-      "bridge.stop",
       "sessions.closeAll",
+      "bridge.stop",
       "browserBridge.stop",
       "timeline.flush",
       "analytics.dispose",

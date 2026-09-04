@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import type RFB from "@novnc/novnc/lib/rfb";
 import { useAPI } from "@/browser/contexts/API";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
+import { DESKTOP_DEFAULTS, DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS } from "@/common/constants/desktop";
 import type { DesktopCapability } from "@/common/types/desktop";
 import { getErrorMessage } from "@/common/utils/errors";
 import { trackDesktopInput } from "./desktopInput";
@@ -23,6 +23,7 @@ export interface UseDesktopConnectionResult {
   containerRef: RefObject<HTMLDivElement>;
   connect: () => void;
   disconnect: () => void;
+  disconnectAndWait: () => Promise<void>;
   controlling: boolean;
   setControlling: (value: boolean) => void;
   scaleToFit: boolean;
@@ -145,6 +146,25 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const connectHandleRef = useRef<() => void>(() => connectImplRef.current());
   const disconnectHandleRef = useRef<() => void>(() => disconnectImplRef.current());
   const scheduleReconnectRef = useRef<() => void>(() => undefined);
+
+  const disconnectAndWait = (): Promise<void> => {
+    const rfb = rfbRef.current;
+    if (!rfb) {
+      disconnectHandleRef.current();
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const onDisconnect = () => {
+        clearTimeout(timeout);
+        rfb.removeEventListener("disconnect", onDisconnect);
+        resolve();
+      };
+      const timeout = setTimeout(onDisconnect, DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS);
+      rfb.addEventListener("disconnect", onDisconnect);
+      // Release synchronously, but let the WebSocket drain before the popout disappears.
+      disconnectHandleRef.current();
+    });
+  };
 
   const clearReconnectTimer = () => {
     if (reconnectTimerRef.current) {
@@ -372,6 +392,7 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
     containerRef,
     connect: connectHandleRef.current,
     disconnect: disconnectHandleRef.current,
+    disconnectAndWait,
     controlling,
     setControlling,
     scaleToFit,

@@ -18,20 +18,29 @@ import "./styles/globals.css";
 function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
   const [granted, setGranted] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const disconnectRef = useRef<(() => void) | null>(null);
+  const disconnectRef = useRef<(() => Promise<void>) | null>(null);
+  const disconnectNowRef = useRef<(() => void) | null>(null);
+  const finishingRef = useRef<Promise<void> | null>(null);
   const channelRef = useRef<BroadcastChannel | null>(null);
   const finishedRef = useRef(false);
-  const finish = (failed = false) => {
-    if (finishedRef.current) return;
+  const finish = (failed = false): Promise<void> => {
+    if (finishingRef.current) return finishingRef.current;
     finishedRef.current = true;
-    // Return ownership only after releasing held input and closing our VNC socket.
-    disconnectRef.current?.();
-    setGranted(false);
-    channelRef.current?.postMessage({
-      type: failed ? "failed" : "closed",
-      instanceId: props.instanceId,
-    });
-    window.close();
+    const closing = (async () => {
+      // Wait for the transport close before acknowledging cleanup or destroying this renderer.
+      await disconnectRef.current?.();
+      setGranted(false);
+      channelRef.current?.postMessage({
+        type: failed ? "failed" : "closed",
+        instanceId: props.instanceId,
+      });
+      window.close();
+    })();
+    finishingRef.current = closing;
+    return closing;
+  };
+  const requestFinish = (failed = false) => {
+    finish(failed).catch((error: unknown) => setError(getErrorMessage(error)));
   };
 
   useEffect(() => {
@@ -60,23 +69,24 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
         setError(null);
         setGranted(true);
         channel.postMessage({ type: "opened", instanceId: props.instanceId });
-      } else if (event.data.type === "bring-back") finish();
+      } else if (event.data.type === "bring-back") requestFinish();
     };
     const onDirectClose = (event: Event) => {
       const request = (event as CustomEvent<DesktopPopoutCloseRequest | undefined>).detail;
       if (!request || request.instanceId !== props.instanceId) return;
       request.handled = true;
-      finish();
+      request.completion = finish();
+      request.completion.catch((error: unknown) => setError(getErrorMessage(error)));
     };
     window.addEventListener(DESKTOP_POPOUT_CLOSE_EVENT, onDirectClose);
-    const onClose = () => finish();
+    const onClose = () => requestFinish();
     window.addEventListener("pagehide", onClose);
     channel.postMessage({ type: "ready", instanceId: props.instanceId });
     return () => {
       clearTimeout(deadline);
       window.removeEventListener("pagehide", onClose);
       window.removeEventListener(DESKTOP_POPOUT_CLOSE_EVENT, onDirectClose);
-      disconnectRef.current?.();
+      disconnectNowRef.current?.();
       channel.close();
       channelRef.current = null;
     };
@@ -87,14 +97,16 @@ function DesktopWindow(props: { workspaceId: string; instanceId: string }) {
   return granted ? (
     <DesktopViewer
       workspaceId={props.workspaceId}
-      attach={(disconnect) => {
-        disconnectRef.current = disconnect;
+      attach={(disconnect, disconnectAndWait) => {
+        disconnectNowRef.current = disconnect;
+        disconnectRef.current = disconnectAndWait;
         return () => {
           disconnectRef.current = null;
+          disconnectNowRef.current = null;
         };
       }}
-      onBringBack={() => finish()}
-      onStartupError={() => finish(true)}
+      onBringBack={() => requestFinish()}
+      onStartupError={() => requestFinish(true)}
     />
   ) : (
     <p role="status" className="text-muted-foreground p-6 text-sm">

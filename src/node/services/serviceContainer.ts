@@ -610,10 +610,10 @@ export class ServiceContainer {
    * Shutdown services that need cleanup
    */
   async shutdown(): Promise<void> {
-    // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
+    // Viewers must release held input before their VNC bridge is revoked.
+    await this.desktopSessionManager.closeAll();
     await this.desktopBridgeServer.stop();
     this.desktopTokenManager.dispose();
-    await this.desktopSessionManager.closeAll();
     this.heartbeatService.stop();
     this.agentStatusService.stop();
     this.idleCompactionService.stop();
@@ -692,12 +692,12 @@ export class ServiceContainer {
     // stream-abort over the bridges; bounded and idempotent, and never rejects
     // (di/appRuntime.ts).
     await closeScopeBounded(this.appFiberScope);
-    // Stop the bridge before closing sessions so desktop clients get a clean disconnect.
-    await shutdownStep("desktopBridgeServer.stop", () => this.desktopBridgeServer.stop());
-    shutdownStep("desktopTokenManager.dispose", () => this.desktopTokenManager.dispose());
+    // Viewers must release held input before their VNC bridge is revoked.
     await shutdownStep("desktopSessionManager.closeAll", () =>
       this.desktopSessionManager.closeAll()
     );
+    await shutdownStep("desktopBridgeServer.stop", () => this.desktopBridgeServer.stop());
+    shutdownStep("desktopTokenManager.dispose", () => this.desktopTokenManager.dispose());
     // Stop the periodic AgentStatusService loop here too (not just in
     // shutdown()): dispose() is the path used by the desktop before-quit
     // and ACP in-process close handlers, and the ref'd setInterval would

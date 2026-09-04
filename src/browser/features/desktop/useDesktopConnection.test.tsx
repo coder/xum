@@ -197,6 +197,39 @@ describe("useDesktopConnection control ownership", () => {
     expect(rfb.input.filter(({ type }) => type === "keyup" || type === "mouseup")).toHaveLength(3);
   });
 
+  test("graceful disconnect releases inputs immediately but waits for the transport close", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    act(() => view.desktop.setControlling(true));
+    holdKeysAndDrag(rfb);
+    let completed = false;
+    let disconnected!: Promise<void>;
+    act(() => {
+      disconnected = view.desktop.disconnectAndWait().then(() => {
+        completed = true;
+      });
+    });
+    expect(rfb.disconnectCount).toBe(1);
+    expect(rfb.viewOnly).toBe(true);
+    expect(rfb.input.filter((event) => event.type === "keyup")).toHaveLength(2);
+    expect(rfb.input.filter((event) => event.type === "mouseup")).toHaveLength(1);
+    await Promise.resolve();
+    expect(completed).toBe(false);
+    rfb.events.dispatchEvent(new Event("disconnect"));
+    await disconnected;
+    expect(completed).toBe(true);
+  });
+
+  test("graceful disconnect is bounded when the transport never announces close", async () => {
+    const view = mountConnection();
+    const rfb = await connect(view);
+    await act(async () => {
+      await view.desktop.disconnectAndWait();
+    });
+    expect(rfb.disconnectCount).toBe(1);
+    expect(view.desktop.state).toBe("idle");
+  });
+
   test("a replacement connection retains zoom but never inherits control", async () => {
     const view = mountConnection();
     const previous = await connect(view);

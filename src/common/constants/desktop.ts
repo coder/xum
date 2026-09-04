@@ -32,3 +32,6 @@ export const DESKTOP_POPOUT_READY_TIMEOUT_MS = 15_000;
 export const DESKTOP_POPOUT_CLOSE_EVENT = "xum-desktop-popout-close";
 /** Browser windows have no closed event; only sample their authoritative closed flag. */
 export const DESKTOP_POPOUT_CLOSE_POLL_MS = 100;
+
+/** Bound a viewer disconnect while still allowing queued input releases to flush. */
+export const DESKTOP_VIEWER_DISCONNECT_TIMEOUT_MS = 500;

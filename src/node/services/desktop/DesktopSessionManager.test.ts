@@ -382,11 +382,16 @@ function createWindowManager() {
     getWindow: (workspaceId: string) => windows.get(workspaceId) ?? null,
     closeWindow(workspaceId: string, instanceId: string) {
       if (windows.get(workspaceId)?.instanceId === instanceId) windows.delete(workspaceId);
+      return Promise.resolve();
     },
     closeWorkspace: (workspaceId: string) => {
       windows.delete(workspaceId);
+      return Promise.resolve();
     },
-    closeAll: () => windows.clear(),
+    closeAll: () => {
+      windows.clear();
+      return Promise.resolve();
+    },
   };
 }
 
@@ -440,7 +445,7 @@ describe("DesktopSessionManager windows", () => {
         workspaceService: createWorkspaceService(() => Promise.resolve(null)),
       });
       expect(manager.getWindow("workspace")).toBeNull();
-      manager.closeWindow("workspace", "instance");
+      await manager.closeWindow("workspace", "instance");
       expect(
         await manager.openWindow("workspace", "instance").catch((error: unknown) => error)
       ).toBeInstanceOf(Error);
@@ -509,9 +514,9 @@ describe("DesktopSessionManager windows", () => {
       expect(await manager.openWindow("workspace", "first")).toEqual({ instanceId: "first" });
       expect(await manager.openWindow("workspace", "second")).toEqual({ instanceId: "first" });
       expect(manager.has("workspace")).toBe(true);
-      manager.closeWindow("workspace", "second");
+      await manager.closeWindow("workspace", "second");
       expect(manager.getWindow("workspace")).toEqual({ instanceId: "first" });
-      manager.closeWindow("workspace", "first");
+      await manager.closeWindow("workspace", "first");
       expect(manager.getWindow("workspace")).toBeNull();
       expect(manager.has("workspace")).toBe(false);
     });
@@ -533,7 +538,7 @@ describe("DesktopSessionManager windows", () => {
         expect(manager.has("workspace")).toBe(true);
         if (teardown === "workspace") await manager.close("workspace");
         if (teardown === "all") await manager.closeAll();
-        if (teardown === "instance") manager.closeWindow("workspace", "instance");
+        if (teardown === "instance") await manager.closeWindow("workspace", "instance");
         if (teardown === "archive") manager.setWorkspaceArchiveGuard(() => true);
         if (teardown === "remove") spyOn(workspaceService, "isRemoving").mockReturnValue(true);
         lookup.resolve();
@@ -553,7 +558,7 @@ describe("DesktopSessionManager windows", () => {
         return capability;
       });
       const pending = manager.openWindow("workspace", "new");
-      manager.closeWindow("workspace", "old");
+      await manager.closeWindow("workspace", "old");
       lookup.resolve();
       expect(await pending).toEqual({ instanceId: "new" });
     });
@@ -637,12 +642,45 @@ describe("DesktopSessionManager windows", () => {
       expect(manager.close("workspace")).toBe(firstClose);
       await firstClose;
       expect(await manager.openWindow("workspace", "first")).toEqual({ instanceId: "first" });
-      manager.closeWindow("workspace", "first");
+      await manager.closeWindow("workspace", "first");
 
       const secondClose = manager.close("workspace");
       expect(secondClose).not.toBe(firstClose);
       await secondClose;
       expect(await manager.openWindow("workspace", "second")).toEqual({ instanceId: "second" });
+    });
+  });
+
+  test("closeAll latches admission and waits for viewer cleanup before bridge revocation", async () => {
+    await withWindowHarness(async ({ manager, windows }) => {
+      await manager.openWindow("workspace", "viewer");
+      const started = deferred();
+      const released = deferred();
+      const originalClose = windows.closeAll.bind(windows);
+      const close = spyOn(windows, "closeAll").mockImplementation(async () => {
+        started.resolve();
+        await released.promise;
+        await originalClose();
+      });
+      const revoked: Array<string | null> = [];
+      const unsubscribe = manager.onWorkspaceClose((id) => revoked.push(id));
+      const closing = manager.closeAll();
+      try {
+        expect(manager.closeAll()).toBe(closing);
+        await started.promise;
+        expect(revoked).toEqual([]);
+        expect(manager.getWindow("workspace")).toEqual({ instanceId: "viewer" });
+        expect(
+          await manager.openWindow("one", "late").catch((error: unknown) => error)
+        ).toBeInstanceOf(Error);
+      } finally {
+        released.resolve();
+        await closing;
+        unsubscribe();
+        close.mockRestore();
+      }
+      expect(revoked).toEqual([null]);
+      expect(manager.getWindow("workspace")).toBeNull();
     });
   });
 
@@ -652,7 +690,7 @@ describe("DesktopSessionManager windows", () => {
       await manager.openWindow("two", "two");
       const closing = manager.close("one");
       expect(manager.close("one")).toBe(closing);
-      expect(manager.getWindow("one")).toBeNull();
+      expect(manager.getWindow("one")).toEqual({ instanceId: "one" });
       expect(manager.getWindow("two")).toEqual({ instanceId: "two" });
       expect(
         await manager.openWindow("one", "racing").catch((error: unknown) => error)
@@ -711,7 +749,7 @@ describe("DesktopSessionManager", () => {
         expect(manager.has("child")).toBe(false);
         await manager.openWindow("owner", "owner-viewer");
         await manager.openWindow("child", "child-viewer");
-        manager.closeWindow("child", "child-viewer");
+        await manager.closeWindow("child", "child-viewer");
         expect(parentSession.isAlive()).toBe(true);
         expect(closeNotifications).toEqual([]);
         await manager.openWindow("child", "child-reopened");
@@ -726,7 +764,32 @@ describe("DesktopSessionManager", () => {
         assertPortableDesktopRecordedCommands(recorded);
         expect(recorded.length).toBe(1);
         expect(recorded[0]?.stateFile).toContain("owner");
-        await manager.close("child");
+        const releaseInput = deferred();
+        const cleanupStarted = deferred();
+        const originalClose = windows.closeWorkspace.bind(windows);
+        const closeViewer = spyOn(windows, "closeWorkspace").mockImplementationOnce(async (id) => {
+          cleanupStarted.resolve();
+          await releaseInput.promise;
+          await originalClose(id);
+        });
+        const closingChild = manager.close("child");
+        try {
+          expect(manager.close("child")).toBe(closingChild);
+          await cleanupStarted.promise;
+          expect(parentSession.isAlive()).toBe(true);
+          expect(closeNotifications).toEqual([]);
+          expect(manager.getWindow("child")).toEqual({ instanceId: "child-reopened" });
+          expect(
+            await manager.openWindow("child", "racing").catch((error: unknown) => error)
+          ).toBeInstanceOf(Error);
+          expect(
+            await manager.ensureStarted("child").catch((error: unknown) => error)
+          ).toBeInstanceOf(Error);
+        } finally {
+          releaseInput.resolve();
+          await closingChild;
+          closeViewer.mockRestore();
+        }
         expect(parentSession.isAlive()).toBe(true);
         expect(manager.getWindow("child")).toBeNull();
         expect(manager.getWindow("owner")).toEqual({ instanceId: "owner-viewer" });
@@ -853,6 +916,29 @@ describe("DesktopSessionManager", () => {
       });
     });
   }
+
+  test("established viewers retain a release channel during admission but not durable invalidation", async () => {
+    await withWindowHarness(async ({ manager, config }) => {
+      await registerSharedWorkspaces(config);
+      await manager.ensureStarted("owner");
+      const live = manager.getLiveSessionConnection("child");
+      expect(live).not.toBeNull();
+      manager.setWorkspaceArchiveGuard((id) => id === "child");
+      expect(manager.getLiveSessionConnection("child")).toBeNull();
+      expect(manager.getLiveSessionConnection("child", "established")).toEqual(live);
+
+      await config.editConfig((current) => {
+        const child = current.projects
+          .get("/tmp/project-1")
+          ?.workspaces.find((entry) => entry.id === "child");
+        if (!child) throw new Error("Missing child");
+        child.archivedAt = "2026-09-04T12:00:00Z";
+        return current;
+      });
+      expect(manager.getLiveSessionConnection("child", "established")).toBeNull();
+      expect(manager.getLiveSessionConnection("owner")).toEqual(live);
+    });
+  });
 
   test("rejects requester and owner archive guards before shared startup", async () => {
     await withDesktopManagerHarness(async ({ config }) => {
@@ -1153,7 +1239,7 @@ describe("DesktopSessionManager", () => {
       expect(secondSession).toBe(firstSession);
       manager.setDesktopWindowManager(createWindowManager());
       await manager.openWindow("workspace-reuse", "viewer");
-      manager.closeWindow("workspace-reuse", "viewer");
+      await manager.closeWindow("workspace-reuse", "viewer");
       expect(manager.getWindow("workspace-reuse")).toBeNull();
       // Viewer handoff must not restart or terminate the underlying desktop session.
       expect(firstSession.isAlive()).toBe(true);

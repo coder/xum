@@ -17,6 +17,8 @@ type PopoutMessageType = "ready" | "grant" | "opened" | "bring-back" | "closed" 
 export interface DesktopPopoutCloseRequest {
   instanceId: string;
   handled: boolean;
+  // Native close interception waits for renderer cleanup before allowing the window to close.
+  completion?: Promise<void>;
 }
 
 export interface DesktopPopoutMessage {

@@ -1,15 +1,22 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import type { BrowserWindow, BrowserWindowConstructorOptions } from "electron";
 import { EventEmitter } from "node:events";
+import { runInNewContext } from "node:vm";
 import { DesktopWindowManager } from "./desktopWindowManager";
 
 class TestWindow extends EventEmitter {
   destroyed = false;
+  forced = false;
   minimized = false;
   url = "";
   loading = Promise.resolve();
   webContents = Object.assign(new EventEmitter(), {
     setWindowOpenHandler: mock<(handler: () => { action: string }) => void>(),
+    getURL: () => this.url,
+    executeJavaScript: mock<(script: string) => Promise<unknown>>(() => {
+      this.close();
+      return Promise.resolve(true);
+    }),
   });
   isDestroyed = () => this.destroyed;
   isMinimized = () => this.minimized;
@@ -21,10 +28,47 @@ class TestWindow extends EventEmitter {
     this.url = url;
     return this.loading;
   };
+  close = () => {
+    let prevented = false;
+    this.emit("close", {
+      preventDefault: () => {
+        prevented = true;
+      },
+    });
+    if (!prevented) {
+      this.destroyed = true;
+      this.emit("closed");
+    }
+  };
   destroy = () => {
+    this.forced = true;
     this.destroyed = true;
     this.emit("closed");
   };
+}
+
+interface CloseRequest {
+  instanceId: string;
+  handled: boolean;
+  completion?: Promise<void>;
+}
+
+function executeCloseScript(
+  window: TestWindow,
+  script: string,
+  onRequest: (request: CloseRequest) => void
+): Promise<unknown> {
+  const result: unknown = runInNewContext(script, {
+    location: { href: window.url },
+    CustomEvent: class {
+      detail: CloseRequest;
+      constructor(_type: string, options: { detail: CloseRequest }) {
+        this.detail = options.detail;
+      }
+    },
+    window: { dispatchEvent: (event: { detail: CloseRequest }) => onRequest(event.detail) },
+  });
+  return Promise.resolve(result);
 }
 
 function setup(isPackaged = false) {
@@ -84,7 +128,7 @@ describe("DesktopWindowManager", () => {
       contextIsolation: true,
     });
     expect(options[0].webPreferences?.preload).toEndWith("preload.js");
-    manager.closeAll();
+    await manager.closeAll();
   });
 
   test.each([false, true])(
@@ -121,7 +165,7 @@ describe("DesktopWindowManager", () => {
       const preventDefault = mock(() => undefined);
       window.webContents.emit("will-attach-webview", { preventDefault });
       expect(preventDefault).toHaveBeenCalledTimes(1);
-      manager.closeAll();
+      await manager.closeAll();
     }
   );
 
@@ -130,7 +174,7 @@ describe("DesktopWindowManager", () => {
     const { manager, windows } = setup();
     await manager.openWindow("workspace", "instance");
     expect(new URL(windows[0].url).protocol).toBe("file:");
-    manager.closeAll();
+    await manager.closeAll();
   });
 
   test("racing opens focus and return the original instance, even while loading", async () => {
@@ -147,9 +191,9 @@ describe("DesktopWindowManager", () => {
     gate.resolve();
     expect(await first).toEqual({ instanceId: "first" });
     expect(await second).toEqual({ instanceId: "first" });
-    manager.closeWindow("workspace", "second");
+    await manager.closeWindow("workspace", "second");
     expect(windows[0].destroyed).toBe(false);
-    manager.closeWindow("workspace", "first");
+    await manager.closeWindow("workspace", "first");
     expect(manager.getWindow("workspace")).toBeNull();
   });
 
@@ -166,7 +210,7 @@ describe("DesktopWindowManager", () => {
     expect(manager.getWindow("workspace")).toBeNull();
     setLoading(Promise.resolve());
     expect(await manager.openWindow("workspace", "retry")).toEqual({ instanceId: "retry" });
-    manager.closeAll();
+    await manager.closeAll();
   });
 
   test("closing a loading window cannot resurrect it or remove its replacement", async () => {
@@ -174,15 +218,15 @@ describe("DesktopWindowManager", () => {
     const gate = deferred();
     setLoading(gate.promise);
     const pending = manager.openWindow("workspace", "old").catch((error: unknown) => error);
-    manager.closeWorkspace("workspace");
+    await manager.closeWorkspace("workspace");
     setLoading(Promise.resolve());
     await manager.openWindow("workspace", "new");
     windows[0].emit("closed");
     gate.resolve();
     expect(await pending).toBeInstanceOf(Error);
-    manager.closeWindow("workspace", "old");
+    await manager.closeWindow("workspace", "old");
     expect(manager.getWindow("workspace")).toEqual({ instanceId: "new" });
-    manager.closeAll();
+    await manager.closeAll();
   });
 
   test("renderer crashes and main-frame load failures release manager truth", async () => {
@@ -210,11 +254,96 @@ describe("DesktopWindowManager", () => {
     expect(manager.getWindow("workspace")).toBeNull();
   });
 
+  test.each(["manager", "native"])(
+    "%s close waits for renderer cleanup and refuses duplicate opens",
+    async (source) => {
+      const { manager, windows } = setup();
+      await manager.openWindow("workspace", "viewer");
+      const cleanup = deferred();
+      windows[0].webContents.executeJavaScript.mockImplementation(async () => {
+        await cleanup.promise;
+        return true;
+      });
+      if (source === "native") windows[0].close();
+      const closing = manager.closeWorkspace("workspace");
+      // A repeated titlebar close cannot bypass an in-flight input release.
+      windows[0].close();
+      expect(manager.closeWorkspace("workspace")).toBe(closing);
+      expect(manager.getWindow("workspace")).toEqual({ instanceId: "viewer" });
+      expect(
+        await manager.openWindow("workspace", "replacement").catch((error: unknown) => error)
+      ).toBeInstanceOf(Error);
+      let settled = false;
+      const finished = closing.then(() => {
+        settled = true;
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(windows[0].destroyed).toBe(false);
+      cleanup.resolve();
+      await finished;
+      expect(windows[0].forced).toBe(false);
+      expect(manager.getWindow("workspace")).toBeNull();
+    }
+  );
+
+  test("bounds a hung renderer and does not leave a closing reservation", async () => {
+    const { manager, windows } = setup();
+    await manager.openWindow("workspace", "hung");
+    windows[0].webContents.executeJavaScript.mockImplementation(() => new Promise(() => undefined));
+    await manager.closeWorkspace("workspace");
+    expect(windows[0].forced).toBe(true);
+    expect(manager.getWindow("workspace")).toBeNull();
+    await manager.openWindow("workspace", "replacement");
+    await manager.closeAll();
+  });
+
+  test("only executes cleanup in the exact trusted viewer and JSON-encodes its identity", async () => {
+    const { manager, windows } = setup();
+    const instanceId = `viewer'); throw new Error('injected'); //`;
+    await manager.openWindow("workspace", instanceId);
+    let received: unknown;
+    windows[0].webContents.executeJavaScript.mockImplementation((script) =>
+      executeCloseScript(windows[0], script, (request) => {
+        received = request.instanceId;
+        request.handled = true;
+        request.completion = Promise.resolve();
+        windows[0].close();
+      })
+    );
+    await manager.closeWorkspace("workspace");
+    expect(received).toBe(instanceId);
+    expect(windows[0].forced).toBe(false);
+    await manager.openWindow("other", "viewer");
+    windows[1].url = "https://untrusted.example/desktop.html";
+    await manager.closeWorkspace("other");
+    expect(windows[1].webContents.executeJavaScript).not.toHaveBeenCalled();
+    expect(windows[1].forced).toBe(true);
+  });
+
+  test("closes all viewers in parallel rather than stacking their cleanup deadlines", async () => {
+    const { manager, windows } = setup();
+    await manager.openWindow("one", "one");
+    await manager.openWindow("two", "two");
+    for (const window of windows) window.webContents.executeJavaScript.mockResolvedValue(true);
+    const closing = manager.closeAll();
+    await Promise.resolve();
+    expect(
+      windows.every((window) => window.webContents.executeJavaScript.mock.calls.length === 1)
+    ).toBe(true);
+    expect(
+      await manager.openWindow("three", "three").catch((error: unknown) => error)
+    ).toBeInstanceOf(Error);
+    for (const window of windows) window.close();
+    await closing;
+    expect(windows.every((window) => !window.forced)).toBe(true);
+  });
+
   test("shutdown closes every workspace and rejects new opens", async () => {
     const { manager, windows } = setup();
     await manager.openWindow("one", "one");
     await manager.openWindow("two", "two");
-    manager.closeAll();
+    await manager.closeAll();
     expect(windows.every((window) => window.destroyed)).toBe(true);
     expect(manager.getWindow("one")).toBeNull();
     expect(await manager.openWindow("one", "new").catch((error: unknown) => error)).toBeInstanceOf(
