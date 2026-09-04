@@ -2239,7 +2239,7 @@ export class TaskService implements AgentTaskIntegration {
 
   async editWorkspaceEntry(
     workspaceId: string,
-    updater: (workspace: WorkspaceConfigEntry) => void,
+    updater: (workspace: WorkspaceConfigEntry, config: ProjectsConfig) => void,
     options?: { allowMissing?: boolean }
   ): Promise<boolean> {
     assert(workspaceId.length > 0, "editWorkspaceEntry: workspaceId must be non-empty");
@@ -2249,7 +2249,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const [_projectPath, project] of config.projects) {
         const ws = project.workspaces.find((w) => w.id === workspaceId);
         if (!ws) continue;
-        updater(ws);
+        updater(ws, config);
         found = true;
         return config;
       }
@@ -2794,7 +2794,14 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<boolean> {
     // Admission protects only persistence. Never hold the desktop gate across nested sends.
     return await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
-      this.editWorkspaceEntry(workspaceId, updater, options)
+      this.editWorkspaceEntry(
+        workspaceId,
+        (workspace, config) => {
+          updater(workspace);
+          this.desktopInputCoordinator.assertAdmission(config, workspaceId);
+        },
+        options
+      )
     );
   }
 
@@ -3187,6 +3194,7 @@ export class TaskService implements AgentTaskIntegration {
                 taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
                 projects: plan.parentMeta.projects,
               });
+              this.desktopInputCoordinator.assertAdmission(config, plan.taskId);
             }
             return config;
           });
@@ -4049,6 +4057,7 @@ export class TaskService implements AgentTaskIntegration {
               taskDesktopOwnerWorkspaceId,
               projects: parentMeta.projects,
             });
+            this.desktopInputCoordinator.assertAdmission(config, taskId);
             return config;
           });
         });
@@ -4231,6 +4240,7 @@ export class TaskService implements AgentTaskIntegration {
           taskDesktopOwnerWorkspaceId,
           projects: inheritedProjects,
         });
+        this.desktopInputCoordinator.assertAdmission(config, taskId);
         return config;
       });
 
@@ -10352,12 +10362,17 @@ export class TaskService implements AgentTaskIntegration {
   private async setTaskStatus(workspaceId: string, status: AgentTaskStatus): Promise<void> {
     assert(workspaceId.length > 0, "setTaskStatus: workspaceId must be non-empty");
 
-    await this.editWorkspaceEntry(workspaceId, (ws) => {
-      ws.taskStatus = status;
+    const update = (workspace: WorkspaceConfigEntry) => {
+      workspace.taskStatus = status;
       if (status === "running") {
-        ws.taskPrompt = undefined;
+        workspace.taskPrompt = undefined;
       }
-    });
+    };
+    if (ACTIVE_AGENT_TASK_STATUSES.has(status)) {
+      await this.editActiveWorkspaceEntry(workspaceId, update);
+    } else {
+      await this.editWorkspaceEntry(workspaceId, update);
+    }
 
     await this.emitWorkspaceMetadata(workspaceId);
 

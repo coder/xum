@@ -552,7 +552,10 @@ export interface WorkspaceTurnTaskHost {
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,
-    updater: (workspace: WorkspaceConfigEntry) => void,
+    updater: (
+      workspace: WorkspaceConfigEntry,
+      config: ReturnType<Config["loadConfigOrDefault"]>
+    ) => void,
     options?: { allowMissing?: boolean }
   ): Promise<boolean>;
   emitWorkspaceMetadata(workspaceId: string): Promise<void>;

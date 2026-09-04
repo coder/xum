@@ -113,6 +113,14 @@ export class DesktopInputCoordinator {
     });
   }
 
+  /** Recheck inside the config transaction: another backend has its own input gates. */
+  assertAdmission(config: ProjectsConfig, workspaceId: string): void {
+    const workspace = findWorkspaceEntry(config, workspaceId)?.workspace;
+    if (workspace?.taskDesktopOwnerWorkspaceId === undefined) return;
+    const target = this.resolveFromConfig(config, workspaceId);
+    this.assertController(config, target.ownerWorkspaceId, workspaceId, false);
+  }
+
   async withInput<T>(workspaceId: string, run: () => Promise<T>): Promise<T> {
     const target = this.resolveTarget(workspaceId);
     return this.gates.withLock(target.ownerWorkspaceId, async () => {

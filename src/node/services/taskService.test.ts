@@ -4061,6 +4061,63 @@ describe("TaskService", () => {
     }
   });
 
+  test("shared desktop reservations from separate backends commit only one borrower", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      cfg.projects.get(projectPath)!.workspaces.push(
+        projectWorkspace(projectPath, "busy", "busy", {
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+          agentId: "explore",
+        })
+      );
+      return cfg;
+    });
+    const otherConfig = new Config(config.rootDir);
+    const services = [config, otherConfig].map((cfg) => createTaskServiceHarness(cfg).taskService);
+    let release!: () => void;
+    const bothReserved = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reservations = 0;
+    const results = await Promise.all(
+      services.map((service) =>
+        service.createMany(
+          [
+            {
+              parentWorkspaceId: parentId,
+              kind: "agent",
+              agentId: "explore",
+              prompt: "Inspect",
+              title: "Inspector",
+              desktop: "shared",
+            },
+          ],
+          {
+            onTaskReserved: async () => {
+              reservations += 1;
+              if (reservations === services.length) release();
+              // Both process-local gates have read an unreserved desktop before either writes.
+              await bothReserved;
+            },
+          }
+        )
+      )
+    );
+    expect(results.filter((result) => result.success)).toHaveLength(1);
+    const failure = results.find((result) => !result.success);
+    assert(failure != null && !failure.success);
+    expect(failure.error).toContain("active borrowers");
+    expect(
+      config
+        .loadConfigOrDefault()
+        .projects.get(projectPath)!
+        .workspaces.filter((workspace) => workspace.taskDesktopOwnerWorkspaceId === parentId)
+    ).toHaveLength(1);
+  });
+
   test("shared desktop batch preserves distinct owners through queued reservation", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
