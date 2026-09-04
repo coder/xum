@@ -1924,6 +1924,7 @@ export class TaskService implements AgentTaskIntegration {
    */
   private async resolveTaskAISettings(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    parentWorkspaceId: string;
     parentMeta: TaskParentAiMeta;
     agentId: string;
     modelString?: string;
@@ -1937,6 +1938,14 @@ export class TaskService implements AgentTaskIntegration {
     effectiveThinkingLevel: ThinkingLevel;
     effectiveReasoningMode?: OpenAIReasoningMode;
   }> {
+    // Display metadata synthesizes Exec/Plan buckets from legacy aiSettings.
+    // Only raw persisted Exec choices may outrank global Exec defaults.
+    const parent = findWorkspaceEntry(params.cfg, params.parentWorkspaceId)?.workspace;
+    const parentWorkspaceExecSettings =
+      parent?.aiSettingsByAgent?.exec ??
+      (normalizeAgentId(parent?.agentId ?? parent?.agentType, "") === "exec"
+        ? parent?.aiSettings
+        : undefined);
     const resolved = await resolveNodeAgentAiSettings({
       agentId: params.agentId,
       profile: "subagent",
@@ -1946,6 +1955,10 @@ export class TaskService implements AgentTaskIntegration {
         model: coerceNonEmptyString(params.modelString) ?? undefined,
         thinkingLevel: params.thinkingLevel ?? undefined,
       },
+      // A saved workspace's omitted reasoning mode means Standard, not inheritance.
+      parentWorkspaceExecSettings: parentWorkspaceExecSettings
+        ? targetWorkspaceBucketToLayer(parentWorkspaceExecSettings)
+        : undefined,
       parentRuntime: params.parentRuntimeAiSettings
         ? {
             model: coerceNonEmptyString(params.parentRuntimeAiSettings.modelString) ?? undefined,
@@ -2998,6 +3011,7 @@ export class TaskService implements AgentTaskIntegration {
         ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
           await this.resolveTaskAISettings({
             cfg,
+            parentWorkspaceId,
             parentMeta,
             agentId,
             modelString: args.modelString,
@@ -3862,6 +3876,7 @@ export class TaskService implements AgentTaskIntegration {
       ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
         await this.resolveTaskAISettings({
           cfg,
+          parentWorkspaceId,
           parentMeta,
           agentId,
           modelString: args.modelString,
@@ -11590,14 +11605,12 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
 
-      // Same delegated resolution as Task.create: configured exec sub-agent/agent
-      // defaults win, then the plan phase's frozen task settings (parent
-      // runtime), then the plan workspace's own buckets — a PRO toggle during
-      // the plan phase persists under the plan agent's bucket
-      // (aiSettingsByAgent), which the shared fallback layers carry over.
+      // Resolve a new Exec phase from this workspace, not its parent. A Plan-only
+      // PRO preference still falls through via the existing workspace fallback.
       const { taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
         await this.resolveTaskAISettings({
           cfg: this.config.loadConfigOrDefault(),
+          parentWorkspaceId: args.workspaceId,
           parentMeta: args.entry.workspace,
           agentId: targetAgentId,
           parentRuntimeAiSettings: {

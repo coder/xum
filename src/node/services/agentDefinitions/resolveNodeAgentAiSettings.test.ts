@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 
-import { collectDefinitionLayers } from "./resolveNodeAgentAiSettings";
+import { collectDefinitionLayers, resolveNodeAgentAiSettings } from "./resolveNodeAgentAiSettings";
 
 // Unrecognized providers avoid capability clamping (see resolveAgentAiSettings.test.ts).
 const MODEL_A = "custom:model-a";
@@ -60,5 +60,19 @@ describe("collectDefinitionLayers", () => {
     expect(resolved.selected.model).toBe(MODEL_A);
     expect(resolved.selected.thinkingLevel).toBe("high");
     expect(resolved.sources.model).toEqual({ tier: "definition", agentId: "exec" });
+  });
+});
+
+describe("calling workspace adapter context", () => {
+  it("forwards Exec context without changing the gateway identity", async () => {
+    const model = "coder:openai/gpt-5.6";
+    const result = await resolveNodeAgentAiSettings({
+      agentId: "exec",
+      profile: "subagent",
+      cfg: { agentAiDefaults: { exec: { modelString: MODEL_A } } },
+      parentWorkspaceExecSettings: { model, thinkingLevel: "high" },
+    });
+    expect(result.selected.model).toBe(model);
+    expect(result.sources.model).toEqual({ tier: "parent-workspace-exec", agentId: "exec" });
   });
 });

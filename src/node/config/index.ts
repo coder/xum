@@ -3195,6 +3195,7 @@ export class Config {
               aiSettings: workspace.aiSettings,
               heartbeat: normalizeWorkspaceMetadataHeartbeat(workspace.heartbeat, config),
               goalDefaults: workspace.goalDefaults,
+              // Display defaults stay ephemeral: no raw Exec bucket means no saved Exec choice.
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
                 (workspace.aiSettings
@@ -3234,22 +3235,6 @@ export class Config {
               recordWorkspaceMigration(projectPath, workspace.path, (entry) => {
                 entry.createdAt ??= metadata.createdAt;
               });
-            }
-
-            // Migrate missing runtimeConfig to config for next load
-            if (!workspace.aiSettingsByAgent) {
-              const derived = workspace.aiSettings
-                ? {
-                    plan: workspace.aiSettings,
-                    exec: workspace.aiSettings,
-                  }
-                : undefined;
-              if (derived) {
-                workspace.aiSettingsByAgent = derived;
-                recordWorkspaceMigration(projectPath, workspace.path, (entry) => {
-                  entry.aiSettingsByAgent ??= derived;
-                });
-              }
             }
 
             if (!workspace.runtimeConfig) {
@@ -3370,6 +3355,7 @@ export class Config {
           }
           if (legacyMetadataRaw !== undefined) {
             const metadata = JSON.parse(legacyMetadataRaw) as WorkspaceMetadata;
+            const persistedAgentSettings = metadata.aiSettingsByAgent;
             this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
 
             // Ensure required fields are present
@@ -3447,10 +3433,11 @@ export class Config {
             metadata.createdAt = workspace.createdAt ?? metadata.createdAt;
             metadata.runtimeConfig = workspace.runtimeConfig ?? metadata.runtimeConfig;
 
-            if (!workspace.aiSettingsByAgent && metadata.aiSettingsByAgent) {
-              workspace.aiSettingsByAgent = metadata.aiSettingsByAgent;
+            // Migrate genuine metadata buckets, never the display fallback above.
+            if (!workspace.aiSettingsByAgent && persistedAgentSettings) {
+              workspace.aiSettingsByAgent = persistedAgentSettings;
               recordWorkspaceMigration(projectPath, workspace.path, (entry) => {
-                entry.aiSettingsByAgent ??= metadata.aiSettingsByAgent;
+                entry.aiSettingsByAgent ??= persistedAgentSettings;
               });
             }
 
