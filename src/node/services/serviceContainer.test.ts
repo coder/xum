@@ -221,6 +221,129 @@ describe("ServiceContainer", () => {
     );
   });
 
+  it("initializeCore completes task recovery and leaves housekeeping to runStartupHousekeeping", async () => {
+    services = new ServiceContainer(stores);
+    const callOrder: string[] = [];
+    let releaseTaskRecovery: (() => void) | undefined;
+    let taskRecoveryCalled: (() => void) | undefined;
+    const taskRecoveryCalledPromise = new Promise<void>((resolve) => {
+      taskRecoveryCalled = resolve;
+    });
+    const recoverTasksSpy = spyOn(
+      services.taskService,
+      "recoverInterruptedTasks"
+    ).mockImplementation(() => {
+      callOrder.push("recoverTasks");
+      taskRecoveryCalled?.();
+      return new Promise<void>((resolve) => {
+        releaseTaskRecovery = resolve;
+      });
+    });
+    const workspaceInitializeSpy = spyOn(
+      services.workspaceService,
+      "initialize"
+    ).mockImplementation(() => {
+      callOrder.push("workspace");
+      return Promise.resolve();
+    });
+    const taskHousekeepingSpy = spyOn(
+      services.taskService,
+      "runStartupHousekeeping"
+    ).mockImplementation(() => {
+      callOrder.push("taskHousekeeping");
+      return Promise.resolve();
+    });
+
+    let coreSettled = false;
+    const core = services.initializeCore().then(() => {
+      coreSettled = true;
+    });
+    await taskRecoveryCalledPromise;
+    // The listener must wait for task recovery (clients may otherwise race its transitions)...
+    expect(recoverTasksSpy).toHaveBeenCalledTimes(1);
+    expect(coreSettled).toBe(false);
+    releaseTaskRecovery?.();
+    await core;
+    // ...but not for the O(workspaces) housekeeping, which runs only when the caller asks for it.
+    expect(workspaceInitializeSpy).not.toHaveBeenCalled();
+    expect(taskHousekeepingSpy).not.toHaveBeenCalled();
+
+    await services.runStartupHousekeeping();
+    expect(callOrder).toEqual(["recoverTasks", "workspace", "taskHousekeeping"]);
+    expect(workspaceInitializeSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(taskHousekeepingSpy.mock.calls[0]?.[0]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("dispose cancels in-flight startup housekeeping before the periodic services start", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    let releaseTaskHousekeeping: (() => void) | undefined;
+    let housekeepingSignal: AbortSignal | undefined;
+    let taskHousekeepingCalled: (() => void) | undefined;
+    const taskHousekeepingCalledPromise = new Promise<void>((resolve) => {
+      taskHousekeepingCalled = resolve;
+    });
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation((options) => {
+      housekeepingSignal = options?.signal;
+      taskHousekeepingCalled?.();
+      return new Promise<void>((release) => {
+        releaseTaskHousekeeping = release;
+      });
+    });
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const beginShutdown = spyOn(
+      (services as unknown as { backgroundProcessManager: { beginShutdown: () => void } })
+        .backgroundProcessManager,
+      "beginShutdown"
+    );
+    const disposeRecoverySessions = spyOn(services.workspaceService, "beginShutdown");
+
+    await services.initializeCore();
+    const housekeeping = services.runStartupHousekeeping();
+    await taskHousekeepingCalledPromise;
+    // Task housekeeping is mid-flight when the process shuts down.
+    const disposed = services.dispose();
+    expect(housekeepingSignal?.aborted).toBe(true);
+    // Both latches are set synchronously, ahead of the join: no session disposed during shutdown
+    // can erase registry records, and no recovery chain still running under the join can start a
+    // stream. Only then does teardown wait for the in-flight housekeeping step to settle.
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
+    releaseTaskHousekeeping?.();
+    await housekeeping;
+    await disposed;
+
+    expect(disposeRecoverySessions).toHaveBeenCalledTimes(1);
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).not.toHaveBeenCalled();
+    expect(idleCompactionStart).not.toHaveBeenCalled();
+  });
+
+  it("runStartupHousekeeping starts the periodic services even when task housekeeping rejects", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.resolve()
+    );
+    spyOn(services.workspaceService, "initialize").mockImplementation(() => Promise.resolve());
+    spyOn(services.taskService, "runStartupHousekeeping").mockImplementation(() =>
+      Promise.reject(new Error("terminal-attention store unreadable"))
+    );
+    const idleCompactionStart = spyOn(services.idleCompactionService, "start");
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+    const agentStatusStart = spyOn(services.agentStatusService, "start");
+
+    await services.initializeCore();
+    await services.runStartupHousekeeping();
+
+    expect(idleCompactionStart).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+    expect(agentStatusStart).toHaveBeenCalledTimes(1);
+  });
+
   it("exposes desktopSessionManager in the ORPC context", () => {
     services = new ServiceContainer(stores);
 

@@ -453,7 +453,11 @@ export interface WorkspaceLifecycleHost {
     worktreeArchiveBehavior?: WorktreeArchiveBehavior,
     metadata?: WorkspaceMetadata
   ): boolean;
-  remove(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  remove(
+    workspaceId: string,
+    force?: boolean,
+    options?: { beforeRemove?: () => Promise<boolean> }
+  ): Promise<Result<void>>;
   removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
 }
 

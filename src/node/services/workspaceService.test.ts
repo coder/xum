@@ -8113,10 +8113,51 @@ describe("WorkspaceService initialize", () => {
       name: "Archived Workspace",
       archivedAt: "2026-03-20T00:00:00.000Z",
     });
+    // Active when metadata was read, but archived (or removed) by a client before the
+    // scheduling loop ran: the live config decides, not the stale metadata.
+    const archivedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "archived-since-ws",
+      name: "Archived Since Read",
+    });
+    const removedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "removed-since-ws",
+      name: "Removed Since Read",
+    });
 
     config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([liveWorkspace, taskWorkspace, archivedWorkspace])
+      Promise.resolve([
+        liveWorkspace,
+        taskWorkspace,
+        archivedWorkspace,
+        archivedSinceWorkspace,
+        removedSinceWorkspace,
+      ])
     ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
+              { id: "task-ws", name: "task-ws", path: "/tmp/task-ws", taskStatus: "running" },
+              {
+                id: "archived-ws",
+                name: "archived-ws",
+                path: "/tmp/archived-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+              {
+                id: "archived-since-ws",
+                name: "archived-since-ws",
+                path: "/tmp/archived-since-ws",
+                archivedAt: "2026-03-21T00:00:00.000Z",
+              },
+            ],
+          },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -8167,6 +8208,70 @@ describe("WorkspaceService initialize", () => {
     try {
       await service.initialize();
       expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("removes stale orphaned scratch workdirs but keeps referenced and recent ones", async () => {
+    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
+    const scratchDirFor = (id: string) => path.join(realConfig.rootDir, "scratch", id);
+    const referencedDir = scratchDirFor("referenced-scratch");
+    const staleOrphanDir = scratchDirFor("stale-orphan-scratch");
+    // A scratch chat created while the sweep runs has a fresh workdir and, briefly, no
+    // config entry yet (createScratch persists config after mkdir).
+    const freshOrphanDir = scratchDirFor("fresh-orphan-scratch");
+    for (const dir of [referencedDir, staleOrphanDir, freshOrphanDir]) {
+      await fsPromises.mkdir(dir, { recursive: true });
+    }
+    const staleTime = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    for (const dir of [referencedDir, staleOrphanDir]) {
+      await fsPromises.utimes(dir, staleTime, staleTime);
+    }
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            kind: "scratch",
+            path: referencedDir,
+            id: "referenced-scratch",
+            name: "scratch-referenced-scratch",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+        projectKind: "system",
+        trusted: true,
+      });
+      return cfg;
+    });
+
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+    const service = createWorkspaceServiceForTest({
+      config: realConfig,
+      historyService,
+      aiService,
+      initStateManager: mockInitStateManager as InitStateManager,
+    });
+    const startupAccess = service as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
+
+    const exists = (dir: string) =>
+      fsPromises.stat(dir).then(
+        () => true,
+        () => false
+      );
+
+    try {
+      await service.initialize();
+      expect(await exists(referencedDir)).toBe(true);
+      expect(await exists(freshOrphanDir)).toBe(true);
+      expect(await exists(staleOrphanDir)).toBe(false);
     } finally {
       await cleanup();
     }
@@ -8275,12 +8380,64 @@ describe("WorkspaceService initialize", () => {
       name: "Archived Workspace",
       archivedAt: "2026-03-20T00:00:00.000Z",
     });
+    // Archived when metadata was read, but a client unarchived it (and produced new logs)
+    // before the sweep reached it: the live config decides.
+    const unarchivedSinceWorkspace = createFrontendWorkspaceMetadata({
+      id: "unarchived-since-ws",
+      name: "Unarchived Since Read",
+      archivedAt: "2026-03-20T00:00:00.000Z",
+    });
+    const archivedWithoutDataWorkspace = createFrontendWorkspaceMetadata({
+      id: "archived-no-data-ws",
+      name: "Archived Without DevTools Data",
+      archivedAt: "2026-03-20T00:00:00.000Z",
+    });
     config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([liveWorkspace, archivedWorkspace])
+      Promise.resolve([
+        liveWorkspace,
+        archivedWorkspace,
+        unarchivedSinceWorkspace,
+        archivedWithoutDataWorkspace,
+      ])
     ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          {
+            workspaces: [
+              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
+              {
+                id: "archived-ws",
+                name: "archived-ws",
+                path: "/tmp/archived-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+              {
+                id: "unarchived-since-ws",
+                name: "unarchived-since-ws",
+                path: "/tmp/unarchived-since-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+                unarchivedAt: "2026-03-21T00:00:00.000Z",
+              },
+              {
+                id: "archived-no-data-ws",
+                name: "archived-no-data-ws",
+                path: "/tmp/archived-no-data-ws",
+                archivedAt: "2026-03-20T00:00:00.000Z",
+              },
+            ],
+          },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
 
     const removeWorkspaceData = mock(() => Promise.resolve());
-    workspaceService.setDevToolsService({ removeWorkspaceData });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData: (workspaceId: string) =>
+        Promise.resolve(workspaceId !== "archived-no-data-ws"),
+      removeWorkspaceData,
+    });
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -8291,6 +8448,62 @@ describe("WorkspaceService initialize", () => {
 
     expect(removeWorkspaceData).toHaveBeenCalledTimes(1);
     expect(removeWorkspaceData).toHaveBeenCalledWith("archived-ws");
+  });
+
+  test("initialize schedules no recovery once shutdown has aborted it", async () => {
+    config.getAllWorkspaceMetadata = mock(() =>
+      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "Live Workspace" })])
+    ) as unknown as Config["getAllWorkspaceMetadata"];
+    config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/project",
+          { workspaces: [{ id: "live-ws", name: "live-ws", path: "/tmp/live-ws" }] },
+        ],
+      ]),
+    })) as unknown as Config["loadConfigOrDefault"];
+    const startupAccess = workspaceService as unknown as {
+      startStartupRecovery: (workspaceId: string) => void;
+    };
+    const startStartupRecoverySpy = spyOn(startupAccess, "startStartupRecovery").mockImplementation(
+      () => undefined
+    );
+    const shutdown = new AbortController();
+
+    await workspaceService.initialize({ signal: shutdown.signal });
+    expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
+
+    shutdown.abort();
+    await workspaceService.initialize({ signal: shutdown.signal });
+    expect(startStartupRecoverySpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("beginShutdown disposes transient recovery sessions and halts the rest", () => {
+    const dispose = mock(() => undefined);
+    const beginShutdown = mock(() => undefined);
+    const startupAccess = workspaceService as unknown as {
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+      sessions: Map<string, AgentSession>;
+    };
+    startupAccess.transientStartupRecoverySessions.set("ws-a", {
+      dispose,
+    } as unknown as AgentSession);
+    startupAccess.transientStartupRecoverySessions.set("ws-b", {
+      dispose,
+    } as unknown as AgentSession);
+    // A recovery session promoted with a retry pending, or a client-created session that
+    // housekeeping scheduled recovery on: it may own a live stream, so it is not disposed.
+    startupAccess.sessions.set("ws-promoted", {
+      dispose,
+      beginShutdown,
+    } as unknown as AgentSession);
+
+    workspaceService.beginShutdown();
+
+    expect(dispose).toHaveBeenCalledTimes(2);
+    expect(startupAccess.transientStartupRecoverySessions.size).toBe(0);
+    expect(beginShutdown).toHaveBeenCalledTimes(1);
+    startupAccess.sessions.delete("ws-promoted");
   });
 
   test("disposes transient startup-recovery sessions that go idle", async () => {
@@ -13607,6 +13820,26 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(entry?.archivedAt).toBeTruthy();
   });
 
+  test("archive() disposes a transient startup-recovery session once archivedAt is durable", async () => {
+    let editConfigCallsAtDispose = -1;
+    const dispose = mock(() => {
+      editConfigCallsAtDispose = editConfigSpy.mock.calls.length;
+    });
+    const access = workspaceService as unknown as {
+      transientStartupRecoverySessions: Map<string, AgentSession>;
+    };
+    access.transientStartupRecoverySessions.set(workspaceId, {
+      dispose,
+    } as unknown as AgentSession);
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result.success).toBe(true);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(editConfigCallsAtDispose).toBe(1);
+    expect(access.transientStartupRecoverySessions.has(workspaceId)).toBe(false);
+  });
+
   test("archive() closes workspace terminal sessions on success", async () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {
@@ -13716,7 +13949,10 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(entry?.archivedAt).toBeTruthy();
       return Promise.resolve();
     });
-    workspaceService.setDevToolsService({ removeWorkspaceData });
+    workspaceService.setDevToolsService({
+      hasWorkspaceData: () => Promise.resolve(true),
+      removeWorkspaceData,
+    });
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -13726,6 +13962,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("archive() stays successful when DevTools cleanup fails", async () => {
     workspaceService.setDevToolsService({
+      hasWorkspaceData: () => Promise.resolve(true),
       removeWorkspaceData: mock(() => Promise.reject(new Error("disk error"))),
     });
 
@@ -16649,6 +16886,87 @@ describe("WorkspaceService init cancellation", () => {
       // Keep init state intact so init-end can refresh metadata and clear isInitializing.
       expect(clearInMemoryStateMock).not.toHaveBeenCalled();
       expect(removeWorkspaceMock).not.toHaveBeenCalled();
+    } finally {
+      createRuntimeSpy.mockRestore();
+      await fsPromises.rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+  test("remove() holds turn admission on the session until removal settles", async () => {
+    const workspaceId = "ws-remove-holds-admission";
+    const projectPath = "/tmp/proj";
+
+    let releases = 0;
+    let releasesWhenRuntimeDeleted = -1;
+    const deleteWorkspaceMock = mock(() => {
+      releasesWhenRuntimeDeleted = releases;
+      return Promise.resolve({ success: false as const, error: "dirty" });
+    });
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace: deleteWorkspaceMock,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+
+    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ws-remove-hold-"));
+    try {
+      const mockAIService = {
+        ...createStreamLifecycleMocks(),
+        isStreaming: mock(() => false),
+        stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve(
+            Ok({
+              id: workspaceId,
+              name: "ws",
+              projectPath,
+              projectName: "proj",
+              runtimeConfig: { type: "local" },
+            })
+          )
+        ),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        on: mock(() => {}),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        off: mock(() => {}),
+      } as unknown as AIService;
+      const mockConfig: MockWorkspaceConfig = {
+        rootDir: path.join(tempRoot, "root"),
+        srcDir: "/tmp/src",
+        sessionsDir: tempRoot,
+        removeWorkspace: mock(() => Promise.resolve()),
+        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      };
+      const workspaceService = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        mockInitStateManager as InitStateManager,
+        mockExtensionMetadataService as ExtensionMetadataService,
+        mockBackgroundProcessManager as BackgroundProcessManager
+      );
+
+      // A session whose startup recovery may be one await away from dispatching.
+      const holdTurnAdmission = mock(() => ({
+        [Symbol.dispose]: () => {
+          releases += 1;
+        },
+      }));
+      const dispose = mock(() => undefined);
+      (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+        workspaceId,
+        {
+          holdTurnAdmission,
+          dispose,
+        } as unknown as AgentSession
+      );
+
+      const result = await workspaceService.remove(workspaceId, false);
+      expect(result.success).toBe(false);
+      expect(holdTurnAdmission).toHaveBeenCalledTimes(1);
+      // Held across the runtime deletion, released once the failed removal settles so the
+      // still-configured workspace stays usable.
+      expect(releasesWhenRuntimeDeleted).toBe(0);
+      expect(releases).toBe(1);
+      expect(dispose).not.toHaveBeenCalled();
     } finally {
       createRuntimeSpy.mockRestore();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });

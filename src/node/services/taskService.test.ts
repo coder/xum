@@ -9,7 +9,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { Config, type ProjectsConfig, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
 import {
@@ -3435,6 +3435,290 @@ describe("TaskService", () => {
       expect.objectContaining({ synthetic: true, agentInitiated: true })
     );
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPendingGuidance).toBeUndefined();
+  });
+
+  test("initialize does not resend the restart nudge to a running task that is already streaming", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-restart-streaming";
+    const streamingTaskId = "child-running-streaming";
+    const idleTaskId = "child-running-idle";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "streaming", streamingTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+        projectWorkspace(projectPath, "idle", idleTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // The queue drain can leave a task streaming before the running-task pass reaches it.
+    const isStreaming = mock((workspaceId: string) => workspaceId === streamingTaskId);
+    const { aiService } = createAIServiceMocks(config, { isStreaming });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await taskService.initialize();
+
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toContain(idleTaskId);
+    expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
+  });
+
+  test("startup phases stay partitioned: recovery resumes tasks, housekeeping prunes reported ones", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-startup-phases";
+    const runningTaskId = "child-running-phases";
+    const reportedTaskId = "child-reported-phases";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "running", runningTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+        projectWorkspace(projectPath, "reported", reportedTaskId, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          taskModelString: "openai:gpt-5.2",
+          workflowTask: { runId: "wfr_startup_phases", stepId: "explore" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const remove = createConfigBackedRemoveMock(config);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // The listener-gating phase only touches active tasks: no O(reported tasks) cleanup here.
+    await taskService.recoverInterruptedTasks();
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toEqual([runningTaskId]);
+    expect(remove).not.toHaveBeenCalled();
+
+    // The background phase never resumes tasks (clients may be acting on them by now).
+    await taskService.runStartupHousekeeping();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(remove.mock.calls.map((call) => call[0])).toEqual([reportedTaskId]);
+    expect(findWorkspaceInConfig(config, reportedTaskId)).toBeUndefined();
+  });
+
+  test("initialize does not reload config.json per completed-report task", async () => {
+    const countConfigLoadsDuringInitialize = async (reportedTaskCount: number): Promise<number> => {
+      const runRootDir = path.join(rootDir, `run-${reportedTaskCount}`);
+      const config = await createTestConfig(runRootDir);
+      const projectPath = path.join(runRootDir, "repo");
+      const parentWorkspaceId = "parent-reload";
+      const reportedTasks = Array.from({ length: reportedTaskCount }, (_unused, index) =>
+        projectWorkspace(projectPath, `reported-${index}`, `child-reported-${index}`, {
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+          taskModelString: "openai:gpt-5.2",
+        })
+      );
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [projectWorkspace(projectPath, "parent", parentWorkspaceId), ...reportedTasks],
+        testTaskSettings()
+      );
+      const { taskService } = createTaskServiceHarness(config);
+      const loadConfigSpy = spyOn(config, "loadConfigOrDefault");
+      try {
+        await taskService.initialize();
+        return loadConfigSpy.mock.calls.length;
+      } finally {
+        loadConfigSpy.mockRestore();
+      }
+    };
+
+    const loadsWithTwoTasks = await countConfigLoadsDuringInitialize(2);
+    const loadsWithSixTasks = await countConfigLoadsDuringInitialize(6);
+    expect(loadsWithSixTasks).toBe(loadsWithTwoTasks);
+  });
+
+  test("startup cleanup confirms a snapshot-eligible task on fresh config before removing it", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-cleanup-live";
+    const reactivatedTaskId = "child-workflow-reactivated";
+    const turnStartingTaskId = "child-workflow-turn-starting";
+    const staleTaskId = "child-workflow-stale";
+    const workflowTask = (stepId: string) => ({
+      parentWorkspaceId,
+      agentId: "exec",
+      agentType: "exec",
+      taskStatus: "reported" as const,
+      reportedAt: "2026-08-10T00:00:00.000Z",
+      taskModelString: "openai:gpt-5.2",
+      workflowTask: { runId: "wfr_cleanup_live", stepId },
+    });
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "reactivated", reactivatedTaskId, workflowTask("a")),
+        projectWorkspace(projectPath, "turn-starting", turnStartingTaskId, workflowTask("c")),
+        projectWorkspace(projectPath, "stale", staleTaskId, workflowTask("b")),
+      ],
+      testTaskSettings()
+    );
+    const snapshot = config.loadConfigOrDefault();
+    // After the startup snapshot, a client reactivated one child, and another got an
+    // existing-workspace turn whose execution mirror is starting before any stream registers
+    // (taskStatus stays "reported" on that path).
+    await config.editConfig((cfg) => {
+      const workspaces = cfg.projects.get(projectPath)?.workspaces ?? [];
+      const reactivated = workspaces.find((workspace) => workspace.id === reactivatedTaskId);
+      if (reactivated) {
+        reactivated.taskStatus = "running";
+        reactivated.reportedAt = undefined;
+      }
+      const turnStarting = workspaces.find((workspace) => workspace.id === turnStartingTaskId);
+      if (turnStarting) {
+        turnStarting.taskExecutionId = "wst_turn_starting";
+        turnStarting.taskExecutionStatus = "starting";
+      }
+      return cfg;
+    });
+
+    const { workspaceService } = createWorkspaceServiceMocks({
+      remove: createConfigBackedRemoveMock(config),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internals = taskService as unknown as {
+      cleanupReportedLeafTask: (
+        workspaceId: string,
+        options?: { config?: ProjectsConfig }
+      ) => Promise<number>;
+    };
+
+    expect(await internals.cleanupReportedLeafTask(reactivatedTaskId, { config: snapshot })).toBe(
+      0
+    );
+    expect(await internals.cleanupReportedLeafTask(turnStartingTaskId, { config: snapshot })).toBe(
+      0
+    );
+    expect(await internals.cleanupReportedLeafTask(staleTaskId, { config: snapshot })).toBe(1);
+    expect(findWorkspaceInConfig(config, reactivatedTaskId)?.taskStatus).toBe("running");
+    expect(findWorkspaceInConfig(config, turnStartingTaskId)?.taskExecutionStatus).toBe("starting");
+    expect(findWorkspaceInConfig(config, staleTaskId)).toBeUndefined();
+  });
+
+  test("startup cleanup continues from the parent the live confirmation saw after a re-parent", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const rootWorkspaceId = "parent-cleanup-reparent-root";
+    const oldParentId = "child-workflow-reparent-old-parent";
+    const newParentId = "child-workflow-reparent-new-parent";
+    const leafTaskId = "child-workflow-reparent-leaf";
+    const workflowTask = (stepId: string, parentWorkspaceId: string) => ({
+      parentWorkspaceId,
+      agentId: "exec",
+      agentType: "exec",
+      taskStatus: "reported" as const,
+      reportedAt: "2026-08-10T00:00:00.000Z",
+      taskModelString: "openai:gpt-5.2",
+      workflowTask: { runId: "wfr_cleanup_reparent", stepId },
+    });
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootWorkspaceId),
+        projectWorkspace(
+          projectPath,
+          "old-parent",
+          oldParentId,
+          workflowTask("old", rootWorkspaceId)
+        ),
+        projectWorkspace(
+          projectPath,
+          "new-parent",
+          newParentId,
+          workflowTask("new", rootWorkspaceId)
+        ),
+        projectWorkspace(projectPath, "leaf", leafTaskId, workflowTask("leaf", oldParentId)),
+      ],
+      testTaskSettings()
+    );
+    const snapshot = config.loadConfigOrDefault();
+
+    // A client re-parents the leaf after the snapshot screen, before remove() takes the lifecycle
+    // lock; the live confirmation inside remove() sees the new parent.
+    const remove = mock(
+      async (
+        workspaceId: string,
+        _force?: boolean,
+        options?: { beforeRemove?: () => Promise<boolean> }
+      ): Promise<Result<void>> => {
+        if (workspaceId === leafTaskId) {
+          await config.editConfig((cfg) => {
+            const leaf = cfg.projects
+              .get(projectPath)
+              ?.workspaces.find((workspace) => workspace.id === leafTaskId);
+            if (leaf) leaf.parentWorkspaceId = newParentId;
+            return cfg;
+          });
+        }
+        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+          return Ok(undefined);
+        }
+        await removeWorkspaceFromTestConfig(config, workspaceId);
+        return Ok(undefined);
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internals = taskService as unknown as {
+      cleanupReportedLeafTask: (
+        workspaceId: string,
+        options?: { config?: ProjectsConfig }
+      ) => Promise<number>;
+    };
+
+    // Removing the leaf makes its live parent a structural leaf, so cleanup prunes that one
+    // next; the former parent had nothing removed under it and stays.
+    expect(await internals.cleanupReportedLeafTask(leafTaskId, { config: snapshot })).toBe(2);
+    expect(findWorkspaceInConfig(config, leafTaskId)).toBeUndefined();
+    expect(findWorkspaceInConfig(config, newParentId)).toBeUndefined();
+    expect(findWorkspaceInConfig(config, oldParentId)).toBeDefined();
   });
 
   test("bare compaction stream-end resumes the pre-compaction parent identity", async () => {
@@ -20014,6 +20298,219 @@ describe("TaskService", () => {
 
     expect(remove).not.toHaveBeenCalled();
   });
+  test("startup best-of finalization defers while a reawakened sibling is executing again", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-best-of-reawakened-sibling";
+    const childOneId = "child-best-of-reawakened-sibling-1";
+    const childTwoId = "child-best-of-reawakened-sibling-2";
+    const partialTimestamp = Date.now();
+    const currentCreatedAt = new Date(partialTimestamp + 60_000).toISOString();
+    const bestOf = {
+      groupId: "best-of-reawakened-sibling",
+      index: 0,
+      total: 2,
+    } as const;
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        {
+          path: path.join(projectPath, "child-1"),
+          id: childOneId,
+          name: "agent_explore_child_1",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          createdAt: currentCreatedAt,
+          bestOf,
+        },
+        {
+          // Reported, then reawakened by a client: its old artifact is about to be replaced.
+          path: path.join(projectPath, "child-2"),
+          id: childTwoId,
+          name: "agent_explore_child_2",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          taskExecutionStatus: "running",
+          taskExecutionId: "wst_reawakened_child_2",
+          createdAt: currentCreatedAt,
+          bestOf: { ...bestOf, index: 1 },
+        },
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const parentPartial = createMuxMessage(
+      "assistant-parent-best-of-reawakened-sibling",
+      "assistant",
+      "Waiting on best-of subagents…",
+      { timestamp: partialTimestamp },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "task-best-of-reawakened-sibling-call",
+          toolName: "task",
+          input: {
+            subagent_type: "explore",
+            prompt: "compare options",
+            title: "Best of 2",
+            n: 2,
+          },
+          state: "input-available",
+        },
+      ]
+    );
+    expect((await partialService.writePartial(parentId, parentPartial)).success).toBe(true);
+
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
+    for (const [childTaskId, reportMarkdown] of [
+      [childOneId, "Report from child one"],
+      [childTwoId, "Report from child two (pre-continuation)"],
+    ] as const) {
+      await upsertSubagentReportArtifact({
+        workspaceId: parentId,
+        workspaceSessionDir: parentSessionDir,
+        childTaskId,
+        parentWorkspaceId: parentId,
+        ancestorWorkspaceIds: [parentId],
+        reportMarkdown,
+        nowMs: Date.now(),
+      });
+    }
+
+    await taskService.runStartupHousekeeping();
+
+    const updatedParentPartial = await partialService.readPartial(parentId);
+    expect(updatedParentPartial).not.toBeNull();
+    const toolPart = updatedParentPartial?.parts.find(
+      (part) => isDynamicToolPart(part) && part.toolName === "task"
+    );
+    expect(toolPart && "state" in toolPart ? toolPart.state : undefined).toBe("input-available");
+  });
+  test("startup best-of finalization never lands on a partial a live parent turn replaced", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-best-of-superseded";
+    const childOneId = "child-best-of-superseded-1";
+    const childTwoId = "child-best-of-superseded-2";
+    const partialTimestamp = Date.now();
+    const currentCreatedAt = new Date(partialTimestamp + 60_000).toISOString();
+    const bestOf = { groupId: "best-of-superseded", index: 0, total: 2 } as const;
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child-1", childOneId, {
+          name: "agent_explore_child_1",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          createdAt: currentCreatedAt,
+          bestOf,
+        }),
+        projectWorkspace(projectPath, "child-2", childTwoId, {
+          name: "agent_explore_child_2",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          createdAt: currentCreatedAt,
+          bestOf: { ...bestOf, index: 1 },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const crashPartial = createMuxMessage(
+      "assistant-parent-best-of-superseded-crash",
+      "assistant",
+      "Waiting on best-of subagents…",
+      { timestamp: partialTimestamp },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "task-best-of-superseded-call",
+          toolName: "task",
+          input: { subagent_type: "explore", prompt: "compare options", title: "Best of 2", n: 2 },
+          state: "input-available",
+        },
+      ]
+    );
+    expect((await partialService.writePartial(parentId, crashPartial)).success).toBe(true);
+    const parentSessionDir = path.join(config.sessionsDir, parentId);
+    for (const [childTaskId, reportMarkdown] of [
+      [childOneId, "Report from child one"],
+      [childTwoId, "Report from child two"],
+    ] as const) {
+      await upsertSubagentReportArtifact({
+        workspaceId: parentId,
+        workspaceSessionDir: parentSessionDir,
+        childTaskId,
+        parentWorkspaceId: parentId,
+        ancestorWorkspaceIds: [parentId],
+        reportMarkdown,
+        nowMs: Date.now(),
+      });
+    }
+
+    // A parent turn that starts while finalization is still assembling the grouped output
+    // commits the crash partial and writes its own under a new message id. Finalization reads
+    // the crash partial once to resolve the group and once more to finalize; the turn lands
+    // right after that second read.
+    const liveTurnPartial = createMuxMessage(
+      "assistant-parent-best-of-superseded-live-turn",
+      "assistant",
+      "Working on the follow-up…",
+      { timestamp: partialTimestamp + 120_000 },
+      []
+    );
+    const originalReadPartial = partialService.readPartial.bind(partialService);
+    let crashPartialReads = 0;
+    const readPartialSpy = spyOn(partialService, "readPartial").mockImplementation(
+      async (workspaceId: string) => {
+        const current = await originalReadPartial(workspaceId);
+        if (workspaceId === parentId && current?.id === crashPartial.id) {
+          crashPartialReads += 1;
+          if (crashPartialReads === 2) {
+            await partialService.writePartial(parentId, liveTurnPartial);
+          }
+        }
+        return current;
+      }
+    );
+    try {
+      await taskService.runStartupHousekeeping();
+    } finally {
+      readPartialSpy.mockRestore();
+    }
+
+    const parentPartial = await partialService.readPartial(parentId);
+    expect(parentPartial?.id).toBe(liveTurnPartial.id);
+    expect(
+      parentPartial?.parts.some((p) => (p as { type?: unknown }).type === "dynamic-tool")
+    ).toBe(false);
+  });
 
   test("initialize finalizes ready legacy variants partials", async () => {
     const parentId = "parent-legacy-variants-initialize";
@@ -21771,6 +22268,26 @@ describe("TaskService", () => {
     expect(childEntry?.runtimeConfig?.type).toBe("worktree");
   }, 20_000);
 
+  /**
+   * A remove() stand-in that mirrors the real one: the under-lock `beforeRemove` precondition
+   * decides whether the workspace actually leaves the config.
+   */
+  function createConfigBackedRemoveMock(config: Config) {
+    return mock(
+      async (
+        workspaceId: string,
+        _force?: boolean,
+        options?: { beforeRemove?: () => Promise<boolean> }
+      ): Promise<Result<void>> => {
+        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+          return Ok(undefined);
+        }
+        await removeWorkspaceFromTestConfig(config, workspaceId);
+        return Ok(undefined);
+      }
+    );
+  }
+
   async function removeWorkspaceFromTestConfig(config: Config, workspaceId: string): Promise<void> {
     const cfg = config.loadConfigOrDefault();
     let removed = false;
@@ -22110,10 +22627,7 @@ describe("TaskService", () => {
       });
 
       const isStreaming = mock(() => false);
-      const remove = mock(async (workspaceId: string, _force?: boolean): Promise<Result<void>> => {
-        await removeWorkspaceFromTestConfig(config, workspaceId);
-        return Ok(undefined);
-      });
+      const remove = createConfigBackedRemoveMock(config);
       const { aiService } = createAIServiceMocks(config, { isStreaming });
       const { workspaceService } = createWorkspaceServiceMocks({ remove });
       const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
@@ -22175,10 +22689,7 @@ describe("TaskService", () => {
       });
       await internal.cleanupReportedLeafTask(childTaskId);
 
-      expect(remove.mock.calls).toEqual([
-        [childTaskId, true],
-        [workflowTaskId, true],
-      ]);
+      expect(remove.mock.calls.map((call) => call[0])).toEqual([childTaskId, workflowTaskId]);
       expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
       expect(findWorkspaceInConfig(config, workflowTaskId)).toBeUndefined();
     });

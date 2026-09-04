@@ -410,6 +410,23 @@ export class DevToolsService extends EventEmitter {
     this.emit(`update:${workspaceId}`, event);
   }
 
+  /** Whether removeWorkspaceData() has anything to remove: live in-memory state or the on-disk log. */
+  async hasWorkspaceData(workspaceId: string): Promise<boolean> {
+    assert(
+      workspaceId.trim().length > 0,
+      "DevToolsService.hasWorkspaceData requires a workspaceId"
+    );
+    if (this.workspaces.has(workspaceId)) {
+      return true;
+    }
+    try {
+      await fs.access(this.getSessionFilePath(workspaceId));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private getSessionFilePath(workspaceId: string): string {
     return path.join(this.config.sessionsDir, workspaceId, "devtools.jsonl");
   }
