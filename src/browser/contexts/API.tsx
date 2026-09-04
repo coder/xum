@@ -1,3 +1,5 @@
+import { SERVER_VERSION_CHECK_TIMEOUT_MS } from "@/constants/serverUpdate";
+import { VERSION } from "@/version";
 import {
   createContext,
   useContext,
@@ -254,7 +256,31 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
         client.general
           .ping("auth-check")
-          .then(() => {
+          .then(async () => {
+            // A reconnected socket may belong to a newer server than this loaded bundle.
+            if (hasConnectedRef.current && connectionId === connectionIdRef.current) {
+              try {
+                const response = await fetch(`${getBrowserBackendBaseUrl()}/version`, {
+                  cache: "no-store",
+                  signal: AbortSignal.timeout(SERVER_VERSION_CHECK_TIMEOUT_MS),
+                });
+                const version: unknown = response.ok ? await response.json() : null;
+                if (
+                  connectionId === connectionIdRef.current &&
+                  version &&
+                  typeof version === "object" &&
+                  "git_commit" in version &&
+                  typeof version.git_commit === "string" &&
+                  version.git_commit.length > 0 &&
+                  version.git_commit !== VERSION.git_commit
+                ) {
+                  window.location.reload();
+                  return;
+                }
+              } catch {
+                // Version discovery must not prevent reconnecting after a transient HTTP failure.
+              }
+            }
             // Ignore stale connections (e.g., auth-check returned after a new connect()).
             if (connectionId !== connectionIdRef.current) {
               cleanup();

@@ -1,3 +1,4 @@
+import type { RestartBlocker } from "@/common/orpc/types";
 import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -1804,6 +1805,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
+  private shuttingDown = false;
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
       ...this.sessions.entries(),
@@ -3951,6 +3953,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
+  collectRestartBlockers(): RestartBlocker[] {
+    const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
+    const pendingTurns = new Set(this.preflightSendCounts.keys());
+    let queuedMessages = 0;
+    let autoRetries = 0;
+    for (const [workspaceId, session] of sessions) {
+      if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
+      if (session.hasQueuedMessages()) queuedMessages++;
+      if (session.hasPendingAutoRetry()) autoRetries++;
+    }
+    const blockers: RestartBlocker[] = [
+      { kind: "pending-turns", count: pendingTurns.size },
+      { kind: "workspace-inits", count: this.initSettlementPromises.size },
+      { kind: "queued-messages", count: queuedMessages },
+      { kind: "auto-retries", count: autoRetries },
+      {
+        kind: "background-processes",
+        count: Array.from(this.preflightExecCounts.values()).reduce((sum, count) => sum + count, 0),
+      },
+    ];
+    return blockers.filter((blocker) => blocker.count > 0);
+  }
+
   /**
    * Shutdown: stop startup chat recovery before the services it dispatches through go away.
    * Transient recovery sessions are disposed outright. Sessions that outlived that sweep (promoted
@@ -3958,6 +3983,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
    */
   beginShutdown(): void {
+    this.shuttingDown = true;
     for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
       this.transientStartupRecoverySessions.delete(workspaceId);
       session.dispose();
@@ -4016,6 +4042,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private createSession(workspaceId: string): AgentSession {
+    if (this.shuttingDown) throw new Error("Server is shutting down");
     return new AgentSession({
       workspaceId,
       config: this.config,
@@ -14200,6 +14227,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     command?: string,
     args?: string[]
   ): Promise<Result<BashToolResult>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     // Block bash execution while workspace is being removed to prevent races with directory deletion.
     // A common case: subagent calls agent_report → frontend's GitStatusStore triggers a git status
     // refresh → executeBash arrives while remove() is deleting the directory → spawn fails with ENOENT.

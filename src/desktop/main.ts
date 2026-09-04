@@ -997,8 +997,7 @@ function createWindow() {
       void prompt
         .then(({ response }) => {
           if (response === 0) {
-            services?.updateService.install();
-            return;
+            return services?.updateService.install();
           }
 
           if (response === 1) {
