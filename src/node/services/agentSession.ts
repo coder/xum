@@ -2521,7 +2521,22 @@ export class AgentSession {
       }
 
       const { agentInitiated, goalKind, goalId, ...resumeOptions } = retryRequest;
-      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId);
+      // A row cut for a queued message carries what the turn had left of its ceiling; the retry
+      // continues that turn, so it runs under the remainder (and is abandoned at zero) rather
+      // than a fresh ceiling.
+      const interruptedAssistant =
+        partial?.role === "assistant"
+          ? partial
+          : lastHistoryMessage?.role === "assistant"
+            ? lastHistoryMessage
+            : undefined;
+      this.setAutoRetryResumeState(
+        resumeOptions,
+        agentInitiated,
+        goalKind,
+        goalId,
+        interruptedAssistant?.metadata?.stepsRemaining
+      );
     }
 
     // Disk reads above may race with user actions; retry once the current work settles
@@ -3365,6 +3380,31 @@ export class AgentSession {
         )
       );
     };
+    const rollbackRefusedLaunchRows = async (): Promise<void> => {
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      const historySequences = historyResult.success
+        ? historyResult.data
+            .filter((message) => persistedCancelableMessageIds.includes(message.id))
+            .map((message) => message.metadata?.historySequence)
+            .filter((sequence): sequence is number => isNonNegativeInteger(sequence))
+        : [];
+      if (!(await rollbackPersistedTurnRows())) {
+        return;
+      }
+      if (historySequences.length > 0) {
+        this.emitChatEvent({ type: "delete", historySequences });
+      }
+      try {
+        await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
+      } catch (error) {
+        log.warn("Failed to resync goal state after a refused launch", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    };
     let cancellationHandled = false;
     let cancellationDisabled = false;
     const cancelBeforeAcceptance = async (): Promise<boolean> => {
@@ -4157,6 +4197,8 @@ export class AgentSession {
     // leaves no trace for a later human resume to replay into provider context. Past this point
     // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
+    // The one exception is a synthetic continuation refused by its own launch probe
+    // (rollbackRefusedLaunchRows), which re-derives goal state after removing its rows.
     if (internal?.admissionStale?.() === true) {
       const rolledBack = await rollbackPersistedTurnRows();
       // Probe-carrying sends are peer messages whose caller already returned success when the
@@ -4393,6 +4435,19 @@ export class AgentSession {
               "Accepted stream startup was canceled during preparation."
             )
           );
+        }
+        // The send's own launch probe refused the turn at the boundary (Ok with the turn still
+        // PREPARING, nothing registered): the goal or delegated turn this synthetic continuation
+        // served ended during startup. Its rows would otherwise sit at the tail as a prompt the
+        // next unrelated request replays, so they go with the launch; goal state re-derives from
+        // the tail they leave (the one rollback past goal sync, see the horizon note above).
+        if (
+          streamResult.success &&
+          this.turnPhase === TurnPhase.PREPARING &&
+          !hasPreTurnMessages &&
+          internal?.refuseStreamStart?.() === true
+        ) {
+          await rollbackRefusedLaunchRows();
         }
         return streamResult;
       } finally {
@@ -8325,12 +8380,21 @@ export class AgentSession {
       return dropFollowUp("legacy goal follow-up without goal identity.");
     }
 
-    // Same raw JSON boundary: the interrupted turn's remainder is optional and dropped if malformed
-    // (the follow-up then runs under the default ceiling and its model's own chain).
-    const persistedStepBudget =
-      typeof followUp.stepBudget === "number" && Number.isInteger(followUp.stepBudget)
-        ? Math.max(0, followUp.stepBudget)
-        : undefined;
+    // Same raw JSON boundary. A present but malformed remainder fails closed: the interrupted turn
+    // ran under a ceiling this row can no longer state, and an absent-legacy reading would hand a
+    // nearly spent autonomous turn the default ceiling instead. The chain state is only a
+    // preference order, so a malformed one falls back to the model's own chain.
+    const persistedStepBudget = followUp.stepBudget;
+    if (
+      persistedStepBudget !== undefined &&
+      !(Number.isInteger(persistedStepBudget) && persistedStepBudget >= 0)
+    ) {
+      log.warn("Discarding pending follow-up with a malformed persisted step budget", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      return dropFollowUp("malformed persisted step budget.");
+    }
     const persistedFallbackProgress =
       followUp.modelFallbackProgress != null
         ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)

@@ -937,6 +937,8 @@ export interface MuxMetadata {
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
   partial?: boolean; // Whether this message was interrupted and is incomplete
+  /** Steps a queued-message cut left under the turn's ceiling; a startup retry runs under it. */
+  stepsRemaining?: number;
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
    * For queue-dispatched user turns: when the user last added to the queued

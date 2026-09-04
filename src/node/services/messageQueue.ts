@@ -286,28 +286,29 @@ export class MessageQueue {
   }
 
   /**
-   * Whether every queued entry continues the exact workspace turn correlation.
+   * Whether every pending queued entry continues the exact workspace turn correlation.
    *
    * The caller uses this for a new continuation that has not entered the queue.
-   * An unrelated entry anywhere ahead of it supersedes the correlation.
+   * An unrelated pending entry anywhere ahead of it supersedes the correlation; a withdrawn
+   * entry still draining is not pending work (see nextDispatchableEntry) and supersedes nothing.
    */
   hasAllWorkspaceTurnContinuations(
     taskHandleId: string,
     ownerWorkspaceId: string,
     turnId: string
   ): boolean {
-    return (
-      this.entries.length > 0 &&
-      this.entries.every((entry) => {
-        const metadata = entry.muxMetadata;
-        return (
-          isWorkspaceTurnMetadata(metadata) &&
-          metadata.taskHandleId === taskHandleId &&
-          metadata.ownerWorkspaceId === ownerWorkspaceId &&
-          metadata.turnId === turnId
-        );
-      })
-    );
+    return this.entries.every((entry) => {
+      if (entry.cancelSignal?.aborted === true) {
+        return true;
+      }
+      const metadata = entry.muxMetadata;
+      return (
+        isWorkspaceTurnMetadata(metadata) &&
+        metadata.taskHandleId === taskHandleId &&
+        metadata.ownerWorkspaceId === ownerWorkspaceId &&
+        metadata.turnId === turnId
+      );
+    });
   }
 
   /**

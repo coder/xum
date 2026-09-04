@@ -1966,12 +1966,21 @@ export class StreamManager {
       streamInfo
     );
 
+    // A queued-message cut owes the turn a continuation under what it left of the ceiling. The
+    // committed partial is that remainder's only durable carrier: a process exit before the
+    // in-memory resume starts leaves startup recovery to retry the row from history.
+    const stepsRemaining =
+      abortReason === "queued-message" ? this.remainingStepBudget(streamInfo) : undefined;
+
     // Stamp the aborted turn's usage onto the partial message BEFORE emitting
     // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
     // prices history rows from metadata.usage, so without this every
     // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
     // would ingest as $0 even though the provider billed all completed steps.
-    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+    if (
+      !abandonPartial &&
+      (usage !== undefined || streamInfo.toolModelUsages.length > 0 || stepsRemaining !== undefined)
+    ) {
       try {
         await this.awaitPendingPartialWrite(streamInfo);
         const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
@@ -1984,6 +1993,7 @@ export class StreamManager {
             ...(streamInfo.toolModelUsages.length > 0
               ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
               : {}),
+            ...(stepsRemaining !== undefined ? { stepsRemaining } : {}),
           },
         });
         await this.historyService.writePartial(workspaceId as string, partialMessage);

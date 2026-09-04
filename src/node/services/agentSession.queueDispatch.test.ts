@@ -1204,6 +1204,57 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a send refused by its launch probe at the boundary leaves no durable row", async () => {
+    const workspaceId = "queue-dispatch-send-launch-refused";
+    const aiEmitter = new EventEmitter();
+    let refused = false;
+    const streamMessage = mock((_options: StreamMessageOptions) => {
+      // The goal is paused right before registration: StreamManager returns a startup-aborted
+      // handle without a stream-start.
+      refused = true;
+      return Promise.resolve(
+        Ok({
+          messageId: "assistant-1",
+          completion: Promise.resolve({ status: "aborted" as const, abortReason: "startup" }),
+        })
+      );
+    });
+    const { session, historyService, events, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: { streamMessage: streamMessage as unknown as AIService["streamMessage"] },
+      captureEvents: true,
+    });
+
+    try {
+      const sent = await session.sendMessage(
+        "Continue",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, refuseStreamStart: () => refused }
+      );
+      expect(sent.success).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+
+      // The row was persisted and shown, then withdrawn with the launch it was appended for.
+      const persisted = events.find((event) => event.type === "message" && event.role === "user");
+      const persistedSequence =
+        persisted?.type === "message" ? persisted.metadata?.historySequence : undefined;
+      expect(persistedSequence).toBeDefined();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data.some((message) => message.role === "user")).toBe(
+        false
+      );
+      const deleted = events.find((event) => event.type === "delete");
+      expect(deleted?.type === "delete" ? deleted.historySequences : undefined).toEqual([
+        persistedSequence ?? -1,
+      ]);
+      expect(session.isBusy()).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("an auto-retry runs under what the failed resumed attempt left of the step budget", async () => {
     const workspaceId = "queue-dispatch-stranded-retry-step-budget";
     const aiEmitter = new EventEmitter();

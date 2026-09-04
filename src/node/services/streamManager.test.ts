@@ -2593,6 +2593,7 @@ describe("StreamManager - turn completion", () => {
     sink?: (event: TurnEngineEvent) => void | Promise<void>;
     events?: TurnEngineEvent[];
     toolPolicy?: ToolPolicy;
+    stepBudget?: number;
   }) {
     const streamManager = new StreamManager(
       historyService,
@@ -2618,6 +2619,7 @@ describe("StreamManager - turn completion", () => {
         model: createTestLanguageModel(),
         providedRuntimeTempDir: "",
         toolPolicy: input.toolPolicy,
+        stepBudget: input.stepBudget,
       })
     );
     expect(result.success).toBe(true);
@@ -2644,6 +2646,7 @@ describe("StreamManager - turn completion", () => {
       const started = await startWithStreamResult({
         workspaceId,
         messageId: "soft-stop-required-message",
+        stepBudget: 5,
         toolPolicy: [{ regex_match: requiredToolCase.requiredTool, action: "require" }],
         sink: (event) => {
           events.push(event);
@@ -2695,6 +2698,9 @@ describe("StreamManager - turn completion", () => {
       expect(abort.metadata?.requiredToolSatisfied).toBe(
         requiredToolCase.satisfied ? true : undefined
       );
+      // The cut's remainder rides on the committed partial for a startup retry after a crash.
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.metadata?.stepsRemaining).toBe(4);
     });
   }
 

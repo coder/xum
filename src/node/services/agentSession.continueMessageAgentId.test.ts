@@ -675,14 +675,13 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(summary?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
   });
 
-  test("dispatchPendingFollowUp drops a malformed persisted remainder", async () => {
+  test("dispatchPendingFollowUp drops a malformed persisted chain state", async () => {
     const dispatched: SendInternal[] = [];
     const { internals } = await createSession([
-      compactionSummaryMessage("summary-malformed-remainder", {
+      compactionSummaryMessage("summary-malformed-chain", {
         text: "Continue",
         model: "openai:gpt-4o",
         agentId: "exec",
-        stepBudget: "seven" as unknown as number,
         modelFallbackProgress: {
           requestedModel: 1,
         } as unknown as CompactionFollowUpRequest["modelFallbackProgress"],
@@ -697,9 +696,37 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     await internals.dispatchPendingFollowUp();
 
+    // The chain state is only a preference order: the follow-up runs on its model's own chain.
     expect(dispatched).toHaveLength(1);
-    expect(dispatched[0]?.stepBudget).toBeUndefined();
     expect(dispatched[0]?.modelFallbackProgress).toBeUndefined();
+  });
+
+  test("dispatchPendingFollowUp settles and drops a follow-up whose persisted step budget is malformed", async () => {
+    const settle = mock((_correlation: unknown, _reason: string) => Promise.resolve());
+    const sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    const { internals, historyService } = await createSession(
+      [
+        compactionSummaryMessage("summary-malformed-budget", {
+          text: "Continue",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          stepBudget: "seven" as unknown as number,
+          muxMetadata: DELEGATED_TURN,
+        }),
+      ],
+      { settleForfeitedWorkspaceTurnContinuation: settle }
+    );
+    internals.sendMessage = sendMessage;
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+
+    // The interrupted turn's ceiling is unknowable from this row; it must not get the default one.
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle.mock.calls[0]?.[0]).toEqual(DELEGATED_TURN);
+    const tail = await historyService.getLastMessages("ws", 1);
+    const summary = tail.success ? tail.data[0] : undefined;
+    expect(summary?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
   });
 
   test("dispatchPendingFollowUp forwards strictAgentResolution to the resumed turn", async () => {

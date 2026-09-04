@@ -604,6 +604,30 @@ describe("MessageQueue", () => {
       ).toBe(false);
     });
 
+    it("ignores withdrawn predecessors when checking that every entry continues the turn", () => {
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { synthetic: true, agentInitiated: true, cancelSignal: withdrawn.signal }
+      );
+      queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(false);
+
+      // Withdrawn but not yet drained: no longer pending work, so it supersedes nothing.
+      withdrawn.abort();
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+    });
+
     it("reads the next entry past withdrawn ones for wake, correlation, and cut candidate", () => {
       const withdrawn = new AbortController();
       queue.add(
