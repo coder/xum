@@ -957,9 +957,9 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
-          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1009,9 +1009,9 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
-          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1100,9 +1100,9 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
-          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1281,9 +1281,9 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
-          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
@@ -1337,9 +1337,9 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
-          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
           preflightArchiveWorkspace: () =>
             Promise.resolve({ success: true, data: { kind: "ready" } }),
           archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
