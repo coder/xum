@@ -1,8 +1,12 @@
+import assert from "@/common/utils/assert";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
-import { STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import {
+  STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+  STARTUP_STEP_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
 import type { CoreServices } from "@/node/services/coreServices";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
@@ -49,6 +53,7 @@ import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeS
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { ORPCContext } from "@/node/orpc/context";
+import { Duration, Effect } from "effect";
 import type { Scope } from "effect";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import {
@@ -128,6 +133,31 @@ import {
   WorkspaceTurnManagerTag,
   type AppTags,
 } from "@/node/services/di/tags";
+
+/**
+ * A hard startup step of `ServiceContainer.initializeCore()` did not settle
+ * within `STARTUP_STEP_TIMEOUT_MS`. Rejects `initializeCore()` like any other
+ * step failure, so the roots' existing startup-failure paths apply unchanged;
+ * `name` is set explicitly so their default `Error` formatting (desktop
+ * "Startup Failed" dialog, `Failed to initialize server:` line) shows the
+ * class together with the step.
+ */
+export class StartupStepTimeoutError extends Error {
+  constructor(
+    readonly step: string,
+    readonly timeoutMs: number
+  ) {
+    super(`${step} exceeded ${timeoutMs} ms`);
+    this.name = "StartupStepTimeoutError";
+  }
+}
+
+interface StartupStep {
+  /** `stepDurationsMs` key of the startup completion log and `StartupStepTimeoutError.step`. */
+  readonly name: string;
+  readonly run: () => Promise<void>;
+}
+
 /**
  * ServiceContainer - Central dependency container for all backend services.
  *
@@ -306,6 +336,10 @@ export class ServiceContainer {
     this.idleDispatcher = get(IdleDispatcherTag);
     this.heartbeatService = get(Heartbeat);
     this.agentStatusService = get(AgentStatus);
+    assert(
+      new Set(this.startupCoreSteps.map((step) => step.name)).size === this.startupCoreSteps.length,
+      "startupCoreSteps names must be unique (they key stepDurationsMs)"
+    );
   }
 
   async initialize(): Promise<void> {
@@ -323,35 +357,83 @@ export class ServiceContainer {
   }
 
   /**
-   * Everything request handling depends on, plus agent-task restart recovery. The server entry
-   * point awaits this before binding its listener: task recovery must finish before any client
-   * can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and it is
-   * bounded by the number of active tasks rather than by deployment size. The per-workspace
+   * The hard startup steps, in order: everything request handling depends on, plus agent-task
+   * restart recovery. All five are mandatory — a failure stops startup — and every name is a
+   * `stepDurationsMs` key of the `[startup] ServiceContainer.initialize completed` line (and the
+   * `step` of a `StartupStepTimeoutError`), so names and order are an observability contract.
+   * Downgrading a step to best-effort is runStartupHousekeeping()'s policy, not a change here.
+   */
+  private readonly startupCoreSteps: ReadonlyArray<StartupStep> = [
+    { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
+    { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
+    // Startup gating
+    { name: "policyService.initialize", run: () => this.policyService.initialize() },
+    { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
+    {
+      name: "taskService.recoverInterruptedTasks",
+      run: () => this.taskService.recoverInterruptedTasks(),
+    },
+  ];
+
+  /**
+   * Runs `startupCoreSteps` on the app runtime (startup contract in di/appRuntime.ts). The
+   * server entry point awaits this before binding its listener: task recovery must finish before
+   * any client can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and
+   * it is bounded by the number of active tasks rather than by deployment size. The per-workspace
    * housekeeping lives in runStartupHousekeeping().
+   *
+   * Rejects with the failing step's own error (identity preserved — a synchronous throw included)
+   * or with a `StartupStepTimeoutError` once a step exceeds `STARTUP_STEP_TIMEOUT_MS` on the
+   * runtime clock; later steps do not run. A timed-out step keeps running as a plain promise
+   * (nothing here observes its result afterwards), which is why every root runs the bounded
+   * `dispose()` before exiting on a rejected startup. Not re-entrancy guarded: a second call
+   * re-runs the steps, as the plain promise chain did.
    */
   async initializeCore(): Promise<void> {
-    this.startupStartedAt = Date.now();
+    assert(this.disposePromise === null, "ServiceContainer.initializeCore() after dispose()");
+    await this.runtime.managed.runPromise(this.startupCoreEffect());
+  }
 
-    log.info("[startup] ServiceContainer.initialize starting");
+  private startupCoreEffect(): Effect.Effect<void, unknown> {
+    const self = this;
+    return Effect.gen(function* () {
+      self.startupStartedAt = Date.now();
+      log.info("[startup] ServiceContainer.initialize starting");
+      for (const step of self.startupCoreSteps) {
+        yield* self.timedStartupStep(step);
+      }
+    });
+  }
 
-    await this.recordStartupStep("extensionMetadata.initialize", () =>
-      this.extensionMetadata.initialize()
-    );
-    // Initialize telemetry service
-    await this.recordStartupStep("telemetryService.initialize", () =>
-      this.telemetryService.initialize()
-    );
-
-    // Initialize policy service (startup gating)
-    await this.recordStartupStep("policyService.initialize", () => this.policyService.initialize());
-
-    await this.recordStartupStep("experimentsService.initialize", () =>
-      this.experimentsService.initialize()
-    );
-
-    await this.recordStartupStep("taskService.recoverInterruptedTasks", () =>
-      this.taskService.recoverInterruptedTasks()
-    );
+  /**
+   * One startup step as an effect. `tryPromise` with an identity catch keeps the rejection
+   * reason as the failure; the `async` thunk turns a synchronous throw into the same path.
+   * `timeoutOrElse` (not `timeout` + `catchTag`: the error channel is `unknown`, which
+   * `catchTag` cannot narrow) races the wait against the runtime clock and interrupts only the
+   * wait — the zero-arity thunk gets no AbortSignal, so the promise keeps running and its
+   * eventual settlement is a no-op on the exited fiber (`tryPromise` keeps a rejection handler
+   * attached, so a late rejection is never unhandled). The duration is recorded when the wait
+   * ends — settled, failed, or abandoned at the timeout — never by the abandoned step later.
+   */
+  private timedStartupStep(step: StartupStep): Effect.Effect<void, unknown> {
+    return Effect.suspend(() => {
+      const stepStartedAt = Date.now();
+      return Effect.tryPromise({
+        try: async () => step.run(),
+        catch: (error: unknown) => error,
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
+          orElse: () =>
+            Effect.fail(new StartupStepTimeoutError(step.name, STARTUP_STEP_TIMEOUT_MS)),
+        }),
+        Effect.ensuring(
+          Effect.sync(() => {
+            this.startupStepDurationsMs[step.name] = Date.now() - stepStartedAt;
+          })
+        )
+      );
+    });
   }
 
   /**
