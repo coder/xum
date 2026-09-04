@@ -678,6 +678,8 @@ interface WorkspaceStreamInfo {
   terminalRawFinishReason?: string;
   // Index into parts where the current step started (used to ensure safe retries)
   currentStepStartIndex: number;
+  // Exact SDK step starts; part shapes cannot distinguish consecutive tool-only steps.
+  stepStartIndices: number[];
   historySequence: number;
   // Track accumulated parts for partial message (includes reasoning, text, and tools)
   parts: CompletedMessagePart[];
@@ -2494,6 +2496,7 @@ export class StreamManager {
       stepTracker,
       receivedTerminalEvent: false,
       currentStepStartIndex: 0,
+      stepStartIndices: [0],
       request,
       historySequence,
       parts: [], // Initialize empty parts array
@@ -3057,6 +3060,9 @@ export class StreamManager {
         }),
         partial: true,
         ...options.metadata,
+        stepStartPartIndices: streamInfo.stepStartIndices.filter(
+          (index) => index < (options.parts ?? streamInfo.parts).length
+        ),
       },
       parts: options.parts ?? streamInfo.parts,
     };
@@ -3284,7 +3290,6 @@ export class StreamManager {
       preserveParts,
       workspaceLog,
     });
-    streamInfo.currentStepStartIndex = streamInfo.parts.length;
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
@@ -3380,7 +3385,6 @@ export class StreamManager {
       preserveUsage: true,
       workspaceLog,
     });
-    streamInfo.currentStepStartIndex = 0;
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
@@ -3435,7 +3439,7 @@ export class StreamManager {
 
             switch (part.type) {
               case "start-step": {
-                streamInfo.currentStepStartIndex = streamInfo.parts.length;
+                this.recordStepStart(streamInfo);
                 break;
               }
 
@@ -4036,6 +4040,9 @@ export class StreamManager {
                 metadata: {
                   ...streamEndEvent.metadata,
                   historySequence: streamInfo.historySequence,
+                  stepStartPartIndices: streamInfo.stepStartIndices.filter(
+                    (index) => index < streamInfo.parts.length
+                  ),
                 },
                 parts: streamInfo.parts,
               };
@@ -4463,6 +4470,14 @@ export class StreamManager {
     };
   }
 
+  private recordStepStart(streamInfo: WorkspaceStreamInfo): void {
+    const start = streamInfo.parts.length;
+    // Retries may discard parts. Drop stale/duplicate starts before reseeding.
+    streamInfo.stepStartIndices = streamInfo.stepStartIndices.filter((index) => index < start);
+    streamInfo.stepStartIndices.push(start);
+    streamInfo.currentStepStartIndex = start;
+  }
+
   private async resetStreamStateForRetry(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -4482,6 +4497,7 @@ export class StreamManager {
     if (!preserveParts) {
       streamInfo.reasoningBackfillStartIndex = undefined;
     }
+    this.recordStepStart(streamInfo);
     streamInfo.receivedTerminalEvent = false;
     streamInfo.terminalFinishReason = undefined;
     streamInfo.terminalRawFinishReason = undefined;
@@ -4585,7 +4601,6 @@ export class StreamManager {
       workspaceLog,
     });
 
-    streamInfo.currentStepStartIndex = streamInfo.parts.length;
     streamInfo.request = {
       ...streamInfo.request,
       ...(stepMessages ? { messages: stepMessages } : {}),
@@ -5310,6 +5325,8 @@ export class StreamManager {
         historySequence: number;
         startTime: number;
         parts: CompletedMessagePart[];
+        currentStepStartIndex: number;
+        stepStartIndices: number[];
         toolCompletionTimestamps: Map<string, number>;
         muxMetadata?: unknown;
       }
@@ -5329,6 +5346,8 @@ export class StreamManager {
         startTime: streamInfo.startTime,
         toolCompletionTimestamps: streamInfo.toolCompletionTimestamps ?? new Map(),
         parts: streamInfo.parts,
+        currentStepStartIndex: streamInfo.currentStepStartIndex,
+        stepStartIndices: streamInfo.stepStartIndices.slice(),
         // Correlation metadata for delegated work (e.g. workspace-turn
         // continuations); lets TaskService match a live continuation stream
         // to its still-open workspace-turn handle.

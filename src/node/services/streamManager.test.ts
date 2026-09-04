@@ -258,6 +258,7 @@ function createStreamInfoForTests(
     didRetryPreviousResponseIdAtStep: false,
     receivedTerminalEvent: false,
     currentStepStartIndex: 0,
+    stepStartIndices: [0],
     stepTracker: {},
     ...overrides,
   };
@@ -1731,6 +1732,7 @@ describe("StreamManager - refusal usage attribution", () => {
       cumulativeUsage: { inputTokens: 1200, outputTokens: 30, totalTokens: 1230 },
       cumulativeProviderMetadata: undefined,
       initialMetadata: undefined,
+      stepStartIndices: [0],
       parts: [],
       toolModelUsages: [],
       // No fallback chain: the terminal-refusal recording path runs.
@@ -1766,6 +1768,7 @@ describe("StreamManager - refusal usage attribution", () => {
       streamResult: { usage: Promise.resolve(undefined), finalStep: Promise.resolve(undefined) },
       startTime: Date.now(),
       initialMetadata: undefined,
+      stepStartIndices: [0],
       parts: [],
       toolModelUsages,
       abortController: { signal: { aborted: false } },
@@ -1822,6 +1825,7 @@ describe("StreamManager - refusal usage attribution", () => {
       cumulativeProviderMetadata: { anthropic: {} },
       startTime: Date.now(),
       initialMetadata: undefined,
+      stepStartIndices: [0],
       parts: [],
       toolModelUsages,
       abortController: { signal: { aborted: false } },
@@ -1980,6 +1984,7 @@ describe("StreamManager - refusal usage attribution", () => {
       model: "coder:openai/claude-opus-4-5",
       metadataModel: "anthropic:claude-opus-4-5",
       initialMetadata: undefined,
+      stepStartIndices: [0],
       parts: [],
       toolModelUsages: [],
     });
@@ -1992,6 +1997,7 @@ describe("StreamManager - refusal usage attribution", () => {
       model: "mux-gateway:anthropic/claude-opus-4-5",
       metadataModel: "anthropic:claude-opus-4-5",
       initialMetadata: undefined,
+      stepStartIndices: [0],
       parts: [],
       toolModelUsages: [],
     });
@@ -3152,6 +3158,84 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     expect(streamStartEmitted).toBe(false);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
+});
+
+describe("StreamManager - exact step indices", () => {
+  test("persists exact tool-only step boundaries through successful completion", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "step-indices-workspace";
+    const messageId = "step-indices-message";
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          for (const toolCallId of ["first", "second"]) {
+            yield { type: "start-step" };
+            // An empty/repeated SDK start must not create duplicate indices.
+            yield { type: "start-step" };
+            yield { type: "tool-call", toolCallId, toolName: "bash", input: { script: "pwd" } };
+            yield { type: "tool-result", toolCallId, toolName: "bash", output: "/tmp" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
+            };
+          }
+          yield { type: "start-step" };
+          yield { type: "finish", finishReason: "stop" };
+        })()
+      ),
+    });
+    await getProcessStreamWithCleanupForTests(streamManager).call(
+      streamManager,
+      workspaceId,
+      streamInfo,
+      1
+    );
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    const committed = history.data.find((row) => row.id === messageId);
+    expect(committed?.parts.map((part) => part.type)).toEqual(["dynamic-tool", "dynamic-tool"]);
+    expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
+    expect(streamInfo.stepStartIndices).toEqual([0, 1, 2]);
+  });
+
+  test.each([true, false])(
+    "retry reset preserves or discards step indices with parts: %s",
+    async (preserveParts) => {
+      const streamManager = new StreamManager(historyService);
+      const streamInfo = createStreamInfoForTests({
+        parts: [{ type: "text", text: "preserved", timestamp: 1 }],
+        stepStartIndices: [0, 1, 3],
+      });
+      const reset = getPrivateMethodForTests<
+        (
+          workspaceId: string,
+          streamInfo: unknown,
+          options: { preserveParts: boolean }
+        ) => Promise<void>
+      >(streamManager, "resetStreamStateForRetry");
+      await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts });
+      expect(streamInfo.stepStartIndices).toEqual(preserveParts ? [0, 1] : [0]);
+      expect(streamInfo.currentStepStartIndex).toBe(preserveParts ? 1 : 0);
+      const buildPartial = getPrivateMethodForTests<(streamInfo: unknown) => MuxMessage>(
+        streamManager,
+        "buildPartialAssistantMessage"
+      );
+      const partial = buildPartial.call(streamManager, streamInfo);
+      expect(partial.metadata?.stepStartPartIndices).toEqual(preserveParts ? [0] : []);
+      await historyService.writePartial("step-reset-workspace", partial);
+      expect(
+        (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
+      ).toEqual(preserveParts ? [0] : []);
+    }
+  );
 });
 
 describe("StreamManager - empty stream completions", () => {
@@ -4515,6 +4599,12 @@ describe("StreamManager - empty stream completions", () => {
     expect(
       streamEnd?.parts?.map((part) => (part.type === "text" ? part.text : part.toolName))
     ).toEqual(["partial answer", "bash", "second fallback answer"]);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.find((row) => row.id === messageId)?.metadata?.stepStartPartIndices
+    ).toEqual([0, 2]);
   });
 
   test("refusal fallback chain exhaustion fails terminally as model_refusal", async () => {
@@ -5470,6 +5560,7 @@ describe("StreamManager - previousResponseId recovery", () => {
       stepTracker: { latestMessages: stepMessages },
       didRetryPreviousResponseIdAtStep: false,
       currentStepStartIndex: 1,
+      stepStartIndices: [0, 1, 2],
       request: {
         model,
         messages: [{ role: "user", content: "original" }],
@@ -5519,6 +5610,7 @@ describe("StreamManager - previousResponseId recovery", () => {
     expect(retried).toBe(true);
     expect(streamInfo.parts).toHaveLength(1);
     expect(streamInfo.didRetryPreviousResponseIdAtStep).toBe(true);
+    expect(streamInfo.stepStartIndices).toEqual([0, 1]);
     expect(streamInfo.request.messages as ModelMessage[]).toBe(stepMessages);
 
     const openaiOptions = streamInfo.request.providerOptions as {
@@ -5901,6 +5993,8 @@ describe("StreamManager - getStreamInfo", () => {
       historySequence: 1,
       startTime: 4_321,
       initialMetadata: {},
+      currentStepStartIndex: 0,
+      stepStartIndices: [0],
       parts: [],
       toolCompletionTimestamps: new Map<string, number>(),
     });
@@ -5909,6 +6003,10 @@ describe("StreamManager - getStreamInfo", () => {
 
     expect(streamInfo?.messageId).toBe("msg-starting");
     expect(streamInfo?.startTime).toBe(4_321);
+    expect(streamInfo?.currentStepStartIndex).toBe(0);
+    expect(streamInfo?.stepStartIndices).toEqual([0]);
+    streamInfo?.stepStartIndices.push(5);
+    expect(streamManager.getStreamInfo(workspaceId)?.stepStartIndices).toEqual([0]);
   });
 });
 
