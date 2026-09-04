@@ -27,7 +27,7 @@ import {
   upsertSubagentFailureArtifact,
 } from "@/node/services/subagentFailureArtifacts";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
-import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -4385,6 +4385,91 @@ describe("TaskService", () => {
       } else {
         expect(await ownerInput()).toBe("clicked");
       }
+    }
+  );
+
+  test.each(["successor mirror", "pending turn"] as const)(
+    "user stop release re-evaluates a %s published while its config edit was queued",
+    async (race) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const desktopCoordinator = new DesktopInputCoordinator(config);
+      const listeners = new Map<string, (payload: unknown) => void>();
+      const on = mock((event: string, handler: (payload: unknown) => void) => {
+        listeners.set(event, handler);
+      });
+      const { aiService } = createAIServiceMocks(config, { on });
+      const pendingTurn = { value: false };
+      const { workspaceService } = createWorkspaceServiceMocks({
+        hasPendingQueuedOrPreparingTurn: mock(() => pendingTurn.value),
+      });
+      const { taskService } = createTaskServiceHarness(config, {
+        aiService,
+        workspaceService,
+        desktopInputCoordinator: desktopCoordinator,
+      });
+      const created = await createAgentTask(taskService, parentId, "Inspect", {
+        desktop: "shared",
+      });
+      assert(created.success, "Expected the child task to start");
+      const childId = created.data.taskId;
+
+      // The release's edit is the first config edit after the abort. Publish the successor after
+      // that edit was scheduled but before its transform runs, mimicking a config-queue suspension.
+      const editConfig = config.editConfig.bind(config);
+      let releaseEditSettled!: () => void;
+      const releaseEdit = new Promise<void>((resolve) => {
+        releaseEditSettled = resolve;
+      });
+      let intercepted = false;
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (transform) => {
+        if (intercepted) return editConfig(transform);
+        intercepted = true;
+        if (race === "successor mirror") {
+          await editConfig((cfg) => {
+            const child = findWorkspaceEntry(cfg, childId)?.workspace;
+            assert(child, "child entry must exist");
+            child.taskExecutionId = "wst_successor";
+            child.taskExecutionStatus = "running";
+            return cfg;
+          });
+        } else {
+          pendingTurn.value = true;
+        }
+        try {
+          return await editConfig(transform);
+        } finally {
+          releaseEditSettled();
+        }
+      });
+      try {
+        const onStreamAbort = listeners.get("stream-abort");
+        assert(onStreamAbort, "TaskService must subscribe to stream-abort");
+        onStreamAbort({
+          type: "stream-abort",
+          workspaceId: childId,
+          messageId: "msg_1",
+          abortReason: "user",
+        });
+        await releaseEdit;
+      } finally {
+        editSpy.mockRestore();
+      }
+
+      // The stale abort must not clear the successor's control.
+      const child = findWorkspaceInConfig(config, childId);
+      expect(child?.taskStatus).toBe("running");
+      if (race === "successor mirror") {
+        expect(child?.taskExecutionId).toBe("wst_successor");
+        expect(child?.taskExecutionStatus).toBe("running");
+      }
+      const ownerInput = await desktopCoordinator
+        .withInput(parentId, () => Promise.resolve("clicked"))
+        .then(
+          (value) => value,
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
+      expect(ownerInput).toContain(`active borrower ${childId}`);
     }
   );
 

@@ -11198,26 +11198,15 @@ export class TaskService implements AgentTaskIntegration {
    * A user Stop on an ordinary child is a steerable pause: the task stays `running` so the
    * user can resume it. A shared-desktop child, however, holds the owner's desktop through that
    * `running` status (the config ledger is the only ownership source), so a paused child would
-   * block the owner until the parent's foreground wait timed out. Mirror task_stop instead: the
-   * durable `interrupted` status releases the desktop and fails the parent's wait fast, while a
-   * user resume re-admits the child onto the same desktop via markInterruptedTaskRunning.
+   * block the owner indefinitely — a wait timeout must never release a still-active child, only
+   * an explicit stop may. Mirror task_stop instead: the durable `interrupted` status releases the
+   * desktop and fails the parent's wait fast, while a user resume re-admits the child onto the
+   * same desktop via markInterruptedTaskRunning.
    */
   private async releaseSharedDesktopTaskOnUserStop(workspaceId: string): Promise<void> {
+    // Cheap bound only; every release decision below is re-evaluated inside the serialized edit.
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
     if (workspace?.parentWorkspaceId == null || workspace.taskDesktopOwnerWorkspaceId == null) {
-      return;
-    }
-    if (workspace.taskStatus !== "running" && workspace.taskStatus !== "awaiting_report") {
-      return;
-    }
-    // Stop-and-send-queued dispatches a new turn right after the abort, and a newer continuation
-    // may already own the execution mirror; either keeps the desktop, so only a genuinely idle
-    // child releases it.
-    if (
-      this.aiService.isStreaming(workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId) ||
-      isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus)
-    ) {
       return;
     }
     let transitionedToInterrupted = false;
@@ -11225,7 +11214,19 @@ export class TaskService implements AgentTaskIntegration {
     await this.editWorkspaceEntry(
       workspaceId,
       (ws) => {
+        if (ws.taskDesktopOwnerWorkspaceId == null) return;
         if (ws.taskStatus !== "running" && ws.taskStatus !== "awaiting_report") return;
+        // Evaluated against the fresh config inside the FIFO config edit: a successor that
+        // claimed the execution mirror, queued a turn, or started streaming while this edit
+        // waited in the queue keeps the desktop (stop-and-send-queued, newer continuation). A
+        // preflight-only check would let this stale abort clear that successor.
+        if (
+          this.aiService.isStreaming(workspaceId) ||
+          this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId) ||
+          isActiveWorkspaceTurnTaskStatus(ws.taskExecutionStatus)
+        ) {
+          return;
+        }
         parentWorkspaceId = ws.parentWorkspaceId;
         transitionedToInterrupted = this.applyInterruptedTaskStatus(ws) === "interrupted";
       },
