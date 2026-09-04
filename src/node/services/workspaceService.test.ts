@@ -361,6 +361,24 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         wakeRecord,
       ]);
 
+      // RLM keep-recent compaction re-appends copies of the pre-boundary tail after the
+      // boundary with their *source* timestamps. Sitting at the tail, an old-stamped copy is
+      // reached before the wake row; if it tripped the cutoff the scan would stop short and
+      // the restarted reconciler would redeliver an acknowledged wake. Bound so the copy reads
+      // as too old while the wake row does not.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("tail-copy", "user", "old turn copy", {
+          timestamp: 500,
+          synthetic: true,
+          rlmPreservedTailCopy: true,
+        })
+      );
+      const armedAtWakeRow = new Date(1_000 + 60_000).toISOString();
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId, armedAtWakeRow)).toEqual([
+        wakeRecord,
+      ]);
+
       // The scan is bounded by the oldest outstanding monitor's arm time: rows appended before
       // that monitor existed cannot acknowledge it, so they are never parsed (an owner's first
       // wake would otherwise read the entire transcript on the stream's tool-boundary path).

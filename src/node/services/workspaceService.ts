@@ -12106,6 +12106,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       (messages) => {
         // Chunks arrive newest-first, as do the rows within a chunk.
         for (const message of messages) {
+          // RLM keep-recent compaction re-appends copies of the pre-boundary tail *after* the
+          // boundary while keeping their source timestamps, so a copy can read as older than
+          // the cutoff while sitting above rows that are newer. Copies carry nothing their
+          // originals (still in history) lack: skip them before the cutoff and before reading
+          // wake metadata, or a stale-stamped copy ends the scan short of the wake row.
+          if (message.metadata?.rlmPreservedTailCopy === true) continue;
           const timestamp = message.metadata?.timestamp;
           if (typeof timestamp === "number" && timestamp < cutoffMs) return false;
           // A wake diverted through on-send compaction is durable as the compaction row that
