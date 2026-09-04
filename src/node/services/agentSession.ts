@@ -115,7 +115,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
+import { MessageQueue } from "./messageQueue";
 import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
@@ -384,9 +384,9 @@ function hasSameWorkspaceTurnCorrelation(
  * Find the still-open workspace-turn correlation for a bash-monitor-wake
  * continuation stream.
  *
- * A queued monitor wake dispatched at a tool boundary cuts the in-flight
- * stream (finishReason "tool-calls") and immediately continues the same
- * delegated work in a new stream. That continuation must inherit the cut
+ * An outstanding monitor wake makes the in-flight stream yield at a tool
+ * boundary (finishReason "tool-calls"); the wake turn sent once the owner is
+ * idle continues the same delegated work in a new stream. That continuation must inherit the cut
  * stream's workspace-turn metadata — otherwise the delegating parent sees the
  * cut as a premature turn failure ("Workspace turn ended before completion")
  * and the turn's real outcome can never settle the task handle (see
@@ -442,6 +442,44 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
   if (obj.type !== "compaction-request") return false;
   if (typeof obj.parsed !== "object" || obj.parsed === null) return false;
   return true;
+}
+
+/**
+ * The bash-monitor wake a row or send carries: the wake itself, or — for an on-send compaction
+ * request — the wake nested in the follow-up it carries. The compaction row is what that turn
+ * shows and what stays durable, so wake identity (and the delivered records the reconciler
+ * recovers from after a restart) has to be read through it.
+ */
+export function getCarriedBashMonitorWake(
+  muxMetadata: unknown
+): Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }> | undefined {
+  const meta = muxMetadata as MuxMessageMetadata | undefined;
+  if (meta?.type === "bash-monitor-wake") return meta;
+  if (!isCompactionRequestMetadata(meta)) return undefined;
+  const followUpMetadata =
+    meta.parsed.followUpContent?.muxMetadata ?? meta.parsed.continueMessage?.muxMetadata;
+  return followUpMetadata?.type === "bash-monitor-wake" ? followUpMetadata : undefined;
+}
+
+function carriesBashMonitorWake(muxMetadata: unknown): boolean {
+  return getCarriedBashMonitorWake(muxMetadata) != null;
+}
+
+/**
+ * The delegated-turn correlation a send / retry will stream under: its own metadata, or —
+ * for an on-send compaction request — the correlation stamped on the follow-up it carries
+ * (the follow-up stream inherits it from the summary).
+ */
+function getCarriedWorkspaceTurnCorrelation(
+  muxMetadata: unknown
+): WorkspaceTurnMuxMetadata | undefined {
+  const meta = muxMetadata as MuxMessageMetadata | undefined;
+  if (!isCompactionRequestMetadata(meta)) return getWorkspaceTurnMuxMetadata(meta);
+  const followUp = meta.parsed.followUpContent;
+  return (
+    followUp?.workspaceTurnMetadata ??
+    getWorkspaceTurnMuxMetadata(followUp?.muxMetadata ?? meta.parsed.continueMessage?.muxMetadata)
+  );
 }
 
 const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
@@ -519,6 +557,10 @@ export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
+/** Retry cadence for a voided wake continuation whose owner-side settlement failed. */
+const UNSETTLED_WAKE_VOID_RETRY_DELAY_MS = 5_000;
+/** Stream starts remembered for hasCorrelatedStreamStartedAfter; older ones are evicted. */
+const RECENT_STREAM_STARTS_LIMIT = 16;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
 
@@ -584,7 +626,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   ): XumToolScope;
 }
 
-interface AgentSessionOptions {
+export interface AgentSessionOptions {
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
@@ -626,7 +668,42 @@ interface AgentSessionOptions {
    * to yield to a manual send that is still awaiting pricing/settings.
    */
   hasExternalSendPreflight?: () => boolean;
+  /**
+   * Live read of the bash-monitor wake level for this workspace
+   * (BashMonitorWakeReconciler.hasOutstandingWake). Consulted at tool boundaries only; the
+   * published mirror (setBashMonitorWakeOutstanding) lags a shown frontier, so cutting on
+   * the mirror alone would yield for lines the step just displayed.
+   */
+  hasOutstandingBashMonitorWake?: () => Promise<boolean>;
+  /**
+   * The tool-end yield lever rose (false → true): the next tool boundary will cut the
+   * stream for a tool-end queue head or the wake level. Fired on every rising edge, whatever
+   * caused it (enqueue, queue-head clear/promote, wake level), so foreground waits that
+   * would outlive the boundary can be backgrounded exactly when the yield becomes effective.
+   */
+  onToolEndYieldRequested?: () => void;
+  /**
+   * This session will never continue the delegated turn identified by `correlation`:
+   * the continuation it owed (see wakeContinuationDebt) was voided, or a compaction
+   * follow-up carrying the correlation was abandoned. Nothing else settles that turn — no
+   * correlated stream-end follows — so the owner settles it now. Called as a tracked
+   * promise from synchronous transitions; must be idempotent.
+   */
+  onWorkspaceTurnContinuationVoided?: (
+    correlation: WorkspaceTurnMuxMetadata,
+    reason: WorkspaceTurnContinuationVoidReason
+  ) => Promise<void>;
 }
+
+/**
+ * Why a session stopped owing a delegated turn's continuation.
+ * - `retracted`: the stream yielded to a bash-monitor wake that then went away (monitor
+ *   canceled, output shown, history cleared, send failed with no retry) before any wake turn
+ *   could show it.
+ * - `superseded`: other input was admitted in its place.
+ * - `abandoned`: a compaction follow-up carrying the correlation was dropped undispatched.
+ */
+export type WorkspaceTurnContinuationVoidReason = "retracted" | "superseded" | "abandoned";
 
 enum TurnPhase {
   IDLE = "idle",
@@ -667,6 +744,17 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly hasOutstandingBashMonitorWake?: () => Promise<boolean>;
+  private readonly onToolEndYieldRequested?: () => void;
+  private readonly onWorkspaceTurnContinuationVoided?: AgentSessionOptions["onWorkspaceTurnContinuationVoided"];
+  /**
+   * Mirror of the reconciler's wake level (setBashMonitorWakeOutstanding): a wake this
+   * workspace has not seen yet. Feeds the tool-end yield lever together with the queue head
+   * and is the sync input to hasPendingToolEndInput.
+   */
+  private bashMonitorWakeOutstanding = false;
+  /** Last value pushed to the tool-end yield lever; edge detection for onToolEndYieldRequested. */
+  private toolEndYieldRequested = false;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -849,14 +937,75 @@ export class AgentSession {
   /**
    * muxMetadata of the queued entry currently being dispatched, held from
    * dequeue until its sendMessage settles (the stream has started or failed).
-   * Lets hasPendingBashMonitorWakeContinuation see a wake continuation during
-   * the dequeue→stream-start window without consulting stale stream context.
+   * Lets hasPendingWorkspaceTurnContinuation / hasQueuedOrDispatchingEntry see the
+   * dequeue→stream-start window without consulting stale stream context.
    */
   private dispatchingQueuedEntry = false;
   private dispatchingQueuedEntryMuxMetadata?: unknown;
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+  /**
+   * Bash-monitor wake continuation model.
+   *
+   * A stream that yields to the wake level (hasPendingToolEndInput) takes out a DEBT: this
+   * session owes the delegated turn it cut a continuation. The debt records the cut stream's
+   * correlation and is settled exactly once — REDEEMED when a stream that shows the wake
+   * starts, or VOIDED when no wake turn can come, in which case the owner is told
+   * (onWorkspaceTurnContinuationVoided). Settlement never probes the wake level: the debt is
+   * the only thing delegated-turn settlement reads (getQueueCutCutter), and it is sync.
+   *
+   * `wakeTurnInFlight` says a wake turn is somewhere inside this session — from sendMessage /
+   * resumeStream entry (raised synchronously, before any await, because the wake's
+   * `onAccepted` lowers the level as soon as its row is durable) until the stream that shows
+   * it starts or the send returns with no stream and no auto-retry armed for its durable row.
+   *
+   * Transitions — each is the only place its consequence is computed:
+   *
+   *   hasPendingToolEndInput yields for the level   → debt = { active stream's correlation }
+   *   wake send / resume / queue dispatch begins    → wakeTurnInFlight = true
+   *   stream-start whose request carries the wake   → redeem (in-flight false, debt cleared);
+   *     (direct wake, or a compaction FOLLOW-UP)       a compaction stream itself does not
+   *   wake send returns without a stream            → in-flight stays true only while an
+   *                                                   auto-retry resume of its durable row is
+   *                                                   armed; otherwise false → maybeVoid
+   *   level lowered (cancel / shown / clear)        → maybeVoid
+   *   maybeVoid: debt ∧ ¬inFlight ∧ ¬level          → void "retracted"
+   *   non-wake input accepted (its row durable)     → void "superseded"; a turn with the
+   *     (settleWakeDebtForAcceptedInput)               same correlation ASSUMES the debt: it
+   *                                                   stays visible to settlement, cannot be
+   *                                                   retracted under the continuation, and
+   *                                                   its stream-start discharges it (that
+   *                                                   stream's own stream-end settles the turn)
+   *   assuming send returns without a stream        → un-assume unless an auto-retry of its
+   *                                                   durable row is armed; then maybeVoid
+   *   compaction follow-up with the correlation     → void "abandoned" (before the erase)
+   *     dropped (clearPendingFollowUpFromSummary)
+   *   dispose / IDLE                                → in-flight false (IDLE keeps the debt:
+   *                                                   the wake dispatcher needs an idle session)
+   *
+   * Voiding clears the debt synchronously; the owner hook may fail (handle store, waiter,
+   * cleanup I/O). A failed void is kept in `unsettledWakeVoids` and retried at every later
+   * debt transition and on a timer, so a deferred delegated handle never waits for a restart.
+   */
+  private wakeContinuationDebt?: { correlation?: WorkspaceTurnMuxMetadata; assumed?: true };
+  private wakeTurnInFlight = false;
+  /**
+   * Recent stream starts, oldest first, with the delegated-turn correlation each streamed
+   * under. A stream-end handler runs behind the workspace event lock and may be late: a
+   * same-turn continuation can have started — and finished — after the stream it handles,
+   * leaving nothing pending, in flight, or owed to probe. The ledger answers "did the turn
+   * continue after this stream?" regardless (hasCorrelatedStreamStartedAfter).
+   */
+  private recentStreamStarts: Array<{
+    messageId: string;
+    correlation?: WorkspaceTurnMuxMetadata;
+  }> = [];
+  private unsettledWakeVoids: Array<{
+    correlation: WorkspaceTurnMuxMetadata;
+    reason: WorkspaceTurnContinuationVoidReason;
+  }> = [];
+  private unsettledWakeVoidRetryTimer?: ReturnType<typeof setTimeout>;
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
@@ -907,6 +1056,9 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       hasExternalSendPreflight,
+      hasOutstandingBashMonitorWake,
+      onToolEndYieldRequested,
+      onWorkspaceTurnContinuationVoided,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -935,6 +1087,9 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.hasOutstandingBashMonitorWake = hasOutstandingBashMonitorWake;
+    this.onToolEndYieldRequested = onToolEndYieldRequested;
+    this.onWorkspaceTurnContinuationVoided = onWorkspaceTurnContinuationVoided;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -981,6 +1136,13 @@ export class AgentSession {
   beginShutdown(): void {
     this.shuttingDown = true;
     this.retryManager.cancel();
+    this.clearUnsettledWakeVoidRetryTimer();
+  }
+
+  private clearUnsettledWakeVoidRetryTimer(): void {
+    if (this.unsettledWakeVoidRetryTimer == null) return;
+    clearTimeout(this.unsettledWakeVoidRetryTimer);
+    this.unsettledWakeVoidRetryTimer = undefined;
   }
 
   dispose(): void {
@@ -991,6 +1153,22 @@ export class AgentSession {
 
     this.activePreparedTurnAbortController?.abort();
     this.activePreparedTurnAbortController = null;
+
+    // The bash early-return flag is keyed by workspace id and outlives this session; a
+    // stale wake level would otherwise make a re-created session's long-polling reads
+    // return early forever. (The reconciler's own dispose lowers the level too.) Only
+    // touched when this session raised it: tests dispose sessions built on partial
+    // BackgroundProcessManager stubs.
+    if (this.bashMonitorWakeOutstanding) {
+      this.bashMonitorWakeOutstanding = false;
+      this.syncToolEndYieldRequested(false);
+    }
+    // No wake turn can come from a disposed session; the debt dies with it silently
+    // (workspace teardown settles delegated turns through its own path).
+    this.wakeTurnInFlight = false;
+    this.wakeContinuationDebt = undefined;
+    this.unsettledWakeVoids = [];
+    this.clearUnsettledWakeVoidRetryTimer();
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -1210,6 +1388,9 @@ export class AgentSession {
       this.autoRetryStarting = false;
     }
     this.emitRetryEvent(event);
+    // A retry given up (exhausted, non-retryable, disabled by the user) was the last thing
+    // that could still bring a durable wake row's stream.
+    if (event.type === "auto-retry-abandoned") this.settleWakeTurnInFlight();
   }
 
   private emitRetryEvent(event: RetryStatusEvent): void {
@@ -1377,6 +1558,9 @@ export class AgentSession {
       );
     } finally {
       this.autoRetryStarting = false;
+      // The resume either started its stream (redeeming a wake it carried), re-armed a
+      // retry, or gave up — only the last leaves a carried wake with no way to arrive.
+      this.settleWakeTurnInFlight();
     }
   }
 
@@ -3039,7 +3223,25 @@ export class AgentSession {
     this.emitMetadata(metadata);
   }
 
+  /**
+   * Public send entry. A send carrying a bash-monitor wake marks the wake turn in flight
+   * synchronously — before the first await, hence before its `onAccepted` can lower the
+   * level — and settles the marker when it returns without a stream (see
+   * wakeContinuationDebt).
+   */
   async sendMessage(
+    ...args: Parameters<AgentSession["sendMessageInner"]>
+  ): Promise<AgentSessionResult<void>> {
+    const wake = carriesBashMonitorWake(args[1]?.muxMetadata);
+    if (wake) this.wakeTurnInFlight = true;
+    try {
+      return await this.sendMessageInner(...args);
+    } finally {
+      if (wake || this.wakeContinuationDebt?.assumed === true) this.settleWakeTurnInFlight();
+    }
+  }
+
+  private async sendMessageInner(
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: {
@@ -3053,8 +3255,6 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
-      cancelSignal?: AbortSignal;
       /**
        * For queue-dispatched sends: when the user last added to the queued
        * entry. Goal safety compares it against the goal's explicit
@@ -3069,8 +3269,8 @@ export class AgentSession {
        * turn claims PREPARING (isBusy() becomes true). WorkspaceService keeps
        * its session-invisible preflight reservation armed until this fires so
        * follow-up recovery cannot observe the idle gap between the service
-       * handoff and the busy claim (cancelBeforeAcceptance and the other
-       * admission awaits yield) and admit a synthetic turn ahead of the
+       * handoff and the busy claim (the admission awaits yield) and admit a
+       * synthetic turn ahead of the
        * accepted manual send. Refusal paths never fire it — the service's
        * scoped disposal releases the reservation when the call returns.
        */
@@ -3124,24 +3324,26 @@ export class AgentSession {
     const isAdmissionStale = () =>
       internal?.admissionEpochStale?.() === true || internal?.admissionStale?.() === true;
 
-    const cancelSignal = internal?.cancelSignal;
-    const persistedCancelableMessageIds: string[] = [];
+    const persistedTurnRowMessageIds: string[] = [];
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
     /**
-     * Returns whether the rows are verifiably gone. deleteMessages can fail AFTER its atomic
+     * "deleted" means the rows are verifiably gone. deleteMessages can fail AFTER its atomic
      * rewrite committed, so a reported failure re-reads the durable history before concluding —
      * callers that couple side effects to the rollback (peer budget refunds) must only act when
      * deletion actually committed, or a "canceled" payload would stay durable while no longer
-     * counting against the sender's budget.
+     * counting against the sender's budget. "remains" is the readback confirming a row is still
+     * durable; "unknown" is a readback that itself failed. Callers whose side effect is only
+     * safe against a row that truly exists (consuming a wake lease) must not treat "unknown"
+     * as "remains".
      */
-    const rollbackPersistedTurnRows = async (): Promise<boolean> => {
-      if (persistedCancelableMessageIds.length === 0) return true;
+    const rollbackPersistedTurnRows = async (): Promise<"deleted" | "remains" | "unknown"> => {
+      if (persistedTurnRowMessageIds.length === 0) return "deleted";
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
-        persistedCancelableMessageIds
+        persistedTurnRowMessageIds
       );
-      if (rollbackResult.success) return true;
+      if (rollbackResult.success) return "deleted";
       log.error("Failed to roll back partially persisted turn rows", {
         workspaceId: this.workspaceId,
         error: rollbackResult.error,
@@ -3149,67 +3351,13 @@ export class AgentSession {
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(
         this.workspaceId
       );
-      return (
-        historyResult.success &&
-        persistedCancelableMessageIds.every(
-          (messageId) => !historyResult.data.some((message) => message.id === messageId)
-        )
-      );
+      if (!historyResult.success) return "unknown";
+      return persistedTurnRowMessageIds.every(
+        (messageId) => !historyResult.data.some((message) => message.id === messageId)
+      )
+        ? "deleted"
+        : "remains";
     };
-    let cancellationHandled = false;
-    let cancellationDisabled = false;
-    const cancelBeforeAcceptance = async (): Promise<boolean> => {
-      if (cancelSignal?.aborted !== true || cancellationDisabled) return false;
-      if (cancellationHandled) return true;
-
-      if (persistedCancelableMessageIds.length > 0) {
-        // History also has non-session writers (for example goal pause boundaries). Delete exactly
-        // this preparing turn's rows in one atomic rewrite so later concurrent rows are preserved.
-        const rollbackResult = await this.historyService.deleteMessages(
-          this.workspaceId,
-          persistedCancelableMessageIds
-        );
-        if (!rollbackResult.success) {
-          // deleteMessages can fail after its atomic rewrite (for example while refreshing
-          // sequence metadata). Verify the durable result before deciding whether cancellation won.
-          const historyResult = await this.historyService.getHistoryFromLatestBoundary(
-            this.workspaceId
-          );
-          const rollbackCommitted =
-            historyResult.success &&
-            persistedCancelableMessageIds.every(
-              (messageId) => !historyResult.data.some((message) => message.id === messageId)
-            );
-          if (!rollbackCommitted) {
-            // Do not report cancellation (which would supersede the durable monitor wake) unless the
-            // not-yet-accepted row is actually gone. Continue accepting this wake instead of leaving
-            // a hidden synthetic row that can leak into a later provider request.
-            cancellationDisabled = true;
-            log.error("Failed to roll back canceled preparing turn; continuing acceptance", {
-              workspaceId: this.workspaceId,
-              error: rollbackResult.error,
-              verificationError: historyResult.success ? undefined : historyResult.error,
-            });
-            return false;
-          }
-          log.warn("Preparing-turn rollback reported failure after its rewrite committed", {
-            workspaceId: this.workspaceId,
-            error: rollbackResult.error,
-          });
-        }
-      }
-
-      cancellationHandled = true;
-      await internal?.onCanceled?.(cancelReasonBeforeAcceptance(cancelSignal));
-      if (internal?.cancelState != null) {
-        internal.cancelState.canceledBeforeAcceptance = true;
-      }
-      return true;
-    };
-
-    if (await cancelBeforeAcceptance()) {
-      return Ok(undefined);
-    }
 
     // Last-line-of-defence pricing gate: every dispatch path (initial sends,
     // sendQueuedMessages, dispatchPendingFollowUp,
@@ -3232,9 +3380,6 @@ export class AgentSession {
         this.workspaceId,
         options?.model
       );
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
       if (!pricingGate.success) {
         if (isManualUserMessage) {
           const persisted = await this.preserveRejectedManualSend(
@@ -3649,10 +3794,6 @@ export class AgentSession {
     // File changes after this point are surfaced via <system-file-update> diffs instead.
     const snapshotResult = await this.materializeFileAtMentionsSnapshot(trimmedMessage);
 
-    if (await cancelBeforeAcceptance()) {
-      return Ok(undefined);
-    }
-
     // Check compaction threshold BEFORE persisting the user message.
     // Skill snapshots are materialized AFTER this decision (below): when on-send
     // compaction defers the turn, the follow-up re-enters sendMessage with the same
@@ -3677,9 +3818,6 @@ export class AgentSession {
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
       await this.seedUsageStateFromHistory();
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
 
       const providersConfigForCompaction = this.getProvidersConfigSafe();
       const compactionResult = this.compactionMonitor.checkBeforeSend({
@@ -3784,10 +3922,7 @@ export class AgentSession {
         if (!appendCompactionResult.success) {
           return Err(createUnknownSendMessageError(appendCompactionResult.error));
         }
-        persistedCancelableMessageIds.push(autoCompactionMessage.id);
-        if (await cancelBeforeAcceptance()) {
-          return Ok(undefined);
-        }
+        persistedTurnRowMessageIds.push(autoCompactionMessage.id);
 
         this.emitChatEvent({
           type: "auto-compaction-triggered",
@@ -3813,13 +3948,41 @@ export class AgentSession {
     // refuse while sends are in preflight (r42), so rows can no longer land
     // after a mutation commits; this check and the PREPARING gate remain
     // backstops for entry-accounting bypasses.
+    //
+    // "Pre-persist" has one exception: the on-send compaction row above is already durable and
+    // carries this send as its follow-up. Refusing without removing it would leave a compaction
+    // request that startup recovery later resumes — for a bash-monitor wake whose lease is
+    // released by this refusal, that resubmits output the reconciler has already re-derived.
+    //
+    // When the rollback fails and the readback CONFIRMS the row still durable, that row already
+    // carries the wake as its follow-up. Leaving the lease released would have the reconciler
+    // redeliver output the row carries — twice, one copy of which the monitor may since have
+    // retracted. So the wake takes the same handoff as every other durable pre-stream failure
+    // (see the goal-sync catch below): arm the in-session resume, consume the lease, schedule
+    // the retry. The resume is what keeps the row reachable — startup recovery only resumes an
+    // interrupted history *tail*, and a competing manual send (one cause of this refusal) could
+    // otherwise complete a newer turn on top of the buried request. The refusal still stands.
+    //
+    // An "unknown" readback must NOT consume: if the row was in fact deleted, consuming would
+    // leave neither carrier nor signal and the wake (and any delegated continuation deferred
+    // behind it) would be lost. Releasing risks at worst a duplicate delivery, which the
+    // reconciler's watermarks and the wake-debt settlement already tolerate.
+    const refuseAfterCompactionRow = async (message: string): Promise<AgentSessionResult<void>> => {
+      const outcome = await rollbackPersistedTurnRows();
+      if (outcome === "remains" && typedMuxMetadata?.type === "bash-monitor-wake") {
+        this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+        await internal?.onAccepted?.();
+        await this.handleStreamFailureForAutoRetry({ type: "unknown", message });
+      }
+      return Err(createUnknownSendMessageError(message));
+    };
     if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      return refuseAfterCompactionRow(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
     }
-    // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
-    // while streamWithHistory's own latch check keeps its stream from ever running.
+    // A row appended now would read as a dispatched turn on the next startup while
+    // streamWithHistory's own latch check keeps its stream from ever running.
     if (this.shuttingDown) {
-      return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
+      return refuseAfterCompactionRow(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE);
     }
 
     // Persist snapshots only when this turn will be sent immediately.
@@ -3836,14 +3999,10 @@ export class AgentSession {
         );
         mcpPromptSnapshotMessages = await this.materializeMcpPromptSnapshots(
           typedMuxMetadata,
-          userMessage.id,
-          cancelSignal
+          userMessage.id
         );
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
-      }
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
       }
     }
 
@@ -3855,10 +4014,7 @@ export class AgentSession {
       if (!snapshotAppendResult.success) {
         return Err(createUnknownSendMessageError(snapshotAppendResult.error));
       }
-      persistedCancelableMessageIds.push(snapshotResult.snapshotMessage.id);
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
+      persistedTurnRowMessageIds.push(snapshotResult.snapshotMessage.id);
     }
 
     if (shouldPersistTurnSnapshots && skillSnapshotMessages.length > 0) {
@@ -3871,10 +4027,7 @@ export class AgentSession {
           await rollbackPersistedTurnRows();
           return Err(createUnknownSendMessageError(skillSnapshotAppendResult.error));
         }
-        persistedCancelableMessageIds.push(snapshotMessage.id);
-        if (await cancelBeforeAcceptance()) {
-          return Ok(undefined);
-        }
+        persistedTurnRowMessageIds.push(snapshotMessage.id);
       }
     }
 
@@ -3888,10 +4041,7 @@ export class AgentSession {
           await rollbackPersistedTurnRows();
           return Err(createUnknownSendMessageError(appendResult.error));
         }
-        persistedCancelableMessageIds.push(snapshotMessage.id);
-        if (await cancelBeforeAcceptance()) {
-          return Ok(undefined);
-        }
+        persistedTurnRowMessageIds.push(snapshotMessage.id);
       }
     }
 
@@ -3920,13 +4070,10 @@ export class AgentSession {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(batchAppendResult.error));
       }
-      persistedCancelableMessageIds.push(
+      persistedTurnRowMessageIds.push(
         ...internal.preTurnMessages.map((message) => message.id),
         userMessage.id
       );
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
     } else if (!autoCompactionMessage) {
       // When on-send compaction triggers, the user message is NOT persisted to
       // history (it's sent as follow-up after compaction). Otherwise, persist
@@ -3936,10 +4083,7 @@ export class AgentSession {
         await rollbackPersistedTurnRows();
         return Err(createUnknownSendMessageError(appendResult.error));
       }
-      persistedCancelableMessageIds.push(userMessage.id);
-      if (await cancelBeforeAcceptance()) {
-        return Ok(undefined);
-      }
+      persistedTurnRowMessageIds.push(userMessage.id);
     }
 
     // Caller-probe staleness (peer sends racing a Stop) must resolve BEFORE the pre-turn batch
@@ -3949,13 +4093,14 @@ export class AgentSession {
     // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
     if (internal?.admissionStale?.() === true) {
-      const rolledBack = await rollbackPersistedTurnRows();
+      const rollbackOutcome = await rollbackPersistedTurnRows();
       // Probe-carrying sends are peer messages whose caller already returned success when the
       // entry was queued — the cancellation hook is their only way to observe this refusal and
       // release the budget reservation (the refund closure is idempotent). Fire it ONLY when the
-      // rollback verifiably committed: rows that remain durable can enter provider context after
-      // a resume, so their charge must stand (budget charged ⇔ rows durable).
-      if (rolledBack) {
+      // rollback verifiably committed: rows that remain durable (or whose fate is unknown) can
+      // enter provider context after a resume, so their charge must stand (budget charged ⇔
+      // rows durable).
+      if (rollbackOutcome === "deleted") {
         await internal?.onCanceled?.(
           "Send refused: the caller's admission became stale before the turn was accepted."
         );
@@ -3973,12 +4118,11 @@ export class AgentSession {
       );
     }
 
-    // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
-    // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
-    // wake finish acceptance rather than delete the row after goal state has already observed it.
-    if (cancelSignal != null) {
-      cancellationDisabled = true;
-    }
+    // The user row is durable from here on. A bash-monitor wake whose row is durable must be
+    // accepted even if a later step throws: otherwise the reconciler re-derives the same wake
+    // and delivers it twice (startup recovery resumes the durable row without redelivery).
+    const finalizeDurableWakeOnFailure = typedMuxMetadata?.type === "bash-monitor-wake";
+    this.settleWakeDebtForAcceptedInput(typedMuxMetadata);
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
@@ -3988,10 +4132,21 @@ export class AgentSession {
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
-      if (cancelSignal != null) {
-        // The durable row crossed the point of no return, so every later goal-sync failure must still
-        // finalize this monitor wake. Startup recovery can resume the row without redelivering it.
+      if (finalizeDurableWakeOnFailure) {
+        // Consuming the signal is what stops the reconciler from re-deriving this wake, so
+        // from that moment the durable row is the only carrier of the turn and nothing
+        // upstream can resend it. Arm the same in-session resume a failed stream start uses
+        // BEFORE consuming, then schedule it: auto-retry resumes the durable row without
+        // appending a second one, so the row (and any delegated turn waiting on its
+        // continuation) no longer depends on an application restart. With auto-retry
+        // disabled by the user this stays a startup-recovery row like every other
+        // pre-stream failure, and the wake turn leaves flight (see settleWakeTurnInFlight).
+        this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
         await internal?.onAccepted?.();
+        await this.handleStreamFailureForAutoRetry({
+          type: "unknown",
+          message: getErrorMessage(error),
+        });
       }
       throw error;
     }
@@ -4004,10 +4159,10 @@ export class AgentSession {
     }
 
     // Workspace may be tearing down while we await filesystem IO.
-    // If so, skip event emission + streaming to avoid races with dispose(). A cancelable monitor
-    // wake past the point of no return is already durable, so finalize it before leaving.
+    // If so, skip event emission + streaming to avoid races with dispose(). A monitor wake's
+    // row is already durable, so finalize it before leaving.
     if (this.disposed) {
-      if (cancelSignal != null && cancellationDisabled) {
+      if (finalizeDurableWakeOnFailure) {
         await internal?.onAccepted?.();
       }
       return Ok(undefined);
@@ -4118,8 +4273,7 @@ export class AgentSession {
 
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(optionsForStream.muxMetadata);
     // From this synchronous point isBusy() reports the turn — release the
     // service-side preflight reservation (see onTurnAdmissionCommitted doc).
     internal?.onTurnAdmissionCommitted?.();
@@ -4133,7 +4287,7 @@ export class AgentSession {
           return Ok(undefined);
         }
         // Background processes are workspace-scoped, not context-scoped. Compaction must preserve
-        // processes, monitors, and queued wakes so a waiting agent is not stranded.
+        // processes, monitors, and pending wakes so a waiting agent is not stranded.
         // Note: Follow-up content for compaction is now stored on the summary message
         // and dispatched via dispatchPendingFollowUp() after compaction completes.
         // This provides crash safety - the follow-up survives app restarts.
@@ -4222,7 +4376,20 @@ export class AgentSession {
     return await startPreparedStream();
   }
 
+  /** Like sendMessage, marks a carried wake in flight for the duration of the resume. */
   async resumeStream(
+    ...args: Parameters<AgentSession["resumeStreamInner"]>
+  ): Promise<AgentSessionResult<{ started: boolean }>> {
+    const wake = carriesBashMonitorWake(args[0].muxMetadata);
+    if (wake) this.wakeTurnInFlight = true;
+    try {
+      return await this.resumeStreamInner(...args);
+    } finally {
+      if (wake || this.wakeContinuationDebt?.assumed === true) this.settleWakeTurnInFlight();
+    }
+  }
+
+  private async resumeStreamInner(
     options: SendMessageOptions,
     internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
@@ -4271,8 +4438,7 @@ export class AgentSession {
       internal?.goalKind,
       internal?.goalId
     );
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(optionsForStream.muxMetadata);
     // Open the mid-turn thinking override window for the resumed turn (after
     // setTurnPhase(PREPARING), which clears the holder on the IDLE transition).
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
@@ -4578,6 +4744,15 @@ export class AgentSession {
 
     if (params.muxMetadata) {
       followUp.muxMetadata = params.muxMetadata;
+      // A bash-monitor wake is an idle-only send (WorkspaceService.dispatchBashMonitorWake
+      // sends it with requireIdle). The compaction hand-off must keep that rule so a manual
+      // message queued or in preflight during the compaction stream still wins over the
+      // wake continuation (dispatchPendingFollowUp). A skipped wake follow-up is lost — its
+      // signals were consumed at acceptance — which is the bounded cost of letting the
+      // user's correction go first; the process output stays readable via task_await.
+      if (params.muxMetadata.type === "bash-monitor-wake") {
+        followUp.dispatchOptions = { ...followUp.dispatchOptions, requireIdle: true };
+      }
     }
 
     if (params.workspaceTurnMetadata) {
@@ -5210,7 +5385,7 @@ export class AgentSession {
     const optionsMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
     const retryMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
     // Bash-monitor-wake continuations inherit the correlation of a delegated
-    // workspace turn that was cut mid-work by the wake's queued dispatch, so
+    // workspace turn whose stream yielded mid-work to the wake, so
     // the turn's eventual terminal stream-end can settle the parent's handle.
     const streamMuxMetadata =
       optionsMuxMetadata?.type === "workspace-turn-task"
@@ -5267,7 +5442,7 @@ export class AgentSession {
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
-      hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      hasPendingToolEndInput: () => this.hasPendingToolEndInput(),
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -5516,10 +5691,7 @@ export class AgentSession {
       retryGoalKind,
       retryGoalId
     );
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
-      retryOptionsForResume.muxMetadata
-    );
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(retryOptionsForResume.muxMetadata);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5625,8 +5797,7 @@ export class AgentSession {
     }
 
     // Retry the same request, but without post-compaction injection.
-    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
-    this.setTurnPhase(TurnPhase.PREPARING);
+    this.enterPreparing(context.options?.muxMetadata);
     let retryResult: Result<void, SendMessageError>;
     try {
       retryResult = await this.streamWithHistory(
@@ -5847,6 +6018,33 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
+        this.recentStreamStarts.push({
+          messageId: payload.messageId,
+          correlation: this.activeStreamContext?.workspaceTurnMetadata,
+        });
+        if (this.recentStreamStarts.length > RECENT_STREAM_STARTS_LIMIT) {
+          this.recentStreamStarts.shift();
+        }
+        // A stream that shows the wake redeems the continuation debt (see
+        // wakeContinuationDebt). Only the wake row's own stream qualifies: an on-send
+        // compaction stream's request is the compaction row, and the wake follows it.
+        const streamMetadata = this.activeStreamContext?.options?.muxMetadata as
+          | MuxMessageMetadata
+          | undefined;
+        if (streamMetadata?.type === "bash-monitor-wake") {
+          this.wakeTurnInFlight = false;
+          this.wakeContinuationDebt = undefined;
+        } else if (
+          this.wakeContinuationDebt != null &&
+          hasSameWorkspaceTurnCorrelation(
+            getWorkspaceTurnMuxMetadata(streamMetadata),
+            this.wakeContinuationDebt.correlation
+          )
+        ) {
+          // The delegated turn's own continuation is streaming: its stream-end settles the
+          // turn, so the debt it assumed at acceptance is discharged.
+          this.wakeContinuationDebt = undefined;
+        }
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
         // setGoal deferral meaningful again — clear the goal service's settled
@@ -6195,7 +6393,7 @@ export class AgentSession {
         if (this.deferQueuedFlushUntilAfterEdit) {
           this.queuedProviderToolEndAbortInFlight = false;
           // Clear the queued-message signal while the edit flow owns the next dispatch.
-          this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+          this.syncToolEndYieldRequested(false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
           // for IDLE; truncation must run before any synthetic turn resumes.
         } else {
@@ -6345,6 +6543,7 @@ export class AgentSession {
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
+      this.settleWakeTurnInFlight();
       // Turn ended: expire any mid-turn thinking override. Safe unconditionally
       // because a replacement turn (e.g. an edit) only creates its holder after
       // the preempted turn has already been transitioned to IDLE.
@@ -6562,8 +6761,6 @@ export class AgentSession {
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
-      cancelState?: { canceledBeforeAcceptance: boolean };
-      cancelSignal?: AbortSignal;
       /** Synthetic assistant rows persisted just before the dispatched turn's user row. */
       preTurnMessages?: MuxMessage[];
       /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
@@ -6582,15 +6779,11 @@ export class AgentSession {
     }
     this.emitQueuedMessageChanged();
     // Signal to bash_output that it should return early to process queued messages
-    // only for tool-end dispatches. Return the same mode so the caller's foreground
-    // task waits follow the entry that will actually run, not a withdrawn FIFO head.
+    // only for tool-end dispatches. Return the FIFO head's mode so the caller's foreground
+    // task waits follow the entry that will actually run next, not the one just added.
     const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      nextDispatchableMode === "tool-end"
-    );
-    // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
-    // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
+    this.syncToolEndYieldRequested(nextDispatchableMode === "tool-end");
+    // The queue is non-empty right after a successful add, so this is never null here.
     return nextDispatchableMode ?? null;
   }
 
@@ -6599,7 +6792,7 @@ export class AgentSession {
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+    this.syncToolEndYieldRequested(false);
     for (const callbacks of callbackSets) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
@@ -6615,10 +6808,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     // Only the FIFO head can dispatch next; later hidden entries must not pull an earlier
     // user-authored turn-end entry forward to a step boundary.
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
+    this.syncToolEndYieldRequested();
     return true;
   }
 
@@ -6652,10 +6842,7 @@ export class AgentSession {
       return 0;
     }
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
+    this.syncToolEndYieldRequested();
     for (const callbacks of removal.callbacks) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
@@ -6680,18 +6867,222 @@ export class AgentSession {
       return false;
     }
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
-    );
+    this.syncToolEndYieldRequested();
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
   }
 
-  /** Pending work only: withdrawn (aborted) entries still occupy the queue but never start a turn. */
+  /** Whether the FIFO head (the only entry the next drain can send) matches `dispatchMode`. */
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
     const nextMode = this.messageQueue.getNextDispatchableMode();
     return nextMode != null && (dispatchMode == null || nextMode === dispatchMode);
+  }
+
+  /**
+   * Stream stop condition: input that must run at a tool boundary is pending. A queued
+   * tool-end message is an edge we hold; a bash-monitor wake is a level read from the
+   * reconciler, so a wake whose lines this very step showed (task_await on the monitored
+   * process) is already gone by the time the SDK asks — the stream keeps going.
+   *
+   * A non-empty queue arbitrates alone: its head runs next whatever the level says (the
+   * wake dispatcher waits for an empty queue), so cutting for the wake behind a turn-end
+   * head would only promote that entry to tool-end. A message queued during the level read
+   * arbitrates the same way.
+   *
+   * The SDK only asks when the loop would otherwise continue, so a true from the level IS
+   * the cut: the continuation debt is taken here, in the same synchronous step as the
+   * decision (see wakeContinuationDebt).
+   */
+  async hasPendingToolEndInput(): Promise<boolean> {
+    const nextMode = this.messageQueue.getNextDispatchableMode();
+    if (nextMode != null) return nextMode === "tool-end";
+    if (this.hasOutstandingBashMonitorWake == null) return false;
+    try {
+      const outstanding = await this.hasOutstandingBashMonitorWake();
+      const modeAfterRead = this.messageQueue.getNextDispatchableMode();
+      if (modeAfterRead != null) return modeAfterRead === "tool-end";
+      if (!outstanding) return false;
+      this.wakeContinuationDebt ??= {
+        correlation: this.activeStreamContext?.workspaceTurnMetadata,
+      };
+      return true;
+    } catch (error) {
+      log.debug("hasPendingToolEndInput: wake level read failed; not yielding on the level", {
+        workspaceId: this.workspaceId,
+        error,
+      });
+      // A message queued while the level read was in flight still arbitrates this boundary:
+      // the read's failure says nothing about the queue.
+      return this.messageQueue.getNextDispatchableMode() === "tool-end";
+    }
+  }
+
+  /**
+   * Mirror the reconciler's wake level. While high, long-polling bash reads return early
+   * so the stream reaches a tool boundary (same lever a queued tool-end message pulls).
+   * Lowered with no wake turn in flight, an owed continuation can no longer arrive.
+   */
+  setBashMonitorWakeOutstanding(outstanding: boolean): void {
+    if (this.bashMonitorWakeOutstanding === outstanding) return;
+    this.bashMonitorWakeOutstanding = outstanding;
+    this.syncToolEndYieldRequested();
+    if (!outstanding) this.maybeVoidWakeContinuation();
+  }
+
+  /** A wake turn is inside this session (see wakeContinuationDebt). */
+  hasPendingBashMonitorWakeTurn(): boolean {
+    return this.wakeTurnInFlight;
+  }
+
+  /**
+   * A stream that yielded to the wake level will still be continued by a wake turn: the
+   * debt is outstanding (its wake not yet dispatched) or the wake turn is already in flight.
+   * Delegated-turn settlement reads this instead of probing the reconciler.
+   */
+  hasBashMonitorWakeContinuation(): boolean {
+    return this.wakeContinuationDebt != null || this.wakeTurnInFlight;
+  }
+
+  /**
+   * A wake send / resume returned, the turn went idle, or a retry was given up: the wake
+   * turn is still in flight only while something inside this session can still start its
+   * stream — a turn in progress (its stream, or a compaction whose follow-up is the wake),
+   * or an auto-retry armed for its durable row.
+   */
+  private settleWakeTurnInFlight(): void {
+    const assumed = this.wakeContinuationDebt?.assumed === true;
+    if (!this.wakeTurnInFlight && !assumed) return;
+    // A turn in progress (the wake's / continuation's own stream, PREPARING, or a compaction
+    // stream whose follow-up is that turn) can still start the stream.
+    if (this.turnPhase !== TurnPhase.IDLE) return;
+    const retryMetadata: unknown = this.hasPendingAutoRetry()
+      ? this.lastAutoRetryResumeRequest?.options.muxMetadata
+      : undefined;
+    if (this.wakeTurnInFlight && !carriesBashMonitorWake(retryMetadata)) {
+      this.wakeTurnInFlight = false;
+    }
+    if (
+      assumed &&
+      this.wakeContinuationDebt != null &&
+      !hasSameWorkspaceTurnCorrelation(
+        // A retry of an on-send compaction still starts the correlated follow-up behind it.
+        getCarriedWorkspaceTurnCorrelation(retryMetadata),
+        this.wakeContinuationDebt.correlation
+      )
+    ) {
+      // The continuation that assumed the debt is not coming from this send; the debt is
+      // plain owed again (the wake, if still outstanding, will discharge it).
+      delete this.wakeContinuationDebt.assumed;
+    }
+    this.maybeVoidWakeContinuation();
+  }
+
+  private maybeVoidWakeContinuation(): void {
+    this.retryUnsettledWakeVoids();
+    if (
+      this.wakeContinuationDebt != null &&
+      this.wakeContinuationDebt.assumed !== true &&
+      !this.wakeTurnInFlight &&
+      !this.bashMonitorWakeOutstanding
+    ) {
+      this.voidWakeContinuation("retracted");
+    }
+  }
+
+  /**
+   * Input other than the wake has crossed its acceptance boundary (row durable, so the send
+   * can no longer fail without leaving a resumable turn). Only now can it settle the debt: a
+   * send refused earlier — pricing, staleness, persistence — leaves the wake outstanding and
+   * its continuation still owed. Synchronous with the PREPARING reservation this is not:
+   * enterPreparing only reserves the turn.
+   *
+   * A continuation of the delegated turn itself does not clear the debt here: between this
+   * point and its PREPARING / stream-start nothing else would tell settlement that the turn
+   * continues, and a stream-end handler running in that gap would settle (and, for a
+   * disposable turn, remove the workspace under) the accepted continuation. It assumes the
+   * debt instead; its stream-start discharges it.
+   */
+  private settleWakeDebtForAcceptedInput(muxMetadata: unknown): void {
+    if (this.wakeContinuationDebt == null || carriesBashMonitorWake(muxMetadata)) return;
+    if (
+      hasSameWorkspaceTurnCorrelation(
+        getWorkspaceTurnMuxMetadata(muxMetadata),
+        this.wakeContinuationDebt.correlation
+      )
+    ) {
+      this.wakeContinuationDebt.assumed = true;
+      this.retryUnsettledWakeVoids();
+    } else {
+      this.voidWakeContinuation("superseded");
+    }
+  }
+
+  /**
+   * Sync transition; the owner hook runs as a tracked promise (never awaited here — callers
+   * sit inside admission and phase transitions).
+   */
+  private voidWakeContinuation(reason: WorkspaceTurnContinuationVoidReason): void {
+    const debt = this.wakeContinuationDebt;
+    this.wakeContinuationDebt = undefined;
+    this.retryUnsettledWakeVoids();
+    const correlation = debt?.correlation;
+    if (correlation == null) return;
+    this.settleVoidedWakeContinuation({ correlation, reason });
+  }
+
+  /** Runs the owner hook; a failure parks the void for retry instead of dropping it. */
+  private settleVoidedWakeContinuation(voided: {
+    correlation: WorkspaceTurnMuxMetadata;
+    reason: WorkspaceTurnContinuationVoidReason;
+  }): void {
+    if (this.onWorkspaceTurnContinuationVoided == null) return;
+    this.onWorkspaceTurnContinuationVoided(voided.correlation, voided.reason).catch(
+      (error: unknown) => {
+        log.error("Voided bash-monitor wake continuation could not be settled; will retry", {
+          workspaceId: this.workspaceId,
+          reason: voided.reason,
+          error: getErrorMessage(error),
+        });
+        if (this.disposed || this.shuttingDown) return;
+        this.unsettledWakeVoids.push(voided);
+        if (this.unsettledWakeVoidRetryTimer == null) {
+          this.unsettledWakeVoidRetryTimer = setTimeout(() => {
+            this.unsettledWakeVoidRetryTimer = undefined;
+            this.retryUnsettledWakeVoids();
+          }, UNSETTLED_WAKE_VOID_RETRY_DELAY_MS);
+          // Recovery must not keep a graceful process exit alive (beginShutdown also cancels).
+          this.unsettledWakeVoidRetryTimer.unref?.();
+        }
+      }
+    );
+  }
+
+  private retryUnsettledWakeVoids(): void {
+    if (this.unsettledWakeVoids.length === 0) return;
+    const pending = this.unsettledWakeVoids;
+    this.unsettledWakeVoids = [];
+    for (const voided of pending) this.settleVoidedWakeContinuation(voided);
+  }
+
+  /**
+   * Tool-end yield flag = queue head is tool-end ∪ (queue empty ∧ wake level), mirroring
+   * hasPendingToolEndInput's arbitration. `queueHeadToolEnd` lets stream-end / clear paths
+   * assert the queue contribution is gone before the queue itself is observed empty.
+   *
+   * This is the single place the effective flag is computed, so it also owns the rising
+   * edge: a turn-end head that is cleared, removed, or promoted while the wake level is high
+   * makes the lever effective without any enqueue or level publish, and the consequence
+   * (backgrounding foreground waits) must follow that edge, not those events.
+   */
+  private syncToolEndYieldRequested(
+    queueHeadToolEnd = this.messageQueue.getNextDispatchableMode() === "tool-end"
+  ): void {
+    const requested =
+      queueHeadToolEnd || (this.bashMonitorWakeOutstanding && this.messageQueue.isEmpty());
+    const rising = requested && !this.toolEndYieldRequested;
+    this.toolEndYieldRequested = requested;
+    this.backgroundProcessManager.setMessageQueued(this.workspaceId, requested);
+    if (rising) this.onToolEndYieldRequested?.();
   }
 
   /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
@@ -6737,26 +7128,45 @@ export class AgentSession {
   }
 
   /**
-   * Whether a bash-monitor-wake continuation is pending dispatch: the next
-   * queued entry is a wake, or a dequeued wake is mid-dispatch (dequeue →
-   * stream start). Wake sends are the only input that inherits an open
-   * delegated workspace turn's correlation, so TaskService uses this — not
-   * generic queued/preparing state — to decide whether a correlated
-   * "tool-calls" queue cut will be continued rather than superseded. Once the
-   * wake's stream starts, TaskService matches the active stream's inherited
-   * correlation instead (see hasSameTurnWakeContinuation).
+   * Claim PREPARING for a send and record what kind of input it carries. A reservation only:
+   * an outstanding wake continuation debt is settled when the input is accepted
+   * (settleWakeDebtForAcceptedInput), not when it is admitted.
    */
-  hasPendingBashMonitorWakeContinuation(): boolean {
-    if (this.messageQueue.isNextEntryBashMonitorWake()) {
-      return true;
-    }
-    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
-    return dispatching?.type === "bash-monitor-wake";
+  private enterPreparing(muxMetadata: unknown): void {
+    this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(muxMetadata);
+    this.setTurnPhase(TurnPhase.PREPARING);
   }
 
   /**
    * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
    */
+  /**
+   * Whether a stream carrying `correlation` started after every stream in `messageIds`
+   * (running or already ended). A message id the ledger no longer holds was evicted by
+   * later starts (or predates this session instance), so every remembered start is after it.
+   */
+  hasCorrelatedStreamStartedAfter(
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean {
+    let after = -1;
+    for (const messageId of messageIds) {
+      after = Math.max(
+        after,
+        this.recentStreamStarts.findIndex((entry) => entry.messageId === messageId)
+      );
+    }
+    return this.recentStreamStarts
+      .slice(after + 1)
+      .some(
+        (entry) =>
+          entry.correlation != null &&
+          entry.correlation.taskHandleId === correlation.taskHandleId &&
+          entry.correlation.ownerWorkspaceId === correlation.ownerWorkspaceId &&
+          entry.correlation.turnId === correlation.turnId
+      );
+  }
+
   hasPendingWorkspaceTurnContinuation(
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
   ): boolean {
@@ -6804,7 +7214,10 @@ export class AgentSession {
       return { stage: "dispatching", muxMetadata: this.dispatchingQueuedEntryMuxMetadata };
     }
     const candidate = this.messageQueue.getNextQueueCutCandidate();
-    return candidate != null ? { stage: "queued", ...candidate } : undefined;
+    if (candidate != null) return { stage: "queued", ...candidate };
+    // No input holds the session: the stream itself yielded to the wake level and the
+    // continuation is still owed (see wakeContinuationDebt).
+    return this.wakeContinuationDebt != null ? { stage: "bash-monitor-wake" } : undefined;
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */
@@ -6860,7 +7273,6 @@ export class AgentSession {
       return false;
     }
 
-    // Physical check: withdrawn entries must still drain so their onCanceled fires.
     const shouldDispatch =
       abortReason !== "user" &&
       !this.deferQueuedFlushUntilAfterEdit &&
@@ -7014,7 +7426,7 @@ export class AgentSession {
 
     this.queuedProviderToolEndAbortInFlight = false;
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
-    this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+    this.syncToolEndYieldRequested(false);
 
     if (!this.messageQueue.isEmpty()) {
       // Entries dispatch one at a time (FIFO): special sends (compaction, agent
@@ -7027,15 +7439,11 @@ export class AgentSession {
 
       // Re-arm dispatch signals for the remaining entries so the stream we are
       // about to start drains them at its next tool end (or stream end).
-      this.backgroundProcessManager.setMessageQueued(
-        this.workspaceId,
-        this.messageQueue.getNextDispatchableMode() === "tool-end"
-      );
+      this.syncToolEndYieldRequested();
 
       // Set PREPARING synchronously before the async sendMessage to prevent
       // incoming messages from bypassing the queue during the await gap.
-      this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
-      this.setTurnPhase(TurnPhase.PREPARING);
+      this.enterPreparing(options?.muxMetadata);
 
       void this.sendMessage(message, options, { ...internal, enqueuedAtMs })
         .then(async (result) => {
@@ -7054,14 +7462,6 @@ export class AgentSession {
             // entry, so this terminates).
             this.sendQueuedMessages();
             return;
-          }
-          if (internal?.cancelState?.canceledBeforeAcceptance === true) {
-            // Cancellation can arrive after dequeue while sendMessage is validating or writing
-            // history. No stream will start, so release PREPARING and continue with later entries.
-            if (this.turnPhase === TurnPhase.PREPARING) {
-              this.setTurnPhase(TurnPhase.IDLE);
-            }
-            this.sendQueuedMessages();
           }
         })
         .catch(async (error: unknown) => {
@@ -7566,6 +7966,31 @@ export class AgentSession {
       return;
     }
 
+    // Every discard path funnels here, so this is the one place that knows the delegated
+    // turn's continuation is gone for good. The void is a synchronous state transition here
+    // and the owner-side settlement runs as a tracked, retried promise (see
+    // settleVoidedWakeContinuation) — it is never awaited: this path runs while the
+    // TaskService stream-end listener holds the workspace event lock waiting for the
+    // compaction completion decision, and the owner settles under that same lock. A wake
+    // follow-up also carried the continuation debt of the stream it cut; the same void clears
+    // it. Whether the erase below succeeds does not affect the settlement: the void carries
+    // the correlation itself.
+    const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
+    if (workspaceTurnMetadata != null) {
+      if (
+        hasSameWorkspaceTurnCorrelation(
+          this.wakeContinuationDebt?.correlation,
+          workspaceTurnMetadata
+        )
+      ) {
+        this.wakeContinuationDebt = undefined;
+      }
+      this.settleVoidedWakeContinuation({
+        correlation: workspaceTurnMetadata,
+        reason: "abandoned",
+      });
+    }
+
     const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
     const updateResult = await this.historyService.updateHistory(this.workspaceId, {
       ...summaryMessage,
@@ -7917,8 +8342,7 @@ export class AgentSession {
 
   private async materializeMcpPromptSnapshots(
     muxMetadata: MuxMessageMetadata | undefined,
-    invokingMessageId: string,
-    cancelSignal: AbortSignal | undefined
+    invokingMessageId: string
   ): Promise<MuxMessage[]> {
     const mcpServerManager = this.mcpServerManager;
     if (!mcpServerManager) return [];
@@ -7931,8 +8355,7 @@ export class AgentSession {
             this.workspaceId,
             ref.serverName,
             ref.promptName,
-            ref.arguments ?? {},
-            cancelSignal !== undefined ? { signal: cancelSignal } : undefined
+            ref.arguments ?? {}
           );
           return createMuxMessage(createMcpPromptSnapshotMessageId(), "user", prompt.text, {
             timestamp: Date.now(),
@@ -7946,8 +8369,6 @@ export class AgentSession {
             },
           });
         } catch (error) {
-          // Cancellation is handled by cancelBeforeAcceptance after this returns.
-          if (cancelSignal?.aborted) return null;
           // A slash-invoked prompt was explicitly selected; sending the turn
           // without its expansion would silently change what the user asked
           // for. Inline references degrade to the authored text instead.

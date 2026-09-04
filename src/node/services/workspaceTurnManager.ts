@@ -18,6 +18,7 @@ import {
   type WorkspaceLifecycleResult,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
+import type { WorkspaceTurnContinuationVoidReason } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
@@ -282,6 +283,17 @@ const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
 /**
+ * Reason persisted when the target stream yielded at a tool boundary to a bash-monitor
+ * wake that was then retracted (monitor canceled) before the wake turn was sent. No
+ * continuation follows, so deferring would leave the owner's wait hanging; settling as a
+ * truncation would misreport the delegated work as failed output. Same supersede family
+ * as new-input cuts: self-heal eligible should a late correlated continuation prove the
+ * turn went on after all.
+ */
+const WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR =
+  "Workspace turn yielded at a tool boundary to a bash-monitor wake that was retracted before delivery; the target workspace is idle and this delegated turn did not complete";
+
+/**
  * Reason prefix persisted when the owner's OWN follow-up turn (task
  * kind="workspace", mode="existing", tool-end dispatch) cut its active
  * delegated turn at a tool boundary. The full reason names the successor
@@ -331,7 +343,8 @@ function isSupersededWorkspaceTurnInterrupt(
 ): boolean {
   return (
     (record.status === "interrupted" &&
-      record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR) ||
+      (record.error === WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR ||
+        record.error === WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR)) ||
     isOwnerFollowUpSupersededWorkspaceTurnInterrupt(record)
   );
 }
@@ -378,6 +391,7 @@ function ownerFollowUpSupersedeSkipsDirectParent(
 type QueueCutSupersedeEvidence =
   | { kind: "same_owner_follow_up"; successorHandleId: string }
   | { kind: "other_input" }
+  | { kind: "retracted_wake" }
   | { kind: "preserved"; error: string }
   | null;
 
@@ -2104,6 +2118,14 @@ export class WorkspaceTurnManager {
      * it would leak the disposable checkout with no owner left to clean it up.
      */
     disposableOwnershipTransferred?: boolean;
+    /**
+     * Re-evaluated under the settlement lock, after the handle reread and before anything is
+     * written: when it returns true the settlement is abandoned. Callers whose reason to
+     * settle can be invalidated by concurrent admission (a continuation of the turn queued or
+     * started while this call awaited the lock / store) revalidate here, at the commit point,
+     * rather than trusting a snapshot taken before those awaits.
+     */
+    abandonIf?: () => boolean;
   }): Promise<void> {
     assert(
       params.next.handleId === params.record.handleId,
@@ -2181,7 +2203,22 @@ export class WorkspaceTurnManager {
             current.status
           );
           this.taskHost.markTaskForegroundRelevant(current.handleId);
+          // The terminal row is the first durable write of a settlement; the phases after it
+          // (mirror, waiters, disposable cleanup) can be skipped by a throw, and this branch is
+          // where the retry lands. Resume the cleanup phase here too — a still-registered
+          // disposable workspace on a terminal record means no settlement reached it (cleanup
+          // either removes the workspace or, when forwarding it, clears the flag).
+          if (
+            current.disposableWorkspace &&
+            (await this.workspaceService.getInfo(current.workspaceId)) != null
+          ) {
+            await this.cleanupDisposableWorkspaceTurn(current);
+          }
           return { pendingNotify: null, winningStatus: current.status };
+        }
+
+        if (params.abandonIf?.() === true) {
+          return null;
         }
 
         // Decide the terminal wake-up using persisted policy + the restart-safe dedupe marker.
@@ -4091,7 +4128,9 @@ export class WorkspaceTurnManager {
           ? buildOwnerFollowUpSupersededError(evidence.successorHandleId)
           : evidence.kind === "preserved"
             ? evidence.error
-            : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
+            : evidence.kind === "retracted_wake"
+              ? WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR
+              : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR;
       return {
         ...baseRecord,
         status: "interrupted",
@@ -4312,7 +4351,8 @@ export class WorkspaceTurnManager {
    */
   private hasSameTurnContinuation(
     event: StreamEndEvent,
-    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    queueCutSnapshot: QueueCutAttributionSnapshot
   ): boolean {
     if (
       this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
@@ -4322,11 +4362,53 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
+    // A stream that yielded to the wake level continues through the wake turn, which
+    // inherits this correlation from history (inheritOpenWorkspaceTurnMetadata). Only the
+    // event-time attribution says whether the level was the cutter: a manual tool-end head
+    // arbitrates the cut even while the level is high, runs first and breaks inheritance, so
+    // the wake behind it is not this turn's continuation and the handle must settle here.
+    // Whether the wake can still arrive is the session's continuation debt, read live and
+    // synchronously: a void that landed before this handler (same per-workspace lock) has
+    // already cleared it, and one landing after finds the record deferred and settles it
+    // itself (settleVoidedWorkspaceTurnContinuation).
+    if (
+      queueCutSnapshot.cutter?.stage === "bash-monitor-wake" &&
+      this.workspaceService.hasBashMonitorWakeContinuation(event.workspaceId)
+    ) {
       return true;
     }
-    const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
-    if (activeStream == null || activeStream.messageId === event.messageId) {
+    return this.hasCorrelatedStreamAfter(event.workspaceId, correlation, [event.messageId]);
+  }
+
+  /**
+   * Whether a stream other than `excludeMessageIds` (the ending stream, or streams whose
+   * stream-end this record already deferred) is currently streaming this exact correlation.
+   */
+  /**
+   * The turn continued after the given stream(s): a correlated stream started later — still
+   * running, or already ended with its own stream-end queued behind this handler on the
+   * workspace event lock. Settling here would pre-empt that stream-end (and, for a disposable
+   * turn, delete the workspace under its work). The session's start ledger is authoritative;
+   * the live stream check covers a session that is not in memory.
+   */
+  private hasCorrelatedStreamAfter(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean {
+    return (
+      this.workspaceService.hasCorrelatedStreamStartedAfter(workspaceId, correlation, messageIds) ||
+      this.hasCorrelatedActiveStream(workspaceId, correlation, messageIds)
+    );
+  }
+
+  private hasCorrelatedActiveStream(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    excludeMessageIds: readonly string[]
+  ): boolean {
+    const activeStream = this.streamManager?.getStreamInfo(workspaceId);
+    if (activeStream == null || excludeMessageIds.includes(activeStream.messageId)) {
       return false;
     }
     const activeCorrelation = this.getWorkspaceTurnMetadataFromValue(activeStream.muxMetadata);
@@ -4398,6 +4480,11 @@ export class WorkspaceTurnManager {
       return cutter.dispatchMode === "tool-end"
         ? classifyMetadata(cutter.muxMetadata)
         : { kind: "other_input" };
+    }
+    // The stream yielded to the wake level and the caller found no continuation
+    // (level low, no wake turn admitted): the wake was retracted after the cut.
+    if (cutter?.stage === "bash-monitor-wake") {
+      return { kind: "retracted_wake" };
     }
     // Residual legacy positives (e.g. hasPendingAutoRetry with an empty queue)
     // stay generic supersede evidence.
@@ -4480,16 +4567,16 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    // A queued continuation can stop the in-flight stream at a tool boundary with
-    // finishReason "tool-calls" and continue the same delegated turn. Report
-    // wake-ups carry the exact correlation explicitly; bash-monitor wakes inherit
-    // it from history. Defer settlement until the continuation's terminal
+    // A queued continuation (or an outstanding bash-monitor wake) can stop the
+    // in-flight stream at a tool boundary with finishReason "tool-calls" and
+    // continue the same delegated turn. Report wake-ups carry the exact
+    // correlation explicitly; bash-monitor wakes inherit it from history. Defer settlement until the continuation's terminal
     // stream-end instead of reporting a false completion failure to the owner.
     // Any other queued input (manual message, /compact) supersedes the turn and
     // must settle the old outcome here.
     if (
       event.metadata.finishReason === "tool-calls" &&
-      this.hasSameTurnContinuation(event, metadata)
+      this.hasSameTurnContinuation(event, metadata, queueCutSnapshot)
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
@@ -4645,22 +4732,80 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * The target session will never continue the delegated turn identified by `muxMetadata`
+   * (AgentSession.onWorkspaceTurnContinuationVoided). `retracted` / `superseded` void a
+   * continuation debt: only a record the stream-end handler already DEFERRED on that debt
+   * needs settling here — a record still running has its handler queued behind this call on
+   * the workspace event lock, and that handler reads the (now cleared) debt live and settles
+   * the turn itself. `abandoned` drops a compaction follow-up carrying the correlation: the
+   * record may still be running behind the compaction stream (whose stream-end is
+   * uncorrelated and settles nothing), so any active record settles.
+   *
+   * A void says nothing about OTHER continuations of the same turn: a correlated report
+   * queued after the wake cut (or already streaming) also deferred the stream-end and will
+   * settle the record with its own stream-end. Settling here would interrupt a turn that is
+   * about to continue — and a disposable turn would delete its workspace under that stream.
+   * That check runs after the record read and again at the settlement's commit point
+   * (`unlessTurnContinues`): a continuation queued while the handle store or the settlement
+   * lock was being awaited must be seen too.
+   */
+  async settleVoidedWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: WorkspaceTurnMuxMetadata,
+    reason: WorkspaceTurnContinuationVoidReason
+  ): Promise<void> {
+    await this.settleWorkspaceTurnContinuationFailure(
+      workspaceId,
+      muxMetadata,
+      "interrupted",
+      reason === "retracted"
+        ? WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR
+        : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR,
+      { deferredOnly: reason !== "abandoned", unlessTurnContinues: true }
+    );
+  }
+
   // A queued report can defer the preceding stream-end. If dispatch then fails, settle that
   // exact turn here because no replacement stream-end can arrive.
   async settleWorkspaceTurnContinuationFailure(
     workspaceId: string,
     muxMetadata: WorkspaceTurnMuxMetadata,
     status: "interrupted" | "error",
-    error: string
+    error: string,
+    options?: { deferredOnly: boolean; unlessTurnContinues: boolean }
   ): Promise<void> {
     const record = await this.taskHandleStore.getWorkspaceTurn(
       muxMetadata.ownerWorkspaceId,
       muxMetadata.taskHandleId
     );
+    if (record?.workspaceId !== workspaceId || record.turnId !== muxMetadata.turnId) {
+      return;
+    }
+    if (this.isTerminalWorkspaceTurnStatus(record.status)) {
+      // Already settled — possibly by an earlier attempt of this very settlement that
+      // persisted the terminal handle and then failed before resolving its waiters (the
+      // void is retried on failure). settleWorkspaceTurn's terminal branch is idempotent and
+      // resolves whatever is still waiting on the persisted outcome.
+      await this.settleWorkspaceTurn({
+        record,
+        next: record,
+        waiterSettlement: { status: "error", error: new Error(error) },
+      });
+      return;
+    }
+    // The turn continues when a correlated continuation is pending, or a correlated stream
+    // whose stream-end the record has not deferred started (it settles the turn itself).
+    // Checked here and again at the commit point inside settleWorkspaceTurn (abandonIf): a
+    // correlated send is invisible during its preflight and can become queued while the
+    // settlement awaits the lock and the store.
+    const turnContinues = () =>
+      this.workspaceService.hasPendingWorkspaceTurnContinuation(workspaceId, muxMetadata) ||
+      this.hasCorrelatedStreamAfter(workspaceId, muxMetadata, record.deferredMessageIds ?? []);
     if (
-      record?.workspaceId !== workspaceId ||
-      record?.turnId !== muxMetadata.turnId ||
-      !isActiveWorkspaceTurnTaskStatus(record?.status)
+      !isActiveWorkspaceTurnTaskStatus(record.status) ||
+      (options?.deferredOnly === true && (record.deferredMessageIds?.length ?? 0) === 0) ||
+      (options?.unlessTurnContinues === true && turnContinues())
     ) {
       return;
     }
@@ -4676,6 +4821,7 @@ export class WorkspaceTurnManager {
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
+      ...(options?.unlessTurnContinues === true ? { abandonIf: turnContinues } : {}),
     });
   }
 

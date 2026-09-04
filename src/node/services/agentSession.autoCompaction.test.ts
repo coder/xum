@@ -6,6 +6,7 @@ import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type MuxMessage,
+  type MuxMessageMetadata,
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
@@ -313,6 +314,40 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(unstamped).toBeUndefined();
   });
 
+  test("bash-monitor wake follow-ups keep their idle-only admission across compaction", async () => {
+    // The wake was sent with requireIdle; a manual message queued during the compaction
+    // stream must still win over the re-dispatched continuation (dispatchPendingFollowUp).
+    const { session } = await createSessionHarness({
+      workspaceId: "ws-auto-compaction-wake-require-idle",
+    });
+    const build = (
+      session as unknown as {
+        buildAutoCompactionFollowUp: (params: {
+          messageText: string;
+          options: SendMessageOptions;
+          modelForStream: string;
+          muxMetadata?: MuxMessageMetadata;
+        }) => CompactionFollowUpRequest;
+      }
+    ).buildAutoCompactionFollowUp.bind(session);
+
+    const wakeFollowUp = build({
+      messageText: "READY",
+      options: { model: "openai:gpt-4o", agentId: "exec" },
+      modelForStream: "openai:gpt-4o",
+      muxMetadata: { type: "bash-monitor-wake", records: [] },
+    });
+    expect(wakeFollowUp.dispatchOptions?.requireIdle).toBe(true);
+
+    const plainFollowUp = build({
+      messageText: "hello",
+      options: { model: "openai:gpt-4o", agentId: "exec" },
+      modelForStream: "openai:gpt-4o",
+    });
+    expect(plainFollowUp.dispatchOptions?.requireIdle).toBeUndefined();
+    session.dispose();
+  });
+
   test("preserves goal kind and goal identity on auto-compaction follow-up requests", async () => {
     const { session } = await createSessionHarness({
       workspaceId: "ws-auto-compaction-goal-kind",
@@ -385,6 +420,186 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(hasCompactionRequest).toBe(true);
 
     session.dispose();
+  });
+
+  test("a send refused after its on-send compaction row landed rolls that row back", async () => {
+    // The compaction row is the one durable write that precedes the admission gates. A send
+    // whose admission went stale in between (a bash-monitor wake whose monitor was cancelled,
+    // a peer send racing a Stop) is refused without a stream — leaving the row would let
+    // startup recovery resume a compaction whose follow-up nobody accepted.
+    const workspaceId = "ws-auto-compaction-stale-admission-rollback";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, historyService } = await createSessionHarness({
+      workspaceId,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    });
+
+    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: false,
+        usagePercentage: 72,
+        thresholdPercentage: 70,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.7),
+    } as unknown as CompactionMonitor;
+
+    const onAccepted = mock(() => Promise.resolve());
+    const result = await session.sendMessage(
+      "hello",
+      {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      },
+      { admissionStale: () => true, onAccepted }
+    );
+    expect(result.success).toBe(false);
+    expect(streamMessage).not.toHaveBeenCalled();
+    // The row is gone, so the wake lease stays released for the reconciler to re-derive.
+    expect(onAccepted).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`failed to load history: ${String(historyResult.error)}`);
+    }
+    expect(
+      historyResult.data.some(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      )
+    ).toBe(false);
+
+    session.dispose();
+  });
+
+  // Shared setup for the rollback-failure refusals below: on-send compaction lands its row,
+  // then the send is refused as stale and the row's deletion fails.
+  async function createRefusedWakeAfterFailedRollbackHarness(workspaceId: string) {
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, historyService } = await createSessionHarness({
+      workspaceId,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    });
+    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: false,
+        usagePercentage: 72,
+        thresholdPercentage: 70,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.7),
+    } as unknown as CompactionMonitor;
+    const deleteMessages = spyOn(historyService, "deleteMessages").mockImplementationOnce(() =>
+      Promise.resolve(Err("disk unavailable"))
+    );
+    const chatEventTypes: string[] = [];
+    session.onChatEvent((event) => {
+      chatEventTypes.push(event.message.type);
+    });
+    const readResumeRequest = () =>
+      (
+        session as unknown as {
+          lastAutoRetryResumeRequest?: { options: { muxMetadata?: unknown } };
+        }
+      ).lastAutoRetryResumeRequest;
+    const onAccepted = mock(() => Promise.resolve());
+    const sendRefusedWake = () =>
+      session.sendMessage(
+        "hello",
+        {
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { admissionStale: () => true, onAccepted }
+      );
+    const hasCompactionRow = async () => {
+      const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!historyResult.success) {
+        throw new Error(`failed to load history: ${String(historyResult.error)}`);
+      }
+      return historyResult.data.some(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      );
+    };
+    return {
+      session,
+      historyService,
+      streamMessage,
+      onAccepted,
+      chatEventTypes,
+      readResumeRequest,
+      sendRefusedWake,
+      hasCompactionRow,
+      deleteMessagesCalls: () => deleteMessages.mock.calls.length,
+    };
+  }
+
+  test("a refused wake whose compaction row verifiably remains consumes its lease and arms a resume", async () => {
+    // The durable row carries the wake as its follow-up. Releasing the lease too would have the
+    // reconciler deliver the same output a second time (possibly after the monitor retracted
+    // it), so the refusal consumes the wake — and arms the in-session resume like every other
+    // durable pre-stream failure, because startup recovery only resumes an interrupted history
+    // tail and a competing manual send could bury the request under a newer turn.
+    const h = await createRefusedWakeAfterFailedRollbackHarness(
+      "ws-auto-compaction-rollback-failure-consumes-wake"
+    );
+    try {
+      let resumeArmedAtAcceptance = false;
+      h.onAccepted.mockImplementation(() => {
+        resumeArmedAtAcceptance = h.readResumeRequest() != null;
+        return Promise.resolve();
+      });
+      const result = await h.sendRefusedWake();
+      expect(result.success).toBe(false);
+      expect(h.streamMessage).not.toHaveBeenCalled();
+      expect(h.onAccepted).toHaveBeenCalledTimes(1);
+      expect(resumeArmedAtAcceptance).toBe(true);
+      // The resume replays the compaction request (which carries the wake), not a fresh row.
+      expect(
+        (h.readResumeRequest()?.options.muxMetadata as { type?: string } | undefined)?.type
+      ).toBe("compaction-request");
+      expect(h.chatEventTypes).toContain("auto-retry-scheduled");
+      expect(await h.hasCompactionRow()).toBe(true);
+    } finally {
+      await h.session.setAutoRetryEnabled(false, { persist: false });
+      h.session.dispose();
+    }
+  });
+
+  test("a refused wake whose rollback outcome is unknown keeps its lease released", async () => {
+    // deleteMessages can fail after committing; if the readback fails too the row's fate is
+    // unknown. Consuming the lease then could leave neither carrier nor signal (the wake and any
+    // delegated continuation deferred behind it would be lost), so the refusal must release
+    // and let the reconciler re-derive — a duplicate delivery is the tolerable failure mode.
+    const h = await createRefusedWakeAfterFailedRollbackHarness(
+      "ws-auto-compaction-rollback-unknown-releases-wake"
+    );
+    try {
+      // Fail only the readback that follows the failed delete; sendMessage reads history
+      // earlier (compaction check) and those reads must stay healthy for the row to land.
+      const readHistory = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+      spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementation((...args) =>
+        h.deleteMessagesCalls() > 0
+          ? Promise.resolve(Err("disk unavailable"))
+          : readHistory(...args)
+      );
+      const result = await h.sendRefusedWake();
+      expect(result.success).toBe(false);
+      expect(h.streamMessage).not.toHaveBeenCalled();
+      expect(h.onAccepted).not.toHaveBeenCalled();
+      expect(h.readResumeRequest()).toBeUndefined();
+      expect(h.chatEventTypes).not.toContain("auto-retry-scheduled");
+    } finally {
+      h.session.dispose();
+    }
   });
 
   test("uses preferred compaction model for on-send auto-compaction requests", async () => {
@@ -1343,6 +1558,8 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
   async function createGuidanceHarness(args: {
     workspaceId: string;
     summaryText?: string;
+    /** Observes each stream request (1-based) just before and just after its stream-start. */
+    onStreamRequest?: (index: number, phase: "preparing" | "streaming") => void;
   }): Promise<GuidanceStreamFixture> {
     const workspaceId = args.workspaceId;
     const streamHistories: MuxMessage[][] = [];
@@ -1355,6 +1572,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
           : undefined;
       streamHistories.push(Array.isArray(requestMessages) ? (requestMessages as MuxMessage[]) : []);
 
+      args.onStreamRequest?.(streamHistories.length, "preparing");
       aiEmitter.emit("stream-start", {
         type: "stream-start",
         workspaceId,
@@ -1363,6 +1581,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         historySequence: streamHistories.length,
         startTime: Date.now(),
       });
+      args.onStreamRequest?.(streamHistories.length, "streaming");
 
       const usage = {
         inputTokens: 42,
@@ -1490,6 +1709,66 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
         (event) => (event as { type?: string }).type === "auto-compaction-completed"
       )
     ).toBe(true);
+
+    fixture.session.dispose();
+  });
+
+  test("a wake consumed by on-send compaction stays in flight until its follow-up streams", async () => {
+    // The wake's onAccepted lowers the reconciler level, and the compaction stream's request is
+    // the compaction row, not the wake — so the compaction stream must not redeem the wake:
+    // the wake turn stays in flight through the compaction and is redeemed only by the
+    // follow-up's own stream (see AgentSession.wakeContinuationDebt).
+    const observed: Array<[number, "preparing" | "streaming", boolean]> = [];
+    const fixtureRef: { session?: AgentSession } = {};
+    const fixture = await createGuidanceHarness({
+      workspaceId: "ws-auto-compaction-wake-identity",
+      onStreamRequest: (index, phase) => {
+        observed.push([index, phase, fixtureRef.session?.hasPendingBashMonitorWakeTurn() ?? false]);
+      },
+    });
+    fixtureRef.session = fixture.session;
+    // Compact the wake once; its follow-up must then stream as the wake itself.
+    let compactionChecks = 0;
+    (
+      fixture.session as unknown as { compactionMonitor: CompactionMonitor }
+    ).compactionMonitor.checkBeforeSend = () => {
+      compactionChecks += 1;
+      return {
+        shouldShowWarning: compactionChecks === 1,
+        shouldForceCompact: compactionChecks === 1,
+        usagePercentage: compactionChecks === 1 ? 95 : 10,
+        thresholdPercentage: 70,
+      };
+    };
+
+    const result = await fixture.session.sendMessage(
+      "READY",
+      {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      },
+      { synthetic: true, agentInitiated: true, startStreamInBackground: true }
+    );
+    expect(result.success).toBe(true);
+    expect(await waitFor(() => fixture.streamHistories.length >= 2)).toBe(true);
+
+    expect(fixture.streamHistories[0].at(-1)?.metadata?.muxMetadata?.type).toBe(
+      "compaction-request"
+    );
+    expect(fixture.streamHistories[1].at(-1)?.metadata?.muxMetadata?.type).toBe(
+      "bash-monitor-wake"
+    );
+    expect(observed).toEqual([
+      // Compaction turn: preparing and streaming both still carry the wake.
+      [1, "preparing", true],
+      [1, "streaming", true],
+      // Follow-up wake turn: preparing carries it; its own stream shows it instead.
+      [2, "preparing", true],
+      [2, "streaming", false],
+    ]);
+    expect(await waitFor(() => !fixture.session.isBusy())).toBe(true);
+    expect(fixture.session.hasPendingBashMonitorWakeTurn()).toBe(false);
 
     fixture.session.dispose();
   });

@@ -272,7 +272,8 @@ export interface StreamMessageOptions {
   allowAgentSetGoal?: boolean;
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /** Whether input that must run at a tool boundary is pending (see StreamRequestInput). */
+  hasPendingToolEndInput?: () => Promise<boolean> | boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -736,7 +737,7 @@ export class TurnRequestBuilder {
       allowAgentSetGoal,
       workspaceGoalService,
       disableWorkspaceAgents,
-      hasQueuedMessages,
+      hasPendingToolEndInput,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -2856,7 +2857,7 @@ export class TurnRequestBuilder {
       maxOutputTokens,
       toolPolicy: effectiveToolPolicy,
       providedStreamToken: streamToken,
-      hasQueuedMessages,
+      hasPendingToolEndInput,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

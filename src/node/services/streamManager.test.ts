@@ -1563,9 +1563,9 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
 });
 
 describe("StreamManager - stopWhen configuration", () => {
-  type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
+  type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
   type BuildStopWhenCondition = (request: {
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    hasPendingToolEndInput?: () => Promise<boolean> | boolean;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
 
@@ -1578,7 +1578,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   function requiredToolConditionForTests(toolPolicy: ToolPolicy): StopWhenCondition {
     const [, , requiredToolCondition] = buildStopWhenForTests()({
-      hasQueuedMessages: () => false,
+      hasPendingToolEndInput: () => false,
       toolPolicy,
     });
     return requiredToolCondition;
@@ -1588,21 +1588,28 @@ describe("StreamManager - stopWhen configuration", () => {
     return { steps: [{ toolResults: [{ toolName, output }] }] };
   }
 
-  test("returns step-cap and queued-message conditions with no policy", () => {
-    let queued = false;
-    const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
+  test("returns step-cap and pending tool-end input conditions with no policy", async () => {
+    // The hook is a live level read (queued tool-end message or outstanding bash-monitor
+    // wake), evaluated after the step's tool results settle — so it is awaited per step.
+    let pending: Promise<boolean> | boolean = false;
+    const stopWhen = buildStopWhenForTests()({ hasPendingToolEndInput: () => pending });
     expect(stopWhen).toHaveLength(3);
 
-    const [maxStepCondition, queuedMessageCondition, requiredToolCondition] = stopWhen;
+    const [maxStepCondition, pendingInputCondition, requiredToolCondition] = stopWhen;
     expect(maxStepCondition({ steps: new Array(99999) })).toBe(false);
     expect(maxStepCondition({ steps: new Array(100000) })).toBe(true);
 
-    expect(queuedMessageCondition({ steps: [] })).toBe(false);
-    queued = true;
-    expect(queuedMessageCondition({ steps: [] })).toBe(true);
+    expect(await pendingInputCondition({ steps: [] })).toBe(false);
+    pending = Promise.resolve(true);
+    expect(await pendingInputCondition({ steps: [] })).toBe(true);
     expect(requiredToolCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
       false
     );
+  });
+
+  test("omitting the pending-input hook never stops the step loop", async () => {
+    const [, pendingInputCondition] = buildStopWhenForTests()({});
+    expect(await pendingInputCondition({ steps: [] })).toBe(false);
   });
 
   const requiredToolCases: Array<{
@@ -2136,7 +2143,7 @@ describe("StreamManager - sequential tool execution", () => {
     headers?: Record<string, string | undefined>;
     maxOutputTokens?: number;
     streamCallSettings?: Record<string, unknown>;
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    hasPendingToolEndInput?: () => Promise<boolean> | boolean;
     toolPolicy?: ToolPolicy;
     toolChoice?: { type: "tool"; toolName: string };
   }
@@ -2245,7 +2252,7 @@ describe("StreamManager - sequential tool execution", () => {
       messages: [{ role: "user", content: "hello" }],
       system: "system",
       tools,
-      hasQueuedMessages: () => false,
+      hasPendingToolEndInput: () => false,
     });
     createStreamResult(request, new AbortController());
 

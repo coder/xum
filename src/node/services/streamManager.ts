@@ -244,7 +244,12 @@ interface StreamRequestOptions {
   maxOutputTokens?: number;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /**
+   * Whether input that must run at a tool boundary is pending: a queued tool-end message
+   * or an outstanding bash-monitor wake. Read (not snapshotted) after every step's tool
+   * results settle, so a wake whose lines the step itself just showed no longer counts.
+   */
+  hasPendingToolEndInput?: () => Promise<boolean> | boolean;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -289,7 +294,7 @@ interface StreamRequestConfig {
   headers?: Record<string, string | undefined>;
   maxOutputTokens?: number;
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  hasPendingToolEndInput?: () => Promise<boolean> | boolean;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -2132,7 +2137,7 @@ export class StreamManager {
       maxOutputTokens,
       callSettingsOverrides,
       toolPolicy,
-      hasQueuedMessages,
+      hasPendingToolEndInput,
       headers,
       onChunk,
       onStepMessages,
@@ -2182,7 +2187,7 @@ export class StreamManager {
       maxOutputTokens: effectiveMaxOutputTokens,
       streamCallSettings:
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
-      hasQueuedMessages,
+      hasPendingToolEndInput,
       onChunk,
       onStepMessages,
       toolPolicy,
@@ -2195,7 +2200,7 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "toolPolicy">
+    request: Pick<StreamRequestConfig, "hasPendingToolEndInput" | "toolPolicy">
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2241,7 +2246,7 @@ export class StreamManager {
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
-      () => request.hasQueuedMessages?.("tool-end") ?? false,
+      async () => (await request.hasPendingToolEndInput?.()) ?? false,
       hasSuccessfulRequiredToolResult,
     ];
   }
@@ -3219,7 +3224,7 @@ export class StreamManager {
       maxOutputTokens: fallbackState.original.maxOutputTokens,
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
-      hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      hasPendingToolEndInput: streamInfo.request.hasPendingToolEndInput,
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,

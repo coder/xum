@@ -11,7 +11,10 @@ import type {
   WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
-import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
+import type {
+  StreamErrorRecoveryOutcome,
+  WorkspaceTurnContinuationVoidReason,
+} from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
@@ -322,9 +325,6 @@ export interface SendMessageInternalOptions {
   onAccepted?: () => Promise<void> | void;
   onCanceled?: (reason: string) => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
-  cancelState?: { canceledBeforeAcceptance: boolean };
-  /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
-  cancelSignal?: AbortSignal;
   /**
    * Synchronous staleness probe from the caller, re-evaluated at the real admission points
    * (the enqueue block and the session's turn-admission gates) in addition to the
@@ -399,7 +399,23 @@ export interface TurnAdmissionHost {
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   hasPendingAutoRetry(workspaceId: string): boolean;
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
+  /**
+   * The session still owes, or already holds, a bash-monitor wake continuation (see
+   * AgentSession.hasBashMonitorWakeContinuation). Sync, no I/O.
+   */
+  hasBashMonitorWakeContinuation(workspaceId: string): boolean;
+  /**
+   * A stream carrying `correlation` started after every stream in `messageIds` — whether it
+   * is still running or already ended (see AgentSession.hasCorrelatedStreamStartedAfter).
+   * Sync, no I/O.
+   */
+  hasCorrelatedStreamStartedAfter(
+    workspaceId: string,
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    messageIds: readonly string[]
+  ): boolean;
+  /** Pending input (queued tool-end message or outstanding wake) wants a tool boundary. */
+  isToolEndYieldRequested(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(
     workspaceId: string,
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
@@ -518,6 +534,22 @@ export interface AgentTaskIntegration {
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
+  /**
+   * The workspace will never continue the delegated turn `muxMetadata` identifies
+   * (AgentSession.onWorkspaceTurnContinuationVoided). Runs under the workspace event lock;
+   * idempotent. See WorkspaceTurnManager.settleVoidedWorkspaceTurnContinuation.
+   */
+  settleVoidedWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    reason: WorkspaceTurnContinuationVoidReason
+  ): Promise<void>;
+  /**
+   * Run `operation` under the per-workspace event lock that serializes stream-end/abort/error
+   * handling for `workspaceId` (FIFO). A send made inside it is ordered after every handler
+   * already queued for that workspace's earlier events.
+   */
+  withWorkspaceEventLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
   restoreInterruptedTaskAfterResumeFailure(workspaceId: string): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;

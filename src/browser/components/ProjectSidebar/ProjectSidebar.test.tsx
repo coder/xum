@@ -957,6 +957,7 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>
@@ -1008,6 +1009,7 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>
@@ -1098,6 +1100,7 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>
@@ -1278,6 +1281,7 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>
@@ -1333,6 +1337,7 @@ describe("ProjectSidebar flat chat list", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: () =>

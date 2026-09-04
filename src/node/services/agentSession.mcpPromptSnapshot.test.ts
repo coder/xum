@@ -58,13 +58,7 @@ describe("AgentSession MCP prompt snapshots", () => {
       expect(history.data[0]?.parts.find((part) => part.type === "text")?.text).toBe(
         "Expanded prompt"
       );
-      expect(getPrompt).toHaveBeenCalledWith(
-        "workspace",
-        "coder",
-        "review",
-        { path: "src" },
-        undefined
-      );
+      expect(getPrompt).toHaveBeenCalledWith("workspace", "coder", "review", { path: "src" });
 
       // The live transcript must also emit the snapshot before the user row.
       const emittedIds = harness.events

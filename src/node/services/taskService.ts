@@ -48,6 +48,7 @@ import {
   type WorkspaceLifecycleResult,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskCreateArgs, TaskKind } from "@/node/services/taskWorkspaceSeam";
+import type { WorkspaceTurnContinuationVoidReason } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -6210,6 +6211,30 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * Under the same per-workspace lock as handleStreamEnd, so "the finalizer deferred on the
+   * debt" and "the debt was voided" are ordered: whichever runs second sees the other's
+   * result (see WorkspaceTurnManager.settleVoidedWorkspaceTurnContinuation).
+   */
+  async settleVoidedWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    reason: WorkspaceTurnContinuationVoidReason
+  ): Promise<void> {
+    await this.workspaceEventLocks.withLock(workspaceId, async () => {
+      await this.getWorkspaceTurnManager().settleVoidedWorkspaceTurnContinuation(
+        workspaceId,
+        muxMetadata,
+        reason
+      );
+    });
+  }
+
+  withWorkspaceEventLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T> {
+    assert(workspaceId.length > 0, "withWorkspaceEventLock requires workspaceId");
+    return this.workspaceEventLocks.withLock(workspaceId, operation);
+  }
+
+  /**
    * Reject all foreground task waiters for a workspace that opted into backgrounding
    * when a new message is queued. Returns the number of waiters signaled.
    * Safe to call repeatedly — already-cleaned-up waiters are skipped.
@@ -7842,7 +7867,7 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Background any registered foreground waits for the requesting workspace when a
-   * tool-end message is already queued. Shared by both wait-registration paths
+   * tool-end message is already queued or a bash-monitor wake is outstanding. Shared by both wait-registration paths
    * (workspace-turn and task await): the auto-backgrounding signal is edge-triggered
    * on enqueue, so a message queued before the waiter registered must be re-checked
    * here. No-op when backgrounding is disabled or no requesting workspace is set.
@@ -7854,7 +7879,7 @@ export class TaskService implements AgentTaskIntegration {
     if (
       shouldBackgroundOnQueuedMessage &&
       requestingWorkspaceId &&
-      this.workspaceService.hasQueuedMessages(requestingWorkspaceId, "tool-end")
+      this.workspaceService.isToolEndYieldRequested(requestingWorkspaceId)
     ) {
       this.backgroundForegroundWaitsForWorkspace(requestingWorkspaceId);
     }
