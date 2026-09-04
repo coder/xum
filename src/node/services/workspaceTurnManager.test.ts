@@ -13,6 +13,7 @@ import {
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { Ok, Err, type Result } from "@/common/types/result";
@@ -165,7 +166,7 @@ function createWorkspaceTurnManagerHost(
         for (const project of cfg.projects.values()) {
           const workspace = project.workspaces.find((candidate) => candidate.id === workspaceId);
           if (workspace != null) {
-            updater(workspace);
+            updater(workspace, cfg);
             found = true;
             break;
           }
@@ -346,6 +347,70 @@ describe("WorkspaceTurnManager", () => {
     await taskService.updateAgentTaskExecutionState("child", "old", "running");
     await taskService.updateAgentTaskExecutionState("child", "new", "running");
     expect(findWorkspaceInConfig(config, "child")?.taskExecutionStatus).toBe("completed");
+  });
+
+  test("an active mirror commit rejects a competing controller written while admission was suspended", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push(
+        ...["child", "competitor"].map((id) =>
+          projectWorkspace(projectPath, id, id, {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            taskStatus: "reported",
+            runtimeConfig: { type: "local" },
+            taskDesktopOwnerWorkspaceId: parentId,
+          })
+        )
+      );
+      return cfg;
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    // A reservation registered by createWorkspaceTurn: the acceptance below claims this handle.
+    (
+      taskService as unknown as {
+        activeWorkspaceTurnHandleByWorkspaceId: Map<
+          string,
+          { handleId: string; ownerWorkspaceId: string; accepted: boolean }
+        >;
+      }
+    ).activeWorkspaceTurnHandleByWorkspaceId.set("child", {
+      handleId: "wst_child",
+      ownerWorkspaceId: parentId,
+      accepted: false,
+    });
+    // The gate admitted the child against a config where nothing else was active. Publish an
+    // independent (gate-bypassing) competing controller after the mirror edit was scheduled but
+    // before its transform runs, as a concurrent process or unrelated writer could.
+    const editConfig = config.editConfig.bind(config);
+    let intercepted = false;
+    const editSpy = spyOn(config, "editConfig").mockImplementation(async (transform) => {
+      if (intercepted) return editConfig(transform);
+      intercepted = true;
+      await editConfig((cfg) => {
+        const competitor = findWorkspaceEntry(cfg, "competitor")?.workspace;
+        assert(competitor, "competitor fixture must exist");
+        competitor.taskStatus = "running";
+        return cfg;
+      });
+      return editConfig(transform);
+    });
+    try {
+      const failure = await taskService
+        .updateAgentTaskExecutionState("child", "wst_child", "running")
+        .then(
+          () => null,
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
+      expect(failure).not.toBeNull();
+    } finally {
+      editSpy.mockRestore();
+    }
+    // Nothing from the rejected transaction reached disk; the competitor keeps control.
+    expect(findWorkspaceInConfig(config, "child")?.taskExecutionId).toBeUndefined();
+    expect(findWorkspaceInConfig(config, "child")?.taskExecutionStatus).toBeUndefined();
+    expect(findWorkspaceInConfig(config, "competitor")?.taskStatus).toBe("running");
   });
 
   test("startup clears an orphan execution mirror that has no handle ID and no handle record", async () => {

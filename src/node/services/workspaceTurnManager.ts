@@ -4840,7 +4840,7 @@ export class WorkspaceTurnManager {
               : referenced;
         const record = selected?.record;
         if (record == null) {
-          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId);
+          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId, config);
           continue;
         }
 
@@ -4856,7 +4856,7 @@ export class WorkspaceTurnManager {
           continue;
         }
         if (normalized?.workspaceId !== task.id) {
-          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId);
+          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId, config);
           continue;
         }
 
@@ -4927,10 +4927,16 @@ export class WorkspaceTurnManager {
    */
   private async clearUnbackedAgentTaskExecutionMirror(
     workspaceId: string,
-    taskExecutionId: string | undefined
+    taskExecutionId: string | undefined,
+    snapshot: ReturnType<Config["loadConfigOrDefault"]>
   ): Promise<void> {
     if (taskExecutionId != null) {
       await this.updateAgentTaskExecutionState(workspaceId, taskExecutionId, null);
+      return;
+    }
+    // Decide from the startup snapshot so the common no-mirror case costs no config reload
+    // (initialize must not re-read config.json per completed-report task).
+    if (findWorkspaceEntry(snapshot, workspaceId)?.workspace.taskExecutionStatus == null) {
       return;
     }
     let clearedOrphan = false;
@@ -4976,7 +4982,7 @@ export class WorkspaceTurnManager {
     let claimedActiveMirror = false;
     const updated = await this.taskHost.editWorkspaceEntry(
       workspaceId,
-      (workspace) => {
+      (workspace, config) => {
         if (status == null) {
           if (workspace.taskExecutionId === handleId) {
             delete workspace.taskExecutionId;
@@ -5009,6 +5015,11 @@ export class WorkspaceTurnManager {
           claimedActiveMirror = true;
           workspace.taskExecutionId = handleId;
           workspace.taskExecutionStatus = status;
+          // Cross-process/independent writes can land between the desktop gate's admission check
+          // and this transform. Re-validate against the config this transaction actually
+          // commits so a competing controller published meanwhile rejects the active mirror
+          // (terminal/clear branches stay ungated: releasing must always be allowed).
+          this.desktopInputCoordinator.assertAdmission(config, workspaceId);
           return;
         }
         if (workspace.taskExecutionId === handleId) {
