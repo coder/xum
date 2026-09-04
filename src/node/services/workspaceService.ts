@@ -377,6 +377,11 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 /**
+ * Slack subtracted from the "not before" bound of readLastBashMonitorWakeRecords so a wall-clock
+ * step between a monitor's arm stamp and its wake row's append stamp cannot hide the row.
+ */
+const BASH_MONITOR_WAKE_ROW_SCAN_CLOCK_MARGIN_MS = 60_000;
+/**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
  * (`workspace-1`, `workspace-2`, ...) come from {@link generateForkBranchName}
  * so the existing fork-style numbering helpers stay the single source of truth.
@@ -2391,8 +2396,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
       registry: this.bashMonitorRegistryStore,
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
-      readDeliveredWakeRecords: (ownerWorkspaceId) =>
-        this.readLastBashMonitorWakeRecords(ownerWorkspaceId),
+      readDeliveredWakeRecords: (ownerWorkspaceId, notBefore) =>
+        this.readLastBashMonitorWakeRecords(ownerWorkspaceId, notBefore),
       onOutstandingChanged: (ownerWorkspaceId, outstanding) =>
         this.publishBashMonitorWakeLevel(ownerWorkspaceId, outstanding),
     });
@@ -12071,16 +12076,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    */
   /**
    * Records of the most recent durable bash-monitor wake row (BashMonitorWakeReconciler
-   * readDeliveredWakeRecords). Scans backward from the tail and stops at the first wake row:
-   * usually that row is at or near the end (committed right before the restart), but the state
-   * this repairs — an acknowledgment that kept failing while the accepted wake turn ran — can
-   * push it behind an arbitrarily long tool-heavy turn, so no fixed depth is safe. The scan
-   * also crosses compaction boundaries: the wake stays acknowledged by its row wherever the
-   * row sits, and a summary over it must not turn into a redelivery.
+   * readDeliveredWakeRecords). Scans backward from the tail and stops at the first wake row
+   * with usable record identities, or at the first row older than `notBefore`.
+   *
+   * No fixed depth is safe: the state this repairs — an acknowledgment that kept failing while
+   * the accepted wake turn ran — can push the row behind an arbitrarily long tool-heavy turn
+   * (and behind a compaction boundary; the wake stays acknowledged by its row wherever it
+   * sits). No unbounded scan is acceptable either: an owner's first wake has no row to find,
+   * and this read sits on the stream's tool-boundary predicate under the history lock. The
+   * arm time of the oldest outstanding monitor is the durable exclusion point — a row appended
+   * before that monitor existed cannot acknowledge it — so the cost is the rows since arming,
+   * usually one tail chunk.
    */
   private async readLastBashMonitorWakeRecords(
-    ownerWorkspaceId: string
+    ownerWorkspaceId: string,
+    notBefore: string
   ): Promise<readonly BashMonitorWakeDisplayRecord[] | undefined> {
+    // Registry and history stamps come from the same wall clock; the margin absorbs a clock
+    // step between arming and the row's append. An unparseable bound (never produced by the
+    // registry) degrades to an unbounded scan rather than to a silent redelivery.
+    const parsedNotBefore = Date.parse(notBefore);
+    const cutoffMs = Number.isFinite(parsedNotBefore)
+      ? parsedNotBefore - BASH_MONITOR_WAKE_ROW_SCAN_CLOCK_MARGIN_MS
+      : Number.NEGATIVE_INFINITY;
     let records: readonly BashMonitorWakeDisplayRecord[] | undefined;
     const iterateResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
@@ -12088,11 +12106,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       (messages) => {
         // Chunks arrive newest-first, as do the rows within a chunk.
         for (const message of messages) {
+          const timestamp = message.metadata?.timestamp;
+          if (typeof timestamp === "number" && timestamp < cutoffMs) return false;
           // A wake diverted through on-send compaction is durable as the compaction row that
           // carries it as follow-up; that row is the acknowledgment too.
           const wake = getCarriedBashMonitorWake(message.metadata?.muxMetadata);
-          if (wake != null) {
-            records = wake.records;
+          if (wake == null) continue;
+          // Persisted rows are data, not trusted structure: one malformed `records` (or a legacy
+          // row without identities) must not stop the scan and brick recovery for every
+          // reconcile retry — the reconciler maps over what this returns.
+          const usable = Array.isArray(wake.records)
+            ? wake.records.filter(
+                (record): record is BashMonitorWakeDisplayRecord =>
+                  typeof record === "object" &&
+                  record !== null &&
+                  typeof record.processId === "string" &&
+                  typeof record.wakeUpdatedAt === "string"
+              )
+            : [];
+          if (usable.length > 0) {
+            records = usable;
             return false;
           }
         }

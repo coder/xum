@@ -329,7 +329,9 @@ describe("BashMonitorWakeReconciler", () => {
     const deliveredRecords = dispatches[0].muxMetadata.records;
 
     const restart = (
-      readDeliveredWakeRecords: (() => Promise<typeof deliveredRecords>) | undefined
+      readDeliveredWakeRecords:
+        | ((ownerWorkspaceId: string, notBefore: string) => Promise<typeof deliveredRecords>)
+        | undefined
     ) => {
       const restarted: BashMonitorWakeDispatch[] = [];
       const instance = new BashMonitorWakeReconciler({
@@ -368,11 +370,13 @@ describe("BashMonitorWakeReconciler", () => {
     // A read that cannot answer fails the reconcile (retried) instead of counting as "no row":
     // recovery is consulted once per owner, so a swallowed failure would dispatch a duplicate.
     let readFails = true;
-    const recovered = restart(() =>
-      readFails
+    const readBounds: string[] = [];
+    const recovered = restart((_ownerWorkspaceId, notBefore) => {
+      readBounds.push(notBefore);
+      return readFails
         ? Promise.reject(new Error("history unavailable"))
-        : Promise.resolve(deliveredRecords)
-    );
+        : Promise.resolve(deliveredRecords);
+    });
     acknowledged = [];
     const failedReconcile = await recovered.instance.reconcile(OWNER).then(
       () => null,
@@ -386,6 +390,9 @@ describe("BashMonitorWakeReconciler", () => {
     expect(recovered.restarted).toHaveLength(0);
     expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
     expect(await recovered.instance.hasOutstandingWake(OWNER)).toBe(false);
+    // The reader is told how far back a row could possibly acknowledge these signals: the
+    // arm time of the oldest outstanding monitor.
+    expect(readBounds).toEqual([CREATED_AT, CREATED_AT]);
 
     // The watermark is durable now: a later read does not consult the row again, and a
     // newer match still wakes.

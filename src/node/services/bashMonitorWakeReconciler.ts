@@ -434,9 +434,14 @@ export class BashMonitorWakeReconciler {
        * per owner, the first time signals derive outstanding in this process. A read that
        * cannot answer must throw (not return undefined): the reconcile fails and retries, so
        * "no row" is only ever concluded from a successful read.
+       *
+       * `notBefore` (ISO) is the arm time of the oldest outstanding monitor: a row appended
+       * before any of these monitors existed cannot acknowledge them, so the reader may stop
+       * its backward scan there instead of parsing the whole transcript.
        */
       readDeliveredWakeRecords?(
-        ownerWorkspaceId: string
+        ownerWorkspaceId: string,
+        notBefore: string
       ): Promise<readonly BashMonitorWakeDisplayRecord[] | undefined>;
     }
   ) {}
@@ -800,7 +805,11 @@ export class BashMonitorWakeReconciler {
       // Signals the durable wake row already delivers are consumed, not re-dispatched. The
       // watermark advance is written here (not left to the caller): level reads do not
       // persist autoConsumed, and a recovery that only held in memory would be lost again.
-      const delivered = await this.args.readDeliveredWakeRecords?.(ownerWorkspaceId);
+      // ISO timestamps order lexicographically.
+      const notBefore = signals
+        .map((signal) => signal.createdAt)
+        .reduce((oldest, createdAt) => (createdAt < oldest ? createdAt : oldest));
+      const delivered = await this.args.readDeliveredWakeRecords?.(ownerWorkspaceId, notBefore);
       const deliveredKeys = new Set(
         (delivered ?? []).map((record) => record.processId + "\u0000" + record.wakeUpdatedAt)
       );

@@ -54,7 +54,7 @@ import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessi
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -267,9 +267,12 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const workspaceId = "compaction-carried-wake-owner";
     const internal = service as unknown as {
       readLastBashMonitorWakeRecords(
-        ownerWorkspaceId: string
+        ownerWorkspaceId: string,
+        notBefore: string
       ): Promise<ReadonlyArray<{ processId?: string }> | undefined>;
     };
+    // History rows below are stamped 1_000..2_300 ms; a bound before them scans everything.
+    const beforeAll = new Date(0).toISOString();
     const wakeRecord = {
       processId: "proc",
       wakeUpdatedAt: "2026-08-31T12:00:00.000Z",
@@ -279,7 +282,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       filterExclude: false,
     };
     try {
-      expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toBeUndefined();
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId, beforeAll)).toBeUndefined();
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("wake-compaction", "user", "Compacting to continue", {
@@ -304,7 +307,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         workspaceId,
         createMuxMessage("summary", "assistant", "summary", { timestamp: 1_100 })
       );
-      expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toEqual([wakeRecord]);
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId, beforeAll)).toEqual([
+        wakeRecord,
+      ]);
 
       // An acknowledgment that kept failing while the accepted wake turn ran leaves the row
       // behind however many rows that turn produced; a fixed tail depth would miss it and the
@@ -323,14 +328,54 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           createMuxMessage(`tool-step-${i}`, "assistant", `step ${i}`, { timestamp: 2_000 + i })
         );
       }
-      expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toEqual([wakeRecord]);
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId, beforeAll)).toEqual([
+        wakeRecord,
+      ]);
+
+      // A newer wake row whose persisted `records` is not usable (corrupt shape, or a legacy
+      // row without identities) is skipped rather than returned: the reconciler maps over the
+      // result, so returning it would fail every reconcile retry and strand current wakes.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-corrupt", "user", "Background monitor wake", {
+          timestamp: 2_300,
+          synthetic: true,
+          muxMetadata: { type: "bash-monitor-wake", records: "corrupt" } as unknown as Extract<
+            MuxMessageMetadata,
+            { type: "bash-monitor-wake" }
+          >,
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-legacy", "user", "Background monitor wake", {
+          timestamp: 2_301,
+          synthetic: true,
+          muxMetadata: {
+            type: "bash-monitor-wake",
+            records: [{ kind: "match", displayName: "run", filter: "READY", filterExclude: false }],
+          },
+        })
+      );
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId, beforeAll)).toEqual([
+        wakeRecord,
+      ]);
+
+      // The scan is bounded by the oldest outstanding monitor's arm time: rows appended before
+      // that monitor existed cannot acknowledge it, so they are never parsed (an owner's first
+      // wake would otherwise read the entire transcript on the stream's tool-boundary path).
+      // The bound carries a clock-step margin, so place it well past the wake row.
+      const armedAfterWakeRow = new Date(1_000 + 60_000 + 1_000_000).toISOString();
+      expect(
+        await internal.readLastBashMonitorWakeRecords(workspaceId, armedAfterWakeRow)
+      ).toBeUndefined();
 
       // "Could not read" is not "no row": the reconciler consults this once per owner.
       const readSpy = spyOn(historyService, "iterateFullHistory").mockImplementationOnce(() =>
         Promise.resolve(Err("history unavailable"))
       );
       try {
-        const failed = await internal.readLastBashMonitorWakeRecords(workspaceId).then(
+        const failed = await internal.readLastBashMonitorWakeRecords(workspaceId, beforeAll).then(
           () => null,
           (error: unknown) => error
         );
