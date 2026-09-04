@@ -1213,7 +1213,8 @@ export class ProviderModelFactory {
   private isProviderAvailableForRouting(
     provider: ProviderName,
     providersConfig: ProvidersConfig,
-    config: ReturnType<Config["loadConfigOrDefault"]>
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    canonicalModel?: string
   ): boolean {
     const rawProviderConfig = providersConfig[provider] ?? {};
     const providerConfig =
@@ -1229,6 +1230,34 @@ export class ProviderModelFactory {
       parseCodexOauthAuth((providerConfig as { codexOauth?: unknown }).codexOauth) !== null;
 
     if (!credentials.isConfigured && !hasCodexOauth) {
+      return false;
+    }
+
+    // Model-aware OpenAI gate, mirroring createModel's credential outcome: a
+    // Codex-OAuth-only credential serves only the OAuth-allowed model set, so
+    // direct OpenAI must not win the route for a model it would then reject
+    // with api_key_not_found — a usable gateway later in routePriority (or the
+    // caller's availability error) should win instead. Matches the shared
+    // canDirectOpenAIServeModel predicate used by availability preflights.
+    if (
+      provider === "openai" &&
+      canonicalModel != null &&
+      !credentials.isConfigured &&
+      !isCodexOauthAllowedModel(canonicalModel, providersConfig)
+    ) {
+      return false;
+    }
+
+    // Same mirror for the wire format: Codex OAuth speaks only the Responses
+    // endpoint, so an OAuth-only credential cannot serve a provider pinned to
+    // chatCompletions — createModel rejects it with api_key_not_found, and a
+    // usable gateway later in routePriority should win instead (matches
+    // canDirectOpenAIServeModel).
+    if (
+      provider === "openai" &&
+      !credentials.isConfigured &&
+      (providerConfig as { wireFormat?: unknown }).wireFormat === "chatCompletions"
+    ) {
       return false;
     }
 
@@ -2883,7 +2912,8 @@ export class ProviderModelFactory {
         return this.isProviderAvailableForRouting(
           provider as ProviderName,
           providersConfig,
-          config
+          config,
+          canonicalModel
         );
       },
       isGatewayModelAccessible
@@ -2987,7 +3017,10 @@ export class ProviderModelFactory {
               return this.isProviderAvailableForRouting(
                 provider as ProviderName,
                 providersConfig,
-                config
+                config,
+                typeof modelKeyOrRouteContext === "string"
+                  ? normalizeToCanonical(modelKeyOrRouteContext)
+                  : canonicalModelString
               );
             },
             isGatewayModelAccessible

@@ -557,9 +557,14 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(sendCount).toBe(1);
   });
 
-  test("startup recovery retries pending follow-up after an initial send failure", async () => {
+  test("a failed follow-up dispatch preserves the prompt instead of re-dispatching", async () => {
+    // The follow-up text is the USER's prompt (their composer cleared when
+    // compaction started). A failed dispatch must move it into a durable
+    // rejected transcript row and clear the summary's marker — the row is
+    // the durable copy now, and re-dispatching the same failing send on
+    // every recovery pass would loop the failure instead of surfacing it.
     let sendCount = 0;
-    const { internals } = await createSession([
+    const { historyService, internals } = await createSession([
       compactionSummaryMessage("summary-retry", {
         text: "follow up retry",
         model: "openai:gpt-4o",
@@ -568,26 +573,29 @@ describe("AgentSession continue-message agentId fallback", () => {
     ]);
     internals.sendMessage = mock(() => {
       sendCount += 1;
-      if (sendCount === 1) {
-        return Promise.resolve({
-          success: false,
-          error: { type: "runtime_start_failed", message: "startup failed" },
-        });
-      }
-      return Promise.resolve({ success: true as const });
+      return Promise.resolve({
+        success: false,
+        error: { type: "runtime_start_failed", message: "startup failed" },
+      });
     });
 
     internals.scheduleStartupRecovery();
     await internals.startupRecoveryPromise;
 
     expect(sendCount).toBe(1);
-    expect(internals.startupRecoveryScheduled).toBe(false);
 
+    const history = await historyService.getLastMessages("ws", 5);
+    expect(history.success).toBe(true);
+    const preserved = history.success
+      ? history.data.find((msg) => msg.metadata?.preStreamRejected === true)
+      : undefined;
+    expect(preserved?.role).toBe("user");
+    expect(preserved?.parts?.[0]).toMatchObject({ type: "text", text: "follow up retry" });
+
+    // Marker cleared: a second recovery pass finds nothing to dispatch.
     internals.scheduleStartupRecovery();
     await internals.startupRecoveryPromise;
-
-    expect(sendCount).toBe(2);
-    expect(internals.startupRecoveryScheduled).toBe(true);
+    expect(sendCount).toBe(1);
   });
 
   // RLM keep-recent floor: post-crash recovery when the compaction summary is

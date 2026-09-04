@@ -16,6 +16,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import {
   createMuxMessage,
+  filterPreStreamRejectedRows,
   getCompactionFollowUpContent,
   type CompactionFollowUpRequest,
   type CompactionSummaryMetadata,
@@ -366,6 +367,12 @@ interface CompactionHandlerOptions {
    * workspace whose compaction keeps failing even though the provider stream ended cleanly.
    */
   onIdleCompactionOutcome?: (success: boolean) => void;
+  /**
+   * Rows quarantined in memory after a failed durable pre-stream-rejection
+   * stamp (the session's unstampedRejectedRowIds). Excluded, together with
+   * stamped rows, from everything compaction carries forward.
+   */
+  getQuarantinedRowIds?: () => ReadonlySet<string>;
 }
 
 /**
@@ -388,6 +395,7 @@ export class CompactionHandler {
 
   private readonly onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   private readonly onIdleCompactionOutcome?: (success: boolean) => void;
+  private readonly getQuarantinedRowIds?: () => ReadonlySet<string>;
 
   /** Flag indicating post-compaction attachments should be generated on next turn */
   private postCompactionAttachmentsPending = false;
@@ -414,6 +422,7 @@ export class CompactionHandler {
     this.emitter = options.emitter;
     this.onCompactionComplete = options.onCompactionComplete;
     this.onIdleCompactionOutcome = options.onIdleCompactionOutcome;
+    this.getQuarantinedRowIds = options.getQuarantinedRowIds;
   }
 
   private async loadPersistedPendingStateIfNeeded(): Promise<void> {
@@ -631,10 +640,26 @@ export class CompactionHandler {
     }
   }
 
+  /**
+   * Rows a provider request never carries (pre-stream rejected: durably
+   * stamped, or quarantined in memory after a failed stamp) must not re-enter
+   * one through compaction either — not as loaded-skill / diff / read
+   * carryover in the pending state, and not as keep-recent tail copies.
+   */
+  private excludeRejectedRows(messages: MuxMessage[]): MuxMessage[] {
+    const quarantined = this.getQuarantinedRowIds?.();
+    return filterPreStreamRejectedRows(messages).filter((msg) => !quarantined?.has(msg.id));
+  }
+
   private async preparePendingStateFromMessages(messages: MuxMessage[]): Promise<void> {
     await this.loadPersistedPendingStateIfNeeded();
 
-    const latestCompactionEpochMessages = sliceMessagesFromLatestCompactionBoundary(messages);
+    // A rejected turn's synthetic skill snapshot row would otherwise be
+    // extracted into cachedLoadedSkills, persisted in post-compaction.json,
+    // and injected into the next turn's provider request.
+    const latestCompactionEpochMessages = this.excludeRejectedRows(
+      sliceMessagesFromLatestCompactionBoundary(messages)
+    );
     this.cachedFileDiffs = mergeFileEditDiffs(
       this.cachedFileDiffs,
       extractEditedFileDiffs(latestCompactionEpochMessages)
@@ -1348,8 +1373,11 @@ export class CompactionHandler {
 
     // Tail = rows between the stamped start and the compaction request.
     // Older compaction-request rows (failed prior attempts) are summarization
-    // prompts, not conversation — never preserve them.
-    const tailRows = messages.slice(0, requestIndex).filter((message) => {
+    // prompts, not conversation — never preserve them. Rejected rows are
+    // excluded outright: a copy gets a fresh ID the in-memory quarantine
+    // cannot match, and a stamped row's copy would only ever be filtered
+    // back out of every request.
+    const tailRows = this.excludeRejectedRows(messages.slice(0, requestIndex)).filter((message) => {
       const sequence = message.metadata?.historySequence;
       if (!isNonNegativeInteger(sequence) || sequence < startHistorySequence) {
         return false;

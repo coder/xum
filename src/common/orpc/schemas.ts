@@ -162,6 +162,7 @@ export {
 } from "./schemas/agentDefinition";
 
 export {
+  SendMessageAcceptedSchema,
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
   NameGenerationErrorSchema,

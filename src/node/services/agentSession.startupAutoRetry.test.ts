@@ -12,7 +12,11 @@ import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/types";
-import { createMuxMessage, pickStartupRetrySendOptions } from "@/common/types/message";
+import {
+  createMuxMessage,
+  pickStartupRetrySendOptions,
+  type StartupRetrySendOptions,
+} from "@/common/types/message";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Ok } from "@/common/types/result";
@@ -24,6 +28,8 @@ interface AutoRetryResumeRequest {
   options: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: typeof GOAL_CONTINUATION_KIND;
+  /** Routed-turn compaction context; must stay absent for malformed rows. */
+  compactionBaseOptions?: SendMessageOptions;
 }
 
 interface RetryableSessionForTests {
@@ -899,6 +905,131 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.agentId).toBe("explore");
     expect(retryOptions.options.model).toBe("openai:gpt-5.5-low");
     expect(retryOptions.options.thinkingLevel).toBe("low");
+
+    session.dispose();
+  });
+
+  test("malformed persisted compactionBaseOptions neither marks the row routed nor is forwarded", async () => {
+    const workspaceId = "startup-retry-child-malformed-routed-context";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      parentWorkspaceId: "parent-workspace",
+      agentId: "explore",
+      agentType: "explore",
+      aiSettingsByAgent: {
+        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
+      },
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    // chat.jsonl is unchecked JSON: a corrupted non-null compactionBaseOptions
+    // (boolean here) must not flip child-workspace precedence toward the
+    // persisted outer model, and must not ride into the resume request as a
+    // compaction base.
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted routed child turn", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "explore",
+          compactionBaseOptions: true,
+        } as unknown as StartupRetrySendOptions,
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    session.ensureStartupAutoRetryCheck();
+
+    const startupCheckPromise = (
+      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
+    ).startupAutoRetryCheckPromise;
+    await startupCheckPromise;
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+
+    // Child settings win because the row does not count as routed.
+    expect(retryOptions.options.model).toBe("openai:gpt-5.5-low");
+    expect(retryOptions.compactionBaseOptions).toBeUndefined();
+
+    session.dispose();
+  });
+
+  test("routed-retry context with an invalid model id is rejected like the startup model path", async () => {
+    const workspaceId = "startup-retry-child-garbage-routed-model";
+    const workspaceMetadata: WorkspaceMetadata = {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      parentWorkspaceId: "parent-workspace",
+      agentId: "explore",
+      agentType: "explore",
+      aiSettingsByAgent: {
+        explore: { model: "openai:gpt-5.5-low", thinkingLevel: "low" },
+      },
+    };
+    const { session, historyService, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
+    cleanups.push(cleanup);
+
+    // An object shape with a model that fails provider:model validation must
+    // not count as routed either — same bar as normalizeStartupModel.
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted routed child turn", {
+        timestamp: Date.now(),
+        retrySendOptions: {
+          model: "anthropic:claude-opus-5",
+          agentId: "explore",
+          compactionBaseOptions: { model: "garbage" },
+        } as unknown as StartupRetrySendOptions,
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    session.ensureStartupAutoRetryCheck();
+
+    const startupCheckPromise = (
+      session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null }
+    ).startupAutoRetryCheckPromise;
+    await startupCheckPromise;
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    if (!retryOptions) {
+      throw new Error("Expected startup retry options");
+    }
+
+    expect(retryOptions.options.model).toBe("openai:gpt-5.5-low");
+    expect(retryOptions.compactionBaseOptions).toBeUndefined();
 
     session.dispose();
   });

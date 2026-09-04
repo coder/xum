@@ -168,7 +168,7 @@ import type {
 } from "@/common/orpc/types";
 
 import type { z } from "zod";
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError, StreamErrorType } from "@/common/types/errors";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
 import { formatSendMessageError as classifySendMessageError } from "@/node/services/utils/sendMessageError";
 import type { IdleCompactionOutcome } from "@/node/services/idleCompactionService";
@@ -4174,6 +4174,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const trimmed = workspaceId.trim();
     assert(trimmed.length > 0, "emitChatEvent requires workspaceId");
     this.sessions.get(trimmed)?.emitChatEvent(message);
+  }
+
+  /** Session-local quarantine of rejected rows for refine's side-channel exclusion. */
+  getQuarantinedRejectedRowIds(workspaceId: string): ReadonlySet<string> {
+    return this.sessions.get(workspaceId)?.getQuarantinedRejectedRowIds() ?? new Set<string>();
   }
 
   /** Queued agent peer messages behind a busy workspace; sessions are lazy, so no session ⇒ 0. */
@@ -10671,7 +10676,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       fileParts?: FilePart[];
     },
     internal?: SendMessageInternalOptions
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<Result<SendMessageAccepted | undefined, SendMessageError>> {
     log.debug("sendMessage handler: Received", {
       workspaceId,
       messagePreview: message.substring(0, 50),
@@ -10779,7 +10784,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         internal?.requireIdle === true || internal?.yieldToQueuedMessages === true;
       // A queue-mode heartbeat superseded by input that arrived during its preparation is a
       // quiet success: its next slot fires anyway.
-      const yieldToPreflightSend = (): Result<void, SendMessageError> => {
+      const yieldToPreflightSend = (): Result<
+        SendMessageAccepted | undefined,
+        SendMessageError
+      > => {
         log.info("sendMessage: yielded to a send in preflight during send preparation", {
           workspaceId,
         });
@@ -10890,10 +10898,78 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // that bypass the client-side guard. Manual sends still delegate into
       // AgentSession on rejection so it can preserve the user's interruption
       // message and apply goal auto-pause safety.
-      const pricingGate = await this.assertPricedModelForBudgetedGoal(
-        workspaceId,
-        normalizedOptions
-      );
+      //
+      // Skill sends defer this preflight: class routing resolves inside
+      // AgentSession (it needs the workspace's skill definitions), and the
+      // dispatch-time gate there re-asserts pricing against the model that
+      // will actually stream — the routed class model when routing applies.
+      // Gating here on the ambient model would reject a skill bound to a
+      // priced class just because the workspace model is unpriced. Deferral
+      // cannot corrupt stored settings: a composer skill send re-persists the
+      // already-selected workspace model, and one-shot prefixed sends skip
+      // persistence entirely.
+      const mayRouteViaSkill = normalizedMuxMetadata?.type === "agent-skill";
+      if (mayRouteViaSkill) {
+        // AI-settings persistence is deferred with the gate (see below): a
+        // skill send whose routing does NOT apply at dispatch (unbound skill,
+        // skipSkillModelRouting) still carries the ambient model into
+        // AgentSession's own pricing gate, and persisting before that gate
+        // could store an unpriced model for a budgeted goal — the exact
+        // corruption assertPricedModelForBudgetedGoal exists to prevent.
+        // Acceptance fires only after every dispatch-time gate passed, and
+        // MessageQueue carries the callback through queued dispatch.
+        const callerOnAccepted = internal?.onAccepted;
+        // MessageQueue carries the acceptance callback until dispatch — an
+        // unbounded window in which the user may store a newer selection.
+        // Snapshot the persisted settings NOW and persist at acceptance only
+        // when they are unchanged, or the enqueue-time options would
+        // overwrite the newer choice.
+        const snapshotPersistedAiSettings = (): string => {
+          try {
+            for (const project of this.config.loadConfigOrDefault().projects.values()) {
+              const entry = project.workspaces.find((candidate) => candidate.id === workspaceId);
+              if (entry) {
+                return JSON.stringify({
+                  agentId: entry.agentId,
+                  aiSettingsByAgent: entry.aiSettingsByAgent,
+                });
+              }
+            }
+          } catch {
+            // Unreadable either time compares equal below → old behavior.
+          }
+          return "unavailable";
+        };
+        const settingsAtEnqueue = snapshotPersistedAiSettings();
+        internal = {
+          ...internal,
+          onAccepted: async () => {
+            try {
+              if (snapshotPersistedAiSettings() === settingsAtEnqueue) {
+                await this.maybePersistAISettingsFromOptions(
+                  workspaceId,
+                  normalizedOptions,
+                  "send"
+                );
+              }
+            } catch (error) {
+              // Best-effort by contract: the send is already accepted (its
+              // user row is durable), so a persistence failure must not
+              // propagate through onAccepted and turn the accepted send into
+              // a partial failure (draft restored over a visible row; queued
+              // entry dropped without streaming).
+              log.debug("Failed to persist AI settings from accepted skill send", {
+                workspaceId,
+                error: getErrorMessage(error),
+              });
+            }
+            await callerOnAccepted?.();
+          },
+        };
+      }
+      const pricingGate = mayRouteViaSkill
+        ? Ok(undefined)
+        : await this.assertPricedModelForBudgetedGoal(workspaceId, normalizedOptions);
       if (!pricingGate.success) {
         if (internal?.synthetic !== true) {
           // Codex P1 (PRRT_kwDOPxxmWM6cSCjs): unlike the accepted handoffs
@@ -10927,7 +11003,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
+      // Skill sends persist on session acceptance instead (see mayRouteViaSkill
+      // above), after the routing-aware gates validated the send.
+      if (!mayRouteViaSkill) {
+        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
+      }
 
       // Decide queue-or-direct in arrival order: a later send whose awaits above finished
       // first would otherwise enqueue ahead of an earlier one. The decision below runs
@@ -11118,7 +11198,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
-        return Ok(undefined);
+        // Queued: class routing has not resolved yet — the acknowledgement
+        // must say so, or the frontend would attribute the ambient model to a
+        // send that may dispatch on a routed class model.
+        return Ok({ queued: true });
       }
 
       if (!internal?.skipAutoResumeReset) {

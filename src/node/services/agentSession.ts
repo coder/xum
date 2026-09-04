@@ -38,7 +38,7 @@ import {
   SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH,
   type GoalSyntheticMessageKind,
 } from "@/constants/goals";
-import type { SendMessageError } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError } from "@/common/types/errors";
 import {
   AgentIdSchema,
   ChatMuxMessageSchema,
@@ -46,6 +46,8 @@ import {
   SkillNameSchema,
 } from "@/common/orpc/schemas";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { roundToBase2 } from "@/common/telemetry/utils";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -53,6 +55,7 @@ import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
   createUnknownSendMessageError,
+  ROUTED_SKILL_TRUST_REVOKED_MESSAGE,
   type StreamErrorPayload,
 } from "@/node/services/utils/sendMessageError";
 import {
@@ -84,10 +87,13 @@ import {
   enforceThinkingPolicy,
   lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
+  resolveThinkingInput,
 } from "@/common/utils/thinking/policy";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import {
+  filterPreStreamRejectedRows,
   createMuxMessage,
+  STARTUP_RETRY_DURABLE_SEND_OPTION_KEYS,
   dedupeAgentSkillRefs,
   dedupeMcpPromptRefs,
   filterOrphanedMcpPromptSnapshots,
@@ -149,6 +155,8 @@ import {
 } from "@/common/utils/messages/extractEditedFiles";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
+import { ROUTED_SEND_COMPACTION_HEADROOM_PERCENT } from "@/common/constants/ui";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
 import {
   getExplicitGatewayPrefix,
@@ -164,8 +172,16 @@ import {
   isProviderConfigFixableError,
 } from "@/common/utils/messages/retryEligibility";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  type ResolvedAgentSkill,
+  readAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  describeSkillModelClassRoutingProblem,
+  resolveSkillModelClassBinding,
+} from "@/common/utils/ai/skillModelClasses";
+import { isModelServableWithProvidersConfig } from "@/common/utils/ai/modelAvailability";
 import {
   createLoadedSkillSnapshot,
   extractLoadedSkillSnapshotsFromMessages,
@@ -246,12 +262,80 @@ interface AutoRetryResumeRequest {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
+  /** Routed project-skill turn: retries re-verify Project Trust (see resumeStream). */
+  routedProjectConsent?: boolean;
+  /**
+   * Pre-skill-routing options for a routed turn (see
+   * activeStreamContext.compactionBaseOptions). A same-session retry must keep
+   * the routed compaction policy — without this, the retried stream would
+   * force-compact at the workspace threshold against the routed window and
+   * summarize on the wrong model.
+   */
+  compactionBaseOptions?: SendMessageOptions;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
   const streamOptions: SendMessageOptions = { ...options };
   delete streamOptions.goalInterventionPolicy;
   return streamOptions;
+}
+
+/**
+ * retrySendOptions comes from unchecked chat.jsonl JSON: a malformed
+ * compactionBaseOptions (boolean, string, partial object) must neither mark a
+ * row as routed — which would flip child-workspace model precedence toward the
+ * persisted outer model — nor be forwarded as a compaction base. A usable
+ * durable context needs at least the model that owns the larger window; every
+ * other field is re-coerced downstream like the outer persisted options. The
+ * nested field is stripped to uphold pickStartupRetrySendOptions' one-level
+ * invariant.
+ */
+function sanitizePersistedCompactionBaseOptions(
+  value: unknown
+): Omit<StartupRetrySendOptions, "compactionBaseOptions"> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.model !== "string" || record.model.trim().length === 0) {
+    return undefined;
+  }
+  // Same bar as the startup model path (normalizeStartupModel): a durable
+  // model must normalize to a valid provider:model id, or the row must not
+  // count as routed at all.
+  const normalizedModel = normalizeSelectedModel(record.model.trim());
+  if (!isValidModelFormat(normalizedModel)) {
+    return undefined;
+  }
+  // Whitelist-then-schema-parse the durable subset: these values are spread
+  // into an internal send (buildAutoCompactionRequest), so a malformed
+  // sibling (providerOptions: false) must not ride into provider request
+  // construction, and a schema-VALID but non-durable field must not flip
+  // behavioral switches there — a smuggled editMessageId would send the
+  // restored compaction request down the edit/truncation path and delete
+  // history. The whitelist is the same key set pickStartupRetrySendOptions
+  // persists; retry-state extras (goalKind, agentInitiated) are dropped since
+  // the base feeds a fresh internal send, and muxMetadata mirrors the durable
+  // pick's narrowing (workspace-turn correlation only).
+  const candidate: Record<string, unknown> = {};
+  for (const key of STARTUP_RETRY_DURABLE_SEND_OPTION_KEYS) {
+    if (key in record) {
+      candidate[key] = record[key];
+    }
+  }
+  const parsed = SendMessageOptionsSchema.safeParse(candidate);
+  if (!parsed.success) {
+    return undefined;
+  }
+  const typedMuxMetadata = parsed.data.muxMetadata as MuxMessageMetadata | undefined;
+  const durable = {
+    ...parsed.data,
+    ...(typedMuxMetadata?.type === "workspace-turn-task"
+      ? { muxMetadata: typedMuxMetadata }
+      : { muxMetadata: undefined }),
+    model: normalizedModel,
+  };
+  return durable as Omit<StartupRetrySendOptions, "compactionBaseOptions">;
 }
 
 function getGoalStreamOriginKind(input: {
@@ -518,6 +602,60 @@ export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
+/**
+ * Accepted-send payload for a turn whose rows are durable but that never
+ * reached a provider (a late consent refusal, a canceled startup): the visible
+ * stream error is the record, and the renderer must not attribute send
+ * telemetry to it — no request occurred.
+ */
+const ACCEPTED_WITHOUT_STREAM: SendMessageAccepted = { acceptedWithoutStream: true };
+
+/**
+ * Late consent gate of a routed project-skill turn. `requestCarriesProjectContent`
+ * is set by the provider-boundary caller when the assembled request carries
+ * project-scope content from EARLIER turns; `midStream` marks a per-step
+ * (prepareStep) invocation, whose refusal surfaces through the stream's own
+ * error path — the gate then leaves the visible error emission to it.
+ */
+type RoutedConsentRejection = (
+  requestCarriesProjectContent?: boolean,
+  midStream?: boolean
+) => Promise<SendMessageError | null>;
+
+// ROUTED_SKILL_TRUST_REVOKED_MESSAGE moved to utils/sendMessageError.ts so
+// StreamManager's per-step consent gate can share it without an import cycle.
+
+/**
+ * Loaded-skills attachments re-inject the scope AND body of every skill read
+ * before the compaction boundary — a second channel for repository-controlled
+ * content, independent of the snapshot rows the request scan sees.
+ */
+function carriesProjectLoadedSkills(attachments: PostCompactionAttachment[] | null): boolean {
+  return (
+    attachments?.some(
+      (attachment) =>
+        attachment.type === "loaded_skills_snapshot" &&
+        attachment.skills.some((skill) => skill.scope === "project")
+    ) === true
+  );
+}
+
+/** Least-privilege counterpart: drop project-scope skills (and an emptied attachment). */
+function excludeProjectLoadedSkills(
+  attachments: PostCompactionAttachment[] | null
+): PostCompactionAttachment[] | null {
+  if (attachments === null) {
+    return null;
+  }
+  return attachments.flatMap((attachment): PostCompactionAttachment[] => {
+    if (attachment.type !== "loaded_skills_snapshot") {
+      return [attachment];
+    }
+    const skills = attachment.skills.filter((skill) => skill.scope !== "project");
+    return skills.length > 0 ? [{ ...attachment, skills }] : [];
+  });
+}
+
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
@@ -709,6 +847,14 @@ export class AgentSession {
   private autoRetryStarting = false;
   private readonly retryManager: RetryManager;
   private lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+  private readonly telemetryService?: TelemetryService;
+  /**
+   * Rows whose durable preStreamRejected stamp FAILED (transient history
+   * rewrite error): request assembly filters these for the rest of the
+   * session so the rejected turn cannot reach a provider unstamped. Startup
+   * recovery re-attempts the durable stamp via the abandon marker.
+   */
+  private readonly unstampedRejectedRowIds = new Set<string>();
   /** Startup recovery should run once per session to avoid duplicate retry timers on reconnect. */
   private startupRecoveryScheduled = false;
   private startupRecoveryPromise: Promise<void> | null = null;
@@ -719,6 +865,15 @@ export class AgentSession {
   private autoRetryEnabledPreference: boolean | null = null;
   private legacyAutoRetryEnabledHint: boolean | null = null;
   private startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null = null;
+  /**
+   * Durable key of a rejected turn whose provider-ineligibility stamp is still
+   * outstanding (the stamp and/or its partial delete failed, so the rows are
+   * only quarantined in memory). Kept apart from the abandon marker — which
+   * every accepted send and stream-end legitimately clears — so a crash
+   * between the failure and the next successful repair still leaves startup
+   * recovery a key to restamp with. Cleared only by a verified repair.
+   */
+  private pendingRejectedTurnRepair: { userMessageId?: string } | null = null;
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
@@ -869,6 +1024,20 @@ export class AgentSession {
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+    /**
+     * Pre-skill-routing options for compaction requests spawned off this
+     * stream. A turn routed to a small class model must never compact on that
+     * model — the compaction model has to fit the full uncompacted history —
+     * so both the on-send and mid-stream compaction sites build their request
+     * from these options when present.
+     */
+    compactionBaseOptions?: SendMessageOptions;
+    /**
+     * The turn's late consent gate, so AgentSession-internal recreations of
+     * this stream (the post-compaction context_exceeded retry) keep verifying
+     * trust the way StreamManager's own fallback/retry recreations do.
+     */
+    routedConsentRejection?: RoutedConsentRejection;
   };
 
   private activeCompactionRequest?: {
@@ -930,6 +1099,7 @@ export class AgentSession {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
+    this.telemetryService = telemetryService;
     this.sessionUsageService = sessionUsageService;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
@@ -942,6 +1112,7 @@ export class AgentSession {
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       telemetryService,
       emitter: this.emitter,
+      getQuarantinedRowIds: () => this.unstampedRejectedRowIds,
       onCompactionComplete: (metadata) => {
         // RLM keep-recent floor: tail copies after the boundary mean the
         // summary is no longer the last row; stash its ID so the stream-end
@@ -1285,6 +1456,14 @@ export class AgentSession {
       return;
     }
 
+    // Consent refusals are non-retryable regardless of their generic
+    // "unknown" classification (see retryActiveStream): the verdict cannot
+    // change without user action, so never arm the retry manager for them.
+    if (error.message?.includes(ROUTED_SKILL_TRUST_REVOKED_MESSAGE)) {
+      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "pre_stream_rejected" });
+      return;
+    }
+
     // Load persisted preference before scheduling retries so an on-disk opt-out is
     // honored even when the first failure happens before startup recovery runs.
     await this.loadAutoRetryEnabledPreference();
@@ -1295,7 +1474,9 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
-    goalId?: string
+    goalId?: string,
+    compactionBaseOptions?: SendMessageOptions,
+    routedProjectConsent?: boolean
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1307,6 +1488,8 @@ export class AgentSession {
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(compactionBaseOptions != null ? { compactionBaseOptions } : {}),
+      ...(routedProjectConsent === true ? { routedProjectConsent: true } : {}),
     };
   }
 
@@ -1341,7 +1524,26 @@ export class AgentSession {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
         goalId: request.goalId,
+        compactionBaseOptions: request.compactionBaseOptions,
+        routedProjectConsent: request.routedProjectConsent,
       });
+      if (
+        !result.success &&
+        result.error.type === "unknown" &&
+        "raw" in result.error &&
+        result.error.raw === ROUTED_SKILL_TRUST_REVOKED_MESSAGE
+      ) {
+        // Consent refusals are non-retryable: the verdict cannot change
+        // without user action (re-granting trust or sending a new turn), and
+        // RetryManager treats "unknown" as retryable with no attempt limit —
+        // it would recheck the same revoked trust forever. resumeStream's
+        // refusal already persisted the abandon marker WITH the refused
+        // turn's row key and stamped its rows (rejectResumedRoutedTurn);
+        // re-persisting here without the key would erase what the repair
+        // needs to finish a failed stamp after a restart.
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "pre_stream_rejected" });
+        return;
+      }
       if (result.success) {
         if (!result.data.started) {
           // resumeStream can defer when a turn is still PREPARING/COMPLETING.
@@ -1373,7 +1575,8 @@ export class AgentSession {
       });
       await this.updateStartupAutoRetryAbandonFromFailure(
         result.error.type,
-        this.activeStreamUserMessageId
+        this.activeStreamUserMessageId,
+        this.extractRetryFailureMessage(result.error)
       );
     } finally {
       this.autoRetryStarting = false;
@@ -1432,12 +1635,16 @@ export class AgentSession {
       const parsed = JSON.parse(raw) as {
         enabled?: unknown;
         startupAutoRetryAbandon?: unknown;
+        pendingRejectedTurnRepair?: unknown;
       };
       const enabled = parsed.enabled !== false;
       this.autoRetryEnabledPreference = enabled;
       this.legacyAutoRetryEnabledHint = null;
       this.startupAutoRetryAbandon = this.parseStartupAutoRetryAbandon(
         parsed.startupAutoRetryAbandon
+      );
+      this.pendingRejectedTurnRepair = this.parsePendingRejectedTurnRepair(
+        parsed.pendingRejectedTurnRepair
       );
       this.retryManager.setEnabled(enabled);
       return enabled;
@@ -1454,6 +1661,7 @@ export class AgentSession {
       this.autoRetryEnabledPreference = defaultEnabled;
       this.legacyAutoRetryEnabledHint = null;
       this.startupAutoRetryAbandon = null;
+      this.pendingRejectedTurnRepair = null;
       this.retryManager.setEnabled(defaultEnabled);
 
       if (errno === "ENOENT" && defaultEnabled === false) {
@@ -1474,7 +1682,8 @@ export class AgentSession {
   private async persistAutoRetryState(): Promise<void> {
     const preferencePath = this.getAutoRetryPreferencePath();
     const enabled = this.autoRetryEnabledPreference !== false;
-    const hasStartupAbandonState = this.startupAutoRetryAbandon !== null;
+    const hasStartupAbandonState =
+      this.startupAutoRetryAbandon !== null || this.pendingRejectedTurnRepair !== null;
 
     if (enabled && !hasStartupAbandonState) {
       try {
@@ -1497,6 +1706,7 @@ export class AgentSession {
     const payload: {
       enabled?: false;
       startupAutoRetryAbandon?: { reason: string; userMessageId?: string };
+      pendingRejectedTurnRepair?: { userMessageId?: string };
     } = {};
 
     if (!enabled) {
@@ -1505,6 +1715,9 @@ export class AgentSession {
 
     if (this.startupAutoRetryAbandon) {
       payload.startupAutoRetryAbandon = this.startupAutoRetryAbandon;
+    }
+    if (this.pendingRejectedTurnRepair) {
+      payload.pendingRejectedTurnRepair = this.pendingRejectedTurnRepair;
     }
 
     try {
@@ -1543,6 +1756,27 @@ export class AgentSession {
     await this.persistAutoRetryState();
   }
 
+  private parsePendingRejectedTurnRepair(value: unknown): { userMessageId?: string } | null {
+    if (typeof value !== "object" || value === null) {
+      return null;
+    }
+    const userMessageId = (value as { userMessageId?: unknown }).userMessageId;
+    return typeof userMessageId === "string" && userMessageId.trim().length > 0
+      ? { userMessageId }
+      : {};
+  }
+
+  /** Persist (or retire) the durable repair record; best-effort like the abandon marker. */
+  private async setPendingRejectedTurnRepair(
+    record: { userMessageId?: string } | null
+  ): Promise<void> {
+    if (JSON.stringify(record) === JSON.stringify(this.pendingRejectedTurnRepair)) {
+      return;
+    }
+    this.pendingRejectedTurnRepair = record;
+    await this.persistAutoRetryState();
+  }
+
   async handleProviderConfigChanged(): Promise<void> {
     await this.loadAutoRetryEnabledPreference();
     if (!isProviderConfigFixableError(this.startupAutoRetryAbandon?.reason ?? "")) {
@@ -1556,8 +1790,18 @@ export class AgentSession {
 
   private async updateStartupAutoRetryAbandonFromFailure(
     errorType: string,
-    userMessageId?: string
+    userMessageId?: string,
+    errorMessage?: string
   ): Promise<void> {
+    // A consent refusal that surfaced through the generic stream error
+    // pipeline (per-step prepareStep rejection is a plain Error there):
+    // preserve the recognizable non-retryable classification — the generic
+    // clear below would erase the repair marker the rejection callback just
+    // persisted, and a restart would lose the quarantine key with it.
+    if (errorMessage?.includes(ROUTED_SKILL_TRUST_REVOKED_MESSAGE)) {
+      await this.persistStartupAutoRetryAbandon("pre_stream_rejected", userMessageId);
+      return;
+    }
     if (
       isNonRetryableSendError({ type: errorType }) ||
       isNonRetryableStreamError({ type: errorType })
@@ -2016,18 +2260,29 @@ export class AgentSession {
     const persistedModel = this.normalizeStartupModel(persistedRetrySendOptions?.model);
     const assistantModel = this.normalizeStartupModel(lastAssistantMessage?.metadata?.model);
     const agentSettingsModel = this.normalizeStartupModel(agentSettings?.model);
-    const baseModel = isChildTaskWorkspace
-      ? (agentSettingsModel ?? persistedModel ?? assistantModel ?? DEFAULT_MODEL)
-      : (persistedModel ?? assistantModel ?? agentSettingsModel ?? DEFAULT_MODEL);
+    // A retry row carrying routed compaction context recorded the CLASS model
+    // the turn actually streamed on. That persisted model must win even in
+    // child task workspaces (whose creation-time settings normally take
+    // precedence) — resuming on the workspace model while restoring a routed
+    // compaction policy would mismatch both. Agent identity stays the child's.
+    const persistedCompactionBaseOptions = sanitizePersistedCompactionBaseOptions(
+      persistedRetrySendOptions?.compactionBaseOptions
+    );
+    const isRoutedRetryRow = persistedCompactionBaseOptions != null;
+    const baseModel =
+      isChildTaskWorkspace && !isRoutedRetryRow
+        ? (agentSettingsModel ?? persistedModel ?? assistantModel ?? DEFAULT_MODEL)
+        : (persistedModel ?? assistantModel ?? agentSettingsModel ?? DEFAULT_MODEL);
 
     const persistedThinkingLevel = coerceThinkingLevel(persistedRetrySendOptions?.thinkingLevel);
     const assistantThinkingLevel = coerceThinkingLevel(
       lastAssistantMessage?.metadata?.thinkingLevel
     );
     const agentSettingsThinkingLevel = coerceThinkingLevel(agentSettings?.thinkingLevel);
-    const baseThinkingLevel = isChildTaskWorkspace
-      ? (agentSettingsThinkingLevel ?? persistedThinkingLevel ?? assistantThinkingLevel)
-      : (persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel);
+    const baseThinkingLevel =
+      isChildTaskWorkspace && !isRoutedRetryRow
+        ? (agentSettingsThinkingLevel ?? persistedThinkingLevel ?? assistantThinkingLevel)
+        : (persistedThinkingLevel ?? assistantThinkingLevel ?? agentSettingsThinkingLevel);
 
     // Pro reasoning mode threads alongside thinkingLevel from the same sources
     // (assistant message metadata does not carry it), so startup retries do not
@@ -2181,6 +2436,19 @@ export class AgentSession {
       retryRequest.agentInitiated = true;
     }
 
+    // Routed turns persist their pre-routing compaction context; restore it so
+    // the post-relaunch retry keeps the routed compaction policy instead of
+    // force-compacting at the workspace threshold against the routed window.
+    if (persistedCompactionBaseOptions != null) {
+      retryRequest.compactionBaseOptions = persistedCompactionBaseOptions;
+    }
+
+    // Routed project-skill turns re-verify Project Trust on every resumed
+    // dispatch (the resume path bypasses the send gates).
+    if (persistedRetrySendOptions?.routedProjectConsent === true) {
+      retryRequest.routedProjectConsent = true;
+    }
+
     return retryRequest;
   }
 
@@ -2246,6 +2514,11 @@ export class AgentSession {
     }
 
     const autoRetryEnabled = await this.loadAutoRetryEnabledPreference();
+    // Quarantine repair runs regardless of the auto-retry preference (which
+    // loadAutoRetryEnabledPreference just hydrated): the hazard is the next
+    // MANUAL send's request including unstamped rejected rows, not automatic
+    // replay.
+    await this.repairUnstampedRejectedTurn();
     if (!autoRetryEnabled) {
       this.resetStartupAutoRetryHistoryReadBackoff();
       return "completed";
@@ -2298,6 +2571,15 @@ export class AgentSession {
         this.shouldUseUserMessageForRetry(message)
       );
 
+    // Pre-stream gate rejections never streamed and must never be replayed:
+    // the row-level stamp is atomic with the row itself, so it holds even
+    // when the crash landed between the row append and the preference-file
+    // abandon write below.
+    if (startupRetryUserMessage?.metadata?.preStreamRejected === true) {
+      this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "pre_stream_rejected" });
+      return "completed";
+    }
+
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
       const abandonMatchesCurrentTail =
@@ -2306,7 +2588,8 @@ export class AgentSession {
 
       if (
         abandonMatchesCurrentTail &&
-        (isNonRetryableSendError({ type: abandonReason }) ||
+        (abandonReason === "pre_stream_rejected" ||
+          isNonRetryableSendError({ type: abandonReason }) ||
           isNonRetryableStreamError({ type: abandonReason }))
       ) {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: abandonReason });
@@ -2325,8 +2608,25 @@ export class AgentSession {
         return "completed";
       }
 
-      const { agentInitiated, goalKind, goalId, ...resumeOptions } = retryRequest;
-      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId);
+      // compactionBaseOptions is retry-state metadata, not a send option: it
+      // must feed the resume state's routed-compaction context, never ride
+      // inside the replayed SendMessageOptions themselves.
+      const {
+        agentInitiated,
+        goalKind,
+        goalId,
+        compactionBaseOptions,
+        routedProjectConsent,
+        ...resumeOptions
+      } = retryRequest;
+      this.setAutoRetryResumeState(
+        resumeOptions,
+        agentInitiated,
+        goalKind,
+        goalId,
+        compactionBaseOptions,
+        routedProjectConsent
+      );
     }
 
     // Disk reads above may race with user actions; retry once the current work settles
@@ -3043,6 +3343,8 @@ export class AgentSession {
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: {
+      /** Queue-dispatched entry (see SendMessageInternalOptions.dequeued). */
+      dequeued?: boolean;
       synthetic?: boolean;
       agentInitiated?: boolean;
       goalContinuation?: boolean;
@@ -3113,7 +3415,7 @@ export class AgentSession {
        */
       admissionStale?: () => boolean;
     }
-  ): Promise<AgentSessionResult<void>> {
+  ): Promise<AgentSessionResult<SendMessageAccepted | undefined>> {
     this.assertNotDisposed("sendMessage");
 
     assert(typeof message === "string", "sendMessage requires a string message");
@@ -3227,16 +3529,63 @@ export class AgentSession {
     // PRRT_kwDOPxxmWM5_s-jo). For synthetic sends (compaction, goal
     // continuation, etc.) the user did not type the message, so we just
     // return Err and let the synthetic caller log/handle it.
+    // Resolve per-skill model routing before any gate or mutation below: the
+    // pricing gate and PDF preflight must judge the model that will actually
+    // stream, and a broken class binding must reject the send BEFORE the edit
+    // path truncates history (see the invariant comment on the edit branch).
+    // Mirroring the pricing gate: a manual send rejected here is persisted and
+    // surfaced as a stream-error — a bare Err would let sendQueuedMessages()
+    // drop the user's queued input with no visible feedback.
+    const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+    const skillModelOverride = options
+      ? await this.resolveSkillModelClassOverride(typedMuxMetadata, options)
+      : null;
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+    if (skillModelOverride?.kind === "config-error") {
+      const routingError = createUnknownSendMessageError(skillModelOverride.message);
+      // Preservation exists for dequeued sends whose composer already cleared —
+      // a rejected EDIT must not append the edited text as a new tail turn
+      // (the original message is untouched and the browser restores the draft).
+      if (isManualUserMessage && options?.editMessageId == null && internal?.dequeued === true) {
+        // Queue authoring time rides along like the pricing rejection below:
+        // without it, a skill queued before a later goal activation reads as
+        // post-goal and wrongly pauses the fresh goal (and the unstamped row
+        // is misclassified again after restart).
+        const persisted = await this.preserveRejectedManualSend(
+          message,
+          options,
+          routingError,
+          internal?.enqueuedAtMs
+        );
+        if (persisted) {
+          await this.applyManualUserMessageGoalSafety({
+            policy: "pause",
+            enqueuedAtMs: internal?.enqueuedAtMs,
+          });
+        }
+      }
+      return Err(routingError);
+    }
+    // The model every downstream gate must validate: the routed class model
+    // when routing applies, else the caller's model.
+    const effectiveModelForGates = skillModelOverride?.model ?? options?.model;
+
     if (this.workspaceGoalService) {
       const pricingGate = await this.workspaceGoalService.assertPricedModelForBudgetedGoal(
         this.workspaceId,
-        options?.model
+        effectiveModelForGates
       );
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
       if (!pricingGate.success) {
-        if (isManualUserMessage) {
+        // Like the class-routing and PDF gates: preservation is for dequeued
+        // sends whose composer already cleared — a rejected EDIT (now
+        // reachable here via routed skill edits) must not append the edited
+        // text as a new tail turn.
+        if (isManualUserMessage && options?.editMessageId == null && internal?.dequeued === true) {
           const persisted = await this.preserveRejectedManualSend(
             message,
             options,
@@ -3341,16 +3690,48 @@ export class AgentSession {
         (part) => normalizeMediaType(part.mediaType) === PDF_MEDIA_TYPE
       );
 
-      if (pdfParts.length > 0) {
+      if (pdfParts.length > 0 && effectiveModelForGates != null) {
+        // Judge the routed class model when skill routing applies — the
+        // workspace model's PDF support is irrelevant to what will stream.
         const caps = getModelCapabilitiesResolved(
-          options.model,
+          effectiveModelForGates,
           this.aiService.getProvidersConfig()
         );
 
+        // Rejections persist + surface like the pricing/routing gates: routable
+        // skill sends skip the browser PDF preflight and can arrive here from
+        // the queue drain, where a bare Err would silently discard the user's
+        // text and attachment (the composer already cleared on queue accept).
+        const rejectPdf = async (
+          errorMessage: string
+        ): Promise<Result<undefined, SendMessageError>> => {
+          const pdfError = createUnknownSendMessageError(errorMessage);
+          // See the class-routing gate above: preservation is for dequeued
+          // sends, never for rejected edits (which would duplicate the turn).
+          if (
+            isManualUserMessage &&
+            options?.editMessageId == null &&
+            internal?.dequeued === true
+          ) {
+            // Same queue-timestamp threading as the routing and pricing gates.
+            const persisted = await this.preserveRejectedManualSend(
+              message,
+              options,
+              pdfError,
+              internal?.enqueuedAtMs
+            );
+            if (persisted) {
+              await this.applyManualUserMessageGoalSafety({
+                policy: "pause",
+                enqueuedAtMs: internal?.enqueuedAtMs,
+              });
+            }
+          }
+          return Err(pdfError);
+        };
+
         if (caps && !caps.supportsPdfInput) {
-          return Err(
-            createUnknownSendMessageError(`Model ${options.model} does not support PDF input.`)
-          );
+          return rejectPdf(`Model ${effectiveModelForGates} does not support PDF input.`);
         }
 
         if (caps?.maxPdfSizeMb !== undefined) {
@@ -3360,10 +3741,8 @@ export class AgentSession {
             if (bytes !== null && bytes > maxBytes) {
               const actualMb = (bytes / (1024 * 1024)).toFixed(1);
               const label = part.filename ?? "PDF";
-              return Err(
-                createUnknownSendMessageError(
-                  `${label} is ${actualMb}MB, but ${options.model} allows up to ${caps.maxPdfSizeMb}MB per PDF.`
-                )
+              return rejectPdf(
+                `${label} is ${actualMb}MB, but ${effectiveModelForGates} allows up to ${caps.maxPdfSizeMb}MB per PDF.`
               );
             }
           }
@@ -3423,6 +3802,20 @@ export class AgentSession {
       },
     };
     using _editAdmission = editAdmission;
+
+    // Edit turns materialize skill snapshots BEFORE truncation (see below);
+    // the persistence section reuses this instead of materializing again.
+    let preTruncationSkillSnapshots: {
+      messages: MuxMessage[];
+      carriesProjectSkillContent: boolean;
+    } | null = null;
+    // Whether project-scope skill content rides this routed turn: seeded
+    // from the invoked package's scope, widened by materialization (an
+    // inline $project-skill ref travels on a globally-invoked routed turn
+    // too). The late consent gates key on this.
+    let routedTurnCarriesProjectContent =
+      skillModelOverride?.kind === "override" &&
+      skillModelOverride.resolvedPackage?.package.scope === "project";
 
     if (editMessageId) {
       // Ensure no in-flight completion code can append after we truncate.
@@ -3500,11 +3893,66 @@ export class AgentSession {
       // so the user can re-evaluate, and start the edit stream with an empty queue.
       this.restoreQueueToInput();
 
+      // Provider-selection consent can be revoked while the edit waited for
+      // idle above: recheck BEFORE the destructive truncation — rejecting
+      // after it would leave a partial edit (deleted tail, no replacement
+      // turn) with only the renderer draft restored.
+      if (
+        skillModelOverride?.kind === "override" &&
+        skillModelOverride.resolvedPackage?.package.scope === "project" &&
+        !(await this.isRoutedProjectSkillTurnStillTrusted())
+      ) {
+        return Err(createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE));
+      }
+
+      // Materialize skill snapshots BEFORE the destructive truncation: the
+      // materialization awaits (skill reads, dynamic context injection) are
+      // where mid-send trust revocation and unresolvable-skill errors
+      // surface, and any rejection there must land while the edited row and
+      // tail still exist. Recent-snapshot dedupe is skipped — it would
+      // compare against rows the truncation below is about to delete and
+      // wrongly suppress a snapshot the rewritten history needs. The rows
+      // are APPENDED later, in the same persistence order as a plain send.
+      try {
+        preTruncationSkillSnapshots = await this.materializeAgentSkillSnapshots(
+          typedMuxMetadata,
+          options?.disableWorkspaceAgents,
+          skillModelOverride?.kind === "override" && skillModelOverride.resolvedPackage != null
+            ? new Map([
+                [
+                  skillModelOverride.resolvedPackage.package.directoryName,
+                  skillModelOverride.resolvedPackage,
+                ],
+              ])
+            : undefined,
+          skillModelOverride?.kind === "override",
+          true
+        );
+      } catch (error) {
+        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+      }
+      if (preTruncationSkillSnapshots?.carriesProjectSkillContent) {
+        routedTurnCarriesProjectContent = true;
+      }
+
       // Find the truncation target: the edited message or any immediately-preceding snapshots.
       // (snapshots are persisted immediately before their corresponding user message)
       // Pre-boundary edits are user-confirmed by the composer, so fall back to full-history lookup
       // when the edit target is outside the active context window.
       const truncateTargetId = await this.getEditTruncateTargetId(editMessageId);
+
+      // Last recheck immediately before the destructive truncation: the
+      // materialization and truncate-target reads above are awaits, and a
+      // rejection AFTER truncation cannot restore the discarded tail. Uses
+      // the widened flag (inline project refs discovered by the
+      // materialization above included).
+      if (
+        skillModelOverride?.kind === "override" &&
+        routedTurnCarriesProjectContent &&
+        !(await this.isRoutedProjectSkillTurnStillTrusted())
+      ) {
+        return Err(createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE));
+      }
 
       this.clearUsageState();
       const truncateResult = await this.historyService.truncateAfterMessage(
@@ -3539,7 +3987,11 @@ export class AgentSession {
           historyService: this.historyService,
           aiService: this.aiService,
           workspaceId: this.workspaceId,
-          abandonedMessages: truncateResult.data.removedMessages,
+          // Quarantined rejected rows (failed durable stamp) are transcript-
+          // only: the side-channel summarizer must not distill them either.
+          abandonedMessages: truncateResult.data.removedMessages.filter(
+            (msg) => !this.unstampedRejectedRowIds.has(msg.id)
+          ),
           experiments: options?.experiments,
           isExperimentEnabled:
             typeof this.aiService.isExperimentEnabled === "function"
@@ -3591,8 +4043,7 @@ export class AgentSession {
 
     // toolPolicy is properly typed via Zod schema inference
     const typedToolPolicy = options?.toolPolicy;
-    // muxMetadata is z.any() in schema - cast to proper type
-    const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+    // typedMuxMetadata was hoisted above the routing/pricing gates.
     const acpPromptId =
       normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(typedMuxMetadata);
     const delegatedToolNames =
@@ -3611,13 +4062,120 @@ export class AgentSession {
       ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
     });
 
+    // Apply the per-skill routing override resolved at the top of sendMessage
+    // (before the gates and the edit branch). Applied before the user message
+    // is created so startup retries (retrySendOptions) replay the routed
+    // model, and before the compaction threshold check so context-limit math
+    // uses the model that will actually stream. preRoutingOptions feeds the
+    // compaction REQUEST below: a turn routed to a small model must never
+    // compact on that small model — the compaction model has to fit the full
+    // uncompacted history.
+    const preRoutingOptions = optionsForStream;
+    let muxMetadataForMessage = typedMuxMetadata;
+    let routedThinkingLevel: ThinkingLevel | undefined;
+    if (skillModelOverride != null) {
+      modelForStream = skillModelOverride.model;
+      // Numeric one-shot thinking is model-relative: the frontend resolved
+      // options.thinkingLevel against the workspace model before routing was
+      // known, so "/+0 /skill" must be re-resolved here to mean the ROUTED
+      // model's lowest level, not the workspace model's.
+      const reroutedOneShotThinking =
+        options.oneShotThinkingIndex != null
+          ? resolveThinkingInput(
+              options.oneShotThinkingIndex,
+              skillModelOverride.model,
+              this.getProvidersConfigSafe()
+            )
+          : undefined;
+      // Precedence: explicit numeric one-shot (re-resolved above) > class
+      // thinking > ambient options. skipAiSettingsPersistence marks one-shot
+      // sends, so a named "/+high /skill" keeps the user's level rather than
+      // the class default.
+      routedThinkingLevel =
+        reroutedOneShotThinking ??
+        (skillModelOverride.thinkingLevel != null && options.skipAiSettingsPersistence !== true
+          ? skillModelOverride.thinkingLevel
+          : undefined);
+      optionsForStream = {
+        ...optionsForStream,
+        model: skillModelOverride.model,
+        ...(routedThinkingLevel != null ? { thinkingLevel: routedThinkingLevel } : {}),
+      };
+      // The persisted request metadata must advertise the model that will
+      // actually stream: the pending-turn label and downstream consumers read
+      // requestedModel from the user message.
+      if (muxMetadataForMessage != null) {
+        muxMetadataForMessage = {
+          ...muxMetadataForMessage,
+          requestedModel: skillModelOverride.model,
+        };
+      }
+    }
+
     // RLM keep-recent floor: stamp compaction requests (manual /compact,
     // mid-stream forced, idle) with the durable tail-start sequence before the
-    // row is persisted. No-op when RLM is off.
+    // row is persisted. No-op when RLM is off. Takes the routing-aware
+    // metadata so a routed re-stamp (requestedModel) survives; the two stamps
+    // touch disjoint metadata types (compaction-request vs agent-skill).
     const stampedMuxMetadata =
-      isCompactionRequest && typedMuxMetadata?.type === "compaction-request"
-        ? await this.withKeepRecentTailStamp(typedMuxMetadata, optionsForStream)
-        : typedMuxMetadata;
+      isCompactionRequest && muxMetadataForMessage?.type === "compaction-request"
+        ? await this.withKeepRecentTailStamp(muxMetadataForMessage, optionsForStream)
+        : muxMetadataForMessage;
+
+    // Routed sends report the class model and the effective thinking level
+    // back to the caller so successful-send telemetry attributes the
+    // invocation to what actually streams. The level is whatever the stream
+    // will receive (class suffix, re-resolved numeric one-shot, or a named
+    // one-shot / ambient level riding through), clamped by the same per-model
+    // floor enforcement the stream applies — "/+off /skill" routed onto a
+    // floor-medium model reports medium, not off.
+    const sendAccepted: SendMessageAccepted | undefined =
+      skillModelOverride != null
+        ? {
+            routedModel: skillModelOverride.model,
+            ...(optionsForStream.thinkingLevel != null
+              ? {
+                  routedThinkingLevel: this.enforceThinkingFloorsForModel(
+                    skillModelOverride.model,
+                    optionsForStream.thinkingLevel,
+                    this.getProvidersConfigSafe()
+                  ),
+                }
+              : {}),
+          }
+        : undefined;
+
+    // Which options a routed turn's compaction (on-send or mid-stream forced)
+    // must run with: the compaction request has to read the FULL uncompacted
+    // history, so it needs whichever model has the larger usable window.
+    // Routing usually shrinks the window (the user's model wins), but a class
+    // can also route UP — repeated routed turns can then grow the history past
+    // the user's model, and summarizing on it would just context-error again.
+    const compactionBaseOptionsForRoutedTurn = ((): SendMessageOptions | undefined => {
+      if (skillModelOverride == null) {
+        return undefined;
+      }
+      const providersConfigForWindows = this.getProvidersConfigSafe();
+      const userModel = preRoutingOptions.model;
+      if (userModel == null) {
+        return optionsForStream;
+      }
+      const userLimit = getEffectiveContextLimit(
+        userModel,
+        this.is1MContextEnabledForModel(userModel, preRoutingOptions, providersConfigForWindows),
+        providersConfigForWindows
+      );
+      const routedLimit = getEffectiveContextLimit(
+        skillModelOverride.model,
+        this.is1MContextEnabledForModel(
+          skillModelOverride.model,
+          optionsForStream,
+          providersConfigForWindows
+        ),
+        providersConfigForWindows
+      );
+      return (routedLimit ?? 0) > (userLimit ?? 0) ? optionsForStream : preRoutingOptions;
+    })();
 
     const userMessage = createMuxMessage(
       messageId,
@@ -3627,8 +4185,17 @@ export class AgentSession {
         timestamp: Date.now(),
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
-        retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
-        muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
+        retrySendOptions: pickStartupRetrySendOptions(
+          optionsForStream,
+          agentInitiated,
+          goalKind,
+          compactionBaseOptionsForRoutedTurn,
+          // Durable consent seed (invoked package's scope; this row persists
+          // before materialization can widen the flag for inline refs — the
+          // in-memory resume state below carries the final value).
+          routedTurnCarriesProjectContent
+        ),
+        muxMetadata: stampedMuxMetadata, // Frontend metadata; requestedModel re-stamped when routing applied
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
         // Scope goal-loop rows to their goal so a replaced goal's continuation
@@ -3697,8 +4264,18 @@ export class AgentSession {
       // before dispatching a risky user turn near the context limit.
       // `shouldForceCompact` remains a stricter (threshold + buffer) signal for
       // mid-stream forcing where we want to avoid abrupt interruptions too early.
+      //
+      // Skill-routed sends compact only when the content genuinely risks
+      // overrunning the routed model's window: applying the threshold to the
+      // (smaller) routed window would let a one-off cheap-skill invocation
+      // force an unrequested, irreversible, workspace-wide compaction of a
+      // session far under its own model's limit. The headroom accounts for
+      // the pending turn (new message, attachments, skill snapshot), which
+      // the recorded usage doesn't include yet.
       const shouldCompactBeforeSend =
-        compactionResult.usagePercentage >= compactionResult.thresholdPercentage;
+        skillModelOverride != null
+          ? compactionResult.usagePercentage >= 100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT
+          : compactionResult.usagePercentage >= compactionResult.thresholdPercentage;
       if (shouldCompactBeforeSend) {
         const followUpFileParts = effectiveFileParts?.map((part) => ({
           url: part.url,
@@ -3724,10 +4301,15 @@ export class AgentSession {
           }
         }
 
+        // Pre-routing options/model: the deferred follow-up re-enters
+        // sendMessage with the same skill metadata and re-resolves routing at
+        // dispatch time. Persisting the routed model here would pin a stale
+        // decision — if the binding is gone by dispatch, the user's prompt
+        // would stream on the routed model with no routing decision behind it.
         const followUpContent = this.buildAutoCompactionFollowUp({
           messageText: message,
-          options: optionsForStream,
-          modelForStream,
+          options: preRoutingOptions,
+          modelForStream: preRoutingOptions.model,
           fileParts: followUpFileParts,
           agentInitiated,
           goalKind,
@@ -3745,9 +4327,48 @@ export class AgentSession {
 
         const autoCompactionRequest = this.buildAutoCompactionRequest({
           followUpContent,
-          baseOptions: optionsForStream,
+          // The compaction request must run on the model able to read the full
+          // history — usually the user's pre-routing model, or the routed model
+          // when the class routes UP to a larger window. The deferred follow-up
+          // re-enters sendMessage with the same skill metadata and re-routes
+          // itself either way.
+          baseOptions: compactionBaseOptionsForRoutedTurn ?? preRoutingOptions,
           reason: "on-send",
         });
+
+        // The pricing gate above validated the ROUTED model, but the
+        // compaction request may inherit the pre-routing ambient model (the
+        // larger-window pick): for a budgeted goal that model must be priced
+        // too, or the compaction stream's cost cannot be enforced against
+        // the budget.
+        if (this.workspaceGoalService) {
+          const compactionPricingGate =
+            await this.workspaceGoalService.assertPricedModelForBudgetedGoal(
+              this.workspaceId,
+              autoCompactionRequest.sendOptions.model
+            );
+          if (!compactionPricingGate.success) {
+            if (
+              isManualUserMessage &&
+              options?.editMessageId == null &&
+              internal?.dequeued === true
+            ) {
+              const persisted = await this.preserveRejectedManualSend(
+                message,
+                options,
+                compactionPricingGate.error,
+                internal?.enqueuedAtMs
+              );
+              if (persisted) {
+                await this.applyManualUserMessageGoalSafety({
+                  policy: "pause",
+                  enqueuedAtMs: internal?.enqueuedAtMs,
+                });
+              }
+            }
+            return Err(compactionPricingGate.error);
+          }
+        }
 
         // RLM keep-recent floor: stamp on-send auto-compaction requests with
         // the durable tail-start sequence. No-op when RLM is off.
@@ -3826,21 +4447,116 @@ export class AgentSession {
     // On on-send compaction paths, snapshots are deferred with the follow-up turn.
     const shouldPersistTurnSnapshots = autoCompactionMessage === null;
 
+    // On-send compaction DEFERS the skill: the invocation has not dispatched
+    // (its persisted follow-up re-enters sendMessage and re-resolves routing
+    // after compaction — mapping, trust, and availability may all differ by
+    // then), so reporting a model now would attribute a dispatch that never
+    // happened, on a model that may not be the one that streams. Report the
+    // deferral like a queued send — for EVERY skill send, routed or not — and
+    // let dispatchPendingFollowUp attribute the turn when it actually
+    // streams (the renderer suppresses its own capture on { queued: true }).
+    const sendAcceptedFinal: SendMessageAccepted | undefined =
+      autoCompactionMessage !== null && typedMuxMetadata?.type === "agent-skill"
+        ? { queued: true }
+        : sendAccepted;
+
+    // Consent recheck immediately before snapshots are built and persisted:
+    // the queue wait and preflights sit between the routing gate and this
+    // point. Runs the same dequeued-send preservation as the
+    // routing/pricing/PDF gates — the materialization-internal throw below
+    // surfaces as a bare Err, which would silently drop a queued prompt
+    // whose composer already cleared. Edit turns are exempt: their consent
+    // was checked (and their snapshots materialized) BEFORE the destructive
+    // truncation, and a rejection here would land after it.
+    if (
+      options?.editMessageId == null &&
+      skillModelOverride?.kind === "override" &&
+      routedTurnCarriesProjectContent &&
+      !(await this.isRoutedProjectSkillTurnStillTrusted())
+    ) {
+      const trustError = createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+      if (isManualUserMessage && options?.editMessageId == null && internal?.dequeued === true) {
+        const persisted = await this.preserveRejectedManualSend(
+          message,
+          options,
+          trustError,
+          internal?.enqueuedAtMs
+        );
+        if (persisted) {
+          await this.applyManualUserMessageGoalSafety({
+            policy: "pause",
+            enqueuedAtMs: internal?.enqueuedAtMs,
+          });
+        }
+      }
+      // On-send compaction already persisted its request row (carrying this
+      // prompt as the pending follow-up) while the user row itself was held
+      // back: refusing without rolling it back would leave a hidden compaction
+      // request that startup recovery resumes — dispatching a prompt whose
+      // send was reported failed. Still pre-acceptance, so the set is exact.
+      const rolledBack = await rollbackPersistedTurnRows();
+      if (!rolledBack && autoCompactionMessage !== null) {
+        // The row could not be verifiably removed: fail CLOSED. Compaction
+        // requests are user rows, so the provider-request filter and the
+        // startup replay check both honor the rejection stamp; a failed
+        // stamp falls back to the in-memory quarantine plus the durable
+        // repair record, and the abandon marker keyed to the row stops
+        // startup recovery from replaying the compaction at all.
+        await this.quarantineUnremovedRefusedRows([autoCompactionMessage.id]);
+      }
+      return Err(trustError);
+    }
+
     let skillSnapshotMessages: MuxMessage[] = [];
     let mcpPromptSnapshotMessages: MuxMessage[] = [];
     if (shouldPersistTurnSnapshots) {
       try {
-        skillSnapshotMessages = await this.materializeAgentSkillSnapshots(
-          typedMuxMetadata,
-          options?.disableWorkspaceAgents
-        );
+        const skillMaterialization =
+          preTruncationSkillSnapshots ??
+          (await this.materializeAgentSkillSnapshots(
+            typedMuxMetadata,
+            options?.disableWorkspaceAgents,
+            skillModelOverride?.kind === "override" && skillModelOverride.resolvedPackage != null
+              ? new Map([
+                  [
+                    skillModelOverride.resolvedPackage.package.directoryName,
+                    skillModelOverride.resolvedPackage,
+                  ],
+                ])
+              : undefined,
+            skillModelOverride?.kind === "override"
+          ));
+        skillSnapshotMessages = skillMaterialization.messages;
+        if (skillMaterialization.carriesProjectSkillContent) {
+          routedTurnCarriesProjectContent = true;
+        }
         mcpPromptSnapshotMessages = await this.materializeMcpPromptSnapshots(
           typedMuxMetadata,
           userMessage.id,
           cancelSignal
         );
       } catch (error) {
-        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+        const materializationError = createUnknownSendMessageError(getErrorMessage(error));
+        // A queued prompt's composer already cleared: like the other
+        // pre-stream gates, a materialization failure (including the
+        // mid-materialization trust revocation throw) must leave a durable
+        // transcript row + visible error instead of silently dropping the
+        // send while sendQueuedMessages moves on.
+        if (isManualUserMessage && options?.editMessageId == null && internal?.dequeued === true) {
+          const persisted = await this.preserveRejectedManualSend(
+            message,
+            options,
+            materializationError,
+            internal?.enqueuedAtMs
+          );
+          if (persisted) {
+            await this.applyManualUserMessageGoalSafety({
+              policy: "pause",
+              enqueuedAtMs: internal?.enqueuedAtMs,
+            });
+          }
+        }
+        return Err(materializationError);
       }
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
@@ -4061,6 +4777,12 @@ export class AgentSession {
     // Synthetic/system sends (mid-stream compaction, task recovery prompts, etc.)
     // must not silently opt users back into auto-retry after they've disabled it.
     if (isManualUserMessage) {
+      // The abandon marker gates the rejected-turn repair. A manual send
+      // accepted while startup recovery is still pending would clear it
+      // first, so the request build's marker-gated pass would find nothing
+      // and the unstamped rejected rows (plus a surviving partial) would ride
+      // this very request. Repair BEFORE the marker goes.
+      await this.repairUnstampedRejectedTurn();
       // A fresh accepted user send supersedes any persisted startup-abandon
       // classification from previous turns.
       await this.clearStartupAutoRetryAbandon();
@@ -4071,7 +4793,16 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      agentInitiated,
+      goalKind,
+      internal?.goalId,
+      compactionBaseOptionsForRoutedTurn,
+      // FINAL consent flag (post-materialization, inline refs included) —
+      // retries of this accepted request re-verify Project Trust.
+      skillModelOverride?.kind === "override" && routedTurnCarriesProjectContent
+    );
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -4084,6 +4815,86 @@ export class AgentSession {
     }
 
     let acceptedPreStreamFailureNotified = false;
+    // Shared rejection for the late consent gates (pre-stream below and the
+    // provider-dispatch boundary inside streamWithHistory): performs durable
+    // bookkeeping and returns the error to surface. The turn's rows are
+    // durable by now, so rejection is non-destructive — but the accepted row
+    // must not be startup-resumable onto its persisted routed retry options
+    // (recovery honors this abandon reason without rerunning the gates), and
+    // the failure must be VISIBLE (these gates bypass streamWithHistory's
+    // own error emission).
+    const routedConsentRejection: RoutedConsentRejection = async (
+      // Set by the provider-boundary caller when the assembled REQUEST
+      // carries project-scope snapshot rows from EARLIER turns: an untrusted
+      // workspace's history can hold a project snapshot even when the
+      // current routed invocation is global with no project refs.
+      requestCarriesProjectContent?: boolean,
+      midStream?: boolean
+    ): Promise<SendMessageError | null> => {
+      if (
+        skillModelOverride?.kind !== "override" ||
+        !(routedTurnCarriesProjectContent || requestCarriesProjectContent === true)
+      ) {
+        return null;
+      }
+      if (await this.isRoutedProjectSkillTurnStillTrusted()) {
+        return null;
+      }
+      const trustError = createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+      // Durable, request-visible rejection: stamp the accepted turn's rows
+      // (filterPreStreamRejectedRows keys on ROW metadata — the sidecar
+      // abandon marker alone would leave this turn provider-eligible for the
+      // NEXT ordinary send), then belt with the abandon marker for startup
+      // recovery, then surface the visible error.
+      const rejectedRowIds = [
+        userMessage.id,
+        ...skillSnapshotMessages.map((msg) => msg.id),
+        ...mcpPromptSnapshotMessages.map((msg) => msg.id),
+        // The @file-mention snapshot persisted with this turn carries
+        // repository contents too — an unstamped copy would stay
+        // provider-eligible after the turn's rejection.
+        ...(snapshotResult?.snapshotMessage != null ? [snapshotResult.snapshotMessage.id] : []),
+      ];
+      let stampResult = await this.historyService.markMessagesPreStreamRejected(
+        this.workspaceId,
+        rejectedRowIds
+      );
+      if (!stampResult.success) {
+        // Fail CLOSED: without the row marker the rejected turn stays
+        // provider-eligible for the next ordinary send (the sidecar abandon
+        // is invisible to request construction, and a later manual send
+        // clears it). Retry once; if the rewrite still fails, quarantine the
+        // ids in memory — request assembly filters them for the rest of the
+        // session, and startup recovery re-attempts the durable stamp when
+        // it sees the abandon reason.
+        stampResult = await this.historyService.markMessagesPreStreamRejected(
+          this.workspaceId,
+          rejectedRowIds
+        );
+      }
+      if (!stampResult.success) {
+        for (const id of rejectedRowIds) {
+          this.unstampedRejectedRowIds.add(id);
+        }
+        log.warn("Failed to stamp rejected rows after consent revocation; quarantined in memory", {
+          workspaceId: this.workspaceId,
+          error: stampResult.error,
+        });
+        // The quarantine dies with the process; the repair record does not.
+        await this.setPendingRejectedTurnRepair({ userMessageId: userMessage.id });
+      }
+      await this.persistStartupAutoRetryAbandon("pre_stream_rejected", userMessage.id);
+      // Pre-start refusals bypass every stream error path, so this emission is
+      // the only visible record. A per-step (mid-stream) refusal is thrown
+      // through StreamManager's standard failure pipeline, whose
+      // handleStreamError emits the row — emitting here too would leave two
+      // error rows for one refusal.
+      if (!this.disposed && midStream !== true) {
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(trustError)));
+      }
+      return trustError;
+    };
+
     const notifyAcceptedPreStreamFailure = async (error: SendMessageError): Promise<void> => {
       if (acceptedPreStreamFailureNotified) {
         return;
@@ -4124,13 +4935,15 @@ export class AgentSession {
     // service-side preflight reservation (see onTurnAdmissionCommitted doc).
     internal?.onTurnAdmissionCommitted?.();
 
-    const startPreparedStream = async (): Promise<AgentSessionResult<void>> => {
+    const startPreparedStream = async (): Promise<
+      AgentSessionResult<SendMessageAccepted | undefined>
+    > => {
       try {
         if (preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError("Accepted stream startup was canceled before it began.")
           );
-          return Ok(undefined);
+          return Ok(ACCEPTED_WITHOUT_STREAM);
         }
         // Background processes are workspace-scoped, not context-scoped. Compaction must preserve
         // processes, monitors, and queued wakes so a waiting agent is not stranded.
@@ -4142,7 +4955,22 @@ export class AgentSession {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError("Accepted stream startup was canceled before streaming.")
           );
-          return Ok(undefined);
+          return Ok(ACCEPTED_WITHOUT_STREAM);
+        }
+
+        // Consent check before streamWithHistory's startup work: every await
+        // since the last gate (branch summary, file snapshot, MCP snapshots,
+        // history writes) is a revocation window — on edits those all run
+        // AFTER truncation. Post-acceptance, so the rejection surfaces as an
+        // accepted pre-stream failure (the emitted stream error is the
+        // visible record); an Err here would make the renderer restore the
+        // draft of a prompt that is already a durable transcript row.
+        {
+          const consentError = await routedConsentRejection();
+          if (consentError) {
+            await notifyAcceptedPreStreamFailure(consentError);
+            return Ok(ACCEPTED_WITHOUT_STREAM);
+          }
         }
 
         // Turn-phase transitions for success are driven by stream events.
@@ -4155,8 +4983,20 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          compactionBaseOptionsForRoutedTurn,
+          routedConsentRejection
         );
+        // The provider-boundary consent gate inside streamWithHistory
+        // surfaces here: same accepted-pre-stream conversion as above.
+        if (
+          !streamResult.success &&
+          streamResult.error.type === "unknown" &&
+          streamResult.error.raw === ROUTED_SKILL_TRUST_REVOKED_MESSAGE
+        ) {
+          await notifyAcceptedPreStreamFailure(streamResult.error);
+          return Ok(ACCEPTED_WITHOUT_STREAM);
+        }
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
             createUnknownSendMessageError(
@@ -4164,7 +5004,7 @@ export class AgentSession {
             )
           );
         }
-        return streamResult;
+        return streamResult.success ? Ok(sendAcceptedFinal) : streamResult;
       } finally {
         // Success should advance via stream events; if startup never emitted any, don't leave the
         // session stuck in PREPARING. Guard by controller identity so an aborted startup cannot
@@ -4214,7 +5054,7 @@ export class AgentSession {
           }
           drainQueuedMessagesAfterFailedStartup();
         });
-      return Ok(undefined);
+      return Ok(sendAcceptedFinal);
     }
 
     // Non-edit sends preserve the old behavior so pre-stream startup failures still propagate to
@@ -4224,7 +5064,15 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
+    internal?: {
+      agentInitiated?: boolean;
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
+      /** Routed-turn compaction context carried across same-session retries. */
+      compactionBaseOptions?: SendMessageOptions;
+      /** Routed project-skill turn: re-verify Project Trust before dispatch. */
+      routedProjectConsent?: boolean;
+    }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
 
@@ -4241,6 +5089,40 @@ export class AgentSession {
     if (this.isBusy()) {
       return Ok({ started: false });
     }
+
+    // Routing consent is re-verified on EVERY resumed dispatch: trust can be
+    // revoked between the original acceptance and a same-session retry or a
+    // startup recovery, and this path bypasses the send gates. The Err is
+    // bounded by the retry machinery's attempt caps — and re-granting trust
+    // lets a later attempt proceed legitimately.
+    if (
+      internal?.routedProjectConsent === true &&
+      !(await this.isRoutedProjectSkillTurnStillTrusted())
+    ) {
+      return Err(await this.rejectResumedRoutedTurn());
+    }
+    // The same verdict rides to the provider-dispatch boundary (pricing,
+    // history reconstruction, request building, and stream startup below are
+    // all revocation windows). Fires on the persisted acceptance-time seed
+    // OR on the request scan — the replayed request carries the original
+    // turn's persisted snapshot rows, so history-carried and
+    // materialization-discovered project content is covered even when the
+    // pre-crash seed missed it. A refusal stamps the replayed turn's rows
+    // (rejectResumedRoutedTurn): they belong to the ORIGINAL accepted send,
+    // and nothing downstream knows their keys.
+    const isRoutedResume =
+      internal?.routedProjectConsent === true || internal?.compactionBaseOptions != null;
+    const resumedConsentRejection: RoutedConsentRejection | undefined = isRoutedResume
+      ? async (requestCarriesProjectContent?: boolean): Promise<SendMessageError | null> => {
+          if (internal?.routedProjectConsent !== true && requestCarriesProjectContent !== true) {
+            return null;
+          }
+          if (await this.isRoutedProjectSkillTurnStillTrusted()) {
+            return null;
+          }
+          return await this.rejectResumedRoutedTurn();
+        }
+      : undefined;
 
     if (this.workspaceGoalService) {
       const pricingGate = await this.workspaceGoalService.assertPricedModelForBudgetedGoal(
@@ -4269,7 +5151,9 @@ export class AgentSession {
       optionsForStream,
       internal?.agentInitiated,
       internal?.goalKind,
-      internal?.goalId
+      internal?.goalId,
+      internal?.compactionBaseOptions,
+      internal?.routedProjectConsent
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
@@ -4289,7 +5173,9 @@ export class AgentSession {
         undefined,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        internal?.compactionBaseOptions,
+        resumedConsentRejection
       );
       if (!result.success) {
         return result;
@@ -4331,6 +5217,52 @@ export class AgentSession {
 
   private getUsageState(): AutoCompactionUsageState | undefined {
     return this.lastUsageState;
+  }
+
+  /**
+   * Per-model thinking floor: the configured minThinkingLevelByModel override
+   * resolved against the model's policy. Tests may provide partial config
+   * mocks, so read overrides only when available. providersConfig lets mapped
+   * aliases (mappedToModel) resolve against the target model's policy.
+   */
+  private resolveThinkingFloorForModel(
+    modelString: string,
+    providersConfig: ProvidersConfigMap | null
+  ): ThinkingLevel {
+    const maybeConfig = this.config as Config & {
+      loadConfigOrDefault?: () => {
+        minThinkingLevelByModel?: Record<string, ThinkingLevel>;
+      } | null;
+    };
+    // Gateway-preserving key first (an explicit coder:<instance>/<model>
+    // floor stays distinct from a direct model with the same ID), with a
+    // legacy name-canonical fallback for floors persisted by older versions.
+    const minThinkingOverride =
+      typeof maybeConfig.loadConfigOrDefault === "function"
+        ? lookupMinThinkingLevelOverride(
+            maybeConfig.loadConfigOrDefault()?.minThinkingLevelByModel,
+            modelString
+          )
+        : undefined;
+    return resolveMinimumThinkingLevel(modelString, minThinkingOverride, providersConfig);
+  }
+
+  /**
+   * Apply per-model thinking floors + policy clamping — the single definition
+   * used by streamWithHistory's request build AND the accepted-send payload,
+   * so telemetry can never report a level the stream doesn't run at.
+   */
+  private enforceThinkingFloorsForModel(
+    modelString: string,
+    thinkingLevel: ThinkingLevel,
+    providersConfig: ProvidersConfigMap | null
+  ): ThinkingLevel {
+    return enforceThinkingPolicy(
+      modelString,
+      thinkingLevel,
+      this.resolveThinkingFloorForModel(modelString, providersConfig),
+      providersConfig
+    );
   }
 
   private getProvidersConfigSafe(): ProvidersConfigMap | null {
@@ -4456,7 +5388,14 @@ export class AgentSession {
       // still need to stay defensive.
       return false;
     }
+    // True only once the row is durably in history: callers gate marker
+    // cleanup (dispatchPendingFollowUp's pendingFollowUp is the ONLY other
+    // durable copy of the prompt) and goal-safety pauses on it, so a failed
+    // append must report false — logging alone would let the caller delete
+    // the prompt's last copy.
+    let persisted = false;
     try {
+      const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
       const userMessage = createMuxMessage(
         createUserMessageId(),
         "user",
@@ -4468,6 +5407,17 @@ export class AgentSession {
           // Without it a rejected queued send would pause a never-driven goal
           // on the next getGoal.
           timestamp: Date.now(),
+          // A rejected skill invocation keeps its invocation metadata: this
+          // preserved row is the ONLY transcript record of the send, and for
+          // queued skills `message` is the rewritten model-facing prompt —
+          // without rawCommand the user's typed "/skill args" and its badge
+          // are lost. Other metadata types stay off (a compaction-request
+          // stamp on a plain rejected row would confuse compaction detection).
+          ...(typedMuxMetadata?.type === "agent-skill" ? { muxMetadata: typedMuxMetadata } : {}),
+          // Atomic with the row (unlike the preference-file abandon marker
+          // below, which a crash between the two writes can lose): startup
+          // recovery must never replay a send its gate rejected.
+          preStreamRejected: true,
           ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
         },
         additionalParts.length > 0 ? additionalParts : undefined
@@ -4478,8 +5428,19 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           error: appendResult.error,
         });
-      } else if (!this.disposed) {
-        this.emitChatEvent({ ...userMessage, type: "message" });
+      } else {
+        // Durable from this point even if the marker write below throws: the
+        // row-atomic preStreamRejected stamp already gates startup recovery.
+        persisted = true;
+        // The preserved row is a REJECTED send, not an interrupted one:
+        // without a durable abandon marker, startup recovery would treat this
+        // tail user row as an interrupted request and resumeStream() it on
+        // the ambient model — bypassing the very gate (class routing,
+        // pricing, PDF) that rejected it.
+        await this.persistStartupAutoRetryAbandon("pre_stream_rejected", userMessage.id);
+        if (!this.disposed) {
+          this.emitChatEvent({ ...userMessage, type: "message" });
+        }
       }
     } catch (error) {
       log.warn("Unexpected error persisting user message after pre-stream gate rejection", {
@@ -4491,7 +5452,7 @@ export class AgentSession {
       const streamError = buildStreamErrorEventData(rejection);
       this.emitChatEvent(createStreamErrorMessage(streamError));
     }
-    return true;
+    return persisted;
   }
 
   /**
@@ -4847,7 +5808,10 @@ export class AgentSession {
 
       const autoCompactionRequest = this.buildAutoCompactionRequest({
         followUpContent,
-        baseOptions: streamContext.options,
+        // Pre-routing options when the stream was skill-routed: the compaction
+        // request must never inherit a routed small model (it has to read the
+        // full uncompacted history) — mirrors the on-send compaction site.
+        baseOptions: streamContext.compactionBaseOptions ?? streamContext.options,
         reason: "mid-stream",
       });
 
@@ -4875,7 +5839,8 @@ export class AgentSession {
           });
           await this.updateStartupAutoRetryAbandonFromFailure(
             failureType,
-            interruptedUserMessageId
+            interruptedUserMessageId,
+            this.extractRetryFailureMessage(sendResult.error)
           );
         }
 
@@ -4990,7 +5955,11 @@ export class AgentSession {
         type: failureType,
         message: this.extractRetryFailureMessage(error),
       });
-      await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+      await this.updateStartupAutoRetryAbandonFromFailure(
+        failureType,
+        failedUserMessageId,
+        this.extractRetryFailureMessage(error)
+      );
     } else {
       await this.handleStreamError(buildStreamErrorEventData(error, { acpPromptId }));
     }
@@ -5030,7 +5999,19 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    // Pre-skill-routing options for compaction requests spawned off this
+    // stream (see activeStreamContext.compactionBaseOptions). Passed
+    // explicitly like the thinking holder so retry paths stay unaffected.
+    compactionBaseOptions?: SendMessageOptions,
+    // Late consent gate for routed project-skill turns, threaded to the
+    // provider-dispatch boundary inside AIService (invoked immediately
+    // before the stream manager starts the provider operation, and again
+    // per step). Receives whether the assembled request carries historical
+    // project content. Performs rejection bookkeeping and returns the error
+    // to surface; absent on unrouted internal paths (resumeStream supplies
+    // its own for resumed routed turns).
+    routedConsentRejection?: RoutedConsentRejection
   ): Promise<AgentSessionResult<void>> {
     // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
     // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
@@ -5057,8 +6038,21 @@ export class AgentSession {
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
       providersConfig,
+      ...(compactionBaseOptions != null ? { compactionBaseOptions } : {}),
+      ...(routedConsentRejection != null ? { routedConsentRejection } : {}),
     };
     this.activeStreamUserMessageId = undefined;
+
+    // Request-time quarantine repair: a send can race the asynchronous
+    // startup recovery (getOrCreateSession exposes the session without
+    // awaiting it, and a PREPARING turn makes the recovery defer), so the
+    // rejected turn's row stamps and surviving partial must be repaired
+    // BEFORE this request commits partials or reads history: commitPartial
+    // below would otherwise promote the rejected turn's surviving in-flight
+    // assistant into an unmarked history row the repair no longer finds.
+    // Marker-gated — a no-op in the common case.
+    await this.loadAutoRetryEnabledPreference();
+    await this.repairUnstampedRejectedTurn();
 
     const commitResult = await this.historyService.commitPartial(this.workspaceId);
     if (!commitResult.success) {
@@ -5108,8 +6102,13 @@ export class AgentSession {
     }
 
     // A crash between snapshot and user-row appends can leave orphaned prompt
-    // expansions on disk; exclude them from every provider request.
-    let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
+    // expansions on disk; exclude them from every provider request. Rows
+    // preserved by pre-stream gate rejections stay visible in the transcript
+    // but never reach the provider — replaying them would duplicate the
+    // prompt after a retry (or re-fail on an incompatible PDF forever).
+    let requestMessages = this.excludeRejectedRows(
+      filterOrphanedMcpPromptSnapshots(historyResult.data)
+    );
 
     if (requestMessages.length === 0) {
       return await this.handleStreamWithHistoryFailure(
@@ -5137,7 +6136,9 @@ export class AgentSession {
       await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
       const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (refreshed.success) {
-        requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+        requestMessages = this.excludeRejectedRows(
+          filterOrphanedMcpPromptSnapshots(refreshed.data)
+        );
       }
     }
 
@@ -5163,7 +6164,7 @@ export class AgentSession {
     }
 
     // Check if post-compaction attachments should be injected.
-    const postCompactionAttachments =
+    let postCompactionAttachments =
       disablePostCompactionAttachments === true
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
@@ -5171,35 +6172,9 @@ export class AgentSession {
       return Ok(undefined);
     }
 
-    this.activeStreamHadPostCompactionInjection =
-      postCompactionAttachments !== null && postCompactionAttachments.length > 0;
-
-    // Apply per-model thinking floors once so desktop, mobile, and ACP requests match.
-    // Tests may provide partial config mocks, so read overrides only when available.
-    const maybeConfig = this.config as Config & {
-      loadConfigOrDefault?: () => {
-        minThinkingLevelByModel?: Record<string, ThinkingLevel>;
-      } | null;
-    };
-    // Gateway-preserving key first (an explicit coder:<instance>/<model>
-    // floor stays distinct from a direct model with the same ID), with a
-    // legacy name-canonical fallback for floors persisted by older versions.
-    const minThinkingOverride =
-      typeof maybeConfig.loadConfigOrDefault === "function"
-        ? lookupMinThinkingLevelOverride(
-            maybeConfig.loadConfigOrDefault()?.minThinkingLevelByModel,
-            modelString
-          )
-        : undefined;
-    // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
-    // clamp against the target model's policy — otherwise a capability level
-    // like native max would be stripped here before buildProviderOptions can
-    // resolve the alias.
-    const minThinkingLevel = resolveMinimumThinkingLevel(
-      modelString,
-      minThinkingOverride,
-      providersConfig
-    );
+    // Mid-turn thinking overrides clamp against the same floor as the
+    // send-time level (single source of truth for the floor).
+    const minThinkingLevel = this.resolveThinkingFloorForModel(modelString, providersConfig);
     const effectiveThinkingLevel = options?.thinkingLevel
       ? enforceThinkingPolicy(modelString, options.thinkingLevel, minThinkingLevel, providersConfig)
       : undefined;
@@ -5232,12 +6207,63 @@ export class AgentSession {
       normalizeDelegatedToolNames(options?.delegatedToolNames) ??
       extractAcpDelegatedTools(optionsMuxMetadata);
 
+    // Provider-boundary consent gate, deferred INTO AIService (invoked
+    // immediately before streamManager.startStream — runtime init, model
+    // creation, and request building are all revocation windows). Bound here
+    // because only this scope can scan the assembled request for
+    // project-scope snapshots persisted by EARLIER turns: an untrusted
+    // workspace's history can carry one even when the current routed
+    // invocation is global. The gate performs the rejection bookkeeping; the
+    // caller converts the Err into an accepted pre-stream failure.
+    let preDispatchConsentGate:
+      | ((context?: { midStream?: boolean }) => Promise<SendMessageError | null>)
+      | undefined;
+    if (routedConsentRejection) {
+      let requestCarriesProjectContent = requestMessages.some(
+        (msg) => msg.metadata?.agentSkillSnapshot?.scope === "project"
+      );
+      // Post-compaction loaded-skill attachments carry the same repository-
+      // controlled content by a different channel: once the original snapshot
+      // row sits behind the boundary, the history scan above no longer sees
+      // it, but the attachment still ships the project skill's body.
+      let attachmentsCarryProjectSkills = carriesProjectLoadedSkills(postCompactionAttachments);
+      if (
+        (requestCarriesProjectContent || attachmentsCarryProjectSkills) &&
+        !(await this.isRoutedProjectSkillTurnStillTrusted())
+      ) {
+        // Historical project content in an UNTRUSTED workspace: exclude it
+        // from the routed request (least privilege, mirroring the
+        // fresh-snapshot omission) instead of rejecting the turn — global
+        // and built-in skills are allowed to route in untrusted projects,
+        // and rejecting on rows the rejection cannot remove would fail every
+        // later routed send deterministically.
+        requestMessages = requestMessages.filter(
+          (msg) => msg.metadata?.agentSkillSnapshot?.scope !== "project"
+        );
+        postCompactionAttachments = excludeProjectLoadedSkills(postCompactionAttachments);
+        log.warn("Excluding historical project skill content from routed request", {
+          workspaceId: this.workspaceId,
+        });
+        requestCarriesProjectContent = false;
+        attachmentsCarryProjectSkills = false;
+      }
+      // Bound once: content kept under trust arms the gate so a revocation
+      // BETWEEN this assembly and any step's provider call still rejects.
+      const carriesForGate = requestCarriesProjectContent || attachmentsCarryProjectSkills;
+      preDispatchConsentGate = (context) =>
+        routedConsentRejection(carriesForGate, context?.midStream === true);
+    }
+
+    this.activeStreamHadPostCompactionInjection =
+      postCompactionAttachments !== null && postCompactionAttachments.length > 0;
+
     // Fatal pre-start failures (runtime readiness, strict agent resolution)
     // emit an error event for fire-and-forget senders and then return Err;
     // collect them so the Err path resolves each exactly once.
     const preStartErrors: StreamErrorPayload[] = [];
     const streamResult = await this.aiService.streamMessage({
       messages: requestMessages,
+      preDispatchConsentGate,
       workspaceId: this.workspaceId,
       modelString,
       abortSignal,
@@ -5637,7 +6663,13 @@ export class AgentSession {
         context.agentInitiated,
         undefined,
         context.goalKind,
-        context.goalId
+        context.goalId,
+        undefined,
+        // A routed turn's retry keeps its routed compaction policy AND its
+        // consent gate: the rebuilt history still carries the project-skill
+        // snapshot, and trust may have been revoked since the failed attempt.
+        context.compactionBaseOptions,
+        context.routedConsentRejection
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -5810,11 +6842,43 @@ export class AgentSession {
       this.clearQueue();
     }
 
+    // A mid-turn consent rejection (per-step gate) leaves the turn's
+    // in-flight assistant parts in partial.json — persisted by the stream
+    // error path BEFORE this handler runs. The next send would commit them
+    // as an orphaned assistant row that the user-row rejection filter cannot
+    // remove (and that can break tool/message ordering). Delete them with
+    // the rejected turn; if the delete fails, quarantine the would-be
+    // committed row id.
+    if (typeof data.error === "string" && data.error.includes(ROUTED_SKILL_TRUST_REVOKED_MESSAGE)) {
+      try {
+        const rejectedPartial = await this.historyService.readPartial(this.workspaceId);
+        const deleteResult = await this.historyService.deletePartial(this.workspaceId);
+        if (!deleteResult.success && rejectedPartial?.id != null) {
+          this.unstampedRejectedRowIds.add(rejectedPartial.id);
+          // Durable record for the repair the next request build (or
+          // startup) must finish; the in-memory quarantine alone dies with
+          // the process.
+          await this.setPendingRejectedTurnRepair({
+            ...(failedUserMessageId != null ? { userMessageId: failedUserMessageId } : {}),
+          });
+        }
+      } catch (error) {
+        log.warn("Failed to remove in-flight assistant after consent rejection", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+
     await this.handleStreamFailureForAutoRetry({
       type: failureType,
       message: data.error,
     });
-    await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    await this.updateStartupAutoRetryAbandonFromFailure(
+      failureType,
+      failedUserMessageId,
+      data.error
+    );
     this.resolveStreamErrorRecoveryDecision(data.messageId, "terminal");
 
     this.emitChatEvent(streamErrorMessage);
@@ -5974,6 +7038,13 @@ export class AgentSession {
           streamContext?.providersConfig ?? null
         ),
         providersConfig: streamContext?.providersConfig ?? null,
+        // A routed turn (compactionBaseOptions set) uses the routed-send
+        // policy mid-stream too: the ordinary threshold+buffer against the
+        // (usually smaller) routed window would immediately force the exact
+        // workspace-wide compaction the pre-send band declined to run.
+        ...(streamContext?.compactionBaseOptions != null
+          ? { forceThresholdPercentOverride: 100 - ROUTED_SEND_COMPACTION_HEADROOM_PERCENT }
+          : {}),
       });
 
       if (shouldInterruptForCompaction) {
@@ -7037,7 +8108,7 @@ export class AgentSession {
       this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
       this.setTurnPhase(TurnPhase.PREPARING);
 
-      void this.sendMessage(message, options, { ...internal, enqueuedAtMs })
+      void this.sendMessage(message, options, { ...internal, enqueuedAtMs, dequeued: true })
         .then(async (result) => {
           // Keep the dispatch marker through the dequeue-to-stream-start window. A background
           // send can resolve before startup emits stream-start, and later reports must not claim
@@ -7062,6 +8133,38 @@ export class AgentSession {
               this.setTurnPhase(TurnPhase.IDLE);
             }
             this.sendQueuedMessages();
+            return;
+          }
+          if (this.turnPhase === TurnPhase.IDLE || result.data?.acceptedWithoutStream === true) {
+            // Accepted pre-stream failure (e.g. a late consent rejection):
+            // sendMessage resolved success but the turn is already back at
+            // IDLE with no stream-start ever fired — no stream-end drain
+            // will run for the remaining entries, so continue them here.
+            // Nothing streamed, so no dispatch attribution either.
+            if (!this.messageQueue.isEmpty()) {
+              this.sendQueuedMessages();
+            }
+            return;
+          }
+          // Busy-queued SKILL sends suppressed the renderer's messageSent
+          // (routing unknown at queue time): attribute at dispatch, routed
+          // or unbound. A compaction-DEFERRED dispatch ({ queued: true })
+          // has not streamed the skill — dispatchPendingFollowUp owns its
+          // attribution, and capturing here would double-count with a false
+          // model.
+          if (
+            result.data?.queued !== true &&
+            (options?.muxMetadata as MuxMessageMetadata | undefined)?.type === "agent-skill"
+          ) {
+            const dispatchModel = result.data?.routedModel ?? options?.model;
+            if (dispatchModel != null) {
+              await this.captureBackendMessageSent({
+                model: dispatchModel,
+                agentId: options?.agentId,
+                messageLength: message.length,
+                thinkingLevel: result.data?.routedThinkingLevel ?? options?.thinkingLevel,
+              });
+            }
           }
         })
         .catch(async (error: unknown) => {
@@ -7427,6 +8530,11 @@ export class AgentSession {
       // may have been removed/hidden/disabled while compaction ran.
       strictAgentResolution: followUp.strictAgentResolution,
       skipAiSettingsPersistence: followUp.skipAiSettingsPersistence,
+      // An explicit one-shot carried through compaction keeps bypassing class routing.
+      skipSkillModelRouting: followUp.skipSkillModelRouting,
+      // A raw numeric thinking index re-resolves against the routed model if
+      // this re-dispatched send gets class-routed.
+      oneShotThinkingIndex: followUp.oneShotThinkingIndex,
     };
 
     if (effectiveFileParts && effectiveFileParts.length > 0) {
@@ -7462,8 +8570,15 @@ export class AgentSession {
     // before sendQueuedMessages() runs, preventing race conditions.
     // Mark as synthetic so recovery/background dispatches do not implicitly
     // re-enable auto-retry after a user explicitly opted out.
+    // Acceptance boundary marker for the failure branch below: once the
+    // session accepted the send, the user row is durable and emitted — any
+    // later startup failure must not re-preserve (duplicate) it.
+    let followUpAccepted = false;
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
+      onAccepted: () => {
+        followUpAccepted = true;
+      },
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
       // Keep the re-dispatched continuation row goal-scoped so a replaced
@@ -7492,7 +8607,63 @@ export class AgentSession {
         return false;
       }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
+      if (followUpAccepted) {
+        // The user row is already durable and emitted (post-acceptance
+        // startup failure): re-preserving would duplicate it. The pre-armed
+        // resume state above owns recovery; clear the marker so a later
+        // stream-end cannot dispatch the same follow-up again on top of the
+        // durable row.
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+        throw new Error(`Failed to dispatch pending follow-up: ${message}`);
+      }
+      // Only genuinely user-authored follow-ups get manual rejection
+      // recovery: heartbeat prompts and mid-stream compaction's "Continue"
+      // sentinel ride the same pendingFollowUp field, but no user typed them
+      // — persisting them as manual rows (and pausing a goal) would fabricate
+      // an intervention.
+      const userAuthoredFollowUp =
+        persistedGoalKind == null &&
+        (options.muxMetadata as MuxMessageMetadata | undefined)?.type !== "heartbeat-request" &&
+        // Persisted provenance, not content matching: a user who literally
+        // typed "Continue" must keep manual recovery, while the generated
+        // mid-stream resume sentinel carries dispatchOptions.source.
+        followUp.dispatchOptions?.source !== "internal-resume";
+      if (userAuthoredFollowUp) {
+        // The follow-up text is the USER's prompt (their composer cleared
+        // when compaction started), redispatched synthetically — so the
+        // routing/pricing rejection branches inside sendMessage skip their
+        // manual-send preservation for it, and a bare throw reaches only the
+        // logs while the summary keeps re-arming the same failing dispatch.
+        const persisted = await this.preserveRejectedManualSend(
+          finalText,
+          options,
+          sendResult.error
+        );
+        if (persisted) {
+          await this.applyManualUserMessageGoalSafety({ policy: "pause" });
+          // The preserved row is the durable copy now; only then may the
+          // summary's pending marker go. A failed preservation KEEPS the
+          // marker — it is the only durable copy of the prompt, and the next
+          // stream-end/idle pass re-attempts the dispatch.
+          await this.clearPendingFollowUpFromSummary(lastMessage);
+        }
+      } else {
+        // Synthetic content: nothing user-visible to preserve; drop the
+        // marker so the same failing dispatch cannot loop.
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+      }
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
+    }
+
+    if (sendResult.data?.acceptedWithoutStream === true) {
+      // Accepted (row durable, visible stream error emitted) but refused
+      // before any provider request: no stream will start, so no stream-end
+      // will ever follow — callers (TaskService's compaction-completion
+      // decision) must not treat this as a running continuation, and there
+      // is no dispatch to attribute. The durable row is the copy now; retire
+      // the summary's pending marker so no later pass redispatches it.
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
     }
 
     // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): if the original wrap-up dispatcher
@@ -7511,6 +8682,24 @@ export class AgentSession {
         log.warn("Failed to reserve budget wrap-up after redispatch", {
           workspaceId: this.workspaceId,
           error,
+        });
+      }
+    }
+
+    // Dispatch-time attribution for a compaction-DEFERRED skill send: the
+    // original send reported { queued: true } (the renderer's messageSent
+    // deliberately skipped), so the turn is attributed here, when it actually
+    // streams — routed or unbound. Routing is re-resolved after compaction
+    // and can disappear (class binding removed, trust revoked); the skill
+    // then streams on the ambient model and the event must still fire.
+    if ((options.muxMetadata as MuxMessageMetadata | undefined)?.type === "agent-skill") {
+      const dispatchModel = sendResult.data?.routedModel ?? options.model;
+      if (dispatchModel != null) {
+        await this.captureBackendMessageSent({
+          model: dispatchModel,
+          agentId: options.agentId,
+          messageLength: finalText.length,
+          thinkingLevel: sendResult.data?.routedThinkingLevel ?? options.thinkingLevel,
         });
       }
     }
@@ -7730,18 +8919,18 @@ export class AgentSession {
       return [];
     }
 
-    const fileDiffs = extractEditedFileDiffs(historyResult.data);
+    // Rejected turns (stamped or quarantined) never reached the provider;
+    // nothing extracted from them may re-enter it as carryover.
+    const epochMessages = this.excludeRejectedRows(historyResult.data);
+    const fileDiffs = extractEditedFileDiffs(epochMessages);
     const loadedSkills = mergeLoadedSkillSnapshots([
       ...this.postCompactionLoadedSkills,
-      ...extractLoadedSkillSnapshotsFromMessages(historyResult.data),
+      ...extractLoadedSkillSnapshotsFromMessages(epochMessages),
     ]);
     // Mirror loadedSkills: cumulative pre-boundary reads carried in memory,
     // merged with reads from the current epoch (newest-first, capped).
     const readFilePaths = includeReadFiles
-      ? mergeReadFilePaths(
-          this.postCompactionReadFilePaths,
-          extractReadFilePaths(historyResult.data)
-        )
+      ? mergeReadFilePaths(this.postCompactionReadFilePaths, extractReadFilePaths(epochMessages))
       : [];
 
     // Reports completed before the latest boundary had their tool results summarized away;
@@ -7969,18 +9158,566 @@ export class AgentSession {
     return snapshots.filter((snapshot): snapshot is MuxMessage => snapshot !== null);
   }
 
+  /**
+   * Build a reader that resolves a skill package with the same roots and
+   * precedence as skill discovery for this workspace. Shared by snapshot
+   * materialization and per-skill model routing so both resolve identically.
+   */
+  private buildSkillReader(args: {
+    metadata: WorkspaceMetadata;
+    runtime: Runtime;
+    workspacePath: string;
+    disableWorkspaceAgents: boolean | undefined;
+  }): (skillName: string) => Promise<Awaited<ReturnType<typeof readAgentSkill>>> {
+    // When workspace agents are disabled, resolve skills from the project path instead of
+    // the worktree so skill invocation uses the same precedence/discovery root as the UI.
+    const skillDiscoveryPath = args.disableWorkspaceAgents
+      ? args.metadata.projectPath
+      : args.workspacePath;
+
+    // claude-skills-compat experiment: resolve slash-invoked skills with the same
+    // roots as discovery. Guard for test mocks that may not implement the gate.
+    const includeClaudeSkills =
+      typeof this.aiService.isClaudeSkillsCompatEnabled === "function" &&
+      this.aiService.isClaudeSkillsCompatEnabled();
+    // agent-plugins experiment: same treatment for plugin-provided skills.
+    const includeAgentPlugins =
+      typeof this.aiService.isAgentPluginsEnabled === "function" &&
+      this.aiService.isAgentPluginsEnabled();
+    // Resolve project workspaces through the same storage context as the
+    // skill tools so subprojects inherit checkout-level skills and plugins
+    // across host-local and runtime-backed workspaces. disableWorkspaceAgents
+    // keeps default projectPath discovery.
+    const xumScope =
+      !args.disableWorkspaceAgents &&
+      typeof this.aiService.resolveXumToolScopeForWorkspace === "function"
+        ? this.aiService.resolveXumToolScopeForWorkspace(
+            args.metadata,
+            args.runtime,
+            args.workspacePath
+          )
+        : null;
+    const skillCtx =
+      xumScope?.type === "project"
+        ? resolveSkillStorageContext({
+            runtime: args.runtime,
+            workspacePath: skillDiscoveryPath,
+            xumScope,
+            includeClaudeSkills,
+            includeAgentPlugins,
+          })
+        : null;
+    return (skillName: string) =>
+      readAgentSkill(
+        skillCtx?.runtime ?? args.runtime,
+        skillCtx?.workspacePath ?? skillDiscoveryPath,
+        skillName,
+        {
+          ...(skillCtx != null ? { roots: skillCtx.roots, containment: skillCtx.containment } : {}),
+          includeClaudeSkills,
+          includeAgentPlugins,
+        }
+      );
+  }
+
+  /**
+   * Per-skill model routing: a slash-invoked skill bound to a model class
+   * (config `skillModelClasses` table, else skill frontmatter metadata
+   * "model-class") streams on the class's model for this send only.
+   *
+   * Explicit overrides win: sends carrying skipAiSettingsPersistence (one-shot
+   * /model commands, compaction requests) are never re-routed. Workspace AI
+   * settings are untouched: persistence happens in WorkspaceService (with the
+   * user's model) before this runs.
+   *
+   * Error posture: a *bound* skill whose routing cannot be delivered — unknown
+   * class, malformed class value, or a class model no configured route can
+   * serve — returns a config-error so the send fails with an actionable
+   * message instead of silently streaming on an unintended (often expensive)
+   * model. Unbound skills route nothing, and infrastructure failures (config
+   * or skill unreadable, providers state unavailable) still fail open: those
+   * are not user mapping mistakes, and a skill send must survive them.
+   */
+  private async resolveSkillModelClassOverride(
+    muxMetadata: MuxMessageMetadata | undefined,
+    options: SendMessageOptions
+  ): Promise<
+    | {
+        kind: "override";
+        className: string;
+        model: string;
+        thinkingLevel?: ThinkingLevel;
+        /**
+         * The scope-checked package this routing consent was granted against
+         * (present whenever the resolver read one — always in untrusted
+         * projects). Materialization reuses it so a project shadow appearing
+         * between routing and the snapshot read cannot swap repo-controlled
+         * content into a class-provider turn.
+         */
+        resolvedPackage?: ResolvedAgentSkill;
+      }
+    | { kind: "config-error"; message: string }
+    | null
+  > {
+    // Only an explicit model override suppresses routing. This must NOT key
+    // off skipAiSettingsPersistence: thinking-only one-shots (/+2 /skill) and
+    // several internal senders set that flag purely to protect persisted
+    // preferences and still want class routing to apply.
+    if (options.skipSkillModelRouting === true) {
+      return null;
+    }
+    if (muxMetadata?.type !== "agent-skill") {
+      return null;
+    }
+
+    try {
+      // Defensive config access mirroring getPreferredCompactionSettings: test
+      // harnesses may provide a partial Config.
+      const maybeConfig = this.config as Config & {
+        loadConfigOrDefault?: () => {
+          modelClasses?: Record<string, string>;
+          skillModelClasses?: Record<string, string>;
+          routePriority?: string[];
+          routeOverrides?: Record<string, string>;
+        } | null;
+      };
+      if (typeof maybeConfig.loadConfigOrDefault !== "function") {
+        return null;
+      }
+      const cfg = maybeConfig.loadConfigOrDefault();
+      const modelClasses = cfg?.modelClasses;
+      const skillModelClasses = cfg?.skillModelClasses;
+
+      const skillName = muxMetadata.skillName;
+      if (!SkillNameSchema.safeParse(skillName).success) {
+        return null;
+      }
+
+      // Fast path: with no classes configured and no table binding for this
+      // skill, routing can never apply — skip the (possibly remote) SKILL.md
+      // frontmatter read entirely. The non-empty-after-trim requirement must
+      // match resolveSkillModelClassBinding's boundViaTable exactly: a blank
+      // hand-edited table entry ({done: ""}) must not suppress the frontmatter
+      // read and then fail the table lookup, silently unrouting the skill.
+      const hasModelClasses = modelClasses != null && Object.keys(modelClasses).length > 0;
+      const tableClassRaw = skillModelClasses?.[skillName];
+      const hasTableBinding = typeof tableClassRaw === "string" && tableClassRaw.trim().length > 0;
+      if (!hasModelClasses && !hasTableBinding) {
+        return null;
+      }
+
+      // Security: repo-controlled content must not silently reroute the
+      // transcript to a different configured provider — an attacker's
+      // repository could bind its skill to a class the user pointed at any
+      // provider. Project Trust is the existing consent boundary for
+      // repo-controlled configuration, so in an UNTRUSTED project a
+      // project-scope skill gets no class routing at all: neither its own
+      // frontmatter nor a name-keyed skillModelClasses entry — the table
+      // consent belongs to the (global/built-in) skill the user knew by that
+      // name, and project skills win name collisions, so a repo shadow would
+      // otherwise inherit it. Global/built-in skills are user-authored and
+      // route normally. Fail closed when trust cannot be determined.
+      if (typeof this.aiService.getWorkspaceMetadata !== "function") {
+        return null;
+      }
+      const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (!metadataResult.success) {
+        return null;
+      }
+      const projectTrusted = (() => {
+        try {
+          // Scratch workspaces are app-trusted for capability purposes
+          // (isWorkspaceProjectTrusted returns true by design), but their
+          // workdirs routinely hold CLONED third-party repositories whose
+          // .xum/skills ARE discovered — for provider-selection consent a
+          // scratch checkout is exactly the untrusted-repository case, so
+          // scratch project skills never route. Global/built-in skills still
+          // route normally there.
+          if (metadataResult.data.kind === "scratch") {
+            return false;
+          }
+          return isWorkspaceProjectTrusted(this.config, metadataResult.data);
+        } catch {
+          return false;
+        }
+      })();
+
+      // Package resolution (a possibly remote SKILL.md read) is ALWAYS
+      // performed: the resolved package is the consent anchor. Its
+      // AUTHORITATIVE scope gates the trust decision here AND the mid-send
+      // revocation rechecks (client-supplied invocation scope must never
+      // gate a security decision), and materialization reuses the exact
+      // package via preResolvedSkills so no shadow can swap content in
+      // between. A trusted table binding previously skipped this read, which
+      // left the routed invocation unidentifiable at recheck time.
+      const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadataResult.data);
+      const resolved = await this.buildSkillReader({
+        metadata: metadataResult.data,
+        runtime,
+        workspacePath,
+        disableWorkspaceAgents: options.disableWorkspaceAgents,
+      })(skillName);
+      if (resolved.package.scope === "project" && !projectTrusted) {
+        return null;
+      }
+      const consentCheckedPackage = resolved;
+      // Table bindings take precedence; frontmatter feeds the binding
+      // resolver only when no table entry names this skill.
+      const frontmatterMetadata = hasTableBinding
+        ? undefined
+        : resolved.package.frontmatter.metadata;
+
+      const providersConfig = this.getProvidersConfigSafe();
+      const binding = resolveSkillModelClassBinding({
+        skillName,
+        frontmatterMetadata,
+        modelClasses,
+        skillModelClasses,
+        providersConfig,
+      });
+
+      switch (binding.status) {
+        case "unbound":
+          return null;
+        case "unknown-class":
+          return {
+            kind: "config-error",
+            message: describeSkillModelClassRoutingProblem({
+              kind: "unknown-class",
+              skillName,
+              className: binding.className,
+            }),
+          };
+        case "invalid-value":
+          return {
+            kind: "config-error",
+            message: describeSkillModelClassRoutingProblem({
+              kind: "invalid-value",
+              skillName,
+              className: binding.className,
+              value: binding.value,
+            }),
+          };
+        case "resolved": {
+          // Availability is a routing-state question (gateways count: a model
+          // can be servable via OpenRouter without a direct provider key).
+          // Null providersConfig means "cannot determine", never "unavailable".
+          if (
+            providersConfig != null &&
+            !isModelServableWithProvidersConfig({
+              canonicalModel: binding.model,
+              routePriority: cfg?.routePriority,
+              routeOverrides: cfg?.routeOverrides,
+              providersConfig,
+            })
+          ) {
+            return {
+              kind: "config-error",
+              message: describeSkillModelClassRoutingProblem({
+                kind: "model-unavailable",
+                skillName,
+                className: binding.className,
+                model: binding.model,
+              }),
+            };
+          }
+
+          log.debug(
+            `skill model routing: /${skillName} → class "${binding.className}" → ${binding.model}` +
+              (binding.thinkingLevel != null ? `+${binding.thinkingLevel}` : "")
+          );
+          return {
+            kind: "override",
+            className: binding.className,
+            model: binding.model,
+            ...(binding.thinkingLevel != null ? { thinkingLevel: binding.thinkingLevel } : {}),
+            resolvedPackage: consentCheckedPackage,
+          };
+        }
+      }
+    } catch (error) {
+      log.debug(`skill model routing: fail-open for skill send: ${getErrorMessage(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Fresh provider-selection consent verdict for a routed project-skill
+   * turn. Read IMMEDIATELY before each irreversible step (edit truncation,
+   * snapshot materialization, snapshot persistence): consent granted at the
+   * routing gate can be revoked mid-send. Fails closed — an unreadable
+   * verdict must not ship repo-controlled content to the class provider.
+   * Same scratch rule as resolveSkillModelClassOverride: scratch workdirs
+   * hold cloned third-party repositories and never carry this consent.
+   */
+  private async isRoutedProjectSkillTurnStillTrusted(): Promise<boolean> {
+    try {
+      if (typeof this.aiService.getWorkspaceMetadata !== "function") {
+        return false;
+      }
+      const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (!metadataResult.success) {
+        return false;
+      }
+      if (metadataResult.data.kind === "scratch") {
+        return false;
+      }
+      return isWorkspaceProjectTrusted(this.config, metadataResult.data);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Backend message_sent attribution for dispatches whose renderer telemetry
+   * was deliberately suppressed (busy-queued and compaction-deferred skill
+   * sends report { queued: true } before routing is known). Telemetry must
+   * never fail the dispatch.
+   */
+  private async captureBackendMessageSent(args: {
+    model: string;
+    agentId?: string;
+    messageLength: number;
+    thinkingLevel?: ThinkingLevel;
+  }): Promise<void> {
+    if (this.telemetryService == null) {
+      return;
+    }
+    try {
+      const metadataResult =
+        typeof this.aiService.getWorkspaceMetadata === "function"
+          ? await this.aiService.getWorkspaceMetadata(this.workspaceId)
+          : null;
+      const runtimeType =
+        metadataResult?.success === true && metadataResult.data.runtimeConfig?.type != null
+          ? metadataResult.data.runtimeConfig.type
+          : "local";
+      this.telemetryService.capture({
+        event: "message_sent",
+        properties: {
+          workspaceId: this.workspaceId,
+          model: args.model,
+          agentId: args.agentId,
+          message_length_b2: roundToBase2(args.messageLength),
+          runtimeType,
+          // Backend-originated event: there is no renderer to describe.
+          frontendPlatform: { userAgent: "backend", platform: process.platform },
+          thinkingLevel: args.thinkingLevel ?? "off",
+        },
+      });
+    } catch (error) {
+      log.debug("Failed to capture backend message_sent telemetry", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Rows quarantined after a failed durable rejection stamp: side-channel
+   * model calls (refine) exclude them like request assembly does.
+   */
+  getQuarantinedRejectedRowIds(): ReadonlySet<string> {
+    return this.unstampedRejectedRowIds;
+  }
+
+  /**
+   * Rows a provider request must never carry: durably stamped pre-stream
+   * rejections plus the in-memory quarantine of rows whose stamp failed.
+   */
+  private excludeRejectedRows(messages: MuxMessage[]): MuxMessage[] {
+    return filterPreStreamRejectedRows(messages).filter(
+      (msg) => !this.unstampedRejectedRowIds.has(msg.id)
+    );
+  }
+
+  /**
+   * Self-healing for a late-gate rejection whose durable row stamp FAILED
+   * (transient rewrite error; the in-memory quarantine died with the
+   * process): the abandon marker still names the rejected user row —
+   * re-attempt the stamp for the row AND its turn's snapshot rows (skill,
+   * MCP prompt, @file — persisted immediately before the user row) so the
+   * whole rejected turn goes provider-ineligible together. Runs regardless
+   * of the auto-retry preference: the hazard is the next MANUAL send.
+   *
+   * Gated on the abandon marker OR the durable repair record, and idempotent.
+   * Runs at startup recovery, at manual-send acceptance (BEFORE the accepted
+   * send clears the marker) and at the top of every request build (BEFORE
+   * partials are committed), so a send racing the recovery cannot slip the
+   * unstamped rows past it. Returns whether the repair is durably complete;
+   * anything short of that leaves (or records) the repair key on disk, since
+   * the in-memory quarantine protecting the current request dies with the
+   * process.
+   */
+  private async repairUnstampedRejectedTurn(): Promise<boolean> {
+    const abandon = this.startupAutoRetryAbandon;
+    const pending = this.pendingRejectedTurnRepair;
+    const abandonRejected = abandon?.reason === "pre_stream_rejected";
+    if (!abandonRejected && pending === null) {
+      return true;
+    }
+    const userMessageId =
+      (abandonRejected ? abandon.userMessageId : undefined) ?? pending?.userMessageId;
+    let durable = true;
+    try {
+      // The rejected turn's in-flight assistant may still sit in
+      // partial.json: its delete can fail at rejection time, and the
+      // in-memory quarantine died with the process. A marker still present
+      // at startup means no send succeeded since the rejection (any accepted
+      // manual send clears it), so a surviving partial belongs to the
+      // rejected turn — remove it before any request-build path commits it
+      // as an unmarked assistant row. Runs even when the row stamp itself
+      // succeeded (the two failures are independent).
+      const rejectedPartial = await this.historyService.readPartial(this.workspaceId);
+      if (rejectedPartial != null) {
+        const deletePartialResult = await this.historyService.deletePartial(this.workspaceId);
+        if (!deletePartialResult.success) {
+          this.unstampedRejectedRowIds.add(rejectedPartial.id);
+          durable = false;
+        }
+      }
+      if (userMessageId != null) {
+        // Full active epoch, not a bounded tail: a turn's synthetic snapshot
+        // prefix (one row per distinct skill/MCP/@file ref) has no count
+        // limit, and a truncated read would stamp only the newest subset.
+        const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+          this.workspaceId
+        );
+        if (!historyResult.success) {
+          durable = false;
+        } else {
+          const rows = historyResult.data;
+          const userIdx = rows.findIndex((msg) => msg.id === userMessageId);
+          // A row that is gone (truncated by an edit) or already stamped needs
+          // nothing more.
+          if (userIdx !== -1 && rows[userIdx].metadata?.preStreamRejected !== true) {
+            const restampIds = [rows[userIdx].id];
+            // Snapshot rows persist immediately before their user row; walk
+            // the contiguous synthetic snapshot prefix.
+            for (let i = userIdx - 1; i >= 0; i--) {
+              const metadata = rows[i].metadata;
+              if (
+                metadata?.synthetic === true &&
+                (metadata.agentSkillSnapshot != null ||
+                  metadata.mcpPromptSnapshot != null ||
+                  metadata.fileAtMentionSnapshot != null)
+              ) {
+                restampIds.push(rows[i].id);
+                continue;
+              }
+              break;
+            }
+            const restamp = await this.historyService.markMessagesPreStreamRejected(
+              this.workspaceId,
+              restampIds
+            );
+            if (!restamp.success) {
+              for (const id of restampIds) {
+                this.unstampedRejectedRowIds.add(id);
+              }
+              durable = false;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      durable = false;
+      log.warn("Failed to repair unstamped rejected turn", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    await this.setPendingRejectedTurnRepair(
+      durable ? null : { ...(userMessageId != null ? { userMessageId } : {}) }
+    );
+    return durable;
+  }
+
+  /**
+   * Refused-turn rows a rollback could not verifiably delete: stamp them
+   * provider-ineligible, fall back to the in-memory quarantine plus the
+   * durable repair record when even the stamp fails, and key the abandon
+   * marker to the first row so startup recovery abandons instead of replaying
+   * it.
+   */
+  private async quarantineUnremovedRefusedRows(rowIds: string[]): Promise<void> {
+    if (rowIds.length === 0) {
+      return;
+    }
+    const stamp = await this.historyService.markMessagesPreStreamRejected(this.workspaceId, rowIds);
+    if (!stamp.success) {
+      for (const id of rowIds) {
+        this.unstampedRejectedRowIds.add(id);
+      }
+      log.warn("Failed to stamp refused rows left behind by a rollback failure; quarantined", {
+        workspaceId: this.workspaceId,
+        error: stamp.error,
+      });
+      await this.setPendingRejectedTurnRepair({ userMessageId: rowIds[0] });
+    }
+    await this.persistStartupAutoRetryAbandon("pre_stream_rejected", rowIds[0]);
+  }
+
+  /**
+   * A resumed routed turn refused by the consent gate. Unlike a fresh send,
+   * the refused rows are the ORIGINAL accepted turn's (its user row plus the
+   * snapshot prefix the retry replays), and the resume path holds none of
+   * their keys — so recover the key the way startup recovery does (the
+   * newest retry-eligible user row), persist the abandon marker WITH it, and
+   * run the marker-gated repair, which stamps the whole turn and removes a
+   * surviving partial. A failed stamp still leaves startup recovery a key to
+   * retry with. Returns the visible error for the caller to surface.
+   */
+  private async rejectResumedRoutedTurn(): Promise<SendMessageError> {
+    const trustError = createUnknownSendMessageError(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+    try {
+      const historyResult = await this.historyService.getLastMessages(this.workspaceId, 20);
+      const resumedUserMessage = historyResult.success
+        ? [...historyResult.data]
+            .reverse()
+            .find((message) => this.shouldUseUserMessageForRetry(message))
+        : undefined;
+      await this.persistStartupAutoRetryAbandon("pre_stream_rejected", resumedUserMessage?.id);
+      await this.repairUnstampedRejectedTurn();
+    } catch (error) {
+      log.warn("Failed to stamp a consent-refused resumed turn", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return trustError;
+  }
+
   private async materializeAgentSkillSnapshots(
     muxMetadata: MuxMessageMetadata | undefined,
-    disableWorkspaceAgents: boolean | undefined
-  ): Promise<MuxMessage[]> {
+    disableWorkspaceAgents: boolean | undefined,
+    // Routing consent binds to a specific resolved package: reuse it here so
+    // a project shadow appearing between routing and this snapshot read
+    // cannot swap repo-controlled content into a class-provider turn.
+    preResolvedSkills?: Map<string, ResolvedAgentSkill>,
+    // True when this turn streams on a routed class model: EVERY
+    // repository-controlled snapshot in it needs the provider-selection
+    // consent gate, not just the slash-invoked package (an inline
+    // $project-skill ref would otherwise ride the routed request).
+    routedTurn?: boolean,
+    // Edit turns materialize BEFORE truncation: recent-snapshot dedupe would
+    // compare against rows the truncation is about to delete and wrongly
+    // suppress a snapshot the rewritten history needs.
+    skipRecentSnapshotDedupe?: boolean
+    // carriesProjectSkillContent: whether any project-scope skill content
+    // (fresh or deduped-into-history) rides this routed turn — the later
+    // consent gates must fire even when the routed invocation itself is
+    // global/built-in but an inline $project-skill ref travels with it.
+  ): Promise<{ messages: MuxMessage[]; carriesProjectSkillContent: boolean }> {
+    const none = { messages: [], carriesProjectSkillContent: false };
     const refs = extractAgentSkillRefs(muxMetadata);
     if (refs.length === 0) {
-      return [];
+      return none;
     }
 
     // Guard for test mocks that may not implement getWorkspaceMetadata.
     if (typeof this.aiService.getWorkspaceMetadata !== "function") {
-      return [];
+      return none;
     }
 
     const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
@@ -7989,21 +9726,21 @@ export class AgentSession {
       if (hasSlash) {
         throw new Error("Cannot materialize agent skill: workspace metadata not found");
       }
-      return [];
+      return none;
     }
 
     const metadata = metadataResult.data;
     const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
-
-    // When workspace agents are disabled, resolve skills from the project path instead of
-    // the worktree so skill invocation uses the same precedence/discovery root as the UI.
-    const skillDiscoveryPath = disableWorkspaceAgents ? metadata.projectPath : workspacePath;
+    const trustedForRoutedSnapshots =
+      routedTurn === true ? await this.isRoutedProjectSkillTurnStillTrusted() : true;
 
     // Dedupe per skill against recent persisted snapshots. A wider window keeps multi-skill
     // turns from reloading snapshots that were persisted together on the previous turn.
     const recentSnapshots: Array<{ skillName: string; sha256: string }> = [];
-    const historyResult = await this.historyService.getLastMessages(this.workspaceId, 10);
-    if (historyResult.success) {
+    const historyResult = skipRecentSnapshotDedupe
+      ? null
+      : await this.historyService.getLastMessages(this.workspaceId, 10);
+    if (historyResult?.success) {
       for (const msg of historyResult.data) {
         const metadata = msg.metadata;
         if (metadata?.synthetic && metadata.agentSkillSnapshot) {
@@ -8016,6 +9753,14 @@ export class AgentSession {
     }
 
     const snapshotMessages: MuxMessage[] = [];
+    // Tracked for the post-loop trust revalidation below. Every resolved
+    // project-scope ref counts (slash or inline), recorded BEFORE dedupe: a
+    // deduped snapshot still means repo-controlled content rides the routed
+    // request via history.
+    const projectScopeSnapshotIds = new Set<string>();
+    let projectScopeRefSeen = false;
+    let routedSlashProjectSkillSeen = false;
+    let dedupedProjectScopeRefSeen = false;
     for (const ref of refs) {
       const parsedName = SkillNameSchema.safeParse(ref.skillName);
       if (!parsedName.success) {
@@ -8026,55 +9771,57 @@ export class AgentSession {
       }
 
       let resolved: Awaited<ReturnType<typeof readAgentSkill>>;
-      try {
-        // claude-skills-compat experiment: resolve slash-invoked skills with the same
-        // roots as discovery. Guard for test mocks that may not implement the gate.
-        const includeClaudeSkills =
-          typeof this.aiService.isClaudeSkillsCompatEnabled === "function" &&
-          this.aiService.isClaudeSkillsCompatEnabled();
-        // agent-plugins experiment: same treatment for plugin-provided skills.
-        const includeAgentPlugins =
-          typeof this.aiService.isAgentPluginsEnabled === "function" &&
-          this.aiService.isAgentPluginsEnabled();
-        // Resolve project workspaces through the same storage context as the
-        // skill tools so subprojects inherit checkout-level skills and plugins
-        // across host-local and runtime-backed workspaces. disableWorkspaceAgents
-        // keeps default projectPath discovery.
-        const xumScope =
-          !disableWorkspaceAgents &&
-          typeof this.aiService.resolveXumToolScopeForWorkspace === "function"
-            ? this.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath)
-            : null;
-        const skillCtx =
-          xumScope?.type === "project"
-            ? resolveSkillStorageContext({
-                runtime,
-                workspacePath: skillDiscoveryPath,
-                xumScope,
-                includeClaudeSkills,
-                includeAgentPlugins,
-              })
-            : null;
-        resolved = await readAgentSkill(
-          skillCtx?.runtime ?? runtime,
-          skillCtx?.workspacePath ?? skillDiscoveryPath,
-          parsedName.data,
-          {
-            ...(skillCtx != null
-              ? { roots: skillCtx.roots, containment: skillCtx.containment }
-              : {}),
-            includeClaudeSkills,
-            includeAgentPlugins,
+      const preResolved = preResolvedSkills?.get(parsedName.data);
+      if (preResolved != null) {
+        resolved = preResolved;
+      } else {
+        try {
+          resolved = await this.buildSkillReader({
+            metadata,
+            runtime,
+            workspacePath,
+            disableWorkspaceAgents,
+          })(parsedName.data);
+        } catch (error) {
+          if (ref.source === "slash") {
+            throw error;
           }
-        );
-      } catch (error) {
-        if (ref.source === "slash") {
-          throw error;
+          continue;
         }
-        continue;
       }
 
       const skill = resolved.package;
+
+      if (routedTurn === true && skill.scope === "project") {
+        projectScopeRefSeen = true;
+        if (ref.source === "slash") {
+          routedSlashProjectSkillSeen = true;
+        }
+      }
+
+      // Routed turns stream to the class provider: an untrusted project
+      // skill's snapshot must not ride along.
+      if (!trustedForRoutedSnapshots && skill.scope === "project") {
+        if (ref.source === "slash") {
+          // The slash ref IS the routed invocation (identified by source,
+          // not by preResolved presence — a trusted table binding resolves
+          // its package right here): revocation between the routing gate and
+          // materialization means the class route itself is no longer
+          // authorized, and the route stays on the turn regardless of
+          // snapshot omission. Reject before any row persists; a re-send
+          // resolves routing against the revoked trust and proceeds
+          // unrouted.
+          throw new Error(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+        }
+        // Inline refs are subject to the same rule — the snapshot is omitted
+        // rather than failing the turn (least privilege, and the invoked
+        // skill's own content still dispatches).
+        log.warn("Omitting untrusted project skill snapshot from routed turn", {
+          workspaceId: this.workspaceId,
+          skillName: skill.directoryName,
+        });
+        continue;
+      }
 
       // Slash invocations can carry trailing argument text (e.g. "/fix-issue 123 high").
       // Substitute $ARGUMENTS/$1..$9 placeholders in the snapshot body so the model sees
@@ -8126,6 +9873,12 @@ export class AgentSession {
           (recent) => recent.skillName === skill.frontmatter.name && recent.sha256 === sha256
         )
       ) {
+        if (routedTurn === true && skill.scope === "project") {
+          // The recent snapshot this dedupes against rides the routed
+          // request via history — omission cannot exclude it, so the
+          // post-loop revalidation must treat it like the invocation.
+          dedupedProjectScopeRefSeen = true;
+        }
         continue;
       }
 
@@ -8143,13 +9896,39 @@ export class AgentSession {
           },
         })
       );
+      if (skill.scope === "project") {
+        projectScopeSnapshotIds.add(snapshotId);
+      }
 
       // Defense-in-depth: avoid double-loading this skill within the same turn even if
       // future metadata shapes bypass extractAgentSkillRefs dedupe.
       recentSnapshots.push({ skillName: skill.frontmatter.name, sha256 });
     }
 
-    return snapshotMessages;
+    // The loop above awaits (remote SKILL.md reads, dynamic context
+    // injection): trust can be revoked WHILE those ran, after the pre-loop
+    // verdict was taken. Revalidate after the last await, immediately before
+    // these snapshots are returned for persistence. The routed invocation —
+    // and any deduped project snapshot, which already rides history and
+    // cannot be omitted — rejects the turn; fresh incidental inline
+    // snapshots are dropped.
+    if (routedTurn === true && projectScopeRefSeen) {
+      const stillTrusted = await this.isRoutedProjectSkillTurnStillTrusted();
+      if (!stillTrusted) {
+        if (routedSlashProjectSkillSeen || dedupedProjectScopeRefSeen) {
+          throw new Error(ROUTED_SKILL_TRUST_REVOKED_MESSAGE);
+        }
+        log.warn("Dropping project skill snapshots after mid-materialization trust revocation", {
+          workspaceId: this.workspaceId,
+        });
+        return {
+          messages: snapshotMessages.filter((msg) => !projectScopeSnapshotIds.has(msg.id)),
+          carriesProjectSkillContent: false,
+        };
+      }
+    }
+
+    return { messages: snapshotMessages, carriesProjectSkillContent: projectScopeRefSeen };
   }
 
   /**

@@ -898,6 +898,12 @@ export class AIService extends EventEmitter {
         return buildOutcome.result;
       }
 
+      // Routed project-skill turns: the consent gate rides
+      // turnExecutionOptions into StreamManager.startStream, which invokes
+      // it inside its critical section (mutex held, safety and temp-dir
+      // setup done) immediately before the provider stream is constructed —
+      // checking here would leave that section as a revocation window. Its
+      // rejection surfaces below as a failed stream start.
       const startStreamStartedAt = Date.now();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);

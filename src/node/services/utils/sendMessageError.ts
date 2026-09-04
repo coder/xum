@@ -28,6 +28,19 @@ export const stripNoisyErrorPrefix = (message: string): string => {
  * Helper to wrap arbitrary errors into SendMessageError structures.
  * Enforces that the raw string is non-empty for defensive debugging.
  */
+/**
+ * Rejection surfaced when Project Trust is revoked between the routing
+ * gate's consent check and one of the turn's irreversible steps (edit
+ * truncation, snapshot persistence, provider dispatch). Lives here — not in
+ * agentSession — so StreamManager's per-step consent gate can reference it
+ * without an import cycle. Shared by every recheck site so the user sees one
+ * consistent, actionable message.
+ */
+export const ROUTED_SKILL_TRUST_REVOKED_MESSAGE =
+  "Project trust was revoked while this send was being prepared; the skill " +
+  "was not dispatched to its routed model. Re-send to run it on the current " +
+  "model without routing.";
+
 export const createUnknownSendMessageError = (raw: string): SendMessageError => {
   assert(typeof raw === "string", "Expected raw error to be a string");
   const trimmed = stripNoisyErrorPrefix(raw.trim());

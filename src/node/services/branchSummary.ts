@@ -20,7 +20,11 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  filterPreStreamRejectedRows,
+  createMuxMessage,
+  type MuxMessage,
+} from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -147,7 +151,13 @@ function formatMessageForBranchTranscript(message: MuxMessage): string {
  */
 export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
   assert(Array.isArray(messages), "buildAbandonedBranchTranscript requires a message array");
-  const formatted = messages.map(formatMessageForBranchTranscript).filter((s) => s.length > 0);
+  // Same exclusion as main request assembly: rows preserved by pre-stream
+  // gate rejections are transcript-only — every model call (refine, RLM
+  // branch summaries) must skip them or the rejected prompt gets distilled
+  // into durable context anyway.
+  const formatted = filterPreStreamRejectedRows(messages)
+    .map(formatMessageForBranchTranscript)
+    .filter((s) => s.length > 0);
 
   let totalChars = formatted.reduce((sum, s) => sum + s.length, 0);
   let drop = 0;

@@ -130,6 +130,12 @@ interface RefineServiceOptions {
   /** Live-session emission hook so the appended summary row renders immediately. */
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
   /**
+   * Session-local quarantine of rejected rows whose durable preStreamRejected
+   * stamp failed: refine's side-channel model call must exclude them exactly
+   * like provider request assembly does.
+   */
+  getQuarantinedRowIds?: (workspaceId: string) => ReadonlySet<string>;
+  /**
    * Serialize refine row publication (and apply mutations) with the
    * workspace's turn lifecycle (r40): returns a disposable holding the
    * session's turn-admission block, or Err when a turn is already
@@ -935,7 +941,10 @@ export class RefineService {
     if (!messagesResult.success) {
       return Err(`could not read workspace history: ${messagesResult.error}`);
     }
-    const activeSegment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
+    const quarantinedRowIds = this.options.getQuarantinedRowIds?.(workspaceId);
+    const activeSegment = sliceMessagesForProviderFromLatestContextBoundary(
+      messagesResult.data
+    ).filter((msg) => !quarantinedRowIds?.has(msg.id));
     // r47: fingerprint the snapshot rows for the pre-publication recheck.
     // Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes
     // a streaming assistant row through updateHistory() PRESERVING its ID
@@ -1172,7 +1181,12 @@ export class RefineService {
       const recheckBoundaryIndex = findLatestContextBoundaryIndex(recheckResult.data);
       const recheckBoundaryId =
         recheckBoundaryIndex >= 0 ? recheckResult.data[recheckBoundaryIndex].id : null;
-      const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data);
+      const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(
+        recheckResult.data
+        // Same quarantine filter as the segment above: an unfiltered recheck
+        // mismatches at the quarantined row and deterministically refuses to
+        // publish after the model call was already spent.
+      ).filter((msg) => !quarantinedRowIds?.has(msg.id));
       const snapshotIsUnchangedPrefix =
         activeSegment.length <= recheckSegment.length &&
         snapshotRowFingerprints.every(

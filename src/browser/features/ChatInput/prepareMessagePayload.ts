@@ -13,7 +13,7 @@ import {
 } from "@/common/types/message";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { appendStagedAttachmentNotice } from "./stagedAttachments";
-import { hasProjectScopedSkillRef } from "./utils";
+import { hasProjectScopedSkillRef, type SkillInvocation } from "./utils";
 import type { GoalInterventionPolicy, QueueDispatchMode } from "./types";
 
 type ModelOneShot = Extract<NonNullable<ParsedCommand>, { type: "model-oneshot" }>;
@@ -34,6 +34,15 @@ interface PrepareMessagePayloadInput {
   compactionMessageText?: string;
   appendStagedNotice?: boolean;
   modelOneShot?: ModelOneShot | null;
+  /**
+   * One-shot override composed with a skill invocation ("/haiku+0 /done").
+   * It rides the invocation rather than parsing as a bare model-oneshot, so
+   * only option building consumes it — the transcript prefix metadata is the
+   * skill path's job (composedPrefixMatch in the caller).
+   */
+  skillOneShot?: SkillInvocation["oneShot"] | null;
+  /** True for slash skill invocations (routable unless a model override rides along). */
+  hasSkillInvocation?: boolean;
   policyModel: string;
   transferredDraftProjectDiscovery: boolean;
   additionalSystemContextHydrated: boolean;
@@ -86,8 +95,12 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
   const additionalSystemInstructions =
     compactionOptions.additionalSystemInstructions ??
     input.sendMessageOptions.additionalSystemInstructions;
+  // Model/thinking override from either a bare one-shot ("/haiku+0 msg") or
+  // one composed with a skill invocation ("/haiku+0 /done args").
+  const oneShotOverride = input.modelOneShot ?? input.skillOneShot ?? null;
+  const oneShotModelOverride = oneShotOverride?.modelString;
   const effectiveModel =
-    input.modelOneShot?.modelString ?? compactionOptions.model ?? input.sendMessageOptions.model;
+    oneShotModelOverride ?? compactionOptions.model ?? input.sendMessageOptions.model;
   const trimmedMessageText = input.messageText.trim();
   const commandPrefix = input.modelOneShot
     ? trimmedMessageText
@@ -103,7 +116,7 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
     ...(rawCommand ? { rawCommand, commandPrefix } : {}),
   };
 
-  const rawThinkingOverride = input.modelOneShot?.thinkingLevel;
+  const rawThinkingOverride = oneShotOverride?.thinkingLevel;
   const thinkingOverride =
     rawThinkingOverride != null
       ? resolveThinkingInput(rawThinkingOverride, input.policyModel)
@@ -119,9 +132,21 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ...(input.transferredDraftProjectDiscovery && hasProjectScopedSkillRef(input.agentSkillRefs)
         ? { disableWorkspaceAgents: true }
         : {}),
-      ...(input.modelOneShot?.modelString ? { model: input.modelOneShot.modelString } : {}),
+      ...(oneShotModelOverride ? { model: oneShotModelOverride } : {}),
       ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
-      ...(input.modelOneShot ? { skipAiSettingsPersistence: true } : {}),
+      ...(oneShotOverride ? { skipAiSettingsPersistence: true } : {}),
+      // Only a model-carrying one-shot bypasses class routing; a thinking-only
+      // override (/+2 /skill) layers on top of routing.
+      ...(oneShotModelOverride ? { skipSkillModelRouting: true } : {}),
+      // Numeric thinking is model-relative and thinkingOverride above was
+      // resolved against the workspace model. A routable skill send may stream
+      // on a different (class) model, so pass the raw index for the backend to
+      // re-resolve against whatever model actually streams.
+      ...(input.hasSkillInvocation === true &&
+      !oneShotModelOverride &&
+      typeof rawThinkingOverride === "number"
+        ? { oneShotThinkingIndex: rawThinkingOverride }
+        : {}),
       ...(input.goalInterventionPolicy
         ? { goalInterventionPolicy: input.goalInterventionPolicy }
         : {}),

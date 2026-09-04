@@ -15,6 +15,9 @@ import {
   type CompactionSuggestion,
 } from "@/browser/utils/compaction/suggestion";
 import { executeCompaction } from "@/browser/utils/chatCommands";
+import { extractStagedAttachmentNotices } from "@/browser/features/ChatInput/stagedAttachments";
+import { parseCommand } from "@/browser/utils/slashCommands/parser";
+import { resolveThinkingInput } from "@/common/utils/thinking/policy";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
 import type { FilePart, ProvidersConfigMap } from "@/common/orpc/types";
@@ -22,6 +25,7 @@ import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   buildAgentSkillMetadata,
   buildMcpPromptUserText,
+  buildSkillInvocationUserText,
   withAgentSkillRefs,
   withMcpPromptRefs,
   type CompactionFollowUpInput,
@@ -56,20 +60,64 @@ function findTriggerUserMessage(
  * Preserves skill metadata if the original message was a skill invocation.
  */
 export function buildFollowUpFromSource(
-  source: Extract<DisplayedMessage, { type: "user" }>
+  source: Extract<DisplayedMessage, { type: "user" }>,
+  // Null ctx degrades gracefully: numeric one-shot thinking rides along as an
+  // index for the backend to resolve instead of resolving here.
+  ctx: { providersConfig: ProvidersConfigMap | null; currentModel: string | null } = {
+    providersConfig: null,
+    currentModel: null,
+  }
 ): CompactionFollowUpInput {
   const slashMcpPromptRef = source.mcpPromptRefs?.find((ref) => ref.source === "slash");
+  // A composed one-shot skill send ("/haiku+0 /done args") stores the full
+  // typed text as content; re-parse it so the rebuilt follow-up keeps the
+  // explicit model AND thinking overrides instead of falling back to class
+  // routing / ambient workspace thinking.
+  // trimStart matches parseCommand's own tolerance for leading whitespace —
+  // a column-zero guard would silently drop the preserved one-shot.
+  const parsedOneShot =
+    source.agentSkill && source.content.trimStart().startsWith("/")
+      ? parseCommand(source.content)
+      : null;
+  const oneShot = parsedOneShot?.type === "model-oneshot" ? parsedOneShot : null;
+  const oneShotModel = oneShot?.modelString;
+  const rawThinking = oneShot?.thinkingLevel;
+
+  // Numeric thinking is model-relative. With an explicit model it resolves
+  // right here; without one the send may get class-routed, so the raw index
+  // rides along for the backend to resolve against whatever model streams
+  // (the resolved fallback below applies only if routing doesn't happen).
+  let thinkingLevel: CompactionFollowUpInput["thinkingLevel"];
+  let oneShotThinkingIndex: number | undefined;
+  if (rawThinking != null) {
+    if (typeof rawThinking !== "number") {
+      thinkingLevel = rawThinking;
+    } else if (oneShotModel != null) {
+      thinkingLevel = resolveThinkingInput(rawThinking, oneShotModel, ctx.providersConfig);
+    } else {
+      oneShotThinkingIndex = rawThinking;
+      thinkingLevel = ctx.currentModel
+        ? resolveThinkingInput(rawThinking, ctx.currentModel, ctx.providersConfig)
+        : undefined;
+    }
+  }
+  const carriesOneShot = oneShotModel != null || rawThinking != null;
+
   const skillMetadata =
     source.agentSkill && source.agentSkill.skillName !== slashMcpPromptRef?.commandKey
       ? buildAgentSkillMetadata({
           rawCommand: source.content,
+          // Preserve the displayed prefix (composed one-shots render
+          // "/haiku+0 /done") — without it the rebuilt transcript loses the
+          // command badge, which keys its highlighting on this value.
+          commandPrefix: source.commandPrefix,
           skillName: source.agentSkill.skillName,
           scope: source.agentSkill.scope,
           arguments: source.agentSkill.arguments,
         })
       : undefined;
 
-  // MCP slash messages display raw commands but send transformed text. Rebuild
+  // Slash messages display raw commands but send transformed text. Rebuild
   // provider content and preserve slash metadata so retried rows remain editable
   // as their original invocation.
   let text = source.content;
@@ -78,7 +126,18 @@ export function buildFollowUpFromSource(
   // original send from a trimmed view); rawCommand keeps source.content
   // verbatim so the retried row displays exactly like the original.
   const trimmedContent = source.content.trimStart();
-  if (slashMcpPromptRef && trimmedContent.startsWith("/")) {
+  if (skillMetadata && source.agentSkill) {
+    // The displayed content is the raw command ("/haiku+0 /done finish"),
+    // but dispatchPendingFollowUp sends text VERBATIM (no slash parsing):
+    // the retry must carry the same model-facing payload the original send
+    // streamed, with the raw command retained in metadata only. Generated
+    // <attached-files> notices ride the content (staged attachments are
+    // deliberately absent from fileParts) and must survive the rebuild.
+    text = [
+      buildSkillInvocationUserText(source.agentSkill.skillName, source.agentSkill.arguments ?? ""),
+      ...extractStagedAttachmentNotices(source.content),
+    ].join("\n");
+  } else if (slashMcpPromptRef && trimmedContent.startsWith("/")) {
     const argumentText = trimmedContent.replace(/^\/\S+/, "").trimStart();
     text = buildMcpPromptUserText(
       slashMcpPromptRef.serverName,
@@ -96,6 +155,12 @@ export function buildFollowUpFromSource(
     text,
     fileParts: source.fileParts,
     reviews: source.reviews,
+    ...(oneShotModel != null ? { model: oneShotModel, skipSkillModelRouting: true } : {}),
+    ...(thinkingLevel != null ? { thinkingLevel } : {}),
+    ...(oneShotThinkingIndex != null ? { oneShotThinkingIndex } : {}),
+    // The original one-shot send never persisted its overrides as workspace
+    // defaults; the re-dispatch must not either.
+    ...(carriesOneShot ? { skipAiSettingsPersistence: true } : {}),
     // Inline skill refs must survive alongside prompt refs; withAgentSkillRefs
     // dedupes against the slash ref that buildAgentSkillMetadata already added.
     muxMetadata: withAgentSkillRefs(
@@ -310,7 +375,10 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       }
 
       // For normal messages (not /compact), build follow-up content directly.
-      const followUpContent = buildFollowUpFromSource(source);
+      const followUpContent = buildFollowUpFromSource(source, {
+        providersConfig,
+        currentModel: workspaceState?.currentModel ?? null,
+      });
       const result = await executeCompaction({
         api,
         workspaceId: props.workspaceId,
@@ -332,7 +400,14 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion, props.workspaceId, triggerUserMessage]);
+  }, [
+    api,
+    compactionSuggestion,
+    props.workspaceId,
+    triggerUserMessage,
+    providersConfig,
+    workspaceState?.currentModel,
+  ]);
 
   /**
    * Auto-compact on context_exceeded. Runs silently - never touches chat input.
@@ -349,7 +424,10 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
 
     try {
       const sendMessageOptions = getSendOptionsFromStorage(props.workspaceId);
-      const followUpContent = buildFollowUpFromSource(triggerUserMessage);
+      const followUpContent = buildFollowUpFromSource(triggerUserMessage, {
+        providersConfig,
+        currentModel: workspaceState?.currentModel ?? null,
+      });
 
       const result = await executeCompaction({
         api,
@@ -372,7 +450,14 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
+  }, [
+    api,
+    compactionSuggestion?.modelId,
+    props.workspaceId,
+    triggerUserMessage,
+    providersConfig,
+    workspaceState?.currentModel,
+  ]);
 
   // Auto-trigger compaction on context_exceeded for seamless recovery.
   // Only auto-compact if we have a compaction suggestion; otherwise show manual UI.
