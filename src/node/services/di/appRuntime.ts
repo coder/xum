@@ -85,11 +85,16 @@
  * - `AppFiberScope` is **supervised**: a child of the runtime's layer scope;
  *   fibers forked into it with `Effect.forkIn` are interrupted *and awaited*
  *   by `closeScopeBounded` early in `dispose()`, while every dependency they
- *   might touch during finalization is still alive. No production occupant in
- *   Phase 11; the first candidate is the streamManager engine core. **Rule for
- *   occupants:** tolerate interruption at any suspension point, do not depend
- *   on resources torn down before step 2 below, and never fork long-lived I/O
- *   work through `EffectRunner` expecting shutdown to await it.
+ *   might touch during finalization is still alive. Occupant: the stream
+ *   engine (`StreamManager.superviseEngine`, Wave 4 PR 1) — one supervisor
+ *   fiber per stream, forked at registration and living until the turn's
+ *   completion settles; the stream's AbortSignal stays the cancellation
+ *   transport and interruption
+ *   routes through the user-stop path (`"system"` abort, partial committed,
+ *   `completion` settled) before the close resolves. **Rule for occupants:**
+ *   tolerate interruption at any suspension point, do not depend on resources
+ *   torn down before step 2 below, and never fork long-lived I/O work through
+ *   `EffectRunner` expecting shutdown to await it.
  *
  * ## Shutdown order (`ServiceContainer.dispose()`, one shared teardown behind
  * a latch so concurrent/repeated calls — the desktop's two `before-quit`
@@ -101,7 +106,10 @@
  *    chat session against further dispatch (`workspaceService.beginShutdown()`,
  *    which also disposes the transient chat-recovery sessions housekeeping
  *    scheduled), and only then bounded-join the housekeeping.
- * 2. `closeScopeBounded(appFiberScope, APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS)`.
+ * 2. `closeScopeBounded(appFiberScope, APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS)` —
+ *    aborts (`"system"`) and awaits every in-flight stream; a flowing stream
+ *    settles within one chunk, a wedged provider (no chunks, ignores abort)
+ *    hits the bound, warns, and the process still exits.
  * 3. The explicit sequence verbatim (`desktopBridgeServer.stop()` …
  *    `terminateAll()` … `timelineService.flush()` last), each step timed as a
  *    `[shutdown] <step> {ms}` debug line (`shutdownStep.ts`).
@@ -137,8 +145,10 @@
  * `initialize()` as a Layer/startup effect (would break I1's failure
  * semantics), layer finalizers for the existing `dispose()` steps (I5),
  * `streamBridge` on the runtime, per-service optional tags (optional
- * cross-cutting services stay optional via `CoreOptionsTag`), the streamManager
- * engine core as the first `AppFiberScope` occupant.
+ * cross-cutting services stay optional via `CoreOptionsTag`). The streamManager
+ * engine core became the `AppFiberScope` occupant in Wave 4 PR 1; the
+ * pre-registration stream-start window (`pendingStreamStarts`) stays
+ * unsupervised (nothing durable exists for it yet).
  */
 import assert from "@/common/utils/assert";
 import { Context, Duration, Effect, Exit, Fiber, ManagedRuntime, Scope } from "effect";

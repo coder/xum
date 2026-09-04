@@ -697,6 +697,19 @@ interface WorkspaceStreamInfo {
   partialWritePromise?: Promise<void>;
   // Track background processing promise for guaranteed cleanup
   processingPromise: Promise<void>;
+  // Latched by the first cancelStreamSafely call (synchronously, before its
+  // first await) so concurrent cancellers — a user stop racing shutdown's
+  // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
+  cancelPromise?: Promise<void>;
+  // Set by the completion path right before it deletes partial.json and writes
+  // the final message to chat.jsonl. From then on no partial may be written for
+  // this stream: a cancel landing between deletePartial and COMPLETED (the
+  // state flips late, see processStreamWithCleanup) would otherwise resurrect
+  // partial.json through its pre-abort flush.
+  partialRetired?: boolean;
+  // Supervisor fiber in the app's AppFiberScope (superviseEngine); set only when
+  // the manager was constructed with an engine scope.
+  engineFiber?: Fiber.Fiber<void>;
   // Soft-interrupt state: when pending, stream will end at next block boundary
   softInterrupt:
     | { pending: false }
@@ -787,6 +800,18 @@ export class StreamManager {
    * and the global runtime wherever nothing is injected (di/effectRunner.ts).
    */
   public readonly effectRunner: EffectRunner;
+  /**
+   * Supervised scope for the stream engine (the app runtime's `AppFiberScope`,
+   * di/appFiberScope.ts). When set, every started stream is wrapped in a
+   * supervisor fiber forked here (`superviseEngine`), so
+   * `ServiceContainer.dispose()`/the CLI cleanup lists interrupt **and await**
+   * in-flight streams — aborted as `"system"`, partial flushed and committed —
+   * before the bridges and sessions are torn down. `undefined` (direct
+   * construction in tests, `aiService.ts` compat path) keeps streams
+   * unsupervised: they die with the process and are recovered from
+   * partial.json on next load.
+   */
+  private readonly engineScope?: Scope.Closeable;
   // Token tracker for live streaming statistics
   private tokenTracker = new StreamingTokenTracker();
   // Track OpenAI previousResponseIds that have been invalidated
@@ -803,13 +828,15 @@ export class StreamManager {
     sessionUsageService?: SessionUsageService,
     getProvidersConfig?: () => ProvidersConfigMap | null,
     eventSink: TurnEngineEventSink = () => undefined,
-    runner: EffectRunner = defaultEffectRunner
+    runner: EffectRunner = defaultEffectRunner,
+    engineScope?: Scope.Closeable
   ) {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
     this.eventSink = eventSink;
     this.effectRunner = runner;
+    this.engineScope = engineScope;
   }
 
   setEventSink(eventSink: TurnEngineEventSink): void {
@@ -1188,6 +1215,12 @@ export class StreamManager {
 
     // Cancel any scheduled debounce flush — we're writing now
     this.interruptPartialWriteFiber(streamInfo);
+
+    // The final message owns chat.jsonl now; re-creating partial.json here (a
+    // cancel racing the completion path) would be committed over it on next load.
+    if (streamInfo.partialRetired) {
+      return;
+    }
 
     // Start new write and track the promise
     streamInfo.partialWritePromise = (async () => {
@@ -1783,20 +1816,32 @@ export class StreamManager {
       return;
     }
 
-    try {
-      streamInfo.state = StreamState.STOPPING;
-      // Flush any pending partial write immediately (preserves work on interruption)
-      await this.flushPartialWrite(workspaceId, streamInfo);
-
-      streamInfo.abortController.abort();
-
-      // Unlike checkSoftCancelStream, await cleanup (blocking)
-      await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
-    } catch (error) {
-      log.error("Error during stream cancellation:", error);
-      // Force cleanup even if cancellation fails
-      this.workspaceStreams.delete(workspaceId);
+    // Idempotent for concurrent cancellers (a user stop racing the shutdown
+    // supervisor's "system" cancel): the latch is checked and assigned here,
+    // synchronously, with no suspension before it — an await ahead of this
+    // point would let both callers reach cleanupAbortedStream and emit two
+    // stream-aborts. Later callers join the first cancel; its abortReason and
+    // abandonPartial are the ones delivered.
+    if (streamInfo.cancelPromise) {
+      return streamInfo.cancelPromise;
     }
+    streamInfo.cancelPromise = (async () => {
+      try {
+        streamInfo.state = StreamState.STOPPING;
+        // Flush any pending partial write immediately (preserves work on interruption)
+        await this.flushPartialWrite(workspaceId, streamInfo);
+
+        streamInfo.abortController.abort();
+
+        // Unlike checkSoftCancelStream, await cleanup (blocking)
+        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
+      } catch (error) {
+        log.error("Error during stream cancellation:", error);
+        // Force cleanup even if cancellation fails
+        this.workspaceStreams.delete(workspaceId);
+      }
+    })();
+    return streamInfo.cancelPromise;
   }
 
   // Checks if a soft interrupt is necessary, and performs one if so
@@ -1815,9 +1860,18 @@ export class StreamManager {
       streamInfo.abortController.abort();
 
       // Return back to the stream loop so we can wait for it to finish before
-      // sending the stream abort event.
+      // sending the stream abort event. Not awaited: cleanupAbortedStream waits
+      // for processingPromise, i.e. for the loop this runs inside of.
+      // Shares cancelStreamSafely's latch: a hard cancel that lands during the
+      // flush above already owns the abort bookkeeping (keep its promise), and a
+      // hard cancel arriving later joins this one — one stream-abort either way.
       const { abandonPartial, abortReason } = streamInfo.softInterrupt;
-      void this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
+      streamInfo.cancelPromise ??= this.cleanupAbortedStream(
+        workspaceId,
+        streamInfo,
+        abortReason,
+        abandonPartial
+      );
     } catch (error) {
       log.error("Error during stream cancellation:", error);
       // Force cleanup even if cancellation fails
@@ -1835,6 +1889,16 @@ export class StreamManager {
     // This prevents race conditions where the old stream is still running
     // while a new stream starts (e.g., old stream writing to partial.json)
     await streamInfo.processingPromise;
+
+    // The cancel lost the race: the loop had already left the fullStream and
+    // finished as completed/failed (terminalCompletion set, stream-end/error
+    // emitted, completion settled by processStreamWithCleanup's finally).
+    // Re-running the abort bookkeeping here would resurrect partial.json after
+    // deletePartial and emit a second terminal event (stream-abort after
+    // stream-end), which the renderer reads as "still partial".
+    if (streamInfo.terminalCompletion !== undefined) {
+      return;
+    }
 
     // For aborts, use our tracked cumulativeUsage directly instead of AI SDK's totalUsage.
     // cumulativeUsage is updated on each finish-step event (before tool execution),
@@ -3977,7 +4041,10 @@ export class StreamManager {
               };
 
               // CRITICAL: Delete partial.json before updating chat.jsonl
-              // On successful completion, partial.json becomes stale and must be removed
+              // On successful completion, partial.json becomes stale and must be removed.
+              // Retire partial writes first: a cancel (user stop, shutdown) landing
+              // between here and COMPLETED must not flush partial.json back to disk.
+              streamInfo.partialRetired = true;
               const deleteResult = await this.historyService.deletePartial(workspaceId as string);
               if (!deleteResult.success) {
                 workspaceLog.warn("Failed to delete partial on stream end", {
@@ -4025,6 +4092,21 @@ export class StreamManager {
           }
           break;
         } catch (error) {
+          // A cancellation may surface as an iterator rejection instead of a
+          // clean close (provider/transport dependent). The canceller that
+          // aborted the signal owns the terminal bookkeeping (cleanupAbortedStream
+          // after processingPromise resolves: stream-abort, partial commit,
+          // settle), so recording this as a provider failure would turn a user
+          // stop or a shutdown abort into an error event and — via the
+          // lost-race guard in cleanupAbortedStream — suppress the abort. Take
+          // the same exit as the clean-close abort path instead.
+          if (streamInfo.abortController.signal.aborted) {
+            workspaceLog.debug("Stream iterator rejected after abort; treating as cancellation", {
+              error: getErrorMessage(error),
+            });
+            await this.flushPartialWrite(workspaceId, streamInfo);
+            break;
+          }
           let handledError: unknown = error;
           let retried = false;
           try {
@@ -4848,6 +4930,11 @@ export class StreamManager {
 
         streamInfo.unlinkAbortSignal = unlinkAbortSignal;
         streamRegistered = true;
+        // Supervise from registration on: a shutdown landing during the envelope
+        // write below must find this STARTING stream and cancel it inside the
+        // scope close (the hard-interrupt path documented after the await),
+        // not after teardown has moved past the bridges.
+        this.superviseEngine(typedWorkspaceId, streamInfo);
 
         // Stream constructed + registered: durable request-describing side
         // effects (turn envelope) may be recorded now.
@@ -4895,9 +4982,83 @@ export class StreamManager {
     } catch (error) {
       // Guaranteed cleanup on any failure
       this.workspaceStreams.delete(typedWorkspaceId);
+      // No handle is handed out on this path, so the completion is observed only
+      // by a supervisor forked at registration: settle it so that fiber exits
+      // instead of cancelling this never-started stream at shutdown.
+      completionController.settle({ status: "aborted", abortReason: "startup" });
       // Convert to strongly-typed error
       return Err(this.convertToSendMessageError(error));
     }
+  }
+
+  /**
+   * Make the engine scope (`AppFiberScope`) supervise this stream: one fiber
+   * per stream that lives exactly as long as the turn is unsettled (it waits on
+   * `completionController.promise`) and, when interrupted by the scope closing
+   * during shutdown, cancels the stream through the user-stop path
+   * (`cancelStreamSafely`, abort reason `"system"`) and waits for the turn to
+   * settle — i.e. for the partial to be flushed with usage, `stream-abort`
+   * delivered (AIService commits the partial into chat.jsonl and deletes
+   * partial.json) and `completion` resolved. `closeScopeBounded` awaits that
+   * finalizer, so dispose() proceeds to tear down bridges and sessions only once
+   * every in-flight stream is durably settled. Supervision starts at
+   * registration (before the awaited turn-envelope write), so a STARTING stream
+   * is covered too: cancelling it takes the same hard-interrupt path a user stop
+   * takes during that write.
+   *
+   * The fiber is the ownership unit only; the stream's AbortSignal stays the
+   * sole cancellation transport (the loop, the AI SDK, soft interrupts and
+   * `stopStream` all key off it), so interruption meets the stream at exactly
+   * one point — this finalizer. A turn that settles on its own resolves the
+   * promise and the fiber exits, which removes its finalizer from the scope
+   * (no per-stream residue). A stream started after the scope closed is
+   * interrupted synchronously by `forkIn` and thus aborted right away (pinned in
+   * appFiberScope.test.ts); the pre-registration window (`pendingStreamStarts`)
+   * is not supervised — nothing durable exists for it yet and `stopStream`
+   * already aborts pending controllers.
+   */
+  private superviseEngine(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo): void {
+    if (this.engineScope === undefined) {
+      return;
+    }
+    assert(streamInfo.engineFiber === undefined, "stream engine already supervised");
+    // Zero-arity thunk on purpose: Effect.promise allocates an internal
+    // AbortController only when the thunk declares a `signal` parameter; the
+    // stream's own controller must stay the only signal in play.
+    const supervisor = Effect.promise(() => streamInfo.completionController.promise).pipe(
+      Effect.onInterrupt(() =>
+        // Finalizers already run uninterruptibly; explicit per house doctrine so
+        // the cancel → settle sequence is visibly atomic under a second interrupt.
+        Effect.uninterruptible(
+          Effect.promise(async () => {
+            const startedAt = performance.now();
+            await this.cancelStreamSafely(workspaceId, streamInfo, "system");
+            // Abort delivery (partial commit, downstream stream-abort listeners)
+            // settles the completion asynchronously after cancelStreamSafely
+            // returns; shutdown must not proceed until it has.
+            await streamInfo.completionController.promise;
+            // Per-stream cost inside the AppFiberScope close (shutdownStep style).
+            log.debug("[shutdown] streamManager.abortStream", {
+              workspaceId,
+              messageId: streamInfo.messageId,
+              ms: Math.round(performance.now() - startedAt),
+            });
+          })
+        )
+      ),
+      Effect.catchDefect((defect) =>
+        Effect.sync(() => {
+          log.warn("[stream] engine supervisor defect", { workspaceId, error: defect });
+        })
+      ),
+      Effect.asVoid
+    );
+    // startImmediately: the fiber reaches its (only) suspension point — the
+    // promise wait — before forkIn registers it with the scope, so a scope that
+    // is already closed interrupts it right here, synchronously.
+    streamInfo.engineFiber = this.effectRunner.runSync(
+      Effect.forkIn(supervisor, this.engineScope, { startImmediately: true })
+    );
   }
 
   /**
