@@ -4,7 +4,7 @@ import type { UpdateChannel } from "@/common/types/project";
 import { parseDebugUpdater } from "@/common/utils/env";
 import type { Config } from "@/node/config";
 import { ServerUpdater, type ServerUpdaterDeps } from "./serverUpdate/serverUpdater";
-import { resolveInstallLayout } from "./serverUpdate/installLayout";
+import type { LayoutResult } from "./serverUpdate/installLayout";
 
 // Keep the Electron implementation out of CLI value imports.
 interface UpdaterImpl {
@@ -64,14 +64,10 @@ export class UpdateService {
     }
   }
 
-  async enableServerUpdater(deps: ServerUpdaterDeps): Promise<void> {
+  async enableServerUpdater(layout: LayoutResult, deps: ServerUpdaterDeps): Promise<void> {
     await this.ready;
     if (process.versions.electron) return;
-    this.impl = new ServerUpdater(
-      resolveInstallLayout(process.env, process.argv),
-      this.config.loadConfigOrDefault().updateChannel,
-      deps
-    );
+    this.impl = new ServerUpdater(layout, this.config.loadConfigOrDefault().updateChannel, deps);
     this.impl.subscribe((status) => {
       this.currentStatus = status;
       this.notifySubscribers();

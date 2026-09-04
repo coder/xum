@@ -37,7 +37,7 @@ async function fixture(manager: InstallLayout["packageManager"] = "bun", version
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "server-update-"));
   dirs.push(root);
   const workdir = path.join(root, "npm");
-  const { entry, bin } = await writePackage(workdir, version);
+  const { bin } = await writePackage(workdir, version);
   if (manager === "pnpm") {
     const packageDir = path.join(workdir, "node_modules/@coder/xum");
     const storeDir = path.join(workdir, "node_modules/.pnpm/xum/node_modules/@coder/xum");
@@ -50,7 +50,7 @@ async function fixture(manager: InstallLayout["packageManager"] = "bun", version
   const launcher = path.join(root, "mux");
   await fs.symlink(bin, launcher);
   const env = { MUX_BINARY: launcher, RESTART_ON_KILL_VALUE: "true" };
-  const argv = ["node", entry];
+  const argv = ["node", launcher];
   const result = resolveInstallLayout(env, argv);
   if (!result.supported) throw new Error(result.reason);
   return { root, env, argv, layout: result.layout };
@@ -79,13 +79,17 @@ describe("server install layout", () => {
   test("requires supervisor, a symlink, and a matching running entry", async () => {
     const { env, argv, layout, root } = await fixture();
     expect(resolveInstallLayout({ MUX_BINARY: env.MUX_BINARY }, argv).supported).toBe(false);
-    expect(resolveInstallLayout({ RESTART_ON_KILL_VALUE: "true" }, argv).supported).toBe(false);
+    expect(
+      resolveInstallLayout({ RESTART_ON_KILL_VALUE: "true" }, ["node", layout.entry]).supported
+    ).toBe(false);
     expect(
       resolveInstallLayout({ XUM_SERVER_SUPERVISED: "1" }, ["node", layout.launcher]).supported
     ).toBe(true);
     const other = await writePackage(path.join(root, "other"), "2.0.0");
     await fs.writeFile(path.join(root, "other/bun.lock"), "");
-    expect(resolveInstallLayout(env, ["node", other.entry]).supported).toBe(false);
+    expect(resolveInstallLayout(env, ["node", other.bin]).supported).toBe(false);
+    // A declared launcher does not excuse starting the entry file directly.
+    expect(resolveInstallLayout(env, ["node", layout.entry]).supported).toBe(false);
   });
   test("honors canonical environment values and registry precedence", async () => {
     const { env, argv, layout } = await fixture();
