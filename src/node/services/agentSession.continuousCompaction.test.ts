@@ -4,7 +4,7 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { SessionUsageService } from "./sessionUsageService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { SendMessageOptions } from "@/common/orpc/types";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
@@ -30,7 +30,15 @@ const sendOptions: SendMessageOptions = {
 
 interface SessionInternals {
   continuousCompactor: ContinuousCompactor;
-  activeStreamContext?: { modelString: string };
+  activeStreamContext?: {
+    modelString: string;
+    options?: SendMessageOptions;
+    providersConfig: ProvidersConfigMap | null;
+  };
+  finishContinuousCompaction: (
+    applied: boolean,
+    context: NonNullable<SessionInternals["activeStreamContext"]>
+  ) => Promise<void>;
   interruptForContinuousCompaction: (
     apply: (followUp?: CompactionFollowUpRequest) => Promise<boolean>
   ) => Promise<boolean>;
@@ -38,6 +46,18 @@ interface SessionInternals {
 
 function internals(session: AgentSession): SessionInternals {
   return session as unknown as SessionInternals;
+}
+
+async function applyThenFinish(
+  session: AgentSession,
+  apply: (followUp?: CompactionFollowUpRequest) => Promise<boolean>
+): Promise<boolean> {
+  const state = internals(session);
+  const context = state.activeStreamContext;
+  if (!context) throw new Error("Expected active stream context");
+  const applied = await state.interruptForContinuousCompaction(apply);
+  await state.finishContinuousCompaction(applied, context);
+  return applied;
 }
 
 function deferred<T>() {
@@ -275,13 +295,19 @@ describe("AgentSession continuous compaction wiring", () => {
       return Ok(undefined);
     });
     let observedMidstream = false;
+    let applying = false;
+    spyOn(internals(h.session).continuousCompactor, "isApplying").mockImplementation(
+      () => applying
+    );
     spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
       async (_percent, context) => {
-        // A second observation while fastApply awaits IDLE or dispatches Continue
-        // would wait on the engine's own latch and deadlock.
-        expect(observedMidstream).toBe(false);
+        // Resumed on-send observation is allowed, but only after the mid-stream
+        // apply latch has been released.
+        expect(applying).toBe(false);
         if (context.phase !== "mid-stream") return "none";
+        expect(observedMidstream).toBe(false);
         observedMidstream = true;
+        applying = true;
         const applied = await internals(h.session).interruptForContinuousCompaction(
           async (followUp) => {
             expect(h.session.isBusy()).toBe(false);
@@ -299,6 +325,9 @@ describe("AgentSession continuous compaction wiring", () => {
             return true;
           }
         );
+        expect(starts).toBe(1);
+        applying = false;
+        order.push("latch-released");
         return applied ? "applied" : "none";
       }
     );
@@ -319,7 +348,7 @@ describe("AgentSession continuous compaction wiring", () => {
       usage: { inputTokens: 92_160, outputTokens: 1, totalTokens: 92_161 },
     });
     await resumed.promise;
-    expect(order).toEqual(["stop", "apply", "resume"]);
+    expect(order).toEqual(["stop", "apply", "latch-released", "resume"]);
     const history = await rows(h);
     expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
       false
@@ -352,9 +381,7 @@ describe("AgentSession continuous compaction wiring", () => {
         return Promise.resolve(Ok(undefined));
       });
       expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
-      expect(
-        await internals(h.session).interruptForContinuousCompaction(() => Promise.resolve(false))
-      ).toBe(false);
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
       expect(starts).toBe(2);
       const history = await rows(h);
       expect(history.at(-1)?.metadata?.muxMetadata?.type === "compaction-request").toBe(
@@ -387,7 +414,7 @@ describe("AgentSession continuous compaction wiring", () => {
       return Promise.resolve(Ok(undefined));
     });
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
-    const applied = await internals(h.session).interruptForContinuousCompaction(async () => {
+    const applied = await applyThenFinish(h.session, async () => {
       await h.session.interruptStream({ abandonPartial: true });
       return false;
     });
@@ -415,13 +442,11 @@ describe("AgentSession continuous compaction wiring", () => {
       return Promise.resolve(Ok(undefined));
     });
     expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
-    const applied = await internals(h.session).interruptForContinuousCompaction(
-      async (followUp) => {
-        await appendBoundary(h, followUp);
-        await h.session.interruptStream({ abandonPartial: true });
-        return true;
-      }
-    );
+    const applied = await applyThenFinish(h.session, async (followUp) => {
+      await appendBoundary(h, followUp);
+      await h.session.interruptStream({ abandonPartial: true });
+      return true;
+    });
     expect(applied).toBe(true);
     expect(starts).toBe(1);
     const history = await rows(h);
@@ -524,7 +549,7 @@ describe("AgentSession continuous compaction wiring", () => {
       sessionUsageService: { recordHeadlessUsage: record },
     });
     expect(create.mock.calls[0]?.[0]).toBe(args.compactOptions.model);
-    expect(result.model).toBe(args.compactOptions.model);
+    expect(result?.model).toBe(args.compactOptions.model);
     expect(requests[0].tools ?? []).toHaveLength(0);
     expect(
       requests[0].prompt.some(
@@ -564,7 +589,27 @@ describe("AgentSession continuous compaction wiring", () => {
       head: [createMuxMessage("large-head", "user", "Important context to retain. ".repeat(1_000))],
     });
     expect(create.mock.calls[0]?.[0]).toBe(model);
-    expect(result.model).toBe(model);
+    expect(result?.model).toBe(model);
+  });
+
+  test("returns null without calling a model when neither configured context can fit the head", async () => {
+    const { h, args } = await summarySetup();
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "gpt-4.1-mini", contextWindowTokens: 100 }],
+      },
+    });
+    const create = spyOn(h.aiService, "createModelWithPinnedMetadata");
+    const result = await summarizeContinuousCompaction({
+      ...args,
+      context: { ...args.context, contextWindowTokens: 100 },
+      head: [createMuxMessage("oversize", "user", "Important evidence. ".repeat(1_000))],
+    });
+    expect(result).toBeNull();
+    expect(create).not.toHaveBeenCalled();
   });
 
   test("reset cancellation actively cancels a stalled headless provider", async () => {

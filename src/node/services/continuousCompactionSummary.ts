@@ -40,7 +40,7 @@ export async function summarizeContinuousCompaction(args: {
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
   compactOptions: SendMessageOptions;
-}): Promise<{ text: string; model: string }> {
+}): Promise<{ text: string; model: string } | null> {
   args.signal.throwIfAborted();
   const providersConfig = args.aiService.getProvidersConfig();
   let options = args.compactOptions;
@@ -54,10 +54,7 @@ export async function summarizeContinuousCompaction(args: {
     // Do not truncate the head to fit a cheaper compact model: use the active
     // model's configured route, or leave the old compaction safety net in charge.
     options = args.baseOptions;
-    assert(
-      headTokens <= args.context.contextWindowTokens * SUMMARIZER_INPUT_FRACTION,
-      "Continuous compaction head exceeds the summarizer input budget"
-    );
+    if (headTokens > args.context.contextWindowTokens * SUMMARIZER_INPUT_FRACTION) return null;
   }
   const modelString = options.model;
   const thinkingLevel = enforceThinkingPolicy(

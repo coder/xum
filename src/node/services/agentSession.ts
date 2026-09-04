@@ -740,6 +740,8 @@ export class AgentSession {
   /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
   private midStreamCompactionPending = false;
   private continuousCompactionAbandoned = false;
+  private continuousCompactionStopped = false;
+  private continuousCompactionObserving = false;
 
   /** Tracks file state for detecting external edits. */
   private readonly fileChangeTracker = new FileChangeTracker();
@@ -3739,12 +3741,7 @@ export class AgentSession {
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
-    if (
-      !isCompactionRequest &&
-      !editMessageId &&
-      !hasPreTurnMessages &&
-      !this.midStreamCompactionPending
-    ) {
+    if (!isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
@@ -4930,7 +4927,12 @@ export class AgentSession {
   ): Promise<void> {
     // fastApply waits for this handler to reach IDLE; waiting on its latch here
     // (or re-entering it from the generated Continue send) would deadlock.
-    if (this.midStreamCompactionPending || this.deferQueuedFlushUntilAfterEdit) return;
+    if (
+      this.midStreamCompactionPending ||
+      this.continuousCompactor.isApplying() ||
+      this.deferQueuedFlushUntilAfterEdit
+    )
+      return;
     const context = this.getContinuousCompactionContext(model, options);
     if (!context.enabled) {
       this.continuousCompactor.reset("disabled");
@@ -4962,93 +4964,111 @@ export class AgentSession {
       return false;
     }
     this.midStreamCompactionPending = true;
-    try {
-      const stopped = await this.streamManager.stopStream(this.workspaceId, {
-        abortReason: "system",
-      });
-      if (!stopped.success) return false;
-      await this.waitForIdle();
+    const stopped = await this.streamManager.stopStream(this.workspaceId, {
+      abortReason: "system",
+    });
+    if (!stopped.success) return false;
+    this.continuousCompactionStopped = true;
+    await this.waitForIdle();
+    if (
+      this.disposed ||
+      this.shuttingDown ||
+      this.continuousCompactionAbandoned ||
+      this.isWorkspaceArchivedOnDisk()
+    )
+      return false;
+    const followUp = this.buildContinuousCompactionFollowUp(context);
+    // observe owns the apply latch. Its caller dispatches this continuation only
+    // after observe returns, so the resumed send can observe normally.
+    return apply(followUp);
+  }
+
+  private buildContinuousCompactionFollowUp(
+    context: NonNullable<AgentSession["activeStreamContext"]>
+  ): CompactionFollowUpRequest {
+    assert(context.options, "Continuous compaction requires the interrupted send options");
+    const followUp = this.buildAutoCompactionFollowUp({
+      messageText: "Continue",
+      modelForStream: context.modelString,
+      options: context.options,
+      agentInitiated: context.agentInitiated,
+      goalKind: context.goalKind,
+      goalId: context.goalId,
+      muxMetadata: context.workspaceTurnMetadata,
+    });
+    followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
+    return followUp;
+  }
+
+  private async finishContinuousCompaction(
+    applied: boolean,
+    context: NonNullable<AgentSession["activeStreamContext"]>
+  ): Promise<void> {
+    assert(
+      !this.continuousCompactor.isApplying(),
+      "Continue must dispatch after the apply latch clears"
+    );
+    if (!this.continuousCompactionStopped || !context.options) return;
+    if (!applied) {
+      const followUp = this.buildContinuousCompactionFollowUp(context);
+      // The completed step can outgrow the staged tail budget during stop.
+      // We already interrupted the turn, so recover using its captured context
+      // rather than relying on activeStreamContext (cleared by stream-abort).
       if (
+        this.continuousCompactionAbandoned ||
         this.disposed ||
         this.shuttingDown ||
-        this.continuousCompactionAbandoned ||
-        this.isWorkspaceArchivedOnDisk()
+        this.isWorkspaceArchivedOnDisk() ||
+        this.turnAdmissionBlocks > 0
       )
-        return false;
-      const followUp = this.buildAutoCompactionFollowUp({
-        messageText: "Continue",
-        modelForStream: context.modelString,
-        options: context.options,
-        agentInitiated: context.agentInitiated,
-        goalKind: context.goalKind,
-        goalId: context.goalId,
-        muxMetadata: context.workspaceTurnMetadata,
+        return;
+      const pressure = this.compactionMonitor.checkBeforeSend({
+        model: context.modelString,
+        usage: this.getUsageState(),
+        use1MContext: this.is1MContextEnabledForModel(
+          context.modelString,
+          context.options,
+          context.providersConfig
+        ),
+        providersConfig: context.providersConfig,
       });
-      followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
-      if (!(await apply(followUp))) {
-        // The completed step can outgrow the staged tail budget during stop.
-        // We already interrupted the turn, so recover using its captured context
-        // rather than relying on activeStreamContext (cleared by stream-abort).
-        if (
-          this.continuousCompactionAbandoned ||
-          this.disposed ||
-          this.shuttingDown ||
-          this.isWorkspaceArchivedOnDisk() ||
-          this.turnAdmissionBlocks > 0
-        )
-          return false;
-        const pressure = this.compactionMonitor.checkBeforeSend({
-          model: context.modelString,
-          usage: this.getUsageState(),
-          use1MContext: this.is1MContextEnabledForModel(
-            context.modelString,
-            context.options,
-            context.providersConfig
-          ),
-          providersConfig: context.providersConfig,
+      if (pressure.shouldForceCompact) {
+        await eventSpine.run("compaction.prepare", {
+          workspaceId: this.workspaceId,
+          reason: "mid-stream",
         });
-        if (pressure.shouldForceCompact) {
-          await eventSpine.run("compaction.prepare", {
-            workspaceId: this.workspaceId,
-            reason: "mid-stream",
-          });
-        }
-        const fallback = pressure.shouldForceCompact
-          ? this.buildAutoCompactionRequest({
-              baseOptions: context.options,
-              followUpContent: followUp,
-              reason: "mid-stream",
-            })
-          : undefined;
-        this.continuousCompactor.reset("failed-fast-apply");
-        const sent = await this.sendMessage(
-          fallback?.messageText ?? followUp.text,
-          fallback ? { ...fallback.sendOptions, muxMetadata: fallback.metadata } : context.options,
-          {
-            synthetic: true,
-            agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
-            goalKind: fallback ? undefined : context.goalKind,
-            goalId: fallback ? undefined : context.goalId,
-            admissionStale: () => this.continuousCompactionAbandoned,
-          }
-        );
-        if (!sent.success && !sent.failureHandled && !this.continuousCompactionAbandoned) {
-          this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(sent.error)));
-        }
-        return false;
       }
-      this.lastUsageState = undefined;
-      const summaryId = this.pendingCompactionFollowUpSummaryId;
-      this.pendingCompactionFollowUpSummaryId = null;
-      await this.dispatchPendingFollowUp(
-        summaryId ?? undefined,
-        () => this.continuousCompactionAbandoned
+      const fallback = pressure.shouldForceCompact
+        ? this.buildAutoCompactionRequest({
+            baseOptions: context.options,
+            followUpContent: followUp,
+            reason: "mid-stream",
+          })
+        : undefined;
+      this.continuousCompactor.reset("failed-fast-apply");
+      const sent = await this.sendMessage(
+        fallback?.messageText ?? followUp.text,
+        fallback ? { ...fallback.sendOptions, muxMetadata: fallback.metadata } : context.options,
+        {
+          synthetic: true,
+          agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
+          goalKind: fallback ? undefined : context.goalKind,
+          goalId: fallback ? undefined : context.goalId,
+          admissionStale: () => this.continuousCompactionAbandoned,
+        }
       );
-      return true;
-    } finally {
-      this.midStreamCompactionPending = false;
-      this.drainQueuedMessagesIfIdle();
+      if (!sent.success && !sent.failureHandled && !this.continuousCompactionAbandoned) {
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(sent.error)));
+      }
+      return;
     }
+    this.lastUsageState = undefined;
+    const summaryId = this.pendingCompactionFollowUpSummaryId;
+    this.pendingCompactionFollowUpSummaryId = null;
+    await this.dispatchPendingFollowUp(
+      summaryId ?? undefined,
+      () => this.continuousCompactionAbandoned
+    );
   }
 
   private async interruptForCompaction(): Promise<void> {
@@ -6219,7 +6239,11 @@ export class AgentSession {
       });
 
       // Never recurse compaction while we're already running a compaction request.
-      if (this.activeCompactionRequest || this.midStreamCompactionPending) {
+      if (
+        this.activeCompactionRequest ||
+        this.midStreamCompactionPending ||
+        this.continuousCompactionObserving
+      ) {
         return;
       }
 
@@ -6234,12 +6258,28 @@ export class AgentSession {
             100
           : 0;
       if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
-      const continuousResult = continuousContext.enabled
-        ? await this.continuousCompactor.observe(usagePercent, {
+      let continuousResult: "none" | "applied" | "fallback" = "none";
+      if (continuousContext.enabled) {
+        // One usage handler owns the eventual resume; observe itself shares its
+        // latch result, which must not dispatch the continuation twice.
+        this.continuousCompactionObserving = true;
+        try {
+          continuousResult = await this.continuousCompactor.observe(usagePercent, {
             ...continuousContext,
             phase: "mid-stream",
-          })
-        : "none";
+          });
+          if (this.midStreamCompactionPending) {
+            await this.finishContinuousCompaction(continuousResult === "applied", streamContext);
+            return;
+          }
+          if (continuousResult === "applied") this.clearUsageState();
+        } finally {
+          this.midStreamCompactionPending = false;
+          this.continuousCompactionStopped = false;
+          this.continuousCompactionObserving = false;
+          this.drainQueuedMessagesIfIdle();
+        }
+      }
       if (
         continuousResult === "applied" ||
         (continuousContext.enabled && continuousResult !== "fallback")
@@ -6367,6 +6407,8 @@ export class AgentSession {
       await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
       const dispatchedQueuedMessage =
+        !this.midStreamCompactionPending &&
+        !this.continuousCompactor.isApplying() &&
         this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
@@ -6491,7 +6533,9 @@ export class AgentSession {
         // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
         // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
         const hadQueuedMessages = this.hasPendingManualFollowUp();
-        if (this.deferQueuedFlushUntilAfterEdit) {
+        const continuousApplyPending =
+          this.midStreamCompactionPending || this.continuousCompactor.isApplying();
+        if (this.deferQueuedFlushUntilAfterEdit || continuousApplyPending) {
           this.queuedProviderToolEndAbortInFlight = false;
           // Clear the queued-message signal while the edit flow owns the next dispatch.
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
@@ -6501,7 +6545,12 @@ export class AgentSession {
           this.sendQueuedMessages();
         }
 
-        if (!handled && !this.deferQueuedFlushUntilAfterEdit && !hadQueuedMessages) {
+        if (
+          !handled &&
+          !this.deferQueuedFlushUntilAfterEdit &&
+          !continuousApplyPending &&
+          !hadQueuedMessages
+        ) {
           const sendOptions = activeStreamOptions ?? {
             model: streamEndPayload.metadata.model,
             agentId: WORKSPACE_DEFAULTS.agentId,
