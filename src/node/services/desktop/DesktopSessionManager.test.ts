@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import * as nodeFs from "node:fs";
 import * as os from "os";
 import * as path from "path";
 import { describe, expect, spyOn, test } from "bun:test";
@@ -546,6 +547,50 @@ describe("DesktopSessionManager", () => {
       }
     });
   });
+
+  for (const event of ["error", "close"] as const) {
+    test(`config watcher ${event} fails closed once and explicit disposal does not`, async () => {
+      await withDesktopManagerHarness(({ config, tempDir }) => {
+        const manager = new DesktopSessionManager({
+          config,
+          experimentsService: createExperimentsService(true),
+          workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+        });
+        const watcher = nodeFs.watch(tempDir, { persistent: false });
+        const watch = spyOn(nodeFs, "watch").mockReturnValue(watcher);
+        const failures: unknown[] = [];
+        const stop = manager.watchWorkspaceConfig(
+          () => undefined,
+          (error) => failures.push(error)
+        );
+        try {
+          watcher.emit(event, new Error("watch lost"));
+          expect(failures).toHaveLength(1);
+          stop();
+          expect(failures).toHaveLength(1);
+        } finally {
+          stop();
+          watch.mockRestore();
+        }
+
+        const cleanWatch = nodeFs.watch(tempDir, { persistent: false });
+        const cleanSpy = spyOn(nodeFs, "watch").mockReturnValue(cleanWatch);
+        try {
+          const dispose = manager.watchWorkspaceConfig(
+            () => undefined,
+            (error) => failures.push(error)
+          );
+          dispose();
+          cleanWatch.emit("close");
+          expect(failures).toHaveLength(1);
+        } finally {
+          cleanWatch.close();
+          cleanSpy.mockRestore();
+        }
+        return Promise.resolve();
+      });
+    });
+  }
 
   test("reports machine-level prereqs without consulting workspace metadata when the binary is missing", async () => {
     await withDesktopManagerHarness(async ({ config }) => {

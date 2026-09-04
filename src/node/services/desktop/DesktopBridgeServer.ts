@@ -18,6 +18,8 @@ interface BridgePair {
   tcp: net.Socket | null;
   requesterWorkspaceId: string;
   ownerWorkspaceId: string;
+  sessionId: string;
+  vncPort: number;
   connectAbort: AbortController;
   unsubscribeClose?: () => void;
   closed: boolean;
@@ -26,7 +28,7 @@ interface BridgePair {
 export interface DesktopBridgeServerOptions {
   desktopSessionManager: Pick<
     DesktopSessionManager,
-    "getLiveSessionConnection" | "onWorkspaceClose"
+    "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
   >;
   desktopTokenManager: Pick<DesktopTokenManager, "validate">;
 }
@@ -101,11 +103,12 @@ async function waitForWebSocketClose(ws: WebSocket, timeoutMs = 250): Promise<vo
 export class DesktopBridgeServer {
   private readonly desktopSessionManager: Pick<
     DesktopSessionManager,
-    "getLiveSessionConnection" | "onWorkspaceClose"
+    "getLiveSessionConnection" | "onWorkspaceClose" | "watchWorkspaceConfig"
   >;
   private readonly desktopTokenManager: Pick<DesktopTokenManager, "validate">;
   private readonly wss: WebSocketServer;
   private readonly activePairs = new Set<BridgePair>();
+  private stopConfigWatch: (() => void) | undefined;
   // Keep upgrade rejection aligned with stop() so httpServer.close() cannot hang on sockets
   // that reconnect after shutdown snapshots the current bridge clients.
   private isStopping = false;
@@ -229,6 +232,8 @@ export class DesktopBridgeServer {
       tcp: null,
       requesterWorkspaceId: payload.workspaceId,
       ownerWorkspaceId: liveSession.ownerWorkspaceId,
+      sessionId: liveSession.sessionId,
+      vncPort: liveSession.vncPort,
       connectAbort: new AbortController(),
       closed: false,
     };
@@ -255,6 +260,21 @@ export class DesktopBridgeServer {
     });
 
     try {
+      if (!this.stopConfigWatch) {
+        try {
+          this.stopConfigWatch = this.desktopSessionManager.watchWorkspaceConfig(
+            () => this.revalidateConnections(),
+            (error) => this.revokeForConfigWatchFailure(error)
+          );
+          // Catch a persisted change between the initial lookup and watcher installation,
+          // even if the TCP connection would never finish to perform its later recheck.
+          this.revalidateConnections();
+          if (pair.closed) return;
+        } catch (error) {
+          this.revokeForConfigWatchFailure(error);
+          return;
+        }
+      }
       const tcp = await this.connectToVnc(liveSession.vncPort, pair.connectAbort.signal);
       if (pair.closed) {
         tcp.destroy();
@@ -298,6 +318,46 @@ export class DesktopBridgeServer {
       this.cleanupPair(pair, {
         closeCode: VNC_CONNECT_FAILURE_CLOSE_CODE,
         closeReason: "vnc connect failed",
+      });
+    }
+  }
+
+  private revalidateConnections(): void {
+    try {
+      const connections = new Map<
+        string,
+        ReturnType<DesktopSessionManager["getLiveSessionConnection"]>
+      >();
+      for (const pair of this.activePairs) {
+        if (!connections.has(pair.requesterWorkspaceId)) {
+          connections.set(
+            pair.requesterWorkspaceId,
+            this.desktopSessionManager.getLiveSessionConnection(pair.requesterWorkspaceId)
+          );
+        }
+        const current = connections.get(pair.requesterWorkspaceId);
+        if (
+          current?.ownerWorkspaceId !== pair.ownerWorkspaceId ||
+          current.sessionId !== pair.sessionId ||
+          current.vncPort !== pair.vncPort
+        ) {
+          this.cleanupPair(pair, {
+            closeCode: MISSING_SESSION_CLOSE_CODE,
+            closeReason: "session unavailable",
+          });
+        }
+      }
+    } catch (error) {
+      this.revokeForConfigWatchFailure(error);
+    }
+  }
+
+  private revokeForConfigWatchFailure(error: unknown): void {
+    log.warn("DesktopBridgeServer: config watching failed; revoking viewers", { error });
+    for (const pair of this.activePairs) {
+      this.cleanupPair(pair, {
+        closeCode: MISSING_SESSION_CLOSE_CODE,
+        closeReason: "session unavailable",
       });
     }
   }
@@ -434,6 +494,11 @@ export class DesktopBridgeServer {
 
     pair.closed = true;
     this.activePairs.delete(pair);
+    if (this.activePairs.size === 0) {
+      const stopConfigWatch = this.stopConfigWatch;
+      this.stopConfigWatch = undefined;
+      stopConfigWatch?.();
+    }
     pair.unsubscribeClose?.();
     pair.connectAbort.abort();
 

@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
@@ -232,6 +234,46 @@ export class DesktopSessionManager {
     return (
       (this.sessions.get(workspaceId)?.isAlive() ?? false) || this.startupPromises.has(workspaceId)
     );
+  }
+
+  watchWorkspaceConfig(onChange: () => void, onError: (error: unknown) => void): () => void {
+    // Watch the directory: Config replaces config.json atomically, so watching the file's
+    // inode would silently miss subsequent writes from another backend.
+    let closed = false;
+    let queued = false;
+    const watcher = fs.watch(
+      this.deps.config.rootDir,
+      { persistent: false },
+      (_event, filename) => {
+        if (closed) return;
+        if (filename === path.basename(this.deps.config.rootDir)) {
+          fail(new Error("Desktop config directory was moved or removed"));
+        } else if ((filename == null || filename === "config.json") && !queued) {
+          queued = true;
+          queueMicrotask(() => {
+            queued = false;
+            if (!closed) onChange();
+          });
+        }
+      }
+    );
+    const stop = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        watcher.close();
+      } catch (error) {
+        log.debug("Desktop config watcher cleanup failed", { error });
+      }
+    };
+    const fail = (error: unknown) => {
+      if (closed) return;
+      stop();
+      onError(error);
+    };
+    watcher.on("error", fail);
+    watcher.on("close", () => fail(new Error("Desktop config watcher closed unexpectedly")));
+    return stop;
   }
 
   /** A null workspace ID revokes all viewers, including pending bridge connections. */
