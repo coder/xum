@@ -4251,14 +4251,16 @@ describe("TaskService", () => {
   });
 
   test.each([
-    ["shared", "user", "interrupted"],
-    ["shared", "system", "running"],
-    ["isolated", "user", "running"],
+    ["initial", "shared", "user", "idle", "interrupted"],
+    ["initial", "shared", "system", "idle", "running"],
+    ["initial", "isolated", "user", "idle", "running"],
+    ["reawakened", "shared", "user", "idle", "interrupted"],
+    ["reawakened", "shared", "user", "pending successor", "running"],
   ] as const)(
-    "%s desktop child %s stream abort leaves the task %s",
-    async (desktop, abortReason, expectedStatus) => {
+    "%s %s desktop child %s stream abort while %s leaves the task %s",
+    async (run, desktop, abortReason, successor, expectedStatus) => {
       const config = await createTestConfig(rootDir);
-      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
       const desktopCoordinator = new DesktopInputCoordinator(config);
       // Drive the real aiService subscription so the abort flows through the event lock.
       const listeners = new Map<string, (payload: unknown) => void>();
@@ -4266,15 +4268,79 @@ describe("TaskService", () => {
         listeners.set(event, handler);
       });
       const { aiService } = createAIServiceMocks(config, { on });
-      const { workspaceService } = createWorkspaceServiceMocks();
+      // The real WorkspaceService restores a reawakened child to running before dispatching;
+      // the mock mirrors that and accepts the turn.
+      const serviceRef: { current?: TaskService } = {};
+      const sendMessage = mock(
+        async (
+          workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        hasPendingQueuedOrPreparingTurn: mock(() => successor === "pending successor"),
+      });
       const { taskService } = createTaskServiceHarness(config, {
         aiService,
         workspaceService,
         desktopInputCoordinator: desktopCoordinator,
       });
-      const created = await createAgentTask(taskService, parentId, "Inspect", { desktop });
-      assert(created.success, "Expected the child task to start");
-      const childId = created.data.taskId;
+      serviceRef.current = taskService;
+
+      let childId: string;
+      let waiter: Promise<string>;
+      if (run === "initial") {
+        const created = await createAgentTask(taskService, parentId, "Inspect", { desktop });
+        assert(created.success, "Expected the child task to start");
+        childId = created.data.taskId;
+        waiter = taskService.waitForAgentReport(childId, { timeoutMs: 5_000 }).then(
+          () => "settled",
+          (error: unknown) => (error instanceof Error ? error.message : "?")
+        );
+      } else {
+        childId = "reported-child";
+        await config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push(
+            projectWorkspace(projectPath, childId, childId, {
+              parentWorkspaceId: parentId,
+              agentId: "explore",
+              agentType: "explore",
+              taskStatus: "reported",
+              reportedAt: "2026-09-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              taskDesktopOwnerWorkspaceId: parentId,
+            })
+          );
+          return cfg;
+        });
+        const continuation = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+          ownerWorkspaceId: parentId,
+          prompt: "Continue on the same desktop",
+          title: "Reawaken",
+          allowAgentWorkspace: true,
+          workspace: { mode: "existing", workspaceId: childId },
+        });
+        assert(continuation.success, "Expected the reawakening turn to be admitted");
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+        expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("running");
+        waiter = workspaceTurnManagerFor(taskService)
+          .waitForWorkspaceTurn(continuation.data.taskId, {
+            requestingWorkspaceId: parentId,
+            ownerWorkspaceId: parentId,
+            timeoutMs: 5_000,
+          })
+          .then(
+            () => "settled",
+            (error: unknown) => (error instanceof Error ? error.message : "?")
+          );
+      }
       const ownerInput = () =>
         desktopCoordinator
           .withInput(parentId, () => Promise.resolve("clicked"))
@@ -4285,10 +4351,6 @@ describe("TaskService", () => {
       if (desktop === "shared") {
         expect(await ownerInput()).toContain(`active borrower ${childId}`);
       }
-      const waiter = taskService.waitForAgentReport(childId, { timeoutMs: 5_000 }).then(
-        () => "settled",
-        (error: unknown) => (error instanceof Error ? error.message : "?")
-      );
 
       const onStreamAbort = listeners.get("stream-abort");
       assert(onStreamAbort, "TaskService must subscribe to stream-abort");
@@ -4303,7 +4365,12 @@ describe("TaskService", () => {
         await waitForWorkspaceTaskStatus(config, childId, "interrupted");
         // Clicking Stop in the child UI hands the desktop back to the owner immediately...
         expect(await ownerInput()).toBe("clicked");
-        expect(await waiter).toBe("Task interrupted");
+        expect(await waiter).toBe(
+          run === "initial" ? "Task interrupted" : "Workspace turn interrupted"
+        );
+        if (run === "reawakened") {
+          expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("interrupted");
+        }
         // ...and the paused child still reawakens onto the same desktop when the user resumes it.
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
         expect(findWorkspaceInConfig(config, childId)?.taskDesktopOwnerWorkspaceId).toBe(parentId);
@@ -4313,6 +4380,7 @@ describe("TaskService", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
       if (desktop === "shared") {
+        // A pending successor turn (or a non-user abort) keeps the child in control.
         expect(await ownerInput()).toContain(`active borrower ${childId}`);
       } else {
         expect(await ownerInput()).toBe("clicked");

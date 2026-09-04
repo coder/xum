@@ -11185,9 +11185,10 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private async handleStreamAbort(event: StreamAbortEvent): Promise<void> {
-    if (await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamAbort(event)) {
-      return;
-    }
+    // Settles a continuation handle (execution mirror) first. A reawakened child is ALSO
+    // `running` in its stable status (markInterruptedTaskRunning), and the desktop ledger treats
+    // either active source as control, so the stable status must be released independently.
+    await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamAbort(event);
     if (event.abortReason === "user") {
       await this.releaseSharedDesktopTaskOnUserStop(event.workspaceId);
     }
@@ -11209,11 +11210,13 @@ export class TaskService implements AgentTaskIntegration {
     if (workspace.taskStatus !== "running" && workspace.taskStatus !== "awaiting_report") {
       return;
     }
-    // Stop-and-send-queued dispatches a new turn right after the abort; that turn keeps the
-    // desktop, so only a genuinely idle child releases it.
+    // Stop-and-send-queued dispatches a new turn right after the abort, and a newer continuation
+    // may already own the execution mirror; either keeps the desktop, so only a genuinely idle
+    // child releases it.
     if (
       this.aiService.isStreaming(workspaceId) ||
-      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId) ||
+      isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus)
     ) {
       return;
     }
