@@ -8,7 +8,9 @@
  * `xum workflow`, via `coreServicesRoot.ts`). It owns the app-lifetime
  * `Scope`, its built `Context<AppTags>` is what oRPC Effect-native handlers
  * receive as `"effect/context"`, and it is the source of the two runtime seams
- * described below. Service classes were not rewritten for this: Layers are
+ * described below. Subscription streams run on this context, so heartbeat
+ * sleeps use the runtime's Clock without inheriting build-fiber artifacts.
+ * Service classes were not rewritten for this: Layers are
  * thin adapters around the existing constructors, and the former composition
  * roots' setter/listener wiring lives in `CoreWiringLive`/`DesktopWiringLive`
  * in the original statement order.
@@ -170,7 +172,7 @@
  *
  * Startup as a Layer (would break I1's failure semantics; it became a
  * runtime-run effect instead, see "Startup"), layer finalizers for the existing
- * `dispose()` steps (I5), `streamBridge` on the runtime, per-service optional
+ * `dispose()` steps (I5), per-service optional
  * tags (optional cross-cutting services stay optional via `CoreOptionsTag`),
  * per-step timeouts for `runStartupHousekeeping()` (policy, see "Startup"). The
  * streamManager engine core became the `AppFiberScope` occupant in Wave 4 PR 1;
@@ -178,8 +180,17 @@
  * unsupervised (nothing durable exists for it yet).
  */
 import assert from "@/common/utils/assert";
-import { Context, Duration, Effect, Exit, Fiber, ManagedRuntime, Scope } from "effect";
-import type { Layer } from "effect";
+import {
+  Context,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  ManagedRuntime,
+  Scheduler,
+  Scope,
+} from "effect";
 import {
   APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS,
   APP_RUNTIME_DISPOSE_TIMEOUT_MS,
@@ -203,7 +214,13 @@ export interface AppRuntime<R> {
 export function makeAppRuntime<R>(layer: Layer.Layer<R, never, never>): AppRuntime<R> {
   const startedAt = performance.now();
   const managed = ManagedRuntime.make(layer);
-  const context = managed.runSync(Effect.context<R>());
+  // Subscription pulls must not inherit the eager build's scope, memo map or sync scheduler.
+  // These artifacts are not declared app services in R (see the DI contract).
+  const context = Context.omit(
+    Scope.Scope,
+    Layer.CurrentMemoMap,
+    Scheduler.Scheduler
+  )(managed.runSync(Effect.context<R>())) as Context.Context<R>;
   assert(
     managed.cachedContext !== undefined,
     "AppRuntime layer graph must build synchronously (see DI contract in di/appRuntime.ts)"
