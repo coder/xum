@@ -214,6 +214,19 @@ export class DesktopBridgeServer {
 
     try {
       const tcp = await this.connectToVnc(liveSession.vncPort);
+      // Tokens name the requester, not the owner: revalidate the current relationship after
+      // connecting too, so an archive/removal during TCP setup cannot attach a stale borrower.
+      const currentSession = this.desktopSessionManager.getLiveSessionConnection(
+        payload.workspaceId
+      );
+      if (
+        currentSession?.sessionId !== payload.sessionId ||
+        currentSession.vncPort !== liveSession.vncPort
+      ) {
+        tcp.destroy();
+        closeWebSocket(ws, MISSING_SESSION_CLOSE_CODE, "session unavailable");
+        return;
+      }
       const pair: BridgePair = { ws, tcp, closed: false };
       this.attachBridgeListeners(pair, payload.workspaceId, liveSession.sessionId);
       this.activePairs.add(pair);

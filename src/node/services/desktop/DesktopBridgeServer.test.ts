@@ -3,6 +3,7 @@ import * as net from "node:net";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { WebSocket, type RawData } from "ws";
 import { DesktopBridgeServer } from "./DesktopBridgeServer";
+import { DesktopTokenManager } from "./DesktopTokenManager";
 
 const VALID_TOKEN = "valid-token";
 const VALID_WORKSPACE_ID = "workspace-1";
@@ -304,6 +305,61 @@ async function waitForTcpData(socket: net.Socket, timeoutMs = 2_000): Promise<Bu
 }
 
 describe("DesktopBridgeServer", () => {
+  test("shared tokens authorize the requester and bind its owner's session", async () => {
+    const tcpHarness = await listenTcpServer();
+    const tokens = new DesktopTokenManager();
+    const token = tokens.mint("child", "owner-session");
+    const getLiveSessionConnection = mock((workspaceId: string) =>
+      workspaceId === "child" ? { sessionId: "owner-session", vncPort: tcpHarness.port } : null
+    );
+    const bridgeServer = new DesktopBridgeServer({
+      desktopTokenManager: tokens,
+      desktopSessionManager: { getLiveSessionConnection },
+    });
+    const upgradeHarness = await listenUpgradeServer(bridgeServer);
+    let ws: WebSocket | null = null;
+    try {
+      ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${token}&workspaceId=owner`);
+      await waitForWebSocketOpen(ws);
+      const tcpSocket = await tcpHarness.connectionPromise;
+      ws.send(Buffer.from([1, 2, 3]));
+      expect(await waitForTcpData(tcpSocket)).toEqual(Buffer.from([1, 2, 3]));
+      expect(getLiveSessionConnection.mock.calls.map((call) => call[0])).toEqual([
+        "child",
+        "child",
+      ]);
+      const replay = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${token}`);
+      expect((await waitForWebSocketClose(replay)).code).toBe(4001);
+    } finally {
+      if (ws) await closeWebSocket(ws);
+      tokens.dispose();
+      await upgradeHarness.close();
+      await bridgeServer.stop();
+      await tcpHarness.close();
+    }
+  });
+
+  test("refuses a requester whose target disappears while connecting to VNC", async () => {
+    const tcpHarness = await listenTcpServer();
+    let checks = 0;
+    const bridgeServer = createBridgeServer({
+      getLiveSessionConnection: () => {
+        checks += 1;
+        return checks === 1 ? { sessionId: VALID_SESSION_ID, vncPort: tcpHarness.port } : null;
+      },
+    });
+    const upgradeHarness = await listenUpgradeServer(bridgeServer);
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${upgradeHarness.port}/?token=${VALID_TOKEN}`);
+      expect((await waitForWebSocketClose(ws)).code).toBe(4002);
+      expect(checks).toBe(2);
+    } finally {
+      await upgradeHarness.close();
+      await bridgeServer.stop();
+      await tcpHarness.close();
+    }
+  });
+
   test("handleUpgrade bridges binary traffic when mounted on an external HTTP server", async () => {
     const tcpHarness = await listenTcpServer();
     const bridgeServer = createBridgeServer({
