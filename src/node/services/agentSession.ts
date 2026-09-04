@@ -47,6 +47,8 @@ import {
 } from "@/common/orpc/schemas";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   buildStreamErrorEventData,
   createStreamErrorMessage,
@@ -514,6 +516,7 @@ export async function clearProviderConfigFixableAbandonMarkers(
  */
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
+const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
 
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
@@ -702,6 +705,7 @@ export class AgentSession {
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
   private disposed = false;
+  private shuttingDown = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
   /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
   private editAdmissionDepth = 0;
@@ -1024,6 +1028,16 @@ export class AgentSession {
     eventSpine.emit("session.start", { workspaceId: this.workspaceId });
   }
 
+  /**
+   * Process shutdown for a session that stays alive through teardown (a live stream's partial must
+   * survive for the next startup's recovery, so dispose() and its abandonPartial are wrong here).
+   * Stops the retry timer and makes every internal dispatch boundary below bail like `disposed`.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+    this.retryManager.cancel();
+  }
+
   dispose(): void {
     if (this.disposed) {
       return;
@@ -1332,6 +1346,9 @@ export class AgentSession {
       typeof error.type === "string" && error.type.length > 0,
       "handleStreamFailureForAutoRetry requires a non-empty error.type"
     );
+    if (this.shuttingDown) {
+      return;
+    }
 
     // Load persisted preference before scheduling retries so an on-disk opt-out is
     // honored even when the first failure happens before startup recovery runs.
@@ -1376,6 +1393,12 @@ export class AgentSession {
       const request = this.lastAutoRetryResumeRequest;
       if (!request) {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
+        return;
+      }
+
+      // Archive only interrupts a live stream; a backoff timer armed before it keeps ticking.
+      if (this.isWorkspaceArchivedOnDisk()) {
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
         return;
       }
 
@@ -2377,6 +2400,12 @@ export class AgentSession {
       this.startupAutoRetryDeferredRetryDelayMs = 0;
       return "deferred";
     }
+    if (this.isWorkspaceArchivedOnDisk()) {
+      log.debug("Startup auto-retry skipped: workspace is archived", {
+        workspaceId: this.workspaceId,
+      });
+      return "completed";
+    }
     await this.handleStreamFailureForAutoRetry({
       type: "unknown",
       message: "startup_interrupted_stream",
@@ -2476,7 +2505,7 @@ export class AgentSession {
   }
 
   async runStartupRecovery(): Promise<void> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return;
     }
 
@@ -2515,7 +2544,7 @@ export class AgentSession {
     }
 
     let deferredAttempts = 0;
-    while (!this.disposed) {
+    while (!this.disposed && !this.shuttingDown) {
       let outcome: StartupAutoRetryCheckOutcome;
       try {
         outcome = await this.scheduleStartupAutoRetryIfNeeded();
@@ -3462,6 +3491,9 @@ export class AgentSession {
       if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
         return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       }
+      if (this.shuttingDown) {
+        return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
+      }
 
       // Idle (or preempted to idle) now: hold busy-ness from here until the
       // turn phase takes over, so concurrent sends queue instead of racing the
@@ -3778,6 +3810,11 @@ export class AgentSession {
     // backstops for entry-accounting bypasses.
     if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    }
+    // Still pre-persist: a row appended now would read as a dispatched turn on the next startup
+    // while streamWithHistory's own latch check keeps its stream from ever running.
+    if (this.shuttingDown) {
+      return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
     }
 
     // Persist snapshots only when this turn will be sent immediately.
@@ -4531,6 +4568,26 @@ export class AgentSession {
   }
 
   /**
+   * Startup recovery dispatches through this session's internal send path, which bypasses
+   * WorkspaceService.sendMessage's archived guard, so an archive that lands while a recovery
+   * step awaits disk I/O would otherwise start a hidden stream. Re-read the durable state right
+   * before dispatching: dispose() reaches only transient recovery sessions, not a session a
+   * client had already created when housekeeping scheduled the recovery on it.
+   */
+  private isWorkspaceArchivedOnDisk(): boolean {
+    try {
+      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
+      return (
+        entry != null &&
+        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+      );
+    } catch {
+      // Partial Config mocks (see getCompactionResolverInputs); a real config never throws here.
+      return false;
+    }
+  }
+
+  /**
    * Layers for auto-compaction resolution. Defensive reads: tests construct
    * sessions with partial Config mocks, so missing methods degrade to empty
    * layers instead of throwing.
@@ -4955,9 +5012,13 @@ export class AgentSession {
     // up its replacement's holder. Absent for internal retry paths.
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride
   ): Promise<AgentSessionResult<void>> {
-    const isStartupAbortRequested = (): boolean => abortSignal?.aborted === true;
+    // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
+    // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
+    // detection, or history reads, and must not reach the provider afterwards.
+    const isStreamStartAborted = (): boolean =>
+      this.disposed || this.shuttingDown || abortSignal?.aborted === true;
 
-    if (this.disposed || isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -4986,7 +5047,7 @@ export class AgentSession {
       );
     }
 
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -4999,7 +5060,7 @@ export class AgentSession {
     // abort or append failure therefore re-detects the same change (nothing is
     // dropped), while a successful append cannot produce a duplicate row.
     const fileChangeDetection = await this.fileChangeTracker.getChangedAttachments();
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
     if (fileChangeDetection.attachments.length > 0) {
@@ -5016,7 +5077,7 @@ export class AgentSession {
     }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5077,7 +5138,7 @@ export class AgentSession {
       options
     );
 
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -5086,7 +5147,7 @@ export class AgentSession {
       disablePostCompactionAttachments === true
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
-    if (isStartupAbortRequested()) {
+    if (isStreamStartAborted()) {
       return Ok(undefined);
     }
 
@@ -7124,7 +7185,7 @@ export class AgentSession {
    * proof of dispatch (no history rewrite needed).
    */
   private async dispatchPendingFollowUp(summaryMessageId?: string): Promise<boolean> {
-    if (this.disposed) {
+    if (this.disposed || this.shuttingDown) {
       return false;
     }
 
@@ -7397,6 +7458,16 @@ export class AgentSession {
 
     if (metadata) {
       options.muxMetadata = metadata;
+    }
+
+    // Leave the follow-up pending on the summary: it dispatches on the next startup after an
+    // unarchive instead of running hidden now.
+    if (this.isWorkspaceArchivedOnDisk()) {
+      log.debug("Pending follow-up skipped: workspace is archived", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      return false;
     }
 
     // The compaction summary is now the source of truth for the next live resume

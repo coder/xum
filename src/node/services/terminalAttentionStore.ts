@@ -7,6 +7,7 @@ import { z } from "zod";
 import assert from "@/common/utils/assert";
 import type { WorkspaceSessionLocator } from "@/node/config";
 import { log } from "@/node/services/log";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
 /**
@@ -15,6 +16,10 @@ import { isErrnoWithCode } from "@/node/utils/fs";
  * accepted-delivery dedupe and crash recovery.
  */
 export const TERMINAL_ATTENTION_DIR = "terminal-attention";
+
+// Enough to keep the disk queue busy on the all-ENOENT fast path without opening thousands of
+// directory handles at once on network or large session dirs.
+const SESSION_DIR_SCAN_CONCURRENCY = 16;
 
 const TERMINAL_ATTENTION_OUTPUT_DELIVERIES = [
   "already_injected",
@@ -226,6 +231,27 @@ export class TerminalAttentionStore {
     return records;
   }
 
+  /** True as soon as one pending record parses; skips the rest of the directory. */
+  private async hasPending(ownerWorkspaceId: string): Promise<boolean> {
+    const dir = this.dir(ownerWorkspaceId);
+    let entries: string[];
+    try {
+      entries = await fsPromises.readdir(dir);
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return false;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const raw = await fsPromises.readFile(path.join(dir, entry), "utf-8").catch(() => null);
+      if (raw == null) continue;
+      if (this.parse(raw)?.status === "pending") {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async listPendingOwnerWorkspaceIds(): Promise<string[]> {
     let entries: Dirent[];
     try {
@@ -235,15 +261,21 @@ export class TerminalAttentionStore {
       throw error;
     }
 
-    const ownerWorkspaceIds: string[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if ((await this.listPending(entry.name)).length > 0) {
-        ownerWorkspaceIds.push(entry.name);
-      }
-    }
-    ownerWorkspaceIds.sort();
-    return ownerWorkspaceIds;
+    // Startup scans every session dir (thousands on large deployments); a sequential await per
+    // directory took minutes to find zero pending records, so overlap the readdir round trips.
+    const semaphore = new AsyncSemaphore(SESSION_DIR_SCAN_CONCURRENCY);
+    const results = await Promise.all(
+      entries.map(async (entry): Promise<string | null> => {
+        if (!entry.isDirectory()) return null;
+        const slot = await semaphore.acquire();
+        try {
+          return (await this.hasPending(entry.name)) ? entry.name : null;
+        } finally {
+          slot.release();
+        }
+      })
+    );
+    return results.filter((name): name is string => name != null).sort();
   }
 
   async delete(ownerWorkspaceId: string, id: string): Promise<void> {

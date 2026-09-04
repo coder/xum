@@ -97,6 +97,10 @@
  *
  * 1. `backgroundProcessManager.beginShutdown()` — first; the latch that keeps
  *    persisted armed-monitor records from being erased by session teardown.
+ *    Then (server mode) abort the background startup housekeeping, latch every
+ *    chat session against further dispatch (`workspaceService.beginShutdown()`,
+ *    which also disposes the transient chat-recovery sessions housekeeping
+ *    scheduled), and only then bounded-join the housekeeping.
  * 2. `closeScopeBounded(appFiberScope, APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS)`.
  * 3. The explicit sequence verbatim (`desktopBridgeServer.stop()` …
  *    `terminateAll()` … `timelineService.flush()` last), each step timed as a

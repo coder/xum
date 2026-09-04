@@ -322,6 +322,7 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
+import type { DevToolsService } from "@/node/services/devToolsService";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createBashTool } from "@/node/services/tools/bash";
@@ -634,6 +635,9 @@ interface WorkspaceAgentStatus {
   url?: string;
 }
 type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+
+/** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
+type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "removeWorkspaceData">;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
@@ -2623,7 +2627,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
-  private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+  private devToolsService?: WorkspaceDevToolsCleanup;
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
@@ -2971,7 +2975,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
-  setDevToolsService(service: { removeWorkspaceData(workspaceId: string): Promise<void> }): void {
+  setDevToolsService(service: WorkspaceDevToolsCleanup): void {
     this.devToolsService = service;
   }
 
@@ -3189,7 +3193,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * Best-effort startup recovery for non-task chats so restart auto-retry can resume
    * interrupted turns before the user explicitly opens each workspace.
    */
-  async initialize(): Promise<void> {
+  async initialize(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
 
     try {
@@ -3207,13 +3211,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       let skippedTaskCount = 0;
       let skippedArchivedCount = 0;
 
+      // Shutdown may have started during the cleanups above; the (synchronous) loop below must
+      // not spawn recovery sessions that beginShutdown() has already swept.
+      if (options?.signal?.aborted === true) {
+        log.info("[startup] WorkspaceService.initialize cancelled before scheduling recovery");
+        return;
+      }
+      // This can run while the server is already serving clients, and the cleanups above took
+      // time: re-read config right before the (synchronous) scheduling loop so a workspace archived
+      // or removed since `allMetadata` was read does not get a hidden recovery stream.
+      const liveConfig = this.config.loadConfigOrDefault();
       for (const metadata of allMetadata) {
         if (metadata.taskStatus) {
           skippedTaskCount += 1;
           continue;
         }
 
-        if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+        const live = findWorkspaceEntry(liveConfig, metadata.id)?.workspace;
+        if (live == null || isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) {
           skippedArchivedCount += 1;
           continue;
         }
@@ -3947,6 +3962,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
+   * Shutdown: stop startup chat recovery before the services it dispatches through go away.
+   * Transient recovery sessions are disposed outright. Sessions that outlived that sweep (promoted
+   * because recovery left a retry pending, or client-created ones housekeeping scheduled recovery
+   * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
+   */
+  beginShutdown(): void {
+    for (const [workspaceId, session] of this.transientStartupRecoverySessions) {
+      this.transientStartupRecoverySessions.delete(workspaceId);
+      session.dispose();
+    }
+    for (const session of this.sessions.values()) {
+      session.beginShutdown();
+    }
+  }
+
+  /**
    * Run startup recovery without permanently caching a session for every workspace.
    * Only promote the temporary session if recovery leaves background activity alive.
    */
@@ -4414,19 +4445,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return false;
   }
 
-  private async cleanupOrphanScratchWorkdirs(): Promise<void> {
-    const scratchRoot = this.getScratchRoot();
-    await ensurePrivateDir(scratchRoot);
-
-    // Never interpret a config read failure as an empty reference set, because that would
-    // turn best-effort orphan cleanup into deletion of valid scratch chats.
+  /**
+   * Scratch workdirs referenced by config. Throws on unreadable config: never interpret a
+   * config read failure as an empty reference set, because that would turn best-effort
+   * orphan cleanup into deletion of valid scratch chats.
+   */
+  private listReferencedScratchPaths(): Set<string> {
     const config = this.config.loadConfigOrDefault({ throwOnError: true });
-    const referencedScratchPaths = new Set(
+    return new Set(
       (config.projects.get(SCRATCH_PROJECT_CONFIG_KEY)?.workspaces ?? [])
         .filter((workspace) => workspace.kind === "scratch")
         .map((workspace) => path.resolve(workspace.path))
     );
+  }
 
+  private async cleanupOrphanScratchWorkdirs(): Promise<void> {
+    const scratchRoot = this.getScratchRoot();
+    await ensurePrivateDir(scratchRoot);
+
+    const referencedScratchPaths = this.listReferencedScratchPaths();
+
+    const nowMs = Date.now();
     for (const entry of await fsPromises.readdir(scratchRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
 
@@ -4434,6 +4473,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (referencedScratchPaths.has(candidatePath)) continue;
 
       try {
+        // This sweep can run while the server is already accepting requests, and createScratch
+        // creates the workdir before persisting its config entry. Same guards as the session
+        // sweep: skip recently touched directories, then re-check fresh config right before
+        // deleting so a scratch chat created after the snapshot above is never reaped.
+        const stat = await fsPromises.stat(candidatePath);
+        if (nowMs - stat.mtimeMs < ORPHAN_SESSION_DIR_GRACE_MS) continue;
+        if (this.listReferencedScratchPaths().has(candidatePath)) continue;
+
         await fsPromises.rm(candidatePath, { recursive: true, force: true });
       } catch (error: unknown) {
         log.debug("Failed to clean orphaned scratch workdir", { candidatePath, error });
@@ -4524,10 +4571,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
+    const devToolsService = this.devToolsService;
     for (const metadata of allMetadata) {
       if (!isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) continue;
       try {
-        await this.devToolsService.removeWorkspaceData(metadata.id);
+        // archive() already removed the log for most archived workspaces, so gate the fresh config
+        // read below on there being something to delete: a per-workspace reload for every archived
+        // entry would scale this sweep with (archived workspaces x config size).
+        if (!(await devToolsService.hasWorkspaceData(metadata.id))) continue;
+        // This sweep can run while the server is serving clients. Unarchive runs under the same
+        // lock, so re-checking the live config inside it means a workspace unarchived since
+        // `allMetadata` was read keeps the logs it has produced since.
+        await this.withTaskTreeLifecycleLock(metadata.id, async () => {
+          const live = findWorkspaceEntry(
+            this.config.loadConfigOrDefault(),
+            metadata.id
+          )?.workspace;
+          if (live == null || !isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) return;
+          await devToolsService.removeWorkspaceData(metadata.id);
+        });
       } catch (error: unknown) {
         log.debug("Failed to remove DevTools log for archived workspace", {
           workspaceId: metadata.id,
@@ -5455,10 +5517,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       : await integration.withTaskTreeLifecycleLock(workspaceId, operation);
   }
 
-  async remove(workspaceId: string, force = false): Promise<Result<void>> {
-    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
-      this.removeUnlocked(workspaceId, force)
-    );
+  /**
+   * @param options.beforeRemove - evaluated inside the task-tree lifecycle lock; returning false
+   *   turns the call into a no-op. Lets callers that screened eligibility outside the lock confirm
+   *   it against live state within the same lock hold that performs the removal.
+   */
+  async remove(
+    workspaceId: string,
+    force = false,
+    options?: { beforeRemove?: () => Promise<boolean> }
+  ): Promise<Result<void>> {
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
+      if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+        return Ok(undefined);
+      }
+      return await this.removeUnlocked(workspaceId, force);
+    });
   }
 
   /**
@@ -5488,6 +5562,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
 
     const persistedWorkspace = this.config.findWorkspace(workspaceId);
+    // Startup recovery or a queued dispatch can be one await from starting a stream that the single
+    // stopStream() below cannot see, and the entry stays present and unarchived until removal has
+    // finished with the runtime. Hold admission for the whole removal: success disposes the session,
+    // failure releases the hold so the workspace stays usable.
+    const admissionHolds = [
+      this.sessions.get(workspaceId),
+      this.transientStartupRecoverySessions.get(workspaceId),
+    ]
+      .filter((session): session is AgentSession => session != null)
+      .map((session) => session.holdTurnAdmission());
 
     // Try to remove from runtime (filesystem)
     try {
@@ -6165,6 +6249,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const message = getErrorMessage(error);
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
+      for (const hold of admissionHolds) {
+        hold[Symbol.dispose]();
+      }
       this.removingWorkspaces.delete(workspaceId);
     }
   }
@@ -8634,6 +8721,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         return config;
       });
+
+      // Startup housekeeping may still be recovering this chat in a transient session whose
+      // stream has not started yet, so the stream stop cannot see it. Disposing it once
+      // archivedAt is durable stops its pending auto-retry or follow-up dispatch; a session the
+      // scheduling loop creates later sees the archived entry and is never started.
+      const transientRecoverySession = this.transientStartupRecoverySessions.get(workspaceId);
+      if (transientRecoverySession) {
+        this.transientStartupRecoverySessions.delete(workspaceId);
+        transientRecoverySession.dispose();
+      }
 
       if (!needsSnapshotCapture) {
         try {
