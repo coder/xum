@@ -5,11 +5,13 @@ import { RPCLink as WebSocketRPCLink } from "@orpc/client/websocket";
 import type { RouterClient } from "@orpc/server";
 import WebSocket from "ws";
 import { getXumHome } from "@/common/constants/paths";
+import { SERVICE_TEARDOWN_BUDGET_MS } from "@/constants/terminationTimeouts";
 import { createConfigStores } from "@/node/config";
 import type { AppRouter } from "@/node/orpc/router";
 import { createOrpcServer } from "@/node/orpc/server";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import { ServerLockfile } from "@/node/services/serverLockfile";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 interface ConnectViaWebSocketResult {
   client: ORPCClient;
@@ -154,12 +156,10 @@ async function connectToInProcessServer(requestedAuthToken?: string): Promise<Se
   const stores = createConfigStores();
   const serviceContainer = new ServiceContainer(stores);
 
-  let initialized = false;
   let inProcessServer: InProcessOrpcServer | undefined;
 
   try {
     await serviceContainer.initialize();
-    initialized = true;
 
     const context = serviceContainer.toORPCContext();
     inProcessServer = await createOrpcServer({
@@ -207,9 +207,16 @@ async function connectToInProcessServer(requestedAuthToken?: string): Promise<Se
       await inProcessServer.close().catch(() => undefined);
     }
 
-    if (initialized) {
-      await serviceContainer.dispose().catch(() => undefined);
-    }
+    // Also after a rejected initialize(): a startup step that failed — or timed out and is still
+    // running as a plain promise (StartupStepTimeoutError) — must not leave half-started services
+    // behind, and the stdio adapter must still exit if a teardown step hangs. dispose() is safe
+    // on a container that never finished initializing.
+    await raceWithAbortAndTimeout(
+      serviceContainer.dispose().catch(() => undefined),
+      {
+        timeoutMs: SERVICE_TEARDOWN_BUDGET_MS,
+      }
+    );
 
     throw error;
   }

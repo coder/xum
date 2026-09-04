@@ -12,6 +12,8 @@ import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
 import { ServerLockfile } from "@/node/services/serverLockfile";
 import { log } from "@/node/services/log";
 import { shutdownStep } from "@/node/services/shutdownStep";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { SERVICE_TEARDOWN_BUDGET_MS } from "@/constants/terminationTimeouts";
 import type { BrowserWindow } from "electron";
 import { Command } from "commander";
 import { validateProjectPath } from "@/node/utils/pathUtils";
@@ -48,6 +50,10 @@ process.on("beforeExit", (code) => {
 
 // Track the launch project path for initial navigation
 let launchProjectPath: string | null = null;
+
+// Set as soon as the container exists so a startup that fails afterwards (main() rejecting) still
+// runs the bounded teardown before the process exits.
+let constructedServices: ServiceContainer | undefined;
 
 // Minimal BrowserWindow stub for services that expect one
 // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
@@ -131,6 +137,7 @@ async function main(): Promise<void> {
   const stores = createConfigStores();
   const config = stores.config;
   const serviceContainer = new ServiceContainer(stores);
+  constructedServices = serviceContainer;
   // Headless server has no interactive host-key dialog
   setOpenSSHHostKeyPolicyMode("headless-fallback");
   // Core init (including agent-task recovery, which must finish before any client can act on
@@ -247,11 +254,11 @@ async function main(): Promise<void> {
     const forceExitTimer = setTimeout(() => {
       appendServerCrashLogSync({
         event: "Server cleanup timed out",
-        context: { timeoutMs: 5000 },
+        context: { timeoutMs: SERVICE_TEARDOWN_BUDGET_MS },
       });
       console.log("Cleanup timed out, forcing exit...");
       process.exit(1);
-    }, 5000);
+    }, SERVICE_TEARDOWN_BUDGET_MS);
 
     try {
       // Close all PTY sessions first
@@ -290,12 +297,28 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void cleanup());
 }
 
-void main().catch((error) => {
+void main().catch(async (error: unknown) => {
   appendServerCrashLogSync({
     event: "Failed to initialize server",
     detail: error,
   });
   console.error("Failed to initialize server:", error);
+  if (constructedServices) {
+    // Parity with the desktop before-quit race and the ACP root: a startup step that failed — or
+    // timed out and is still running as a plain promise (StartupStepTimeoutError) — must not leave
+    // half-started services behind. Bounded like the SIGTERM cleanup; the process exits either way.
+    const teardown = await raceWithAbortAndTimeout(
+      constructedServices.dispose().catch((disposeError: unknown) => {
+        log.error("[shutdown] dispose after failed startup failed", { error: disposeError });
+      }),
+      { timeoutMs: SERVICE_TEARDOWN_BUDGET_MS }
+    );
+    if (teardown.kind === "timeout") {
+      log.warn("[shutdown] dispose after failed startup timed out; exiting", {
+        timeoutMs: SERVICE_TEARDOWN_BUDGET_MS,
+      });
+    }
+  }
   process.exit(1);
 });
 

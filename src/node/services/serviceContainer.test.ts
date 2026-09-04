@@ -362,6 +362,14 @@ describe("ServiceContainer", () => {
     };
   }
 
+  /** The rejection reason of `promise` as-is (identity assertions), or a marker if it resolved. */
+  function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
+    return promise.then(
+      () => "<resolved>",
+      (reason: unknown) => reason
+    );
+  }
+
   it("initializeCore times out a hung step on the runtime clock and skips the later steps", async () => {
     // TestClock beneath the real graph: the per-step bound must sleep on the runtime's clock
     // (the effect runs through the ManagedRuntime, not a global Effect.runPromise).
@@ -449,7 +457,7 @@ describe("ServiceContainer", () => {
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
 
     // Identity, not a wrapped copy: roots log/print the object they receive.
-    await expect(services.initializeCore()).rejects.toBe(boom);
+    expect(await rejectionOf(services.initializeCore())).toBe(boom);
     expect(experimentsInitialize).not.toHaveBeenCalled();
     expect(recoverTasks).not.toHaveBeenCalled();
   });
@@ -462,7 +470,7 @@ describe("ServiceContainer", () => {
     });
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks");
 
-    await expect(services.initializeCore()).rejects.toBe(boom);
+    expect(await rejectionOf(services.initializeCore())).toBe(boom);
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
@@ -486,7 +494,9 @@ describe("ServiceContainer", () => {
 
     // A disposed ManagedRuntime would otherwise reject with a bare "ManagedRuntime disposed"
     // defect string from inside the first step.
-    await expect(services.initializeCore()).rejects.toThrow("after dispose()");
+    const rejection = await rejectionOf(services.initializeCore());
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("after dispose()");
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 

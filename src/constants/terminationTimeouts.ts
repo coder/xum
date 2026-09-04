@@ -32,6 +32,14 @@ export const APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS = 2 * 1000;
 export const STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS = 500;
 
 /**
+ * Outer budget the `xum server` and ACP roots give the whole
+ * `ServiceContainer.dispose()` — the SIGTERM cleanup and the dispose after a
+ * failed startup; `desktop/main.ts` races its before-quit dispose against the
+ * same 5 s. The bounded steps above are sized to fit inside it.
+ */
+export const SERVICE_TEARDOWN_BUDGET_MS = 5 * 1000;
+
+/**
  * Bounds each hard startup step of `ServiceContainer.initializeCore()` on the app
  * runtime's clock. A step that has not settled by then fails startup with a
  * `StartupStepTimeoutError` through the same exit path as a throwing step

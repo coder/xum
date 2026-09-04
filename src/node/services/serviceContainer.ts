@@ -363,7 +363,7 @@ export class ServiceContainer {
    * `step` of a `StartupStepTimeoutError`), so names and order are an observability contract.
    * Downgrading a step to best-effort is runStartupHousekeeping()'s policy, not a change here.
    */
-  private readonly startupCoreSteps: ReadonlyArray<StartupStep> = [
+  private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
     { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
     // Startup gating
@@ -395,6 +395,7 @@ export class ServiceContainer {
   }
 
   private startupCoreEffect(): Effect.Effect<void, unknown> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
       self.startupStartedAt = Date.now();
