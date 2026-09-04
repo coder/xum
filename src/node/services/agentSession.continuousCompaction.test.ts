@@ -124,7 +124,12 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(result.success).toBe(true);
   }
 
-  test("startup commits the ordinary partial, folds the valid journal, then considers interrupted-turn retry", async () => {
+  test.each([
+    "startup",
+    "disabled-terminal",
+    "threshold-terminal",
+    "disabled-usage-terminal",
+  ] as const)("%s commits a consumed journal before retry or new work", async (mode) => {
     const h = await setup();
     const source = createMuxMessage("live-answer", "assistant", "", {
       partial: true,
@@ -171,6 +176,7 @@ describe("AgentSession continuous compaction wiring", () => {
         swap = value;
         return true;
       },
+      getPrefixSwapState: () => (streaming ? (swap?.consumed ? "consumed" : "pending") : "none"),
     };
     deps.prepare = () => Promise.resolve();
     deps.estimateAttachmentTokens = () => Promise.resolve(0);
@@ -203,9 +209,50 @@ describe("AgentSession continuous compaction wiring", () => {
     const store = h.historyService.getContinuousCompactionJournal(workspaceId);
     const journal = await store.write(swap.journal, swap.prefix, () => true);
     assert(journal, "Expected durable swap journal");
+    swap.consumed = true;
+    if (mode === "threshold-terminal") h.session.setAutoCompactionThreshold(1);
+    if (mode === "disabled-terminal") compactor.reset("disabled");
+    if (mode === "disabled-usage-terminal") {
+      internals(h.session).activeStreamContext = {
+        modelString: model,
+        providersConfig: null,
+        options: { ...sendOptions, experiments: { continuousCompaction: false } },
+      };
+      const observed = deferred<void>();
+      const observe = compactor.observe.bind(compactor);
+      spyOn(compactor, "observe").mockImplementation(async (...args) => {
+        const result = await observe(...args);
+        observed.resolve();
+        return result;
+      });
+      h.aiEmitter.emit("usage-delta", {
+        type: "usage-delta",
+        workspaceId,
+        messageId: source.id,
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      });
+      await observed.promise;
+      expect(await store.read()).not.toBeNull();
+      internals(h.session).activeStreamContext = undefined;
+    }
     source.parts.push({ type: "text", text: "post-swap crash growth" });
     await h.historyService.writePartial(workspaceId, source);
     streaming = false;
+    if (mode !== "startup") {
+      const terminal = Reflect.get(h.session, "observeContinuousCompactionAtStreamEnd") as (
+        model: string,
+        options: SendMessageOptions
+      ) => Promise<void>;
+      const options = { ...sendOptions, experiments: { continuousCompaction: false } };
+      await terminal.call(h.session, model, options);
+      await terminal.call(h.session, model, options);
+      const history = await rows(h);
+      expect(history[0].id).toBe(journal.boundary.id);
+      expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
+      expect(history.filter((row) => row.metadata?.compactionBoundary)).toHaveLength(1);
+      expect(await store.read()).toBeNull();
+      return;
+    }
     const order: string[] = [];
     const commit = h.historyService.commitPartial.bind(h.historyService);
     spyOn(h.historyService, "commitPartial").mockImplementation((id) => {

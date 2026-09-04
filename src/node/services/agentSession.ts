@@ -4981,7 +4981,7 @@ export class AgentSession {
     )
       return;
     const context = this.getContinuousCompactionContext(model, options);
-    if (!context.enabled) {
+    if (!context.enabled && !this.continuousCompactor.hasConsumedSwap()) {
       this.continuousCompactor.reset("disabled");
       return;
     }
@@ -6337,8 +6337,9 @@ export class AgentSession {
             100
           : 0;
       if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
+      const consumedSwapPending = this.continuousCompactor.hasConsumedSwap();
       let continuousResult: "none" | "applied" | "fallback" = "none";
-      if (continuousContext.enabled) {
+      if (continuousContext.enabled || consumedSwapPending) {
         // One usage handler owns the eventual resume; observe itself shares its
         // latch result, which must not dispatch the continuation twice.
         this.continuousCompactionObserving = true;
@@ -6361,7 +6362,7 @@ export class AgentSession {
       }
       if (
         continuousResult === "applied" ||
-        (continuousContext.enabled && continuousResult !== "fallback")
+        ((continuousContext.enabled || consumedSwapPending) && continuousResult !== "fallback")
       )
         return;
       if (this.activeStreamContext !== streamContext) return;

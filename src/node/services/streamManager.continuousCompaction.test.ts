@@ -1,3 +1,4 @@
+import { prepareMessagesForProvider } from "./messagePipeline";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as ai from "ai";
 import * as atomicWrite from "write-file-atomic";
@@ -159,7 +160,7 @@ describe("continuous prefix prepareStep and journal", () => {
   async function setup() {
     const journal = journalFixture();
     const prefix = await rebuildContinuousPrefix(journal, workspaceId);
-    const swap = { journal, prefix, firstTailToolCallId: "keep" };
+    const swap: ContinuousPrefixSwap = { journal, prefix, firstTailToolCallId: "keep" };
     const tracker: Tracker = { workspaceId, pendingPrefixSwap: swap };
     const manager = new StreamManager(history.historyService);
     const harness = prepareHarness(manager, tracker);
@@ -184,6 +185,7 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(tracker.latestMessages).toBe(result.messages);
     expect(tracker.pendingPrefixSwap).toBeUndefined();
     expect(tracker.consumedPrefixSwap).toBe(swap);
+    expect(swap.consumed).toBe(true);
     const write = spyOn(store, "write");
     expect(await run(result.messages, 2)).toBeUndefined();
     expect(write).not.toHaveBeenCalled();
@@ -208,6 +210,49 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(tracker.pendingPrefixSwap).toBeUndefined();
     expect(tracker.consumedPrefixSwap).toBeUndefined();
     expect(tracker.latestMessages).toBe(originalMessages);
+    expect(await store.read()).toBeNull();
+  });
+
+  it("declines a committed step cut that the real provider pipeline flattens into one assistant", async () => {
+    const { run, tracker, store, swap } = await setup();
+    const committed = createMuxMessage("committed", "assistant", "", {
+      stepStartPartIndices: [0, 2],
+    });
+    committed.parts = [
+      { type: "text", text: "summarized head must not return" },
+      {
+        type: "dynamic-tool",
+        toolCallId: "old-call",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { success: true },
+      },
+      {
+        type: "dynamic-tool",
+        toolCallId: "keep",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { success: true },
+      },
+    ];
+    swap.journal.headEnd = { id: committed.id, sequence: 0 };
+    swap.journal.headPartIndex = 2;
+    const messages = await prepareMessagesForProvider({
+      ...swap.journal.preparation,
+      workspaceId,
+      messagesWithSentinel: [createMuxMessage("user", "user", "request"), committed],
+    });
+    const assistant = messages.find(
+      (message) =>
+        message.role === "assistant" &&
+        JSON.stringify(message.content).includes('"toolCallId":"keep"')
+    );
+    expect(JSON.stringify(assistant)).toContain("summarized head must not return");
+    // No provable wire step boundary means P1 fallback, never a partly swapped request.
+    expect(await run(messages)).toBeUndefined();
+    expect(tracker.consumedPrefixSwap).toBeUndefined();
     expect(await store.read()).toBeNull();
   });
 
@@ -316,9 +361,18 @@ describe("continuous prefix prepareStep and journal", () => {
   }
 
   for (const family of ["anthropic", "openai"]) {
-    for (const consumed of [false, true]) {
-      it(`${family} fallback ${consumed ? "after" : "before"} consumption preserves the correct view and emits only after reset`, async () => {
+    for (const mode of ["pending", "whole-row", "sliced-row"] as const) {
+      const consumed = mode !== "pending";
+      const sliced = mode === "sliced-row";
+      it(`${family} fallback ${mode} preserves the correct view and emits only after reset`, async () => {
         const { tracker, manager, run, swap } = await setup();
+        if (sliced) {
+          swap.journal.headEnd = { id: "live", sequence: 1 };
+          swap.journal.headPartIndex = 2;
+          swap.journal.liveTailCopySpec.partIndex = 2;
+        } else {
+          swap.journal.liveTailCopySpec.partIndex = 0;
+        }
         if (consumed) await run();
         const controller = new AbortController();
         const nextModel = `${family}:fallback-model`;
@@ -329,7 +383,48 @@ describe("continuous prefix prepareStep and journal", () => {
           events.push(event.type);
           controller.abort();
         });
-        const preparedMessages = structuredClone(originalMessages);
+        const rebuilt = createMuxMessage("live", "assistant", "", {
+          stepStartPartIndices: sliced ? [0, 2] : [0],
+        });
+        rebuilt.parts = [
+          ...(sliced
+            ? [
+                { type: "text" as const, text: "summarized live head" },
+                {
+                  type: "dynamic-tool" as const,
+                  toolCallId: "head-call",
+                  toolName: "bash",
+                  state: "output-available" as const,
+                  input: {},
+                  output: { success: true },
+                },
+              ]
+            : []),
+          ...(!sliced ? [{ type: "text" as const, text: "retained step" }] : []),
+          {
+            type: "dynamic-tool",
+            toolCallId: "keep",
+            toolName: "bash",
+            state: "output-available",
+            input: {},
+            output: { success: true },
+          },
+          { type: "text", text: "refused response after swap" },
+        ];
+        const preparedMessages = await prepareMessagesForProvider({
+          ...swap.journal.preparation,
+          providerForMessages: family,
+          workspaceId,
+          messagesWithSentinel: [createMuxMessage("prompt", "user", "original request"), rebuilt],
+        });
+        if (sliced) {
+          const containing = preparedMessages.find(
+            (message) =>
+              message.role === "assistant" &&
+              JSON.stringify(message.content).includes('"toolCallId":"keep"')
+          );
+          expect(JSON.stringify(containing)).toContain("summarized live head");
+        }
         const stream = {
           model: swap.journal.parentModel,
           metadataModel: swap.journal.parentModel,
@@ -341,7 +436,7 @@ describe("continuous prefix prepareStep and journal", () => {
           startTime: Date.now(),
           messageId: "live",
           historySequence: 1,
-          parts: [{ type: "text", text: "refused response" }],
+          parts: rebuilt.parts,
           stepStartIndices: [0],
           currentStepStartIndex: 1,
           stepTracker: tracker,
@@ -391,14 +486,16 @@ describe("continuous prefix prepareStep and journal", () => {
             preserveParts: true,
           })
         ).toEqual({ kind: "swapped" });
-        expect(events).toEqual(consumed && family === "openai" ? ["prefix-swap-invalidated"] : []);
-        if (consumed && family === "anthropic") {
-          expect(JSON.stringify(stream.request.messages)).not.toContain("old output");
+        expect(events).toEqual(
+          consumed && (family === "openai" || sliced) ? ["prefix-swap-invalidated"] : []
+        );
+        if (consumed && family === "anthropic" && !sliced) {
+          expect(JSON.stringify(stream.request.messages)).not.toContain("original request");
           expect(stream.request.messages.slice(0, swap.prefix.length)).toEqual(swap.prefix);
         } else {
           expect(stream.request.messages).toEqual(preparedMessages);
         }
-        if (consumed && family === "openai") {
+        if (consumed && (family === "openai" || sliced)) {
           const blocked = prepareHarness(manager, tracker);
           const result = blocked.run().catch((error: unknown) => error);
           blocked.controller.abort(new Error("stop for durable fold"));

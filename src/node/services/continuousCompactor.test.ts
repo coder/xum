@@ -549,7 +549,7 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
   });
 
-  async function seedLiveTurn(committedTail = false) {
+  async function seedLiveTurn(committedTail = false, splitCommitted = false) {
     const earlier = createMuxMessage("committed-tail", "assistant", "", {
       stepStartPartIndices: [0],
     });
@@ -563,6 +563,21 @@ describe("ContinuousCompactor", () => {
         output: { success: true },
       },
     ];
+    if (splitCommitted) {
+      earlier.parts = [
+        { type: "text", text: "committed investigation ".repeat(8_000) },
+        {
+          type: "dynamic-tool",
+          toolCallId: "old-committed-tool",
+          toolName: "bash",
+          state: "output-available",
+          input: {},
+          output: { success: true },
+        },
+        ...earlier.parts,
+      ];
+      earlier.metadata = { ...earlier.metadata, stepStartPartIndices: [0, 2] };
+    }
     await seed(
       createMuxMessage("old-user", "user", "Investigate the regression"),
       createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
@@ -596,7 +611,7 @@ describe("ContinuousCompactor", () => {
     return answer;
   }
 
-  async function activateJournaledSwap(committedTail = false) {
+  async function activateJournaledSwap(committedTail = false, consumed = true) {
     const answer = await seedLiveTurn(committedTail);
     assert(live, "Live fixture missing");
     const toolPart: MuxMessage["parts"][number] = {
@@ -658,9 +673,118 @@ describe("ContinuousCompactor", () => {
     const journalStore = store.historyService.getContinuousCompactionJournal(workspaceId);
     const journal = await journalStore.write(swap.journal, swap.prefix, () => true);
     assert(journal, "Expected reproducible journal");
-    state = "consumed";
+    state = consumed ? "consumed" : "pending";
+    swap.consumed = consumed;
     return { answer, journal, journalStore, dependencies };
   }
+
+  for (const reason of ["disabled", "threshold-changed", "context-changed"]) {
+    it(`preserves consumed journal through ${reason} and finalizes once even after tracker retirement`, async () => {
+      const { answer, journal, journalStore } = await activateJournaledSwap();
+      compactor.reset(reason);
+      expect(await journalStore.read()).not.toBeNull();
+      assert(live, "Live fixture missing");
+      answer.parts = [...live.parts, { type: "text", text: "after settings change" }];
+      await store.historyService.writePartial(workspaceId, answer);
+      streaming = false;
+      live = undefined;
+      compactor.reset(reason);
+      const disabled = { ...context, enabled: false, thresholdPercent: 100 };
+      expect(await compactor.observe(0, disabled)).toBe("applied");
+      expect(await compactor.observe(0, disabled)).toBe("none");
+      expect((await rows())[0].id).toBe(journal.boundary.id);
+      expect((await rows()).at(-1)?.parts).toEqual(
+        answer.parts.slice(journal.liveTailCopySpec.partIndex)
+      );
+      expect(summarize).toHaveBeenCalledTimes(1);
+      expect(completed).toHaveBeenCalledTimes(1);
+      expect(await journalStore.read()).toBeNull();
+    });
+
+    it(`cancels an unconsumed journal on ${reason}`, async () => {
+      const { journalStore } = await activateJournaledSwap(false, false);
+      compactor.reset(reason);
+      expect(await journalStore.read()).toBeNull();
+      expect(await compactor.observe(100, { ...context, enabled: false })).toBe("none");
+      expect((await rows())[0].id).toBe("old-user");
+      expect(completed).not.toHaveBeenCalled();
+    });
+  }
+
+  it("uses P1 durable fallback for an internal cut in a committed tool-only row", async () => {
+    await seedLiveTurn(true, true);
+    const deps = Reflect.get(compactor, "deps") as Dependencies;
+    const setSwap = mock(() => true);
+    deps.streamManager.setPrefixSwap = setSwap;
+    deps.prepareSwap = () =>
+      Promise.resolve({
+        preparation: {
+          modelString: context.model,
+          providerForMessages: "anthropic",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "off",
+          toolNamesForSentinel: ["bash"],
+        },
+        attachments: [],
+        systemPrefix: [],
+        cacheEnabled: true,
+      });
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(
+      await compactor.observe(context.thresholdPercent, { ...context, phase: "mid-stream" })
+    ).toBe("applied");
+    expect(fastApply).toHaveBeenCalledTimes(1);
+    expect(setSwap).not.toHaveBeenCalled();
+    const current = await rows();
+    expect(JSON.stringify(current.slice(1))).not.toContain("committed investigation");
+    expect(JSON.stringify(current.slice(1))).toContain("committed-tool");
+    expect(current[0].metadata?.compactionBoundary).toBe(true);
+  });
+
+  it("retains a consumed journal after failed disabled finalization so the next attempt can fold it", async () => {
+    const { answer, journal, journalStore } = await activateJournaledSwap();
+    assert(live, "Live fixture missing");
+    answer.parts = live.parts;
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(() =>
+      Promise.resolve({ success: false, error: "transient write failure" })
+    );
+    const disabled = { ...context, enabled: false, thresholdPercent: 100 };
+    expect(await compactor.observe(0, disabled)).toBe("none");
+    compactor.reset("disabled");
+    expect(await journalStore.read()).not.toBeNull();
+    expect(await compactor.observe(0, disabled)).toBe("applied");
+    expect((await rows())[0].id).toBe(journal.boundary.id);
+    expect(completed).toHaveBeenCalledTimes(1);
+  });
+
+  it("settings changes during finalization cannot invalidate a consumed journal's durable fold", async () => {
+    const { answer, journal } = await activateJournaledSwap();
+    assert(live, "Live fixture missing");
+    answer.parts = live.parts;
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    const entered = deferred();
+    const release = deferred();
+    const original = handler.withContinuousPendingState.bind(handler);
+    spyOn(handler, "withContinuousPendingState").mockImplementation(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return original(...args);
+    });
+    const finalizing = compactor.observe(0, { ...context, enabled: false });
+    await entered.promise;
+    compactor.reset("disabled");
+    compactor.reset("threshold-changed");
+    release.resolve();
+    expect(await finalizing).toBe("applied");
+    expect((await rows())[0].id).toBe(journal.boundary.id);
+  });
 
   it("stays seamless and finalizes a consumed swap despite lowered usage, preserving new parts", async () => {
     const { answer, journal, journalStore } = await activateJournaledSwap();
@@ -688,6 +812,7 @@ describe("ContinuousCompactor", () => {
     assert(live, "Live fixture missing");
     answer.parts = [...live.parts, { type: "text", text: "crash-time growth" }];
     await store.historyService.writePartial(workspaceId, answer);
+    compactor.reset("disabled");
     streaming = false;
     live = undefined;
     compactor = new ContinuousCompactor(dependencies);

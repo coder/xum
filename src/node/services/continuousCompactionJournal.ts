@@ -177,6 +177,8 @@ export class ContinuousCompactionJournalStore {
 }
 
 export interface ContinuousPrefixSwap {
+  // Shared with the compactor so consumption survives stream tracker retirement.
+  consumed?: boolean;
   prefix: ModelMessage[];
   firstTailToolCallId: string;
   journal: ContinuousCompactionJournal;

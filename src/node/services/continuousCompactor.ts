@@ -132,7 +132,7 @@ export class ContinuousCompactor {
   private job: { generation: number; abort: AbortController; done: Promise<void> } | null = null;
   private applying: Promise<Verdict> | null = null;
   private swapAttempted: StagedSummary | null = null;
-  private swapActive = false;
+  private activeSwap: ContinuousPrefixSwap | null = null;
 
   constructor(private readonly deps: Dependencies) {
     assert(deps.workspaceId.length > 0, "ContinuousCompactor requires a workspace");
@@ -141,15 +141,18 @@ export class ContinuousCompactor {
   reset(reason: string): void {
     const settingsOnly =
       reason === "disabled" || reason === "threshold-changed" || reason === "context-changed";
+    // Once consumed, the journal describes an actual model request. Disabling
+    // future compaction cannot undo it or invalidate an in-progress durable fold.
+    if (settingsOnly && this.hasConsumedSwap()) return;
     // Hydrating settings must not erase a previous process's journal before recovery.
     // It also keeps the disabled hot path free of journal I/O when no swap ever activated.
-    const discardJournal = !settingsOnly || this.swapActive || this.swapAttempted !== null;
+    const discardJournal = !settingsOnly || this.activeSwap !== null || this.swapAttempted !== null;
     this.generation++;
     this.job?.abort.abort();
     this.job = null;
     this.staged = null;
     this.swapAttempted = null;
-    this.swapActive = false;
+    this.activeSwap = null;
     this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
     // Graceful shutdown retains the write-ahead record for ordinary startup recovery.
     if (discardJournal && reason !== "shutdown") {
@@ -159,6 +162,10 @@ export class ContinuousCompactor {
         .catch((error: unknown) => log.warn("[continuous-compaction] journal clear failed", error));
     }
     log.debug("[continuous-compaction] reset", { workspaceId: this.deps.workspaceId, reason });
+  }
+
+  hasConsumedSwap(): boolean {
+    return this.activeSwap?.consumed === true;
   }
 
   isApplying(): boolean {
@@ -173,12 +180,12 @@ export class ContinuousCompactor {
     usagePercent: number,
     context: ContinuousCompactionContext & { phase: Phase }
   ): Promise<Verdict> {
-    if ((!context.enabled || context.thresholdPercent >= 100) && !this.swapActive) {
+    if ((!context.enabled || context.thresholdPercent >= 100) && !this.hasConsumedSwap()) {
       this.reset("disabled");
       return Promise.resolve("none");
     }
     if (
-      !this.swapActive &&
+      !this.activeSwap &&
       (!Number.isFinite(usagePercent) ||
         !Number.isFinite(context.contextWindowTokens) ||
         context.contextWindowTokens <= 0)
@@ -204,7 +211,7 @@ export class ContinuousCompactor {
     context: ContinuousCompactionContext & { phase: Phase }
   ): Promise<Verdict> {
     const generation = this.generation;
-    if (this.swapActive) {
+    if (this.activeSwap) {
       const state = this.deps.streamManager.getPrefixSwapState?.(this.deps.workspaceId);
       if (state === "invalidated") {
         return (await this.deps.fastApply((followUp) => this.finalizeJournal(followUp)))
@@ -213,7 +220,10 @@ export class ContinuousCompactor {
       }
       if (context.phase !== "mid-stream") {
         if (await this.finalizeJournal()) return "applied";
-        this.swapActive = false;
+        // A transient history failure must remain recoverable even when future
+        // compaction is disabled; only a discarded/invalid journal releases this latch.
+        if (this.hasConsumedSwap()) return "none";
+        this.activeSwap = null;
       } else if (state === "pending" || state === "consumed") {
         return "none";
       } else if (!this.deps.streamManager.isStreaming(this.deps.workspaceId)) {
@@ -221,9 +231,10 @@ export class ContinuousCompactor {
         // Late usage must leave the journal for terminal folding, not initiate a stop.
         return "none";
       } else {
-        this.swapActive = false;
+        this.activeSwap = null;
       }
     }
+    if (!context.enabled || context.thresholdPercent >= 100) return "none";
     if (usagePercent >= context.thresholdPercent && this.staged) {
       const staged = this.staged;
       const rows = await this.readSnapshot();
@@ -445,6 +456,14 @@ export class ContinuousCompactor {
     const source = rows.at(-1);
     if (!live || source?.id !== live.messageId || source.metadata?.historySequence == null)
       return false;
+    // Persisted row metadata is not a wire step delimiter in the SDK converter.
+    // Keep Phase 1's stop/apply fallback for cuts inside a committed assistant.
+    if (
+      staged.cut.stepCut &&
+      staged.cut.stepCut.partIndex > 0 &&
+      staged.cut.stepCut.messageId !== live.messageId
+    )
+      return false;
     const tail = this.materializeTail(staged, rows);
     const firstAssistant = tail.findIndex((row) => row.role === "assistant");
     const first = tail[firstAssistant];
@@ -514,12 +533,10 @@ export class ContinuousCompactor {
       };
       const prefix = await rebuildContinuousPrefix(journal, this.deps.workspaceId);
       if (!this.isValid(staged, rows)) return false;
-      this.swapActive = this.deps.streamManager.setPrefixSwap(this.deps.workspaceId, {
-        prefix,
-        firstTailToolCallId: tool.toolCallId,
-        journal,
-      });
-      return this.swapActive;
+      const swap: ContinuousPrefixSwap = { prefix, firstTailToolCallId: tool.toolCallId, journal };
+      if (!this.deps.streamManager.setPrefixSwap(this.deps.workspaceId, swap)) return false;
+      this.activeSwap = swap;
+      return true;
     } catch (error) {
       log.warn("[continuous-compaction] prefix preparation failed", error);
       return false;
@@ -551,7 +568,11 @@ export class ContinuousCompactor {
     const generation = this.generation;
     const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
     const journal = await store.read();
-    if (!journal || generation !== this.generation) return false;
+    if (generation !== this.generation) return false;
+    if (!journal) {
+      this.activeSwap = null;
+      return false;
+    }
     assert(!this.deps.streamManager.isStreaming(this.deps.workspaceId), "Cannot fold a live swap");
     const committed = await this.deps.historyService.commitPartial(this.deps.workspaceId);
     if (!committed.success) return false;
@@ -562,7 +583,7 @@ export class ContinuousCompactor {
       rows.some((row) => row.id === journal.liveTailCopySpec.copyId);
     if (rows.some((row) => row.id === journal.boundary.id) && copiesPresent) {
       await store.clear();
-      this.swapActive = false;
+      this.activeSwap = null;
       return true;
     }
     const spec = journal.liveTailCopySpec;
@@ -598,6 +619,7 @@ export class ContinuousCompactor {
         workspaceId: this.deps.workspaceId,
       });
       await store.clear();
+      this.activeSwap = null;
       return false;
     }
     const snapshot = fingerprint(rows);

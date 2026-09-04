@@ -2362,6 +2362,15 @@ export class StreamManager {
   }
 
   private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
+    if (
+      swap.journal.headPartIndex != null &&
+      swap.journal.headEnd.id !== swap.journal.streamMessageId
+    ) {
+      log.warn(
+        "[continuous-compaction] committed step has no exact wire boundary; retaining full context"
+      );
+      return null;
+    }
     const index = messages.findIndex(
       (message) =>
         Array.isArray(message.content) &&
@@ -2430,6 +2439,7 @@ export class StreamManager {
               );
             if (journal && stepTracker.pendingPrefixSwap === swap) {
               swap.journal = journal;
+              swap.consumed = true;
               stepTracker.consumedPrefixSwap = swap;
               effectiveMessages = swapped;
             }
@@ -3362,8 +3372,11 @@ export class StreamManager {
         prepared.data.modelString,
         prepared.data.providersConfig
       ).split(":", 1)[0];
+      // Fallback preparation can combine consecutive tool-only steps from the live
+      // Mux row. An internal cut is no longer a provable wire-message boundary.
       const messages =
-        family === consumedSwap.journal.providerFamily
+        family === consumedSwap.journal.providerFamily &&
+        consumedSwap.journal.liveTailCopySpec.partIndex === 0
           ? this.swapPrefix(nextRequest.messages, consumedSwap)
           : null;
       if (messages) nextRequest.messages = messages;
