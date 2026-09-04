@@ -476,18 +476,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
-  test("a refused wake whose compaction row cannot be rolled back consumes its lease", async () => {
-    // If the rollback fails the row stays durable and startup recovery will resume it with the
-    // wake as its follow-up. Releasing the lease too would have the reconciler deliver the same
-    // output a second time (possibly after the monitor retracted it), so the refusal must
-    // consume the wake and leave the durable row as its only carrier.
-    const workspaceId = "ws-auto-compaction-rollback-failure-consumes-wake";
+  // Shared setup for the rollback-failure refusals below: on-send compaction lands its row,
+  // then the send is refused as stale and the row's deletion fails.
+  async function createRefusedWakeAfterFailedRollbackHarness(workspaceId: string) {
     const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
     const { session, historyService } = await createSessionHarness({
       workspaceId,
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
     });
-
     (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
       checkBeforeSend: mock(() => ({
         shouldShowWarning: true,
@@ -500,36 +496,110 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       setThreshold: mock(() => undefined),
       getThreshold: mock(() => 0.7),
     } as unknown as CompactionMonitor;
-    spyOn(historyService, "deleteMessages").mockImplementationOnce(() =>
+    const deleteMessages = spyOn(historyService, "deleteMessages").mockImplementationOnce(() =>
       Promise.resolve(Err("disk unavailable"))
     );
-
+    const chatEventTypes: string[] = [];
+    session.onChatEvent((event) => {
+      chatEventTypes.push(event.message.type);
+    });
+    const readResumeRequest = () =>
+      (
+        session as unknown as {
+          lastAutoRetryResumeRequest?: { options: { muxMetadata?: unknown } };
+        }
+      ).lastAutoRetryResumeRequest;
     const onAccepted = mock(() => Promise.resolve());
-    const result = await session.sendMessage(
-      "hello",
-      {
-        model: "openai:gpt-4o",
-        agentId: "exec",
-        muxMetadata: { type: "bash-monitor-wake", records: [] },
-      },
-      { admissionStale: () => true, onAccepted }
-    );
-    expect(result.success).toBe(false);
-    expect(streamMessage).not.toHaveBeenCalled();
-    expect(onAccepted).toHaveBeenCalledTimes(1);
-
-    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(historyResult.success).toBe(true);
-    if (!historyResult.success) {
-      throw new Error(`failed to load history: ${String(historyResult.error)}`);
-    }
-    expect(
-      historyResult.data.some(
+    const sendRefusedWake = () =>
+      session.sendMessage(
+        "hello",
+        {
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { admissionStale: () => true, onAccepted }
+      );
+    const hasCompactionRow = async () => {
+      const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!historyResult.success) {
+        throw new Error(`failed to load history: ${String(historyResult.error)}`);
+      }
+      return historyResult.data.some(
         (message) => message.metadata?.muxMetadata?.type === "compaction-request"
-      )
-    ).toBe(true);
+      );
+    };
+    return {
+      session,
+      historyService,
+      streamMessage,
+      onAccepted,
+      chatEventTypes,
+      readResumeRequest,
+      sendRefusedWake,
+      hasCompactionRow,
+      deleteMessagesCalls: () => deleteMessages.mock.calls.length,
+    };
+  }
 
-    session.dispose();
+  test("a refused wake whose compaction row verifiably remains consumes its lease and arms a resume", async () => {
+    // The durable row carries the wake as its follow-up. Releasing the lease too would have the
+    // reconciler deliver the same output a second time (possibly after the monitor retracted
+    // it), so the refusal consumes the wake — and arms the in-session resume like every other
+    // durable pre-stream failure, because startup recovery only resumes an interrupted history
+    // tail and a competing manual send could bury the request under a newer turn.
+    const h = await createRefusedWakeAfterFailedRollbackHarness(
+      "ws-auto-compaction-rollback-failure-consumes-wake"
+    );
+    try {
+      let resumeArmedAtAcceptance = false;
+      h.onAccepted.mockImplementation(() => {
+        resumeArmedAtAcceptance = h.readResumeRequest() != null;
+        return Promise.resolve();
+      });
+      const result = await h.sendRefusedWake();
+      expect(result.success).toBe(false);
+      expect(h.streamMessage).not.toHaveBeenCalled();
+      expect(h.onAccepted).toHaveBeenCalledTimes(1);
+      expect(resumeArmedAtAcceptance).toBe(true);
+      // The resume replays the compaction request (which carries the wake), not a fresh row.
+      expect(
+        (h.readResumeRequest()?.options.muxMetadata as { type?: string } | undefined)?.type
+      ).toBe("compaction-request");
+      expect(h.chatEventTypes).toContain("auto-retry-scheduled");
+      expect(await h.hasCompactionRow()).toBe(true);
+    } finally {
+      await h.session.setAutoRetryEnabled(false, { persist: false });
+      h.session.dispose();
+    }
+  });
+
+  test("a refused wake whose rollback outcome is unknown keeps its lease released", async () => {
+    // deleteMessages can fail after committing; if the readback fails too the row's fate is
+    // unknown. Consuming the lease then could leave neither carrier nor signal (the wake and any
+    // delegated continuation deferred behind it would be lost), so the refusal must release
+    // and let the reconciler re-derive — a duplicate delivery is the tolerable failure mode.
+    const h = await createRefusedWakeAfterFailedRollbackHarness(
+      "ws-auto-compaction-rollback-unknown-releases-wake"
+    );
+    try {
+      // Fail only the readback that follows the failed delete; sendMessage reads history
+      // earlier (compaction check) and those reads must stay healthy for the row to land.
+      const readHistory = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
+      spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementation((...args) =>
+        h.deleteMessagesCalls() > 0
+          ? Promise.resolve(Err("disk unavailable"))
+          : readHistory(...args)
+      );
+      const result = await h.sendRefusedWake();
+      expect(result.success).toBe(false);
+      expect(h.streamMessage).not.toHaveBeenCalled();
+      expect(h.onAccepted).not.toHaveBeenCalled();
+      expect(h.readResumeRequest()).toBeUndefined();
+      expect(h.chatEventTypes).not.toContain("auto-retry-scheduled");
+    } finally {
+      h.session.dispose();
+    }
   });
 
   test("uses preferred compaction model for on-send auto-compaction requests", async () => {

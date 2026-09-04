@@ -3328,19 +3328,22 @@ export class AgentSession {
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
     /**
-     * Returns whether the rows are verifiably gone. deleteMessages can fail AFTER its atomic
+     * "deleted" means the rows are verifiably gone. deleteMessages can fail AFTER its atomic
      * rewrite committed, so a reported failure re-reads the durable history before concluding —
      * callers that couple side effects to the rollback (peer budget refunds) must only act when
      * deletion actually committed, or a "canceled" payload would stay durable while no longer
-     * counting against the sender's budget.
+     * counting against the sender's budget. "remains" is the readback confirming a row is still
+     * durable; "unknown" is a readback that itself failed. Callers whose side effect is only
+     * safe against a row that truly exists (consuming a wake lease) must not treat "unknown"
+     * as "remains".
      */
-    const rollbackPersistedTurnRows = async (): Promise<boolean> => {
-      if (persistedTurnRowMessageIds.length === 0) return true;
+    const rollbackPersistedTurnRows = async (): Promise<"deleted" | "remains" | "unknown"> => {
+      if (persistedTurnRowMessageIds.length === 0) return "deleted";
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
         persistedTurnRowMessageIds
       );
-      if (rollbackResult.success) return true;
+      if (rollbackResult.success) return "deleted";
       log.error("Failed to roll back partially persisted turn rows", {
         workspaceId: this.workspaceId,
         error: rollbackResult.error,
@@ -3348,12 +3351,12 @@ export class AgentSession {
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(
         this.workspaceId
       );
-      return (
-        historyResult.success &&
-        persistedTurnRowMessageIds.every(
-          (messageId) => !historyResult.data.some((message) => message.id === messageId)
-        )
-      );
+      if (!historyResult.success) return "unknown";
+      return persistedTurnRowMessageIds.every(
+        (messageId) => !historyResult.data.some((message) => message.id === messageId)
+      )
+        ? "deleted"
+        : "remains";
     };
 
     // Last-line-of-defence pricing gate: every dispatch path (initial sends,
@@ -3951,15 +3954,25 @@ export class AgentSession {
     // request that startup recovery later resumes — for a bash-monitor wake whose lease is
     // released by this refusal, that resubmits output the reconciler has already re-derived.
     //
-    // When the rollback itself fails the row stays durable and startup recovery WILL resume it,
-    // follow-up wake included. A wake must then be consumed (same convention as the `disposed`
-    // path below): leaving the lease released would have the reconciler redeliver output that
-    // the durable row already carries — twice, one copy of which the monitor may since have
-    // retracted. The refusal still stands; the row is the wake's only carrier from here.
+    // When the rollback fails and the readback CONFIRMS the row still durable, that row already
+    // carries the wake as its follow-up. Leaving the lease released would have the reconciler
+    // redeliver output the row carries — twice, one copy of which the monitor may since have
+    // retracted. So the wake takes the same handoff as every other durable pre-stream failure
+    // (see the goal-sync catch below): arm the in-session resume, consume the lease, schedule
+    // the retry. The resume is what keeps the row reachable — startup recovery only resumes an
+    // interrupted history *tail*, and a competing manual send (one cause of this refusal) could
+    // otherwise complete a newer turn on top of the buried request. The refusal still stands.
+    //
+    // An "unknown" readback must NOT consume: if the row was in fact deleted, consuming would
+    // leave neither carrier nor signal and the wake (and any delegated continuation deferred
+    // behind it) would be lost. Releasing risks at worst a duplicate delivery, which the
+    // reconciler's watermarks and the wake-debt settlement already tolerate.
     const refuseAfterCompactionRow = async (message: string): Promise<AgentSessionResult<void>> => {
-      const rolledBack = await rollbackPersistedTurnRows();
-      if (!rolledBack && typedMuxMetadata?.type === "bash-monitor-wake") {
+      const outcome = await rollbackPersistedTurnRows();
+      if (outcome === "remains" && typedMuxMetadata?.type === "bash-monitor-wake") {
+        this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
         await internal?.onAccepted?.();
+        await this.handleStreamFailureForAutoRetry({ type: "unknown", message });
       }
       return Err(createUnknownSendMessageError(message));
     };
@@ -4080,13 +4093,14 @@ export class AgentSession {
     // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
     if (internal?.admissionStale?.() === true) {
-      const rolledBack = await rollbackPersistedTurnRows();
+      const rollbackOutcome = await rollbackPersistedTurnRows();
       // Probe-carrying sends are peer messages whose caller already returned success when the
       // entry was queued — the cancellation hook is their only way to observe this refusal and
       // release the budget reservation (the refund closure is idempotent). Fire it ONLY when the
-      // rollback verifiably committed: rows that remain durable can enter provider context after
-      // a resume, so their charge must stand (budget charged ⇔ rows durable).
-      if (rolledBack) {
+      // rollback verifiably committed: rows that remain durable (or whose fate is unknown) can
+      // enter provider context after a resume, so their charge must stand (budget charged ⇔
+      // rows durable).
+      if (rollbackOutcome === "deleted") {
         await internal?.onCanceled?.(
           "Send refused: the caller's admission became stale before the turn was accepted."
         );
