@@ -1018,6 +1018,8 @@ export class AgentSession {
         );
       },
       prepareSwap: async (head) => {
+        // A consumed swap may need the fast-stop fallback on a provider-family hop.
+        if (!this.activeStreamContext?.options) return null;
         const prepared = this.streamManager.getPrefixSwapPreparation?.(this.workspaceId);
         if (!prepared) return null;
         const attachments = await this.buildContinuousCompactionAttachments(head);
@@ -6279,6 +6281,7 @@ export class AgentSession {
         this.midStreamCompactionPending = false;
         this.continuousCompactionStopped = false;
         this.continuousCompactionObserving = false;
+        this.drainQueuedMessagesIfIdle();
       }
     });
 

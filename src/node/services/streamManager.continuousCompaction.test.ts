@@ -102,7 +102,11 @@ interface Tracker {
 }
 type Prepare = NonNullable<Parameters<typeof ai.streamText>[0]["prepareStep"]>;
 
-function prepareHarness(manager: StreamManager, tracker: Tracker) {
+function prepareHarness(
+  manager: StreamManager,
+  tracker: Tracker,
+  requestOptions: Record<string, unknown> = {}
+) {
   const spy = spyOn(ai, "streamText").mockReturnValue({} as ReturnType<typeof ai.streamText>);
   const create = Reflect.get(manager, "createStreamResult") as (
     request: { model: ai.LanguageModel; messages: ai.ModelMessage[] },
@@ -110,7 +114,12 @@ function prepareHarness(manager: StreamManager, tracker: Tracker) {
     tracker: Tracker
   ) => unknown;
   const controller = new AbortController();
-  create.call(manager, { model, messages: originalMessages }, controller, tracker);
+  create.call(
+    manager,
+    { model, messages: originalMessages, ...requestOptions },
+    controller,
+    tracker
+  );
   const prepare: Prepare | undefined = spy.mock.calls.at(-1)?.[0].prepareStep;
   assert(prepare, "Expected prepareStep callback");
   return {
@@ -192,6 +201,16 @@ describe("continuous prefix prepareStep and journal", () => {
     });
   }
 
+  it("drops a pending swap when thinking options change before the first prepared step", async () => {
+    const { manager, tracker, store } = await setup();
+    const { run } = prepareHarness(manager, tracker, { thinkingOverrideState: { pending: "off" } });
+    expect(await run(originalMessages, 0)).toBeUndefined();
+    expect(tracker.pendingPrefixSwap).toBeUndefined();
+    expect(tracker.consumedPrefixSwap).toBeUndefined();
+    expect(tracker.latestMessages).toBe(originalMessages);
+    expect(await store.read()).toBeNull();
+  });
+
   it("does not return a swap when atomic journal persistence fails", async () => {
     const { run, tracker, store } = await setup();
     spyOn(atomicWrite, "default").mockImplementationOnce(
@@ -205,37 +224,46 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await store.read()).toBeNull();
   });
 
-  it("reset racing a journal write fences the return and deletes the stale record", async () => {
-    const { run, tracker, store } = await setup();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let entered!: () => void;
-    const started = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    const original = atomicWrite.default;
-    spyOn(atomicWrite, "default").mockImplementationOnce(
-      Object.assign(
-        async (filename: string, data: string | Buffer) => {
-          entered();
-          await gate;
-          return original(filename, data);
-        },
-        { sync: original.sync }
-      )
-    );
-    const preparing = run();
-    await started;
-    tracker.pendingPrefixSwap = undefined;
-    const cleared = store.clear();
-    release();
-    expect(await preparing).toBeUndefined();
-    await cleared;
-    expect(await store.read()).toBeNull();
-    expect(tracker.consumedPrefixSwap).toBeUndefined();
-  });
+  it.each(["reset-before-write", "abort-after-write"] as const)(
+    "%s fences the swap return and deletes the stale journal",
+    async (mode) => {
+      const { run, tracker, store, controller } = await setup();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered!: () => void;
+      const started = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const original = atomicWrite.default;
+      spyOn(atomicWrite, "default").mockImplementationOnce(
+        Object.assign(
+          async (filename: string, data: string | Buffer) => {
+            if (mode === "abort-after-write") await original(filename, data);
+            entered();
+            await gate;
+            if (mode === "reset-before-write") await original(filename, data);
+          },
+          { sync: original.sync }
+        )
+      );
+      const preparing = run();
+      await started;
+      let cleared = Promise.resolve();
+      if (mode === "reset-before-write") {
+        tracker.pendingPrefixSwap = undefined;
+        cleared = store.clear();
+      } else {
+        controller.abort();
+      }
+      release();
+      expect(await preparing).toBeUndefined();
+      await cleared;
+      expect(await store.read()).toBeNull();
+      expect(tracker.consumedPrefixSwap).toBeUndefined();
+    }
+  );
 
   it("rejects lossy options rather than silently JSON-dropping them", async () => {
     const { run, tracker, swap, store } = await setup();

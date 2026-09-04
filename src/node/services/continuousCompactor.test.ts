@@ -691,6 +691,9 @@ describe("ContinuousCompactor", () => {
     streaming = false;
     live = undefined;
     compactor = new ContinuousCompactor(dependencies);
+    // Settings hydrate before startup recovery, including an experiment disabled since the crash.
+    compactor.reset("threshold-changed");
+    compactor.reset("disabled");
     expect(await compactor.recover()).toBe(true);
     const once = await rows();
     expect(once.at(-1)?.parts).toEqual(answer.parts.slice(journal.liveTailCopySpec.partIndex));

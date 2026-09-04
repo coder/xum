@@ -2412,6 +2412,11 @@ export class StreamManager {
           }
           throw abortController.signal.reason ?? new Error("Prefix swap invalidated");
         }
+        // The staged prefix was prepared under the previous thinking options.
+        // Keep full context if those options change before the swap is consumed.
+        if (stepTracker && request.thinkingOverrideState?.pending != null) {
+          stepTracker.pendingPrefixSwap = undefined;
+        }
         const swap = stepTracker?.pendingPrefixSwap;
         if (swap && stepTracker?.workspaceId) {
           const swapped = this.swapPrefix(effectiveMessages, swap);

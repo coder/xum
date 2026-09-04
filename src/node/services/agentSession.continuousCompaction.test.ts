@@ -231,6 +231,17 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(await store.read()).toBeNull();
   });
 
+  test("does not activate a prefix without the captured options required by fast-stop fallback", async () => {
+    const h = await setup();
+    internals(h.session).activeStreamContext = { modelString: model, providersConfig: null };
+    const deps = Reflect.get(
+      internals(h.session).continuousCompactor,
+      "deps"
+    ) as ConstructorParameters<typeof ContinuousCompactor>[0];
+    assert(deps.prepareSwap !== undefined, "Expected session prefix preparation");
+    expect(await deps.prepareSwap([])).toBeNull();
+  });
+
   test("on-send apply preserves the new user turn without running a compact turn", async () => {
     const h = await setup(72);
     spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(

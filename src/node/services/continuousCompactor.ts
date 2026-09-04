@@ -139,6 +139,11 @@ export class ContinuousCompactor {
   }
 
   reset(reason: string): void {
+    const settingsOnly =
+      reason === "disabled" || reason === "threshold-changed" || reason === "context-changed";
+    // Hydrating settings must not erase a previous process's journal before recovery.
+    // It also keeps the disabled hot path free of journal I/O when no swap ever activated.
+    const discardJournal = !settingsOnly || this.swapActive || this.swapAttempted !== null;
     this.generation++;
     this.job?.abort.abort();
     this.job = null;
@@ -147,7 +152,7 @@ export class ContinuousCompactor {
     this.swapActive = false;
     this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
     // Graceful shutdown retains the write-ahead record for ordinary startup recovery.
-    if (reason !== "shutdown") {
+    if (discardJournal && reason !== "shutdown") {
       this.deps.historyService
         .getContinuousCompactionJournal(this.deps.workspaceId)
         .clear()
