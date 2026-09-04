@@ -14,7 +14,9 @@ export const CompactionBoundaryMessage: React.FC<CompactionBoundaryMessageProps>
   const label =
     props.message.boundaryKind === CONTEXT_BOUNDARY_KINDS.RESET
       ? "Context reset"
-      : `Compaction boundary${epochLabel}`;
+      : props.message.strategy === "continuous"
+        ? `Continuous compaction${epochLabel}`
+        : `Compaction boundary${epochLabel}`;
 
   return (
     <div

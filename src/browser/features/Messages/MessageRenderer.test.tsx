@@ -782,6 +782,25 @@ describe("MessageRenderer compaction boundary rows", () => {
     expect(getByText("Compaction boundary #4")).toBeDefined();
   });
 
+  test("distinguishes continuous summaries while keeping context reset authoritative", () => {
+    const message: DisplayedMessage = {
+      type: "compaction-boundary",
+      id: "continuous-boundary",
+      historySequence: 10,
+      position: "start",
+      compactionEpoch: 4,
+      strategy: "continuous",
+    };
+    const { getByRole, rerender } = render(<MessageRenderer message={message} />);
+    expect(getByRole("separator").getAttribute("aria-label")).toBe("Continuous compaction #4");
+
+    rerender(<MessageRenderer message={{ ...message, boundaryKind: "reset" }} />);
+    expect(getByRole("separator").getAttribute("aria-label")).toBe("Context reset");
+
+    rerender(<MessageRenderer message={{ ...message, strategy: undefined }} />);
+    expect(getByRole("separator").getAttribute("aria-label")).toBe("Compaction boundary #4");
+  });
+
   test("renders context reset boundary rows", () => {
     const message: DisplayedMessage = {
       type: "compaction-boundary",

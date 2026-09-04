@@ -61,6 +61,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
   const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
   const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
+  const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
   const baseModel = resolveEffectiveComposerModel(
@@ -84,6 +85,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
       memory,
       memoryIntuition,
       toolSearch,
+      continuousCompaction,
     },
     disableWorkspaceAgents,
   });

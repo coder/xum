@@ -92,7 +92,7 @@ export interface RequestAssembleContext {
 
 export interface CompactionPrepareContext {
   readonly workspaceId: string;
-  readonly reason: "on-send" | "mid-stream";
+  readonly reason: "on-send" | "mid-stream" | "continuous-eager";
 }
 
 export interface WaterfallPointMap {

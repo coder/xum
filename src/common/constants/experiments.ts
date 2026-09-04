@@ -25,6 +25,7 @@ export const EXPERIMENT_IDS = {
   AGENT_PLUGINS: "agent-plugins",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   TIMELINE: "timeline",
+  CONTINUOUS_COMPACTION: "continuous-compaction",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
@@ -92,6 +93,13 @@ export interface ExperimentDefinition {
  * Use Record<ExperimentId, ExperimentDefinition> to ensure exhaustive coverage.
  */
 export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
+  [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: {
+    id: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+    name: "Continuous Compaction",
+    description: "Compact older context between turns while preserving recent messages verbatim",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
     id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
     name: "Programmatic Tool Calling",

@@ -99,6 +99,7 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
       memory: isExperimentEnabled(EXPERIMENT_IDS.MEMORY),
       memoryIntuition: isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION),
       toolSearch: isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH),
+      continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
     },
   });
 }

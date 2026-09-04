@@ -787,6 +787,7 @@ export const ExperimentsSchema = z.preprocess(
     timeline: z.boolean().optional(),
     workspaceHeartbeats: z.boolean().optional(),
     toolSearch: z.boolean().optional(),
+    continuousCompaction: z.boolean().optional(),
   })
 );
 

@@ -170,6 +170,10 @@ function createCompactionBoundaryRow(
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
     compactionEpoch,
+    ...(message.metadata?.muxMetadata?.type === "compaction-summary" &&
+    message.metadata.muxMetadata.strategy === "continuous"
+      ? { strategy: "continuous" }
+      : {}),
   };
 }
 
