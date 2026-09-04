@@ -242,6 +242,14 @@ type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPo
 /** Consumed continuation cuts kept for a late owner claim (see consumedContinuationCuts). */
 const MAX_RETAINED_CONTINUATION_CUTS = 8;
 
+interface OwedForfeitSettlement {
+  key: string;
+  correlation: WorkspaceTurnMuxMetadata;
+  reason: string;
+  /** The attempt under way; resolves true once the owner has the record, false when it failed. */
+  inFlight?: Promise<boolean>;
+}
+
 interface AutoRetryResumeRequest {
   // Same-session auto-retry must preserve the full normalized request because
   // ACP correlation/delegation lives in transient send options that are
@@ -255,6 +263,12 @@ interface AutoRetryResumeRequest {
   /** The retried stream was admitted under resumeStream's revalidation; the retry repeats it. */
   revalidateAdmission?: boolean;
   modelFallbackProgress?: ModelFallbackProgress;
+  /**
+   * Delegated turn the retried stream continues when `options.muxMetadata` does not carry it (a
+   * bash-monitor wake inherits its correlation from history), so revalidation still reaches the
+   * owner's handle.
+   */
+  workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -835,11 +849,8 @@ export class AgentSession {
    * the turn, and this evidence keeps the late claim from settling it as failed first.
    */
   private readonly consumedContinuationCuts = new Map<string, WorkspaceTurnMuxMetadata>();
-  /** Owner settlements for forfeited continuations that have not landed yet (settleOwedForfeits). */
-  private readonly owedForfeitSettlements = new Map<
-    string,
-    { correlation: WorkspaceTurnMuxMetadata; reason: string; inFlight: boolean }
-  >();
+  /** Owner settlements for forfeited continuations that have not landed yet (settleOwedForfeit). */
+  private readonly owedForfeitSettlements = new Map<string, OwedForfeitSettlement>();
   private owedForfeitSettlementRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private consecutiveStrandedResumes = 0;
 
@@ -1457,7 +1468,8 @@ export class AgentSession {
     goalId?: string,
     stepBudget?: number,
     revalidateAdmission?: boolean,
-    modelFallbackProgress?: ModelFallbackProgress
+    modelFallbackProgress?: ModelFallbackProgress,
+    workspaceTurnMetadata?: WorkspaceTurnMuxMetadata
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1472,6 +1484,7 @@ export class AgentSession {
       ...(stepBudget != null ? { stepBudget } : {}),
       ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
       ...(modelFallbackProgress != null ? { modelFallbackProgress } : {}),
+      ...(workspaceTurnMetadata != null ? { workspaceTurnMetadata } : {}),
     };
   }
 
@@ -1514,6 +1527,7 @@ export class AgentSession {
         stepBudget: request.stepBudget,
         revalidateAdmission: request.revalidateAdmission,
         modelFallbackProgress: request.modelFallbackProgress,
+        workspaceTurnMetadata: request.workspaceTurnMetadata,
       });
       if (result.success) {
         if (result.data.refusedBy != null) {
@@ -3237,6 +3251,8 @@ export class AgentSession {
       modelFallbackProgress?: ModelFallbackProgress;
       /** For a send continuing an interrupted turn: it ran under resumeStream's revalidation. */
       revalidateAdmission?: boolean;
+      /** For a send continuing a delegated turn its `muxMetadata` does not carry (a wake). */
+      workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
       /**
        * Launch-boundary admission probe (goal and delegated-turn state), rechecked by
        * StreamManager right before the stream registers; unlike admissionStale it must not
@@ -4279,7 +4295,8 @@ export class AgentSession {
       internal?.goalId,
       internal?.stepBudget,
       internal?.revalidateAdmission,
-      internal?.modelFallbackProgress
+      internal?.modelFallbackProgress,
+      internal?.workspaceTurnMetadata
     );
     try {
       await internal?.onAccepted?.();
@@ -4453,6 +4470,8 @@ export class AgentSession {
       stepBudget?: number;
       /** Fallback chain the resumed stream continues when it continues a cut turn. */
       modelFallbackProgress?: ModelFallbackProgress;
+      /** Delegated turn to revalidate against when `options.muxMetadata` does not carry it. */
+      workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
     }
   ): Promise<AgentSessionResult<{ started: boolean; refusedBy?: "goal" | "workspace-turn" }>> {
     this.assertNotDisposed("resumeStream");
@@ -4491,7 +4510,8 @@ export class AgentSession {
       internal?.goalId,
       internal?.stepBudget,
       internal?.revalidateAdmission,
-      internal?.modelFallbackProgress
+      internal?.modelFallbackProgress,
+      internal?.workspaceTurnMetadata
     );
     // Claim the turn before any await: the admission gates below do I/O, and a manual send
     // entering meanwhile must see a busy session rather than start a stream this resume
@@ -4523,6 +4543,7 @@ export class AgentSession {
           goalKind: internal.goalKind,
           goalId: internal.goalId,
           muxMetadata: optionsForStream.muxMetadata,
+          workspaceTurnMetadata: internal.workspaceTurnMetadata,
         });
         if (!admission.admissible) {
           return Ok({ started: false, refusedBy: admission.refusedBy });
@@ -4586,6 +4607,8 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
     muxMetadata: unknown;
+    /** The delegated turn when `muxMetadata` does not carry it (an inherited correlation). */
+    workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
   }): Promise<
     | { admissible: false; refusedBy: "goal" | "workspace-turn" }
     | {
@@ -4609,7 +4632,7 @@ export class AgentSession {
     let turnAdmissionStale: (() => boolean) | undefined;
     if (this.admitStrandedTurnResume) {
       const admission = await this.admitStrandedTurnResume(
-        getWorkspaceTurnMuxMetadata(input.muxMetadata)
+        getWorkspaceTurnMuxMetadata(input.muxMetadata) ?? input.workspaceTurnMetadata
       );
       if (!admission.admissible) {
         return { admissible: false, refusedBy: "workspace-turn" };
@@ -5877,6 +5900,7 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind;
     goalId?: string;
     muxMetadata: unknown;
+    workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
     retryLabel: string;
   }): Promise<{ refuseStreamStart?: () => boolean } | undefined> {
     if (input.stepBudget != null && input.stepBudget <= 0) {
@@ -5897,6 +5921,46 @@ export class AgentSession {
       return undefined;
     }
     return { refuseStreamStart: admission.refuseStreamStart };
+  }
+
+  /**
+   * Runs an in-session retry's launch under PREPARING. False when no stream registered: an Err,
+   * or a launch refused at the boundary, which returns Ok before any stream registers (like a
+   * refused resumeStream). Either way the recovery decision stays pending: the terminal path in
+   * handleStreamError resolves it once settlement state is final, so waiters (task/workspace-turn
+   * settlement) never observe a transient "retry preparing" that already ended before startup.
+   */
+  private async launchInSessionRetry(
+    retryLabel: string,
+    refuseStreamStart: (() => boolean) | undefined,
+    launch: () => Promise<Result<void, SendMessageError>>
+  ): Promise<boolean> {
+    try {
+      const result = await launch();
+      if (!result.success) {
+        log.error(`${retryLabel} failed to start`, {
+          workspaceId: this.workspaceId,
+          error: result.error,
+        });
+        return false;
+      }
+      // stream-start moves the turn to STREAMING synchronously inside startStream, so a turn
+      // still PREPARING here registered nothing.
+      if (
+        this.turnPhase === TurnPhase.PREPARING &&
+        (refuseStreamStart?.() === true || this.disposed || this.shuttingDown)
+      ) {
+        log.info(`${retryLabel} refused at the launch boundary`, {
+          workspaceId: this.workspaceId,
+        });
+        return false;
+      }
+      return true;
+    } finally {
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
+    }
   }
 
   private async maybeRetryCompactionOnContextExceeded(data: {
@@ -5958,6 +6022,7 @@ export class AgentSession {
     const retryStepBudget = this.activeStreamContext?.stepBudget;
     const retryModelFallbackProgress = this.activeStreamContext?.modelFallbackProgress;
     const retryRevalidateAdmission = this.activeStreamContext?.revalidateAdmission;
+    const retryWorkspaceTurnMetadata = this.activeStreamContext?.workspaceTurnMetadata;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -5982,6 +6047,7 @@ export class AgentSession {
       goalKind: retryGoalKind,
       goalId: retryGoalId,
       muxMetadata: retryOptionsForResume.muxMetadata,
+      workspaceTurnMetadata: retryWorkspaceTurnMetadata,
       retryLabel: "compaction retry",
     });
     if (retryAdmission == null) {
@@ -5995,43 +6061,34 @@ export class AgentSession {
       retryGoalId,
       retryStepBudget,
       retryRevalidateAdmission,
-      retryModelFallbackProgress
+      retryModelFallbackProgress,
+      retryWorkspaceTurnMetadata
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
     );
     this.setTurnPhase(TurnPhase.PREPARING);
-    let retryResult: Result<void, SendMessageError>;
-    try {
-      retryResult = await this.streamWithHistory(
-        context.modelString,
-        retryOptions,
-        isGptClass ? "auto" : undefined,
-        undefined,
-        retryAgentInitiated,
-        undefined,
-        retryGoalKind,
-        retryGoalId,
-        undefined,
-        retryAdmission.refuseStreamStart,
-        retryStepBudget,
-        retryRevalidateAdmission,
-        retryModelFallbackProgress
-      );
-    } finally {
-      if (this.turnPhase === TurnPhase.PREPARING) {
-        this.setTurnPhase(TurnPhase.IDLE);
-      }
-    }
-    if (!retryResult.success) {
-      // Leave the recovery decision pending: the terminal path in
-      // handleStreamError resolves it once settlement state is final, so
-      // waiters (task/workspace-turn settlement) never observe a transient
-      // "retry preparing" that already failed before stream startup.
-      log.error("Compaction retry failed to start", {
-        workspaceId: this.workspaceId,
-        error: retryResult.error,
-      });
+    const retryStarted = await this.launchInSessionRetry(
+      "Compaction retry",
+      retryAdmission.refuseStreamStart,
+      () =>
+        this.streamWithHistory(
+          context.modelString,
+          retryOptions,
+          isGptClass ? "auto" : undefined,
+          undefined,
+          retryAgentInitiated,
+          undefined,
+          retryGoalKind,
+          retryGoalId,
+          undefined,
+          retryAdmission.refuseStreamStart,
+          retryStepBudget,
+          retryRevalidateAdmission,
+          retryModelFallbackProgress
+        )
+    );
+    if (!retryStarted) {
       return false;
     }
 
@@ -6115,6 +6172,7 @@ export class AgentSession {
       goalKind: context.goalKind,
       goalId: context.goalId,
       muxMetadata: context.options?.muxMetadata,
+      workspaceTurnMetadata: context.workspaceTurnMetadata,
       retryLabel: "post-compaction retry",
     });
     if (retryAdmission == null) {
@@ -6124,37 +6182,27 @@ export class AgentSession {
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
-    let retryResult: Result<void, SendMessageError>;
-    try {
-      retryResult = await this.streamWithHistory(
-        context.modelString,
-        context.options,
-        context.openaiTruncationModeOverride,
-        true,
-        context.agentInitiated,
-        undefined,
-        context.goalKind,
-        context.goalId,
-        undefined,
-        retryAdmission.refuseStreamStart,
-        context.stepBudget,
-        context.revalidateAdmission,
-        context.modelFallbackProgress
-      );
-    } finally {
-      if (this.turnPhase === TurnPhase.PREPARING) {
-        this.setTurnPhase(TurnPhase.IDLE);
-      }
-    }
-
-    if (!retryResult.success) {
-      // Leave the recovery decision pending: the terminal path in
-      // handleStreamError resolves it once settlement state is final (see
-      // maybeRetryCompactionOnContextExceeded).
-      log.error("Post-compaction retry failed to start", {
-        workspaceId: this.workspaceId,
-        error: retryResult.error,
-      });
+    const retryStarted = await this.launchInSessionRetry(
+      "Post-compaction retry",
+      retryAdmission.refuseStreamStart,
+      () =>
+        this.streamWithHistory(
+          context.modelString,
+          context.options,
+          context.openaiTruncationModeOverride,
+          true,
+          context.agentInitiated,
+          undefined,
+          context.goalKind,
+          context.goalId,
+          undefined,
+          retryAdmission.refuseStreamStart,
+          context.stepBudget,
+          context.revalidateAdmission,
+          context.modelFallbackProgress
+        )
+    );
+    if (!retryStarted) {
       return false;
     }
 
@@ -7518,38 +7566,47 @@ export class AgentSession {
   private forfeitStrandedTurnResume(reason: string): void {
     const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
     // Retain the owner's only terminal path before dropping the marker that advertised it.
-    const settlementOwed = this.recordOwedForfeit(correlation, reason);
+    const owed = this.recordOwedForfeit(correlation, reason);
     this.withdrawStrandedTurnResume();
-    if (settlementOwed) {
-      this.settleOwedForfeits();
+    if (owed != null) {
+      void this.settleOwedForfeit(owed);
     }
   }
 
   /**
    * A delegated turn given up outside the marker (a dropped compaction follow-up that continued
-   * it): the same settlement, since nothing else will end the turn for its owner.
+   * it): the same settlement, since nothing else will end the turn for its owner. Resolves true
+   * once the owner has the terminal record (or nothing was owed), false when the attempt failed
+   * and the settlement stays owed.
    */
   private forfeitWorkspaceTurnContinuation(
     correlation: WorkspaceTurnMuxMetadata | undefined,
     reason: string
-  ): void {
-    if (this.recordOwedForfeit(correlation, reason)) {
-      this.settleOwedForfeits();
-    }
+  ): Promise<boolean> {
+    const owed = this.recordOwedForfeit(correlation, reason);
+    return owed == null ? Promise.resolve(true) : this.settleOwedForfeit(owed);
   }
 
   private recordOwedForfeit(
     correlation: WorkspaceTurnMuxMetadata | undefined,
     reason: string
-  ): boolean {
+  ): OwedForfeitSettlement | undefined {
     if (correlation == null || this.settleForfeitedWorkspaceTurnContinuation == null) {
-      return false;
+      return undefined;
     }
-    this.owedForfeitSettlements.set(
-      `${correlation.ownerWorkspaceId}/${correlation.taskHandleId}/${correlation.turnId}`,
-      { correlation, reason, inFlight: false }
-    );
-    return true;
+    const owed: OwedForfeitSettlement = {
+      key: `${correlation.ownerWorkspaceId}/${correlation.taskHandleId}/${correlation.turnId}`,
+      correlation,
+      reason,
+    };
+    this.owedForfeitSettlements.set(owed.key, owed);
+    return owed;
+  }
+
+  private settleOwedForfeits(): void {
+    for (const owed of this.owedForfeitSettlements.values()) {
+      void this.settleOwedForfeit(owed);
+    }
   }
 
   /**
@@ -7557,31 +7614,30 @@ export class AgentSession {
    * failed attempt (task store I/O) stays owed and retries on its own (including after session
    * disposal) as well as from idle sweeps. Settlement is idempotent on the owner's side.
    */
-  private settleOwedForfeits(): void {
+  private settleOwedForfeit(owed: OwedForfeitSettlement): Promise<boolean> {
+    if (owed.inFlight != null) {
+      return owed.inFlight;
+    }
     const settle = this.settleForfeitedWorkspaceTurnContinuation;
-    if (settle == null) {
-      return;
-    }
-    for (const [key, owed] of this.owedForfeitSettlements) {
-      if (owed.inFlight) {
-        continue;
-      }
-      owed.inFlight = true;
-      void settle(owed.correlation, owed.reason)
-        .then(() => {
-          if (this.owedForfeitSettlements.get(key) === owed) {
-            this.owedForfeitSettlements.delete(key);
-          }
-        })
-        .catch((error: unknown) => {
-          owed.inFlight = false;
-          log.warn("Failed to settle forfeited workspace turn continuation; retrying", {
-            workspaceId: this.workspaceId,
-            error: getErrorMessage(error),
-          });
-          this.scheduleOwedForfeitSettlementRetry();
+    assert(settle != null, "an owed forfeit settlement requires a settler");
+    owed.inFlight = settle(owed.correlation, owed.reason).then(
+      () => {
+        if (this.owedForfeitSettlements.get(owed.key) === owed) {
+          this.owedForfeitSettlements.delete(owed.key);
+        }
+        return true;
+      },
+      (error: unknown) => {
+        owed.inFlight = undefined;
+        log.warn("Failed to settle forfeited workspace turn continuation; retrying", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
         });
-    }
+        this.scheduleOwedForfeitSettlementRetry();
+        return false;
+      }
+    );
+    return owed.inFlight;
   }
 
   private scheduleOwedForfeitSettlementRetry(): void {
@@ -8219,11 +8275,16 @@ export class AgentSession {
       parsePersistedWorkspaceTurnMetadata(followUp.muxMetadata) ??
       parsePersistedWorkspaceTurnMetadata(followUp.workspaceTurnMetadata);
     const dropFollowUp = async (reason: string): Promise<false> => {
-      this.forfeitWorkspaceTurnContinuation(
+      // The owner's terminal record lands before the follow-up leaves history: the owed
+      // settlement is memory, so a crash between the two would strand the handle for good. A
+      // failed attempt keeps the follow-up pending for the next startup to re-drop and re-settle.
+      const settled = await this.forfeitWorkspaceTurnContinuation(
         continuedTurn,
         `Compaction follow-up dropped: ${reason}`
       );
-      await this.clearPendingFollowUpFromSummary(lastMessage);
+      if (settled) {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+      }
       return false;
     };
 
@@ -8476,7 +8537,8 @@ export class AgentSession {
       persistedGoalId,
       persistedStepBudget,
       revalidateAdmission,
-      persistedFallbackProgress?.success ? persistedFallbackProgress.data : undefined
+      persistedFallbackProgress?.success ? persistedFallbackProgress.data : undefined,
+      continuedTurn
     );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
@@ -8502,22 +8564,26 @@ export class AgentSession {
         ? persistedFallbackProgress.data
         : undefined,
       revalidateAdmission,
+      // The wake's own metadata does not carry the delegated turn; its retries must still
+      // revalidate against that turn's handle.
+      workspaceTurnMetadata: continuedTurn,
     });
-    // The workspace or the delegated turn stopped admitting the follow-up during its preflight
-    // (an Err) or at the launch boundary (StreamManager refuses as a startup-aborted Ok handle,
-    // like a refused stranded resume): no successor stream, so the turn is settled and the
-    // follow-up dropped.
-    if (turnAdmissionStale?.() === true) {
-      log.info("Pending follow-up refused at admission: workspace or delegated turn", {
+    // The goal, the workspace, or the delegated turn stopped admitting the follow-up during its
+    // preflight (an Err) or at the launch boundary (StreamManager refuses as a startup-aborted Ok
+    // handle, like a refused stranded resume): no successor stream, so the turn is settled and
+    // the follow-up dropped.
+    if (launchAdmissionStale?.() === true) {
+      log.info("Pending follow-up refused at admission: goal, workspace, or delegated turn", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
+        goalRefused: goalAdmissionStale?.() === true,
       });
-      return dropFollowUp("the workspace or delegated turn no longer admits it.");
+      return dropFollowUp("no longer admitted by its goal, workspace, or delegated turn.");
     }
     if (!sendResult.success) {
-      // A stale-admission refusal is the idle rule (or a goal transition)
-      // working as intended, not a recovery failure: route it through the
-      // same skip path as the pre-send check instead of throwing.
+      // A stale-admission refusal is the idle rule working as intended, not a
+      // recovery failure: route it through the same skip path as the pre-send
+      // check instead of throwing.
       if (followUpAdmissionStale?.() === true) {
         log.info("Pending follow-up refused at send admission; skipping it", {
           workspaceId: this.workspaceId,
