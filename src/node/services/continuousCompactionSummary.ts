@@ -1,0 +1,185 @@
+import { streamText, wrapLanguageModel } from "ai";
+import assert from "@/common/utils/assert";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import type { MuxMessage } from "@/common/types/message";
+import { coerceThinkingLevel } from "@/common/types/thinking";
+import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
+import {
+  buildProviderOptions,
+  buildRequestHeaders,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import type { Config } from "@/node/config";
+import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
+import type { AgentSessionAIService } from "./agentSession";
+import { resolveAgentForStream } from "./agentResolution";
+import {
+  resolveAgentBody,
+  getSkipScopesAboveForKnownScope,
+} from "./agentDefinitions/agentDefinitionsService";
+import type { ContinuousCompactionContext } from "./continuousCompactor";
+import { looksLikeRawJsonObject } from "./compactionHandler";
+import { prepareMessagesForProvider } from "./messagePipeline";
+import { runLanguageModelCleanup } from "./languageModelCleanup";
+import { modelCostsIncluded } from "./providerModelFactory";
+import type { SessionUsageService } from "./sessionUsageService";
+
+/** A headless compact-agent call: no workspace stream or compaction request row. */
+export async function summarizeContinuousCompaction(args: {
+  workspaceId: string;
+  config: Config;
+  aiService: AgentSessionAIService;
+  sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
+  head: MuxMessage[];
+  signal: AbortSignal;
+  context: ContinuousCompactionContext;
+  baseOptions: SendMessageOptions;
+  compactOptions: SendMessageOptions;
+}): Promise<{ text: string; model: string }> {
+  args.signal.throwIfAborted();
+  const providersConfig = args.aiService.getProvidersConfig();
+  let options = args.compactOptions;
+  const compactLimit = getEffectiveContextLimit(
+    options.model,
+    isAnthropic1MEffectivelyEnabled(options.model, options.providerOptions, providersConfig),
+    providersConfig
+  );
+  const headTokens = args.head.reduce((total, row) => total + estimateMuxMessageTokens(row), 0);
+  if (!compactLimit || headTokens > compactLimit * SUMMARIZER_INPUT_FRACTION) {
+    // Do not truncate the head to fit a cheaper compact model: use the active
+    // model's configured route, or leave the old compaction safety net in charge.
+    options = args.baseOptions;
+    assert(
+      headTokens <= args.context.contextWindowTokens * SUMMARIZER_INPUT_FRACTION,
+      "Continuous compaction head exceeds the summarizer input budget"
+    );
+  }
+  const modelString = options.model;
+  const thinkingLevel = enforceThinkingPolicy(
+    modelString,
+    coerceThinkingLevel(options.thinkingLevel) ?? "off",
+    undefined,
+    providersConfig
+  );
+  const metadata = await args.aiService.getWorkspaceMetadata(args.workspaceId);
+  if (!metadata.success) throw new Error(metadata.error);
+  args.signal.throwIfAborted();
+  const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata.data);
+  const agent = await resolveAgentForStream({
+    workspaceId: args.workspaceId,
+    metadata: metadata.data,
+    runtime,
+    workspacePath,
+    requestedAgentId: "compact",
+    disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
+    callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
+    cfg: args.config.loadConfigOrDefault(),
+    emitError: () => undefined,
+    includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
+  });
+  if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
+  const system = await resolveAgentBody(
+    agent.data.agentDiscoveryRuntime,
+    agent.data.agentDiscoveryPath,
+    agent.data.agentDefinition.id,
+    {
+      includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
+      skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
+    }
+  );
+  args.signal.throwIfAborted();
+  const created = await args.aiService.createModelWithPinnedMetadata(modelString, {
+    workspaceId: args.workspaceId,
+    agentInitiated: true,
+  });
+  if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
+  try {
+    args.signal.throwIfAborted();
+    const messages = await prepareMessagesForProvider({
+      messagesWithSentinel: args.head,
+      effectiveAgentId: "compact",
+      toolNamesForSentinel: [],
+      postCompactionAttachments: null,
+      providerForMessages: created.data.metadataModel.split(":", 1)[0],
+      effectiveThinkingLevel: thinkingLevel,
+      modelString,
+      providersConfig,
+      workspaceId: args.workspaceId,
+    });
+    messages.push({
+      role: "user",
+      content: `${buildCompactionMessageText({})}\nThe most recent steps remain verbatim after this summary.`,
+    });
+    args.signal.throwIfAborted();
+    assert(
+      typeof created.data.model !== "string",
+      "Pinned model creation must return a model instance"
+    );
+    const stream = streamText({
+      // The SDK checks cancellation only after the next chunk. Piping with a
+      // signal also cancels a provider that stalls while ignoring abortSignal.
+      model: wrapLanguageModel({
+        model: created.data.model,
+        middleware: {
+          specificationVersion: "v3",
+          wrapStream: async ({ doStream }) => {
+            const response = await doStream();
+            return {
+              ...response,
+              stream: response.stream.pipeThrough(new TransformStream(), { signal: args.signal }),
+            };
+          },
+        },
+      }),
+      system,
+      messages,
+      abortSignal: args.signal,
+      providerOptions: buildProviderOptions(
+        modelString,
+        thinkingLevel,
+        args.head,
+        undefined,
+        options.providerOptions,
+        args.workspaceId,
+        undefined,
+        providersConfig,
+        getExplicitGatewayPrefix(modelString),
+        undefined,
+        options.reasoningMode
+      ) as NonNullable<Parameters<typeof streamText>[0]["providerOptions"]>,
+      headers: buildRequestHeaders(
+        modelString,
+        options.providerOptions,
+        args.workspaceId,
+        providersConfig,
+        getExplicitGatewayPrefix(modelString)
+      ),
+    });
+    const text = (await stream.text).trim();
+    const [usage, providerMetadata] = await Promise.all([stream.usage, stream.providerMetadata]);
+    await args.sessionUsageService?.recordHeadlessUsage(
+      args.workspaceId,
+      modelString,
+      usage,
+      providerMetadata,
+      {
+        metadataModel: created.data.metadataModel,
+        costsIncluded: modelCostsIncluded(created.data.model),
+        analyticsSource: "continuous-compaction",
+      }
+    );
+    args.signal.throwIfAborted();
+    assert(
+      text.length > 0 && !looksLikeRawJsonObject(text),
+      "Continuous compaction requires a prose summary"
+    );
+    return { text, model: modelString };
+  } finally {
+    runLanguageModelCleanup(created.data.model);
+  }
+}

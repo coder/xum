@@ -198,6 +198,13 @@ import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
+import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
+
+type SessionCompactionContext = ContinuousCompactionContext & {
+  sendOptions?: SendMessageOptions;
+};
 
 /**
  * Result shape for turn-starting session methods. failureHandled marks errors
@@ -535,7 +542,12 @@ export interface AgentSessionMetadataEvent {
 interface AgentSessionActiveStreamInfo {
   messageId: string;
   startTime?: number;
-  parts: Array<{ timestamp?: number; workflowRun?: { timestamp?: number } }>;
+  parts: Array<
+    MuxMessage["parts"][number] & { timestamp?: number; workflowRun?: { timestamp?: number } }
+  >;
+  stepStartIndices?: readonly number[];
+  currentStepStartIndex?: number;
+  initialMetadata?: { systemMessageTokens?: number };
   toolCompletionTimestamps: Map<string, number>;
 }
 
@@ -705,6 +717,7 @@ export class AgentSession {
   private readonly messageQueue = new MessageQueue();
   private readonly compactionHandler: CompactionHandler;
   private readonly compactionMonitor: CompactionMonitor;
+  private readonly continuousCompactor: ContinuousCompactor;
 
   private autoRetryStarting = false;
   private readonly retryManager: RetryManager;
@@ -722,9 +735,11 @@ export class AgentSession {
 
   /** Latest context-usage snapshot used for on-send compaction checks. */
   private lastUsageState?: AutoCompactionUsageState;
+  private lastSystemMessageTokens?: number;
 
   /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
   private midStreamCompactionPending = false;
+  private continuousCompactionAbandoned = false;
 
   /** Tracks file state for detecting external edits. */
   private readonly fileChangeTracker = new FileChangeTracker();
@@ -959,6 +974,50 @@ export class AgentSession {
       (event: CompactionStatusEvent) => this.emitChatEvent(event)
     );
 
+    this.continuousCompactor = new ContinuousCompactor({
+      workspaceId: this.workspaceId,
+      historyService: this.historyService,
+      compactionHandler: this.compactionHandler,
+      streamManager: {
+        isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
+        getStreamInfo: (workspaceId) => {
+          const info = this.streamManager.getStreamInfo(workspaceId);
+          return (
+            info && {
+              ...info,
+              stepStartIndices: info.stepStartIndices ?? [],
+              currentStepStartIndex: info.currentStepStartIndex ?? 0,
+            }
+          );
+        },
+      },
+      prepare: () =>
+        eventSpine.run("compaction.prepare", {
+          workspaceId: this.workspaceId,
+          reason: "continuous-eager",
+        }),
+      summarize: (head, signal, context: SessionCompactionContext) => {
+        const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
+        const request = this.buildAutoCompactionRequest({
+          baseOptions,
+          followUpContent: { text: "Continue", model: context.model, agentId: "exec" },
+          reason: "on-send",
+        });
+        return summarizeContinuousCompaction({
+          workspaceId: this.workspaceId,
+          config: this.config,
+          aiService: this.aiService,
+          sessionUsageService: this.sessionUsageService,
+          head,
+          signal,
+          context,
+          baseOptions,
+          compactOptions: request.sendOptions,
+        });
+      },
+      fastApply: (apply) => this.interruptForContinuousCompaction(apply),
+    });
+
     this.retryManager = new RetryManager(
       this.workspaceId,
       async () => {
@@ -980,6 +1039,7 @@ export class AgentSession {
    */
   beginShutdown(): void {
     this.shuttingDown = true;
+    this.continuousCompactor.reset("shutdown");
     this.retryManager.cancel();
   }
 
@@ -988,6 +1048,7 @@ export class AgentSession {
       return;
     }
     this.disposed = true;
+    this.continuousCompactor.reset("dispose");
 
     this.activePreparedTurnAbortController?.abort();
     this.activePreparedTurnAbortController = null;
@@ -3137,6 +3198,7 @@ export class AgentSession {
      */
     const rollbackPersistedTurnRows = async (): Promise<boolean> => {
       if (persistedCancelableMessageIds.length === 0) return true;
+      this.continuousCompactor.reset("delete-messages");
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
         persistedCancelableMessageIds
@@ -3165,6 +3227,7 @@ export class AgentSession {
       if (persistedCancelableMessageIds.length > 0) {
         // History also has non-session writers (for example goal pause boundaries). Delete exactly
         // this preparing turn's rows in one atomic rewrite so later concurrent rows are preserved.
+        this.continuousCompactor.reset("delete-messages");
         const rollbackResult = await this.historyService.deleteMessages(
           this.workspaceId,
           persistedCancelableMessageIds
@@ -3425,6 +3488,7 @@ export class AgentSession {
     using _editAdmission = editAdmission;
 
     if (editMessageId) {
+      this.continuousCompactor.reset("edit");
       // Ensure no in-flight completion code can append after we truncate.
       if (this.isBusy()) {
         let preemptedPreparing = false;
@@ -3599,6 +3663,9 @@ export class AgentSession {
       normalizeDelegatedToolNames(options?.delegatedToolNames) ??
       extractAcpDelegatedTools(typedMuxMetadata);
     const isCompactionRequest = isCompactionRequestMetadata(typedMuxMetadata);
+    if (isCompactionRequest) {
+      this.continuousCompactor.reset("compaction-request");
+    }
 
     // Internal callers can force Copilot billing attribution for non-user turns
     // (task orchestration, compaction, auto-resume, etc.).
@@ -3672,7 +3739,12 @@ export class AgentSession {
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
-    if (!isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
+    if (
+      !isCompactionRequest &&
+      !editMessageId &&
+      !hasPreTurnMessages &&
+      !this.midStreamCompactionPending
+    ) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
@@ -3693,13 +3765,29 @@ export class AgentSession {
         providersConfig: providersConfigForCompaction,
       });
 
-      // On-send compaction uses the configured threshold directly so we compact
-      // before dispatching a risky user turn near the context limit.
-      // `shouldForceCompact` remains a stricter (threshold + buffer) signal for
-      // mid-stream forcing where we want to avoid abrupt interruptions too early.
+      const continuousContext = this.getContinuousCompactionContext(
+        modelForStream,
+        optionsForStream
+      );
+      if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
+      const continuousResult = continuousContext.enabled
+        ? await this.continuousCompactor.observe(compactionResult.usagePercentage, {
+            ...continuousContext,
+            phase: "on-send",
+          })
+        : "none";
+      if (continuousResult === "applied") this.clearUsageState();
+      if (await cancelBeforeAcceptance()) return Ok(undefined);
+
+      // A staged fold needs no compact turn. Without one, the experiment waits
+      // until the force threshold; the legacy path retains its on-send threshold.
       const shouldCompactBeforeSend =
-        compactionResult.usagePercentage >= compactionResult.thresholdPercentage;
+        this.compactionMonitor.getThreshold() < 1 &&
+        (continuousContext.enabled
+          ? continuousResult === "fallback" && compactionResult.shouldForceCompact
+          : compactionResult.usagePercentage >= compactionResult.thresholdPercentage);
       if (shouldCompactBeforeSend) {
+        this.continuousCompactor.reset("legacy-fallback");
         const followUpFileParts = effectiveFileParts?.map((part) => ({
           url: part.url,
           mediaType: part.mediaType,
@@ -4326,7 +4414,9 @@ export class AgentSession {
 
   setAutoCompactionThreshold(threshold: number): void {
     this.assertNotDisposed("setAutoCompactionThreshold");
+    const previous = this.compactionMonitor.getThreshold();
     this.compactionMonitor.setThreshold(threshold);
+    if (previous !== threshold) this.continuousCompactor.reset("threshold-changed");
   }
 
   private getUsageState(): AutoCompactionUsageState | undefined {
@@ -4408,6 +4498,7 @@ export class AgentSession {
 
   /** Prevent cached usage from auto-compacting a rewritten context. */
   clearUsageState(): void {
+    this.continuousCompactor.reset("context-changed");
     this.lastUsageState = undefined;
   }
 
@@ -4527,6 +4618,7 @@ export class AgentSession {
           continue;
         }
 
+        this.lastSystemMessageTokens = meta.systemMessageTokens;
         this.updateUsageStateFromModelUsage({
           model: meta.model,
           usage: meta.contextUsage,
@@ -4798,6 +4890,167 @@ export class AgentSession {
     };
   }
 
+  private getContinuousCompactionContext(
+    model: string,
+    options?: SendMessageOptions
+  ): SessionCompactionContext {
+    const providersConfig = this.getProvidersConfigSafe();
+    const enabled =
+      options?.experiments?.continuousCompaction ??
+      (typeof this.aiService.isExperimentEnabled === "function" &&
+        this.aiService.isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION));
+    return {
+      enabled:
+        enabled &&
+        this.compactionMonitor.getThreshold() < 1 &&
+        !this.disposed &&
+        !this.shuttingDown &&
+        !this.continuousCompactionAbandoned &&
+        this.turnAdmissionBlocks === 0 &&
+        this.editAdmissionDepth === 0 &&
+        !this.isWorkspaceArchivedOnDisk(),
+      model,
+      contextWindowTokens:
+        getEffectiveContextLimit(
+          model,
+          this.is1MContextEnabledForModel(model, options, providersConfig),
+          providersConfig
+        ) ?? 0,
+      thresholdPercent: this.compactionMonitor.getThreshold() * 100,
+      systemMessageTokens:
+        this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
+        this.lastSystemMessageTokens,
+      sendOptions: options,
+    };
+  }
+
+  private async observeContinuousCompactionAtStreamEnd(
+    model: string,
+    options?: SendMessageOptions
+  ): Promise<void> {
+    // fastApply waits for this handler to reach IDLE; waiting on its latch here
+    // (or re-entering it from the generated Continue send) would deadlock.
+    if (this.midStreamCompactionPending || this.deferQueuedFlushUntilAfterEdit) return;
+    const context = this.getContinuousCompactionContext(model, options);
+    if (!context.enabled) {
+      this.continuousCompactor.reset("disabled");
+      return;
+    }
+    const usage = this.compactionMonitor.checkBeforeSend({
+      model,
+      usage: this.getUsageState(),
+      use1MContext: this.is1MContextEnabledForModel(model, options, this.getProvidersConfigSafe()),
+      providersConfig: this.getProvidersConfigSafe(),
+    });
+    const result = await this.continuousCompactor.observe(usage.usagePercentage, {
+      ...context,
+      phase: "stream-end",
+    });
+    if (result === "applied") this.clearUsageState();
+  }
+
+  private async interruptForContinuousCompaction(
+    apply: (pendingFollowUp?: CompactionFollowUpRequest) => Promise<boolean>
+  ): Promise<boolean> {
+    const context = this.activeStreamContext;
+    if (
+      this.midStreamCompactionPending ||
+      !context?.options ||
+      this.disposed ||
+      this.shuttingDown
+    ) {
+      return false;
+    }
+    this.midStreamCompactionPending = true;
+    try {
+      const stopped = await this.streamManager.stopStream(this.workspaceId, {
+        abortReason: "system",
+      });
+      if (!stopped.success) return false;
+      await this.waitForIdle();
+      if (
+        this.disposed ||
+        this.shuttingDown ||
+        this.continuousCompactionAbandoned ||
+        this.isWorkspaceArchivedOnDisk()
+      )
+        return false;
+      const followUp = this.buildAutoCompactionFollowUp({
+        messageText: "Continue",
+        modelForStream: context.modelString,
+        options: context.options,
+        agentInitiated: context.agentInitiated,
+        goalKind: context.goalKind,
+        goalId: context.goalId,
+        muxMetadata: context.workspaceTurnMetadata,
+      });
+      followUp.dispatchOptions = { ...followUp.dispatchOptions, source: "internal-resume" };
+      if (!(await apply(followUp))) {
+        // The completed step can outgrow the staged tail budget during stop.
+        // We already interrupted the turn, so recover using its captured context
+        // rather than relying on activeStreamContext (cleared by stream-abort).
+        if (
+          this.continuousCompactionAbandoned ||
+          this.disposed ||
+          this.shuttingDown ||
+          this.isWorkspaceArchivedOnDisk() ||
+          this.turnAdmissionBlocks > 0
+        )
+          return false;
+        const pressure = this.compactionMonitor.checkBeforeSend({
+          model: context.modelString,
+          usage: this.getUsageState(),
+          use1MContext: this.is1MContextEnabledForModel(
+            context.modelString,
+            context.options,
+            context.providersConfig
+          ),
+          providersConfig: context.providersConfig,
+        });
+        if (pressure.shouldForceCompact) {
+          await eventSpine.run("compaction.prepare", {
+            workspaceId: this.workspaceId,
+            reason: "mid-stream",
+          });
+        }
+        const fallback = pressure.shouldForceCompact
+          ? this.buildAutoCompactionRequest({
+              baseOptions: context.options,
+              followUpContent: followUp,
+              reason: "mid-stream",
+            })
+          : undefined;
+        this.continuousCompactor.reset("failed-fast-apply");
+        const sent = await this.sendMessage(
+          fallback?.messageText ?? followUp.text,
+          fallback ? { ...fallback.sendOptions, muxMetadata: fallback.metadata } : context.options,
+          {
+            synthetic: true,
+            agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
+            goalKind: fallback ? undefined : context.goalKind,
+            goalId: fallback ? undefined : context.goalId,
+            admissionStale: () => this.continuousCompactionAbandoned,
+          }
+        );
+        if (!sent.success && !sent.failureHandled && !this.continuousCompactionAbandoned) {
+          this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(sent.error)));
+        }
+        return false;
+      }
+      this.lastUsageState = undefined;
+      const summaryId = this.pendingCompactionFollowUpSummaryId;
+      this.pendingCompactionFollowUpSummaryId = null;
+      await this.dispatchPendingFollowUp(
+        summaryId ?? undefined,
+        () => this.continuousCompactionAbandoned
+      );
+      return true;
+    } finally {
+      this.midStreamCompactionPending = false;
+      this.drainQueuedMessagesIfIdle();
+    }
+  }
+
   private async interruptForCompaction(): Promise<void> {
     if (this.midStreamCompactionPending || this.disposed) {
       return;
@@ -4809,6 +5062,7 @@ export class AgentSession {
     }
 
     const interruptedUserMessageId = this.activeStreamUserMessageId;
+    this.continuousCompactor.reset("legacy-fallback");
 
     this.midStreamCompactionPending = true;
     try {
@@ -4918,6 +5172,10 @@ export class AgentSession {
     abandonPartial?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
+    if (options?.abandonPartial || this.midStreamCompactionPending) {
+      this.continuousCompactionAbandoned = true;
+      this.continuousCompactor.reset("user-interrupt");
+    }
 
     // Explicit user interruption should immediately stop any pending auto-retry loop.
     this.retryManager.cancel();
@@ -5327,6 +5585,7 @@ export class AgentSession {
   }
 
   private async clearFailedAssistantMessage(messageId: string, reason: string): Promise<void> {
+    this.continuousCompactor.reset("delete-message");
     const [partialResult, deleteMessageResult] = await Promise.all([
       this.historyService.deletePartial(this.workspaceId),
       this.historyService.deleteMessage(this.workspaceId, messageId),
@@ -5844,6 +6103,7 @@ export class AgentSession {
 
     forward("stream-start", (payload) => {
       if (payload.type === "stream-start") {
+        this.continuousCompactionAbandoned = false;
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
@@ -5965,6 +6225,27 @@ export class AgentSession {
 
       const streamContext = this.activeStreamContext;
       const streamOptions = streamContext?.options;
+      if (streamContext?.modelString !== modelForUsage) return;
+      const continuousContext = this.getContinuousCompactionContext(modelForUsage, streamOptions);
+      const usagePercent =
+        continuousContext.contextWindowTokens > 0
+          ? ((payload.usage.inputTokens ?? payload.usage.cachedInputTokens ?? 0) /
+              continuousContext.contextWindowTokens) *
+            100
+          : 0;
+      if (!continuousContext.enabled) this.continuousCompactor.reset("disabled");
+      const continuousResult = continuousContext.enabled
+        ? await this.continuousCompactor.observe(usagePercent, {
+            ...continuousContext,
+            phase: "mid-stream",
+          })
+        : "none";
+      if (
+        continuousResult === "applied" ||
+        (continuousContext.enabled && continuousResult !== "fallback")
+      )
+        return;
+      if (this.activeStreamContext !== streamContext) return;
       const shouldInterruptForCompaction = this.compactionMonitor.checkMidStream({
         model: modelForUsage,
         usage: payload.usage,
@@ -6023,6 +6304,10 @@ export class AgentSession {
 
       this.setTurnPhase(TurnPhase.COMPLETING);
       const activeModelForAbort = this.activeStreamContext?.modelString;
+      const activeOptionsForAbort = this.activeStreamContext?.options;
+      this.lastSystemMessageTokens =
+        this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
+        this.lastSystemMessageTokens;
       if (activeModelForAbort) {
         this.updateUsageStateFromModelUsage({
           model: activeModelForAbort,
@@ -6064,6 +6349,12 @@ export class AgentSession {
       this.setTerminalStreamLifecycle("interrupted", { abortReason });
       this.activeCompactionRequest = undefined;
       this.resetActiveStreamState();
+      if (!hadCompactionRequest && activeModelForAbort && !this.continuousCompactionAbandoned) {
+        await this.observeContinuousCompactionAtStreamEnd(
+          activeModelForAbort,
+          activeOptionsForAbort
+        );
+      }
       if (hadCompactionRequest && !this.disposed) {
         this.clearQueue();
       }
@@ -6115,6 +6406,8 @@ export class AgentSession {
         if (completedCompactionRequest != null) {
           this.beginCompactionCompletionDecision(streamEndPayload.messageId);
         }
+        this.lastSystemMessageTokens =
+          streamEndPayload.metadata.systemMessageTokens ?? this.lastSystemMessageTokens;
         this.updateUsageStateFromModelUsage({
           model: streamEndPayload.metadata.model,
           usage: streamEndPayload.metadata.contextUsage,
@@ -6177,6 +6470,12 @@ export class AgentSession {
         // IMPORTANT: reset BEFORE anything that can start a new stream,
         // so the next turn doesn't get its state clobbered by our cleanup.
         this.resetActiveStreamState();
+        if (!handled && !completedCompactionRequest) {
+          await this.observeContinuousCompactionAtStreamEnd(
+            streamEndPayload.metadata.model,
+            activeStreamOptions
+          );
+        }
 
         if (handled) {
           // Dispatch follow-up AFTER reset so it can set its own stream state. Child lifecycle
@@ -6399,6 +6698,7 @@ export class AgentSession {
    * deleting the partial removes the discarded transcript's tail durably.
    */
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
+    this.continuousCompactor.reset("context-mutation");
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
@@ -6425,6 +6725,7 @@ export class AgentSession {
    * check.
    */
   holdTurnAdmission(): Disposable {
+    this.continuousCompactor.reset("context-mutation");
     this.turnAdmissionBlocks += 1;
     let released = false;
     return {
@@ -7161,7 +7462,10 @@ export class AgentSession {
    * for crash safety. The user message persisted by sendMessage() serves as
    * proof of dispatch (no history rewrite needed).
    */
-  private async dispatchPendingFollowUp(summaryMessageId?: string): Promise<boolean> {
+  private async dispatchPendingFollowUp(
+    summaryMessageId?: string,
+    cancelResume?: () => boolean
+  ): Promise<boolean> {
     if (this.disposed || this.shuttingDown) {
       return false;
     }
@@ -7242,6 +7546,13 @@ export class AgentSession {
 
     // Check if it's a compaction summary with a pending follow-up
     if (!isCompactionSummaryMetadata(muxMeta) || !muxMeta.pendingFollowUp) {
+      return false;
+    }
+
+    // A user can abandon after the boundary commits but before its continuation
+    // dispatches. Keep the fold, but remove the crash-recoverable resume intent.
+    if (cancelResume?.()) {
+      await this.clearPendingFollowUpFromSummary(lastMessage);
       return false;
     }
 
@@ -7365,8 +7676,11 @@ export class AgentSession {
           (this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING)
       : undefined;
     const followUpAdmissionStale =
-      idleRuleStale != null || goalAdmissionStale != null
-        ? () => idleRuleStale?.() === true || goalAdmissionStale?.() === true
+      idleRuleStale != null || goalAdmissionStale != null || cancelResume != null
+        ? () =>
+            idleRuleStale?.() === true ||
+            goalAdmissionStale?.() === true ||
+            cancelResume?.() === true
         : undefined;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
@@ -7447,6 +7761,11 @@ export class AgentSession {
       return false;
     }
 
+    if (cancelResume?.()) {
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
+
     // The compaction summary is now the source of truth for the next live resume
     // request. Pre-arm retry state from the reconstructed follow-up so failures
     // before stream startup do not fall back to the already-completed compact turn.
@@ -7476,6 +7795,10 @@ export class AgentSession {
       admissionStale: followUpAdmissionStale,
     });
     if (!sendResult.success) {
+      if (cancelResume?.()) {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+        return false;
+      }
       // A stale-admission refusal is the idle rule (or a goal transition)
       // working as intended, not a recovery failure: route it through the
       // same skip path as the pre-send check instead of throwing.

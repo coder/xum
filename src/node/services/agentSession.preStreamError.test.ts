@@ -21,7 +21,7 @@ import { createTestHistoryService } from "./testHistoryService";
 interface ReplayHarnessStreamInfo {
   messageId: string;
   startTime: number;
-  parts: Array<{ timestamp?: number }>;
+  parts: Array<{ type: "text"; text: string; timestamp?: number }>;
   toolCompletionTimestamps: Map<string, number>;
 }
 
@@ -563,7 +563,7 @@ describe("AgentSession pre-stream errors", () => {
         streamInfo: {
           messageId: "msg-live-clamp",
           startTime: 1_000,
-          parts: [{ timestamp: 100 }],
+          parts: [{ type: "text", text: "partial", timestamp: 100 }],
           toolCompletionTimestamps: new Map(),
         },
       }
