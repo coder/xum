@@ -447,13 +447,20 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       getThreshold: mock(() => 0.7),
     } as unknown as CompactionMonitor;
 
+    const onAccepted = mock(() => Promise.resolve());
     const result = await session.sendMessage(
       "hello",
-      { model: "openai:gpt-4o", agentId: "exec" },
-      { admissionStale: () => true }
+      {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      },
+      { admissionStale: () => true, onAccepted }
     );
     expect(result.success).toBe(false);
     expect(streamMessage).not.toHaveBeenCalled();
+    // The row is gone, so the wake lease stays released for the reconciler to re-derive.
+    expect(onAccepted).not.toHaveBeenCalled();
 
     const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(historyResult.success).toBe(true);
@@ -465,6 +472,62 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         (message) => message.metadata?.muxMetadata?.type === "compaction-request"
       )
     ).toBe(false);
+
+    session.dispose();
+  });
+
+  test("a refused wake whose compaction row cannot be rolled back consumes its lease", async () => {
+    // If the rollback fails the row stays durable and startup recovery will resume it with the
+    // wake as its follow-up. Releasing the lease too would have the reconciler deliver the same
+    // output a second time (possibly after the monitor retracted it), so the refusal must
+    // consume the wake and leave the durable row as its only carrier.
+    const workspaceId = "ws-auto-compaction-rollback-failure-consumes-wake";
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, historyService } = await createSessionHarness({
+      workspaceId,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    });
+
+    (session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: false,
+        usagePercentage: 72,
+        thresholdPercentage: 70,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.7),
+    } as unknown as CompactionMonitor;
+    spyOn(historyService, "deleteMessages").mockImplementationOnce(() =>
+      Promise.resolve(Err("disk unavailable"))
+    );
+
+    const onAccepted = mock(() => Promise.resolve());
+    const result = await session.sendMessage(
+      "hello",
+      {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+      },
+      { admissionStale: () => true, onAccepted }
+    );
+    expect(result.success).toBe(false);
+    expect(streamMessage).not.toHaveBeenCalled();
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`failed to load history: ${String(historyResult.error)}`);
+    }
+    expect(
+      historyResult.data.some(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      )
+    ).toBe(true);
 
     session.dispose();
   });

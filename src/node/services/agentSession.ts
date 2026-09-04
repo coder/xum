@@ -3950,15 +3950,26 @@ export class AgentSession {
     // carries this send as its follow-up. Refusing without removing it would leave a compaction
     // request that startup recovery later resumes — for a bash-monitor wake whose lease is
     // released by this refusal, that resubmits output the reconciler has already re-derived.
+    //
+    // When the rollback itself fails the row stays durable and startup recovery WILL resume it,
+    // follow-up wake included. A wake must then be consumed (same convention as the `disposed`
+    // path below): leaving the lease released would have the reconciler redeliver output that
+    // the durable row already carries — twice, one copy of which the monitor may since have
+    // retracted. The refusal still stands; the row is the wake's only carrier from here.
+    const refuseAfterCompactionRow = async (message: string): Promise<AgentSessionResult<void>> => {
+      const rolledBack = await rollbackPersistedTurnRows();
+      if (!rolledBack && typedMuxMetadata?.type === "bash-monitor-wake") {
+        await internal?.onAccepted?.();
+      }
+      return Err(createUnknownSendMessageError(message));
+    };
     if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
-      await rollbackPersistedTurnRows();
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      return refuseAfterCompactionRow(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
     }
     // A row appended now would read as a dispatched turn on the next startup while
     // streamWithHistory's own latch check keeps its stream from ever running.
     if (this.shuttingDown) {
-      await rollbackPersistedTurnRows();
-      return Err(createUnknownSendMessageError(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE));
+      return refuseAfterCompactionRow(SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE);
     }
 
     // Persist snapshots only when this turn will be sent immediately.
