@@ -21,6 +21,17 @@ function base(overrides: Partial<ResolveAgentAiSettingsInput>): ResolveAgentAiSe
 }
 
 describe("resolveAgentAiSettings precedence", () => {
+  it("inherits the calling chat Exec model before global Exec defaults", () => {
+    const result = resolveAgentAiSettings({
+      targetAgentId: "exec",
+      profile: "subagent",
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-fable-5-1" } },
+      parentRuntime: { model: "openai:gpt-5-pro" },
+      parentWorkspaceExecSettings: { model: "openai:gpt-6-astra", thinkingLevel: "high" },
+    });
+    expect(result.selected.model).toBe("openai:gpt-6-astra");
+  });
+
   it("explicit values win independently per field", () => {
     const result = resolveAgentAiSettings(
       base({
@@ -240,6 +251,114 @@ describe("resolveAgentAiSettings precedence", () => {
     const result = resolveAgentAiSettings(base({ defaultModel: MODEL_C }));
     expect(result.selected.model).toBe(MODEL_C);
     expect(result.sources.model.tier).toBe("default");
+  });
+});
+
+describe("calling workspace Exec inheritance", () => {
+  const parent = { model: MODEL_A, thinkingLevel: "high" as const, reasoningMode: "pro" as const };
+  const input: ResolveAgentAiSettingsInput = {
+    targetAgentId: "exec",
+    profile: "subagent",
+    parentWorkspaceExecSettings: parent,
+    agentAiDefaults: {
+      exec: { modelString: MODEL_B, thinkingLevel: "low", reasoningMode: "standard" },
+    },
+    parentRuntime: { model: MODEL_C, thinkingLevel: "medium" },
+  };
+
+  it("inherits every supplied field with provenance, even without global config", () => {
+    for (const agentAiDefaults of [input.agentAiDefaults, undefined]) {
+      const result = resolveAgentAiSettings({ ...input, agentAiDefaults });
+      expect(result.selected).toEqual(parent);
+      for (const source of Object.values(result.sources)) {
+        expect(source).toEqual({ tier: "parent-workspace-exec", agentId: "exec" });
+      }
+      expect(result.effective.reasoningMode).toBeUndefined();
+    }
+  });
+
+  it("keeps explicit invocation, target workspace, and sub-agent profile precedence", () => {
+    const subagent = { modelString: MODEL_C };
+    const withSubagent = {
+      ...input,
+      agentAiDefaults: { exec: { modelString: MODEL_B, subagent } },
+    };
+    expect(resolveAgentAiSettings(withSubagent).sources.model.tier).toBe("config-subagent");
+    const workspace = { ...withSubagent, targetWorkspaceSettings: { model: MODEL_B } };
+    expect(resolveAgentAiSettings(workspace).sources.model.tier).toBe("workspace");
+    const explicit = resolveAgentAiSettings({ ...workspace, explicit: { model: MODEL_C } });
+    expect(explicit.sources.model.tier).toBe("explicit");
+    expect(explicit.selected.thinkingLevel).toBe("high");
+    expect(explicit.sources.thinkingLevel.tier).toBe("parent-workspace-exec");
+  });
+
+  it("resolves partial profile and parent layers independently", () => {
+    const thinkingOnly = resolveAgentAiSettings({
+      ...input,
+      agentAiDefaults: { exec: { modelString: MODEL_B, subagent: { thinkingLevel: "low" } } },
+    });
+    expect(thinkingOnly.selected).toEqual({ ...parent, thinkingLevel: "low" });
+    const modelOnly = resolveAgentAiSettings({
+      ...input,
+      agentAiDefaults: { exec: { modelString: MODEL_B, subagent: { modelString: MODEL_C } } },
+    });
+    expect(modelOnly.selected).toEqual({ ...parent, model: MODEL_C });
+    const reasoningOnly = resolveAgentAiSettings({
+      ...input,
+      parentWorkspaceExecSettings: { reasoningMode: "pro" },
+    });
+    expect(reasoningOnly.selected).toEqual({
+      model: MODEL_B,
+      thinkingLevel: "low",
+      reasoningMode: "pro",
+    });
+    const missing = resolveAgentAiSettings({ ...input, parentWorkspaceExecSettings: undefined });
+    expect(missing.sources.model.tier).toBe("config");
+  });
+
+  it("falls through empty parent models without discarding valid fields", () => {
+    const result = resolveAgentAiSettings({
+      ...input,
+      parentWorkspaceExecSettings: { model: " ", thinkingLevel: "medium" },
+    });
+    expect(result.selected.model).toBe(MODEL_B);
+    expect(result.selected.thinkingLevel).toBe("medium");
+    expect(result.diagnostics).toHaveLength(1);
+  });
+
+  it.each(["plan", "explore", "desktop", "custom"])(
+    "does not promote Exec context for %s targets or ancestors",
+    (targetAgentId) => {
+      for (const ancestors of [undefined, [{ agentId: "exec" }]]) {
+        const scoped = { ...input, targetAgentId, ancestors };
+        expect(resolveAgentAiSettings(scoped)).toEqual(
+          resolveAgentAiSettings({ ...scoped, parentWorkspaceExecSettings: undefined })
+        );
+      }
+    }
+  );
+
+  it("leaves interactive Exec unchanged", () => {
+    const scoped = { ...input, profile: "interactive" as const };
+    expect(resolveAgentAiSettings(scoped)).toEqual(
+      resolveAgentAiSettings({ ...scoped, parentWorkspaceExecSettings: undefined })
+    );
+  });
+
+  it("normalizes thinking and gates reasoning against the final model", () => {
+    const result = resolveAgentAiSettings({
+      ...input,
+      parentWorkspaceExecSettings: {
+        model: "openai:gpt-5.2",
+        thinkingLevel: "off",
+        reasoningMode: "pro",
+      },
+      minThinkingLevelByModel: { "openai:gpt-5.2": "high" },
+    });
+    expect(result.selected.thinkingLevel).toBe("off");
+    expect(result.effective.thinkingLevel).toBe("high");
+    expect(result.selected.reasoningMode).toBe("pro");
+    expect(result.effective.reasoningMode).toBeUndefined();
   });
 });
 

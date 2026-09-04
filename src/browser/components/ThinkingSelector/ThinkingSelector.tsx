@@ -14,8 +14,10 @@ import {
 } from "@/browser/utils/fastModeServiceTier";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
+import assert from "@/common/utils/assert";
 import {
   getThinkingDisplayLabel,
+  THINKING_LEVELS,
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
@@ -38,22 +40,26 @@ const THINKING_OPTION_LABELS: Record<ThinkingLevel, string> = {
 
 // Friendly option label, provider-aware for xhigh/max so menu rows match the
 // trigger's branding (e.g. Opus 4.6 calls its top effort "Max", not "Extra High").
-function getThinkingMenuLabel(level: ThinkingLevel, capabilityModel: string): string {
-  if (level === "xhigh" || level === "max") {
+function getThinkingMenuLabel(level: ThinkingLevel, capabilityModel?: string): string {
+  if (capabilityModel && (level === "xhigh" || level === "max")) {
     return getThinkingDisplayLabel(level, capabilityModel) === "XHIGH" ? "Extra High" : "Max";
   }
   return THINKING_OPTION_LABELS[level];
 }
 
 export interface ThinkingInheritOption {
-  /** Row/trigger label shown while inherit is selected (e.g. "Inherit from UI Exec"). */
+  /** Row/trigger label shown while inherit is selected. */
   label: string;
   selected: boolean;
   onSelect: () => void;
 }
 
 interface ThinkingSelectorControlProps {
-  modelString: string;
+  modelString: string | undefined;
+  /** Delegated preferences may inherit a model that is only known at launch. */
+  modelCapabilitiesDeferred?: boolean;
+  /** Independent of effort/model inheritance; false denotes an explicit mode override. */
+  reasoningModeInherited?: boolean;
   thinkingLevel: ThinkingLevel;
   onThinkingLevelChange: (level: ThinkingLevel) => void;
   reasoningMode: OpenAIReasoningMode;
@@ -87,35 +93,53 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
   const variant = props.variant ?? "composer";
   const inheritSelected = props.inheritOption?.selected === true;
 
-  // Resolve mapped aliases so the selector offers the target model's ladder
-  // (e.g. an alias mapped to GPT-5.6 exposes native max).
-  const minimum = getMinimum(props.modelString);
-  const allowed = getAvailableThinkingLevels(props.modelString, minimum, providersConfig);
-  const effectiveThinkingLevel = enforceThinkingPolicy(
-    props.modelString,
-    props.thinkingLevel,
-    minimum,
-    providersConfig
-  );
-  // Label from the capability model so mapped aliases (e.g. xai:team-grok ->
-  // xai:grok-4.6) show the same provider-aware xhigh/max wording as the ladder.
-  const capabilityModel = resolveModelForMetadata(props.modelString, providersConfig ?? null);
-  const resolvedRoute = routing.resolveRoute(normalizeToCanonical(props.modelString)).route;
-  const proModeAvailable =
-    props.allowProMode !== false &&
-    openaiProModeAvailable(props.modelString, {
-      providersConfig,
-      resolvedRouteProvider: resolvedRoute,
-    });
-  const fastModeProvider =
-    props.allowFastMode !== false && providersConfig != null
-      ? getFastModeProvider(props.modelString, {
-          providersConfig,
-          resolvedRouteProvider: resolvedRoute,
-        })
-      : null;
+  const modelCapabilitiesDeferred = props.modelCapabilitiesDeferred ?? false;
+  const reasoningModeInherited = props.reasoningModeInherited === true;
+  const { allowed, effectiveThinkingLevel, capabilityModel, proModeAvailable, fastModeProvider } =
+    (() => {
+      // The calling chat's model is unknown in Settings. Store preferences without
+      // borrowing global Exec capabilities; the launch path enforces the real model's policy.
+      if (modelCapabilitiesDeferred) {
+        return {
+          allowed: THINKING_LEVELS,
+          effectiveThinkingLevel: props.thinkingLevel,
+          capabilityModel: undefined,
+          proModeAvailable: props.allowProMode !== false,
+          fastModeProvider: null,
+        };
+      }
+
+      assert(props.modelString, "A model is required unless capabilities are deferred");
+      const minimum = getMinimum(props.modelString);
+      const resolvedRoute = routing.resolveRoute(normalizeToCanonical(props.modelString)).route;
+      return {
+        allowed: getAvailableThinkingLevels(props.modelString, minimum, providersConfig),
+        effectiveThinkingLevel: enforceThinkingPolicy(
+          props.modelString,
+          props.thinkingLevel,
+          minimum,
+          providersConfig
+        ),
+        // Mapped aliases use the target model's ladder and provider-aware labels.
+        capabilityModel: resolveModelForMetadata(props.modelString, providersConfig ?? null),
+        proModeAvailable:
+          props.allowProMode !== false &&
+          openaiProModeAvailable(props.modelString, {
+            providersConfig,
+            resolvedRouteProvider: resolvedRoute,
+          }),
+        fastModeProvider:
+          props.allowFastMode !== false && providersConfig != null
+            ? getFastModeProvider(props.modelString, {
+                providersConfig,
+                resolvedRouteProvider: resolvedRoute,
+              })
+            : null,
+      };
+    })();
   const fastModeAvailable = fastModeProvider != null;
-  const proModeActive = proModeAvailable && props.reasoningMode === "pro";
+  const proModeActive =
+    !reasoningModeInherited && proModeAvailable && props.reasoningMode === "pro";
   const fastModeActive =
     fastModeProvider != null && providersConfig?.[fastModeProvider]?.serviceTier === "priority";
   const hasMenu =
@@ -195,7 +219,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
         onClick={() => setIsOpen((previous) => !previous)}
       >
         <span data-thinking-label className="min-w-[3ch] text-center">
-          {getThinkingDisplayLabel(effectiveThinkingLevel, capabilityModel)}
+          {modelCapabilitiesDeferred
+            ? THINKING_OPTION_LABELS[effectiveThinkingLevel]
+            : getThinkingDisplayLabel(effectiveThinkingLevel, capabilityModel)}
         </span>
         {proModeActive && (
           <span
@@ -239,12 +265,12 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
             ? props.inheritOption.label
             : getThinkingMenuLabel(effectiveThinkingLevel, capabilityModel)}
         </span>
-        {proModeActive && (
+        {(proModeActive || props.reasoningModeInherited === false) && (
           <span
             data-thinking-pro-status
             className="border-border-medium text-muted rounded-[3px] border bg-transparent px-1 text-[9px] leading-[14px] font-semibold tracking-wide"
           >
-            PRO
+            {props.reasoningMode === "pro" ? "PRO" : "STANDARD"}
           </span>
         )}
         {fastModeActive && (
@@ -295,6 +321,10 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
         </Tooltip>
       ) : (
         trigger
+      )}
+
+      {reasoningModeInherited && (
+        <div className="text-muted mt-1 text-xs">Reasoning mode: Use calling chat’s Exec</div>
       )}
 
       {isOpen && (
@@ -358,14 +388,16 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                 <button
                   type="button"
                   data-component="ProModeToggle"
-                  aria-pressed={proModeActive}
+                  aria-pressed={reasoningModeInherited ? "mixed" : proModeActive}
                   className="hover:bg-hover flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left transition-colors"
                   onClick={() => props.onReasoningModeChange(proModeActive ? "standard" : "pro")}
                 >
                   <span className="min-w-0 flex-1">
                     <span className="text-foreground block text-[11px] font-medium">Pro mode</span>
                     <span className="text-muted block text-[10px] font-normal">
-                      More reliable on difficult tasks
+                      {reasoningModeInherited
+                        ? "Use calling chat’s Exec"
+                        : "More reliable on difficult tasks"}
                     </span>
                   </span>
                   {proModeActive && <Check className="text-thinking-mode h-3 w-3" aria-hidden />}

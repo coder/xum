@@ -4,8 +4,6 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import { getThinkingOptionLabel } from "@/common/types/thinking";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 
 let advisorExperimentEnabled = false;
 
@@ -242,42 +240,86 @@ describe("TasksSection Exec subagent defaults", () => {
     });
   });
 
-  test("unset Exec subagent defaults inherit from UI Exec", async () => {
+  test.each(["openai:gpt-5.6-sol", "xai:grok-code-fast-1"])(
+    "does not resolve or persist inherited preferences from global Exec model %s",
+    async (modelString) => {
+      const view = renderTasksSection({
+        agentAiDefaults: { exec: { modelString, thinkingLevel: "medium", reasoningMode: "pro" } },
+      });
+      const row = await view.findByRole("group", { name: "Exec defaults" });
+      const trigger = within(row).getByRole("button", { name: "Reasoning" });
+      expect(trigger.textContent).not.toContain("PRO");
+      expect(within(row).getByLabelText<HTMLSelectElement>("Model").value).toBe("");
+      fireEvent.click(trigger);
+      const listbox = within(row).getByRole("listbox", { name: "Reasoning effort" });
+      expect(within(listbox).getByRole("option", { selected: true }).textContent).not.toContain(
+        "Medium"
+      );
+      for (const level of ["Off", "Low", "Medium", "High", "Extra High", "Max"]) {
+        expect(
+          within(listbox).getByRole("option", { name: level }).getAttribute("aria-selected")
+        ).toBe("false");
+      }
+      expect(
+        within(row)
+          .getByRole("button", { name: /Pro mode/ })
+          .getAttribute("aria-pressed")
+      ).toBe("mixed");
+      expect(within(row).queryByRole("button", { name: /Fast mode/ })).toBeNull();
+      expect(view.saveConfig).not.toHaveBeenCalled();
+    }
+  );
+
+  test("defers inherited-model effort capabilities without persisting a model or mode", async () => {
     const view = renderTasksSection({
-      agentAiDefaults: {
-        exec: { modelString: "anthropic:ui-exec", thinkingLevel: "medium" },
-      },
+      agentAiDefaults: { exec: { modelString: "xai:grok-code-fast-1", reasoningMode: "pro" } },
     });
-
     const row = await view.findByRole("group", { name: "Exec defaults" });
-
-    expect(within(row).getByText("Inherits from UI Exec: anthropic:ui-exec")).toBeTruthy();
-    expect(within(row).getByText("Inherits from UI Exec: medium")).toBeTruthy();
-    expect(within(row).queryByRole("button", { name: "Inherit from UI Exec" })).toBeNull();
+    selectReasoningOption(row, "Max");
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.exec?.subagent).toEqual({
+        thinkingLevel: "max",
+      })
+    );
+    const trigger = within(row).getByRole("button", { name: "Reasoning" });
+    expect(trigger.textContent).toContain("Max");
+    expect(trigger.textContent).not.toContain("PRO");
+    const listbox = within(row).getByRole("listbox", { name: "Reasoning effort" });
+    fireEvent.click(within(listbox).getByRole("option", { name: "Extra High" }));
+    await waitFor(() =>
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.exec?.subagent).toEqual({
+        thinkingLevel: "xhigh",
+      })
+    );
+    expect(trigger.textContent).toContain("Extra High");
   });
 
-  test("clamps inherited Exec subagent thinking hint to the effective model policy", async () => {
-    const model = "openai:gpt-5-pro";
-    const expectedLabel = getThinkingOptionLabel(enforceThinkingPolicy(model, "xhigh"), model);
-    const unclampedLabel = getThinkingOptionLabel("xhigh", model);
-
+  test("explicit subagent models use their capabilities while mode remains inherited", async () => {
     const view = renderTasksSection({
       agentAiDefaults: {
         exec: {
-          modelString: "anthropic:ui-exec",
-          thinkingLevel: "xhigh",
-          subagent: { modelString: model },
+          reasoningMode: "pro",
+          subagent: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "high" },
         },
       },
     });
-
     const row = await view.findByRole("group", { name: "Exec defaults" });
-
-    expect(within(row).getByText(`Inherits from UI Exec: ${expectedLabel}`)).toBeTruthy();
-    if (unclampedLabel !== expectedLabel) {
-      expect(within(row).queryByText(`Inherits from UI Exec: ${unclampedLabel}`)).toBeNull();
-    }
-    expect(within(row).queryByText("Inherits from UI Exec: Inherit")).toBeNull();
+    fireEvent.click(within(row).getByRole("button", { name: "Reasoning" }));
+    expect(
+      within(row)
+        .getByRole("button", { name: /Pro mode/ })
+        .getAttribute("aria-pressed")
+    ).toBe("mixed");
+    fireEvent.change(within(row).getByLabelText("Model"), {
+      target: { value: "xai:grok-code-fast-1" },
+    });
+    expect(within(row).queryByRole("button", { name: /Pro mode/ })).toBeNull();
+    expect(within(row).queryByRole("option", { name: "Max" })).toBeNull();
+    await waitFor(() =>
+      expect(
+        getLatestSavePayload(view.saveConfig).agentAiDefaults.exec?.subagent?.reasoningMode
+      ).toBeUndefined()
+    );
   });
 
   test("setting only the Exec subagent model writes only the sparse subagent model", async () => {
@@ -334,7 +376,7 @@ describe("TasksSection Exec subagent defaults", () => {
     });
     const row = await view.findByRole("group", { name: "Exec defaults" });
 
-    fireEvent.click(within(row).getAllByRole("button", { name: "Inherit from UI Exec" })[0]);
+    fireEvent.click(within(row).getAllByRole("button", { name: "Reset" })[0]);
 
     await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
     const payload = getLatestSavePayload(view.saveConfig);
@@ -350,7 +392,7 @@ describe("TasksSection Exec subagent defaults", () => {
     });
     const row = await view.findByRole("group", { name: "Exec defaults" });
 
-    fireEvent.click(within(row).getByRole("button", { name: "Inherit from UI Exec" }));
+    fireEvent.click(within(row).getByRole("button", { name: "Reset" }));
 
     await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
     const payload = getLatestSavePayload(view.saveConfig);
@@ -400,28 +442,38 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(payload.agentAiDefaults.explore?.modelString).toBe("openai:gpt-5.6-sol");
   });
 
-  test("disabling inherited Pro mode persists an explicit standard override", async () => {
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        exec: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" },
-      },
-    });
-
-    const row = await view.findByRole("group", { name: "Exec defaults" });
-    fireEvent.click(within(row).getByRole("button", { name: /Reasoning/ }));
-    const proToggle = row.querySelector('[data-component="ProModeToggle"]');
-    if (!(proToggle instanceof HTMLElement)) throw new Error("Pro mode toggle not rendered");
-    // Inherited from UI Exec, so the toggle starts pressed with no override.
-    expect(proToggle.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(proToggle);
-
-    await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
-    const payload = getLatestSavePayload(view.saveConfig);
-
-    expect(payload.agentAiDefaults.exec?.subagent?.reasoningMode).toBe("standard");
-    // UI Exec's own default stays pro; only the sub-agent override changes.
-    expect(payload.agentAiDefaults.exec?.reasoningMode).toBe("pro");
-  });
+  test.each(["standard", "pro"] as const)(
+    "cycles inherited mode through explicit Pro and Standard regardless of global %s",
+    async (reasoningMode) => {
+      const view = renderTasksSection({
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5.6-sol", reasoningMode } },
+      });
+      const row = await view.findByRole("group", { name: "Exec defaults" });
+      const trigger = within(row).getByRole("button", { name: "Reasoning" });
+      fireEvent.click(trigger);
+      const proToggle = within(row).getByRole("button", { name: /Pro mode/ });
+      expect(proToggle.getAttribute("aria-pressed")).toBe("mixed");
+      for (const mode of ["pro", "standard", "pro"] as const) {
+        fireEvent.click(proToggle);
+        await waitFor(() =>
+          expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.exec?.subagent).toEqual({
+            reasoningMode: mode,
+          })
+        );
+        expect(proToggle.getAttribute("aria-pressed")).toBe(String(mode === "pro"));
+        expect(trigger.textContent).toContain(mode.toUpperCase());
+        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.exec?.reasoningMode).toBe(
+          reasoningMode
+        );
+      }
+      const listbox = within(row).getByRole("listbox", { name: "Reasoning effort" });
+      fireEvent.click(within(listbox).getByRole("option", { selected: true }));
+      await waitFor(() =>
+        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.exec?.subagent).toBeUndefined()
+      );
+      expect(proToggle.getAttribute("aria-pressed")).toBe("mixed");
+    }
+  );
 
   test("disabling Pro mode inherited from a base agent persists an explicit standard override", async () => {
     // Explore's base is exec (FALLBACK_AGENTS), so ACP resolution inherits
@@ -457,7 +509,7 @@ describe("TasksSection Exec subagent defaults", () => {
     const row = await view.findByRole("group", { name: "Exec defaults" });
     fireEvent.click(within(row).getByRole("button", { name: /Reasoning/ }));
     const listbox = within(row).getByRole("listbox", { name: "Reasoning effort" });
-    fireEvent.click(within(listbox).getByRole("option", { name: "Inherit from UI Exec" }));
+    fireEvent.click(within(listbox).getByRole("option", { name: "Use calling chat’s Exec" }));
 
     await waitFor(() => expect(view.saveConfig).toHaveBeenCalled());
     const payload = getLatestSavePayload(view.saveConfig);
