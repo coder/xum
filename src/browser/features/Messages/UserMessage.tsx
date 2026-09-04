@@ -16,6 +16,8 @@ import {
   parseSubagentReportEnvelope,
   SubagentReportMessageContent,
 } from "./SubagentReportMessageContent";
+import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
+import { SubagentFailureMessageContent } from "./SubagentFailureMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
@@ -88,6 +90,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   // Only backend-authored synthetic messages may opt into protocol-aware presentation. A user who
   // types a lookalike envelope should continue to see an ordinary escaped user message.
   const subagentReport = isSynthetic ? parseSubagentReportEnvelope(content) : null;
+  const subagentFailure = isSynthetic ? parseSubagentFailureEnvelope(content) : null;
   const structuredOutputJson = subagentReport
     ? formatSubagentStructuredOutput(subagentReport)
     : undefined;
@@ -260,6 +263,13 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         {isInProgress ? "subagent update" : "subagent report"}
       </span>
     );
+  } else if (subagentFailure) {
+    label = (
+      <span className="bg-muted/20 text-muted flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
+        <Bot aria-hidden="true" className="h-3 w-3" />
+        subagent
+      </span>
+    );
   } else if (isSynthetic) {
     label = (
       <span className="bg-muted/20 text-muted rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
@@ -269,8 +279,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   }
   const syntheticClassName = cn(
     className,
-    isSynthetic && !subagentReport && "opacity-70",
-    subagentReport && "ml-0 w-full",
+    isSynthetic && !subagentReport && !subagentFailure && "opacity-70",
+    (subagentReport ?? subagentFailure) && "ml-0 w-full",
     (isGoalContinuation || isBudgetLimitWrapup) && "italic"
   );
 
@@ -286,6 +296,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     );
   } else if (subagentReport) {
     renderedContent = <SubagentReportMessageContent report={subagentReport} />;
+  } else if (subagentFailure) {
+    renderedContent = <SubagentFailureMessageContent failure={subagentFailure} />;
   } else {
     renderedContent = (
       <UserMessageContent
