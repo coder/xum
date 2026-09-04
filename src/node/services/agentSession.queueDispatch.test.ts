@@ -661,9 +661,17 @@ describe("AgentSession queued message tool-call dispatch", () => {
       level = () => Promise.resolve(false);
       expect(await session.hasPendingToolEndInput()).toBe(false);
 
-      // A failing level read must not cut the stream.
+      // A failing level read must not cut the stream on the level's account...
       level = () => Promise.reject(new Error("watermark read failed"));
       expect(await session.hasPendingToolEndInput()).toBe(false);
+      // ...but a tool-end message queued while that read was in flight still arbitrates the
+      // boundary: the failure says nothing about the queue.
+      level = () => {
+        session.queueMessage("correction", { model: TEST_MODEL, agentId: "exec" });
+        return Promise.reject(new Error("watermark read failed"));
+      };
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      session.clearQueue();
 
       // A non-empty queue arbitrates alone: a turn-end head is not promoted to tool-end by
       // a high wake level (the wake dispatcher waits for the queue to drain anyway).

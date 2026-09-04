@@ -11931,11 +11931,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   isBusyForMessage(workspaceId: string): boolean {
-    return this.sessions.get(workspaceId.trim())?.isBusy() === true;
+    return this.getLiveSession(workspaceId)?.isBusy() === true;
   }
 
   hasQueuedWorkspaceTurn(workspaceId: string, handleId: string): boolean {
-    return this.sessions.get(workspaceId.trim())?.hasQueuedWorkspaceTurn(handleId) ?? false;
+    return this.getLiveSession(workspaceId)?.hasQueuedWorkspaceTurn(handleId) ?? false;
   }
 
   /**
@@ -11961,11 +11961,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   hasQueuedOrDispatchingEntry(workspaceId: string): boolean {
-    return this.sessions.get(workspaceId.trim())?.hasQueuedOrDispatchingEntry() ?? false;
+    return this.getLiveSession(workspaceId)?.hasQueuedOrDispatchingEntry() ?? false;
   }
 
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
-    return this.sessions.get(workspaceId.trim())?.hasQueuedMessages(dispatchMode) ?? false;
+    return this.getLiveSession(workspaceId)?.hasQueuedMessages(dispatchMode) ?? false;
   }
 
   async waitForPendingCompactionCompletionDecision(
@@ -12033,7 +12033,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
-    const session = this.sessions.get(workspaceId.trim());
+    const session = this.getLiveSession(workspaceId);
     if (!session) {
       return false;
     }
@@ -12083,7 +12083,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       ownerWorkspaceId,
       LAST_BASH_MONITOR_WAKE_ROW_SCAN_DEPTH
     );
-    if (!tail.success) return undefined;
+    // Distinguish "no row" from "could not read": the reconciler recovers once per owner, so a
+    // read failure swallowed here would let the reconcile dispatch a duplicate of a wake the
+    // row already delivered. Throwing fails this reconcile; its retry reads again.
+    if (!tail.success) {
+      throw new Error(`Failed to read the last bash-monitor wake row: ${tail.error}`);
+    }
     for (const message of tail.data.toReversed()) {
       // A wake diverted through on-send compaction is durable as the compaction row that
       // carries it as follow-up; that row is the acknowledgment too.
@@ -12097,7 +12102,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     workspaceId: string,
     metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
   ): boolean {
-    const session = this.sessions.get(workspaceId.trim());
+    const session = this.getLiveSession(workspaceId);
     return session?.hasPendingWorkspaceTurnContinuation(metadata) ?? false;
   }
 
@@ -12106,7 +12111,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * See AgentSession.getQueueCutCutter for stage semantics.
    */
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined {
-    const session = this.sessions.get(workspaceId.trim());
+    const session = this.getLiveSession(workspaceId);
     return session?.getQueueCutCutter();
   }
 
@@ -12118,7 +12123,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * hasPendingQueuedOrPreparingTurn.
    */
   hasPendingAutoRetry(workspaceId: string): boolean {
-    const session = this.sessions.get(workspaceId.trim());
+    const session = this.getLiveSession(workspaceId);
     return session?.hasPendingAutoRetry() ?? false;
   }
 

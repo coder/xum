@@ -365,8 +365,23 @@ describe("BashMonitorWakeReconciler", () => {
     await control.instance.reconcile(OWNER);
     expect(control.restarted).toHaveLength(1);
 
-    const recovered = restart(() => Promise.resolve(deliveredRecords));
+    // A read that cannot answer fails the reconcile (retried) instead of counting as "no row":
+    // recovery is consulted once per owner, so a swallowed failure would dispatch a duplicate.
+    let readFails = true;
+    const recovered = restart(() =>
+      readFails
+        ? Promise.reject(new Error("history unavailable"))
+        : Promise.resolve(deliveredRecords)
+    );
     acknowledged = [];
+    const failedReconcile = await recovered.instance.reconcile(OWNER).then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect(failedReconcile).toBeInstanceOf(Error);
+    expect(recovered.restarted).toHaveLength(0);
+    expect(acknowledged).toEqual([]);
+    readFails = false;
     await recovered.instance.reconcile(OWNER);
     expect(recovered.restarted).toHaveLength(0);
     expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);

@@ -305,6 +305,20 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         createMuxMessage("summary", "assistant", "summary", { timestamp: 1_100 })
       );
       expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toEqual([wakeRecord]);
+
+      // "Could not read" is not "no row": the reconciler consults this once per owner.
+      const readSpy = spyOn(historyService, "getLastMessages").mockImplementationOnce(() =>
+        Promise.resolve(Err("history unavailable"))
+      );
+      try {
+        const failed = await internal.readLastBashMonitorWakeRecords(workspaceId).then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(failed).toBeInstanceOf(Error);
+      } finally {
+        readSpy.mockRestore();
+      }
     } finally {
       await cleanup();
     }
@@ -1299,6 +1313,17 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // once, so long-polling bash reads return early and foreground waits background.
       internal.publishBashMonitorWakeLevel(workspaceId, true);
       expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
+
+      // Settlement's reads of the cut resolve through the same live lookup: a recovered
+      // delegated stream that yielded to the wake must not settle for want of a cutter.
+      const sessionInternal = session as unknown as {
+        getQueueCutCutter(): unknown;
+        hasBashMonitorWakeContinuation(): boolean;
+      };
+      sessionInternal.getQueueCutCutter = () => ({ stage: "bash-monitor-wake" });
+      sessionInternal.hasBashMonitorWakeContinuation = () => true;
+      expect(service.getQueueCutCutter(workspaceId)).toEqual({ stage: "bash-monitor-wake" });
+      expect(service.hasBashMonitorWakeContinuation(workspaceId)).toBe(true);
 
       // Promotion keeps the mirror: it lives on the session, not on the map it sits in.
       expect(service.getOrCreateSession(workspaceId)).toBe(session);

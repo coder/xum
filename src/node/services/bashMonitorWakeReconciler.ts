@@ -431,7 +431,9 @@ export class BashMonitorWakeReconciler {
        * durable acknowledgment: a commit whose watermark write failed and was then lost to a
        * restart (the in-memory committed lease dies with the process) would otherwise
        * re-derive and re-dispatch the very signals that row already delivers. Consulted once
-       * per owner, the first time signals derive outstanding in this process.
+       * per owner, the first time signals derive outstanding in this process. A read that
+       * cannot answer must throw (not return undefined): the reconcile fails and retries, so
+       * "no row" is only ever concluded from a successful read.
        */
       readDeliveredWakeRecords?(
         ownerWorkspaceId: string

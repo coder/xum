@@ -6882,11 +6882,13 @@ export class AgentSession {
       };
       return true;
     } catch (error) {
-      log.debug("hasPendingToolEndInput: wake level read failed; not yielding", {
+      log.debug("hasPendingToolEndInput: wake level read failed; not yielding on the level", {
         workspaceId: this.workspaceId,
         error,
       });
-      return false;
+      // A message queued while the level read was in flight still arbitrates this boundary:
+      // the read's failure says nothing about the queue.
+      return this.messageQueue.getNextDispatchableMode() === "tool-end";
     }
   }
 
