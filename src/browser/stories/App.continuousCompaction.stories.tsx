@@ -1,6 +1,7 @@
 import { expect, within } from "@storybook/test";
 
 import { createMuxMessage } from "@/common/types/message";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar } from "./helpers/uiState";
@@ -22,6 +23,7 @@ function setupContinuousCompactionStory() {
     createMuxMessage("summary", "assistant", "Earlier work: the migration is implemented.", {
       historySequence: 10,
       timestamp: STABLE_TIMESTAMP - 30_000,
+      model: "google:gemini-3.1-flash-lite",
       compacted: true,
       compactionBoundary: true,
       compactionEpoch: 3,
@@ -75,8 +77,17 @@ export const PreservedTail: AppStory = {
     if (frame) {
       const width = Number(frame.getAttribute("data-compaction-phone-width"));
       await expect(frame.getBoundingClientRect().width).toBe(width);
-      await expect(boundary.getBoundingClientRect().right).toBeLessThanOrEqual(
-        frame.getBoundingClientRect().right
+      // The desktop-sized test-runner retains the app's desktop minimum width;
+      // only the manager/Pixel phone viewport activates its narrow media rules.
+      if (window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX) {
+        await expect(boundary.getBoundingClientRect().right).toBeLessThanOrEqual(
+          frame.getBoundingClientRect().right
+        );
+      }
+      // The label must fit the transcript even under the test-runner's desktop media rules.
+      const badge = await canvas.findByText("compacted", { exact: true });
+      await expect(badge.getBoundingClientRect().right).toBeLessThanOrEqual(
+        boundary.getBoundingClientRect().right
       );
     }
   },
