@@ -24743,6 +24743,61 @@ describe("TaskService", () => {
     });
   });
 
+  test("a void retried after a partially persisted settlement still wakes the waiter", async () => {
+    // The first attempt persists the terminal handle and then fails (the execution-state
+    // mirror write rejects) before resolving the waiter. The session retries the void; the
+    // record is now terminal, so the retry must re-enter settlement's idempotent terminal
+    // branch rather than treat "already settled" as nothing left to do.
+    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const manager = workspaceTurnManagerFor(taskService) as unknown as {
+      updateAgentTaskExecutionState: (...args: unknown[]) => Promise<void>;
+    };
+    const mirrorSpy = spyOn(manager, "updateAgentTaskExecutionState").mockImplementationOnce(() =>
+      Promise.reject(new Error("execution state mirror unavailable"))
+    );
+    let settled = false;
+    const waited = workspaceTurnManagerFor(taskService)
+      .waitForWorkspaceTurn("wst_handle", { requestingWorkspaceId: parentId, timeoutMs: 5_000 })
+      .then(
+        () => null,
+        (error: unknown) => error
+      )
+      .finally(() => {
+        settled = true;
+      });
+    try {
+      const firstAttempt = await taskService
+        .settleVoidedWorkspaceTurnContinuation(
+          "childworkspace",
+          workspaceTurnMuxMetadata(parentId),
+          "abandoned"
+        )
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(firstAttempt).toBeInstanceOf(Error);
+      expect((firstAttempt as Error).message).toContain("execution state mirror unavailable");
+      expect(mirrorSpy).toHaveBeenCalledTimes(1);
+      expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+        status: "interrupted",
+      });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await taskService.settleVoidedWorkspaceTurnContinuation(
+        "childworkspace",
+        workspaceTurnMuxMetadata(parentId),
+        "abandoned"
+      );
+      const error = await waited;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("superseded by new input");
+    } finally {
+      mirrorSpy.mockRestore();
+    }
+  });
+
   test("settleVoidedWorkspaceTurnContinuation ignores a stale correlation", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
 

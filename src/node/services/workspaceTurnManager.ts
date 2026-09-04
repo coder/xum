@@ -4737,12 +4737,25 @@ export class WorkspaceTurnManager {
       muxMetadata.ownerWorkspaceId,
       muxMetadata.taskHandleId
     );
+    if (record?.workspaceId !== workspaceId || record.turnId !== muxMetadata.turnId) {
+      return;
+    }
+    if (this.isTerminalWorkspaceTurnStatus(record.status)) {
+      // Already settled — possibly by an earlier attempt of this very settlement that
+      // persisted the terminal handle and then failed before resolving its waiters (the
+      // void is retried on failure). settleWorkspaceTurn's terminal branch is idempotent and
+      // resolves whatever is still waiting on the persisted outcome.
+      await this.settleWorkspaceTurn({
+        record,
+        next: record,
+        waiterSettlement: { status: "error", error: new Error(error) },
+      });
+      return;
+    }
     // Both continuation reads are synchronous and sit after the last await before the
     // settlement write, so nothing queued or started during the record read is missed.
     if (
-      record?.workspaceId !== workspaceId ||
-      record?.turnId !== muxMetadata.turnId ||
-      !isActiveWorkspaceTurnTaskStatus(record?.status) ||
+      !isActiveWorkspaceTurnTaskStatus(record.status) ||
       (options?.deferredOnly === true && (record.deferredMessageIds?.length ?? 0) === 0) ||
       (options?.unlessTurnContinues === true &&
         (this.workspaceService.hasPendingWorkspaceTurnContinuation(workspaceId, muxMetadata) ||

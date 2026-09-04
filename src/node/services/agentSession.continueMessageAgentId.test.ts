@@ -394,27 +394,20 @@ describe("AgentSession continue-message agentId fallback", () => {
     (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
       () => true;
 
-    // Settlement runs BEFORE the follow-up is erased: a failure keeps the durable record (the
-    // only carrier of the correlation) so the next attempt retries it.
-    let dispatchError: unknown;
-    try {
-      await internals.dispatchPendingFollowUp();
-    } catch (error) {
-      dispatchError = error;
-    }
-    expect(dispatchError).toBeInstanceOf(Error);
-    expect((dispatchError as Error).message).toContain("task handle store unavailable");
-    expect(internals.sendMessage).not.toHaveBeenCalled();
-    expect(abandoned).toHaveBeenCalledTimes(1);
-    const retained = await historyService.getLastMessages("ws", 1);
-    expect(retained.success && retained.data[0]?.metadata?.muxMetadata).toMatchObject({
-      type: "compaction-summary",
-      pendingFollowUp: { workspaceTurnMetadata },
-    });
-
-    settlementError = undefined;
+    // The owner-side settlement is never awaited here: this path runs while the owner's
+    // stream-end listener holds the workspace event lock (waiting on the compaction decision)
+    // and the settlement needs that lock. The discard completes; a failed settlement is parked
+    // and retried, not lost.
     expect(await internals.dispatchPendingFollowUp()).toBe(false);
     expect(internals.sendMessage).not.toHaveBeenCalled();
+    expect(abandoned).toHaveBeenCalledTimes(1);
+    expect(abandoned).toHaveBeenLastCalledWith(workspaceTurnMetadata, "abandoned");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    settlementError = undefined;
+    session.setBashMonitorWakeOutstanding(true);
+    session.setBashMonitorWakeOutstanding(false);
     expect(abandoned).toHaveBeenCalledTimes(2);
     expect(abandoned).toHaveBeenLastCalledWith(workspaceTurnMetadata, "abandoned");
     const lastMessages = await historyService.getLastMessages("ws", 1);

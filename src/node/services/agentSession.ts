@@ -1099,6 +1099,13 @@ export class AgentSession {
   beginShutdown(): void {
     this.shuttingDown = true;
     this.retryManager.cancel();
+    this.clearUnsettledWakeVoidRetryTimer();
+  }
+
+  private clearUnsettledWakeVoidRetryTimer(): void {
+    if (this.unsettledWakeVoidRetryTimer == null) return;
+    clearTimeout(this.unsettledWakeVoidRetryTimer);
+    this.unsettledWakeVoidRetryTimer = undefined;
   }
 
   dispose(): void {
@@ -1124,10 +1131,7 @@ export class AgentSession {
     this.wakeTurnInFlight = false;
     this.wakeContinuationDebt = undefined;
     this.unsettledWakeVoids = [];
-    if (this.unsettledWakeVoidRetryTimer != null) {
-      clearTimeout(this.unsettledWakeVoidRetryTimer);
-      this.unsettledWakeVoidRetryTimer = undefined;
-    }
+    this.clearUnsettledWakeVoidRetryTimer();
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -6960,12 +6964,16 @@ export class AgentSession {
           reason: voided.reason,
           error: getErrorMessage(error),
         });
-        if (this.disposed) return;
+        if (this.disposed || this.shuttingDown) return;
         this.unsettledWakeVoids.push(voided);
-        this.unsettledWakeVoidRetryTimer ??= setTimeout(() => {
-          this.unsettledWakeVoidRetryTimer = undefined;
-          this.retryUnsettledWakeVoids();
-        }, UNSETTLED_WAKE_VOID_RETRY_DELAY_MS);
+        if (this.unsettledWakeVoidRetryTimer == null) {
+          this.unsettledWakeVoidRetryTimer = setTimeout(() => {
+            this.unsettledWakeVoidRetryTimer = undefined;
+            this.retryUnsettledWakeVoids();
+          }, UNSETTLED_WAKE_VOID_RETRY_DELAY_MS);
+          // Recovery must not keep a graceful process exit alive (beginShutdown also cancels).
+          this.unsettledWakeVoidRetryTimer.unref?.();
+        }
       }
     );
   }
@@ -7853,11 +7861,14 @@ export class AgentSession {
     }
 
     // Every discard path funnels here, so this is the one place that knows the delegated
-    // turn's continuation is gone for good. Settle BEFORE erasing the follow-up: the durable
-    // record is the only carrier of the correlation, so a settlement failure must leave it in
-    // place for the next dispatch attempt (or startup recovery) to retry — settlement is
-    // idempotent, a lost record is not recoverable. A wake follow-up also carried the
-    // continuation debt of the stream it cut; that debt is settled by this same void.
+    // turn's continuation is gone for good. The void is a synchronous state transition here
+    // and the owner-side settlement runs as a tracked, retried promise (see
+    // settleVoidedWakeContinuation) — it is never awaited: this path runs while the
+    // TaskService stream-end listener holds the workspace event lock waiting for the
+    // compaction completion decision, and the owner settles under that same lock. A wake
+    // follow-up also carried the continuation debt of the stream it cut; the same void clears
+    // it. Whether the erase below succeeds does not affect the settlement: the void carries
+    // the correlation itself.
     const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
     if (workspaceTurnMetadata != null) {
       if (
@@ -7868,7 +7879,10 @@ export class AgentSession {
       ) {
         this.wakeContinuationDebt = undefined;
       }
-      await this.onWorkspaceTurnContinuationVoided?.(workspaceTurnMetadata, "abandoned");
+      this.settleVoidedWakeContinuation({
+        correlation: workspaceTurnMetadata,
+        reason: "abandoned",
+      });
     }
 
     const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
