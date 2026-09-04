@@ -208,6 +208,27 @@ describe("DesktopInputCoordinator", () => {
     });
   });
 
+  test("unarchiving a stale execution mirror cannot steal a sibling's desktop", async () => {
+    await withCoordinator(async (coordinator, write) => {
+      for (const taskExecutionStatus of ["queued", "starting", "running"] as const) {
+        const restored = borrower("restored", {
+          taskExecutionId: "old-execution",
+          taskExecutionStatus,
+          archivedAt: "2026-09-01T00:00:00Z",
+        });
+        settleArchivedSharedDesktopTask(restored);
+        restored.unarchivedAt = "2026-09-02T00:00:00Z";
+        await write([owner, restored, borrower("active", { taskStatus: "running" })]);
+        expect(await coordinator.withInput("active", () => Promise.resolve("input"))).toBe("input");
+        expect(restored.taskExecutionStatus).toBe("interrupted");
+        expect(restored.taskExecutionId).toBe("old-execution");
+        expect(coordinator.withAdmission("restored", () => Promise.resolve())).rejects.toThrow(
+          "controlled by active borrower active"
+        );
+      }
+    });
+  });
+
   test("settleArchivedSharedDesktopTask interrupts only bound active children and keeps queued briefs", () => {
     for (const taskStatus of ["queued", "starting", "running", "awaiting_report"] as const) {
       const child = borrower("child", { taskStatus, taskPrompt: "brief" });

@@ -23,16 +23,19 @@ export function settleArchivedSharedDesktopTask(workspace: Workspace): boolean {
   if (workspace.taskDesktopOwnerWorkspaceId === undefined || workspace.parentWorkspaceId == null) {
     return false;
   }
-  if (
-    workspace.taskStatus !== "queued" &&
-    workspace.taskStatus !== "starting" &&
-    workspace.taskStatus !== "running" &&
-    workspace.taskStatus !== "awaiting_report"
-  ) {
-    return false;
-  }
-  workspace.taskStatus = "interrupted";
-  return true;
+  const activeTask =
+    workspace.taskStatus === "queued" ||
+    workspace.taskStatus === "starting" ||
+    workspace.taskStatus === "running" ||
+    workspace.taskStatus === "awaiting_report";
+  const activeExecution =
+    workspace.taskExecutionStatus === "queued" ||
+    workspace.taskExecutionStatus === "starting" ||
+    workspace.taskExecutionStatus === "running";
+  if (activeTask) workspace.taskStatus = "interrupted";
+  // Both status sources reserve input; an old execution must not reclaim it on unarchive.
+  if (activeExecution) workspace.taskExecutionStatus = "interrupted";
+  return activeTask || activeExecution;
 }
 
 /**
