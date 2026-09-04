@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { AgentReportToolCall } from "./AgentReportToolCall";
@@ -76,5 +76,57 @@ describe("AgentReportToolCall", () => {
     );
 
     expect(view.getByText(/Report file: report\.md/)).toBeTruthy();
+  });
+
+  test("collapses the body while retaining the title, then reopens it", () => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ title: "Recovery audit", reportMarkdown: "Summary\n\nDetailed findings" }}
+          result={{ success: true }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    const toggle = view.getByRole("button", { name: "Recovery audit" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(view.queryByText("Detailed findings")).toBeNull();
+    fireEvent.click(toggle);
+    expect(view.getByText(/Detailed findings/)).toBeTruthy();
+  });
+
+  test("keeps validation failures visible when collapsed instead of claiming delivery", () => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ title: "Audit", reportMarkdown: "Draft" }}
+          result={{
+            success: false,
+            message: "Report rejected",
+            errors: [{ path: "reportMarkdown", message: "Report exceeds limit" }],
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    fireEvent.click(view.getByRole("button", { name: "Audit" }));
+    expect(view.getByRole("alert").textContent).toContain("Report exceeds limit");
+    expect(view.getByRole("status").className).toContain("text-danger");
+  });
+
+  test("prefers the submitted report over the draft arguments", () => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ reportMarkdown: "Draft report" }}
+          result={{ success: true, report: { reportMarkdown: "Accepted report" } }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    expect(view.queryByText("Draft report")).toBeNull();
+    expect(view.getByText("Accepted report")).toBeTruthy();
   });
 });

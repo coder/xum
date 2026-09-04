@@ -212,10 +212,10 @@ The report inherited transcript-sized markdown styles instead of compact task ch
                     title: "Agent update",
                     reportMarkdown: `## Agent update
 
-The same compact report typography applies to incremental agent findings.
+Incremental findings read as outgoing communication, separate from compact task details.
 
-- Body and inline \`code\` remain aligned with tool chrome.
-- Headings retain a modest hierarchy.`,
+- Body and inline \`code\` stay legible alongside transcript messages.
+- Headings retain a clear hierarchy.`,
                   },
                   { success: true }
                 ),
@@ -238,7 +238,7 @@ The same compact report typography applies to incremental agent findings.
 
     const agentReportCard = await waitFor(() => {
       const card = canvasElement.querySelector<HTMLElement>(
-        '[data-component="AgentReportToolCall"]'
+        '[data-component="AgentCommunicationCard"]'
       );
       if (!card) throw new Error("Agent report card not rendered");
       return card;
@@ -287,20 +287,21 @@ The same compact report typography applies to incremental agent findings.
     });
 
     await waitFor(() => {
-      const report = agentReportCard.querySelector<HTMLElement>(".compact-report-markdown");
+      const report = agentReportCard.querySelector<HTMLElement>(".markdown-content");
       const heading = report?.querySelector<HTMLElement>("h2");
       const code = report?.querySelector<HTMLElement>("code");
       if (!report || !heading || !code) {
         throw new Error("Expanded agent report markdown not rendered");
       }
-      if (Number.parseFloat(getComputedStyle(report).fontSize) > 11) {
-        throw new Error("Agent report body text is larger than compact tool chrome");
+      const bodyFontSize = Number.parseFloat(getComputedStyle(report).fontSize);
+      if (bodyFontSize < 14) {
+        throw new Error("Agent report body text is smaller than transcript prose");
       }
-      if (Number.parseFloat(getComputedStyle(heading).fontSize) > 13) {
-        throw new Error("Agent report heading is too large for compact tool chrome");
+      if (Number.parseFloat(getComputedStyle(heading).fontSize) <= bodyFontSize) {
+        throw new Error("Agent report heading has lost its hierarchy");
       }
-      if (Number.parseFloat(getComputedStyle(code).fontSize) > 11) {
-        throw new Error("Agent report inline code is larger than compact tool chrome");
+      if (Number.parseFloat(getComputedStyle(code).fontSize) < 12) {
+        throw new Error("Agent report inline code is too small to read");
       }
       if (agentReportCard.scrollWidth > agentReportCard.clientWidth) {
         throw new Error(

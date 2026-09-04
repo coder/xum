@@ -2,22 +2,9 @@ import React from "react";
 
 import type { AgentReportToolArgs, AgentReportToolResult } from "@/common/types/tools";
 
-import {
-  ToolContainer,
-  ToolHeader,
-  ExpandIcon,
-  ToolName,
-  StatusIndicator,
-  ToolDetails,
-  ToolIcon,
-  ErrorBox,
-} from "./Shared/ToolPrimitives";
-import {
-  useToolExpansion,
-  getStatusDisplay,
-  isToolErrorResult,
-  type ToolStatus,
-} from "./Shared/toolUtils";
+import { ErrorBox } from "./Shared/ToolPrimitives";
+import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
+import { isToolErrorResult, type ToolStatus } from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 
 interface LegacyAgentReportFileArgs {
@@ -47,42 +34,38 @@ function getSubmittedReportMarkdown(
   return `Report file: ${args.reportMarkdownPath ?? "report.md"}`;
 }
 
-export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = ({
-  args,
-  result,
-  status = "pending",
-}) => {
-  // Default to expanded so incremental findings are visible when they wake the parent.
-  const { expanded, toggleExpanded } = useToolExpansion(true);
-
-  const errorResult = isToolErrorResult(result) ? result : null;
-
-  const title = args.title ?? "Agent update";
-  const reportMarkdown = getSubmittedReportMarkdown(args, result);
-
-  // Show a small preview when collapsed so the card still has some useful context.
-  const firstLine = reportMarkdown.trim().split("\n")[0] ?? "";
-  const preview = firstLine.length > 80 ? firstLine.slice(0, 80).trim() + "…" : firstLine;
+export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = (props) => {
+  const reportMarkdown = getSubmittedReportMarkdown(props.args, props.result);
+  const failedResult = props.result?.success === false ? props.result : null;
 
   return (
-    <ToolContainer expanded={expanded} data-component="AgentReportToolCall">
-      <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <ToolIcon toolName="agent_report" />
-        <ToolName className="min-w-0 flex-1 truncate">{title}</ToolName>
-        <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
-      </ToolHeader>
-
-      {expanded && (
-        <ToolDetails>
-          <MarkdownRenderer content={reportMarkdown} className="compact-report-markdown" />
-          {errorResult && <ErrorBox className="mt-2">{errorResult.error}</ErrorBox>}
-        </ToolDetails>
-      )}
-
-      {!expanded && preview && (
-        <div className="text-muted mt-1 truncate text-[10px]">{preview}</div>
-      )}
-    </ToolContainer>
+    <AgentCommunicationCard
+      toolName="agent_report"
+      title={props.args.title ?? "Agent update"}
+      destination="To parent"
+      status={failedResult ? "failed" : (props.status ?? "pending")}
+      preview={reportMarkdown}
+      initiallyExpanded
+      error={
+        failedResult && (
+          <ErrorBox className="mt-2" role="alert">
+            {isToolErrorResult(failedResult) ? (
+              failedResult.error
+            ) : (
+              <>
+                {failedResult.message}
+                {failedResult.errors.map((error, index) => (
+                  <div key={index}>
+                    {error.path}: {error.message}
+                  </div>
+                ))}
+              </>
+            )}
+          </ErrorBox>
+        )
+      }
+    >
+      <MarkdownRenderer content={reportMarkdown} className="text-sm leading-relaxed" />
+    </AgentCommunicationCard>
   );
 };

@@ -17,6 +17,7 @@ import {
   isToolErrorResult,
   type ToolStatus,
 } from "./Shared/toolUtils";
+import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 import { useOptionalMessageListContext } from "../Messages/MessageListContext";
 import { useStickyExpand } from "../Messages/useStickyExpand";
@@ -1706,53 +1707,77 @@ const TaskListItem: React.FC<{
 
 interface TaskSendMessageToolCallProps {
   args: TaskSendMessageToolArgs;
-  result?: TaskSendMessageToolSuccessResult;
+  result?: TaskSendMessageToolSuccessResult | ToolErrorResult;
   status?: ToolStatus;
 }
 
+const MESSAGE_DELIVERY: Record<
+  TaskSendMessageToolSuccessResult["status"],
+  { status: ToolStatus; label: string }
+> = {
+  accepted: { status: "completed", label: "Accepted" },
+  queued: { status: "backgrounded", label: "Queued" },
+  reactivated: { status: "completed", label: "Sent · Agent reactivated" },
+  not_found: { status: "failed", label: "Target not found" },
+  invalid_scope: { status: "failed", label: "Invalid target" },
+  not_active: { status: "failed", label: "Agent inactive" },
+  error: { status: "failed", label: "Not sent" },
+  refused: { status: "failed", label: "Refused" },
+  rate_limited: { status: "failed", label: "Rate limited" },
+};
+
 export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (props) => {
-  const { expanded, toggleExpanded } = useToolExpansion(false);
-  const status = props.status ?? "pending";
-  const summary = props.result?.status ?? "sending";
+  const workspaceContext = useOptionalWorkspaceContext();
+  const workspace = findWorkspaceForTaskTarget(
+    workspaceContext?.workspaceMetadata,
+    props.args.task_id
+  );
+  const result = props.result;
+  const toolError = isToolErrorResult(result);
+  // A finished tool call can still mean delivery was refused or queued, not sent.
+  const delivery = result && !toolError ? MESSAGE_DELIVERY[result.status] : undefined;
+  const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
+  const error = result && "error" in result ? result.error : undefined;
 
   return (
-    <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <TaskIcon toolName="task_send_message" />
-        <ToolName>task_send_message</ToolName>
-        <span className="text-muted text-[10px]">{summary}</span>
-        <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
-      </ToolHeader>
-
-      {expanded && (
-        <ToolDetails>
-          <div className="task-surface mt-1 space-y-2 rounded-md p-3">
-            <div className="flex items-center gap-2">
-              <TaskId id={props.args.task_id} />
-              {props.result && <TaskStatusBadge status={props.result.status} />}
-              {props.result && "targetRelation" in props.result && props.result.targetRelation && (
-                <span className="text-muted text-[10px]">to {props.result.targetRelation}</span>
-              )}
-            </div>
-            <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
-              {props.args.message}
-            </div>
-            {props.result && "error" in props.result && props.result.error && (
-              <div className="text-danger text-[11px]">{props.result.error}</div>
-            )}
-            {props.result?.status === "refused" && (
-              <div className="text-danger text-[11px]">{props.result.reason}</div>
-            )}
-            {props.result?.status === "rate_limited" && props.result.retryAfterMs != null && (
-              <div className="text-warning text-[11px]">
-                Retry in {Math.ceil(props.result.retryAfterMs / 1000)}s
+    <AgentCommunicationCard
+      toolName="task_send_message"
+      title={workspace ? `Message to ${workspace.title ?? workspace.name}` : "Message to agent"}
+      destination={
+        <>
+          To {relation && `${relation} `}
+          <TaskId id={props.args.task_id} className="text-xs opacity-100" />
+        </>
+      }
+      status={toolError ? "failed" : (delivery?.status ?? props.status ?? "pending")}
+      statusLabel={delivery?.label}
+      preview={props.args.message}
+      initiallyExpanded={false}
+      error={
+        <>
+          {error && (
+            <ErrorBox className="mt-2" role="alert">
+              {error}
+            </ErrorBox>
+          )}
+          {result && "status" in result && result.status === "refused" && (
+            <ErrorBox className="mt-2" role="alert">
+              {result.reason}
+            </ErrorBox>
+          )}
+          {result &&
+            "status" in result &&
+            result.status === "rate_limited" &&
+            result.retryAfterMs != null && (
+              <div className="text-warning mt-2 text-xs">
+                Retry in {Math.ceil(result.retryAfterMs / 1000)}s
               </div>
             )}
-          </div>
-        </ToolDetails>
-      )}
-    </ToolContainer>
+        </>
+      }
+    >
+      <div className="whitespace-pre-wrap">{props.args.message}</div>
+    </AgentCommunicationCard>
   );
 };
 
