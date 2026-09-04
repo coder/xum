@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import type { CompactionFollowUpRequest, MuxMessage } from "@/common/types/message";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
@@ -425,6 +425,75 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(await internals.dispatchPendingFollowUp()).toBe(true);
     expect(internals.sendMessage).toHaveBeenCalledTimes(1);
     expect(abandoned).toHaveBeenCalledTimes(2);
+  });
+
+  test("abandoning a follow-up settles its delegated turn only once the erase is durable", async () => {
+    // While the summary still carries the follow-up, startup recovery or a retry can dispatch
+    // it; settling the delegated turn first would interrupt the handle under a continuation
+    // that is still live. A failed rewrite therefore keeps the turn unsettled — unless the
+    // rewrite actually landed and only its result was lost, which a readback recognises.
+    const workspaceTurnMetadata = {
+      type: "workspace-turn-task",
+      taskHandleId: "wst_durable",
+      ownerWorkspaceId: "parent-durable",
+      turnId: "turn-durable",
+    } as const;
+    const wakeFollowUp: CompactionFollowUpRequest = {
+      text: "monitor matched",
+      model: "openai:gpt-4o",
+      agentId: "exec",
+      muxMetadata: { type: "bash-monitor-wake", records: [] },
+      workspaceTurnMetadata,
+      dispatchOptions: { requireIdle: true },
+    };
+    const abandoned = mock(
+      (
+        _metadata: NonNullable<CompactionFollowUpRequest["workspaceTurnMetadata"]>,
+        _reason: string
+      ) => Promise.resolve()
+    );
+    const { session, historyService, internals } = await createSession(
+      [compactionSummaryMessage("summary-durable", wakeFollowUp)],
+      { onWorkspaceTurnContinuationVoided: abandoned }
+    );
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => true;
+
+    // Rewrite genuinely fails: the follow-up stays durable and the turn stays unsettled.
+    const realUpdate = historyService.updateHistory.bind(historyService);
+    const updateSpy = spyOn(historyService, "updateHistory").mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "disk full" })
+    );
+    try {
+      const failed = await internals.dispatchPendingFollowUp().then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failed).toBeInstanceOf(Error);
+      expect(abandoned).not.toHaveBeenCalled();
+      const stillPending = await historyService.getLastMessages("ws", 1);
+      expect(stillPending.success && stillPending.data[0]?.metadata?.muxMetadata).toMatchObject({
+        type: "compaction-summary",
+        pendingFollowUp: { text: "monitor matched" },
+      });
+
+      // Rewrite landed but reported failure: the readback finds the follow-up gone, so the
+      // delegated turn is settled rather than stranded behind a follow-up nothing can dispatch.
+      updateSpy.mockImplementationOnce(async (workspaceId, message) => {
+        await realUpdate(workspaceId, message);
+        return { success: false as const, error: "result lost" };
+      });
+      expect(await internals.dispatchPendingFollowUp()).toBe(false);
+      expect(abandoned).toHaveBeenCalledTimes(1);
+      expect(abandoned).toHaveBeenLastCalledWith(workspaceTurnMetadata, "abandoned");
+      const cleared = await historyService.getLastMessages("ws", 1);
+      expect(cleared.success && cleared.data[0]?.metadata?.muxMetadata).toEqual({
+        type: "compaction-summary",
+      });
+    } finally {
+      updateSpy.mockRestore();
+    }
   });
 
   test("dispatchPendingFollowUp removes heartbeat reset boundaries when idle-only follow-ups are skipped", async () => {

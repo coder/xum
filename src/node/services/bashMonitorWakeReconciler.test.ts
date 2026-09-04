@@ -207,6 +207,34 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].isCurrent()).toBe(true);
   });
 
+  test("a wake offered from a registry row mid-removal is withdrawn once the row is gone", async () => {
+    // Cancel path: the owner discards the process, then removes its registry row. A pass that
+    // lands between the two sees a row without a process and offers a monitor-lost wake for
+    // the canceled monitor. The post-removal pass derives nothing for it, and that must
+    // retire the offer — otherwise it stays current and the canceled monitor starts a turn.
+    rows = [registryRecord()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].muxMetadata.records[0]).toMatchObject({
+      processId: "dead",
+      kind: "monitor-lost",
+    });
+    expect(dispatches[0].isCurrent()).toBe(true);
+
+    rows = [];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches[0].isCurrent()).toBe(false);
+    expect(dispatches).toHaveLength(1);
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+
+    // The cancel itself schedules no pass: only the caller's post-removal schedule does, so
+    // no intermediate offer is manufactured for a row the caller is about to delete.
+    rows = [registryRecord()];
+    await reconciler.discardProcess(OWNER, "dead", CREATED_AT);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(dispatches).toHaveLength(1);
+  });
+
   test("a shown-frontier advance retires a handed-out wake so a stale send is refused", async () => {
     // The owner ran a manual turn that task_await-ed the monitored process while this wake
     // was still resolving send options: the reconcile that would re-derive it is queued

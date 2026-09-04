@@ -1198,6 +1198,15 @@ describe("AgentSession queued message tool-call dispatch", () => {
       session.setBashMonitorWakeOutstanding(false);
       expect(lastFlag()).toBe(false);
 
+      // A stream ending onto an empty queue while the level is high (the drain
+      // sendQueuedMessages runs at stream end) keeps the flag up: the wake still asks the
+      // next stream — a racing manual send's — to yield at its first tool boundary.
+      session.setBashMonitorWakeOutstanding(true);
+      session.sendQueuedMessages();
+      expect(lastFlag()).toBe(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(lastFlag()).toBe(false);
+
       // A turn-end head owns the next dispatch: the level must not pull the early-return
       // lever for it (mirrors hasPendingToolEndInput's arbitration).
       session.setBashMonitorWakeOutstanding(true);

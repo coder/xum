@@ -173,9 +173,11 @@ interface DerivedSignal {
  *
  *   offered ──release──▶ released      the owner did not send it: `onDeferred`, `onWake`
  *                                       threw, or the signals were withdrawn under it (cancel,
- *                                       shown frontier, full-history clear). `isCurrent()` turns
- *                                       false so the owner drops it at its next admission gate;
- *                                       whatever still derives is re-leased by the next reconcile.
+ *                                       shown frontier, full-history clear, or a reconcile pass
+ *                                       under which they no longer all derive). `isCurrent()`
+ *                                       turns false so the owner drops it at its next admission
+ *                                       gate; whatever still derives is re-leased by the next
+ *                                       reconcile.
  *   offered ──commit───▶ committed     the owner's prompt row is durable (`onAccepted`). The
  *   released ─commit───▶ committed     signals are consumed from here on regardless of what
  *                                       happened to the offer meanwhile (a release can land in
@@ -508,14 +510,16 @@ export class BashMonitorWakeReconciler {
   /**
    * The operator canceled a monitor: a wake already handed to the owner that carries this
    * process's output must not be sent (its isCurrent() turns false). Its other signals, if
-   * any, re-derive on the next reconcile.
+   * any, re-derive on the next reconcile — which the caller schedules after it removes the
+   * registry row, not here: a pass between the cancel and that removal would see a row
+   * without a process and offer a monitor-lost wake for the canceled monitor.
    */
   async discardProcess(
     ownerWorkspaceId: string,
     processId: string,
     createdAt: string
   ): Promise<void> {
-    await this.forgetDispatchFor(
+    await this.releaseOfferedCovering(
       ownerWorkspaceId,
       (signal) => signal.processId === processId && signal.createdAt === createdAt
     );
@@ -529,10 +533,11 @@ export class BashMonitorWakeReconciler {
    * and let the reconcile scheduled here re-lease whatever still derives.
    */
   async outputShown(ownerWorkspaceId: string, processId: string): Promise<void> {
-    await this.forgetDispatchFor(ownerWorkspaceId, (signal) => signal.processId === processId);
+    await this.releaseOfferedCovering(ownerWorkspaceId, (signal) => signal.processId === processId);
+    this.scheduleReconcile(ownerWorkspaceId);
   }
 
-  private async forgetDispatchFor(
+  private async releaseOfferedCovering(
     ownerWorkspaceId: string,
     covers: (signal: DerivedSignal) => boolean
   ): Promise<void> {
@@ -541,7 +546,6 @@ export class BashMonitorWakeReconciler {
       if (state?.offered?.signals.some(covers)) this.releaseOffered(state);
       return Promise.resolve();
     });
-    this.scheduleReconcile(ownerWorkspaceId);
   }
 
   /** Caller holds the owner lock. */
@@ -633,6 +637,18 @@ export class BashMonitorWakeReconciler {
       await this.cleanup(collected.autoConsumed);
 
       const state = this.state(ownerWorkspaceId);
+      // An offer is a claim on signals that derive *now*. A pass that ran between a monitor's
+      // cancel and its registry-row removal sees a row without a process and offers a
+      // monitor-lost wake for it; once the row is gone nothing derives, yet the offer would
+      // stay current and the canceled monitor could still start an agent turn. Withdraw an
+      // offer whose signals no longer all derive outstanding (also covers a frontier advance
+      // whose outputShown release lost the race with this pass).
+      if (state.offered != null) {
+        const outstandingKeys = new Set(collected.signals.map((signal) => signal.key));
+        if (!state.offered.signals.every((signal) => outstandingKeys.has(signal.key))) {
+          this.releaseOffered(state);
+        }
+      }
       if (collected.signals.length === 0 || state.offered != null || state.committed != null) {
         return undefined;
       }

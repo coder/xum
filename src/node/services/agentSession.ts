@@ -7966,6 +7966,23 @@ export class AgentSession {
       return;
     }
 
+    const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
+    const updateResult = await this.historyService.updateHistory(this.workspaceId, {
+      ...summaryMessage,
+      metadata: {
+        ...(summaryMessage.metadata ?? {}),
+        muxMetadata: muxMetadataWithoutFollowUp,
+      },
+    });
+    // The erase must be durable before the delegated turn it carried is settled: while the
+    // summary still holds the follow-up, startup recovery or a retry can dispatch it, and a
+    // settlement issued now would interrupt the handle (and remove a disposable workspace)
+    // under a continuation that is still live. A failed write is re-checked on disk so a
+    // rewrite that landed but reported failure does not strand the turn unsettled.
+    if (!updateResult.success && !(await this.isPendingFollowUpCleared(summaryMessage))) {
+      throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
+    }
+
     // Every discard path funnels here, so this is the one place that knows the delegated
     // turn's continuation is gone for good. The void is a synchronous state transition here
     // and the owner-side settlement runs as a tracked, retried promise (see
@@ -7973,8 +7990,7 @@ export class AgentSession {
     // TaskService stream-end listener holds the workspace event lock waiting for the
     // compaction completion decision, and the owner settles under that same lock. A wake
     // follow-up also carried the continuation debt of the stream it cut; the same void clears
-    // it. Whether the erase below succeeds does not affect the settlement: the void carries
-    // the correlation itself.
+    // it.
     const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
     if (workspaceTurnMetadata != null) {
       if (
@@ -7990,18 +8006,23 @@ export class AgentSession {
         reason: "abandoned",
       });
     }
+  }
 
-    const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
-    const updateResult = await this.historyService.updateHistory(this.workspaceId, {
-      ...summaryMessage,
-      metadata: {
-        ...(summaryMessage.metadata ?? {}),
-        muxMetadata: muxMetadataWithoutFollowUp,
-      },
-    });
-    if (!updateResult.success) {
-      throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
-    }
+  /**
+   * Whether the durable copy of a compaction summary no longer carries a pending follow-up.
+   * Only a successful read that finds the row without one counts; an unreadable or missing row
+   * is "unknown", which callers treat as not cleared.
+   */
+  private async isPendingFollowUpCleared(summaryMessage: MuxMessage): Promise<boolean> {
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!historyResult.success) return false;
+    const durable = historyResult.data.find((message) => message.id === summaryMessage.id);
+    const durableMuxMeta = durable?.metadata?.muxMetadata;
+    return (
+      durable != null &&
+      isCompactionSummaryMetadata(durableMuxMeta) &&
+      durableMuxMeta.pendingFollowUp == null
+    );
   }
 
   /**
