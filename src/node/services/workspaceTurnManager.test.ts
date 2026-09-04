@@ -5733,10 +5733,11 @@ describe("WorkspaceTurnManager", () => {
       ) => Promise<void>;
       recoverTerminalWorkspaceTurnAttentionNotifications: () => Promise<number>;
     };
+    // Reject only when recovery invokes the fault, after its asynchronous disk scan.
     const replay = spyOn(
       internal,
       "deliverPersistentChildWorkspaceTurnResult"
-    ).mockRejectedValueOnce(new Error("read-only session"));
+    ).mockImplementationOnce(() => Promise.reject(new Error("read-only session")));
 
     try {
       await internal.recoverTerminalWorkspaceTurnAttentionNotifications();
@@ -5768,8 +5769,8 @@ describe("WorkspaceTurnManager", () => {
     };
     const enqueueTerminalAttention = taskHost.enqueueTerminalAttention.bind(taskHost);
     const enqueue = spyOn(taskHost, "enqueueTerminalAttention")
-      .mockRejectedValueOnce(new Error("read-only attention store"))
-      .mockImplementation(enqueueTerminalAttention);
+      .mockImplementation(enqueueTerminalAttention)
+      .mockImplementationOnce(() => Promise.reject(new Error("read-only attention store")));
 
     try {
       expect(await internal.recoverTerminalWorkspaceTurnAttentionNotifications()).toBe(1);
