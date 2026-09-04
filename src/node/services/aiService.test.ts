@@ -1609,6 +1609,24 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       eligible: false,
     },
     {
+      name: "disabled intuition agent",
+      memory: true,
+      intuition: true,
+      child: false,
+      service: true,
+      agentEnabled: false,
+      eligible: false,
+    },
+    {
+      name: "explicitly enabled intuition agent",
+      memory: true,
+      intuition: true,
+      child: false,
+      service: true,
+      agentEnabled: true,
+      eligible: true,
+    },
+    {
       name: "disabled memory",
       memory: false,
       intuition: true,
@@ -1663,7 +1681,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await harness.config.editConfig((cfg) => {
         cfg.agentAiDefaults = {
           ...cfg.agentAiDefaults,
-          intuition: { modelString: KNOWN_MODELS.SONNET.id },
+          intuition: { modelString: KNOWN_MODELS.SONNET.id, enabled: scenario.agentEnabled },
         };
         return cfg;
       });

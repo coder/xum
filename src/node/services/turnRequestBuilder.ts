@@ -40,6 +40,7 @@ import {
 import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
+import { resolveAgentEnabledOverride } from "@/node/services/agentDefinitions/agentEnablement";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -1455,8 +1456,12 @@ export class TurnRequestBuilder {
     // below so the prompt never advertises an absent tool.
     const memoryToolEligible =
       memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
+    // Agent settings can disable paid headless calls independently of the experiment.
     const intuitionToolEligible =
-      memoryToolEligible && memoryIntuitionExperimentEnabled && !isSubagentWorkspace;
+      memoryToolEligible &&
+      memoryIntuitionExperimentEnabled &&
+      !isSubagentWorkspace &&
+      resolveAgentEnabledOverride(cfg, "intuition") !== false;
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
