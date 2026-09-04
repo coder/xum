@@ -21,6 +21,11 @@ const SAMPLING_CALL_SETTINGS = ["temperature", "topP", "topK"] as const;
  * temperature/top_p/top_k; Google's migration guides require stripping them from
  * generation configs, so forwarding user overrides would break existing setups
  * (e.g. a wildcard temperature) when the gemini-flash alias repoints.
+ *
+ * OpenAI reasoning models are deliberately absent even though GPT-6 Astra also
+ * rejects temperature/top_p/logprobs: @ai-sdk/openai already drops those from
+ * both wire formats for any GPT-5+ id unless the effort is "none", and Astra
+ * never receives "none" (see openaiRejectsDisabledReasoning).
  */
 export function modelRejectsSamplingParameters(modelString: string): boolean {
   const bareModelId = stripModelProviderPrefixes(modelString);

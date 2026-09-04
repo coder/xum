@@ -152,9 +152,10 @@ describe("openaiSupportsProMode", () => {
     expect(openaiSupportsProMode("anthropic:claude-opus-4-7")).toBe(false);
   });
 
-  test("withholds pro mode from GPT-6 Astra, whose docs list no reasoning.mode", () => {
+  test("withholds pro mode from GPT-6 Astra while OpenAI's docs disagree about it", () => {
     // Native max is real for Astra, but pro mode is gated separately: an
-    // unsupported reasoning.mode could fail the request, a missing toggle cannot.
+    // unsupported reasoning.mode could fail the request, a missing toggle cannot
+    // (see openaiSupportsProMode for the doc split).
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6-astra")).toBe(true);
     expect(openaiSupportsProMode("openai:gpt-6-astra")).toBe(false);
     expect(openaiSupportsProMode("mux-gateway:openai/gpt-6-astra")).toBe(false);

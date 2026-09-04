@@ -333,9 +333,14 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
  * `gpt-5.6` alias) — the Sol/Terra-only restriction came from stale preview
  * coverage.
  *
- * Excludes GPT-6 Astra: its launch documentation lists no `reasoning.mode`, and
- * OpenAI rejects parameters a model does not support, so enabling the toggle
- * could fail every pro-mode request whereas withholding it only costs an option.
+ * Excludes GPT-6 Astra for now: OpenAI's launch docs disagree with each other.
+ * The model guide lists pro mode among the GPT-5.6 capabilities Astra inherits,
+ * but the reasoning guide's "Reasoning mode" reference still names only GPT-5.6
+ * models, and the Astra model page does not mention `reasoning.mode` at all.
+ * OpenAI rejects parameters a model does not support, so enabling the toggle on
+ * the optimistic reading could fail every pro-mode request, whereas withholding
+ * it only costs an option. Flip once the reference lists Astra or a live
+ * Responses probe with `reasoning.mode: "pro"` succeeds.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
   return isGpt56FamilyModel(modelString);

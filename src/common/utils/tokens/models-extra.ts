@@ -448,8 +448,13 @@ export const modelsExtra: Record<string, ModelData> = {
   // cache writes billed at 1.25x the active input rate ($12.50/M base). Prompts
   // above 272K input tokens bill the full request at 2x input / 1.5x output:
   // $20/M input, $75/M output, $2/M cached input, $25/M cache writes.
+  // supports_function_calling holds for the default Responses wire format only:
+  // Astra is served on Chat Completions too, but OpenAI's reasoning guide states
+  // tool calling requires the Responses API there, so the `chatCompletions`
+  // wireFormat opt-in loses tools for this model.
   // Ref: https://developers.openai.com/api/docs/models/gpt-6-astra
   // Ref: https://developers.openai.com/api/docs/pricing
+  // Ref: https://developers.openai.com/api/docs/guides/reasoning#reasoning-effort
   "gpt-6-astra": {
     max_input_tokens: 1050000,
     max_output_tokens: 128000,
