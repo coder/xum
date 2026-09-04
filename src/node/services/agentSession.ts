@@ -946,8 +946,13 @@ export class AgentSession {
    *   level lowered (cancel / shown / clear)        → maybeVoid
    *   maybeVoid: debt ∧ ¬inFlight ∧ ¬level          → void "retracted"
    *   non-wake input accepted (its row durable)     → void "superseded"; a turn with the
-   *     (settleWakeDebtForAcceptedInput)               same correlation continues the debt
-   *                                                   itself (its stream-end settles it)
+   *     (settleWakeDebtForAcceptedInput)               same correlation ASSUMES the debt: it
+   *                                                   stays visible to settlement, cannot be
+   *                                                   retracted under the continuation, and
+   *                                                   its stream-start discharges it (that
+   *                                                   stream's own stream-end settles the turn)
+   *   assuming send returns without a stream        → un-assume unless an auto-retry of its
+   *                                                   durable row is armed; then maybeVoid
    *   compaction follow-up with the correlation     → void "abandoned" (before the erase)
    *     dropped (clearPendingFollowUpFromSummary)
    *   dispose / IDLE                                → in-flight false (IDLE keeps the debt:
@@ -957,7 +962,7 @@ export class AgentSession {
    * cleanup I/O). A failed void is kept in `unsettledWakeVoids` and retried at every later
    * debt transition and on a timer, so a deferred delegated handle never waits for a restart.
    */
-  private wakeContinuationDebt?: { correlation?: WorkspaceTurnMuxMetadata };
+  private wakeContinuationDebt?: { correlation?: WorkspaceTurnMuxMetadata; assumed?: true };
   private wakeTurnInFlight = false;
   private unsettledWakeVoids: Array<{
     correlation: WorkspaceTurnMuxMetadata;
@@ -3191,7 +3196,7 @@ export class AgentSession {
     try {
       return await this.sendMessageInner(...args);
     } finally {
-      if (wake) this.settleWakeTurnInFlight();
+      if (wake || this.wakeContinuationDebt?.assumed === true) this.settleWakeTurnInFlight();
     }
   }
 
@@ -4307,7 +4312,7 @@ export class AgentSession {
     try {
       return await this.resumeStreamInner(...args);
     } finally {
-      if (wake) this.settleWakeTurnInFlight();
+      if (wake || this.wakeContinuationDebt?.assumed === true) this.settleWakeTurnInFlight();
     }
   }
 
@@ -5949,6 +5954,16 @@ export class AgentSession {
         if (streamMetadata?.type === "bash-monitor-wake") {
           this.wakeTurnInFlight = false;
           this.wakeContinuationDebt = undefined;
+        } else if (
+          this.wakeContinuationDebt != null &&
+          hasSameWorkspaceTurnCorrelation(
+            getWorkspaceTurnMuxMetadata(streamMetadata),
+            this.wakeContinuationDebt.correlation
+          )
+        ) {
+          // The delegated turn's own continuation is streaming: its stream-end settles the
+          // turn, so the debt it assumed at acceptance is discharged.
+          this.wakeContinuationDebt = undefined;
         }
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
@@ -6853,15 +6868,29 @@ export class AgentSession {
    * or an auto-retry armed for its durable row.
    */
   private settleWakeTurnInFlight(): void {
-    if (!this.wakeTurnInFlight) return;
+    const assumed = this.wakeContinuationDebt?.assumed === true;
+    if (!this.wakeTurnInFlight && !assumed) return;
+    // A turn in progress (the wake's / continuation's own stream, PREPARING, or a compaction
+    // stream whose follow-up is that turn) can still start the stream.
     if (this.turnPhase !== TurnPhase.IDLE) return;
-    if (
-      this.hasPendingAutoRetry() &&
-      carriesBashMonitorWake(this.lastAutoRetryResumeRequest?.options.muxMetadata)
-    ) {
-      return;
+    const retryMetadata: unknown = this.hasPendingAutoRetry()
+      ? this.lastAutoRetryResumeRequest?.options.muxMetadata
+      : undefined;
+    if (this.wakeTurnInFlight && !carriesBashMonitorWake(retryMetadata)) {
+      this.wakeTurnInFlight = false;
     }
-    this.wakeTurnInFlight = false;
+    if (
+      assumed &&
+      this.wakeContinuationDebt != null &&
+      !hasSameWorkspaceTurnCorrelation(
+        getWorkspaceTurnMuxMetadata(retryMetadata),
+        this.wakeContinuationDebt.correlation
+      )
+    ) {
+      // The continuation that assumed the debt is not coming from this send; the debt is
+      // plain owed again (the wake, if still outstanding, will discharge it).
+      delete this.wakeContinuationDebt.assumed;
+    }
     this.maybeVoidWakeContinuation();
   }
 
@@ -6869,6 +6898,7 @@ export class AgentSession {
     this.retryUnsettledWakeVoids();
     if (
       this.wakeContinuationDebt != null &&
+      this.wakeContinuationDebt.assumed !== true &&
       !this.wakeTurnInFlight &&
       !this.bashMonitorWakeOutstanding
     ) {
@@ -6882,6 +6912,12 @@ export class AgentSession {
    * send refused earlier — pricing, staleness, persistence — leaves the wake outstanding and
    * its continuation still owed. Synchronous with the PREPARING reservation this is not:
    * enterPreparing only reserves the turn.
+   *
+   * A continuation of the delegated turn itself does not clear the debt here: between this
+   * point and its PREPARING / stream-start nothing else would tell settlement that the turn
+   * continues, and a stream-end handler running in that gap would settle (and, for a
+   * disposable turn, remove the workspace under) the accepted continuation. It assumes the
+   * debt instead; its stream-start discharges it.
    */
   private settleWakeDebtForAcceptedInput(muxMetadata: unknown): void {
     if (this.wakeContinuationDebt == null || carriesBashMonitorWake(muxMetadata)) return;
@@ -6891,7 +6927,7 @@ export class AgentSession {
         this.wakeContinuationDebt.correlation
       )
     ) {
-      this.wakeContinuationDebt = undefined;
+      this.wakeContinuationDebt.assumed = true;
       this.retryUnsettledWakeVoids();
     } else {
       this.voidWakeContinuation("superseded");

@@ -751,9 +751,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("a correlated turn admitted after the cut continues the debt without settling it", async () => {
+  test("a correlated turn admitted after the cut assumes the debt until its stream starts", async () => {
     // The delegated turn's own continuation (e.g. a queued same-turn message) supersedes
-    // nothing: its stream-end settles the turn, so the owner is not told.
+    // nothing: its stream-end settles the turn, so the owner is not told. Until that stream
+    // starts the debt stays visible to settlement (a stream-end handler running in the gap
+    // must still defer) and cannot be retracted by the level lowering.
     const workspaceId = "queue-dispatch-wake-cut-same-turn";
     let level = true;
     let markStreamRequested: () => void = () => undefined;
@@ -765,7 +767,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       releaseStream = resolve;
     });
     const voided: unknown[] = [];
-    const { session, cleanup } = await createAgentSessionHarness({
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
       workspaceId,
       hasOutstandingBashMonitorWake: () => Promise.resolve(level),
       onWorkspaceTurnContinuationVoided: (...args) => {
@@ -791,7 +793,17 @@ describe("AgentSession queued message tool-call dispatch", () => {
         muxMetadata: DELEGATED_TURN,
       });
       await streamRequested;
+      expect(session.hasBashMonitorWakeContinuation()).toBe(true);
+      // PREPARING attributes the cut to this continuation; either attribution defers.
+      expect(session.getQueueCutCutter()?.stage).toBe("preparing");
+      session.setBashMonitorWakeOutstanding(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(session.hasBashMonitorWakeContinuation()).toBe(true);
+      expect(voided).toEqual([]);
+
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
       expect(session.hasBashMonitorWakeContinuation()).toBe(false);
+      expect(session.getQueueCutCutter()).toBeUndefined();
       expect(voided).toEqual([]);
       session.dispose();
       disposed = true;

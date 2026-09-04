@@ -24856,12 +24856,25 @@ describe("TaskService", () => {
       deferredMessageIds: ["msg_deferred_cut"],
     });
 
-    queuedContinuation = true;
-    await taskService.settleVoidedWorkspaceTurnContinuation(
-      "childworkspace",
-      correlation,
-      "retracted"
-    );
+    // The continuation is queued while the void is reading the handle store: the check must
+    // run after that read, not once up front.
+    const store = (taskService as unknown as { taskHandleStore: TaskHandleStore }).taskHandleStore;
+    const getWorkspaceTurn = store.getWorkspaceTurn.bind(store);
+    const readSpy = spyOn(store, "getWorkspaceTurn").mockImplementationOnce(async (...args) => {
+      const record = await getWorkspaceTurn(...args);
+      queuedContinuation = true;
+      return record;
+    });
+    try {
+      await taskService.settleVoidedWorkspaceTurnContinuation(
+        "childworkspace",
+        correlation,
+        "retracted"
+      );
+    } finally {
+      readSpy.mockRestore();
+    }
+    expect(queuedContinuation).toBe(true);
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
       status: "running",
       deferredMessageIds: ["msg_deferred_cut"],
