@@ -1,3 +1,4 @@
+import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { SecretsStore } from "@/node/config";
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
@@ -26,7 +27,7 @@ import {
   upsertSubagentFailureArtifact,
 } from "@/node/services/subagentFailureArtifacts";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
-import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -199,6 +200,7 @@ function createTaskServiceHarness(
     initStateManager?: InitStateManager;
     sessionUsageService?: SessionUsageService;
     workspaceGoalService?: WorkspaceGoalService;
+    desktopInputCoordinator?: DesktopInputCoordinator;
   }
 ): {
   historyService: HistoryService;
@@ -229,7 +231,8 @@ function createTaskServiceHarness(
     overrides?.sessionUsageService,
     overrides?.workspaceGoalService,
     new SecretsStore(config.rootDir),
-    terminalAttentionStore
+    terminalAttentionStore,
+    overrides?.desktopInputCoordinator
   );
   const workspaceTurnManager = new WorkspaceTurnManager(
     config,
@@ -239,7 +242,8 @@ function createTaskServiceHarness(
     initStateManager,
     taskService,
     terminalAttentionStore,
-    streamManager
+    streamManager,
+    overrides?.desktopInputCoordinator
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);
   const managerInternals = workspaceTurnManager as unknown as {
@@ -476,6 +480,7 @@ describe("TaskService", () => {
     expect(result).toEqual(
       Ok({
         taskId: childId,
+        desktopOwnerWorkspaceId: childId,
         kind: "agent",
         status: "running",
         modelString: "anthropic:claude-opus-4-6",
@@ -4009,6 +4014,556 @@ describe("TaskService", () => {
     ]);
     expect(workflowOwned.success).toBe(true);
   });
+
+  test.each(["single", "batch"] as const)(
+    "shared desktop best-of %s refuses before creation side effects",
+    async (mode) => {
+      const config = await createTestConfig(rootDir);
+      const { taskService, aiService } = createTaskServiceHarness(config);
+      const metadata = spyOn(aiService, "getWorkspaceMetadata");
+      const args = {
+        parentWorkspaceId: "missing-parent",
+        kind: "agent" as const,
+        agentId: "desktop",
+        prompt: "Inspect the desktop",
+        title: "Inspector",
+        bestOf: { groupId: "group", index: 0, total: 2 },
+      };
+      const result =
+        mode === "single" ? await taskService.create(args) : await taskService.createMany([args]);
+      expect(result.success).toBe(false);
+      expect(metadata).not.toHaveBeenCalled();
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+    }
+  );
+
+  test("shared desktop batch rejects competing children before reservation callbacks", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const { taskService } = createTaskServiceHarness(config);
+    const onTaskReserved = mock(() => undefined);
+    const fork = spyOn(forkOrchestrator, "orchestrateFork");
+    try {
+      const result = await taskService.createMany(
+        ["one", "two"].map((prompt) => ({
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentId: "explore",
+          prompt,
+          title: prompt,
+          desktop: "shared" as const,
+        })),
+        { onTaskReserved }
+      );
+      expect(result.success).toBe(false);
+      expect(onTaskReserved).not.toHaveBeenCalled();
+      expect(fork).not.toHaveBeenCalled();
+      expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toHaveLength(1);
+    } finally {
+      fork.mockRestore();
+    }
+  });
+
+  test("shared desktop reservations from separate backends commit only one borrower", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      cfg.projects.get(projectPath)!.workspaces.push(
+        projectWorkspace(projectPath, "busy", "busy", {
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+          agentId: "explore",
+        })
+      );
+      return cfg;
+    });
+    const otherConfig = new Config(config.rootDir);
+    const services = [config, otherConfig].map((cfg) => createTaskServiceHarness(cfg).taskService);
+    let reservations = 0;
+    const results = await Promise.all(
+      services.map((service) =>
+        service.createMany(
+          [
+            {
+              parentWorkspaceId: parentId,
+              kind: "agent",
+              agentId: "explore",
+              prompt: "Inspect",
+              title: "Inspector",
+              desktop: "shared",
+            },
+          ],
+          {
+            onTaskReserved: () => {
+              reservations += 1;
+            },
+          }
+        )
+      )
+    );
+    expect(results.filter((result) => result.success)).toHaveLength(1);
+    expect(reservations).toBe(1);
+    const failure = results.find((result) => !result.success);
+    assert(failure != null && !failure.success);
+    expect(failure.error).toContain("controlled by active borrower");
+    expect(
+      config
+        .loadConfigOrDefault()
+        .projects.get(projectPath)!
+        .workspaces.filter((workspace) => workspace.taskDesktopOwnerWorkspaceId === parentId)
+    ).toHaveLength(1);
+  });
+
+  test("shared desktop batch preserves distinct owners through queued reservation", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      const project = cfg.projects.get(projectPath)!;
+      project.workspaces.push(
+        { ...project.workspaces[0], id: "second-parent", name: "second-parent" },
+        projectWorkspace(projectPath, "busy", "busy", {
+          parentWorkspaceId: parentId,
+          taskStatus: "running",
+          agentId: "explore",
+        })
+      );
+      return cfg;
+    });
+    const { taskService } = createTaskServiceHarness(config);
+    const owners = [parentId, "second-parent"];
+    const result = await taskService.createMany(
+      owners.map((owner) => ({
+        parentWorkspaceId: owner,
+        kind: "agent" as const,
+        agentId: "explore",
+        prompt: "Inspect",
+        title: "Inspector",
+        desktop: "shared" as const,
+      }))
+    );
+    assert(result.success);
+    expect(result.data.map((task) => task.status)).toEqual(["queued", "queued"]);
+    expect(result.data.map((task) => task.desktopOwnerWorkspaceId)).toEqual(owners);
+    expect(
+      result.data.map(
+        (task) => findWorkspaceInConfig(config, task.taskId)?.taskDesktopOwnerWorkspaceId
+      )
+    ).toEqual(owners);
+  });
+
+  test.each([undefined, "isolated"] as const)(
+    "desktop specialist queued binding respects explicit override %s",
+    async (desktop) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      await config.editConfig((cfg) => {
+        cfg.taskSettings = testTaskSettings(1, 3);
+        cfg.projects.get(projectPath)!.workspaces.push(
+          projectWorkspace(projectPath, "busy", "busy", {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            taskStatus: "running",
+            runtimeConfig: { type: "local" },
+          })
+        );
+        return cfg;
+      });
+      const { taskService } = createTaskServiceHarness(config);
+      const result = await createAgentTask(taskService, parentId, "Inspect", {
+        agentId: " Desktop ",
+        desktop,
+      });
+      assert(result.success);
+      expect(result.data.status).toBe("queued");
+      expect(findWorkspaceInConfig(config, result.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
+        desktop === "isolated" ? undefined : parentId
+      );
+      expect(result.data.desktopOwnerWorkspaceId).toBe(
+        desktop === "isolated" ? result.data.taskId : parentId
+      );
+    }
+  );
+
+  test("shared desktop creation waits for open input then releases its gate before sending", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const desktop = new DesktopInputCoordinator(config);
+    let releaseInput!: () => void;
+    const inputReleased = new Promise<void>((resolve) => {
+      releaseInput = resolve;
+    });
+    let inputStarted!: () => void;
+    const inputEntered = new Promise<void>((resolve) => {
+      inputStarted = resolve;
+    });
+    let reservationStarted!: () => void;
+    const reservationEntered = new Promise<void>((resolve) => {
+      reservationStarted = resolve;
+    });
+    const reserve = desktop.withReservation.bind(desktop);
+    const reservationSpy = spyOn(desktop, "withReservation").mockImplementation(
+      (owner, borrower, persist) => {
+        reservationStarted();
+        return reserve(owner, borrower, persist);
+      }
+    );
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    sendMessage.mockImplementation((id: string) =>
+      desktop.withInput(id, () => Promise.resolve(Ok(undefined)))
+    );
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+      desktopInputCoordinator: desktop,
+    });
+    const input = desktop.withInput(parentId, async () => {
+      inputStarted();
+      await inputReleased;
+    });
+    try {
+      await inputEntered;
+      const creation = createAgentTask(taskService, parentId, "Inspect", { desktop: "shared" });
+      await reservationEntered;
+      expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toHaveLength(1);
+      expect(sendMessage).not.toHaveBeenCalled();
+      releaseInput();
+      await input;
+      const result = await creation;
+      assert(result.success);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const failure = await desktop
+        .withInput(parentId, () => Promise.resolve())
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(failure).toBeInstanceOf(Error);
+      await taskService.editWorkspaceEntry(result.data.taskId, (workspace) => {
+        workspace.taskStatus = "interrupted";
+      });
+      await desktop.withInput(parentId, () => Promise.resolve());
+    } finally {
+      releaseInput();
+      await input;
+      reservationSpy.mockRestore();
+    }
+  });
+
+  test.each(["queued", "starting", "running", "awaiting_report"] as const)(
+    "shared desktop startup recovery refuses a missing owner from %s",
+    async (taskStatus) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(
+          projectWorkspace(projectPath, "child", "child", {
+            parentWorkspaceId: parentId,
+            taskStatus,
+            agentId: "explore",
+            agentType: "explore",
+            runtimeConfig: { type: "local" },
+            taskDesktopOwnerWorkspaceId: "deleted",
+            taskPrompt: "Inspect",
+            taskModelString: "anthropic:claude-opus-4-6",
+          })
+        );
+        return cfg;
+      });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      await taskService.recoverInterruptedTasks();
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe("interrupted");
+      expect(findWorkspaceInConfig(config, "child")?.taskDesktopOwnerWorkspaceId).toBe("deleted");
+    }
+  );
+
+  test("shared desktop failed launch releases the owner for the next child", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    sendMessage.mockResolvedValueOnce(Err("launch refused"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const failed = await createAgentTask(taskService, parentId, "First", { desktop: "shared" });
+    expect(failed.success).toBe(false);
+    const next = await createAgentTask(taskService, parentId, "Second", { desktop: "shared" });
+    assert(next.success);
+    expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
+      parentId
+    );
+    const fork = spyOn(forkOrchestrator, "orchestrateFork");
+    try {
+      const competing = await createAgentTask(taskService, parentId, "Third", {
+        desktop: "shared",
+      });
+      expect(competing.success).toBe(false);
+      expect(fork).not.toHaveBeenCalled();
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+    } finally {
+      fork.mockRestore();
+    }
+  });
+
+  test.each([
+    ["initial", "shared", "user", "idle", "interrupted"],
+    ["initial", "shared", "system", "idle", "running"],
+    ["initial", "isolated", "user", "idle", "running"],
+    ["reawakened", "shared", "user", "idle", "interrupted"],
+    ["reawakened", "shared", "user", "pending successor", "running"],
+  ] as const)(
+    "%s %s desktop child %s stream abort while %s leaves the task %s",
+    async (run, desktop, abortReason, successor, expectedStatus) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const desktopCoordinator = new DesktopInputCoordinator(config);
+      // Drive the real aiService subscription so the abort flows through the event lock.
+      const listeners = new Map<string, (payload: unknown) => void>();
+      const on = mock((event: string, handler: (payload: unknown) => void) => {
+        listeners.set(event, handler);
+      });
+      const { aiService } = createAIServiceMocks(config, { on });
+      // The real WorkspaceService restores a reawakened child to running before dispatching;
+      // the mock mirrors that and accepts the turn.
+      const serviceRef: { current?: TaskService } = {};
+      const sendMessage = mock(
+        async (
+          workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await serviceRef.current?.markInterruptedTaskRunning(workspaceId);
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage,
+        hasPendingQueuedOrPreparingTurn: mock(() => successor === "pending successor"),
+      });
+      const { taskService } = createTaskServiceHarness(config, {
+        aiService,
+        workspaceService,
+        desktopInputCoordinator: desktopCoordinator,
+      });
+      serviceRef.current = taskService;
+
+      let childId: string;
+      let waiter: Promise<string>;
+      if (run === "initial") {
+        const created = await createAgentTask(taskService, parentId, "Inspect", { desktop });
+        assert(created.success, "Expected the child task to start");
+        childId = created.data.taskId;
+        waiter = taskService.waitForAgentReport(childId, { timeoutMs: 5_000 }).then(
+          () => "settled",
+          (error: unknown) => (error instanceof Error ? error.message : "?")
+        );
+      } else {
+        childId = "reported-child";
+        await config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.workspaces.push(
+            projectWorkspace(projectPath, childId, childId, {
+              parentWorkspaceId: parentId,
+              agentId: "explore",
+              agentType: "explore",
+              taskStatus: "reported",
+              reportedAt: "2026-09-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              taskDesktopOwnerWorkspaceId: parentId,
+            })
+          );
+          return cfg;
+        });
+        const continuation = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+          ownerWorkspaceId: parentId,
+          prompt: "Continue on the same desktop",
+          title: "Reawaken",
+          allowAgentWorkspace: true,
+          workspace: { mode: "existing", workspaceId: childId },
+        });
+        assert(continuation.success, "Expected the reawakening turn to be admitted");
+        expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+        expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("running");
+        waiter = workspaceTurnManagerFor(taskService)
+          .waitForWorkspaceTurn(continuation.data.taskId, {
+            requestingWorkspaceId: parentId,
+            ownerWorkspaceId: parentId,
+            timeoutMs: 5_000,
+          })
+          .then(
+            () => "settled",
+            (error: unknown) => (error instanceof Error ? error.message : "?")
+          );
+      }
+      const ownerInput = () =>
+        desktopCoordinator
+          .withInput(parentId, () => Promise.resolve("clicked"))
+          .then(
+            (value) => value,
+            (error: unknown) => (error instanceof Error ? error.message : String(error))
+          );
+      if (desktop === "shared") {
+        expect(await ownerInput()).toContain(`active borrower ${childId}`);
+      }
+
+      const onStreamAbort = listeners.get("stream-abort");
+      assert(onStreamAbort, "TaskService must subscribe to stream-abort");
+      onStreamAbort({
+        type: "stream-abort",
+        workspaceId: childId,
+        messageId: "msg_1",
+        abortReason,
+      });
+
+      if (expectedStatus === "interrupted") {
+        await waitForWorkspaceTaskStatus(config, childId, "interrupted");
+        // Clicking Stop in the child UI hands the desktop back to the owner immediately...
+        expect(await ownerInput()).toBe("clicked");
+        expect(await waiter).toBe(
+          run === "initial" ? "Task interrupted" : "Workspace turn interrupted"
+        );
+        if (run === "reawakened") {
+          expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("interrupted");
+        }
+        // ...and the paused child still reawakens onto the same desktop when the user resumes it.
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        expect(findWorkspaceInConfig(config, childId)?.taskDesktopOwnerWorkspaceId).toBe(parentId);
+        expect(await ownerInput()).toContain(`active borrower ${childId}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("running");
+      if (desktop === "shared") {
+        // A pending successor turn (or a non-user abort) keeps the child in control.
+        expect(await ownerInput()).toContain(`active borrower ${childId}`);
+      } else {
+        expect(await ownerInput()).toBe("clicked");
+      }
+    }
+  );
+
+  test.each(["successor mirror", "pending turn"] as const)(
+    "user stop release re-evaluates a %s published while its config edit was queued",
+    async (race) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const desktopCoordinator = new DesktopInputCoordinator(config);
+      const listeners = new Map<string, (payload: unknown) => void>();
+      const on = mock((event: string, handler: (payload: unknown) => void) => {
+        listeners.set(event, handler);
+      });
+      const { aiService } = createAIServiceMocks(config, { on });
+      const pendingTurn = { value: false };
+      const { workspaceService } = createWorkspaceServiceMocks({
+        hasPendingQueuedOrPreparingTurn: mock(() => pendingTurn.value),
+      });
+      const { taskService } = createTaskServiceHarness(config, {
+        aiService,
+        workspaceService,
+        desktopInputCoordinator: desktopCoordinator,
+      });
+      const created = await createAgentTask(taskService, parentId, "Inspect", {
+        desktop: "shared",
+      });
+      assert(created.success, "Expected the child task to start");
+      const childId = created.data.taskId;
+
+      // The release's edit is the first config edit after the abort. Publish the successor after
+      // that edit was scheduled but before its transform runs, mimicking a config-queue suspension.
+      const editConfig = config.editConfig.bind(config);
+      let releaseEditSettled!: () => void;
+      const releaseEdit = new Promise<void>((resolve) => {
+        releaseEditSettled = resolve;
+      });
+      let intercepted = false;
+      const editSpy = spyOn(config, "editConfig").mockImplementation(async (transform) => {
+        if (intercepted) return editConfig(transform);
+        intercepted = true;
+        if (race === "successor mirror") {
+          await editConfig((cfg) => {
+            const child = findWorkspaceEntry(cfg, childId)?.workspace;
+            assert(child, "child entry must exist");
+            child.taskExecutionId = "wst_successor";
+            child.taskExecutionStatus = "running";
+            return cfg;
+          });
+        } else {
+          pendingTurn.value = true;
+        }
+        try {
+          return await editConfig(transform);
+        } finally {
+          releaseEditSettled();
+        }
+      });
+      try {
+        const onStreamAbort = listeners.get("stream-abort");
+        assert(onStreamAbort, "TaskService must subscribe to stream-abort");
+        onStreamAbort({
+          type: "stream-abort",
+          workspaceId: childId,
+          messageId: "msg_1",
+          abortReason: "user",
+        });
+        await releaseEdit;
+      } finally {
+        editSpy.mockRestore();
+      }
+
+      // The stale abort must not clear the successor's control.
+      const child = findWorkspaceInConfig(config, childId);
+      expect(child?.taskStatus).toBe("running");
+      if (race === "successor mirror") {
+        expect(child?.taskExecutionId).toBe("wst_successor");
+        expect(child?.taskExecutionStatus).toBe("running");
+      }
+      const ownerInput = await desktopCoordinator
+        .withInput(parentId, () => Promise.resolve("clicked"))
+        .then(
+          (value) => value,
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
+      expect(ownerInput).toContain(`active borrower ${childId}`);
+    }
+  );
+
+  test.each(["reported", "interrupted"] as const)(
+    "shared desktop %s resume preserves binding and refuses a competing controller",
+    async (taskStatus) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(
+          ...["child", "competitor"].map((id) =>
+            projectWorkspace(projectPath, id, id, {
+              parentWorkspaceId: parentId,
+              taskStatus: id === "child" ? taskStatus : "running",
+              agentId: "explore",
+              runtimeConfig: { type: "local" },
+              taskDesktopOwnerWorkspaceId: parentId,
+            })
+          )
+        );
+        return cfg;
+      });
+      const { taskService } = createTaskServiceHarness(config);
+      const failure = await taskService.markInterruptedTaskRunning("child").then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe(taskStatus);
+      await taskService.editWorkspaceEntry("competitor", (workspace) => {
+        workspace.taskStatus = "interrupted";
+      });
+      expect(await taskService.markInterruptedTaskRunning("child")).toBe(true);
+      expect(await taskService.markInterruptedTaskRunning("child")).toBe(false);
+      expect(findWorkspaceInConfig(config, "child")?.taskDesktopOwnerWorkspaceId).toBe(parentId);
+      await taskService.restoreInterruptedTaskAfterResumeFailure("child", taskStatus);
+      expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe(taskStatus);
+    }
+  );
 
   test("createMany reserves admitted tasks as starting and over-capacity tasks as queued", async () => {
     const config = await createTestConfig(rootDir);
@@ -15711,6 +16266,78 @@ describe("TaskService", () => {
     expect(workspacePathExists).toBe(false);
   }, 20_000);
 
+  test("rolls back a forked checkout when persistence throws after the fork", async () => {
+    const config = await createTestConfig(rootDir);
+    const childTaskId = "cccccccccc";
+    stubStableIds(config, [childTaskId, "dddddddddd"], childTaskId);
+
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    const parentCreate = await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: createNullInitLogger(),
+    });
+    expect(parentCreate.success).toBe(true);
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: runtime.getWorkspacePath(projectPath, parentName),
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService, sendMessage, discardExtensionMetadataEntry } =
+      createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Deterministic post-fork failure: the transform that registers the child entry throws, so
+    // the checkout already exists on disk while nothing was persisted.
+    const editConfig = config.editConfig.bind(config);
+    const persistSpy = spyOn(config, "editConfig").mockImplementation((transform) =>
+      editConfig((cfg) => {
+        const next = transform(cfg);
+        const registersChild = Array.from(next.projects.values()).some((project) =>
+          project.workspaces.some((workspace) => workspace.id === childTaskId)
+        );
+        if (registersChild) throw new Error("config persistence failed after fork");
+        return next;
+      })
+    );
+    try {
+      const failed = await createAgentTask(taskService, parentId, "Inspect", { desktop: "shared" });
+      expect(failed).toEqual(Err("config persistence failed after fork"));
+    } finally {
+      persistSpy.mockRestore();
+    }
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
+    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith(childTaskId);
+    const forkedPath = runtime.getWorkspacePath(projectPath, `agent_explore_${childTaskId}`);
+    expect(existsSync(forkedPath)).toBe(false);
+
+    // The owner's desktop is free again: the reservation never outlived the failed callback.
+    const next = await createAgentTask(taskService, parentId, "Inspect again", {
+      desktop: "shared",
+    });
+    assert(next.success, "Expected the next shared desktop task to be admitted");
+    expect(findWorkspaceInConfig(config, next.data.taskId)?.taskDesktopOwnerWorkspaceId).toBe(
+      parentId
+    );
+  }, 20_000);
+
   test("failed config deregistration during rollback does not tombstone the task's metadata", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["bbbbbbbbbb"], "bbbbbbbbbb");
@@ -24408,52 +25035,55 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("running");
   });
 
-  test("initialize prefers a newer unreferenced execution over a stale child pointer", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    const childTaskId = "child-newer-execution";
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push(
-        projectWorkspace(projectPath, "child-newer", childTaskId, {
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "reported",
-          reportedAt: "2026-08-10T00:00:00.000Z",
-          title: "React lifecycle expert",
-          taskExecutionId: "wst_old",
-          taskExecutionStatus: "completed",
+  test.each(["completed", "running"] as const)(
+    "initialize prefers a newer unreferenced execution over a stale %s child pointer",
+    async (previousStatus) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const childTaskId = "child-newer-execution";
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push(
+          projectWorkspace(projectPath, "child-newer", childTaskId, {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "reported",
+            reportedAt: "2026-08-10T00:00:00.000Z",
+            title: "React lifecycle expert",
+            taskExecutionId: "wst_old",
+            taskExecutionStatus: previousStatus,
+          })
+        );
+        return cfg;
+      });
+      const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
+      const { aiService } = createAIServiceMocks(config, { isStreaming });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+        .taskHandleStore;
+      await taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, childTaskId, "wst_old", previousStatus, {
+          turnId: "turn-old",
+          createdAt: "2026-08-10T00:00:01.000Z",
+          updatedAt: "2026-08-10T00:00:02.000Z",
         })
       );
-      return cfg;
-    });
-    const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
-    const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { taskService } = createTaskServiceHarness(config, { aiService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, childTaskId, "wst_old", "completed", {
-        turnId: "turn-old",
-        createdAt: "2026-08-10T00:00:01.000Z",
-        updatedAt: "2026-08-10T00:00:02.000Z",
-      })
-    );
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, childTaskId, "wst_new", "running", {
-        turnId: "turn-new",
-        createdAt: "2026-08-10T00:00:03.000Z",
-        updatedAt: "2026-08-10T00:00:04.000Z",
-      })
-    );
+      await taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, childTaskId, "wst_new", "running", {
+          turnId: "turn-new",
+          createdAt: "2026-08-10T00:00:03.000Z",
+          updatedAt: "2026-08-10T00:00:04.000Z",
+        })
+      );
 
-    await taskService.initialize();
+      await taskService.initialize();
 
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toBe("wst_new");
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("running");
-  });
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toBe("wst_new");
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("running");
+    }
+  );
 
   test("initialize ignores parseable non-ISO timestamps when selecting the latest handle", async () => {
     const config = await createTestConfig(rootDir);

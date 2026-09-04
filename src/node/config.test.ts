@@ -2714,6 +2714,37 @@ describe("Config", () => {
       expect(workspace.name).toBe("feature-branch");
     });
 
+    it.each(["owner", undefined])(
+      "preserves desktop ownership through metadata read/write (%s)",
+      async (owner) => {
+        const projectPath = path.join(tempDir, "project");
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                id: "child",
+                name: "child",
+                path: projectPath,
+                createdAt: "2025-01-01T00:00:00.000Z",
+                runtimeConfig: { type: "local" },
+                parentWorkspaceId: "owner",
+                agentId: "desktop",
+                taskDesktopOwnerWorkspaceId: owner,
+              },
+            ],
+          });
+          return cfg;
+        });
+        const reloaded = new Config(tempDir);
+        const [metadata] = await reloaded.getAllWorkspaceMetadata();
+        expect(metadata.taskDesktopOwnerWorkspaceId).toBe(owner);
+        await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed operator" });
+        const [saved] = await new Config(tempDir).getAllWorkspaceMetadata();
+        expect(saved.title).toBe("Renamed operator");
+        expect(saved.taskDesktopOwnerWorkspaceId).toBe(owner);
+      }
+    );
+
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "heartbeat-sparse");

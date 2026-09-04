@@ -2076,6 +2076,7 @@ export const tasks = {
       .object({
         parentWorkspaceId: z.string(),
         kind: z.literal("agent"),
+        desktop: z.enum(["shared", "isolated"]).optional(),
         agentId: AgentIdSchema.optional(),
         /** @deprecated Legacy alias for agentId (kept for downgrade compatibility). */
         agentType: z.string().min(1).optional(),
@@ -2102,6 +2103,7 @@ export const tasks = {
         taskId: z.string(),
         kind: z.literal("agent"),
         status: z.enum(["queued", "starting", "running"]),
+        desktopOwnerWorkspaceId: z.string().optional(),
       }),
       z.string()
     ),
@@ -3167,6 +3169,7 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
     width: z.number(),
     height: z.number(),
     sessionId: z.string(),
+    sharedDesktop: z.object({ ownerWorkspaceId: z.string(), ownerName: z.string() }).optional(),
   }),
   z.object({
     available: z.literal(false),

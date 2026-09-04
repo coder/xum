@@ -24,6 +24,7 @@ export interface UseDesktopConnectionResult {
   disconnect: () => void;
   width: number;
   height: number;
+  sharedDesktop: Extract<DesktopCapability, { available: true }>["sharedDesktop"] | null;
 }
 
 type DesktopUnavailableReason = Extract<DesktopCapability, { available: false }>["reason"];
@@ -108,6 +109,8 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const [reason, setReason] = useState<string | null>(null);
   const [width, setWidth] = useState<number>(DESKTOP_DEFAULTS.WIDTH);
   const [height, setHeight] = useState<number>(DESKTOP_DEFAULTS.HEIGHT);
+  const [sharedDesktop, setSharedDesktop] =
+    useState<UseDesktopConnectionResult["sharedDesktop"]>(null);
 
   const rfbRef = useRef<RFB | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -131,6 +134,7 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   };
 
   const disconnectCurrentRfb = () => {
+    setSharedDesktop(null);
     const currentRfb = rfbRef.current;
     rfbRef.current = null;
     if (!currentRfb) {
@@ -199,6 +203,8 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
       setState("checking");
 
       try {
+        // Shared-target metadata is display-only: the caller's bootstrap/token preserves the
+        // backend's authorization and binding checks; never bootstrap the owner directly.
         const result = await api.desktop.getBootstrap({ workspaceId });
         if (generationRef.current !== generation || isDisposedRef.current) {
           return;
@@ -290,6 +296,7 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
         rfb.addEventListener("disconnect", handleDisconnect);
         rfb.addEventListener("securityfailure", handleSecurityFailure);
         rfbRef.current = rfb;
+        setSharedDesktop(result.capability.sharedDesktop ?? null);
         setState("connecting");
       } catch (error) {
         if (generationRef.current !== generation || isDisposedRef.current) {
@@ -326,5 +333,6 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
     disconnect: disconnectHandleRef.current,
     width,
     height,
+    sharedDesktop,
   };
 }

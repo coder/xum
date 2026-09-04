@@ -371,6 +371,7 @@ function refineTaskToolAgentArgs(
     subagent_type?: string | null;
     prompt: string;
     n?: number | null;
+    desktop?: "shared" | "isolated" | null;
     workspace?: { mode?: "new" | "fork" | "existing" | null; workspaceId?: string | null } | null;
   },
   ctx: z.RefinementCtx
@@ -382,6 +383,13 @@ function refineTaskToolAgentArgs(
   if (kind === "workspace") {
     // Workspace tasks accept agentId (agent mode for the launched turn, e.g. "plan") but keep
     // rejecting the deprecated sub-agent alias subagent_type.
+    if (args.desktop != null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Workspace tasks do not accept desktop targeting",
+        path: ["desktop"],
+      });
+    }
     if (hasSubagentType) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -422,6 +430,19 @@ function refineTaskToolAgentArgs(
     return;
   }
 
+  if (
+    (args.n ?? 1) > 1 &&
+    (args.desktop === "shared" ||
+      (args.desktop == null && (args.agentId ?? args.subagent_type) === "desktop"))
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'Shared desktop tasks cannot use n > 1. Request desktop: "isolated" for parallel GUI work.',
+      path: ["n"],
+    });
+  }
+
   // GPT models often send both fields with identical values — allow that.
   // Only reject when they conflict, since the handler silently prefers agentId.
   if (hasAgentId && hasSubagentType && args.agentId !== args.subagent_type) {
@@ -435,6 +456,15 @@ function refineTaskToolAgentArgs(
 }
 
 const taskToolBaseShape = {
+  desktop: z
+    .enum(["shared", "isolated"])
+    .nullish()
+    .describe(
+      'Desktop target for sub-agents, independent of checkout isolation. "shared" uses the caller\'s desktop; ' +
+        '"isolated" starts a separate desktop. Defaults to shared for agentId="desktop", isolated otherwise. ' +
+        "Only one active shared child can control desktop tools; n > 1 requires isolation. " +
+        "Does not exclude human viewer input, shell tools, or external CDP clients."
+    ),
   kind: WorkspaceTaskKindSchema.nullish().describe(
     'Task kind. Omit or use "subagent" for the existing child-workspace sub-agent flow; use "workspace" to start a normal full workspace turn.'
   ),
@@ -503,6 +533,7 @@ const TaskToolSpawnedTaskSchema = z
     workspaceId: z.string().optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    desktopOwnerWorkspaceId: z.string().optional(),
   })
   .strict();
 
@@ -521,6 +552,7 @@ const TaskToolCompletedReportSchema = z
     finalMessageRef: WorkspaceTurnFinalMessageRefSchema.optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    desktopOwnerWorkspaceId: z.string().optional(),
   })
   .strict();
 
@@ -535,6 +567,7 @@ export const TaskToolQueuedResultSchema = z
     reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    desktopOwnerWorkspaceId: z.string().optional(),
     note: z
       .string()
       .min(1)
@@ -573,6 +606,7 @@ export const TaskToolCompletedResultSchema = z
     reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    desktopOwnerWorkspaceId: z.string().optional(),
     /**
      * Follow-up context the caller needs alongside the terminal report — e.g.
      * that the caller's previously tracked handle was quietly superseded by

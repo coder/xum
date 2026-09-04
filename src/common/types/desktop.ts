@@ -13,7 +13,13 @@ export type DesktopPrereqStatus =
 
 /** Capability check result for a workspace's desktop support. */
 export type DesktopCapability =
-  | { available: true; width: number; height: number; sessionId: string }
+  | {
+      available: true;
+      width: number;
+      height: number;
+      sessionId: string;
+      sharedDesktop?: { ownerWorkspaceId: string; ownerName: string };
+    }
   | {
       available: false;
       reason:

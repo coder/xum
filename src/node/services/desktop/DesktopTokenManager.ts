@@ -4,6 +4,8 @@ import { assert } from "@/common/utils/assert";
 import { log } from "@/node/services/log";
 
 interface TokenRecord {
+  // Keep the requester even for a shared desktop: the bridge must revalidate its
+  // current relationship to the owner, not authorize it as the owner directly.
   workspaceId: string;
   sessionId: string;
   expiresAtMs: number;

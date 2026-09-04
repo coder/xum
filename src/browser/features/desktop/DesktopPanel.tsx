@@ -81,6 +81,11 @@ function StatusOverlay(props: { desktop: UseDesktopConnectionResult }) {
 }
 
 export function DesktopPanel(props: { workspaceId: string }) {
+  // A workspace switch must dispose the old viewer, token, and shared-target label together.
+  return <WorkspaceDesktopPanel key={props.workspaceId} workspaceId={props.workspaceId} />;
+}
+
+function WorkspaceDesktopPanel(props: { workspaceId: string }) {
   const desktop = useDesktopConnection(props.workspaceId);
 
   useEffect(() => {
@@ -90,7 +95,12 @@ export function DesktopPanel(props: { workspaceId: string }) {
   }, []);
 
   return (
-    <div className="bg-background flex h-full flex-col">
+    <div className="bg-background flex h-full min-w-0 flex-col">
+      {desktop.sharedDesktop && (
+        <div className="text-muted-foreground border-border shrink-0 truncate border-b px-3 py-1.5 text-xs">
+          Shared desktop · {desktop.sharedDesktop.ownerName}
+        </div>
+      )}
       {desktop.state === "connected" ? null : <StatusOverlay desktop={desktop} />}
       <div
         ref={desktop.containerRef}

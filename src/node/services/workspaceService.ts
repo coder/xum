@@ -1,3 +1,7 @@
+import {
+  DesktopInputCoordinator,
+  settleArchivedSharedDesktopTask,
+} from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -2350,7 +2354,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
     ),
-    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
+    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -2926,8 +2931,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // Archive admission pairing for desktop startups (mirrors setTerminalService above):
     // ensureStarted checks this guard in the same synchronous block that registers its startup
     // promise, so whichever of {archive gate, desktop startup entry} runs first is observed by
-    // the other.
-    manager.setWorkspaceArchiveGuard((workspaceId) => this.archivingWorkspaces.has(workspaceId));
+    // the other. Removal latches removingWorkspaces before closing the desktop and only then
+    // awaits config deletion, so a borrower bridge connecting in that window must be refused
+    // by the same guard rather than start a session the removal never closes.
+    manager.setWorkspaceArchiveGuard(
+      (workspaceId) =>
+        this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)
+    );
   }
 
   private async closeDesktopSessionBestEffort(
@@ -8713,6 +8723,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           if (workspaceEntry) {
             // Just set archivedAt - archived state is derived from archivedAt > unarchivedAt.
             workspaceEntry.archivedAt = new Date().toISOString();
+            // A shared-desktop child releases the owner's desktop in the same edit.
+            settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.
             delete workspaceEntry.pinnedAt;
             if (capturedWorktreeSnapshot) {
@@ -8882,6 +8894,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               previousUnarchivedAt = workspaceEntry.unarchivedAt;
               persistedUnarchivedAt = new Date().toISOString();
               workspaceEntry.unarchivedAt = persistedUnarchivedAt;
+              // Records archived before archive-time settlement must reappear as interrupted,
+              // never as a competing active desktop controller.
+              settleArchivedSharedDesktopTask(workspaceEntry);
               didUnarchive = true;
             }
           }
@@ -10672,6 +10687,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const authoredAtMs = Date.now();
 
     let resumedInterruptedTask = false;
+    let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     let claimedAutoTitle = false;
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
@@ -11125,23 +11141,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // config read inside markInterruptedTaskRunning would otherwise be flipped straight back
       // to running — after which every later probe sees an active status and admits the very
       // turn the stop was meant to prevent.
+      if (
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .taskDesktopOwnerWorkspaceId !== undefined
+      ) {
+        await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
+          Promise.resolve(undefined)
+        );
+      }
       if (internal?.admissionStale == null) {
-        try {
-          resumedInterruptedTask =
-            (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
-        } catch (error: unknown) {
-          log.error("Failed to restore interrupted task status before sendMessage", {
-            workspaceId,
-            error,
-          });
-        }
+        previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
+        resumedInterruptedTask =
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       }
 
       const continuationSendState = getContinuationSendState();
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (restoreError: unknown) {
             log.error(
               "Failed to restore interrupted task status after accepted edit startup failure",
@@ -11218,7 +11239,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
               workspaceId,
@@ -11253,7 +11277,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       if (resumedInterruptedTask) {
         try {
-          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+            workspaceId,
+            previousTaskStatus
+          );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
             workspaceId,
@@ -11288,6 +11315,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
+    let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -11421,15 +11449,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
       // handling does not early-return on interrupted status.
-      try {
-        resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
-      } catch (error: unknown) {
-        log.error("Failed to restore interrupted task status before resumeStream", {
-          workspaceId,
-          error,
-        });
+      if (
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .taskDesktopOwnerWorkspaceId !== undefined
+      ) {
+        await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
+          Promise.resolve(undefined)
+        );
       }
+      previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
+      resumedInterruptedTask =
+        (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
 
       // Codex P1 (PRRT_kwDOPxxmWM6cSREO): resumeStream runs its own async
       // admission (a second pricing gate) during which the session still
@@ -11450,7 +11480,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
               workspaceId,
@@ -11466,7 +11499,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!result.data.started) {
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
               workspaceId,
@@ -11481,7 +11517,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       if (resumedInterruptedTask) {
         try {
-          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+            workspaceId,
+            previousTaskStatus
+          );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
             workspaceId,

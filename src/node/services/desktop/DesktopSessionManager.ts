@@ -1,6 +1,6 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
-import { isWorkspaceArchived } from "@/common/utils/archive";
-import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   DesktopActionResult,
@@ -9,13 +9,12 @@ import type {
   DesktopPrereqStatus,
   DesktopScreenshotResult,
 } from "@/common/types/desktop";
-import { parseRuntimeModeAndHost } from "@/common/types/runtime";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { log } from "@/node/services/log";
 import assert from "node:assert/strict";
 import type { WorkspaceService } from "@/node/services/workspaceService";
+import { DesktopInputCoordinator, UnsupportedDesktopRuntimeError } from "./DesktopInputCoordinator";
 import {
   PortableDesktopBinaryNotFoundError,
   PortableDesktopSession,
@@ -24,6 +23,8 @@ import {
 export class DesktopSessionManager {
   private readonly sessions = new Map<string, PortableDesktopSession>();
   private readonly startupPromises = new Map<string, Promise<PortableDesktopSession>>();
+  private readonly inputCoordinator: DesktopInputCoordinator;
+  private readonly closeListeners = new Set<(workspaceId: string | null) => void>();
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
 
   /**
@@ -37,44 +38,27 @@ export class DesktopSessionManager {
     this.workspaceArchiveGuard = guard;
   }
 
-  private isArchivedNow(workspaceId: string): boolean {
-    const workspaceEntry = findWorkspaceEntry(this.deps.config.loadConfigOrDefault(), workspaceId);
-    return (
-      workspaceEntry != null &&
-      isWorkspaceArchived(
-        workspaceEntry.workspace.archivedAt,
-        workspaceEntry.workspace.unarchivedAt
-      )
-    );
-  }
-
   constructor(
     private readonly deps: {
       config: Config;
       experimentsService: ExperimentsService;
       workspaceService: WorkspaceService;
+      inputCoordinator?: DesktopInputCoordinator;
     }
-  ) {}
+  ) {
+    this.inputCoordinator = deps.inputCoordinator ?? new DesktopInputCoordinator(deps.config);
+  }
 
-  private parseWorkspaceRuntime(metadata: FrontendWorkspaceMetadata) {
-    const runtimeConfig = metadata.runtimeConfig;
-
-    switch (runtimeConfig.type) {
-      case "local":
-        return parseRuntimeModeAndHost("srcBaseDir" in runtimeConfig ? "worktree" : "local");
-      case "worktree":
-        return parseRuntimeModeAndHost("worktree");
-      case "ssh":
-        return parseRuntimeModeAndHost(`ssh ${runtimeConfig.host}`);
-      case "docker":
-        return parseRuntimeModeAndHost(`docker ${runtimeConfig.image}`);
-      case "devcontainer":
-        return parseRuntimeModeAndHost(
-          runtimeConfig.configPath.length > 0
-            ? `devcontainer ${runtimeConfig.configPath}`
-            : "devcontainer"
+  resolveTarget(workspaceId: string) {
+    const target = this.inputCoordinator.resolveTarget(workspaceId);
+    for (const id of new Set([workspaceId, target.ownerWorkspaceId])) {
+      if (this.workspaceArchiveGuard?.(id) === true) {
+        throw new Error(
+          `Workspace is being archived or removed: ${id}. Wait for cleanup to finish.`
         );
+      }
     }
+    return target;
   }
 
   getPrereqStatus(): DesktopPrereqStatus {
@@ -104,63 +88,57 @@ export class DesktopSessionManager {
     }
   }
 
-  async getCapability(workspaceId: string): Promise<DesktopCapability> {
-    if (!this.deps.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PORTABLE_DESKTOP)) {
-      return { available: false, reason: "disabled" };
-    }
+  getCapability(workspaceId: string): Promise<DesktopCapability> {
+    return Promise.resolve().then(() => {
+      if (!this.deps.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.PORTABLE_DESKTOP)) {
+        return { available: false, reason: "disabled" };
+      }
 
-    const workspaceInfo = await this.deps.workspaceService.getInfo(workspaceId);
-    if (!workspaceInfo) {
-      log.error("PortableDesktop capability check failed because workspace metadata was missing", {
-        workspaceId,
-      });
-      return { available: false, reason: "startup_failed" };
-    }
+      let target;
+      try {
+        target = this.resolveTarget(workspaceId);
+      } catch (error) {
+        log.debug("PortableDesktop target unavailable", { workspaceId, error });
+        return {
+          available: false,
+          reason:
+            error instanceof UnsupportedDesktopRuntimeError
+              ? "unsupported_runtime"
+              : "startup_failed",
+        };
+      }
 
-    const parsedRuntime = this.parseWorkspaceRuntime(workspaceInfo);
-    if (
-      parsedRuntime?.mode === "ssh" ||
-      parsedRuntime?.mode === "docker" ||
-      parsedRuntime?.mode === "devcontainer"
-    ) {
-      return { available: false, reason: "unsupported_runtime" };
-    }
+      const prereqStatus = this.getPrereqStatus();
+      if (!prereqStatus.available) {
+        return prereqStatus;
+      }
 
-    const prereqStatus = this.getPrereqStatus();
-    if (!prereqStatus.available) {
-      return prereqStatus;
-    }
-
-    // Capability checks are used for agent listing and tool gating, so they must not
-    // start a long-lived desktop session just to report whether PortableDesktop exists.
-    return {
-      available: true,
-      width: DESKTOP_DEFAULTS.WIDTH,
-      height: DESKTOP_DEFAULTS.HEIGHT,
-      sessionId: `desktop:${workspaceId}`,
-    };
+      // Capability checks are used for agent listing and tool gating, so they must not
+      // start a long-lived desktop session just to report whether PortableDesktop exists.
+      return {
+        available: true,
+        width: DESKTOP_DEFAULTS.WIDTH,
+        height: DESKTOP_DEFAULTS.HEIGHT,
+        sessionId: `desktop:${target.ownerWorkspaceId}`,
+        ...(target.ownerWorkspaceId !== workspaceId ? { sharedDesktop: target } : {}),
+      };
+    });
   }
 
   async ensureStarted(workspaceId: string): Promise<PortableDesktopSession> {
-    // Archive admission pairing: this check shares the synchronous block that registers the
-    // startup promise below (no awaits in between), so an archive gate armed first refuses
-    // this startup while a startup registered first is observed by the gate via has(). Without
-    // it, a startup entering between the gate's has() check and archivedAt persisting would
-    // publish a live desktop session into the hidden workspace.
-    if (this.workspaceArchiveGuard?.(workspaceId) === true) {
-      throw new Error(
-        `Workspace is being archived: ${workspaceId}. Unarchive it before starting a desktop session.`
-      );
+    const target = this.resolveTarget(workspaceId);
+    // Reserve the owner startup synchronously with both archive guards; has() stays owner-keyed.
+    const session = await this.ensureOwnerStarted(target.ownerWorkspaceId);
+    // A requester may disappear/archive while joining somebody else's startup. Reject that
+    // request without closing the owner's desktop, which other requesters can still use.
+    if (this.resolveTarget(workspaceId).ownerWorkspaceId !== target.ownerWorkspaceId) {
+      throw new Error(`Desktop target changed while starting for workspace ${workspaceId}`);
     }
-    // Archived workspaces must not accrue hidden live activity: archive stops desktop
-    // sessions, so admitting a new one afterwards would leave one running in a workspace
-    // the UI no longer surfaces. Unarchive first.
-    if (this.isArchivedNow(workspaceId)) {
-      throw new Error(
-        `Workspace is archived: ${workspaceId}. Unarchive it before starting a desktop session.`
-      );
-    }
+    return session;
+  }
 
+  private async ensureOwnerStarted(workspaceId: string): Promise<PortableDesktopSession> {
+    this.resolveTarget(workspaceId);
     const existingSession = this.sessions.get(workspaceId);
     if (existingSession?.isAlive()) {
       return existingSession;
@@ -193,15 +171,15 @@ export class DesktopSessionManager {
           await session.close();
           throw new Error(`PortableDesktop startup for workspace ${workspaceId} was superseded`);
         }
-        // Post-start recheck: a user-driven archive (which force-closes rather than refuses)
-        // may have run its close() snapshot while start() was awaiting — that close only
-        // terminates tracked sessions, so publishing now would leave a hidden desktop session
-        // in the archived workspace. Close the just-started session instead of registering it.
-        if (this.workspaceArchiveGuard?.(workspaceId) === true || this.isArchivedNow(workspaceId)) {
+        // A user archive can persist while startup awaits; never publish a hidden session.
+        try {
+          const target = this.resolveTarget(workspaceId);
+          if (target.ownerWorkspaceId !== workspaceId) {
+            throw new Error(`Desktop owner changed while starting: ${workspaceId}`);
+          }
+        } catch (error) {
           await session.close();
-          throw new Error(
-            `Workspace was archived while the desktop session was starting: ${workspaceId}.`
-          );
+          throw error;
         }
         this.sessions.set(workspaceId, session);
         return session;
@@ -223,7 +201,11 @@ export class DesktopSessionManager {
   }
 
   async screenshot(workspaceId: string): Promise<DesktopScreenshotResult> {
+    const target = this.resolveTarget(workspaceId);
     const session = await this.ensureStarted(workspaceId);
+    if (this.resolveTarget(workspaceId).ownerWorkspaceId !== target.ownerWorkspaceId) {
+      throw new Error(`Desktop target changed before screenshot for workspace ${workspaceId}`);
+    }
     return session.screenshot();
   }
 
@@ -232,8 +214,14 @@ export class DesktopSessionManager {
     actionType: DesktopActionType,
     params: Record<string, unknown>
   ): Promise<DesktopActionResult> {
+    const target = this.resolveTarget(workspaceId);
     const session = await this.ensureStarted(workspaceId);
-    return session.action(actionType, params);
+    return this.inputCoordinator.withInput(workspaceId, () => {
+      if (this.resolveTarget(workspaceId).ownerWorkspaceId !== target.ownerWorkspaceId) {
+        throw new Error(`Desktop target changed before input for workspace ${workspaceId}`);
+      }
+      return session.action(actionType, params);
+    });
   }
 
   /** Whether a live desktop session exists for this workspace. */
@@ -248,7 +236,55 @@ export class DesktopSessionManager {
     );
   }
 
+  watchWorkspaceConfig(onChange: () => void, onError: (error: unknown) => void): () => void {
+    // Watch the directory: Config replaces config.json atomically, so watching the file's
+    // inode would silently miss subsequent writes from another backend.
+    let closed = false;
+    let queued = false;
+    const watcher = fs.watch(
+      this.deps.config.rootDir,
+      { persistent: false },
+      (_event, filename) => {
+        if (closed) return;
+        if (filename === path.basename(this.deps.config.rootDir)) {
+          fail(new Error("Desktop config directory was moved or removed"));
+        } else if ((filename == null || filename === "config.json") && !queued) {
+          queued = true;
+          queueMicrotask(() => {
+            queued = false;
+            if (!closed) onChange();
+          });
+        }
+      }
+    );
+    const stop = () => {
+      if (closed) return;
+      closed = true;
+      try {
+        watcher.close();
+      } catch (error) {
+        log.debug("Desktop config watcher cleanup failed", { error });
+      }
+    };
+    const fail = (error: unknown) => {
+      if (closed) return;
+      stop();
+      onError(error);
+    };
+    watcher.on("error", fail);
+    watcher.on("close", () => fail(new Error("Desktop config watcher closed unexpectedly")));
+    return stop;
+  }
+
+  /** A null workspace ID revokes all viewers, including pending bridge connections. */
+  onWorkspaceClose(listener: (workspaceId: string | null) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
+  }
+
   async close(workspaceId: string): Promise<void> {
+    // A shared borrower has no owned session, but cleanup must still revoke its viewers.
+    for (const listener of this.closeListeners) listener(workspaceId);
     const session = this.sessions.get(workspaceId);
     const startupPromise = this.startupPromises.get(workspaceId);
 
@@ -273,6 +309,7 @@ export class DesktopSessionManager {
   }
 
   async closeAll(): Promise<void> {
+    for (const listener of this.closeListeners) listener(null);
     const sessions = Array.from(this.sessions.values());
     const startupPromises = Array.from(this.startupPromises.values());
 
@@ -292,9 +329,20 @@ export class DesktopSessionManager {
    * Returns null if no live session exists for the workspace.
    * Used by DesktopBridgeServer to resolve token→VNC-port mappings.
    */
-  getLiveSessionConnection(workspaceId: string): { sessionId: string; vncPort: number } | null {
-    const session = this.sessions.get(workspaceId);
-    if (!session) {
+  getLiveSessionConnection(workspaceId: string): {
+    ownerWorkspaceId: string;
+    sessionId: string;
+    vncPort: number;
+  } | null {
+    let ownerWorkspaceId: string;
+    try {
+      ownerWorkspaceId = this.resolveTarget(workspaceId).ownerWorkspaceId;
+    } catch (error) {
+      log.debug("Desktop bridge target unavailable", { workspaceId, error });
+      return null;
+    }
+    const session = this.sessions.get(ownerWorkspaceId);
+    if (!session?.isAlive()) {
       return null;
     }
 
@@ -308,7 +356,8 @@ export class DesktopSessionManager {
     }
 
     return {
-      sessionId: sessionInfo.sessionId ?? `desktop:${workspaceId}`,
+      ownerWorkspaceId,
+      sessionId: sessionInfo.sessionId ?? `desktop:${ownerWorkspaceId}`,
       vncPort: sessionInfo.vncPort,
     };
   }

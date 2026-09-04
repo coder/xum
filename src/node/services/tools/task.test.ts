@@ -372,6 +372,89 @@ describe("task tool", () => {
     expect(silent.note ?? "").not.toContain("wst_previous_turn");
   });
 
+  it.each([
+    { kind: "workspace", desktop: "shared" },
+    { kind: "workspace", desktop: "isolated" },
+    { agentId: "desktop", n: 2 },
+    { agentId: "desktop", desktop: null, n: 2 },
+    { agentId: "custom", desktop: "shared", n: 2 },
+  ])("rejects invalid desktop delegation before creating any work: %j", async (args) => {
+    using tempDir = new TestTempDir("test-desktop-task-refusal");
+    const create = mock(() => Ok({ taskId: "unexpected", kind: "agent", status: "running" }));
+    const createWorkspaceTurn = mock(() => Promise.resolve(Err("unexpected")));
+    const baseConfig = createTestToolConfig(tempDir.path);
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: { create } as unknown as TaskService,
+      workspaceTurnManager: {
+        createWorkspaceTurn,
+      } as unknown as NonNullable<typeof baseConfig.workspaceTurnManager>,
+    });
+    await Promise.resolve(
+      expect(
+        tool.execute!({ ...args, prompt: "test", title: "Operator" }, mockToolCallOptions)
+      ).rejects.toThrow("task tool input validation failed")
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(createWorkspaceTurn).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "preserves the resolved desktop in task results (background=%s)",
+    async (background) => {
+      using tempDir = new TestTempDir("test-desktop-task-target");
+      const create = mock((_: { desktop?: string; isolation?: string }) =>
+        Ok({
+          taskId: "child",
+          kind: "agent" as const,
+          status: "running" as const,
+          desktopOwnerWorkspaceId: "ancestor",
+        })
+      );
+      const taskService = {
+        create,
+        waitForAgentReport: () => Promise.resolve({ reportMarkdown: "done" }),
+      } as unknown as TaskService;
+      const tool = createTaskTool({ ...createTestToolConfig(tempDir.path), taskService });
+      const result: unknown = await tool.execute!(
+        {
+          agentId: "custom",
+          desktop: "shared",
+          isolation: "none",
+          prompt: "test",
+          title: "Operator",
+          run_in_background: background,
+        },
+        mockToolCallOptions
+      );
+      expect(create.mock.calls[0]?.[0]).toMatchObject({ desktop: "shared", isolation: "none" });
+      expect(result).toMatchObject({ desktopOwnerWorkspaceId: "ancestor" });
+    }
+  );
+
+  it("allows explicitly isolated desktop groups", async () => {
+    using tempDir = new TestTempDir("test-isolated-desktop-group");
+    const create = mock(() =>
+      Ok({ taskId: "child", kind: "agent" as const, status: "running" as const })
+    );
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path),
+      taskService: { create } as unknown as TaskService,
+    });
+    await tool.execute!(
+      {
+        agentId: "desktop",
+        desktop: "isolated",
+        n: 2,
+        prompt: "test",
+        title: "Operator",
+        run_in_background: true,
+      },
+      mockToolCallOptions
+    );
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
   it("forwards isolation to taskService.create", async () => {
     using tempDir = new TestTempDir("test-task-tool-isolation-passthrough");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
