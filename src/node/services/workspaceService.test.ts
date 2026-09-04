@@ -1325,6 +1325,30 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(service.getQueueCutCutter(workspaceId)).toEqual({ stage: "bash-monitor-wake" });
       expect(service.hasBashMonitorWakeContinuation(workspaceId)).toBe(true);
 
+      // A wake deferred because this session is busy waits for *this* session: if the wait
+      // resolved through `sessions` alone it would return at once and re-defer in a loop.
+      let busy = true;
+      let releaseIdle: () => void = () => undefined;
+      const idle = new Promise<void>((resolve) => {
+        releaseIdle = resolve;
+      });
+      const busyInternal = session as unknown as {
+        isBusy(): boolean;
+        waitForIdle(): Promise<void>;
+      };
+      busyInternal.isBusy = () => busy;
+      busyInternal.waitForIdle = () => idle;
+      expect(service.isBusyForMessage(workspaceId)).toBe(true);
+      let idleWaitResolved = false;
+      const idleWait = service.waitForIdleAndNoQueuedMessages(workspaceId).then(() => {
+        idleWaitResolved = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(idleWaitResolved).toBe(false);
+      busy = false;
+      releaseIdle();
+      await idleWait;
+
       // Promotion keeps the mirror: it lives on the session, not on the map it sits in.
       expect(service.getOrCreateSession(workspaceId)).toBe(session);
       internal.publishBashMonitorWakeLevel(workspaceId, false);

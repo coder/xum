@@ -11984,13 +11984,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return session?.waitForPendingStreamErrorRecoveryDecision(messageId);
   }
 
+  // Both waits resolve through the live lookup, matching the busy predicates above: a wake
+  // deferred because a transient startup-recovery session is busy waits for *that* session to
+  // go idle. Waiting on `sessions` alone would resolve at once and re-defer in a tight loop of
+  // history/registry reads until recovery promoted it. A transient session either promotes as
+  // the same instance or is disposed, and dispose releases idle waiters.
   async waitForIdle(workspaceId: string): Promise<void> {
-    const session = this.sessions.get(workspaceId.trim());
+    const session = this.getLiveSession(workspaceId);
     await session?.waitForIdle();
   }
 
   async waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void> {
-    const session = this.sessions.get(workspaceId.trim());
+    const session = this.getLiveSession(workspaceId);
     if (!session) {
       return;
     }
