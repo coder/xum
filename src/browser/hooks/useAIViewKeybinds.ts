@@ -6,6 +6,7 @@ import {
   KEYBINDS,
   isEditableElement,
   isBrowserViewportFocused,
+  isDesktopViewportFocused,
   isTerminalFocused,
   isDialogOpen,
 } from "@/browser/utils/ui/keybinds";
@@ -80,6 +81,7 @@ export function useAIViewKeybinds({
       if (
         matchesKeybind(e, interruptKeybind) &&
         !isTerminalFocused(e.target) &&
+        !isDesktopViewportFocused(e.target) &&
         !browserViewportOwnsInterrupt
       ) {
         // If something else already claimed this key event, skip.
@@ -126,6 +128,8 @@ export function useAIViewKeybinds({
     };
 
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      // Remote desktops own their keyboard, including chat/editor shortcuts.
+      if (isDesktopViewportFocused(e.target)) return;
       const dialogOpen = isDialogOpen();
 
       // Focus chat input works anywhere (even in input fields)

@@ -2062,6 +2062,24 @@ export const router = (authToken?: string) => {
       },
     },
     desktop: {
+      openWindow: t
+        .input(schemas.desktop.openWindow.input)
+        .output(schemas.desktop.openWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.openWindow(input.workspaceId, input.instanceId)
+        ),
+      closeWindow: t
+        .input(schemas.desktop.closeWindow.input)
+        .output(schemas.desktop.closeWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.closeWindow(input.workspaceId, input.instanceId)
+        ),
+      getWindow: t
+        .input(schemas.desktop.getWindow.input)
+        .output(schemas.desktop.getWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.getWindow(input.workspaceId)
+        ),
       getPrereqStatus: t
         .input(schemas.desktop.getPrereqStatus.input)
         .output(schemas.desktop.getPrereqStatus.output)

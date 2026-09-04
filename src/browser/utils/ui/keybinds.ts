@@ -172,6 +172,11 @@ export const TERMINAL_CONTAINER_ATTR = "data-terminal-container";
  * keystrokes instead of having capture/bubble-phase app shortcuts steal them first.
  */
 export const BROWSER_VIEWPORT_ATTR = "data-browser-viewport";
+export const DESKTOP_VIEWPORT_ATTR = "data-desktop-viewport";
+
+export function isDesktopViewportFocused(target: EventTarget | null): boolean {
+  return hasClosestWithAttr(target, DESKTOP_VIEWPORT_ATTR);
+}
 
 /**
  * Data attribute used to opt an element (or one of its ancestors) into allowing Escape

@@ -252,7 +252,11 @@ describe("useAIViewKeybinds", () => {
     expect(interruptStream.mock.calls.length).toBe(1);
   });
 
-  test("Ctrl+C does not interrupt when the focused browser viewport owns it", () => {
+  test.each([
+    ["data-browser-viewport", "c", true],
+    ["data-desktop-viewport", "c", true],
+    ["data-desktop-viewport", "Escape", false],
+  ] as const)("%s keeps %s instead of interrupting the stream", (attribute, key, ctrlKey) => {
     const interruptStream = mock(() =>
       Promise.resolve({ success: true as const, data: undefined })
     );
@@ -275,24 +279,90 @@ describe("useAIViewKeybinds", () => {
       handleOpenInEditor: () => undefined,
       aggregator: undefined,
       setEditingMessage: () => undefined,
-      vimEnabled: true,
+      vimEnabled: ctrlKey,
     });
 
     const browserViewport = document.createElement("div");
-    browserViewport.setAttribute("data-browser-viewport", "true");
+    browserViewport.setAttribute(attribute, "true");
+    const canvas = document.createElement("canvas");
+    browserViewport.appendChild(canvas);
     document.body.appendChild(browserViewport);
 
-    browserViewport.dispatchEvent(
+    canvas.dispatchEvent(
       new window.KeyboardEvent("keydown", {
-        key: "c",
-        code: "KeyC",
-        ctrlKey: true,
+        key,
+        ctrlKey,
         bubbles: true,
         cancelable: true,
       })
     );
 
     expect(interruptStream.mock.calls.length).toBe(0);
+  });
+
+  test("desktop canvas owns capture-phase resume, chat focus, editor, and terminal shortcuts", () => {
+    const focus = mock(() => undefined);
+    const resumeInterruptedStream = mock(() => undefined);
+    const handleOpenInEditor = mock(() => undefined);
+    const handleOpenTerminal = mock(() => undefined);
+    const chatInputAPI: RefObject<ChatInputAPI | null> = {
+      current: {
+        focus,
+        send: () => Promise.resolve(),
+        restoreText: () => undefined,
+        restoreDraft: () => undefined,
+        appendText: () => undefined,
+        prependText: () => undefined,
+      },
+    };
+    renderUseAIViewKeybinds({
+      workspaceId: "ws",
+      canInterrupt: false,
+      showRetryBarrier: false,
+      chatInputAPI,
+      jumpToBottom: () => undefined,
+      loadOlderHistory: null,
+      handleOpenTerminal,
+      handleOpenInEditor,
+      aggregator: undefined,
+      setEditingMessage: () => undefined,
+      vimEnabled: false,
+      canResumeInterruptedStream: true,
+      resumeInterruptedStream,
+    });
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    document.body.appendChild(viewport);
+    const shortcuts = [
+      { key: "R", shiftKey: true },
+      { key: "i", ctrlKey: true },
+      { key: "E", ctrlKey: true, shiftKey: true },
+      { key: "t", ctrlKey: true },
+    ];
+    for (const shortcut of shortcuts) {
+      const event = new window.KeyboardEvent("keydown", {
+        ...shortcut,
+        bubbles: true,
+        cancelable: true,
+      });
+      canvas.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    for (const action of [focus, resumeInterruptedStream, handleOpenInEditor, handleOpenTerminal]) {
+      expect(action).not.toHaveBeenCalled();
+    }
+
+    // Outside the guest surface, those same keystrokes must retain their host behavior.
+    for (const shortcut of shortcuts) {
+      document.body.dispatchEvent(
+        new window.KeyboardEvent("keydown", { ...shortcut, bubbles: true, cancelable: true })
+      );
+    }
+    for (const action of [focus, resumeInterruptedStream, handleOpenInEditor, handleOpenTerminal]) {
+      expect(action).toHaveBeenCalledTimes(1);
+    }
   });
 
   test("Shift+H loads older history when callback is provided", () => {

@@ -11,17 +11,27 @@ void mock.module("@/browser/contexts/API", () => ({
 
 class FakeRfb extends EventTarget {
   static instances: FakeRfb[] = [];
+  readonly canvas: HTMLCanvasElement;
+  background = "";
+  viewOnly = false;
+  scaleViewport = false;
+  resizeSession = false;
   disconnected = false;
   constructor(
-    _container: HTMLElement,
+    container: HTMLElement,
     readonly url: string
   ) {
     super();
+    this.canvas = container.ownerDocument.createElement("canvas");
+    container.appendChild(this.canvas);
     FakeRfb.instances.push(this);
-    queueMicrotask(() => this.dispatchEvent(new Event("connect")));
+    queueMicrotask(() => {
+      if (!this.disconnected) this.dispatchEvent(new Event("connect"));
+    });
   }
   disconnect() {
     this.disconnected = true;
+    this.canvas.remove();
   }
 }
 void mock.module("@novnc/novnc/lib/rfb", () => ({ default: FakeRfb }));

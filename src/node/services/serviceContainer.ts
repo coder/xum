@@ -8,6 +8,7 @@ import {
   STARTUP_STEP_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
 import type { CoreServices } from "@/node/services/coreServices";
+import type { DesktopWindowManager } from "@/desktop/desktopWindowManager";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
@@ -626,6 +627,10 @@ export class ServiceContainer {
 
   setProjectDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>): void {
     this.projectService.setDirectoryPicker(picker);
+  }
+
+  setDesktopWindowManager(manager: DesktopWindowManager): void {
+    this.desktopSessionManager.setDesktopWindowManager(manager);
   }
 
   setTerminalWindowManager(manager: TerminalWindowManager): void {

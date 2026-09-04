@@ -3183,7 +3183,25 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
   }),
 ]);
 
+const DesktopWindowInputSchema = z.object({
+  workspaceId: z.string().min(1),
+  instanceId: z.string().min(1),
+});
+const DesktopWindowStateSchema = z.object({ instanceId: z.string().min(1) });
+
 export const desktop = {
+  openWindow: {
+    input: DesktopWindowInputSchema,
+    output: DesktopWindowStateSchema,
+  },
+  closeWindow: {
+    input: DesktopWindowInputSchema,
+    output: z.void(),
+  },
+  getWindow: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: DesktopWindowStateSchema.nullable(),
+  },
   getPrereqStatus: {
     input: z.void(),
     output: DesktopPrereqStatusSchema,

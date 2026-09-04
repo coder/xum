@@ -1,7 +1,12 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { AlertCircle, Loader2, MonitorOff } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { assertNever } from "@/common/utils/assertNever";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { DESKTOP_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
+import { useAPI } from "@/browser/contexts/API";
+import { getDesktopPopout } from "./desktopPopout";
+import { DesktopToolbar } from "./DesktopToolbar";
 import { useDesktopConnection, type UseDesktopConnectionResult } from "./useDesktopConnection";
 
 interface StatusPresentation {
@@ -80,33 +85,135 @@ function StatusOverlay(props: { desktop: UseDesktopConnectionResult }) {
   );
 }
 
-export function DesktopPanel(props: { workspaceId: string }) {
-  // A workspace switch must dispose the old viewer, token, and shared-target label together.
-  return <WorkspaceDesktopPanel key={props.workspaceId} workspaceId={props.workspaceId} />;
-}
-
-function WorkspaceDesktopPanel(props: { workspaceId: string }) {
+export function DesktopViewer(props: {
+  workspaceId: string;
+  onDetach?: () => void;
+  onBringBack?: () => void;
+  attach?: (disconnect: () => void) => () => void;
+  onStartupError?: () => void;
+}) {
   const desktop = useDesktopConnection(props.workspaceId);
 
   useEffect(() => {
+    const detach = props.attach?.(desktop.disconnect);
     desktop.connect();
+    return detach;
     // disconnect handled by hook's own cleanup
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const onStartupError = props.onStartupError;
+  useEffect(() => {
+    if (desktop.state === "error" || desktop.state === "unavailable") onStartupError?.();
+  }, [desktop.state, onStartupError]);
+
   return (
-    <div className="bg-background flex h-full min-w-0 flex-col">
+    <div className="bg-background @container flex h-full min-h-0 min-w-0 flex-col">
       {desktop.sharedDesktop && (
         <div className="text-muted-foreground border-border shrink-0 truncate border-b px-3 py-1.5 text-xs">
           Shared desktop · {desktop.sharedDesktop.ownerName}
         </div>
       )}
+      <DesktopToolbar
+        connected={desktop.state === "connected"}
+        controlling={desktop.controlling}
+        scaleToFit={desktop.scaleToFit}
+        onToggleControl={() => desktop.setControlling(!desktop.controlling)}
+        onToggleScale={() => desktop.setScaleToFit(!desktop.scaleToFit)}
+        onDetach={props.onDetach}
+        onBringBack={props.onBringBack}
+      />
       {desktop.state === "connected" ? null : <StatusOverlay desktop={desktop} />}
       <div
         ref={desktop.containerRef}
-        className="bg-background flex-1 overflow-hidden"
+        {...{ [DESKTOP_VIEWPORT_ATTR]: "" }}
+        className="bg-background min-h-0 min-w-0 flex-1 overflow-hidden"
         style={{ display: desktop.state === "connected" ? "block" : "none" }}
       />
+    </div>
+  );
+}
+
+export function DesktopPanel(props: { workspaceId: string }) {
+  // A workspace switch disposes its viewer, token, and shared-target label together.
+  return <WorkspaceDesktopPanel key={props.workspaceId} workspaceId={props.workspaceId} />;
+}
+
+function WorkspaceDesktopPanel(props: { workspaceId: string }) {
+  const { api } = useAPI();
+  const [popout] = useState(() => getDesktopPopout(props.workspaceId));
+  const snapshot = useSyncExternalStore(popout.subscribe, popout.getSnapshot);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const reportError = (error: unknown) =>
+    setActionError(error instanceof Error ? error.message : String(error));
+  useEffect(() => {
+    if (!api) return;
+    const reconcile = () => {
+      popout.reconcile(api.desktop).catch(reportError);
+    };
+    reconcile();
+    window.addEventListener("focus", reconcile);
+    return () => window.removeEventListener("focus", reconcile);
+  }, [api, popout]);
+  const inline = snapshot.state === "inline" || snapshot.state === "opening";
+  return (
+    <div className="bg-background flex h-full min-h-0 min-w-0 flex-col">
+      {(snapshot.error ?? actionError) ? (
+        <p role="alert" className="text-destructive p-2 text-xs">
+          {snapshot.error ?? actionError}
+        </p>
+      ) : null}
+      {inline ? (
+        <DesktopViewer
+          workspaceId={props.workspaceId}
+          attach={(disconnect) => popout.attach(disconnect)}
+          onDetach={() => {
+            if (api) popout.open(api.desktop).catch(reportError);
+          }}
+        />
+      ) : (
+        <div
+          className="text-muted-foreground flex h-full flex-col items-center justify-center gap-3 p-4 text-center"
+          onKeyDown={(event) => {
+            if (
+              ["b", "r"].includes(event.key.toLowerCase()) &&
+              !event.ctrlKey &&
+              !event.metaKey &&
+              !event.altKey
+            ) {
+              event.preventDefault();
+              stopKeyboardPropagation(event);
+              if (event.key.toLowerCase() === "b") popout.bringBack();
+              else if (api) popout.recover(api.desktop).catch(reportError);
+            }
+          }}
+        >
+          <MonitorOff aria-hidden className="h-8 w-8" />
+          <p className="text-sm">
+            {snapshot.state === "checking"
+              ? "Checking desktop window…"
+              : "Desktop is open in a separate window"}
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => popout.bringBack()}
+            aria-keyshortcuts="B"
+          >
+            Bring back
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-keyshortcuts="R"
+            onClick={() => {
+              if (api) popout.recover(api.desktop).catch(reportError);
+            }}
+          >
+            Reconnect here
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

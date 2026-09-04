@@ -303,6 +303,7 @@ function createWorkspaceService(
   return Object.setPrototypeOf(
     {
       getInfo,
+      isRemoving: () => false,
     },
     WorkspaceService.prototype
   );
@@ -370,6 +371,302 @@ function deferred() {
   return { promise, resolve };
 }
 
+function createWindowManager() {
+  const windows = new Map<string, { instanceId: string }>();
+  return {
+    openWindow(workspaceId: string, instanceId: string) {
+      const state = windows.get(workspaceId) ?? { instanceId };
+      windows.set(workspaceId, state);
+      return Promise.resolve(state);
+    },
+    getWindow: (workspaceId: string) => windows.get(workspaceId) ?? null,
+    closeWindow(workspaceId: string, instanceId: string) {
+      if (windows.get(workspaceId)?.instanceId === instanceId) windows.delete(workspaceId);
+    },
+    closeWorkspace: (workspaceId: string) => {
+      windows.delete(workspaceId);
+    },
+    closeAll: () => windows.clear(),
+  };
+}
+
+async function withWindowHarness(
+  run: (harness: {
+    manager: DesktopSessionManager;
+    config: Config;
+    windows: ReturnType<typeof createWindowManager>;
+    workspaceService: WorkspaceService;
+    experimentsService: ExperimentsService;
+  }) => Promise<void>
+) {
+  await withDesktopManagerHarness(async ({ tempDir, config }) => {
+    await installPortableDesktopShim({ rootDir: tempDir, config: {} });
+    await config.editConfig((current) => {
+      const project = current.projects.get("/tmp/project-1");
+      if (!project) throw new Error("Missing test project");
+      project.workspaces.push(
+        ...["workspace", "one", "two"].map((id) => ({
+          id,
+          name: id,
+          path: `/tmp/project-1/${id}`,
+          runtimeConfig: { type: "local" as const },
+        }))
+      );
+      return current;
+    });
+    const workspaceService = createWorkspaceService(() =>
+      Promise.resolve(createWorkspaceMetadata({ type: "local" }))
+    );
+    const experimentsService = createExperimentsService(true);
+    const manager = new DesktopSessionManager({ config, experimentsService, workspaceService });
+    // WorkspaceService now supplies one guard covering both archive and removal admission.
+    manager.setWorkspaceArchiveGuard((workspaceId) => workspaceService.isRemoving(workspaceId));
+    const windows = createWindowManager();
+    manager.setDesktopWindowManager(windows);
+    try {
+      await run({ manager, config, windows, workspaceService, experimentsService });
+    } finally {
+      await manager.closeAll();
+    }
+  });
+}
+
+describe("DesktopSessionManager windows", () => {
+  test("server mode has no window and cannot create one", async () => {
+    await withDesktopManagerHarness(async ({ config }) => {
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() => Promise.resolve(null)),
+      });
+      expect(manager.getWindow("workspace")).toBeNull();
+      manager.closeWindow("workspace", "instance");
+      expect(
+        await manager.openWindow("workspace", "instance").catch((error: unknown) => error)
+      ).toBeInstanceOf(Error);
+    });
+  });
+
+  test.each(["missing", "remote", "disabled", "archiving", "removing"] as const)(
+    "rejects a %s workspace before opening a window",
+    async (reason) => {
+      await withWindowHarness(
+        async ({ manager, config, windows, workspaceService, experimentsService }) => {
+          if (reason === "missing" || reason === "remote") {
+            await config.editConfig((current) => {
+              const project = current.projects.get("/tmp/project-1");
+              const workspace = project?.workspaces.find((entry) => entry.id === "workspace");
+              if (!project || !workspace) throw new Error("Missing test workspace");
+              if (reason === "missing") {
+                project.workspaces = project.workspaces.filter((entry) => entry !== workspace);
+              } else {
+                workspace.runtimeConfig = { type: "ssh", host: "host", srcBaseDir: "/tmp" };
+              }
+              return current;
+            });
+          }
+          if (reason === "disabled")
+            spyOn(experimentsService, "isExperimentEnabled").mockReturnValue(false);
+          if (reason === "archiving") manager.setWorkspaceArchiveGuard(() => true);
+          if (reason === "removing") spyOn(workspaceService, "isRemoving").mockReturnValue(true);
+          expect(
+            await manager.openWindow("workspace", "instance").catch((error: unknown) => error)
+          ).toBeInstanceOf(Error);
+          expect(windows.getWindow("workspace")).toBeNull();
+          expect(manager.has("workspace")).toBe(false);
+        }
+      );
+    }
+  );
+
+  test("persisted archive blocks stale requests but unarchiving allows a fresh viewer", async () => {
+    await withWindowHarness(async ({ manager, config }) => {
+      const workspace = {
+        id: "workspace",
+        path: "/tmp/project/workspace",
+        archivedAt: "2026-01-01T00:00:00.000Z",
+      };
+      await config.editConfig((current) => {
+        current.projects.set("/tmp/project-1", { workspaces: [workspace] });
+        return current;
+      });
+      await manager.close("workspace");
+      expect(
+        await manager.openWindow("workspace", "stale").catch((error: unknown) => error)
+      ).toBeInstanceOf(Error);
+      await config.editConfig((current) => {
+        current.projects.set("/tmp/project-1", {
+          workspaces: [{ ...workspace, unarchivedAt: "2026-01-02T00:00:00.000Z" }],
+        });
+        return current;
+      });
+      expect(await manager.openWindow("workspace", "fresh")).toEqual({ instanceId: "fresh" });
+    });
+  });
+
+  test("returns the actual instance and guards stale closes", async () => {
+    await withWindowHarness(async ({ manager }) => {
+      expect(await manager.openWindow("workspace", "first")).toEqual({ instanceId: "first" });
+      expect(await manager.openWindow("workspace", "second")).toEqual({ instanceId: "first" });
+      expect(manager.has("workspace")).toBe(true);
+      manager.closeWindow("workspace", "second");
+      expect(manager.getWindow("workspace")).toEqual({ instanceId: "first" });
+      manager.closeWindow("workspace", "first");
+      expect(manager.getWindow("workspace")).toBeNull();
+      expect(manager.has("workspace")).toBe(false);
+    });
+  });
+
+  test.each(["workspace", "all", "instance", "archive", "remove"] as const)(
+    "%s teardown during capability lookup cannot resurrect a window",
+    async (teardown) => {
+      await withWindowHarness(async ({ manager, windows, workspaceService }) => {
+        const capability = await manager.getCapability("workspace");
+        const lookup = deferred();
+        spyOn(manager, "getCapability").mockImplementationOnce(async () => {
+          await lookup.promise;
+          return capability;
+        });
+        const pending = manager
+          .openWindow("workspace", "instance")
+          .catch((error: unknown) => error);
+        expect(manager.has("workspace")).toBe(true);
+        if (teardown === "workspace") await manager.close("workspace");
+        if (teardown === "all") await manager.closeAll();
+        if (teardown === "instance") manager.closeWindow("workspace", "instance");
+        if (teardown === "archive") manager.setWorkspaceArchiveGuard(() => true);
+        if (teardown === "remove") spyOn(workspaceService, "isRemoving").mockReturnValue(true);
+        lookup.resolve();
+        expect(await pending).toBeInstanceOf(Error);
+        expect(windows.getWindow("workspace")).toBeNull();
+        expect(manager.has("workspace")).toBe(false);
+      });
+    }
+  );
+
+  test("a stale close does not cancel another instance's pending open", async () => {
+    await withWindowHarness(async ({ manager }) => {
+      const capability = await manager.getCapability("workspace");
+      const lookup = deferred();
+      spyOn(manager, "getCapability").mockImplementationOnce(async () => {
+        await lookup.promise;
+        return capability;
+      });
+      const pending = manager.openWindow("workspace", "new");
+      manager.closeWindow("workspace", "old");
+      lookup.resolve();
+      expect(await pending).toEqual({ instanceId: "new" });
+    });
+  });
+
+  test.each(["owner", "child"])(
+    "closing %s cancels a borrower's pending viewer without blocking isolated viewers",
+    async (closedId) => {
+      await withWindowHarness(async ({ manager, config }) => {
+        await registerSharedWorkspaces(config);
+        const capability = await manager.getCapability("child");
+        const lookup = deferred();
+        spyOn(manager, "getCapability").mockImplementationOnce(async () => {
+          await lookup.promise;
+          return capability;
+        });
+        const opening = manager.openWindow("child", "borrowed").catch((error: unknown) => error);
+        expect(manager.has("child")).toBe(true);
+        expect(manager.has("owner")).toBe(true);
+        await manager.close(closedId);
+        lookup.resolve();
+        expect(await opening).toBeInstanceOf(Error);
+        expect(manager.getWindow("child")).toBeNull();
+        expect(manager.has("owner")).toBe(false);
+        await manager.openWindow("child", "fresh");
+        expect(manager.has("owner")).toBe(true);
+        await manager.openWindow("isolated", "isolated-viewer");
+        await manager.close("owner");
+        expect(manager.getWindow("child")).toBeNull();
+        expect(manager.getWindow("isolated")).toEqual({ instanceId: "isolated-viewer" });
+      });
+    }
+  );
+
+  test.each(["owner", "child"])(
+    "a guard on %s refuses a borrower popout before and after capability lookup",
+    async (guardedId) => {
+      await withWindowHarness(async ({ manager, config }) => {
+        await registerSharedWorkspaces(config);
+        manager.setWorkspaceArchiveGuard((id) => id === guardedId);
+        expect(
+          await manager.openWindow("child", "blocked").catch((error: unknown) => error)
+        ).toBeInstanceOf(Error);
+        manager.setWorkspaceArchiveGuard(() => false);
+        const opening = manager.openWindow("child", "racing").catch((error: unknown) => error);
+        manager.setWorkspaceArchiveGuard((id) => id === guardedId);
+        expect(await opening).toBeInstanceOf(Error);
+        expect(manager.getWindow("child")).toBeNull();
+      });
+    }
+  );
+
+  test("a changed owner during capability lookup cannot retarget a pending viewer", async () => {
+    await withWindowHarness(async ({ manager, config }) => {
+      await registerSharedWorkspaces(config);
+      const capability = await manager.getCapability("child");
+      const lookup = deferred();
+      spyOn(manager, "getCapability").mockImplementationOnce(async () => {
+        await lookup.promise;
+        return capability;
+      });
+      const opening = manager.openWindow("child", "stale").catch((error: unknown) => error);
+      await config.editConfig((current) => {
+        const child = current.projects
+          .get("/tmp/project-1")
+          ?.workspaces.find((entry) => entry.id === "child");
+        if (!child) throw new Error("Missing child");
+        delete child.taskDesktopOwnerWorkspaceId;
+        return current;
+      });
+      lookup.resolve();
+      expect(await opening).toBeInstanceOf(Error);
+      expect(manager.getWindow("child")).toBeNull();
+    });
+  });
+
+  test("closing an idle workspace does not leave a tombstone that blocks reopening", async () => {
+    await withWindowHarness(async ({ manager }) => {
+      expect(manager.has("workspace")).toBe(false);
+      const firstClose = manager.close("workspace");
+      expect(manager.close("workspace")).toBe(firstClose);
+      await firstClose;
+      expect(await manager.openWindow("workspace", "first")).toEqual({ instanceId: "first" });
+      manager.closeWindow("workspace", "first");
+
+      const secondClose = manager.close("workspace");
+      expect(secondClose).not.toBe(firstClose);
+      await secondClose;
+      expect(await manager.openWindow("workspace", "second")).toEqual({ instanceId: "second" });
+    });
+  });
+
+  test("workspace cleanup closes its viewer and shutdown prevents subsequent opens", async () => {
+    await withWindowHarness(async ({ manager }) => {
+      await manager.openWindow("one", "one");
+      await manager.openWindow("two", "two");
+      const closing = manager.close("one");
+      expect(manager.close("one")).toBe(closing);
+      expect(manager.getWindow("one")).toBeNull();
+      expect(manager.getWindow("two")).toEqual({ instanceId: "two" });
+      expect(
+        await manager.openWindow("one", "racing").catch((error: unknown) => error)
+      ).toBeInstanceOf(Error);
+      await closing;
+      await manager.closeAll();
+      expect(manager.getWindow("two")).toBeNull();
+      expect(
+        await manager.openWindow("one", "late").catch((error: unknown) => error)
+      ).toBeInstanceOf(Error);
+    });
+  });
+});
+
 describe("DesktopSessionManager", () => {
   test("shares startup, screenshots, actions and bootstrap while legacy children stay isolated", async () => {
     await withDesktopManagerHarness(async ({ tempDir, config }) => {
@@ -389,6 +686,10 @@ describe("DesktopSessionManager", () => {
         experimentsService: createExperimentsService(true),
         workspaceService: createWorkspaceService(() => Promise.resolve(null)),
       });
+      const windows = createWindowManager();
+      manager.setDesktopWindowManager(windows);
+      const closeNotifications: Array<string | null> = [];
+      const unsubscribeClose = manager.onWorkspaceClose((id) => closeNotifications.push(id));
       const tokens = new DesktopTokenManager();
       const start = spyOn(PortableDesktopSession.prototype, "start");
       const serverService = {
@@ -408,6 +709,12 @@ describe("DesktopSessionManager", () => {
         expect(childSession).toBe(parentSession);
         expect(start).toHaveBeenCalledTimes(1);
         expect(manager.has("child")).toBe(false);
+        await manager.openWindow("owner", "owner-viewer");
+        await manager.openWindow("child", "child-viewer");
+        manager.closeWindow("child", "child-viewer");
+        expect(parentSession.isAlive()).toBe(true);
+        expect(closeNotifications).toEqual([]);
+        await manager.openWindow("child", "child-reopened");
         expect(await manager.screenshot("child")).toEqual(await manager.screenshot("owner"));
         expect(await manager.action("child", "key_press", { key: "Return" })).toEqual({
           success: true,
@@ -421,10 +728,15 @@ describe("DesktopSessionManager", () => {
         expect(recorded[0]?.stateFile).toContain("owner");
         await manager.close("child");
         expect(parentSession.isAlive()).toBe(true);
+        expect(manager.getWindow("child")).toBeNull();
+        expect(manager.getWindow("owner")).toEqual({ instanceId: "owner-viewer" });
+        expect(closeNotifications).toEqual(["child"]);
+        await manager.openWindow("child", "child-after-cleanup");
 
         const isolated = await manager.ensureStarted("isolated");
         expect(isolated).not.toBe(parentSession);
         expect(start).toHaveBeenCalledTimes(2);
+        await manager.openWindow("isolated", "isolated-viewer");
         const bootstrap = await getDesktopBootstrap(
           { desktopSessionManager: manager, desktopTokenManager: tokens, serverService },
           "child"
@@ -462,7 +774,17 @@ describe("DesktopSessionManager", () => {
           available: false,
           reason: "startup_failed",
         });
+        await manager.close("owner");
+        expect(manager.getWindow("owner")).toBeNull();
+        expect(manager.getWindow("child")).toBeNull();
+        expect(manager.getWindow("isolated")).toEqual({ instanceId: "isolated-viewer" });
+        expect(isolated.isAlive()).toBe(true);
+        expect(closeNotifications).toEqual(["child", "owner"]);
+        await manager.closeAll();
+        expect(manager.getWindow("isolated")).toBeNull();
+        expect(closeNotifications).toEqual(["child", "owner", null]);
       } finally {
+        unsubscribeClose();
         start.mockRestore();
         tokens.dispose();
         await manager.closeAll();
@@ -829,6 +1151,13 @@ describe("DesktopSessionManager", () => {
       const secondSession = await manager.ensureStarted("workspace-reuse");
 
       expect(secondSession).toBe(firstSession);
+      manager.setDesktopWindowManager(createWindowManager());
+      await manager.openWindow("workspace-reuse", "viewer");
+      manager.closeWindow("workspace-reuse", "viewer");
+      expect(manager.getWindow("workspace-reuse")).toBeNull();
+      // Viewer handoff must not restart or terminate the underlying desktop session.
+      expect(firstSession.isAlive()).toBe(true);
+      expect(await manager.ensureStarted("workspace-reuse")).toBe(firstSession);
       await manager.closeAll();
     });
   });

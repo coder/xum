@@ -5,6 +5,7 @@ import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
 import type { DesktopCapability } from "@/common/types/desktop";
 import { getErrorMessage } from "@/common/utils/errors";
+import { trackDesktopInput } from "./desktopInput";
 
 export type DesktopConnectionState =
   | "idle"
@@ -22,6 +23,10 @@ export interface UseDesktopConnectionResult {
   containerRef: RefObject<HTMLDivElement>;
   connect: () => void;
   disconnect: () => void;
+  controlling: boolean;
+  setControlling: (value: boolean) => void;
+  scaleToFit: boolean;
+  setScaleToFit: (value: boolean) => void;
   width: number;
   height: number;
   sharedDesktop: Extract<DesktopCapability, { available: true }>["sharedDesktop"] | null;
@@ -112,7 +117,22 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const [sharedDesktop, setSharedDesktop] =
     useState<UseDesktopConnectionResult["sharedDesktop"]>(null);
 
+  const [controlling, setControllingState] = useState(false);
+  const [scaleToFit, setScaleToFitState] = useState(true);
+  const scaleToFitRef = useRef(true);
+  const inputRef = useRef<ReturnType<typeof trackDesktopInput> | null>(null);
   const rfbRef = useRef<RFB | null>(null);
+  const setControlling = (value: boolean) => {
+    const rfb = rfbRef.current;
+    if (!value) inputRef.current?.release();
+    if (rfb) rfb.viewOnly = !value;
+    setControllingState(value && rfb !== null);
+  };
+  const setScaleToFit = (value: boolean) => {
+    scaleToFitRef.current = value;
+    if (rfbRef.current) rfbRef.current.scaleViewport = value;
+    setScaleToFitState(value);
+  };
   const containerRef = useRef<HTMLDivElement | null>(null);
   const hasEverConnectedRef = useRef(false);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -136,6 +156,9 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
   const disconnectCurrentRfb = () => {
     setSharedDesktop(null);
     const currentRfb = rfbRef.current;
+    setControlling(false);
+    inputRef.current?.dispose();
+    inputRef.current = null;
     rfbRef.current = null;
     if (!currentRfb) {
       return;
@@ -249,13 +272,18 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
           return;
         }
         const rfb = new RFB(container, wsUrl);
-        rfb.scaleViewport = true;
+        rfb.background = "var(--color-background)";
+        rfb.viewOnly = true;
+        rfb.scaleViewport = scaleToFitRef.current;
         rfb.resizeSession = false;
 
         const handleConnect = () => {
           if (generationRef.current !== generation || isDisposedRef.current) {
             return;
           }
+          const canvas = container.querySelector("canvas");
+          assertDesktop(canvas, "Connected desktop is missing its canvas.");
+          inputRef.current = trackDesktopInput(canvas, () => !rfb.viewOnly);
           hasEverConnectedRef.current = true;
           attemptRef.current = 0;
           setState("connected");
@@ -319,7 +347,20 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
 
   useEffect(() => {
     const disconnect = disconnectHandleRef.current;
+    const release = () => setControlling(false);
+    const onWindowBlur = (event: FocusEvent) => {
+      // Capture runs before noVNC's window blur handler, but also sees toolbar/canvas
+      // focus changes. Moving focus into the guest must not revoke human control.
+      if (event.target === window) release();
+    };
+    window.addEventListener("blur", onWindowBlur, true);
+    const onVisibilityChange = () => {
+      if (document.hidden) release();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
+      window.removeEventListener("blur", onWindowBlur, true);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       disconnect();
     };
   }, []);
@@ -331,6 +372,10 @@ export function useDesktopConnection(workspaceId: string): UseDesktopConnectionR
     containerRef,
     connect: connectHandleRef.current,
     disconnect: disconnectHandleRef.current,
+    controlling,
+    setControlling,
+    scaleToFit,
+    setScaleToFit,
     width,
     height,
     sharedDesktop,

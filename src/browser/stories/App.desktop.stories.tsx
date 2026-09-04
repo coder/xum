@@ -50,6 +50,9 @@ function setupDesktopStory(phone = false): APIClient {
   });
   // Only bootstrap carries the binding; a capability probe must not determine the viewer's label.
   client.desktop = {
+    openWindow: ({ instanceId }) => Promise.resolve({ instanceId }),
+    closeWindow: () => Promise.resolve(),
+    getWindow: () => Promise.resolve(null),
     getPrereqStatus: () => Promise.resolve({ available: true }),
     getCapability: () => Promise.resolve(capability),
     getBootstrap,
@@ -82,7 +85,7 @@ async function expectCallerConnection(
     const url = new URL(viewer.url);
     await expect(url.pathname).toBe(`/desktop/ws/${workspaceId}`);
     await expect(url.searchParams.get("token")).toBe(`token-for-${workspaceId}`);
-    await expect(viewer.viewOnly).toBe(false);
+    await expect(viewer.viewOnly).toBe(true);
   });
   await expect(getBootstrap).not.toHaveBeenCalledWith({ workspaceId: OWNER_ID });
 }
