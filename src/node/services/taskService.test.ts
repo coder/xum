@@ -4077,10 +4077,6 @@ describe("TaskService", () => {
     });
     const otherConfig = new Config(config.rootDir);
     const services = [config, otherConfig].map((cfg) => createTaskServiceHarness(cfg).taskService);
-    let release!: () => void;
-    const bothReserved = new Promise<void>((resolve) => {
-      release = resolve;
-    });
     let reservations = 0;
     const results = await Promise.all(
       services.map((service) =>
@@ -4096,20 +4092,18 @@ describe("TaskService", () => {
             },
           ],
           {
-            onTaskReserved: async () => {
+            onTaskReserved: () => {
               reservations += 1;
-              if (reservations === services.length) release();
-              // Both process-local gates have read an unreserved desktop before either writes.
-              await bothReserved;
             },
           }
         )
       )
     );
     expect(results.filter((result) => result.success)).toHaveLength(1);
+    expect(reservations).toBe(1);
     const failure = results.find((result) => !result.success);
     assert(failure != null && !failure.success);
-    expect(failure.error).toContain("active borrowers");
+    expect(failure.error).toContain("controlled by active borrower");
     expect(
       config
         .loadConfigOrDefault()

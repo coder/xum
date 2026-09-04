@@ -33,7 +33,8 @@ const borrower = (id: string, fields: Partial<Workspace> = {}) =>
 async function withCoordinator(
   run: (
     coordinator: DesktopInputCoordinator,
-    write: (workspaces: Workspace[]) => Promise<void>
+    write: (workspaces: Workspace[]) => Promise<void>,
+    config: Config
   ) => Promise<void>
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-coordinator-"));
@@ -46,7 +47,7 @@ async function withCoordinator(
   };
   try {
     await write([owner, borrower("child")]);
-    await run(new DesktopInputCoordinator(config), write);
+    await run(new DesktopInputCoordinator(config), write, config);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -272,6 +273,45 @@ describe("DesktopInputCoordinator", () => {
       expect(admitted).toBe(true);
     });
   });
+
+  test.each(["admission", "reservation"] as const)(
+    "another backend's %s waits for the owner's in-flight input",
+    async (mode) => {
+      await withCoordinator(async (coordinator, write, config) => {
+        const other = new DesktopInputCoordinator(new Config(config.rootDir));
+        const entered = deferred();
+        const release = deferred();
+        const events: string[] = [];
+        const input = coordinator.withInput("owner", async () => {
+          entered.resolve();
+          await release.promise;
+          events.push("input finished");
+        });
+        await entered.promise;
+        const admit = async () => {
+          events.push("admitted");
+          await write([owner, borrower("child", { taskStatus: "running" })]);
+        };
+        const admission =
+          mode === "admission"
+            ? other.withAdmission("child", admit)
+            : other.withReservation("owner", "child", admit);
+        try {
+          // Flush the independent coordinator's local gate; it must still wait for owner input.
+          await Promise.resolve();
+          expect(events).toEqual([]);
+        } finally {
+          release.resolve();
+          await Promise.all([input, admission]);
+        }
+        expect(events).toEqual(["input finished", "admitted"]);
+        expect(await other.withInput("child", () => Promise.resolve("clicked"))).toBe("clicked");
+        expect(coordinator.withInput("owner", () => Promise.resolve())).rejects.toThrow(
+          "controlled by"
+        );
+      });
+    }
+  );
 
   test("overlapping reservations observe persisted winners and permit the same borrower", async () => {
     await withCoordinator(async (coordinator, write) => {

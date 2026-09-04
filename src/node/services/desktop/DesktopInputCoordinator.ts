@@ -1,4 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import * as path from "node:path";
+import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Config } from "@/node/config";
@@ -82,7 +86,7 @@ export class DesktopInputCoordinator {
     const lockNext = (index: number): Promise<T> => {
       const ownerId = ownerIds[index];
       if (ownerId !== undefined) {
-        return this.gates.withLock(ownerId, () => lockNext(index + 1));
+        return this.withOwnerGate(ownerId, () => lockNext(index + 1));
       }
       const config = this.config.loadConfigOrDefault();
       for (const [ownerWorkspaceId, borrowerWorkspaceId] of borrowers) {
@@ -105,7 +109,7 @@ export class DesktopInputCoordinator {
     // Non-desktop/legacy tasks retain their existing admission behavior, including remote runtimes.
     if (entry?.workspace.taskDesktopOwnerWorkspaceId === undefined) return admit();
     const target = this.resolveTarget(workspaceId);
-    return this.gates.withLock(target.ownerWorkspaceId, async () => {
+    return this.withOwnerGate(target.ownerWorkspaceId, async () => {
       const config = this.config.loadConfigOrDefault();
       this.assertSameTarget(config, workspaceId, target.ownerWorkspaceId);
       this.assertController(config, target.ownerWorkspaceId, workspaceId, false);
@@ -123,11 +127,26 @@ export class DesktopInputCoordinator {
 
   async withInput<T>(workspaceId: string, run: () => Promise<T>): Promise<T> {
     const target = this.resolveTarget(workspaceId);
-    return this.gates.withLock(target.ownerWorkspaceId, async () => {
+    return this.withOwnerGate(target.ownerWorkspaceId, async () => {
       const config = this.config.loadConfigOrDefault();
       this.assertSameTarget(config, workspaceId, target.ownerWorkspaceId);
       this.assertController(config, target.ownerWorkspaceId, workspaceId, true);
       return run();
+    });
+  }
+
+  private withOwnerGate<T>(ownerWorkspaceId: string, run: () => Promise<T>): Promise<T> {
+    return this.gates.withLock(ownerWorkspaceId, async () => {
+      // The transient mutex spans input completion as well as admission in other backends.
+      // Keep it outside the config transaction; unrelated config writes must remain unblocked.
+      const ownerKey = createHash("sha256").update(ownerWorkspaceId).digest("hex");
+      await using lock = await acquireProcessFileLock({
+        lockPath: path.join(this.config.rootDir, "locks", `desktop-input-${ownerKey}.lock`),
+        timeoutMs: DESKTOP_DEFAULTS.INPUT_LOCK_TIMEOUT_MS,
+        label: "desktop input lock",
+      });
+      await lock.assertStillOwned();
+      return await run();
     });
   }
 
