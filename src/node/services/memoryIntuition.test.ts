@@ -14,6 +14,7 @@ import {
   MEMORY_INTUITION_TIMEOUT_MS,
   MEMORY_MAX_FILE_BYTES,
 } from "@/common/constants/memory";
+import { MemoryToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import type { IntuitionReportToolArgs } from "@/common/types/tools";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -114,6 +115,20 @@ function pinned(model: MockLanguageModelV3) {
   return { model, optionsModelString: "mock:test", optionsProvidersConfig: null };
 }
 const body = () => Promise.resolve("Read memories and report relevant evidence.");
+
+function memoryReadResults(options: LanguageModelV3CallOptions) {
+  return options.prompt.flatMap((message) =>
+    message.role === "tool"
+      ? message.content.flatMap((part) =>
+          part.type === "tool-result" &&
+          part.toolName === "memory_read" &&
+          part.output.type === "json"
+            ? [part.output.value]
+            : []
+        )
+      : []
+  );
+}
 
 describe("selectIndexForCue", () => {
   it("ranks all rows before capping and includes zero-score rows with stable scope/path ties", () => {
@@ -371,6 +386,236 @@ describe("runMemoryIntuition", () => {
     expect(reads).not.toHaveBeenCalled();
     expect(prompts[1]).toContain("outside the selected memory index");
   });
+  it.each(["deny", "redact"])(
+    "reauthorizes cached reads and verification when hooks later %s",
+    async (mode) => {
+      using f = await fixture({ "a.md": "alpha secret" });
+      const calls: LanguageModelV3CallOptions[] = [];
+      const audit: string[] = [];
+      let uses = 0;
+      const reads = spyOn(f.memoryService, "readFileWithSha");
+      const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+        if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        audit.push("pre");
+        const denied = ++uses > 1;
+        if (denied && mode === "deny") {
+          ctx.blocked = { result: { error: "access revoked" } };
+          return;
+        }
+        await next();
+        audit.push("post");
+        if (denied) ctx.result = { success: true, output: "redacted" };
+      });
+      try {
+        const result = await runMemoryIntuition({
+          ...f,
+          cue: "alpha",
+          modelString: "mock:test",
+          resolveAgentBody: body,
+          createModel: () =>
+            Promise.resolve(
+              pinned(
+                scriptedModel(
+                  [[read("a.md")], [read("a.md")], [report([item("a.md", 0.9, "alpha secret")])]],
+                  (options) => calls.push(options)
+                )
+              )
+            ),
+          hooks: {
+            runtime: new LocalRuntime(f.root),
+            cwd: f.root,
+            runtimeTempDir: f.root,
+            workspaceId: f.ctx.workspaceId,
+          },
+        });
+        expect(memoryReadResults(calls[2])).toMatchObject([
+          { success: true, output: "alpha secret" },
+          mode === "deny"
+            ? { success: false, error: "access revoked" }
+            : { success: true, output: "redacted" },
+        ]);
+        expect(result).toMatchObject({
+          kind: "report",
+          memories: [],
+          candidates: [{ path: entry("a.md").path }],
+          stats: { filesRead: 1 },
+        });
+        expect(audit).toEqual(
+          mode === "deny"
+            ? ["pre", "post", "pre", "pre"]
+            : ["pre", "post", "pre", "post", "pre", "post"]
+        );
+        expect(reads).toHaveBeenCalledTimes(1);
+        expect((await f.meta.getEntries()).size).toBe(0);
+      } finally {
+        unregister();
+      }
+    }
+  );
+
+  it("charges concurrent repeated large cached outputs but not private report verification", async () => {
+    const content = "remember this ".padEnd(MEMORY_MAX_FILE_BYTES, "x");
+    using f = await fixture({ "a.md": content });
+    const calls: LanguageModelV3CallOptions[] = [];
+    const reads = spyOn(f.memoryService, "readFileWithSha");
+    const result = await runMemoryIntuition({
+      ...f,
+      cue: "remember",
+      modelString: "mock:test",
+      resolveAgentBody: body,
+      createModel: () =>
+        Promise.resolve(
+          pinned(
+            scriptedModel(
+              [
+                [read("a.md"), read("a.md"), read("a.md")],
+                [report([item("a.md", 0.9, "remember this")])],
+              ],
+              (options) => calls.push(options)
+            )
+          )
+        ),
+    });
+    const outputs = memoryReadResults(calls[1]);
+    expect(outputs).toHaveLength(3);
+    expect(outputs.map((output) => MemoryToolResultSchema.parse(output).success).sort()).toEqual([
+      false,
+      true,
+      true,
+    ]);
+    expect(outputs).toContainEqual({ success: false, error: "Memory read budget exhausted" });
+    expect(Buffer.byteLength(JSON.stringify(outputs))).toBeLessThanOrEqual(
+      MEMORY_INTUITION_MAX_READ_BYTES
+    );
+    expect(result).toMatchObject({
+      kind: "report",
+      memories: [item("a.md", 0.9, "remember this")],
+      stats: { filesRead: 1, bytesRead: Buffer.byteLength(content) },
+    });
+    expect(reads).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares physical reads by rewritten authorized path while applying hooks to each request", async () => {
+    using f = await fixture({ "a.md": "alpha", "b.md": "bravo", "c.md": "shared content" });
+    const requests: unknown[] = [];
+    const reads = spyOn(f.memoryService, "readFileWithSha");
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      requests.push(ctx.args);
+      ctx.args = { command: "view", path: entry("c.md").path };
+      await next();
+    });
+    try {
+      await runMemoryIntuition({
+        ...f,
+        cue: "shared",
+        modelString: "mock:test",
+        resolveAgentBody: body,
+        createModel: () =>
+          Promise.resolve(pinned(scriptedModel([[read("a.md"), read("b.md")], [report([])]]))),
+        hooks: {
+          runtime: new LocalRuntime(f.root),
+          cwd: f.root,
+          runtimeTempDir: f.root,
+          workspaceId: f.ctx.workspaceId,
+        },
+      });
+      expect(requests).toHaveLength(2);
+      expect(requests).toContainEqual({ command: "view", path: entry("a.md").path });
+      expect(requests).toContainEqual({ command: "view", path: entry("b.md").path });
+      expect(reads.mock.calls.map((call) => call[1])).toEqual([entry("c.md").path]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it.each(["annotation", "post-error", "blocked-error"])(
+    "bounds inflated %s outputs on every invocation",
+    async (mode) => {
+      using f = await fixture({ "a.md": "alpha secret" });
+      const calls: LanguageModelV3CallOptions[] = [];
+      const large = "oversized-hook-output" + "x".repeat(MEMORY_INTUITION_MAX_READ_BYTES);
+      const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+        if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        if (mode === "blocked-error") {
+          ctx.blocked = { result: { error: large } };
+          return;
+        }
+        await next();
+        ctx.result =
+          mode === "post-error"
+            ? { success: false, error: large }
+            : { success: true, output: "alpha secret", hook_output: large };
+      });
+      try {
+        await runMemoryIntuition({
+          ...f,
+          cue: "alpha",
+          modelString: "mock:test",
+          resolveAgentBody: body,
+          createModel: () =>
+            Promise.resolve(
+              pinned(
+                scriptedModel([[read("a.md")], [report([])]], (options) => calls.push(options))
+              )
+            ),
+          hooks: {
+            runtime: new LocalRuntime(f.root),
+            cwd: f.root,
+            runtimeTempDir: f.root,
+            workspaceId: f.ctx.workspaceId,
+          },
+        });
+        expect(memoryReadResults(calls[1])).toEqual([
+          { success: false, error: "Memory read budget exhausted" },
+        ]);
+        expect(JSON.stringify(calls[1].prompt)).not.toContain("oversized-hook-output");
+      } finally {
+        unregister();
+      }
+    }
+  );
+
+  it("does not charge a near-budget first read again when verifying its report", async () => {
+    using f = await fixture({ "a.md": "alpha secret" });
+    let audits = 0;
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      audits++;
+      await next();
+      ctx.result = {
+        success: true,
+        output: "alpha secret",
+        hook_output: "x".repeat(MEMORY_INTUITION_MAX_READ_BYTES - 128),
+      };
+    });
+    try {
+      const result = await runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "mock:test",
+        resolveAgentBody: body,
+        createModel: () =>
+          Promise.resolve(
+            pinned(scriptedModel([[read("a.md")], [report([item("a.md", 0.9, "alpha secret")])]]))
+          ),
+        hooks: {
+          runtime: new LocalRuntime(f.root),
+          cwd: f.root,
+          runtimeTempDir: f.root,
+          workspaceId: f.ctx.workspaceId,
+        },
+      });
+      expect(result).toMatchObject({
+        kind: "report",
+        memories: [item("a.md", 0.9, "alpha secret")],
+      });
+      expect(audits).toBe(2);
+    } finally {
+      unregister();
+    }
+  });
+
   it("reserves aggregate read bytes before parallel reads and recovers from budget denial", async () => {
     const text = "x".repeat(MEMORY_MAX_FILE_BYTES);
     using f = await fixture({ "a.md": text, "b.md": text, "c.md": text });

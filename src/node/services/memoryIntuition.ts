@@ -40,7 +40,12 @@ import {
   normalizeUsage,
 } from "@/common/utils/tokens/usageHelpers";
 import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import type { MemoryIndexEntry, MemoryScopeContext, MemoryService } from "./memoryService";
+import type {
+  MemoryIndexEntry,
+  MemoryReadFileResult,
+  MemoryScopeContext,
+  MemoryService,
+} from "./memoryService";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
@@ -292,13 +297,11 @@ export async function runMemoryIntuition(args: {
     if (!body?.trim())
       return { kind: "error", message: "Intuition agent definition is missing", stats };
     const allowed = new Set(selection.entries.map((entry) => entry.path));
-    const cache = new Map<string, Promise<IntuitionReadResult>>();
+    const physicalReads = new Map<string, Promise<MemoryReadFileResult>>();
     let reservedBytes = 0;
     let returnedBytes = 0;
-    const readFile = (path: string): Promise<IntuitionReadResult> => {
-      const cached = cache.get(path);
-      if (cached) return cached;
-      const pending = untilAborted(signal, async (): Promise<IntuitionReadResult> => {
+    const readMemoryView = (path: string): Promise<IntuitionReadResult> => {
+      return untilAborted(signal, async (): Promise<IntuitionReadResult> => {
         let effectivePath: string | undefined;
         let rawContent: string | undefined;
         const execute = async (input: MemoryToolArgs): Promise<MemoryToolResult> => {
@@ -313,36 +316,42 @@ export async function runMemoryIntuition(args: {
             return { success: false, error: "Path is outside the selected memory index" };
           if (signal.aborted) return { success: false, error: "Intuition aborted" };
           effectivePath = currentPath;
-          // Reserve the maximum physical read (including the oversize probe)
-          // synchronously so parallel calls cannot overdraw the aggregate budget.
-          const reservation = MEMORY_MAX_FILE_BYTES + 1;
-          if (stats.bytesRead + reservedBytes + reservation > MEMORY_INTUITION_MAX_READ_BYTES) {
-            // In-flight reservations may shrink after small reads; allow a later retry.
-            cache.delete(path);
-            return { success: false, error: "Memory read budget exhausted" };
+          let read = physicalReads.get(currentPath);
+          if (!read) {
+            // Cache only physical I/O, after authorization of the rewritten path.
+            // Reserve before awaiting so concurrent requests share one bounded read.
+            const reservation = MEMORY_MAX_FILE_BYTES + 1;
+            if (stats.bytesRead + reservedBytes + reservation > MEMORY_INTUITION_MAX_READ_BYTES)
+              return { success: false, error: "Memory read budget exhausted" };
+            reservedBytes += reservation;
+            read = Promise.resolve()
+              .then(async (): Promise<MemoryReadFileResult> => {
+                if (signal.aborted) return { success: false, error: "Intuition aborted" };
+                const result = await args.memoryService.readFileWithSha(args.ctx, currentPath);
+                stats.bytesRead += result.success
+                  ? Buffer.byteLength(result.data.content)
+                  : reservation;
+                stats.filesRead++;
+                return result;
+              })
+              .finally(() => {
+                reservedBytes -= reservation;
+              });
+            physicalReads.set(currentPath, read);
           }
-          reservedBytes += reservation;
-          try {
-            const result = await args.memoryService.readFileWithSha(args.ctx, effectivePath);
-            stats.bytesRead += result.success
-              ? Buffer.byteLength(result.data.content)
-              : reservation;
-            stats.filesRead++;
-            if (!result.success) return result;
-            const content = result.data.content;
-            rawContent = content;
-            const start = (current.offset ?? 1) - 1;
-            const output =
-              current.offset == null && current.limit == null
-                ? content
-                : content
-                    .split("\n")
-                    .slice(start, current.limit == null ? undefined : start + current.limit)
-                    .join("\n");
-            return { success: true, output };
-          } finally {
-            reservedBytes -= reservation;
-          }
+          const result = await read;
+          if (!result.success) return result;
+          const content = result.data.content;
+          rawContent = content;
+          const start = (current.offset ?? 1) - 1;
+          const output =
+            current.offset == null && current.limit == null
+              ? content
+              : content
+                  .split("\n")
+                  .slice(start, current.limit == null ? undefined : start + current.limit)
+                  .join("\n");
+          return { success: true, output };
         };
         // Use the ordinary public memory-view hook contract for BOTH provider
         // reads and report-only verification, including configured shell hooks.
@@ -371,16 +380,9 @@ export async function runMemoryIntuition(args: {
           };
         }
         if (!parsed.data.success) return parsed.data;
-        // Honor post-hook redaction/annotations, never the pre-hook raw bytes.
-        // Middleware cannot inflate the provider-visible aggregate beyond its budget.
-        const bytes = Buffer.byteLength(JSON.stringify(outcome.result));
-        if (returnedBytes + bytes > MEMORY_INTUITION_MAX_READ_BYTES)
-          return { success: false, error: "Memory read budget exhausted" };
-        returnedBytes += bytes;
+        // Both provider reads and report verification use this invocation's permitted view.
         return { ...(outcome.result as object), ...parsed.data, effectivePath, rawContent };
       }).catch(() => ({ success: false as const, error: "Memory read failed or aborted" }));
-      cache.set(path, pending);
-      return pending;
     };
     const report: { items?: IntuitionReportToolArgs["items"] } = {};
     const errors: string[] = [];
@@ -425,7 +427,17 @@ export async function runMemoryIntuition(args: {
           description: TOOL_DEFINITIONS.memory_read.description,
           inputSchema: TOOL_DEFINITIONS.memory_read.schema,
           execute: async ({ path }) => {
-            const { rawContent: _raw, effectivePath: _path, ...result } = await readFile(path);
+            const {
+              rawContent: _raw,
+              effectivePath: _path,
+              ...result
+            } = await readMemoryView(path);
+            // Charge every public result, including errors and hook annotations, even on
+            // cache hits. Private verification below reauthorizes but emits no file bytes.
+            const bytes = Buffer.byteLength(JSON.stringify(result));
+            if (returnedBytes + bytes > MEMORY_INTUITION_MAX_READ_BYTES)
+              return { success: false, error: "Memory read budget exhausted" };
+            returnedBytes += bytes;
             return result;
           },
         }),
@@ -477,7 +489,7 @@ export async function runMemoryIntuition(args: {
         : await classifyIntuitionReport({
             items: report.items,
             entries: selection.entries,
-            readFile,
+            readFile: readMemoryView,
           });
     if (classified) return { kind: "report", ...classified, stats };
     if (errors.length > 0 && !signal.aborted) return { kind: "error", message: errors[0], stats };
