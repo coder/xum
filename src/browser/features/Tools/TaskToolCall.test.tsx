@@ -864,6 +864,48 @@ describe("TaskSendMessageToolCall", () => {
     );
     expect(view.getByRole("alert").textContent).toBe("Connection lost");
   });
+
+  test.each(["accepted", "queued", "reactivated"] as const)(
+    "preserves hooked delivery outcome: %s",
+    (status) => {
+      const view = render(
+        <TooltipProvider>
+          <TaskSendMessageToolCall
+            args={taskSendMessageArgs}
+            status="completed"
+            result={Object.freeze({
+              status,
+              taskId: "child-task",
+              hook_output: "Post hook finished",
+              hook_duration_ms: 20,
+              hook_path: ".xum/tool_post",
+            })}
+          />
+        </TooltipProvider>
+      );
+      expect(view.getByRole("status").className).toContain(
+        status === "queued" ? "text-backgrounded" : "text-success"
+      );
+    }
+  );
+
+  test("shows bare pre-hook errors alongside their metadata", () => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={{
+            error: "Blocked by project hook",
+            hook_output: "Policy refused",
+            hook_path: ".xum/tool_pre",
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Blocked by project hook");
+    expect(view.getByRole("status").className).toContain("text-danger");
+  });
 });
 
 const taskTerminateArgs = { task_ids: ["wfr_x"] };

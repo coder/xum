@@ -1,6 +1,7 @@
 import React from "react";
 import { AlertTriangle, Check, CircleDot, EyeOff, X } from "lucide-react";
 import type { ToolErrorResult } from "@/common/types/tools";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import {
   useStickyExpand,
   type UseStickyExpandOptions,
@@ -163,6 +164,21 @@ export function unwrapResult(result: unknown): unknown {
     return (result as { value: unknown }).value;
   }
   return result;
+}
+
+/** Preserve wrapper compatibility before strict result validation without mutating hook/UI output. */
+export function normalizeToolResultForRendering(result: unknown): unknown {
+  if (!isPlainObject(result)) return result;
+  const core = { ...result };
+  delete core.hook_output;
+  delete core.hook_duration_ms;
+  delete core.hook_path;
+  delete core.ui_only;
+  // Blocking pre-hooks return a bare error instead of the tool's result schema.
+  if (typeof core.error === "string" && !("success" in core) && !("status" in core)) {
+    return { success: false, error: core.error };
+  }
+  return core;
 }
 
 /**

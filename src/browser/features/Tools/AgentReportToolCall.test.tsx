@@ -156,4 +156,40 @@ describe("AgentReportToolCall", () => {
     expect(view.getByText("Preserved findings")).toBeTruthy();
     expect(view.getByRole("status").className).not.toContain("text-success");
   });
+
+  test("accepts report results decorated by post hooks without mutating hook output", () => {
+    const result = Object.freeze({
+      success: true,
+      report: { reportMarkdown: "Submitted findings" },
+      hook_output: "Formatter completed",
+      hook_duration_ms: 20,
+      hook_path: ".xum/tool_post",
+      ui_only: {},
+    });
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ reportMarkdownPath: "report.md" }}
+          result={result}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByText("Submitted findings")).toBeTruthy();
+    expect(view.getByRole("status").className).toContain("text-success");
+  });
+
+  test("shows bare pre-hook blocking errors", () => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ reportMarkdown: "Draft" }}
+          result={{ error: "Blocked by project hook" }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Blocked by project hook");
+    expect(view.getByRole("status").className).toContain("text-danger");
+  });
 });

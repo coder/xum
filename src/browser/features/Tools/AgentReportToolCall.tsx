@@ -5,7 +5,11 @@ import { AgentReportToolResultSchema } from "@/common/utils/tools/toolDefinition
 
 import { ErrorBox } from "./Shared/ToolPrimitives";
 import { AgentCommunicationCard } from "./Shared/AgentCommunicationCard";
-import { isToolErrorResult, type ToolStatus } from "./Shared/toolUtils";
+import {
+  isToolErrorResult,
+  normalizeToolResultForRendering,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 
 interface LegacyAgentReportFileArgs {
@@ -37,9 +41,10 @@ function getSubmittedReportMarkdown(
 
 export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = (props) => {
   // Persisted results bypass input-schema validation and may be malformed.
-  const parsed = AgentReportToolResultSchema.safeParse(props.result);
-  const result = isToolErrorResult(props.result)
-    ? props.result
+  const normalizedResult = normalizeToolResultForRendering(props.result);
+  const parsed = AgentReportToolResultSchema.safeParse(normalizedResult);
+  const result = isToolErrorResult(normalizedResult)
+    ? normalizedResult
     : parsed.success
       ? parsed.data
       : undefined;
