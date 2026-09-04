@@ -20,7 +20,7 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { RecursivePartial } from "@/browser/testUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -520,15 +520,22 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
-  test("stale metadata does not override a main workspace agent selection", async () => {
+  test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
+    const changed = change !== "unchanged";
+    const nextAgentId = change === "mode" ? "auto" : "plan";
     const workspaceId = "ws-agent-main";
+    const saved = createWorkspaceMetadata({
+      id: workspaceId,
+      agentId: "plan",
+      aiSettingsByAgent: { plan: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
+    });
     let emitMetadata:
       | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
       | null = null;
 
     createMockAPI({
       workspace: {
-        list: () => Promise.resolve([createWorkspaceMetadata({ id: workspaceId })]),
+        list: () => Promise.resolve([saved]),
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
@@ -551,19 +558,34 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBeUndefined();
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
     act(() => {
+      updatePersistedState(getAgentIdKey(workspaceId), "exec");
+      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-opus-4-6");
       emitMetadata?.({
         workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+        metadata: {
+          ...saved,
+          title: "Updated title",
+          ...(changed
+            ? {
+                agentId: nextAgentId,
+                aiSettingsByAgent: {
+                  [nextAgentId]: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" },
+                },
+              }
+            : {}),
+        },
       });
     });
 
-    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "exec"
+    await waitFor(() =>
+      expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("anthropic:claude-opus-4-6");
   });
 
   test("child workspace metadata still seeds the locked backend agent", async () => {

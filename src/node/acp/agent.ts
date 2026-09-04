@@ -49,7 +49,7 @@ import {
 } from "@/common/utils/subProjects";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { negotiateCapabilities, type NegotiatedCapabilities } from "./capabilities";
-import { AGENT_MODE_CONFIG_ID, buildConfigOptions, handleSetConfigOption } from "./configOptions";
+import { buildConfigOptions, handleSetConfigOption } from "./configOptions";
 import { forkSessionFromWorkspace } from "./experimental/sessionFork";
 import {
   canonicalizePathForWorkspaceMatch,
@@ -372,7 +372,6 @@ export class MuxAgent implements Agent {
 
       const agentId = meta.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
       const aiSettings = await resolveAgentAiSettings(this.server.client, agentId, workspaceId);
-      await this.persistAiSettings(workspaceId, agentId, aiSettings);
 
       this.sessionStateById.set(sessionId, {
         workspaceId,
@@ -388,6 +387,7 @@ export class MuxAgent implements Agent {
         sessionId,
         configOptions: await buildConfigOptions(this.server.client, workspaceId, {
           activeAgentId: agentId,
+          aiSettings,
         }),
       };
 
@@ -551,8 +551,6 @@ export class MuxAgent implements Agent {
       meta.forkName
     );
 
-    await this.persistAiSettings(forked.workspaceId, forked.agentId, forked.aiSettings);
-
     this.sessionStateById.set(forked.sessionId, {
       workspaceId: forked.workspaceId,
       runtimeMode: forked.runtimeMode,
@@ -598,8 +596,7 @@ export class MuxAgent implements Agent {
       options: {
         model: sessionState.aiSettings.model,
         thinkingLevel: sessionState.aiSettings.thinkingLevel,
-        // Per-workspace pro mode from workspace metadata; the send path
-        // re-gates per model/route so this is inert for unsupported models.
+        // The send path re-gates pro mode for the selected model and route.
         reasoningMode: sessionState.aiSettings.reasoningMode,
         agentId: sessionState.agentId,
       },
@@ -655,23 +652,20 @@ export class MuxAgent implements Agent {
       );
     }
 
-    const activeAgentId = this.sessionStateById.get(sessionId)?.agentId;
+    const sessionState = this.sessionStateById.get(sessionId);
     const configOptions = await handleSetConfigOption(
       this.server.client,
       workspaceId,
       params.configId,
       params.value,
       {
-        activeAgentId,
+        activeAgentId: sessionState?.agentId,
+        aiSettings: sessionState?.aiSettings,
         onAgentModeChanged: (agentId, aiSettings) => {
           this.updateSessionAgentState(sessionId, agentId, aiSettings);
         },
       }
     );
-
-    if (trimmedConfigId !== AGENT_MODE_CONFIG_ID) {
-      await this.refreshSessionState(sessionId);
-    }
 
     return { configOptions };
   }
@@ -2143,7 +2137,9 @@ export class MuxAgent implements Agent {
     // selection lives in sessionStateById and must not be reverted by a
     // workspace.agentId value from the backend.
     const agentId = existing?.agentId ?? workspace.agentId ?? DEFAULT_AGENT_ID;
+    // Picker choices remain session-local until the next user message sends them.
     const aiSettings =
+      existing?.aiSettings ??
       workspace.aiSettingsByAgent?.[agentId] ??
       workspace.aiSettings ??
       (await resolveAgentAiSettings(this.server.client, agentId, workspaceId));
@@ -2157,36 +2153,6 @@ export class MuxAgent implements Agent {
 
     this.sessionStateById.set(sessionId, nextState);
     return nextState;
-  }
-
-  private async persistAiSettings(
-    workspaceId: string,
-    agentId: string,
-    aiSettings: ResolvedAiSettings
-  ): Promise<void> {
-    if (agentId === "plan" || agentId === "exec") {
-      const updateModeResult = await this.server.client.workspace.updateModeAISettings({
-        workspaceId,
-        mode: agentId,
-        aiSettings,
-      });
-
-      if (!updateModeResult.success) {
-        throw new Error(`workspace.updateModeAISettings failed: ${updateModeResult.error}`);
-      }
-
-      return;
-    }
-
-    const updateAgentResult = await this.server.client.workspace.updateAgentAISettings({
-      workspaceId,
-      agentId,
-      aiSettings,
-    });
-
-    if (!updateAgentResult.success) {
-      throw new Error(`workspace.updateAgentAISettings failed: ${updateAgentResult.error}`);
-    }
   }
 
   async waitForDisconnectCleanup(): Promise<void> {
