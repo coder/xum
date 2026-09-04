@@ -1,6 +1,7 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { GlobalWindow } from "happy-dom";
+// Keep the fake transport and its events in one realm even after other UI tests install a DOM.
+import { GlobalWindow, EventTarget, Event, CustomEvent } from "happy-dom";
 import type { APIClient } from "@/browser/contexts/API";
 
 const getBootstrap = mock<APIClient["desktop"]["getBootstrap"]>();

@@ -477,6 +477,7 @@ describe("TaskService", () => {
     expect(result).toEqual(
       Ok({
         taskId: childId,
+        desktopOwnerWorkspaceId: childId,
         kind: "agent",
         status: "running",
         modelString: "anthropic:claude-opus-4-6",
