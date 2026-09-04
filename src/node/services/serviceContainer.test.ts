@@ -170,6 +170,85 @@ describe("ServiceContainer", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it("collects restart blockers from live sessions, including pre-stream work", () => {
+    services = new ServiceContainer(stores);
+    expect(services.collectRestartBlockers()).toEqual([]);
+    const session = services.workspaceService.getOrCreateSession("restart-test");
+    const internal = session as unknown as {
+      setTurnPhase(phase: "idle" | "preparing"): void;
+      autoRetryStarting: boolean;
+    };
+    using _admission = session.holdTurnAdmission();
+    internal.setTurnPhase("preparing");
+    expect(services.collectRestartBlockers()).toContainEqual({ kind: "pending-turns", count: 1 });
+    internal.setTurnPhase("idle");
+    session.queueMessage("queued for later");
+    expect(services.collectRestartBlockers()).toEqual([{ kind: "queued-messages", count: 1 }]);
+    session.clearQueue();
+    internal.autoRetryStarting = true;
+    expect(services.collectRestartBlockers()).toEqual([{ kind: "auto-retries", count: 1 }]);
+    internal.autoRetryStarting = false;
+    expect(services.collectRestartBlockers()).toEqual([]);
+  });
+
+  it("counts server-wide streams, terminal starts, and foreground or background processes", () => {
+    services = new ServiceContainer(stores);
+    const streams = services.streamManager as unknown as { workspaceStreams: Map<string, unknown> };
+    const terminals = services.terminalService as unknown as {
+      pendingSessionCreations: Map<string, number>;
+    };
+    const processes = services.backgroundProcessManager as unknown as {
+      processes: Map<string, { status: string; isForeground: boolean }>;
+    };
+    const workspace = services.workspaceService as unknown as {
+      preflightSendCounts: Map<string, number>;
+      preflightExecCounts: Map<string, number>;
+    };
+    try {
+      streams.workspaceStreams.set("streaming", {});
+      terminals.pendingSessionCreations.set("terminal-starting", 2);
+      processes.processes.set("running", { status: "running", isForeground: false });
+      processes.processes.set("foreground", { status: "running", isForeground: true });
+      processes.processes.set("finished", { status: "exited", isForeground: false });
+      workspace.preflightSendCounts.set("preflight", 1);
+      workspace.preflightExecCounts.set("executing", 1);
+      expect(services.collectRestartBlockers()).toEqual([
+        { kind: "pending-turns", count: 1 },
+        { kind: "background-processes", count: 3 },
+        { kind: "active-streams", count: 1 },
+        { kind: "terminals", count: 2 },
+      ]);
+    } finally {
+      streams.workspaceStreams.clear();
+      terminals.pendingSessionCreations.clear();
+      processes.processes.clear();
+      workspace.preflightSendCounts.clear();
+      workspace.preflightExecCounts.clear();
+    }
+    expect(services.collectRestartBlockers()).toEqual([]);
+  });
+
+  it("refuses new sessions, commands, and terminals synchronously during disposal", async () => {
+    services = new ServiceContainer(stores);
+    const disposal = services.dispose();
+    expect(() => services!.workspaceService.getOrCreateSession("cold-workspace")).toThrow(
+      "shutting down"
+    );
+    expect(await services.workspaceService.executeBash("cold-workspace", "echo not-run")).toEqual({
+      success: false,
+      error: "Server is shutting down",
+    });
+    let terminalError: unknown;
+    try {
+      await services.terminalService.create({ workspaceId: "cold-workspace", cols: 80, rows: 24 });
+    } catch (error) {
+      terminalError = error;
+    }
+    expect(terminalError).toBeInstanceOf(Error);
+    expect(String(terminalError)).toContain("shutting down");
+    await disposal;
+  });
+
   it("attributes multi-project stream-end analytics to the primary project path", async () => {
     const primaryProjectPath = "/fake/project-a";
     const secondaryProjectPath = "/fake/project-b";

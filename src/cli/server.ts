@@ -254,6 +254,7 @@ async function main(): Promise<void> {
     }, 5000);
 
     try {
+      serviceContainer.terminalService.beginShutdown();
       // Close all PTY sessions first
       shutdownStep("terminalService.closeAllSessions", () =>
         serviceContainer.terminalService.closeAllSessions()
@@ -285,6 +286,11 @@ async function main(): Promise<void> {
       process.exit(1);
     }
   };
+
+  await serviceContainer.updateService.enableServerUpdater({
+    collectBlockers: () => serviceContainer.collectRestartBlockers(),
+    restart: cleanup,
+  });
 
   process.on("SIGINT", () => void cleanup());
   process.on("SIGTERM", () => void cleanup());

@@ -1,3 +1,4 @@
+import type { RestartBlocker } from "@/common/orpc/types";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
@@ -171,7 +172,7 @@ export class ServiceContainer {
   public readonly memoryConsolidationService: CoreServices["memoryConsolidationService"];
   public readonly refineService: RefineService;
   private readonly extensionMetadata: CoreServices["extensionMetadata"];
-  private readonly backgroundProcessManager: CoreServices["backgroundProcessManager"];
+  public readonly backgroundProcessManager: CoreServices["backgroundProcessManager"];
   // Desktop-only services (`di/layers/desktop.ts`)
   public readonly projectService: ProjectService;
   public readonly muxGatewayOauthService: MuxGatewayOauthService;
@@ -542,6 +543,23 @@ export class ServiceContainer {
     this.terminalService.setTerminalWindowManager(manager);
   }
 
+  collectRestartBlockers(): RestartBlocker[] {
+    const blockers = this.workspaceService.collectRestartBlockers();
+    const counts: Array<[RestartBlocker["kind"], number]> = [
+      ["active-streams", this.streamManager.getActiveStreams().length],
+      ["terminals", this.terminalService.getOpenSessionCount()],
+      ["background-processes", this.backgroundProcessManager.getRunningProcessCount()],
+    ];
+    for (const [kind, count] of counts) {
+      if (count > 0) {
+        const existing = blockers.find((blocker) => blocker.kind === kind);
+        if (existing) existing.count += count;
+        else blockers.push({ kind, count });
+      }
+    }
+    return blockers;
+  }
+
   /**
    * Dispose all services. Called on app quit to clean up resources.
    * Terminates all background processes to prevent orphans. Idempotent:
@@ -576,6 +594,7 @@ export class ServiceContainer {
     // abort nor the join, so latch every session before the wait: nothing may start a stream inside
     // it, and nothing may dispatch through the provider/runtime services torn down below.
     shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
+    shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
     const housekeepingSettled = this.startupHousekeepingSettled;
     if (housekeepingSettled != null) {
       await shutdownStep("startupHousekeeping.join", async () => {
