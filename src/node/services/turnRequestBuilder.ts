@@ -1896,6 +1896,7 @@ export class TurnRequestBuilder {
       const toolModel = await this.dependencies.createModel(toolModelString, undefined, {
         workspaceId,
         providersConfig: toolProvidersConfig,
+        agentInitiated: true,
       });
       if (!toolModel.success) {
         throw new Error(`Failed to create tool model: ${getErrorMessage(toolModel.error)}`);
@@ -2006,9 +2007,11 @@ export class TurnRequestBuilder {
               modelString: resolveHeadlessAgentModelString(
                 this.dependencies.config,
                 workspaceId,
-                "intuition"
+                "intuition",
+                modelString
               ),
               maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
+              usesThisTurn: 0,
               createModel: createToolModel,
               resolveAgentBody: () =>
                 resolveHeadlessAgentBody(this.dependencies.config.rootDir, "intuition"),

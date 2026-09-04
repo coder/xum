@@ -2,7 +2,7 @@ import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
-import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import type { Tool } from "ai";
 import {
   MEMORY_INTUITION_MAX_USES_PER_TURN,
@@ -28,17 +28,22 @@ const memory = {
 };
 const candidate = { path: candidatePath, relevance: 0.5, excerpt: "", why: "Possibly relevant." };
 
-function reportingModel(items = [memory, memory, candidate]) {
+function reportingModel(
+  items = [memory, memory, candidate],
+  capture?: (options: LanguageModelV3CallOptions) => void,
+  readPath = candidatePath
+) {
   let step = 0;
   return new MockLanguageModelV3({
-    doStream: () => {
+    doStream: (options) => {
+      capture?.(options);
       const first = step++ === 0;
       const chunks: LanguageModelV3StreamPart[] = [
         {
           type: "tool-call",
           toolCallId: `call-${step}`,
           toolName: first ? "memory_read" : "intuition_report",
-          input: JSON.stringify(first ? { path: candidatePath } : { items }),
+          input: JSON.stringify(first ? { path: readPath } : { items }),
         },
         {
           type: "finish",
@@ -67,7 +72,13 @@ async function fixture(empty = false) {
   const meta = new MemoryMetaService(root);
   const memoryService = new MemoryService(hostConfig, meta);
   const controller = new AbortController();
-  const createModel = mock((_modelString: string) => Promise.resolve({ model: reportingModel() }));
+  const createModel = mock((_modelString: string) =>
+    Promise.resolve({
+      model: reportingModel(),
+      optionsModelString: "openai:intuition-model",
+      optionsProvidersConfig: null,
+    })
+  );
   const resolveAgentBody = mock(() =>
     Promise.resolve("Read memories and report relevant evidence.")
   );
@@ -82,6 +93,7 @@ async function fixture(empty = false) {
     intuitionRuntime: {
       modelString: "openai:intuition-model",
       maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
+      usesThisTurn: 0,
       createModel,
       resolveAgentBody,
       abortSignal: controller.signal,
@@ -136,9 +148,103 @@ describe("intuition tool", () => {
     });
   });
 
+  it("passes creation-time provider options for required reasoning while keeping ordinary thinking off", async () => {
+    using f = await fixture();
+    const calls: LanguageModelV3CallOptions[] = [];
+    // Raw selection is a private alias, not the wire identity pinned by the factory.
+    f.config.intuitionRuntime.modelString = "coder:private/recall";
+    f.createModel.mockImplementation(() =>
+      Promise.resolve({
+        model: reportingModel([], (options) => calls.push(options)),
+        optionsModelString: "openrouter:moonshotai/kimi-k3",
+        optionsProvidersConfig: null,
+      })
+    );
+    await execute(createIntuitionTool(f.config));
+    expect(calls[0].providerOptions).toMatchObject({
+      openrouter: { reasoning: { effort: "max" } },
+    });
+    calls.length = 0;
+    f.createModel.mockImplementation(() =>
+      Promise.resolve({
+        model: reportingModel([], (options) => calls.push(options)),
+        optionsModelString: "openrouter:moonshotai/kimi-k2.5",
+        optionsProvidersConfig: null,
+      })
+    );
+    await execute(createIntuitionTool(f.config));
+    expect(calls[0].providerOptions?.openrouter).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    "honors path-specific shell hooks for nested reads and verification-only reports (read denied path: %s)",
+    async (readDeniedPath) => {
+      using f = await fixture();
+      const hooksDir = path.join(f.config.cwd, ".xum");
+      await fs.mkdir(hooksDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hooksDir, "tool_pre"),
+        `#!/bin/bash
+if [ "$XUM_TOOL" = memory ] && [ "$XUM_TOOL_INPUT_COMMAND" = view ]; then
+  printf 'pre:%s\n' "$XUM_TOOL_INPUT_FILE_PATH" >> "$PWD/hook-audit"
+  if [ "$XUM_TOOL_INPUT_FILE_PATH" = "${rememberedPath}" ]; then
+    echo 'private memory denied'
+    exit 1
+  fi
+fi
+`,
+        { mode: 0o755 }
+      );
+      await fs.writeFile(
+        path.join(hooksDir, "tool_post"),
+        `#!/bin/bash
+if [ "$XUM_TOOL" = memory ]; then
+  printf 'post:%s\n' "$XUM_TOOL_INPUT_FILE_PATH" >> "$PWD/hook-audit"
+  echo 'scan audited'
+fi
+`,
+        { mode: 0o755 }
+      );
+      const prompts: string[] = [];
+      f.createModel.mockImplementation(() =>
+        Promise.resolve({
+          model: reportingModel(
+            [memory, candidate],
+            (options) => prompts.push(JSON.stringify(options.prompt)),
+            readDeniedPath ? rememberedPath : candidatePath
+          ),
+          optionsModelString: "openai:intuition-model",
+          optionsProvidersConfig: null,
+        })
+      );
+      const reads = spyOn(f.memoryService, "readFileWithSha");
+      const result = await execute(createIntuitionTool({ ...f.config, trusted: true }));
+      expect(result.kind).toBe("uncertain");
+      expect(reads.mock.calls.map((call) => call[1])).toEqual(
+        readDeniedPath ? [] : [candidatePath]
+      );
+      expect(prompts[1]).not.toContain(memory.excerpt);
+      expect(prompts[1]).toContain(
+        readDeniedPath ? "private memory denied" : "Check the write path."
+      );
+      if (!readDeniedPath) expect(prompts[1]).toContain("scan audited");
+      expect((await f.meta.getEntries()).size).toBe(0);
+      const audit = await fs.readFile(path.join(f.config.cwd, "hook-audit"), "utf8");
+      expect(audit).toContain(`pre:${rememberedPath}`);
+      expect(audit).not.toContain(`post:${rememberedPath}`);
+      if (!readDeniedPath) expect(audit).toContain(`post:${candidatePath}`);
+    }
+  );
+
   it("leaves candidate scans out of recall metadata", async () => {
     using f = await fixture();
-    f.createModel.mockImplementation(() => Promise.resolve({ model: reportingModel([candidate]) }));
+    f.createModel.mockImplementation(() =>
+      Promise.resolve({
+        model: reportingModel([candidate]),
+        optionsModelString: "openai:intuition-model",
+        optionsProvidersConfig: null,
+      })
+    );
     expect(await execute(createIntuitionTool(f.config))).toMatchObject({
       kind: "uncertain",
       candidates: [{ path: candidatePath }],
@@ -183,8 +289,11 @@ describe("intuition tool", () => {
   it("reserves concurrent uses before awaiting and resets the cap for a new turn", async () => {
     using f = await fixture(true);
     const tool = createIntuitionTool(f.config);
+    const retryTool = createIntuitionTool(f.config);
     const results = await Promise.all(
-      Array.from({ length: MEMORY_INTUITION_MAX_USES_PER_TURN + 1 }, () => execute(tool))
+      Array.from({ length: MEMORY_INTUITION_MAX_USES_PER_TURN + 1 }, (_, i) =>
+        execute(i % 2 ? retryTool : tool)
+      )
     );
     expect(results.map((r) => r.kind)).toEqual([
       "uncertain",
@@ -192,7 +301,12 @@ describe("intuition tool", () => {
       "uncertain",
       "limit_reached",
     ]);
-    expect((await execute(createIntuitionTool(f.config))).kind).toBe("uncertain");
+    expect((await execute(createIntuitionTool(f.config))).kind).toBe("limit_reached");
+    const nextTurn = {
+      ...f.config,
+      intuitionRuntime: { ...f.config.intuitionRuntime, usesThisTurn: 0 },
+    };
+    expect((await execute(createIntuitionTool(nextTurn))).kind).toBe("uncertain");
   });
 
   it("preserves verified recall when usage reporting throws", async () => {

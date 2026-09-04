@@ -1703,6 +1703,49 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   }
 
+  it("pins intuition to the resolved parent selection when no intuition override exists", async () => {
+    using xumHome = new DisposableTempDir("ai-intuition-selected-route");
+    const metadata = createLocalWorkspaceMetadata("intuition-selected-route", xumHome.path);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+    );
+    const harness = createHarness(xumHome.path, metadata, { experimentsService });
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const selected = "private:exec-global";
+    await harness.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { exec: { modelString: selected } };
+      cfg.projects.set(metadata.projectPath, {
+        workspaces: [
+          {
+            path: metadata.projectPath,
+            id: metadata.id,
+            agentId: "exec",
+            aiSettingsByAgent: { plan: { model: "openai:stale-plan", thinkingLevel: "off" } },
+          },
+        ],
+      });
+      return cfg;
+    });
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "hello")],
+      workspaceId: metadata.id,
+      modelString: selected,
+      thinkingLevel: "off",
+      experiments: { memory: true },
+    });
+    expect(result.success).toBe(true);
+    expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
+      selected
+    );
+  });
+
   for (const denied of ["memory", "intuition"]) {
     it(`strips intuition and its guidance when policy denies ${denied}`, async () => {
       using xumHome = new DisposableTempDir("ai-intuition-policy");
@@ -2446,7 +2489,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const runtime =
         toolName === "advisor" ? toolConfig.advisorRuntime : toolConfig.intuitionRuntime;
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
+      const createModel = spyOn(harness.service, "createModel");
       await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      expect(createModel.mock.calls.at(-1)?.[2]).toMatchObject({
+        agentInitiated: true,
+        workspaceId,
+      });
       // A live config refresh must not change the already-created model's billing mode.
       new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
         openai: { apiKey: "new-direct-key" },

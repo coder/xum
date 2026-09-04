@@ -20,6 +20,7 @@
 
 import assert from "node:assert";
 import type { Tool } from "ai";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WithHookOutput, MayHaveHookOutput } from "@/common/types/tools";
@@ -49,6 +50,35 @@ export interface HookConfig {
   workspaceId: string;
   /** Additional environment variables to pass to hooks */
   env?: Record<string, string>;
+}
+
+/**
+ * Derive the hook config every hook-wrapped tool runs with, or null when
+ * hooks must not run. Host-side reads (mux.load and intuition) share this
+ * trust gate with public tools: repo-controlled hooks run only for trusted projects.
+ */
+export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
+  // Skip hooks for untrusted projects — repo-controlled scripts must not run
+  if (config.trusted !== true) {
+    return null;
+  }
+
+  // Hooks require workspaceId, cwd, and runtime
+  if (!config.workspaceId || !config.cwd || !config.runtime) {
+    return null;
+  }
+
+  return {
+    runtime: config.runtime,
+    cwd: config.cwd,
+    runtimeTempDir: config.runtimeTempDir,
+    workspaceId: config.workspaceId,
+    // Match bash tool behavior: xumEnv is present and secrets override it.
+    env: {
+      ...(config.xumEnv ?? {}),
+      ...(config.secrets ?? {}),
+    },
+  };
 }
 
 const HOOK_OUTPUT_MAX_CHARS = 64 * 1024;

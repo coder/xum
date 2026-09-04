@@ -1537,6 +1537,40 @@ describe("MemoryConsolidationService", () => {
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("openai:dream-only");
   });
 
+  it.each([false, true])(
+    "pins the resolved selected agent route ahead of stale buckets (Plan bucket: %s)",
+    async (stalePlan) => {
+      using fixture = await createFixture();
+      const selected = "private:exec-global";
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get("/projects/demo")!.workspaces[0];
+        workspace.agentId = "exec";
+        workspace.aiSettingsByAgent = stalePlan
+          ? { plan: { model: "openai:stale-plan", thinkingLevel: "off" } }
+          : {};
+        delete workspace.aiSettings;
+        cfg.agentAiDefaults = { exec: { modelString: selected } };
+        return cfg;
+      });
+      const resolve = () =>
+        resolveHeadlessAgentModelString(fixture.config, "ws-dream", "intuition", selected);
+      expect(resolve()).toBe(selected);
+      await fixture.config.editConfig((cfg) => {
+        cfg.agentAiDefaults!.intuition = { modelString: "openai:intuition-global" };
+        return cfg;
+      });
+      expect(resolve()).toBe("openai:intuition-global");
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent!.intuition = {
+          model: "private:intuition-workspace",
+          thinkingLevel: "off",
+        };
+        return cfg;
+      });
+      expect(resolve()).toBe("private:intuition-workspace");
+    }
+  );
+
   it("resolves intuition global body overrides without changing dream or accepting traversal", async () => {
     using fixture = await createFixture();
     const builtin = await resolveHeadlessAgentBody(fixture.xumHome, "intuition");

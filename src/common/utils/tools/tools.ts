@@ -62,7 +62,7 @@ import { createWorkflowRunTool } from "@/node/services/tools/workflow_run";
 import { createWorkflowResumeTool } from "@/node/services/tools/workflow_resume";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
 import { wrapWithInitWait } from "@/node/services/tools/wrapWithInitWait";
-import { withHooks, type HookConfig } from "@/node/services/tools/withHooks";
+import { deriveToolHookConfig, withHooks } from "@/node/services/tools/withHooks";
 import { log } from "@/node/services/log";
 import { attachModelOnlyToolNotifications } from "@/common/utils/tools/internalToolResultFields";
 import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
@@ -321,7 +321,9 @@ export interface ToolConfiguration {
   intuitionRuntime?: {
     modelString: string;
     maxUsesPerTurn: number;
-    createModel: (modelString: string) => Promise<{ model: LanguageModel }>;
+    /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
+    usesThisTurn: number;
+    createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
     resolveAgentBody: () => Promise<string | null>;
     abortSignal: AbortSignal;
   };
@@ -493,36 +495,7 @@ function wrapToolsWithModelOnlyNotifications(
   return wrappedTools;
 }
 
-/**
- * Derive the hook config every hook-wrapped tool runs with, or null when
- * hooks must not run. Shared with the kernel file loader (mux.load) so the
- * bulk-ingestion path can never drift from the tool trust gate: hooks are
- * repo-controlled scripts, so they run only for trusted projects, and mux.load
- * must be hook-gated exactly when file_read is.
- */
-export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
-  // Skip hooks for untrusted projects — repo-controlled scripts must not run
-  if (config.trusted !== true) {
-    return null;
-  }
-
-  // Hooks require workspaceId, cwd, and runtime
-  if (!config.workspaceId || !config.cwd || !config.runtime) {
-    return null;
-  }
-
-  return {
-    runtime: config.runtime,
-    cwd: config.cwd,
-    runtimeTempDir: config.runtimeTempDir,
-    workspaceId: config.workspaceId,
-    // Match bash tool behavior: xumEnv is present and secrets override it.
-    env: {
-      ...(config.xumEnv ?? {}),
-      ...(config.secrets ?? {}),
-    },
-  };
-}
+export { deriveToolHookConfig } from "@/node/services/tools/withHooks";
 
 /**
  * Wrap tools with hook support.

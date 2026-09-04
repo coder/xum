@@ -7,6 +7,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { runMemoryIntuition } from "@/node/services/memoryIntuition";
 import { memoryScopeContextFromToolConfig } from "./memory";
+import { deriveToolHookConfig } from "./withHooks";
 
 export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
   const runtime = config.intuitionRuntime;
@@ -19,8 +20,12 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
     Number.isSafeInteger(runtime.maxUsesPerTurn) && runtime.maxUsesPerTurn > 0,
     "intuition maxUsesPerTurn must be a positive integer"
   );
+  assert(
+    Number.isSafeInteger(runtime.usesThisTurn) && runtime.usesThisTurn >= 0,
+    "intuition usesThisTurn must be a non-negative integer"
+  );
   const ctx = memoryScopeContextFromToolConfig(config);
-  let usesThisTurn = 0;
+  const hooks = deriveToolHookConfig(config) ?? undefined;
 
   return tool({
     description: TOOL_DEFINITIONS.intuition.description,
@@ -35,17 +40,18 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
         message: "Intuition request cancelled.",
       });
       if (signal.aborted) return cancelled();
-      if (usesThisTurn >= runtime.maxUsesPerTurn) {
+      if (runtime.usesThisTurn >= runtime.maxUsesPerTurn) {
         return {
           kind: "limit_reached",
           message: `Intuition limit reached for this turn (max ${runtime.maxUsesPerTurn} uses).`,
         };
       }
       // Reserve before awaiting so parallel calls cannot bypass the per-turn cap.
-      usesThisTurn++;
+      runtime.usesThisTurn++;
       try {
         const result = await runMemoryIntuition({
-          createModel: async () => (await runtime.createModel(model)).model,
+          createModel: () => runtime.createModel(model),
+          hooks,
           resolveAgentBody: () => runtime.resolveAgentBody(),
           modelString: model,
           memoryService,

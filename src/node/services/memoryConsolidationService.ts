@@ -120,12 +120,15 @@ interface ModelFactoryLike {
 /**
  * Resolve a headless agent model — the inherit cascade from PRD #3534
  * (uniform with other agents): per-workspace agent override → global agent
- * default → workspace session model → app default. Shared with the debug CLI.
+ * default → pinned selected model (or legacy workspace session fallback) → app
+ * default. Interactive callers supply their fully resolved model so unrelated
+ * agent buckets cannot change the route. Shared with the debug CLI.
  */
 export function resolveHeadlessAgentModelString(
   config: Config,
   workspaceId: string,
-  agentId: string
+  agentId: string,
+  selectedModel?: string
 ): string {
   const cfg = config.loadConfigOrDefault();
   const workspace = config.findWorkspace(workspaceId);
@@ -143,7 +146,14 @@ export function resolveHeadlessAgentModelString(
   // ship transcript-derived content off-route. Same candidate derivation as
   // branch summaries: selected agent's model, other per-agent models, then
   // the legacy model as a compatibility fallback.
-  const fallbackModels = workspaceEntry ? deriveSideChannelModelCandidates(workspaceEntry) : [];
+  // Interactive headless tools pin the already-resolved parent route, including
+  // global agent defaults. Other buckets may be stale or belong to another provider.
+  // Legacy callers (dream) retain their existing session fallback.
+  const fallbackModels = selectedModel
+    ? [selectedModel]
+    : workspaceEntry
+      ? deriveSideChannelModelCandidates(workspaceEntry)
+      : [];
   return resolveAgentAiSettings({
     targetAgentId: agentId,
     profile: "interactive",
