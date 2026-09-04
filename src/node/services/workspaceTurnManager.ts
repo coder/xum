@@ -4873,7 +4873,8 @@ export class WorkspaceTurnManager {
                 taskId,
                 normalized.handleId,
                 normalized.status,
-                true
+                true,
+                task.taskExecutionId
               )
             );
           } catch (error) {
@@ -4939,7 +4940,8 @@ export class WorkspaceTurnManager {
     workspaceId: string,
     handleId: string,
     status: WorkspaceTurnTaskStatus | null,
-    allowNewExecution = false
+    allowNewExecution = false,
+    reconciledPreviousExecutionId?: string
   ): Promise<boolean> {
     // editWorkspaceEntry reports `updated` for a mere existing workspace, so a queued/stale
     // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
@@ -4970,7 +4972,11 @@ export class WorkspaceTurnManager {
               return;
             if (
               workspace.taskExecutionId !== handleId &&
-              isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus)
+              isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus) &&
+              // Startup's timestamp-selected successor may replace the pointer it actually read,
+              // but never a different continuation published while reconciliation was suspended.
+              (reconciledPreviousExecutionId == null ||
+                workspace.taskExecutionId !== reconciledPreviousExecutionId)
             )
               return;
           }

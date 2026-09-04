@@ -24359,52 +24359,55 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("running");
   });
 
-  test("initialize prefers a newer unreferenced execution over a stale child pointer", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    const childTaskId = "child-newer-execution";
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push(
-        projectWorkspace(projectPath, "child-newer", childTaskId, {
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "reported",
-          reportedAt: "2026-08-10T00:00:00.000Z",
-          title: "React lifecycle expert",
-          taskExecutionId: "wst_old",
-          taskExecutionStatus: "completed",
+  test.each(["completed", "running"] as const)(
+    "initialize prefers a newer unreferenced execution over a stale %s child pointer",
+    async (previousStatus) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const childTaskId = "child-newer-execution";
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push(
+          projectWorkspace(projectPath, "child-newer", childTaskId, {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "reported",
+            reportedAt: "2026-08-10T00:00:00.000Z",
+            title: "React lifecycle expert",
+            taskExecutionId: "wst_old",
+            taskExecutionStatus: previousStatus,
+          })
+        );
+        return cfg;
+      });
+      const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
+      const { aiService } = createAIServiceMocks(config, { isStreaming });
+      const { taskService } = createTaskServiceHarness(config, { aiService });
+      const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
+        .taskHandleStore;
+      await taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, childTaskId, "wst_old", previousStatus, {
+          turnId: "turn-old",
+          createdAt: "2026-08-10T00:00:01.000Z",
+          updatedAt: "2026-08-10T00:00:02.000Z",
         })
       );
-      return cfg;
-    });
-    const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
-    const { aiService } = createAIServiceMocks(config, { isStreaming });
-    const { taskService } = createTaskServiceHarness(config, { aiService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, childTaskId, "wst_old", "completed", {
-        turnId: "turn-old",
-        createdAt: "2026-08-10T00:00:01.000Z",
-        updatedAt: "2026-08-10T00:00:02.000Z",
-      })
-    );
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, childTaskId, "wst_new", "running", {
-        turnId: "turn-new",
-        createdAt: "2026-08-10T00:00:03.000Z",
-        updatedAt: "2026-08-10T00:00:04.000Z",
-      })
-    );
+      await taskHandleStore.upsertWorkspaceTurn(
+        workspaceTurnRecord(parentId, childTaskId, "wst_new", "running", {
+          turnId: "turn-new",
+          createdAt: "2026-08-10T00:00:03.000Z",
+          updatedAt: "2026-08-10T00:00:04.000Z",
+        })
+      );
 
-    await taskService.initialize();
+      await taskService.initialize();
 
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toBe("wst_new");
-    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("running");
-  });
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toBe("wst_new");
+      expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionStatus).toBe("running");
+    }
+  );
 
   test("initialize ignores parseable non-ISO timestamps when selecting the latest handle", async () => {
     const config = await createTestConfig(rootDir);
