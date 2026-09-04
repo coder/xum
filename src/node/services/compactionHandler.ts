@@ -1110,6 +1110,7 @@ export class CompactionHandler {
     systemMessageTokens: number;
     attachmentTokens: number;
     pendingFollowUp?: CompactionFollowUpRequest;
+    shouldPersist: (messages: MuxMessage[]) => boolean;
   }): Promise<boolean> {
     assert(params.text.trim().length > 0, "Continuous compaction requires a summary");
     const boundary = createMuxMessage(
@@ -1156,7 +1157,8 @@ export class CompactionHandler {
       this.workspaceId,
       boundary,
       copies,
-      false
+      false,
+      params.shouldPersist
     );
     if (!result.success) {
       log.warn("[continuous-compaction] persist failed", result.error);

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import assert from "@/common/utils/assert";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
-import { EAGER_LEAD_PERCENT, MIN_HEAD_TOKENS } from "@/constants/continuousCompaction";
+import { EAGER_LEAD_PERCENT } from "@/constants/continuousCompaction";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
@@ -9,7 +9,10 @@ import {
 } from "@/common/types/message";
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
-import { isDurableContextBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
+import {
+  isDurableContextBoundaryMarker,
+  sliceMessagesFromLatestCompactionBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
@@ -29,6 +32,7 @@ interface StreamSnapshot {
   messageId: string;
   parts: MuxMessage["parts"];
   stepStartIndices: readonly number[];
+  currentStepStartIndex: number;
 }
 interface Dependencies {
   workspaceId: string;
@@ -159,10 +163,11 @@ export class ContinuousCompactor {
     usagePercent: number,
     context: ContinuousCompactionContext & { phase: Phase }
   ): Promise<Verdict> {
+    const generation = this.generation;
     if (usagePercent >= context.thresholdPercent && this.staged) {
       const staged = this.staged;
       const rows = await this.readSnapshot();
-      if (rows && this.isValid(staged, rows)) {
+      if (rows && this.isValid(staged, rows) && this.wouldFit(staged, rows, context)) {
         const applied =
           context.phase === "mid-stream"
             ? await this.deps.fastApply((pendingFollowUp) =>
@@ -173,6 +178,7 @@ export class ContinuousCompactor {
       }
       if (this.staged === staged) this.staged = null;
     }
+    if (generation !== this.generation) return "none";
     if (
       usagePercent >= Math.max(0, context.thresholdPercent - EAGER_LEAD_PERCENT) &&
       !this.staged &&
@@ -226,7 +232,7 @@ export class ContinuousCompactor {
     if (!rows || job.generation !== this.generation) return;
     const live = this.deps.streamManager.getStreamInfo(this.deps.workspaceId);
     if (live) {
-      const completedEnd = live.stepStartIndices.at(-1) ?? 0;
+      const completedEnd = live.currentStepStartIndex;
       // Until one exact completed step exists there is no safe mandatory tail.
       if (completedEnd === 0) return;
       const index = rows.findIndex((row) => row.id === live.messageId);
@@ -235,11 +241,9 @@ export class ContinuousCompactor {
     }
     const cut = selectRollingCut(rows, live ?? null, {
       contextWindowTokens: context.contextWindowTokens,
-      // Reserve the minimum head budget for the as-yet-unknown summary. Actual
-      // summary + current tail are checked again immediately before applying.
-      summaryTokens:
-        (context.systemMessageTokens ?? 0) +
-        Math.min(MIN_HEAD_TOKENS, context.contextWindowTokens * 0.1),
+      // Before the model call only the system/attachment cost is known. Reject
+      // provably oversized tails now, then check the actual summary before staging.
+      summaryTokens: context.systemMessageTokens ?? 0,
       attachmentTokens: context.attachmentTokens ?? 0,
       forceThresholdTokens:
         (context.contextWindowTokens *
@@ -262,7 +266,9 @@ export class ContinuousCompactor {
     const summary = await this.deps.summarize(cut.head, job.abort.signal, context);
     if (!summary || job.generation !== this.generation || job.abort.signal.aborted) return;
     assert(summary.text.trim().length > 0, "Continuous summarizer returned empty text");
-    this.staged = { ...stagedBase, ...summary };
+    const staged = { ...stagedBase, ...summary };
+    if (!this.wouldFit(staged, rows, context)) return;
+    this.staged = staged;
     log.debug("[continuous-compaction] staged", {
       workspaceId: this.deps.workspaceId,
       headTokens: cut.headTokens,
@@ -278,10 +284,13 @@ export class ContinuousCompactor {
     if (end < 0) return null;
     const head = rows.slice(0, end + 1);
     if (staged.cut.stepCut) {
-      const row = head[end];
-      const partIndex = staged.cut.stepCut.partIndex;
-      if (row.id !== staged.cut.stepCut.messageId || row.parts.length < partIndex) return null;
-      head[end] = { ...row, parts: row.parts.slice(0, partIndex) };
+      const { messageId, partIndex } = staged.cut.stepCut;
+      const row = rows.find((message) => message.id === messageId);
+      if (!row || row.parts.length < partIndex) return null;
+      if (partIndex > 0) {
+        if (head[end].id !== messageId) return null;
+        head[end] = { ...row, parts: row.parts.slice(0, partIndex) };
+      }
     }
     return head;
   }
@@ -318,6 +327,27 @@ export class ContinuousCompactor {
     });
   }
 
+  private wouldFit(
+    staged: StagedSummary,
+    rows: MuxMessage[],
+    context: ContinuousCompactionContext
+  ): boolean {
+    const tail = this.materializeTail(staged, rows);
+    const summaryTokens = estimateMuxMessageTokens(
+      createMuxMessage("estimate", "assistant", staged.text)
+    );
+    const tokens =
+      summaryTokens +
+      (context.systemMessageTokens ?? 0) +
+      (context.attachmentTokens ?? 0) +
+      tail.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
+    return (
+      tokens <
+      (context.contextWindowTokens * (context.thresholdPercent + FORCE_COMPACTION_BUFFER_PERCENT)) /
+        100
+    );
+  }
+
   private async applyDurably(
     staged: StagedSummary,
     context: ContinuousCompactionContext,
@@ -342,22 +372,19 @@ export class ContinuousCompactor {
     const partial = await this.deps.historyService.readPartial(this.deps.workspaceId);
     assert(!partial, "Continuous apply requires the partial to be committed first");
     if (staged.generation !== this.generation) return false;
+    if (!this.wouldFit(staged, rows, context)) return false;
     const tail = this.materializeTail(staged, rows);
-    const summaryTokens = estimateMuxMessageTokens(
-      createMuxMessage("estimate", "assistant", staged.text)
-    );
-    const inputTokens =
-      summaryTokens +
-      (context.systemMessageTokens ?? 0) +
-      (context.attachmentTokens ?? 0) +
-      tail.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
-    if (
-      inputTokens >=
-      (context.contextWindowTokens * (context.thresholdPercent + FORCE_COMPACTION_BUFFER_PERCENT)) /
-        100
-    )
-      return false;
+    const snapshotFingerprint = fingerprint(rows);
     const applied = await this.deps.compactionHandler.persistContinuousCompaction({
+      shouldPersist: (currentRows) => {
+        const current = sliceMessagesFromLatestCompactionBoundary(currentRows);
+        return (
+          staged.generation === this.generation &&
+          !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
+          this.isValid(staged, current) &&
+          fingerprint(current) === snapshotFingerprint
+        );
+      },
       messages: rows,
       text: staged.text,
       model: staged.model,

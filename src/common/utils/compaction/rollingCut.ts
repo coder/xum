@@ -173,6 +173,13 @@ export function selectRollingCut(
     // No completed step with an exact start: wait rather than drop the live turn.
     return null;
   }
+  if (
+    mandatory !== null &&
+    budget.summaryTokens + budget.attachmentTokens + mandatory.tailTokens >=
+      budget.forceThresholdTokens
+  ) {
+    return null;
+  }
   if (best !== null) {
     return best;
   }

@@ -2613,13 +2613,10 @@ export class HistoryService {
     workspaceId: string,
     summaryMessage: MuxMessage,
     tailCopies: readonly MuxMessage[],
-    updateExisting: boolean
+    updateExisting: boolean,
+    shouldPersist?: (messages: MuxMessage[]) => boolean
   ): Promise<Result<void>> {
     // Continuous compaction may intentionally keep no tail when no complete turn fits.
-    assert(
-      isDurableContextBoundaryMarker(summaryMessage),
-      "Expected a durable compaction boundary"
-    );
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
@@ -2635,6 +2632,10 @@ export class HistoryService {
           const historyPath = this.getChatHistoryPath(workspaceId);
           const messages = await this.readChatHistory(workspaceId);
 
+          // Rolling summaries are prepared outside this lock. Edits, resets, and
+          // newly appended rows must win over a stale prepared boundary.
+          if (shouldPersist && !shouldPersist(messages)) return Err("Compaction snapshot changed");
+          const sourceMessages = messages.slice();
           let persistedSummary: MuxMessage | undefined;
           if (updateExisting) {
             // Same replace semantics as updateHistory: match by sequence and
@@ -2698,6 +2699,8 @@ export class HistoryService {
             messages.push(copy);
           }
 
+          if (shouldPersist && !shouldPersist(sourceMessages))
+            return Err("Compaction snapshot changed");
           await writeFileAtomic(historyPath, this.serializeHistoryEntries(messages, workspaceId));
 
           // Seal the previous epoch only after boundary + tail are durable.
