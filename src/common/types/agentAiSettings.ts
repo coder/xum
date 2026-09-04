@@ -62,6 +62,7 @@ export type AiSettingTier =
   | "explicit"
   | "workspace"
   | "config-subagent"
+  | "parent-workspace-exec"
   | "config"
   | "definition"
   | "parent-runtime"
@@ -95,6 +96,12 @@ export interface ResolveAgentAiSettingsInput {
   };
   /** Tier 2: the target workspace's per-agent bucket (existing target workspaces only). */
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
+  /**
+   * Calling-workspace Exec context for Exec sub-agents only: below explicit
+   * sub-agent defaults, above global Exec defaults. Not an invocation override
+   * or the active parent runtime model (which may be Plan).
+   */
+  parentWorkspaceExecSettings?: AgentAiSettingsLayerValues;
   /** Tiers 3 and 5: canonical configured defaults map. */
   agentAiDefaults?: AgentAiDefaults;
   /** Tier 4: the target agent's definition frontmatter `ai` block. */

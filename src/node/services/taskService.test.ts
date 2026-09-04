@@ -399,6 +399,7 @@ describe("TaskService", () => {
       taskService as unknown as {
         resolveTaskAISettings: (params: {
           cfg: ReturnType<Config["loadConfigOrDefault"]>;
+          parentWorkspaceId: string;
           parentMeta: Record<string, never>;
           agentId: string;
           modelString?: string;
@@ -412,6 +413,7 @@ describe("TaskService", () => {
     // queued follow-ups and plan→exec continuations to direct OpenAI.
     const gateway = await resolver({
       cfg: config.loadConfigOrDefault(),
+      parentWorkspaceId: "missing-parent",
       parentMeta: {},
       agentId: "exec",
       modelString: "coder:openai/claude-sonnet-4-20250514",
@@ -421,6 +423,7 @@ describe("TaskService", () => {
     // Non-gateway strings keep canonical normalization.
     const direct = await resolver({
       cfg: config.loadConfigOrDefault(),
+      parentWorkspaceId: "missing-parent",
       parentMeta: {},
       agentId: "exec",
       modelString: "anthropic:claude-sonnet-4-20250514",
@@ -6431,6 +6434,230 @@ describe("TaskService", () => {
     const childEntry = findWorkspaceInConfig(config, created.data.taskId);
     expect(childEntry?.taskModelString).toBe(resolvedModel);
     expect(childEntry?.taskThinkingLevel).toBe(expectedThinkingLevel);
+  }, 20_000);
+
+  test("exec subagent inherits the calling chat Exec selection while parent is in Plan", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-fable-5-1" } },
+    });
+    await config.editConfig((cfg) => {
+      const parent = cfg.projects.get(projectPath)!.workspaces[0];
+      parent.agentId = "plan";
+      parent.aiSettingsByAgent = {
+        exec: { model: "openai:gpt-6-astra", thinkingLevel: "high" },
+        plan: { model: "openai:gpt-5-pro", thinkingLevel: "medium" },
+      };
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const initStateManager = new RealInitStateManager(config);
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+      initStateManager,
+    });
+    const created = await createAgentTask(taskService, parentId, "inherit saved Exec", {
+      agentType: "exec",
+      parentRuntimeAiSettings: { modelString: "openai:gpt-5-pro", thinkingLevel: "medium" },
+    });
+    assert(created.success);
+    await initStateManager.waitForInit(created.data.taskId);
+    expect(findWorkspaceInConfig(config, created.data.taskId)?.taskModelString).toBe(
+      "openai:gpt-6-astra"
+    );
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "inherit saved Exec",
+      expect.objectContaining({
+        model: "openai:gpt-6-astra",
+        agentId: "exec",
+        thinkingLevel: "high",
+      }),
+      { agentInitiated: true }
+    );
+    const child = findWorkspaceInConfig(config, created.data.taskId);
+    expect(child?.taskModelString).toBe("openai:gpt-6-astra");
+    expect(child?.aiSettings).toEqual({ model: "openai:gpt-6-astra", thinkingLevel: "high" });
+  }, 20_000);
+
+  test.each([
+    { name: "legacy Exec", agentId: " ExEc ", expectedParent: true },
+    { name: "legacy agentType Exec", agentType: "exec", expectedParent: true },
+    { name: "legacy Plan", agentId: "plan", expectedParent: false },
+    { name: "unknown mode", expectedParent: false },
+    {
+      name: "Plan beats stale Exec alias",
+      agentId: "plan",
+      agentType: "exec",
+      expectedParent: false,
+    },
+    {
+      name: "empty identity does not use legacy alias",
+      agentId: "",
+      agentType: "exec",
+      expectedParent: false,
+    },
+    {
+      name: "authentic equal Plan and Exec buckets",
+      agentId: "plan",
+      equalBuckets: true,
+      expectedParent: true,
+    },
+  ])("Exec inheritance provenance: $name", async (scenario) => {
+    const config = await createTestConfig(rootDir);
+    const globalModel = "openai:gpt-5.2";
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: { exec: { modelString: globalModel, thinkingLevel: "medium" } },
+    });
+    await config.editConfig((cfg) => {
+      const parent = cfg.projects.get(projectPath)!.workspaces[0];
+      parent.agentId = scenario.agentId;
+      parent.agentType = scenario.agentType;
+      if (scenario.equalBuckets) {
+        assert(parent.aiSettings);
+        parent.aiSettingsByAgent = { exec: parent.aiSettings, plan: parent.aiSettings };
+      }
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const initStateManager = new RealInitStateManager(config);
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+      initStateManager,
+    });
+    const created = await createAgentTask(taskService, parentId, "check provenance", {
+      agentType: "exec",
+    });
+    assert(created.success);
+    await initStateManager.waitForInit(created.data.taskId);
+    const expected = scenario.expectedParent ? "anthropic:claude-opus-4-6" : globalModel;
+    expect(findWorkspaceInConfig(config, created.data.taskId)?.aiSettings?.model).toBe(expected);
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "check provenance",
+      expect.objectContaining({ model: expected }),
+      { agentInitiated: true }
+    );
+  });
+
+  test("grouped Exec children keep creation-time settings through queueing, reload, and reactivation", async () => {
+    const config = await createTestConfig(rootDir);
+    const model = "openai:gpt-5.2";
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-opus-4-6" } },
+    });
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces[0].aiSettingsByAgent = {
+        exec: { model, thinkingLevel: "high" },
+      };
+      cfg.taskSettings = testTaskSettings(1, 3);
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const initStateManager = new RealInitStateManager(config);
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+      initStateManager,
+    });
+    const created = await taskService.createMany(
+      ["first", "queued"].map((prompt) => ({
+        parentWorkspaceId: parentId,
+        kind: "agent" as const,
+        agentId: "exec",
+        prompt,
+        title: prompt,
+      }))
+    );
+    assert(created.success);
+    const [first, queued] = created.data;
+    expect(created.data.map((child) => child.status)).toEqual(["starting", "queued"]);
+    await waitForWorkspaceTaskStatus(config, first.taskId, "running");
+    await initStateManager.waitForInit(first.taskId);
+    for (const child of created.data) {
+      expect(findWorkspaceInConfig(config, child.taskId)?.taskModelString).toBe(model);
+    }
+    await config.editConfig((cfg) => {
+      const workspaces = cfg.projects.get(projectPath)!.workspaces;
+      workspaces[0].aiSettingsByAgent = {
+        exec: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" },
+      };
+      cfg.agentAiDefaults = { exec: { modelString: "anthropic:claude-haiku-4-5" } };
+      workspaces.find((workspace) => workspace.id === first.taskId)!.taskStatus = "reported";
+      return cfg;
+    });
+    const reloaded = createTaskServiceHarness(config, {
+      workspaceService,
+      initStateManager,
+    }).taskService;
+    await reloaded.maybeStartQueuedTasks();
+    await waitForWorkspaceTaskStatus(config, queued.taskId, "running");
+    await initStateManager.waitForInit(queued.taskId);
+    expect(sendMessage).toHaveBeenCalledWith(
+      queued.taskId,
+      "queued",
+      expect.objectContaining({ model, thinkingLevel: "high" }),
+      expect.anything()
+    );
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.find((workspace) => workspace.id === queued.taskId)!.taskStatus = "reported";
+      return cfg;
+    });
+    const reactivated = await reloaded.sendMessageToDescendantAgentTask(
+      parentId,
+      first.taskId,
+      "continue",
+      "tool-end"
+    );
+    expect(reactivated).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+    expect(sendMessage).toHaveBeenLastCalledWith(
+      first.taskId,
+      expect.any(String),
+      expect.objectContaining({ model, thinkingLevel: "high" }),
+      expect.anything()
+    );
+    expect(findWorkspaceInConfig(config, first.taskId)?.aiSettings?.model).toBe(model);
+  }, 20_000);
+
+  test("nested Exec delegation inherits the immediate child rather than the root chat", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-opus-4-6" } },
+    });
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces[0].aiSettingsByAgent = {
+        exec: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+      };
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const initStateManager = new RealInitStateManager(config);
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+      initStateManager,
+    });
+    const child = await createAgentTask(taskService, parentId, "child", {
+      agentType: "exec",
+      modelString: "openai:gpt-5.3-codex",
+    });
+    assert(child.success);
+    await initStateManager.waitForInit(child.data.taskId);
+    const grandchild = await createAgentTask(taskService, child.data.taskId, "grandchild", {
+      agentType: "exec",
+    });
+    assert(grandchild.success);
+    await initStateManager.waitForInit(grandchild.data.taskId);
+    expect(sendMessage).toHaveBeenCalledWith(
+      grandchild.data.taskId,
+      "grandchild",
+      expect.objectContaining({ model: "openai:gpt-5.3-codex" }),
+      { agentInitiated: true }
+    );
+    expect(findWorkspaceInConfig(config, grandchild.data.taskId)?.taskModelString).toBe(
+      "openai:gpt-5.3-codex"
+    );
   }, 20_000);
 
   test("exec subagent uses subagentAiDefaults exec when present", async () => {
@@ -20770,6 +20997,22 @@ describe("TaskService", () => {
 
     expect(updatedTask?.agentId).toBe("exec");
     expect(updatedTask?.taskStatus).toBe("running");
+  });
+
+  test("plan handoff uses the transitioning workspace Exec choice, not its parent", async () => {
+    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+      childAiSettingsByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
+      parentAiSettingsByAgent: { exec: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" } },
+      agentAiDefaults: { exec: { modelString: "anthropic:claude-opus-4-6" } },
+    });
+    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    expect(sendMessage).toHaveBeenCalledWith(
+      childId,
+      expect.any(String),
+      expect.objectContaining({ agentId: "exec", model: "openai:gpt-5.2", thinkingLevel: "high" }),
+      expect.objectContaining({ synthetic: true })
+    );
+    expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe("openai:gpt-5.2");
   });
 
   test("plan handoff preserves a pro mode persisted under the plan agent bucket", async () => {

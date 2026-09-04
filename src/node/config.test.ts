@@ -599,6 +599,70 @@ describe("Config", () => {
     });
   });
 
+  describe("display-only legacy AI settings", () => {
+    it.each([false, true])(
+      "does not persist synthesized buckets (legacy metadata: %s)",
+      async (legacyMetadata) => {
+        const projectPath = path.join(tempDir, "repo");
+        const legacySettings = { model: "openai:gpt-5.2", thinkingLevel: "high" as const };
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                path: projectPath,
+                ...(legacyMetadata ? {} : { id: "legacy-ai", name: "legacy-ai" }),
+                agentId: "plan",
+                aiSettings: legacySettings,
+              },
+            ],
+          });
+          return cfg;
+        });
+        if (legacyMetadata) {
+          const sessionDir = path.join(config.sessionsDir, "repo");
+          fs.mkdirSync(sessionDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(sessionDir, "metadata.json"),
+            JSON.stringify({ id: "legacy-ai", name: "legacy-ai" })
+          );
+        }
+        const metadata = await config.getAllWorkspaceMetadata();
+        expect(metadata[0]?.aiSettingsByAgent).toEqual({
+          exec: legacySettings,
+          plan: legacySettings,
+        });
+        expect(
+          config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].aiSettingsByAgent
+        ).toBeUndefined();
+        expect((await config.getAllWorkspaceMetadata())[0]?.aiSettingsByAgent).toEqual(
+          metadata[0]?.aiSettingsByAgent
+        );
+        expect(
+          config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].aiSettingsByAgent
+        ).toBeUndefined();
+      }
+    );
+
+    it("still migrates genuine per-agent settings from legacy metadata", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      const exec = { model: "openai:gpt-5.2", thinkingLevel: "high" as const };
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [{ path: projectPath }] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "repo");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({ id: "legacy-ai", name: "legacy-ai", aiSettingsByAgent: { exec } })
+      );
+      await config.getAllWorkspaceMetadata();
+      expect(
+        config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].aiSettingsByAgent
+      ).toEqual({ exec });
+    });
+  });
+
   describe("workspace tags", () => {
     it("persists programmatic tags through save/load and metadata mapping", async () => {
       await config.editConfig((cfg) => {
