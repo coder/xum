@@ -358,20 +358,36 @@ fi
     "maps an internal timeout to uncertainty, not cancellation",
     async () => {
       using f = await fixture();
-      f.createModel.mockImplementation(
-        () =>
-          new Promise(() => {
-            /* hung provider setup */
-          })
-      );
-      const result = await execute(createIntuitionTool(f.config));
-      expect(result).toMatchObject({
-        kind: "uncertain",
-        candidates: [],
-        stats: { timedOut: true },
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        started = resolve;
       });
-      expect(result.kind === "uncertain" && typeof result.note === "string").toBe(true);
-      expect((await f.meta.getEntries()).size).toBe(0);
+      f.createModel.mockImplementation(() => {
+        started();
+        return new Promise(() => {
+          /* hung provider setup */
+        });
+      });
+      const timer = spyOn(globalThis, "setTimeout");
+      const pending = execute(createIntuitionTool(f.config));
+      try {
+        await ready;
+        const expire = timer.mock.calls.find(
+          ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+        )?.[0];
+        if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+        expire();
+        const result = await pending;
+        expect(result).toMatchObject({
+          kind: "uncertain",
+          candidates: [],
+          stats: { timedOut: true },
+        });
+        expect(result.kind === "uncertain" && typeof result.note === "string").toBe(true);
+        expect((await f.meta.getEntries()).size).toBe(0);
+      } finally {
+        timer.mockRestore();
+      }
     },
     MEMORY_INTUITION_TIMEOUT_MS + 5000
   );

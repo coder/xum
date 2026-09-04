@@ -41,7 +41,14 @@ async function fixture(files: Record<string, string> = {}) {
   };
   const readFile = async (path: string) => {
     const result = await memoryService.readFileWithSha(ctx, path);
-    return result.success ? { success: true as const, output: result.data.content } : result;
+    return result.success
+      ? {
+          success: true as const,
+          output: result.data.content,
+          rawContent: result.data.content,
+          effectivePath: path,
+        }
+      : result;
   };
   return {
     memoryService,
@@ -407,7 +414,7 @@ describe("runMemoryIntuition", () => {
     ]);
   });
 
-  it.each(["rewrite", "outside", "command", "redact", "blocked", "inflate"])(
+  it.each(["rewrite", "outside", "command", "redact", "blocked", "inflate", "fabricate", "bypass"])(
     "honors memory-view middleware %s without leaking or misattributing evidence",
     async (mode) => {
       using f = await fixture({ "a.md": "alpha secret", "b.md": "hidden\nbravo\nhidden" });
@@ -424,7 +431,12 @@ describe("runMemoryIntuition", () => {
           ctx.blocked = { result: { error: "policy denied" } };
           return;
         }
+        if (mode === "bypass") {
+          ctx.result = { success: true, output: "fabricated" };
+          return;
+        }
         await next();
+        if (mode === "fabricate") ctx.result = { success: true, output: "fabricated" };
         if (mode === "redact") ctx.result = { success: true, output: "redacted" };
         if (mode === "inflate")
           ctx.result = { success: true, output: "x".repeat(MEMORY_INTUITION_MAX_READ_BYTES + 1) };
@@ -433,7 +445,19 @@ describe("runMemoryIntuition", () => {
         const model = scriptedModel(
           [
             [read("a.md")],
-            [report([item("a.md", 0.9, mode === "rewrite" ? "bravo" : "alpha secret")])],
+            [
+              report([
+                item(
+                  "a.md",
+                  0.9,
+                  mode === "rewrite"
+                    ? "bravo"
+                    : ["fabricate", "bypass"].includes(mode)
+                      ? "fabricated"
+                      : "alpha secret"
+                ),
+              ]),
+            ],
           ],
           (options) => prompts.push(JSON.stringify(options.prompt))
         );
@@ -456,12 +480,14 @@ describe("runMemoryIntuition", () => {
           candidates: [{ path: entry("a.md").path }],
         });
         expect(reads.mock.calls.map((call) => call[1])).toEqual(
-          ["outside", "command", "blocked"].includes(mode)
+          ["outside", "command", "blocked", "bypass"].includes(mode)
             ? []
             : [entry(mode === "rewrite" ? "b.md" : "a.md").path]
         );
         expect(prompts[1]).not.toContain("alpha secret");
         expect(prompts[1]).not.toContain("hidden");
+        expect(prompts[1]).not.toContain("rawContent");
+        expect(prompts[1]).not.toContain("effectivePath");
         if (mode === "rewrite") expect(prompts[1]).toContain("bravo");
         if (mode === "redact") expect(prompts[1]).toContain("redacted");
         if (mode === "blocked") expect(prompts[1]).toContain("policy denied");
@@ -726,14 +752,33 @@ describe("runMemoryIntuition", () => {
       });
       const cleanup = mock(cleaned);
       attachLanguageModelCleanup(model, cleanup);
-      const result = await runMemoryIntuition({
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const timer = spyOn(globalThis, "setTimeout");
+      const pending = runMemoryIntuition({
         ...f,
         cue: "alpha",
         modelString: "mock:test",
-        createModel: async () => pinned(await created),
+        createModel: async () => {
+          started();
+          return pinned(await created);
+        },
         resolveAgentBody,
       });
-      expect(result).toMatchObject({ kind: "no_report", stats: { timedOut: true } });
+      try {
+        await ready;
+        // Drive the real deadline callback after setup blocks, without a wall-clock wait.
+        const expire = timer.mock.calls.find(
+          ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+        )?.[0];
+        if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+        expire();
+        expect(await pending).toMatchObject({ kind: "no_report", stats: { timedOut: true } });
+      } finally {
+        timer.mockRestore();
+      }
       expect(resolveAgentBody).not.toHaveBeenCalled();
       release(model);
       await closed;

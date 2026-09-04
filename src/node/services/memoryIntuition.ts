@@ -46,7 +46,8 @@ import { isCustomProviderConfig } from "@/common/utils/providers/customProviders
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { runThroughToolHookPipeline, type HookConfig } from "./tools/withHooks";
 
-type IntuitionReadResult = MemoryToolResult & { effectivePath?: string };
+// Verification evidence stays private; memory_read exposes only the hook-filtered result.
+type IntuitionReadResult = MemoryToolResult & { effectivePath?: string; rawContent?: string };
 type IntuitionModel = Awaited<
   ReturnType<NonNullable<ToolConfiguration["intuitionRuntime"]>["createModel"]>
 >;
@@ -145,9 +146,12 @@ export async function classifyIntuitionReport(args: {
         file = { success: false, error: "Memory unavailable" };
       }
       // Check the FULL excerpt first: truncation must not turn a fabricated suffix into evidence.
+      // Require both views: hook annotations are not memories, and redacted bytes are not evidence.
       if (
         file.success &&
-        (file.effectivePath ?? item.path) === item.path &&
+        file.effectivePath === item.path &&
+        file.rawContent !== undefined &&
+        normalizeWhitespace(file.rawContent).includes(excerpt) &&
         normalizeWhitespace(file.output).includes(excerpt)
       ) {
         memories.push({ ...item, excerpt: excerpt.slice(0, MEMORY_INTUITION_MAX_EXCERPT_CHARS) });
@@ -283,6 +287,7 @@ export async function runMemoryIntuition(args: {
       if (cached) return cached;
       const pending = untilAborted(signal, async (): Promise<IntuitionReadResult> => {
         let effectivePath: string | undefined;
+        let rawContent: string | undefined;
         const execute = async (input: MemoryToolArgs): Promise<MemoryToolResult> => {
           const parsed = TOOL_DEFINITIONS.memory.schema.safeParse(input);
           if (!parsed.success || parsed.data.command !== "view" || !parsed.data.path)
@@ -312,6 +317,7 @@ export async function runMemoryIntuition(args: {
             stats.filesRead++;
             if (!result.success) return result;
             const content = result.data.content;
+            rawContent = content;
             const start = (current.offset ?? 1) - 1;
             const output =
               current.offset == null && current.limit == null
@@ -358,7 +364,7 @@ export async function runMemoryIntuition(args: {
         if (returnedBytes + bytes > MEMORY_INTUITION_MAX_READ_BYTES)
           return { success: false, error: "Memory read budget exhausted" };
         returnedBytes += bytes;
-        return { ...(outcome.result as object), ...parsed.data, effectivePath };
+        return { ...(outcome.result as object), ...parsed.data, effectivePath, rawContent };
       }).catch(() => ({ success: false as const, error: "Memory read failed or aborted" }));
       cache.set(path, pending);
       return pending;
@@ -405,7 +411,10 @@ export async function runMemoryIntuition(args: {
         memory_read: tool({
           description: TOOL_DEFINITIONS.memory_read.description,
           inputSchema: TOOL_DEFINITIONS.memory_read.schema,
-          execute: ({ path }) => readFile(path),
+          execute: async ({ path }) => {
+            const { rawContent: _raw, effectivePath: _path, ...result } = await readFile(path);
+            return result;
+          },
         }),
         intuition_report: tool({
           description: TOOL_DEFINITIONS.intuition_report.description,
