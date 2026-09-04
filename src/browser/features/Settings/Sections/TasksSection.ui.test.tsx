@@ -5,9 +5,11 @@ import { installDom } from "../../../../../tests/ui/dom";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { getThinkingOptionLabel } from "@/common/types/thinking";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 
 let advisorExperimentEnabled = false;
+let experimentValues: Record<string, boolean> = {};
 
 let apiMock: {
   config: {
@@ -32,7 +34,7 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 }));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({
-  useExperimentValue: () => advisorExperimentEnabled,
+  useExperimentValue: (id: string) => experimentValues[id] ?? advisorExperimentEnabled,
 }));
 
 void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
@@ -169,6 +171,7 @@ describe("TasksSection Exec subagent defaults", () => {
   beforeEach(() => {
     restoreDom = installDom();
     advisorExperimentEnabled = false;
+    experimentValues = {};
     apiMock = null;
     selectedWorkspaceMock = null;
   });
@@ -178,6 +181,32 @@ describe("TasksSection Exec subagent defaults", () => {
     apiMock = null;
     restoreDom?.();
     restoreDom = null;
+  });
+
+  test.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])("gates the Intuition card on parent=%s and intuition=%s", async (memory, intuition) => {
+    experimentValues = {
+      [EXPERIMENT_IDS.MEMORY]: memory,
+      [EXPERIMENT_IDS.MEMORY_INTUITION]: intuition,
+    };
+    const view = renderTasksSection({
+      agentAiDefaults: { intuition: { modelString: "openai:gpt-5.6-sol" } },
+    });
+    await view.findByText("Name Workspace");
+    if (!memory || !intuition) {
+      expect(view.queryByText("Intuition")).toBeNull();
+      return;
+    }
+    const card = getAgentCardByName(view, "Intuition");
+    expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
+      "openai:gpt-5.6-sol"
+    );
+    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+    expect(card.querySelector('[data-component="ProModeToggle"]')).toBeNull();
   });
 
   test("renders a distinct Exec subagent row", async () => {
