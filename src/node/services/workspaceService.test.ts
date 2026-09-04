@@ -255,8 +255,60 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ),
       backgroundProcessManager,
     });
-    return { config, service, events, cleanup };
+    return { config, service, events, historyService, cleanup };
   }
+
+  test("delivery recovery reads a wake diverted through on-send compaction", async () => {
+    // The reconciler recovers "already delivered" from the owner's last durable wake row. A
+    // wake that crossed the compaction threshold is durable as the compaction request that
+    // carries it as follow-up, so the reader has to unwrap that row like carriesBashMonitorWake
+    // does — otherwise a restart after a failed acknowledgment re-dispatches the same output.
+    const { service, historyService, cleanup } = await createWakeWiringService();
+    const workspaceId = "compaction-carried-wake-owner";
+    const internal = service as unknown as {
+      readLastBashMonitorWakeRecords(
+        ownerWorkspaceId: string
+      ): Promise<ReadonlyArray<{ processId?: string }> | undefined>;
+    };
+    const wakeRecord = {
+      processId: "proc",
+      wakeUpdatedAt: "2026-08-31T12:00:00.000Z",
+      kind: "match" as const,
+      displayName: "run",
+      filter: "READY",
+      filterExclude: false,
+    };
+    try {
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toBeUndefined();
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-compaction", "user", "Compacting to continue", {
+          timestamp: 1_000,
+          synthetic: true,
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {
+              followUpContent: {
+                text: "Monitor output",
+                model: "openai:gpt-5.2",
+                agentId: "exec",
+                muxMetadata: { type: "bash-monitor-wake", records: [wakeRecord] },
+              },
+            },
+            source: "auto-compaction",
+          },
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("summary", "assistant", "summary", { timestamp: 1_100 })
+      );
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toEqual([wakeRecord]);
+    } finally {
+      await cleanup();
+    }
+  });
 
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
     const { service, events, cleanup } = await createWakeWiringService();

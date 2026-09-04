@@ -445,17 +445,24 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
 }
 
 /**
- * Whether send metadata carries a bash-monitor wake: the wake itself, or an on-send
- * compaction request whose follow-up is the wake (the compaction row is what that turn
- * shows, so the wake identity has to be read through it).
+ * The bash-monitor wake a row or send carries: the wake itself, or — for an on-send compaction
+ * request — the wake nested in the follow-up it carries. The compaction row is what that turn
+ * shows and what stays durable, so wake identity (and the delivered records the reconciler
+ * recovers from after a restart) has to be read through it.
  */
-function carriesBashMonitorWake(muxMetadata: unknown): boolean {
+export function getCarriedBashMonitorWake(
+  muxMetadata: unknown
+): Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }> | undefined {
   const meta = muxMetadata as MuxMessageMetadata | undefined;
-  if (meta?.type === "bash-monitor-wake") return true;
-  if (!isCompactionRequestMetadata(meta)) return false;
+  if (meta?.type === "bash-monitor-wake") return meta;
+  if (!isCompactionRequestMetadata(meta)) return undefined;
   const followUpMetadata =
     meta.parsed.followUpContent?.muxMetadata ?? meta.parsed.continueMessage?.muxMetadata;
-  return followUpMetadata?.type === "bash-monitor-wake";
+  return followUpMetadata?.type === "bash-monitor-wake" ? followUpMetadata : undefined;
+}
+
+function carriesBashMonitorWake(muxMetadata: unknown): boolean {
+  return getCarriedBashMonitorWake(muxMetadata) != null;
 }
 
 /**

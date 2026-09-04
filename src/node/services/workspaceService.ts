@@ -39,6 +39,7 @@ import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
   CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
+  getCarriedBashMonitorWake,
   inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
@@ -12084,8 +12085,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
     if (!tail.success) return undefined;
     for (const message of tail.data.toReversed()) {
-      const muxMetadata = message.metadata?.muxMetadata;
-      if (muxMetadata?.type === "bash-monitor-wake") return muxMetadata.records;
+      // A wake diverted through on-send compaction is durable as the compaction row that
+      // carries it as follow-up; that row is the acknowledgment too.
+      const wake = getCarriedBashMonitorWake(message.metadata?.muxMetadata);
+      if (wake != null) return wake.records;
     }
     return undefined;
   }
