@@ -660,6 +660,29 @@ function zeroTokenUsage(): LanguageModelV2Usage {
   return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 }
 
+/**
+ * Completion-tool success check: completion/routing tools use explicit success/ok markers
+ * (agent_report, propose_plan). When a marker is present, respect it (success:false means the tool
+ * should be retried, so the turn goes on). When no marker is present (MCP tools, arbitrary
+ * required tools), treat non-null object results as successful completion unless error-shaped.
+ */
+function isSuccessfulRequiredToolOutput(output: unknown): boolean {
+  if (typeof output !== "object" || output === null) {
+    return false;
+  }
+  const parsedOutput = output as Record<string, unknown>;
+  if ("success" in parsedOutput) {
+    return parsedOutput.success === true;
+  }
+  if ("ok" in parsedOutput) {
+    return parsedOutput.ok === true;
+  }
+  if (parsedOutput.error != null || parsedOutput.isError === true) {
+    return false;
+  }
+  return true;
+}
+
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
@@ -692,6 +715,11 @@ interface WorkspaceStreamInfo {
   // an abort counts a step the model already began. Reset when the loop restarts under
   // request.stepBudget (restartStepBudget).
   stepCount: number;
+
+  // A required completion tool (request.toolPolicy) succeeded in the step in progress. The
+  // step-end stop condition would end the turn on it, so a queued-message soft stop that lands
+  // first (after a provider-executed tool result) owes the turn no continuation.
+  requiredToolSatisfied?: boolean;
 
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
   // attachment and apply it as soon as the matching dynamic-tool part lands.
@@ -2010,6 +2038,7 @@ export class StreamManager {
         model: streamInfo.model,
         stepsRemaining: this.remainingStepBudget(streamInfo),
         modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
+        ...(streamInfo.requiredToolSatisfied === true ? { requiredToolSatisfied: true } : {}),
       },
       abortReason,
       abandonPartial,
@@ -2228,29 +2257,6 @@ export class StreamManager {
     >
   ): Array<ReturnType<typeof stepCountIs>> {
     const stepBudget = request.stepBudget ?? MAX_STREAM_STEPS;
-    // Completion-tool stop check: completion/routing tools use explicit
-    // success/ok markers (agent_report, propose_plan).
-    // When a marker is present, respect it — success:false means the tool
-    // should be retried, so don't stop. When no marker is present (e.g.,
-    // MCP tools, arbitrary required tools), treat non-null object results
-    // as successful completion unless the result is error-shaped.
-    const isSuccessfulOutput = (output: unknown): boolean => {
-      if (typeof output !== "object" || output === null) {
-        return false;
-      }
-      const parsedOutput = output as Record<string, unknown>;
-      if ("success" in parsedOutput) {
-        return parsedOutput.success === true;
-      }
-      if ("ok" in parsedOutput) {
-        return parsedOutput.ok === true;
-      }
-      if (parsedOutput.error != null || parsedOutput.isError === true) {
-        return false;
-      }
-      return true;
-    };
-
     const requiredPatterns = buildRequiredToolPatterns(request.toolPolicy);
 
     const hasSuccessfulRequiredToolResult: ReturnType<typeof stepCountIs> = ({ steps }) => {
@@ -2262,7 +2268,7 @@ export class StreamManager {
         lastStep?.toolResults?.some(
           (toolResult) =>
             requiredPatterns.some((pattern) => pattern.test(toolResult.toolName)) &&
-            isSuccessfulOutput(toolResult.output)
+            isSuccessfulRequiredToolOutput(toolResult.output)
         ) ?? false
       );
     };
@@ -2684,6 +2690,15 @@ export class StreamManager {
       output,
       providerExecuted
     );
+    if (
+      streamInfo.requiredToolSatisfied !== true &&
+      isSuccessfulRequiredToolOutput(output) &&
+      buildRequiredToolPatterns(streamInfo.request.toolPolicy).some((pattern) =>
+        pattern.test(toolName)
+      )
+    ) {
+      streamInfo.requiredToolSatisfied = true;
+    }
     await this.checkSoftCancelStream(workspaceId, streamInfo);
   }
 
@@ -3527,6 +3542,7 @@ export class StreamManager {
               case "start-step": {
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
                 streamInfo.stepCount += 1;
+                streamInfo.requiredToolSatisfied = false;
                 break;
               }
 

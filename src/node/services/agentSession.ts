@@ -6672,7 +6672,8 @@ export class AgentSession {
         payload.metadata?.model,
         payload.messageId,
         payload.metadata?.stepsRemaining,
-        payload.metadata?.modelFallbackProgress
+        payload.metadata?.modelFallbackProgress,
+        payload.metadata?.requiredToolSatisfied
       );
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
@@ -7739,7 +7740,8 @@ export class AgentSession {
     abortedModelString: string | undefined,
     abortedMessageId: string,
     abortedStepsRemaining: number | undefined,
-    abortedModelFallbackProgress: ModelFallbackProgress | undefined
+    abortedModelFallbackProgress: ModelFallbackProgress | undefined,
+    abortedRequiredToolSatisfied: boolean | undefined
   ): boolean {
     this.queuedProviderToolEndAbortInFlight = false;
     if (!isQueuedProviderToolEndAbort || this.deferQueuedFlushUntilAfterEdit) {
@@ -7749,11 +7751,14 @@ export class AgentSession {
     // The soft stop was made on behalf of the queued message; if that message has been
     // withdrawn (or is withdrawn after dequeue), the interrupted turn must resume instead.
     // Only under the steps the cut stream had left: at zero the ceiling ended the turn, and an
-    // abort that reports no budget must not hand the resume a fresh one.
+    // abort that reports no budget must not hand the resume a fresh one. A successful required
+    // tool in the cut step ended the turn too (the loop's stop condition would have, one tool
+    // result later), as in the loop's own queued-message stop.
     if (
       abortedStreamContext != null &&
       abortedStepsRemaining != null &&
-      abortedStepsRemaining > 0
+      abortedStepsRemaining > 0 &&
+      abortedRequiredToolSatisfied !== true
     ) {
       this.strandedTurnResume = buildStrandedTurnResume({
         ...abortedStreamContext,

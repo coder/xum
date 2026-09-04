@@ -350,6 +350,9 @@ export const StreamAbortEventSchema = z.object({
       // Steps left under the stream's ceiling at the abort; a turn cut for a queued message
       // resumes under this budget rather than a fresh one.
       stepsRemaining: z.number().int().nonnegative().optional(),
+      // A required completion tool succeeded in the interrupted step: the turn was complete, so a
+      // queued-message soft stop owes it no continuation.
+      requiredToolSatisfied: z.boolean().optional(),
       // Fallback chain state at the abort, carried into the resumed stream for the same reason.
       modelFallbackProgress: ModelFallbackProgressSchema.optional(),
     })

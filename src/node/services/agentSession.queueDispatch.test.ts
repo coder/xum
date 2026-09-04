@@ -1079,6 +1079,41 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("a provider-tool soft stop after a successful required tool owes no continuation", async () => {
+    const workspaceId = "queue-dispatch-soft-stop-required-tool";
+    const harness = await createStreamingTurnHarness(workspaceId);
+    const { session, cleanup, aiEmitter, aiService, streamMessage } = harness;
+    const stopStream = spyOn(aiService, "stopStream").mockResolvedValue(Ok(undefined));
+
+    try {
+      // The provider-executed tool that ended the batch was the turn's required completion tool:
+      // the loop would have stopped on it one result later, so the withdrawn wake strands nothing.
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, dedupeKey: "wake:1" }
+      );
+      aiEmitter.emit("tool-call-end", {
+        ...toolCallEndEvent(workspaceId),
+        toolName: "web_search",
+        providerExecuted: true,
+      });
+      expect(stopStream).toHaveBeenCalledTimes(1);
+      expect(session.removeQueuedMessagesByDedupeKeyPrefix("wake:", "superseded")).toBe(1);
+      aiEmitter.emit("stream-abort", {
+        ...streamAbortEvent(workspaceId, "queued-message", 3),
+        metadata: { duration: 1, stepsRemaining: 3, requiredToolSatisfied: true },
+      });
+      expect(await waitForCondition(() => !session.isBusy())).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      stopStream.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("a resumed turn continues the cut stream's fallback chain", async () => {
     const workspaceId = "queue-dispatch-stranded-fallback-chain";
     const harness = await createStreamingTurnHarness(workspaceId);

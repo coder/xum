@@ -2592,6 +2592,7 @@ describe("StreamManager - turn completion", () => {
     createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
     sink?: (event: TurnEngineEvent) => void | Promise<void>;
     events?: TurnEngineEvent[];
+    toolPolicy?: ToolPolicy;
   }) {
     const streamManager = new StreamManager(
       historyService,
@@ -2616,11 +2617,85 @@ describe("StreamManager - turn completion", () => {
         messageId: input.messageId,
         model: createTestLanguageModel(),
         providedRuntimeTempDir: "",
+        toolPolicy: input.toolPolicy,
       })
     );
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected stream to start");
     return { streamManager, handle: result.data };
+  }
+
+  // The soft stop for a queued tool-end message lands right after a provider-executed tool
+  // result, before the loop's step-end stop conditions run; the abort reports whether that step
+  // already completed a required tool so the session knows the turn was over anyway.
+  for (const requiredToolCase of [
+    { requiredTool: "web_search", output: { ok: true }, satisfied: true },
+    { requiredTool: "web_search", output: { ok: false }, satisfied: false },
+    { requiredTool: "agent_report", output: { ok: true }, satisfied: false },
+  ]) {
+    test(`a queued-message soft stop reports a satisfied required tool: ${requiredToolCase.requiredTool} -> ${requiredToolCase.output.ok} is ${requiredToolCase.satisfied}`, async () => {
+      const workspaceId = `soft-stop-required-${requiredToolCase.requiredTool}-${requiredToolCase.output.ok}`;
+      const events: TurnEngineEvent[] = [];
+      const managerRef: { current?: StreamManager } = {};
+      let releaseToolResult!: () => void;
+      const toolResultGate = new Promise<void>((resolve) => {
+        releaseToolResult = resolve;
+      });
+      const started = await startWithStreamResult({
+        workspaceId,
+        messageId: "soft-stop-required-message",
+        toolPolicy: [{ regex_match: requiredToolCase.requiredTool, action: "require" }],
+        sink: (event) => {
+          events.push(event);
+          if (event.type === "tool-call-end") {
+            // AgentSession asks for the soft stop from this event, synchronously.
+            void managerRef.current?.stopStream(workspaceId, {
+              soft: true,
+              abortReason: "queued-message",
+            });
+          }
+        },
+        createStreamResult: (_request, abortController) =>
+          createStreamResultForTests(
+            (async function* () {
+              // Armed before the tool result: the soft stop aborts while that result is handled.
+              const aborted = new Promise<void>((resolve) => {
+                abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+              });
+              yield { type: "start-step" };
+              yield {
+                type: "tool-call",
+                toolCallId: "call-1",
+                toolName: "web_search",
+                input: { query: "x" },
+                providerExecuted: true,
+              };
+              await toolResultGate;
+              yield {
+                type: "tool-result",
+                toolCallId: "call-1",
+                toolName: "web_search",
+                output: requiredToolCase.output,
+                providerExecuted: true,
+              };
+              await aborted;
+            })()
+          ),
+      });
+      managerRef.current = started.streamManager;
+      releaseToolResult();
+
+      expect(await started.handle.completion).toEqual({
+        status: "aborted",
+        abortReason: "queued-message",
+      });
+      const abort = events.find((event) => event.type === "stream-abort");
+      expect(abort?.type).toBe("stream-abort");
+      if (abort?.type !== "stream-abort") throw new Error("Expected a stream-abort event");
+      expect(abort.metadata?.requiredToolSatisfied).toBe(
+        requiredToolCase.satisfied ? true : undefined
+      );
+    });
   }
 
   test("pre-start failures return Err while successful startup owns an aborted completion", async () => {
