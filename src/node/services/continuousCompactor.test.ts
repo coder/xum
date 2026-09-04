@@ -1,3 +1,5 @@
+import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
+import { writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as atomicWrite from "write-file-atomic";
 import { EventEmitter } from "node:events";
@@ -547,10 +549,26 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
   });
 
-  async function seedLiveTurn() {
+  async function seedLiveTurn(committedTail = false) {
+    const earlier = createMuxMessage("committed-tail", "assistant", "", {
+      stepStartPartIndices: [0],
+    });
+    earlier.parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "committed-tool",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "pwd" },
+        output: { success: true },
+      },
+    ];
     await seed(
       createMuxMessage("old-user", "user", "Investigate the regression"),
       createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+      ...(committedTail
+        ? [createMuxMessage("committed-user", "user", "Preserve this earlier task"), earlier]
+        : []),
       createMuxMessage("live-user", "user", "Implement and verify the fix")
     );
     const answer = createMuxMessage("live-answer", "assistant", "", {
@@ -560,7 +578,10 @@ describe("ContinuousCompactor", () => {
       contextUsage: { inputTokens: 70_000, outputTokens: 1_000, totalTokens: 71_000 },
     });
     answer.parts = [
-      { type: "text", text: "completed investigation ".repeat(4_000) },
+      {
+        type: "text",
+        text: committedTail ? "completed small step" : "completed investigation ".repeat(4_000),
+      },
       { type: "text", text: "latest completed step" },
       { type: "text", text: "currently streaming step" },
     ];
@@ -574,6 +595,205 @@ describe("ContinuousCompactor", () => {
     streaming = true;
     return answer;
   }
+
+  async function activateJournaledSwap(committedTail = false) {
+    const answer = await seedLiveTurn(committedTail);
+    assert(live, "Live fixture missing");
+    const toolPart: MuxMessage["parts"][number] = {
+      type: "dynamic-tool",
+      toolCallId: "tail-tool",
+      toolName: "bash",
+      state: "output-available",
+      input: { script: "pwd" },
+      output: { success: true },
+    };
+    live.parts[1] = toolPart;
+    answer.parts[1] = toolPart;
+    let swap: ContinuousPrefixSwap | undefined;
+    let state: "none" | "pending" | "consumed" = "none";
+    const dependencies: Dependencies = {
+      workspaceId,
+      historyService: store.historyService,
+      compactionHandler: handler,
+      streamManager: {
+        getStreamInfo: () => live,
+        isStreaming: () => streaming,
+        setPrefixSwap: (_id, value) => {
+          swap = value;
+          state = "pending";
+          return true;
+        },
+        clearPrefixSwap: () => {
+          state = "none";
+        },
+        getPrefixSwapState: () => (streaming ? state : "none"),
+      },
+      prepare,
+      summarize,
+      fastApply,
+      prepareSwap: () =>
+        Promise.resolve({
+          preparation: {
+            modelString: context.model,
+            providerForMessages: "anthropic",
+            effectiveAgentId: "exec",
+            toolNamesForSentinel: ["bash"],
+            effectiveThinkingLevel: "off",
+          },
+          attachments: [{ type: "read_files_reference", paths: ["kept.txt"] }],
+          systemPrefix: [],
+          cacheEnabled: true,
+        }),
+    };
+    compactor = new ContinuousCompactor(dependencies);
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(
+      await compactor.observe(context.thresholdPercent, { ...context, phase: "mid-stream" })
+    ).toBe("none");
+    assert(swap, "Expected seamless prefix activation");
+    expect(fastApply).not.toHaveBeenCalled();
+    expect((await rows())[0].id).toBe("old-user");
+    const journalStore = store.historyService.getContinuousCompactionJournal(workspaceId);
+    const journal = await journalStore.write(swap.journal, swap.prefix, () => true);
+    assert(journal, "Expected reproducible journal");
+    state = "consumed";
+    return { answer, journal, journalStore, dependencies };
+  }
+
+  it("stays seamless and finalizes a consumed swap despite lowered usage, preserving new parts", async () => {
+    const { answer, journal, journalStore } = await activateJournaledSwap();
+    expect(await compactor.observe(1, { ...context, phase: "mid-stream" })).toBe("none");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    assert(live, "Live fixture missing");
+    answer.parts = [...live.parts, { type: "text", text: "generated after swapping" }];
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    expect(await compactor.observe(forcePercent, { ...context, phase: "mid-stream" })).toBe("none");
+    expect(fastApply).not.toHaveBeenCalled();
+    expect(await compactor.observe(1, context)).toBe("applied");
+    const history = await rows();
+    expect(history[0].id).toBe(journal.boundary.id);
+    expect(history.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+    expect(history.at(-1)?.parts).toEqual(answer.parts.slice(journal.liveTailCopySpec.partIndex));
+    expect(history.at(-1)?.metadata?.usage).toBeUndefined();
+    expect(await journalStore.read()).toBeNull();
+    expect(fastApply).not.toHaveBeenCalled();
+  });
+
+  it("recovers growing crash partials verbatim and retries recovery idempotently after boundary persistence", async () => {
+    const { answer, journal, journalStore, dependencies } = await activateJournaledSwap();
+    assert(live, "Live fixture missing");
+    answer.parts = [...live.parts, { type: "text", text: "crash-time growth" }];
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    expect(await compactor.recover()).toBe(true);
+    const once = await rows();
+    expect(once.at(-1)?.parts).toEqual(answer.parts.slice(journal.liveTailCopySpec.partIndex));
+    expect(once.at(-1)?.metadata?.partial).toBe(true);
+    expect(
+      once[0].metadata?.muxMetadata?.type === "compaction-summary" &&
+        once[0].metadata.muxMetadata.pendingFollowUp
+    ).toBeUndefined();
+    // Simulate the crash window after atomic history persistence but before journal unlink.
+    await writeFile(journalStore.path, JSON.stringify(journal));
+    expect(await compactor.recover()).toBe(true);
+    expect(await rows()).toEqual(once);
+    expect(await journalStore.read()).toBeNull();
+  });
+
+  for (const corruption of [
+    "invalid-json",
+    "wrong-sequence",
+    "edited-head",
+    "missing-row",
+    "abandoned",
+  ] as const) {
+    it(`discards ${corruption} journals without losing source history`, async () => {
+      const { journal, journalStore, dependencies } = await activateJournaledSwap();
+      streaming = false;
+      live = undefined;
+      if (corruption === "invalid-json") await writeFile(journalStore.path, "{");
+      if (corruption === "wrong-sequence")
+        await writeFile(
+          journalStore.path,
+          JSON.stringify({ ...journal, streamHistorySequence: 900 })
+        );
+      if (corruption === "edited-head")
+        await writeFile(
+          journalStore.path,
+          JSON.stringify({ ...journal, headFingerprint: "different" })
+        );
+      if (corruption === "missing-row")
+        await writeFile(
+          journalStore.path,
+          JSON.stringify({
+            ...journal,
+            liveTailCopySpec: { ...journal.liveTailCopySpec, sourceMessageId: "missing" },
+          })
+        );
+      if (corruption === "abandoned") compactor.reset("user-interrupt");
+      compactor = new ContinuousCompactor(dependencies);
+      expect(await compactor.recover()).toBe(false);
+      expect((await rows())[0].id).toBe("old-user");
+      expect(await journalStore.read()).toBeNull();
+    });
+  }
+
+  it("a cut before a committed row preserves every later static row and the entire growing live answer", async () => {
+    const { answer, journal, dependencies } = await activateJournaledSwap(true);
+    expect(journal.liveTailCopySpec.partIndex).toBe(0);
+    expect(journal.firstTailToolCallId).toBe("committed-tool");
+    expect(
+      journal.staticCopies.some((row) =>
+        row.parts.some(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === "committed-tool"
+        )
+      )
+    ).toBe(true);
+    assert(live, "Live fixture missing");
+    answer.parts = [...live.parts, { type: "text", text: "latest work" }];
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    const results = await Promise.all([compactor.recover(), compactor.recover()]);
+    expect(results).toEqual([true, true]);
+    const history = await rows();
+    expect(history.slice(1, -1).map((row) => row.parts)).toEqual(
+      journal.staticCopies.map((row) => row.parts)
+    );
+    expect(history.at(-1)?.parts).toEqual(answer.parts);
+    expect(history.filter((row) => row.metadata?.compactionBoundary)).toHaveLength(1);
+  });
+
+  it("reset during journal apply cannot append a boundary", async () => {
+    const { answer, dependencies } = await activateJournaledSwap();
+    assert(live, "Live fixture missing");
+    answer.parts = live.parts;
+    await store.historyService.writePartial(workspaceId, answer);
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    const entered = deferred();
+    const release = deferred();
+    const original = handler.withContinuousPendingState.bind(handler);
+    spyOn(handler, "withContinuousPendingState").mockImplementation(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return original(...args);
+    });
+    const recovered = compactor.recover();
+    await entered.promise;
+    compactor.reset("edit");
+    release.resolve();
+    expect(await recovered).toBe(false);
+    expect((await rows())[0].id).toBe("old-user");
+  });
 
   it("copies a sliced live tail including post-snapshot fast-stop growth and the pending follow-up", async () => {
     const answer = await seedLiveTurn();

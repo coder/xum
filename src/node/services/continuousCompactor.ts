@@ -1,3 +1,13 @@
+import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
+import type { ModelMessage } from "ai";
+import type { PostCompactionAttachment } from "@/common/types/attachment";
+import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
+import {
+  exactJson,
+  rebuildContinuousPrefix,
+  type ContinuousPrefixSwap,
+} from "./continuousCompactionJournal";
+import { z } from "zod";
 import { createHash } from "node:crypto";
 import assert from "@/common/utils/assert";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
@@ -41,9 +51,19 @@ interface Dependencies {
   streamManager: {
     getStreamInfo(workspaceId: string): StreamSnapshot | undefined;
     isStreaming(workspaceId: string): boolean;
+    setPrefixSwap?(workspaceId: string, swap: ContinuousPrefixSwap): boolean;
+    clearPrefixSwap?(workspaceId: string): void;
+    getPrefixSwapState?(workspaceId: string): "none" | "pending" | "consumed" | "invalidated";
   };
   prepare(): Promise<void>;
   estimateAttachmentTokens?(head: MuxMessage[]): Promise<number>;
+  prepareSwap?(head: MuxMessage[]): Promise<{
+    preparation: ContinuousCompactionJournal["preparation"];
+    systemPrefix: ModelMessage[];
+    requestProviderOptions?: Record<string, unknown>;
+    attachments: PostCompactionAttachment[];
+    cacheEnabled: boolean;
+  } | null>;
   // Includes usage recording: the generation fence must be AFTER the last await.
   summarize(
     head: MuxMessage[],
@@ -111,6 +131,8 @@ export class ContinuousCompactor {
   private staged: StagedSummary | null = null;
   private job: { generation: number; abort: AbortController; done: Promise<void> } | null = null;
   private applying: Promise<Verdict> | null = null;
+  private swapAttempted: StagedSummary | null = null;
+  private swapActive = false;
 
   constructor(private readonly deps: Dependencies) {
     assert(deps.workspaceId.length > 0, "ContinuousCompactor requires a workspace");
@@ -121,6 +143,16 @@ export class ContinuousCompactor {
     this.job?.abort.abort();
     this.job = null;
     this.staged = null;
+    this.swapAttempted = null;
+    this.swapActive = false;
+    this.deps.streamManager.clearPrefixSwap?.(this.deps.workspaceId);
+    // Graceful shutdown retains the write-ahead record for ordinary startup recovery.
+    if (reason !== "shutdown") {
+      this.deps.historyService
+        .getContinuousCompactionJournal(this.deps.workspaceId)
+        .clear()
+        .catch((error: unknown) => log.warn("[continuous-compaction] journal clear failed", error));
+    }
     log.debug("[continuous-compaction] reset", { workspaceId: this.deps.workspaceId, reason });
   }
 
@@ -136,14 +168,15 @@ export class ContinuousCompactor {
     usagePercent: number,
     context: ContinuousCompactionContext & { phase: Phase }
   ): Promise<Verdict> {
-    if (!context.enabled || context.thresholdPercent >= 100) {
+    if ((!context.enabled || context.thresholdPercent >= 100) && !this.swapActive) {
       this.reset("disabled");
       return Promise.resolve("none");
     }
     if (
-      !Number.isFinite(usagePercent) ||
-      !Number.isFinite(context.contextWindowTokens) ||
-      context.contextWindowTokens <= 0
+      !this.swapActive &&
+      (!Number.isFinite(usagePercent) ||
+        !Number.isFinite(context.contextWindowTokens) ||
+        context.contextWindowTokens <= 0)
     ) {
       return Promise.resolve("none");
     }
@@ -166,10 +199,32 @@ export class ContinuousCompactor {
     context: ContinuousCompactionContext & { phase: Phase }
   ): Promise<Verdict> {
     const generation = this.generation;
+    if (this.swapActive) {
+      const state = this.deps.streamManager.getPrefixSwapState?.(this.deps.workspaceId);
+      if (state === "invalidated") {
+        return (await this.deps.fastApply((followUp) => this.finalizeJournal(followUp)))
+          ? "applied"
+          : "none";
+      }
+      if (context.phase !== "mid-stream") {
+        if (await this.finalizeJournal()) return "applied";
+        this.swapActive = false;
+      } else if (state === "pending" || state === "consumed") {
+        return "none";
+      } else if (!this.deps.streamManager.isStreaming(this.deps.workspaceId)) {
+        // The engine can retire its tracker before AgentSession receives stream-end.
+        // Late usage must leave the journal for terminal folding, not initiate a stop.
+        return "none";
+      } else {
+        this.swapActive = false;
+      }
+    }
     if (usagePercent >= context.thresholdPercent && this.staged) {
       const staged = this.staged;
       const rows = await this.readSnapshot();
       if (rows && this.isValid(staged, rows) && this.wouldFit(staged, rows, context)) {
+        if (context.phase === "mid-stream" && (await this.activateSwap(staged, rows, context)))
+          return "none";
         const applied =
           context.phase === "mid-stream"
             ? await this.deps.fastApply((pendingFollowUp) =>
@@ -219,7 +274,11 @@ export class ContinuousCompactor {
     if (live) {
       const index = rows.findIndex((row) => row.id === live.messageId);
       if (index < 0) return null;
-      rows[index] = { ...rows[index], parts: structuredClone(live.parts) };
+      rows[index] = {
+        ...rows[index],
+        parts: structuredClone(live.parts),
+        metadata: { ...rows[index].metadata, stepStartPartIndices: [...live.stepStartIndices] },
+      };
     }
     return rows;
   }
@@ -363,6 +422,231 @@ export class ContinuousCompactor {
       (context.contextWindowTokens * (context.thresholdPercent + FORCE_COMPACTION_BUFFER_PERCENT)) /
         100
     );
+  }
+
+  private async activateSwap(
+    staged: StagedSummary,
+    rows: MuxMessage[],
+    context: ContinuousCompactionContext
+  ): Promise<boolean> {
+    if (
+      this.swapAttempted === staged ||
+      !this.deps.prepareSwap ||
+      !this.deps.streamManager.setPrefixSwap
+    )
+      return false;
+    this.swapAttempted = staged;
+    const live = this.deps.streamManager.getStreamInfo(this.deps.workspaceId);
+    const source = rows.at(-1);
+    if (!live || source?.id !== live.messageId || source.metadata?.historySequence == null)
+      return false;
+    const tail = this.materializeTail(staged, rows);
+    const firstAssistant = tail.findIndex((row) => row.role === "assistant");
+    const first = tail[firstAssistant];
+    // A later tool in another step is not a locator for the beginning of the tail.
+    const firstStepEnd = first?.metadata?.stepStartPartIndices?.[1] ?? first?.parts.length;
+    const tool = first?.parts.slice(0, firstStepEnd).find((part) => part.type === "dynamic-tool");
+    if (!first || first.metadata?.stepStartPartIndices?.[0] !== 0 || tool?.type !== "dynamic-tool")
+      return false;
+    const prepared = await this.deps.prepareSwap(staged.cut.head);
+    if (!prepared || !this.isValid(staged, rows)) return false;
+    const { boundary, copies } = this.deps.compactionHandler.buildContinuousCompactionRows({
+      messages: rows,
+      text: staged.text,
+      model: staged.model,
+      tail,
+      systemMessageTokens: context.systemMessageTokens ?? 0,
+      attachmentTokens: staged.attachmentTokens,
+    });
+    const liveCopy = copies.at(-1);
+    assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");
+    // A live template must never replay costs, boundary/error flags, or stale partial state.
+    for (const copy of copies) {
+      if (copy.metadata) delete copy.metadata.partial;
+    }
+    const partIndex =
+      staged.cut.stepCut?.messageId === live.messageId ? staged.cut.stepCut.partIndex : 0;
+    try {
+      const journal: ContinuousCompactionJournal = {
+        version: 1,
+        boundary,
+        staticCopies: copies.slice(0, -1),
+        liveTailCopySpec: {
+          sourceMessageId: live.messageId,
+          sourceHistorySequence: source.metadata.historySequence,
+          copyId: liveCopy.id,
+          partIndex,
+          metadataTemplate: liveCopy.metadata,
+        },
+        prefixSourceRows: [boundary, ...copies.slice(0, firstAssistant)],
+        systemPrefix: z.array(z.json()).parse(exactJson(prepared.systemPrefix)),
+        cacheEnabled: prepared.cacheEnabled,
+        sourceFingerprint: fingerprint([
+          ...rows.slice(0, -1),
+          { ...source, parts: source.parts.slice(0, partIndex) },
+        ]),
+        postCompactionAttachments: prepared.attachments,
+        preparation: prepared.preparation,
+        requestProviderOptions:
+          prepared.requestProviderOptions == null
+            ? undefined
+            : exactJson(prepared.requestProviderOptions),
+        providerFamily: prepared.preparation.providerForMessages,
+        parentModel: context.model,
+        summaryModel: staged.model,
+        headFingerprint: staged.headFingerprint,
+        headEnd: staged.headEnd,
+        headPartIndex:
+          staged.cut.stepCut && staged.cut.stepCut.partIndex > 0
+            ? staged.cut.stepCut.partIndex
+            : undefined,
+        epoch: staged.epoch,
+        boundarySequence: staged.boundarySequence,
+        streamMessageId: live.messageId,
+        streamHistorySequence: source.metadata.historySequence,
+        stepNumber: 0,
+        firstTailToolCallId: tool.toolCallId,
+      };
+      const prefix = await rebuildContinuousPrefix(journal, this.deps.workspaceId);
+      if (!this.isValid(staged, rows)) return false;
+      this.swapActive = this.deps.streamManager.setPrefixSwap(this.deps.workspaceId, {
+        prefix,
+        firstTailToolCallId: tool.toolCallId,
+        journal,
+      });
+      return this.swapActive;
+    } catch (error) {
+      log.warn("[continuous-compaction] prefix preparation failed", error);
+      return false;
+    }
+  }
+
+  /** Runs before startup retry/send admission; ordinary partial commit precedes journal recovery. */
+  async recover(): Promise<boolean> {
+    if (this.deps.streamManager.isStreaming(this.deps.workspaceId)) return false;
+    if (this.applying) return (await this.applying) === "applied";
+    const generation = this.generation;
+    const applying = Promise.resolve().then(async () => {
+      // Probe without parsing: ordinary partial recovery must precede journal validation.
+      const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
+      if (!(await store.exists()) || generation !== this.generation) return "none" as const;
+      const committed = await this.deps.historyService.commitPartial(this.deps.workspaceId);
+      if (!committed.success || generation !== this.generation) return "none" as const;
+      return (await this.finalizeJournal()) ? ("applied" as const) : ("none" as const);
+    });
+    this.applying = applying;
+    try {
+      return (await applying) === "applied";
+    } finally {
+      if (this.applying === applying) this.applying = null;
+    }
+  }
+
+  private async finalizeJournal(pendingFollowUp?: CompactionFollowUpRequest): Promise<boolean> {
+    const generation = this.generation;
+    const store = this.deps.historyService.getContinuousCompactionJournal(this.deps.workspaceId);
+    const journal = await store.read();
+    if (!journal || generation !== this.generation) return false;
+    assert(!this.deps.streamManager.isStreaming(this.deps.workspaceId), "Cannot fold a live swap");
+    const committed = await this.deps.historyService.commitPartial(this.deps.workspaceId);
+    if (!committed.success) return false;
+    const rows = await this.readSnapshot();
+    if (!rows || generation !== this.generation) return false;
+    const copiesPresent =
+      journal.staticCopies.every((copy) => rows.some((row) => row.id === copy.id)) &&
+      rows.some((row) => row.id === journal.liveTailCopySpec.copyId);
+    if (rows.some((row) => row.id === journal.boundary.id) && copiesPresent) {
+      await store.clear();
+      this.swapActive = false;
+      return true;
+    }
+    const spec = journal.liveTailCopySpec;
+    const source = rows.at(-1);
+    const identity = boundaryIdentity(rows);
+    const headEnd = rows.findIndex(
+      (row) =>
+        row.id === journal.headEnd.id && row.metadata?.historySequence === journal.headEnd.sequence
+    );
+    const head = rows.slice(0, headEnd + 1);
+    if (journal.headPartIndex != null && head.length)
+      head[head.length - 1] = {
+        ...head[head.length - 1],
+        parts: head[head.length - 1].parts.slice(0, journal.headPartIndex),
+      };
+    if (
+      !source ||
+      source.id !== spec.sourceMessageId ||
+      source.metadata?.historySequence !== spec.sourceHistorySequence ||
+      source.parts.length < spec.partIndex ||
+      journal.streamMessageId !== spec.sourceMessageId ||
+      journal.streamHistorySequence !== spec.sourceHistorySequence ||
+      identity.epoch !== journal.epoch ||
+      identity.boundarySequence !== journal.boundarySequence ||
+      headEnd < 0 ||
+      fingerprint(head) !== journal.headFingerprint ||
+      fingerprint([
+        ...rows.slice(0, -1),
+        { ...source, parts: source.parts.slice(0, spec.partIndex) },
+      ]) !== journal.sourceFingerprint
+    ) {
+      log.warn("[continuous-compaction] discarded mismatched journal", {
+        workspaceId: this.deps.workspaceId,
+      });
+      await store.clear();
+      return false;
+    }
+    const snapshot = fingerprint(rows);
+    const liveCopy: MuxMessage = {
+      id: spec.copyId,
+      role: "assistant",
+      parts: source.parts.slice(spec.partIndex),
+      metadata: {
+        ...spec.metadataTemplate,
+        stepStartPartIndices: source.metadata?.stepStartPartIndices
+          ?.filter((index) => index >= spec.partIndex && index < source.parts.length)
+          .map((index) => index - spec.partIndex),
+        // Preserve user-Esc continuation semantics, but not the internal stop's marker.
+        ...(!pendingFollowUp && source.metadata?.partial ? { partial: true } : {}),
+      },
+    };
+    const boundary = structuredClone(journal.boundary);
+    if (pendingFollowUp && boundary.metadata?.muxMetadata?.type === "compaction-summary")
+      boundary.metadata.muxMetadata.pendingFollowUp = pendingFollowUp;
+    const applied = await this.deps.compactionHandler.withContinuousPendingState(
+      head,
+      async () => {
+        if (
+          generation !== this.generation ||
+          this.deps.streamManager.isStreaming(this.deps.workspaceId)
+        )
+          return false;
+        return this.deps.compactionHandler.persistContinuousCompaction({
+          messages: rows,
+          text: boundary.parts
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("\n"),
+          model: journal.summaryModel,
+          tail: [],
+          systemMessageTokens: boundary.metadata?.systemMessageTokens ?? 0,
+          attachmentTokens: injectPostCompactionAttachments(
+            [],
+            journal.postCompactionAttachments
+          ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
+          prepared: { boundary, copies: [...journal.staticCopies, liveCopy] },
+          shouldPersist: (current) =>
+            generation === this.generation &&
+            !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
+            fingerprint(sliceMessagesFromLatestCompactionBoundary(current)) === snapshot,
+        });
+      },
+      boundary.id
+    );
+    if (applied) {
+      await store.clear();
+      this.reset("applied");
+    }
+    return applied;
   }
 
   private async applyDurably(

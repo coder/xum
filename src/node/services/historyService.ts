@@ -2,6 +2,7 @@ import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
 import * as fs from "fs/promises";
+import { ContinuousCompactionJournalStore } from "./continuousCompactionJournal";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
@@ -224,6 +225,20 @@ export class HistoryService {
 
   constructor(config: HistorySessionLocation) {
     this.config = config;
+  }
+
+  private readonly continuousJournals = new Map<string, ContinuousCompactionJournalStore>();
+
+  getContinuousCompactionJournal(workspaceId: string): ContinuousCompactionJournalStore {
+    let journal = this.continuousJournals.get(workspaceId);
+    if (!journal) {
+      journal = new ContinuousCompactionJournalStore(
+        path.join(this.getSessionDir(workspaceId), "continuous-compaction.json"),
+        workspaceId
+      );
+      this.continuousJournals.set(workspaceId, journal);
+    }
+    return journal;
   }
 
   private getSessionDir(workspaceId: string): string {

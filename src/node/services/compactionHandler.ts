@@ -712,7 +712,8 @@ export class CompactionHandler {
 
   async withContinuousPendingState(
     messages: MuxMessage[],
-    apply: (boundaryMessageId: string) => Promise<boolean>
+    apply: (boundaryMessageId: string) => Promise<boolean>,
+    boundaryMessageId = createCompactionSummaryMessageId()
   ): Promise<boolean> {
     await this.loadPersistedPendingStateIfNeeded();
     const previous = {
@@ -732,7 +733,6 @@ export class CompactionHandler {
           boundaryMessageId: previous.boundaryMessageId,
         }
       : undefined;
-    const boundaryMessageId = createCompactionSummaryMessageId();
     let applied = false;
     try {
       await this.preparePendingStateFromMessages(messages, boundaryMessageId, previousState);
@@ -1190,7 +1190,7 @@ export class CompactionHandler {
   }
 
   /** The rolling summarizer already paid for this text; applying it must not start another turn. */
-  async persistContinuousCompaction(params: {
+  buildContinuousCompactionRows(params: {
     boundaryMessageId?: string;
     messages: MuxMessage[];
     text: string;
@@ -1199,8 +1199,7 @@ export class CompactionHandler {
     systemMessageTokens: number;
     attachmentTokens: number;
     pendingFollowUp?: CompactionFollowUpRequest;
-    shouldPersist: (messages: MuxMessage[]) => boolean;
-  }): Promise<boolean> {
+  }): { boundary: MuxMessage; copies: MuxMessage[] } {
     assert(params.text.trim().length > 0, "Continuous compaction requires a summary");
     const boundary = createMuxMessage(
       params.boundaryMessageId ?? createCompactionSummaryMessageId(),
@@ -1231,6 +1230,16 @@ export class CompactionHandler {
       if (params.pendingFollowUp) delete copy.metadata.partial;
       return copy;
     });
+    return { boundary, copies };
+  }
+
+  async persistContinuousCompaction(
+    params: Parameters<CompactionHandler["buildContinuousCompactionRows"]>[0] & {
+      prepared?: { boundary: MuxMessage; copies: MuxMessage[] };
+      shouldPersist: (messages: MuxMessage[]) => boolean;
+    }
+  ): Promise<boolean> {
+    const { boundary, copies } = params.prepared ?? this.buildContinuousCompactionRows(params);
     const inputTokens =
       params.systemMessageTokens +
       params.attachmentTokens +

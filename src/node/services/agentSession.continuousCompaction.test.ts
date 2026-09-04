@@ -1,3 +1,5 @@
+import assert from "@/common/utils/assert";
+import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
@@ -121,6 +123,113 @@ describe("AgentSession continuous compaction wiring", () => {
     );
     expect(result.success).toBe(true);
   }
+
+  test("startup commits the ordinary partial, folds the valid journal, then considers interrupted-turn retry", async () => {
+    const h = await setup();
+    const source = createMuxMessage("live-answer", "assistant", "", {
+      partial: true,
+      stepStartPartIndices: [0, 1, 2],
+    });
+    source.parts = [
+      { type: "text", text: "completed investigation ".repeat(4_000) },
+      {
+        type: "dynamic-tool",
+        toolCallId: "kept-tool",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "pwd" },
+        output: { success: true },
+      },
+      { type: "text", text: "still generating" },
+    ];
+    for (const row of [
+      createMuxMessage("old-user", "user", "Earlier request"),
+      createMuxMessage("old-answer", "assistant", "old context ".repeat(6_000)),
+      createMuxMessage("new-user", "user", "Continue the task"),
+      source,
+    ]) {
+      expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+    }
+    const compactor = internals(h.session).continuousCompactor;
+    const deps = Reflect.get(compactor, "deps") as ConstructorParameters<
+      typeof ContinuousCompactor
+    >[0];
+    let streaming = true;
+    let swap: ContinuousPrefixSwap | undefined;
+    deps.streamManager = {
+      isStreaming: () => streaming,
+      getStreamInfo: () =>
+        streaming
+          ? {
+              messageId: source.id,
+              parts: source.parts,
+              stepStartIndices: [0, 1, 2],
+              currentStepStartIndex: 2,
+            }
+          : undefined,
+      setPrefixSwap: (_id, value) => {
+        swap = value;
+        return true;
+      },
+    };
+    deps.prepare = () => Promise.resolve();
+    deps.estimateAttachmentTokens = () => Promise.resolve(0);
+    deps.summarize = () => Promise.resolve({ text: "Earlier work summarized", model });
+    deps.prepareSwap = () =>
+      Promise.resolve({
+        preparation: {
+          modelString: model,
+          providerForMessages: "openai",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "off",
+          toolNamesForSentinel: ["bash"],
+        },
+        attachments: [],
+        systemPrefix: [],
+        cacheEnabled: false,
+      });
+    const context = {
+      enabled: true,
+      model,
+      thresholdPercent: 70,
+      contextWindowTokens: 100_000,
+      phase: "mid-stream" as const,
+    };
+    await compactor.observe(60, context);
+    const job = Reflect.get(compactor, "job") as { done: Promise<void> };
+    await job.done;
+    expect(await compactor.observe(70, context)).toBe("none");
+    assert(swap, "Expected pending swap");
+    const store = h.historyService.getContinuousCompactionJournal(workspaceId);
+    const journal = await store.write(swap.journal, swap.prefix, () => true);
+    assert(journal, "Expected durable swap journal");
+    source.parts.push({ type: "text", text: "post-swap crash growth" });
+    await h.historyService.writePartial(workspaceId, source);
+    streaming = false;
+    const order: string[] = [];
+    const commit = h.historyService.commitPartial.bind(h.historyService);
+    spyOn(h.historyService, "commitPartial").mockImplementation((id) => {
+      order.push("commit");
+      return commit(id);
+    });
+    const read = store.read.bind(store);
+    spyOn(store, "read").mockImplementation(() => {
+      order.push("journal");
+      return read();
+    });
+    let retryChecks = 0;
+    Reflect.set(h.session, "scheduleStartupAutoRetryIfNeeded", async () => {
+      const history = await rows(h);
+      expect(history[0].id).toBe(journal.boundary.id);
+      expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
+      retryChecks++;
+      return "completed";
+    });
+    await h.session.runStartupRecovery();
+    expect(order.slice(0, 2)).toEqual(["commit", "journal"]);
+    expect(retryChecks).toBe(1);
+    expect(await store.read()).toBeNull();
+  });
 
   test("on-send apply preserves the new user turn without running a compact turn", async () => {
     const h = await setup(72);
@@ -264,101 +373,123 @@ describe("AgentSession continuous compaction wiring", () => {
     });
   });
 
-  test("mid-stream fast apply commits after system stop then resumes without a compact turn or latch recursion", async () => {
-    const h = await setup();
-    const resumed = deferred<void>();
-    const order: string[] = [];
-    let starts = 0;
-    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
-      starts++;
-      startStream(h);
-      if (starts === 2) {
-        order.push("resume");
-        resumed.resolve();
-      }
-      return Promise.resolve(Ok(createStartedTurnHandle()));
-    });
-    spyOn(h.aiService, "stopStream").mockImplementation(async (_id, options) => {
-      expect(options?.abortReason).toBe("system");
-      order.push("stop");
-      const result = await h.historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("live-assistant", "assistant", "Committed partial")
+  test.each(["usage-delta", "prefix-swap-invalidated"] as const)(
+    "%s fast apply commits after system stop then resumes without a compact turn or latch recursion",
+    async (eventType) => {
+      const h = await setup();
+      const resumed = deferred<void>();
+      const order: string[] = [];
+      let starts = 0;
+      spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+        starts++;
+        startStream(h);
+        if (starts === 2) {
+          order.push("resume");
+          resumed.resolve();
+        }
+        return Promise.resolve(Ok(createStartedTurnHandle()));
+      });
+      spyOn(h.aiService, "stopStream").mockImplementation(async (_id, options) => {
+        if (eventType === "prefix-swap-invalidated")
+          spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+        expect(options?.abortReason).toBe("system");
+        order.push("stop");
+        const result = await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("live-assistant", "assistant", "Committed partial")
+        );
+        expect(result.success).toBe(true);
+        h.aiEmitter.emit("stream-abort", {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "live-assistant",
+          abortReason: "system",
+        });
+        return Ok(undefined);
+      });
+      let observedMidstream = false;
+      let applying = false;
+      spyOn(internals(h.session).continuousCompactor, "isApplying").mockImplementation(
+        () => applying
       );
-      expect(result.success).toBe(true);
-      h.aiEmitter.emit("stream-abort", {
-        type: "stream-abort",
+      spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+        async (_percent, context) => {
+          // Resumed on-send observation is allowed, but only after the mid-stream
+          // apply latch has been released.
+          expect(applying).toBe(false);
+          if (context.phase !== "mid-stream") return "none";
+          expect(observedMidstream).toBe(false);
+          observedMidstream = true;
+          applying = true;
+          const applied = await internals(h.session).interruptForContinuousCompaction(
+            async (followUp) => {
+              expect(h.session.isBusy()).toBe(false);
+              expect(internals(h.session).activeStreamContext).toBeUndefined();
+              expect((await rows(h)).at(-1)?.id).toBe("live-assistant");
+              expect(followUp).toMatchObject({
+                text: "Continue",
+                model,
+                goalKind: GOAL_CONTINUATION_KIND,
+                goalId: "11111111-1111-4111-8111-111111111111",
+                dispatchOptions: { source: "internal-resume" },
+              });
+              order.push("apply");
+              await appendBoundary(h, followUp);
+              return true;
+            }
+          );
+          expect(starts).toBe(1);
+          applying = false;
+          order.push("latch-released");
+          return applied ? "applied" : "none";
+        }
+      );
+      expect(
+        (
+          await h.session.sendMessage("Working", sendOptions, {
+            synthetic: true,
+            agentInitiated: true,
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: "11111111-1111-4111-8111-111111111111",
+          })
+        ).success
+      ).toBe(true);
+      const observationFinished = deferred<void>();
+      if (eventType === "prefix-swap-invalidated") {
+        spyOn(h.aiService, "isStreaming").mockReturnValue(true);
+        spyOn(h.aiService, "getStreamInfo").mockReturnValue({
+          messageId: "live-assistant",
+          parts: [],
+          toolCompletionTimestamps: new Map(),
+        });
+        spyOn(internals(h.session).continuousCompactor, "waitForIdle").mockReturnValueOnce(
+          observationFinished.promise
+        );
+        Reflect.set(h.session, "continuousCompactionObserving", true);
+      }
+      h.aiEmitter.emit(eventType, {
+        type: eventType,
         workspaceId,
         messageId: "live-assistant",
-        abortReason: "system",
+        usage: { inputTokens: 92_160, outputTokens: 1, totalTokens: 92_161 },
       });
-      return Ok(undefined);
-    });
-    let observedMidstream = false;
-    let applying = false;
-    spyOn(internals(h.session).continuousCompactor, "isApplying").mockImplementation(
-      () => applying
-    );
-    spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
-      async (_percent, context) => {
-        // Resumed on-send observation is allowed, but only after the mid-stream
-        // apply latch has been released.
-        expect(applying).toBe(false);
-        if (context.phase !== "mid-stream") return "none";
-        expect(observedMidstream).toBe(false);
-        observedMidstream = true;
-        applying = true;
-        const applied = await internals(h.session).interruptForContinuousCompaction(
-          async (followUp) => {
-            expect(h.session.isBusy()).toBe(false);
-            expect(internals(h.session).activeStreamContext).toBeUndefined();
-            expect((await rows(h)).at(-1)?.id).toBe("live-assistant");
-            expect(followUp).toMatchObject({
-              text: "Continue",
-              model,
-              goalKind: GOAL_CONTINUATION_KIND,
-              goalId: "11111111-1111-4111-8111-111111111111",
-              dispatchOptions: { source: "internal-resume" },
-            });
-            order.push("apply");
-            await appendBoundary(h, followUp);
-            return true;
-          }
-        );
-        expect(starts).toBe(1);
-        applying = false;
-        order.push("latch-released");
-        return applied ? "applied" : "none";
+      if (eventType === "prefix-swap-invalidated") {
+        expect(order).toEqual([]);
+        observationFinished.resolve();
       }
-    );
-    expect(
-      (
-        await h.session.sendMessage("Working", sendOptions, {
-          synthetic: true,
-          agentInitiated: true,
-          goalKind: GOAL_CONTINUATION_KIND,
-          goalId: "11111111-1111-4111-8111-111111111111",
-        })
-      ).success
-    ).toBe(true);
-    h.aiEmitter.emit("usage-delta", {
-      type: "usage-delta",
-      workspaceId,
-      messageId: "live-assistant",
-      usage: { inputTokens: 92_160, outputTokens: 1, totalTokens: 92_161 },
-    });
-    await resumed.promise;
-    expect(order).toEqual(["stop", "apply", "latch-released", "resume"]);
-    const history = await rows(h);
-    expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
-      false
-    );
-    expect(history.at(-1)?.parts.find((part) => part.type === "text")).toMatchObject({
-      text: "Continue",
-    });
-    // Disposal's stop is intentionally not the fast-apply stop under test.
-    mock.restore();
-  });
+      await resumed.promise;
+      expect(order).toEqual(["stop", "apply", "latch-released", "resume"]);
+      const history = await rows(h);
+      expect(history.some((row) => row.metadata?.muxMetadata?.type === "compaction-request")).toBe(
+        false
+      );
+      expect(history.at(-1)?.parts.find((part) => part.type === "text")).toMatchObject({
+        text: "Continue",
+      });
+      // Disposal's stop is intentionally not the fast-apply stop under test.
+      mock.restore();
+    }
+  );
 
   test.each([72, 76])(
     "a failed post-stop apply recovers the interrupted turn at %s%%",

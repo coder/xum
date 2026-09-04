@@ -1,3 +1,4 @@
+import type { StreamManager } from "./streamManager";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import { EventEmitter } from "events";
@@ -554,6 +555,10 @@ interface AgentSessionActiveStreamInfo {
 }
 
 export interface AgentSessionStreamManager {
+  setPrefixSwap?: StreamManager["setPrefixSwap"];
+  clearPrefixSwap?: StreamManager["clearPrefixSwap"];
+  getPrefixSwapState?: StreamManager["getPrefixSwapState"];
+  getPrefixSwapPreparation?: StreamManager["getPrefixSwapPreparation"];
   stopStream(
     workspaceId: string,
     options?: { soft?: boolean; abandonPartial?: boolean; abortReason?: StreamAbortReason }
@@ -984,6 +989,11 @@ export class AgentSession {
       compactionHandler: this.compactionHandler,
       streamManager: {
         isStreaming: (workspaceId) => this.streamManager.isStreaming(workspaceId),
+        setPrefixSwap: (workspaceId, swap) =>
+          this.streamManager.setPrefixSwap?.(workspaceId, swap) ?? false,
+        clearPrefixSwap: (workspaceId) => this.streamManager.clearPrefixSwap?.(workspaceId),
+        getPrefixSwapState: (workspaceId) =>
+          this.streamManager.getPrefixSwapState?.(workspaceId) ?? "none",
         getStreamInfo: (workspaceId) => {
           const info = this.streamManager.getStreamInfo(workspaceId);
           return (
@@ -1001,24 +1011,17 @@ export class AgentSession {
           reason: "continuous-eager",
         }),
       estimateAttachmentTokens: async (head) => {
-        const pending = await this.compactionHandler.peekPendingState();
-        const attachments = await this.buildAttachmentsFromContext({
-          diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
-          loadedSkills: mergeLoadedSkillSnapshots([
-            ...this.postCompactionLoadedSkills,
-            ...(pending?.loadedSkills ?? []),
-            ...extractLoadedSkillSnapshotsFromMessages(head),
-          ]),
-          readFilePaths: mergeReadFilePaths(this.postCompactionReadFilePaths, [
-            ...(pending?.readFiles ?? []),
-            ...extractReadFilePaths(head),
-          ]),
-          reportsCompletedBeforeMs: Date.now(),
-        });
+        const attachments = await this.buildContinuousCompactionAttachments(head);
         return injectPostCompactionAttachments([], attachments).reduce(
           (sum, row) => sum + estimateMuxMessageTokens(row),
           0
         );
+      },
+      prepareSwap: async (head) => {
+        const prepared = this.streamManager.getPrefixSwapPreparation?.(this.workspaceId);
+        if (!prepared) return null;
+        const attachments = await this.buildContinuousCompactionAttachments(head);
+        return { ...prepared, attachments };
       },
       summarize: (head, signal, context: SessionCompactionContext) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
@@ -2535,6 +2538,7 @@ export class AgentSession {
       // This handles the case where the app crashed after compaction completed
       // but before the follow-up was sent.
       this.startupRecoveryPromise = this.requireGoalAcknowledgmentForCrashRecoveredPartial()
+        .then(() => this.continuousCompactor.recover())
         .then(() => this.dispatchPendingFollowUp())
         .then(() =>
           // Re-arm pending continuation / budget-wrap-up dispatches that were
@@ -3773,6 +3777,8 @@ export class AgentSession {
       }
 
       const providersConfigForCompaction = this.getProvidersConfigSafe();
+      // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
+      if (await this.continuousCompactor.recover()) this.clearUsageState();
       const compactionResult = this.compactionMonitor.checkBeforeSend({
         model: modelForStream,
         usage: this.getUsageState(),
@@ -4907,6 +4913,23 @@ export class AgentSession {
       sendOptions,
       agentInitiated: true,
     };
+  }
+
+  private async buildContinuousCompactionAttachments(head: MuxMessage[]) {
+    const pending = await this.compactionHandler.peekPendingState();
+    return this.buildAttachmentsFromContext({
+      diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
+      loadedSkills: mergeLoadedSkillSnapshots([
+        ...this.postCompactionLoadedSkills,
+        ...(pending?.loadedSkills ?? []),
+        ...extractLoadedSkillSnapshotsFromMessages(head),
+      ]),
+      readFilePaths: mergeReadFilePaths(this.postCompactionReadFilePaths, [
+        ...(pending?.readFiles ?? []),
+        ...extractReadFilePaths(head),
+      ]),
+      reportsCompletedBeforeMs: Date.now(),
+    });
   }
 
   private getContinuousCompactionContext(
@@ -6228,6 +6251,37 @@ export class AgentSession {
       this.emitChatEvent(payload);
     });
     forward("reasoning-end", (payload) => this.emitChatEvent(payload));
+    forward("prefix-swap-invalidated", async (payload) => {
+      if (
+        payload.type !== "prefix-swap-invalidated" ||
+        payload.messageId !== this.streamManager.getStreamInfo(this.workspaceId)?.messageId
+      )
+        return;
+      // A usage observation can overlap the fallback. Join it rather than dropping
+      // the only invalidation event while the fallback's prepareStep is blocked.
+      await this.continuousCompactor.waitForIdle();
+      const context = this.activeStreamContext;
+      if (
+        !context ||
+        this.midStreamCompactionPending ||
+        !this.streamManager.isStreaming(this.workspaceId)
+      )
+        return;
+      this.continuousCompactionObserving = true;
+      try {
+        const result = await this.continuousCompactor.observe(0, {
+          ...this.getContinuousCompactionContext(context.modelString, context.options),
+          phase: "mid-stream",
+        });
+        this.midStreamCompactionPending = false;
+        await this.finishContinuousCompaction(result === "applied", context);
+      } finally {
+        this.midStreamCompactionPending = false;
+        this.continuousCompactionStopped = false;
+        this.continuousCompactionObserving = false;
+      }
+    });
+
     forward("usage-delta", async (payload) => {
       this.emitChatEvent(payload);
 

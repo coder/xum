@@ -1,3 +1,6 @@
+import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
+import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
+import type { PrefixSwapInvalidatedEvent } from "@/common/types/stream";
 import * as path from "path";
 import { Duration, Effect, Exit, Fiber, Scope } from "effect";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -47,7 +50,7 @@ import {
   reasoningProviderOptionsFromMetadata,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import { ThinkingLevelSchema, type ThinkingLevel } from "@/common/types/thinking";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -196,7 +199,8 @@ export type TurnEngineEvent =
   | ToolCallEndEvent
   | ReasoningDeltaEvent
   | ReasoningEndEvent
-  | WorkflowRunAttachedEvent;
+  | WorkflowRunAttachedEvent
+  | PrefixSwapInvalidatedEvent;
 
 export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<void>;
 
@@ -276,9 +280,15 @@ type StreamRequestInput = StreamRequestOptions & {
 };
 
 interface StepMessageTracker {
+  workspaceId?: string;
+  pendingPrefixSwap?: ContinuousPrefixSwap;
+  consumedPrefixSwap?: ContinuousPrefixSwap;
+  prefixSwapInvalidated?: boolean;
+  prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
 }
 interface StreamRequestConfig {
+  cacheEnabled?: boolean;
   model: LanguageModel;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
@@ -2176,6 +2186,7 @@ export class StreamManager {
       model,
       messages,
       system,
+      cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
       tools: withSequentialExecution(tools, onToolExecutionStart),
@@ -2299,6 +2310,72 @@ export class StreamManager {
     return rebuilt.providerOptions;
   }
 
+  getPrefixSwapPreparation(workspaceId: string) {
+    const info = this.workspaceStreams.get(workspaceId as WorkspaceId);
+    if (!info) return null;
+    return {
+      requestProviderOptions: info.request.providerOptions,
+      systemPrefix: info.request.messages.filter((message) => message.role === "system"),
+      cacheEnabled: info.request.cacheEnabled ?? false,
+      preparation: {
+        effectiveAgentId: info.initialMetadata?.agentId ?? "exec",
+        toolNamesForSentinel: Object.keys(info.request.tools ?? {}),
+        effectiveThinkingLevel: ThinkingLevelSchema.parse(info.thinkingLevel ?? "off"),
+        modelString: info.model,
+        providerForMessages: info.metadataModel.split(":", 1)[0],
+        anthropicCacheTtl: getAnthropicCacheTtl(info.request.providerOptions),
+      },
+    };
+  }
+
+  setPrefixSwap(workspaceId: string, swap: ContinuousPrefixSwap): boolean {
+    const stream = this.workspaceStreams.get(workspaceId as WorkspaceId);
+    if (
+      !stream ||
+      stream.messageId !== swap.journal.streamMessageId ||
+      stream.model !== swap.journal.parentModel ||
+      stream.stepTracker.pendingPrefixSwap ||
+      stream.stepTracker.consumedPrefixSwap
+    )
+      return false;
+    stream.stepTracker.pendingPrefixSwap = swap;
+    return true;
+  }
+
+  clearPrefixSwap(workspaceId: string): void {
+    const tracker = this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker;
+    if (tracker) {
+      tracker.pendingPrefixSwap = undefined;
+      tracker.consumedPrefixSwap = undefined;
+    }
+  }
+
+  getPrefixSwapState(workspaceId: string): "none" | "pending" | "consumed" | "invalidated" {
+    const tracker = this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker;
+    return tracker?.prefixSwapInvalidated
+      ? "invalidated"
+      : tracker?.consumedPrefixSwap
+        ? "consumed"
+        : tracker?.pendingPrefixSwap
+          ? "pending"
+          : "none";
+  }
+
+  private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
+    const index = messages.findIndex(
+      (message) =>
+        Array.isArray(message.content) &&
+        message.content.some(
+          (part) => "toolCallId" in part && part.toolCallId === swap.firstTailToolCallId
+        )
+    );
+    if (index < 0 || messages[index].role !== "assistant") {
+      log.warn("[continuous-compaction] prefix locator missing; retaining full context");
+      return null;
+    }
+    return [...swap.prefix, ...stripMessageCacheControl(messages.slice(index))];
+  }
+
   private createStreamResult(
     request: StreamRequestConfig,
     abortController: AbortController,
@@ -2324,7 +2401,36 @@ export class StreamManager {
         const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
         const rewritten =
           await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
-        const effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
+        let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
+        if (stepTracker?.prefixSwapInvalidated) {
+          // Cross-family fallback must not send the old provider's cached prefix.
+          // Release only on the session's stop, after fallback reset/locks have completed.
+          if (!abortController.signal.aborted) {
+            await new Promise<void>((resolve) =>
+              abortController.signal.addEventListener("abort", () => resolve(), { once: true })
+            );
+          }
+          throw abortController.signal.reason ?? new Error("Prefix swap invalidated");
+        }
+        const swap = stepTracker?.pendingPrefixSwap;
+        if (swap && stepTracker?.workspaceId) {
+          const swapped = this.swapPrefix(effectiveMessages, swap);
+          if (swapped) {
+            const journal = await this.historyService
+              .getContinuousCompactionJournal(stepTracker.workspaceId)
+              .write(
+                { ...swap.journal, stepNumber },
+                swap.prefix,
+                () => stepTracker.pendingPrefixSwap === swap && !abortController.signal.aborted
+              );
+            if (journal && stepTracker.pendingPrefixSwap === swap) {
+              swap.journal = journal;
+              stepTracker.consumedPrefixSwap = swap;
+              effectiveMessages = swapped;
+            }
+          }
+          if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
+        }
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -2354,6 +2460,7 @@ export class StreamManager {
         if (
           thinkingOverride !== undefined &&
           stepNumber === 0 &&
+          !stepTracker?.consumedPrefixSwap &&
           request.rebuildFirstStepForThinkingLevel != null &&
           appliedLevel != null
         ) {
@@ -2382,7 +2489,7 @@ export class StreamManager {
           }
         }
         if (
-          rewritten === stepMessages &&
+          effectiveMessages === stepMessages &&
           activeTools === undefined &&
           thinkingOverride === undefined
         ) {
@@ -2391,9 +2498,9 @@ export class StreamManager {
         return {
           ...(rebuiltFirstStepMessages != null
             ? { messages: rebuiltFirstStepMessages }
-            : rewritten === stepMessages
+            : effectiveMessages === stepMessages
               ? {}
-              : { messages: rewritten }),
+              : { messages: effectiveMessages }),
           ...(forceFirstStepTools !== undefined ? { toolChoice: "required" as const } : {}),
           ...(activeTools !== undefined ? { activeTools } : {}),
           // Defense in depth: the in-place request mutation is authoritative
@@ -2441,7 +2548,7 @@ export class StreamManager {
       maxOutputTokens,
       runtime,
     } = options;
-    const stepTracker: StepMessageTracker = {};
+    const stepTracker: StepMessageTracker = { workspaceId: options.workspaceId };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
@@ -3193,6 +3300,7 @@ export class StreamManager {
             ...(thinkingLevelOverride != null ? { thinkingLevelOverride } : {}),
           }
         : undefined;
+    streamInfo.stepTracker.pendingPrefixSwap = undefined;
     let prepared: Result<PreparedModelFallback, string>;
     try {
       prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
@@ -3243,6 +3351,19 @@ export class StreamManager {
       providersConfigSnapshot: prepared.data.providersConfig,
       rebuildFirstStepForThinkingLevel: prepared.data.rebuildFirstStepForThinkingLevel,
     });
+    const consumedSwap = streamInfo.stepTracker.consumedPrefixSwap;
+    if (consumedSwap) {
+      const family = this.resolveMetadataModel(
+        prepared.data.modelString,
+        prepared.data.providersConfig
+      ).split(":", 1)[0];
+      const messages =
+        family === consumedSwap.journal.providerFamily
+          ? this.swapPrefix(nextRequest.messages, consumedSwap)
+          : null;
+      if (messages) nextRequest.messages = messages;
+      else streamInfo.stepTracker.prefixSwapInvalidated = true;
+    }
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
     // later disk-reset await cannot wipe freshly prepared fallback messages.
@@ -3317,6 +3438,18 @@ export class StreamManager {
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
+    if (
+      consumedSwap &&
+      streamInfo.stepTracker.prefixSwapInvalidated &&
+      !streamInfo.stepTracker.prefixSwapInvalidationEmitted
+    ) {
+      streamInfo.stepTracker.prefixSwapInvalidationEmitted = true;
+      this.emitTurnEvent({
+        type: "prefix-swap-invalidated",
+        workspaceId,
+        messageId: streamInfo.messageId,
+      });
+    }
 
     return { kind: "swapped" };
   }
@@ -4483,6 +4616,7 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo,
     options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
   ): Promise<void> {
+    streamInfo.stepTracker.pendingPrefixSwap = undefined;
     const preserveParts = options?.preserveParts ?? false;
     const preserveUsage = options?.preserveUsage ?? false;
 
