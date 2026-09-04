@@ -555,13 +555,15 @@ export const NarrowControlRowCollapse: AppStory = {
   },
 };
 
-function assertComposerPillGeometry(storyRoot: HTMLElement) {
+function assertComposerPillGeometry(
+  storyRoot: HTMLElement,
+  touch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches
+) {
   const row = storyRoot.querySelector<HTMLElement>('[data-component="ComposerControlRow"]');
   const group = storyRoot.querySelector<HTMLElement>('[data-component="ModelSelectorGroup"]');
   if (!row || !group) throw new Error("Composer controls not rendered");
   const groupBounds = group.getBoundingClientRect();
   const rowBounds = row.getBoundingClientRect();
-  const touch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
   const pills = [
     within(row).getByLabelText("Select agent"),
     within(row).getByRole("button", { name: /^Context usage/ }),
@@ -611,6 +613,20 @@ export const ComposerPillHeights: AppStory = {
     await waitForChatInputAutofocusDone(storyRoot);
     blurActiveElement();
     await waitFor(() => assertComposerPillGeometry(storyRoot));
+
+    // Pixel and the test-runner do not emulate coarse pointers.
+    const wrapper = within(storyRoot).getByTestId("composer-width-wrapper");
+    const originalWidth = wrapper.style.width;
+    const touchFloor = document.createElement("style");
+    touchFloor.textContent = `[data-component="ComposerControlRow"] button { min-height: ${MOBILE_TOUCH_TARGET_PX}px; min-width: ${MOBILE_TOUCH_TARGET_PX}px; }`;
+    document.head.append(touchFloor);
+    wrapper.style.width = "390px";
+    try {
+      await waitFor(() => assertComposerPillGeometry(storyRoot, true));
+    } finally {
+      touchFloor.remove();
+      wrapper.style.width = originalWidth;
+    }
   },
 };
 
