@@ -604,7 +604,7 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Sidebar</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
@@ -653,7 +653,7 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Transcript</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
@@ -724,7 +724,7 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Terminal</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
@@ -872,7 +872,7 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Archiving</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
@@ -933,7 +933,7 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Editor & debugging</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between">
@@ -1014,7 +1014,7 @@ export function GeneralSection() {
         </div>
       </div>
 
-      <div>
+      <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Projects</h3>
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
