@@ -168,8 +168,9 @@ export function unwrapResult(result: unknown): unknown {
 
 /** Preserve wrapper compatibility before strict result validation without mutating hook/UI output. */
 export function normalizeToolResultForRendering(result: unknown): unknown {
-  if (!isPlainObject(result)) return result;
-  const core = { ...result };
+  const unwrapped = unwrapResult(result);
+  if (!isPlainObject(unwrapped)) return unwrapped;
+  const core = { ...unwrapped };
   delete core.hook_output;
   delete core.hook_duration_ms;
   delete core.hook_path;

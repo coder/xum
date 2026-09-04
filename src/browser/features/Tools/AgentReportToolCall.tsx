@@ -48,7 +48,7 @@ export const AgentReportToolCall: React.FC<AgentReportToolCallProps> = (props) =
     : parsed.success
       ? parsed.data
       : undefined;
-  const invalidResult = props.result != null && result == null;
+  const invalidResult = (props.result != null || props.status === "completed") && result == null;
   const reportMarkdown = getSubmittedReportMarkdown(props.args, result);
   const failedResult = result?.success === false ? result : null;
   const title = props.args.title?.trim() ?? "";

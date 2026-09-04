@@ -192,4 +192,69 @@ describe("AgentReportToolCall", () => {
     expect(view.getByRole("alert").textContent).toBe("Blocked by project hook");
     expect(view.getByRole("status").className).toContain("text-danger");
   });
+
+  test.each([null, undefined, { type: "json", value: null }].map((result) => ({ result })))(
+    "does not claim delivery for a missing completed result: %j",
+    ({ result }) => {
+      const view = render(
+        <TooltipProvider>
+          <AgentReportToolCall
+            args={{ reportMarkdown: "Findings" }}
+            result={result}
+            status="completed"
+          />
+        </TooltipProvider>
+      );
+      expect(view.getByRole("status").className).not.toContain("text-success");
+      expect(view.getByRole("status").textContent).toBe("Result unavailable");
+    }
+  );
+
+  test.each([
+    { status: "pending", label: "Pending" },
+    { status: "executing", label: "Sending…" },
+    { status: "failed", label: "Not sent" },
+    { status: "interrupted", label: "Interrupted" },
+  ] as const)("preserves lifecycle status without a result: $status", ({ status, label }) => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall args={{ reportMarkdown: "Findings" }} result={null} status={status} />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").textContent).toBe(label);
+  });
+
+  test("accepts SDK-wrapped results with inner and outer hook metadata", () => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ reportMarkdown: "Findings" }}
+          status="completed"
+          result={Object.freeze({
+            type: "json",
+            value: Object.freeze({ ...{ success: true }, hook_output: "Inner hook" }),
+            hook_output: "Outer hook",
+            hook_path: ".xum/tool_post",
+          })}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").className).toContain("text-success");
+  });
+
+  test("shows SDK-wrapped blocking errors", () => {
+    const view = render(
+      <TooltipProvider>
+        <AgentReportToolCall
+          args={{ reportMarkdown: "Findings" }}
+          status="completed"
+          result={{
+            type: "json",
+            value: { error: "Wrapped blocking error" },
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("alert").textContent).toBe("Wrapped blocking error");
+  });
 });

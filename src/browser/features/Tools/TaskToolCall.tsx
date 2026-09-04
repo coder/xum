@@ -1739,7 +1739,8 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
   const parsed = TaskSendMessageToolResultSchema.safeParse(normalizedResult);
   const result = parsed.success ? parsed.data : undefined;
   const toolError = isToolErrorResult(normalizedResult) ? normalizedResult : undefined;
-  const invalidResult = props.result != null && result == null && toolError == null;
+  const invalidResult =
+    (props.result != null || props.status === "completed") && result == null && toolError == null;
   // A finished tool call can still mean delivery was refused or queued, not sent.
   const delivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
   const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
