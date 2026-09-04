@@ -216,6 +216,102 @@ describe("DesktopInputCoordinator", () => {
     });
   });
 
+  test("mixed-owner batches lock in stable order and validate every owner before admission", async () => {
+    await withCoordinator(async (coordinator, write) => {
+      const otherOwner = workspace("other-owner");
+      const otherChild = borrower("other-child", {
+        parentWorkspaceId: "other-owner",
+        taskDesktopOwnerWorkspaceId: "other-owner",
+      });
+      await write([owner, otherOwner, borrower("child"), otherChild]);
+      const reservations = [
+        { ownerWorkspaceId: "owner", borrowerWorkspaceId: "child" },
+        { ownerWorkspaceId: "other-owner", borrowerWorkspaceId: "other-child" },
+      ];
+      // Both calls begin before either owns its second gate: opposite input ordering must
+      // not let each batch hold one owner's gate while waiting forever for the other.
+      expect(
+        await Promise.all([
+          coordinator.withReservations(reservations, () => Promise.resolve("forward")),
+          coordinator.withReservations([...reservations].reverse(), () =>
+            Promise.resolve("reverse")
+          ),
+        ])
+      ).toEqual(["forward", "reverse"]);
+      const entered = deferred();
+      const release = deferred();
+      const first = coordinator.withReservations(reservations, async () => {
+        entered.resolve();
+        await release.promise;
+        await write([
+          owner,
+          otherOwner,
+          borrower("child", { taskStatus: "queued" }),
+          { ...otherChild, taskStatus: "queued" },
+        ]);
+      });
+      await entered.promise;
+      let secondEntered = false;
+      const second = coordinator.withReservations([...reservations].reverse(), () => {
+        secondEntered = true;
+        return Promise.resolve("same borrowers");
+      });
+      const input = coordinator
+        .withInput("other-owner", () => Promise.resolve())
+        .catch((error: unknown) => error);
+      expect(secondEntered).toBe(false);
+      release.resolve();
+      await first;
+      expect(await second).toBe("same borrowers");
+      expect(String(await input)).toContain("controlled by");
+
+      let admitted = false;
+      expect(
+        coordinator.withReservations(
+          [
+            { ownerWorkspaceId: "owner", borrowerWorkspaceId: "child" },
+            { ownerWorkspaceId: "other-owner", borrowerWorkspaceId: "competitor" },
+          ],
+          () => {
+            admitted = true;
+            return Promise.resolve();
+          }
+        )
+      ).rejects.toThrow("controlled by");
+      expect(admitted).toBe(false);
+    });
+  });
+
+  test("rejects conflicting batch owners before callbacks and deduplicates identical reservations", async () => {
+    await withCoordinator(async (coordinator) => {
+      let admissions = 0;
+      const reserve = () => {
+        admissions += 1;
+        return Promise.resolve(admissions);
+      };
+      expect(
+        coordinator.withReservations(
+          [
+            { ownerWorkspaceId: "owner", borrowerWorkspaceId: "child" },
+            { ownerWorkspaceId: "owner", borrowerWorkspaceId: "other" },
+          ],
+          reserve
+        )
+      ).rejects.toThrow("multiple borrowers in one batch");
+      expect(admissions).toBe(0);
+      expect(
+        await coordinator.withReservations(
+          [
+            { ownerWorkspaceId: "owner", borrowerWorkspaceId: "child" },
+            { ownerWorkspaceId: "owner", borrowerWorkspaceId: "child" },
+          ],
+          reserve
+        )
+      ).toBe(1);
+      expect(await coordinator.withReservations([], reserve)).toBe(2);
+    });
+  });
+
   test("revalidates queued operations and releases the gate after failures", async () => {
     await withCoordinator(async (coordinator, write) => {
       const entered = deferred();

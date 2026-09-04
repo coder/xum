@@ -26,21 +26,52 @@ export class DesktopInputCoordinator {
     return this.resolveFromConfig(this.config.loadConfigOrDefault(), workspaceId);
   }
 
-  async withReservation<T>(
+  withReservation<T>(
     ownerWorkspaceId: string,
     borrowerWorkspaceId: string,
     reserve: () => Promise<T>
   ): Promise<T> {
-    assert(borrowerWorkspaceId.length > 0, "Desktop reservation requires a borrower ID");
-    return this.gates.withLock(ownerWorkspaceId, async () => {
-      const config = this.config.loadConfigOrDefault();
-      const owner = this.resolveFromConfig(config, ownerWorkspaceId);
-      if (owner.ownerWorkspaceId !== ownerWorkspaceId || ownerWorkspaceId === borrowerWorkspaceId) {
-        throw new Error("Desktop reservation requires an unbound owner and a distinct borrower");
+    return this.withReservations([{ ownerWorkspaceId, borrowerWorkspaceId }], reserve);
+  }
+
+  async withReservations<T>(
+    reservations: ReadonlyArray<{ ownerWorkspaceId: string; borrowerWorkspaceId: string }>,
+    reserve: () => Promise<T>
+  ): Promise<T> {
+    const borrowers = new Map<string, string>();
+    for (const { ownerWorkspaceId, borrowerWorkspaceId } of reservations) {
+      assert(ownerWorkspaceId.length > 0, "Desktop reservation requires an owner ID");
+      assert(borrowerWorkspaceId.length > 0, "Desktop reservation requires a borrower ID");
+      const existing = borrowers.get(ownerWorkspaceId);
+      if (existing !== undefined && existing !== borrowerWorkspaceId) {
+        throw new Error(`Desktop ${ownerWorkspaceId} cannot have multiple borrowers in one batch`);
       }
-      this.assertController(config, ownerWorkspaceId, borrowerWorkspaceId, false);
+      borrowers.set(ownerWorkspaceId, borrowerWorkspaceId);
+    }
+    if (borrowers.size === 0) return reserve();
+
+    // Mixed-owner batches need one atomic admission window. Stable ordering avoids deadlock
+    // between concurrent batches without recursively acquiring the same owner's gate.
+    const ownerIds = [...borrowers.keys()].sort();
+    const lockNext = (index: number): Promise<T> => {
+      const ownerId = ownerIds[index];
+      if (ownerId !== undefined) {
+        return this.gates.withLock(ownerId, () => lockNext(index + 1));
+      }
+      const config = this.config.loadConfigOrDefault();
+      for (const [ownerWorkspaceId, borrowerWorkspaceId] of borrowers) {
+        const owner = this.resolveFromConfig(config, ownerWorkspaceId);
+        if (
+          owner.ownerWorkspaceId !== ownerWorkspaceId ||
+          ownerWorkspaceId === borrowerWorkspaceId
+        ) {
+          throw new Error("Desktop reservation requires an unbound owner and a distinct borrower");
+        }
+        this.assertController(config, ownerWorkspaceId, borrowerWorkspaceId, false);
+      }
       return reserve();
-    });
+    };
+    return lockNext(0);
   }
 
   async withAdmission<T>(workspaceId: string, admit: () => Promise<T>): Promise<T> {
