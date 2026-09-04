@@ -1,11 +1,11 @@
 import { lstatSync, realpathSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import type { InstallLayout } from "./installLayout";
+import { resolveCliEntry, type InstallLayout } from "./installLayout";
 
 export function activateUpdate(layout: InstallLayout, stagedEntry: string): void {
   if (
     !lstatSync(layout.launcher).isSymbolicLink() ||
-    realpathSync(layout.launcher) !== layout.entry
+    resolveCliEntry(layout.launcher) !== layout.entry
   ) {
     throw new Error("Server launcher changed since startup");
   }

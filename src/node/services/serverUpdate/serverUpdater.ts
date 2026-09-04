@@ -30,6 +30,7 @@ export class ServerUpdater {
   private availableVersion: string | null = null;
   private stagedEntry: string | null = null;
   private installing = false;
+  private shuttingDown = false;
   private download: { abort: AbortController; settled: Promise<void> } | null = null;
 
   constructor(
@@ -81,6 +82,7 @@ export class ServerUpdater {
   async checkForUpdates(options?: { source?: "auto" | "manual" }): Promise<void> {
     if (
       !this.layout ||
+      this.shuttingDown ||
       this.installing ||
       this.status.type === "checking" ||
       this.status.type === "downloading" ||
@@ -110,6 +112,7 @@ export class ServerUpdater {
   async downloadUpdate(): Promise<void> {
     if (
       !this.layout ||
+      this.shuttingDown ||
       !this.availableVersion ||
       this.stagedEntry ||
       this.installing ||
@@ -144,12 +147,20 @@ export class ServerUpdater {
 
   /** A detached package manager must not outlive the server and keep writing into the stage. */
   async beginShutdown(): Promise<void> {
+    this.shuttingDown = true;
     this.download?.abort.abort();
     await this.download?.settled;
   }
 
   async installUpdate(): Promise<void> {
-    if (!this.layout || !this.stagedEntry || !this.availableVersion || this.installing) return;
+    if (
+      !this.layout ||
+      this.shuttingDown ||
+      !this.stagedEntry ||
+      !this.availableVersion ||
+      this.installing
+    )
+      return;
     this.installing = true;
     try {
       await this.deps.refreshBlockers?.();

@@ -545,7 +545,7 @@ check-appimage-icons: ## Validate AppImage icon structure (requires prior dist-l
 
 ## VS Code Extension (delegates to vscode/Makefile)
 
-vscode-ext: ## Build VS Code extension (.vsix)
+vscode-ext: src/version.ts ## Build VS Code extension (.vsix)
 	@$(MAKE) -C vscode build
 
 vscode-ext-install: ## Build and install VS Code extension locally

@@ -1,5 +1,6 @@
 import { getErrorMessage } from "@/common/utils/errors";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import * as path from "node:path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import type { UpdateChannel } from "@/common/types/project";
@@ -26,6 +27,31 @@ export function isExactVersion(value: unknown): value is string {
     typeof value === "string" &&
     /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(value)
   );
+}
+
+/**
+ * Real path of the CLI entry a launcher runs. The published `mux` package is a forwarding shim
+ * (`bin/mux.js` requiring `@coder/xum`), which the registry module installs by default, so the
+ * shim is followed to the xum entry it forwards to.
+ */
+export function resolveCliEntry(file: string): string {
+  const real = realpathSync(file);
+  const shimPackage = path.dirname(path.dirname(real));
+  if (path.basename(path.dirname(real)) === "bin" && readPackageName(shimPackage) === "mux") {
+    return realpathSync(createRequire(real).resolve("@coder/xum/dist/cli/index.js"));
+  }
+  return real;
+}
+
+function readPackageName(packageDir: string): string | undefined {
+  try {
+    const pkg: unknown = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
+    return pkg && typeof pkg === "object" && "name" in pkg && typeof pkg.name === "string"
+      ? pkg.name
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function readPackageVersion(packageDir: string): string {
@@ -61,8 +87,8 @@ export function resolveInstallLayout(
       throw new Error("Server must be started through its launcher symlink");
     const launcher = path.resolve(resolveXumEnvironmentValue("BINARY", env) ?? running);
     if (!lstatSync(launcher).isSymbolicLink()) throw new Error("Server launcher must be a symlink");
-    const entry = realpathSync(running);
-    if (realpathSync(launcher) !== entry)
+    const entry = resolveCliEntry(running);
+    if (resolveCliEntry(launcher) !== entry)
       throw new Error("Server launcher does not point to the running entry");
     const packageDir = path.dirname(path.dirname(path.dirname(entry)));
     if (entry !== path.join(packageDir, "dist", "cli", "index.js"))

@@ -33,11 +33,25 @@ async function writePackage(
   return { entry, bin };
 }
 
-async function fixture(manager: InstallLayout["packageManager"] = "bun", version = "1.0.0-next.1") {
+async function writeMuxShim(workdir: string): Promise<string> {
+  const shimDir = path.join(workdir, "node_modules/mux");
+  await fs.mkdir(path.join(shimDir, "bin"), { recursive: true });
+  await fs.writeFile(path.join(shimDir, "package.json"), JSON.stringify({ name: "mux" }));
+  const shim = path.join(shimDir, "bin/mux.js");
+  await fs.writeFile(shim, 'require("@coder/xum/dist/cli/index.js");');
+  return shim;
+}
+
+async function fixture(
+  manager: InstallLayout["packageManager"] = "bun",
+  version = "1.0.0-next.1",
+  launcherTarget: "xum" | "shim" = "xum"
+) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "server-update-"));
   dirs.push(root);
   const workdir = path.join(root, "npm");
-  const { bin } = await writePackage(workdir, version);
+  const { bin: xumBin } = await writePackage(workdir, version);
+  const bin = launcherTarget === "shim" ? await writeMuxShim(workdir) : xumBin;
   if (manager === "pnpm") {
     const packageDir = path.join(workdir, "node_modules/@coder/xum");
     const storeDir = path.join(workdir, "node_modules/.pnpm/xum/node_modules/@coder/xum");
@@ -76,6 +90,16 @@ describe("server install layout", () => {
       expect(inferChannel("1.0.0")).toBe("stable");
     });
   }
+  test("follows the published mux shim to the xum entry it forwards to", async () => {
+    const { layout, root } = await fixture("bun", "1.0.0-next.1", "shim");
+    expect(layout.entry).toBe(path.join(root, "npm/node_modules/@coder/xum/dist/cli/index.js"));
+    expect(layout.version).toBe("1.0.0-next.1");
+    const bin = await stageUpdate(layout, "2.0.0", async (_file, _args, cwd) => {
+      await writePackage(cwd, "2.0.0");
+    });
+    activateUpdate(layout, bin);
+    expect(await fs.readlink(layout.launcher)).toBe(bin);
+  });
   test("requires supervisor, a symlink, and a matching running entry", async () => {
     const { env, argv, layout, root } = await fixture();
     expect(resolveInstallLayout({ MUX_BINARY: env.MUX_BINARY }, argv).supported).toBe(false);
@@ -319,6 +343,9 @@ describe("server updater", () => {
     await download;
     expect(observed?.aborted).toBe(true);
     expect(updater.getStatus()).toMatchObject({ type: "error", phase: "download" });
+    observed = undefined;
+    await updater.downloadUpdate();
+    expect(observed).toBeUndefined();
   });
   test("serializes checks and downloads and refuses channel changes while busy", async () => {
     const { layout } = await fixture();

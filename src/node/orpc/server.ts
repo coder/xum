@@ -742,13 +742,8 @@ function isOAuthCallbackNavigationRequest(req: Pick<express.Request, "method" | 
 function shouldEnforceOriginValidation(req: Pick<express.Request, "path">): boolean {
   // User rationale: static HTML/CSS/JS must keep loading even when intermediaries rewrite
   // Origin/forwarded headers, while API and auth endpoints retain strict same-origin checks.
-  // /version joins the API set because the browser's reconnect probe fetches it cross-origin when
-  // the frontend is served from a different origin than the backend.
   return (
-    req.path.startsWith("/orpc") ||
-    req.path.startsWith("/api") ||
-    req.path.startsWith("/auth/") ||
-    req.path === "/version"
+    req.path.startsWith("/orpc") || req.path.startsWith("/api") || req.path.startsWith("/auth/")
   );
 }
 

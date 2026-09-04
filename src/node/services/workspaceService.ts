@@ -3970,6 +3970,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         count: new Set([...this.initAbortControllers.keys(), ...this.initSettlementPromises.keys()])
           .size,
       },
+      {
+        kind: "workspace-lifecycle",
+        count: new Set([
+          ...this.removingWorkspaces,
+          ...this.archivingWorkspaces,
+          ...this.preflightForkCounts.keys(),
+          ...this.preflightStagingCounts.keys(),
+        ]).size,
+      },
       { kind: "queued-messages", count: queuedMessages },
       { kind: "auto-retries", count: autoRetries },
       {
@@ -5551,6 +5560,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private async removeUnlocked(workspaceId: string, force = false): Promise<Result<void>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -8396,6 +8406,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
+    if (this.shuttingDown) return Err("Server is shutting down");
     this.archivingWorkspaces.add(workspaceId);
     let admissionHold: Disposable | undefined;
 

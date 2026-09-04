@@ -241,9 +241,10 @@ describe("API reconnection", () => {
     expect(MockWebSocket.instances).toHaveLength(0);
   });
 
-  test.each(["changed", "same", "unreachable", "malformed"])(
+  test.each(["changed", "rebuilt", "same", "unreachable", "malformed", "cross-origin"])(
     "checks the server version on reconnect: %s",
     async (scenario) => {
+      if (scenario === "cross-origin") process.env.VITE_BACKEND_URL = "https://api.example.com";
       const reload = spyOn(window.location, "reload").mockImplementation(() => undefined);
       const requests: string[] = [];
       fetchImpl = (input) => {
@@ -259,6 +260,7 @@ describe("API reconnection", () => {
                 : {
                     git_commit:
                       scenario === "changed" ? "different-server-commit" : VERSION.git_commit,
+                    git_describe: scenario === "rebuilt" ? "v9.9.9-rebuilt" : VERSION.git_describe,
                   }
             ),
             { status: 200 }
@@ -289,10 +291,14 @@ describe("API reconnection", () => {
         MockWebSocket.lastInstance()!.simulateOpen();
         await Promise.resolve();
       });
-      expect(requests).toEqual(["https://coder.example.com/@u/ws/apps/mux/version"]);
-      expect(reload).toHaveBeenCalledTimes(scenario === "changed" ? 1 : 0);
-      if (scenario !== "changed") expect(latestState!.status).toBe("connected");
+      expect(requests).toEqual(
+        scenario === "cross-origin" ? [] : ["https://coder.example.com/@u/ws/apps/mux/version"]
+      );
+      const reloads = scenario === "changed" || scenario === "rebuilt" ? 1 : 0;
+      expect(reload).toHaveBeenCalledTimes(reloads);
+      if (reloads === 0) expect(latestState!.status).toBe("connected");
       reload.mockRestore();
+      delete process.env.VITE_BACKEND_URL;
     }
   );
 

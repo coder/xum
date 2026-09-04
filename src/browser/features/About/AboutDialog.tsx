@@ -19,6 +19,7 @@ const blockerLabels: Record<RestartBlocker["kind"], string> = {
   "active-streams": "Active streams",
   "pending-turns": "Pending turns",
   "workspace-inits": "Workspaces still initializing",
+  "workspace-lifecycle": "Workspaces being archived, removed, forked, or staged",
   "queued-messages": "Sessions with queued messages",
   "auto-retries": "Pending auto-retries",
   terminals: "Open terminals",

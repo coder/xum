@@ -6,7 +6,12 @@ import {
   SERVER_UPDATE_SMOKE_TIMEOUT_MS,
   SERVER_UPDATE_STAGING_PREFIX,
 } from "@/constants/serverUpdate";
-import { isExactVersion, readPackageVersion, type InstallLayout } from "./installLayout";
+import {
+  isExactVersion,
+  readPackageVersion,
+  resolveCliEntry,
+  type InstallLayout,
+} from "./installLayout";
 
 export function installCommand(
   layout: InstallLayout,
@@ -66,7 +71,7 @@ export async function stageUpdate(
 ): Promise<string> {
   const command = installCommand(layout, version);
   // Pruning must never remove the target of a launcher that was re-pointed behind this process.
-  if ((await fs.realpath(layout.launcher)) !== layout.entry)
+  if (resolveCliEntry(layout.launcher) !== layout.entry)
     throw new Error("Server launcher changed since startup");
   const parent = path.dirname(layout.workdir);
   const active = await fs.realpath(layout.workdir);

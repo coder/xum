@@ -257,10 +257,17 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         client.general
           .ping("auth-check")
           .then(async () => {
-            // A reconnected socket may belong to a newer server than this loaded bundle.
-            if (hasConnectedRef.current && connectionId === connectionIdRef.current) {
+            // A reconnected socket may belong to a newer server than this loaded bundle. Only a
+            // bundle served by that server can be refreshed by reloading, so split-origin setups
+            // (VITE_BACKEND_URL, extension webviews) skip the probe.
+            const backendBaseUrl = getBrowserBackendBaseUrl();
+            if (
+              hasConnectedRef.current &&
+              connectionId === connectionIdRef.current &&
+              new URL(backendBaseUrl).origin === window.location.origin
+            ) {
               try {
-                const response = await fetch(`${getBrowserBackendBaseUrl()}/version`, {
+                const response = await fetch(`${backendBaseUrl}/version`, {
                   cache: "no-store",
                   signal: AbortSignal.timeout(SERVER_VERSION_CHECK_TIMEOUT_MS),
                 });
@@ -272,7 +279,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
                   "git_commit" in version &&
                   typeof version.git_commit === "string" &&
                   version.git_commit.length > 0 &&
-                  version.git_commit !== VERSION.git_commit
+                  (version.git_commit !== VERSION.git_commit ||
+                    ("git_describe" in version && version.git_describe !== VERSION.git_describe))
                 ) {
                   window.location.reload();
                   return;
