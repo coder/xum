@@ -61,7 +61,7 @@ const INHERIT = "__inherit__";
 // apply reasoningMode. Never offer a Pro toggle that cannot affect requests.
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
-const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
+const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "intuition"]);
 
 function getAgentDefinitionPath(agent: AgentDefinitionDescriptor): string | null {
   switch (agent.scope) {
@@ -439,6 +439,8 @@ export function TasksSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const memoryConsolidationEnabled = memoryEnabled && memoryConsolidationFlag;
+  const memoryIntuitionFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_INTUITION);
+  const memoryIntuitionEnabled = memoryEnabled && memoryIntuitionFlag;
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
@@ -851,8 +853,15 @@ export function TasksSection() {
         agentAiDefaults,
         portableDesktopEnabled,
         memoryConsolidationEnabled,
+        memoryIntuitionEnabled,
       }),
-    [agentAiDefaults, listedAgents, portableDesktopEnabled, memoryConsolidationEnabled]
+    [
+      agentAiDefaults,
+      listedAgents,
+      portableDesktopEnabled,
+      memoryConsolidationEnabled,
+      memoryIntuitionEnabled,
+    ]
   );
   const execSubagentAgent = listedAgents.find(
     (agent) => agent.id === "exec" && agent.subagentRunnable && agent.uiSelectable

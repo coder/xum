@@ -613,6 +613,13 @@ export class MemoryService extends EventEmitter {
     }
   }
 
+  /** Recognition, unlike scanning or UI browsing, is an actual agent recall. */
+  async recordRecall(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
+    const parsed = parseMemoryPath(virtualPath);
+    const scope = this.requireFilePath(parsed, virtualPath);
+    await this.recordUsage(ctx, scope, parsed.relPath, { write: false });
+  }
+
   private async recordRename(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
