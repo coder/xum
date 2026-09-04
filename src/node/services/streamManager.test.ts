@@ -8,6 +8,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
+  ModelFallbackProgress,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
   ToolCallStartEvent,
@@ -258,6 +259,7 @@ function createStreamInfoForTests(
     didRetryPreviousResponseIdAtStep: false,
     receivedTerminalEvent: false,
     currentStepStartIndex: 0,
+    stepCount: 0,
     stepTracker: {},
     ...overrides,
   };
@@ -1565,9 +1567,13 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean;
   type BuildStopWhenCondition = (request: {
+    modelString: string;
     hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+    onQueuedMessageStop?: (stop: { modelString: string; stepsRemaining: number }) => void;
+    stepBudget?: number;
     toolPolicy?: ToolPolicy;
   }) => StopWhenCondition[];
+  const TEST_MODEL_STRING = "anthropic:claude-sonnet-4-5";
 
   function buildStopWhenForTests(streamManager = new StreamManager(historyService)) {
     return getPrivateMethodForTests<BuildStopWhenCondition>(
@@ -1578,6 +1584,7 @@ describe("StreamManager - stopWhen configuration", () => {
 
   function requiredToolConditionForTests(toolPolicy: ToolPolicy): StopWhenCondition {
     const [, , requiredToolCondition] = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
       hasQueuedMessages: () => false,
       toolPolicy,
     });
@@ -1590,7 +1597,10 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("returns step-cap and queued-message conditions with no policy", () => {
     let queued = false;
-    const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
+    const stopWhen = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
+      hasQueuedMessages: () => queued,
+    });
     expect(stopWhen).toHaveLength(3);
 
     const [maxStepCondition, queuedMessageCondition, requiredToolCondition] = stopWhen;
@@ -1603,6 +1613,81 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(requiredToolCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
       false
     );
+  });
+
+  test("queued-message stop reports itself only when no required tool completed", () => {
+    let queued = false;
+    let stopsForQueuedMessage = 0;
+    let stoppedModel: string | undefined;
+    const [, queuedMessageCondition] = buildStopWhenForTests()({
+      modelString: "openai:gpt-5-fallback",
+      hasQueuedMessages: () => queued,
+      onQueuedMessageStop: ({ modelString }) => {
+        stopsForQueuedMessage += 1;
+        stoppedModel = modelString;
+      },
+      toolPolicy: [{ regex_match: "agent_report", action: "require" }],
+    });
+    const bashStep = stepsWithToolResult("bash", { success: true });
+
+    expect(queuedMessageCondition(bashStep)).toBe(false);
+    expect(stopsForQueuedMessage).toBe(0);
+
+    queued = true;
+    expect(queuedMessageCondition(bashStep)).toBe(true);
+    expect(stopsForQueuedMessage).toBe(1);
+    // The stop names the request's own model, which is the fallback's after a model swap.
+    expect(stoppedModel).toBe("openai:gpt-5-fallback");
+
+    expect(queuedMessageCondition(stepsWithToolResult("agent_report", { success: true }))).toBe(
+      true
+    );
+    expect(stopsForQueuedMessage).toBe(1);
+
+    expect(queuedMessageCondition(stepsWithToolResult("agent_report", { success: false }))).toBe(
+      true
+    );
+    expect(stopsForQueuedMessage).toBe(2);
+  });
+
+  test("queued-message stop does not report itself once the step cap is reached", () => {
+    let stopsForQueuedMessage = 0;
+    const [maxStepCondition, queuedMessageCondition] = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
+      hasQueuedMessages: () => true,
+      onQueuedMessageStop: () => {
+        stopsForQueuedMessage += 1;
+      },
+    });
+    const cappedSteps = { steps: new Array<unknown>(100000).fill({}) };
+
+    expect(maxStepCondition(cappedSteps)).toBe(true);
+    expect(queuedMessageCondition(cappedSteps)).toBe(true);
+    expect(stopsForQueuedMessage).toBe(0);
+
+    expect(queuedMessageCondition({ steps: new Array<unknown>(99999).fill({}) })).toBe(true);
+    expect(stopsForQueuedMessage).toBe(1);
+  });
+
+  test("a step budget replaces the default ceiling and the cut reports what is left", () => {
+    const stops: number[] = [];
+    const [maxStepCondition, queuedMessageCondition] = buildStopWhenForTests()({
+      modelString: TEST_MODEL_STRING,
+      hasQueuedMessages: () => true,
+      onQueuedMessageStop: ({ stepsRemaining }) => {
+        stops.push(stepsRemaining);
+      },
+      stepBudget: 5,
+    });
+
+    expect(maxStepCondition({ steps: new Array<unknown>(4).fill({}) })).toBe(false);
+    expect(maxStepCondition({ steps: new Array<unknown>(5).fill({}) })).toBe(true);
+
+    expect(queuedMessageCondition({ steps: new Array<unknown>(2).fill({}) })).toBe(true);
+    expect(stops).toEqual([3]);
+    // At the budget the ceiling ends the turn; the cut owes nothing.
+    expect(queuedMessageCondition({ steps: new Array<unknown>(5).fill({}) })).toBe(true);
+    expect(stops).toEqual([3]);
   });
 
   const requiredToolCases: Array<{
@@ -2117,6 +2202,137 @@ describe("StreamManager - fallback construction callbacks", () => {
       failStreamConstruction: true,
     });
     expect(onFailure).not.toHaveBeenCalled();
+  });
+});
+
+describe("StreamManager - fallback chain continuation", () => {
+  const requestedModel = KNOWN_MODELS.SONNET.id;
+  const cutModel = KNOWN_MODELS.GPT.id;
+  const nextModel = KNOWN_MODELS.GEMINI_FLASH.id;
+  // The requested model refused and the turn was cut while running on the first fallback.
+  const progress: ModelFallbackProgress = {
+    requestedModel,
+    refusedModels: [requestedModel],
+    chain: [cutModel, nextModel],
+  };
+
+  async function runContinuationForTests(
+    workspaceId: string,
+    streams: Array<() => AsyncGenerator<unknown, void, unknown>>
+  ) {
+    const streamManager = new StreamManager(historyService);
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+    Reflect.set(streamManager, "createTempDirForStream", () =>
+      Promise.resolve("/tmp/fallback-continuation-tempdir")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => undefined);
+    const errorEvents: unknown[] = [];
+    const streamEndEvents: Array<{
+      metadata?: {
+        model?: string;
+        modelFallback?: { requestedModel: string; refusedModels: string[] };
+      };
+    }> = [];
+    onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+    onTurnEngineEvent(streamManager, "stream-end", (data) => {
+      streamEndEvents.push(data as (typeof streamEndEvents)[number]);
+    });
+
+    const messageId = `${workspaceId}-message`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const createStreamResult = mock(
+      (_request: { modelFallbackProgress?: ModelFallbackProgress }) => {
+        const nextStream = streams.shift();
+        if (nextStream == null) {
+          throw new Error("createStreamResult called more often than the test provided streams");
+        }
+        return createStreamResultForTests(nextStream(), {
+          inputTokens: 5,
+          outputTokens: 3,
+          totalTokens: 8,
+        });
+      }
+    );
+    expect(Reflect.set(streamManager, "createStreamResult", createStreamResult)).toBe(true);
+    const prepare = mock((nextModelString: string) =>
+      Promise.resolve(
+        Ok({
+          model: createTestLanguageModel(`fallback-${nextModelString}`),
+          modelString: nextModelString,
+          messages: [],
+          system: "fallback system",
+          tools: undefined,
+        })
+      )
+    );
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel("cut-model"),
+        modelString: cutModel,
+        tools: {},
+        modelFallback: { chain: progress.chain, prepare },
+        modelFallbackProgress: progress,
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected the continuation stream to start");
+    }
+    await result.data.completion;
+    return { errorEvents, streamEndEvents, createStreamResult, prepare };
+  }
+
+  const refusal = () =>
+    (async function* () {
+      await Promise.resolve();
+      yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+    })();
+  const answer = () =>
+    (async function* () {
+      await Promise.resolve();
+      yield { type: "text-delta", text: "answer" };
+      yield { type: "finish", finishReason: "stop" };
+    })();
+
+  test("a refusal on the resumed stream moves on to the entry after the resumed model", async () => {
+    const run = await runContinuationForTests("fallback-continuation-refusal-workspace", [
+      refusal,
+      answer,
+    ]);
+
+    expect(run.errorEvents).toHaveLength(0);
+    // Not back to the chain's first entry (the resumed model itself) or a chain of its own.
+    expect(run.prepare.mock.calls.map((call) => call[0])).toEqual([nextModel]);
+    // Each request carries the chain state a further cut would report: the cut turn's at
+    // first, then the hop's.
+    expect(run.createStreamResult.mock.calls[0]?.[0].modelFallbackProgress).toEqual(progress);
+    expect(run.createStreamResult.mock.calls[1]?.[0].modelFallbackProgress).toEqual({
+      ...progress,
+      refusedModels: [requestedModel, cutModel],
+    });
+    expect(run.streamEndEvents[0]?.metadata?.model).toBe(nextModel);
+    expect(run.streamEndEvents[0]?.metadata?.modelFallback).toEqual({
+      requestedModel,
+      refusedModels: [requestedModel, cutModel],
+    });
+  });
+
+  test("a resumed stream that answers records the cut turn's fallback", async () => {
+    const run = await runContinuationForTests("fallback-continuation-answer-workspace", [answer]);
+
+    expect(run.errorEvents).toHaveLength(0);
+    expect(run.prepare).not.toHaveBeenCalled();
+    expect(run.streamEndEvents[0]?.metadata?.model).toBe(cutModel);
+    expect(run.streamEndEvents[0]?.metadata?.modelFallback).toEqual({
+      requestedModel,
+      refusedModels: [requestedModel],
+    });
   });
 });
 
@@ -2715,6 +2931,8 @@ describe("StreamManager - turn completion", () => {
     createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
     sink?: (event: TurnEngineEvent) => void | Promise<void>;
     events?: TurnEngineEvent[];
+    toolPolicy?: ToolPolicy;
+    stepBudget?: number;
   }) {
     const streamManager = new StreamManager(
       historyService,
@@ -2739,11 +2957,90 @@ describe("StreamManager - turn completion", () => {
         messageId: input.messageId,
         model: createTestLanguageModel(),
         providedRuntimeTempDir: "",
+        toolPolicy: input.toolPolicy,
+        stepBudget: input.stepBudget,
       })
     );
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected stream to start");
     return { streamManager, handle: result.data };
+  }
+
+  // The soft stop for a queued tool-end message lands right after a provider-executed tool
+  // result, before the loop's step-end stop conditions run; the abort reports whether that step
+  // already completed a required tool so the session knows the turn was over anyway.
+  for (const requiredToolCase of [
+    { requiredTool: "web_search", output: { ok: true }, satisfied: true },
+    { requiredTool: "web_search", output: { ok: false }, satisfied: false },
+    { requiredTool: "agent_report", output: { ok: true }, satisfied: false },
+  ]) {
+    test(`a queued-message soft stop reports a satisfied required tool: ${requiredToolCase.requiredTool} -> ${requiredToolCase.output.ok} is ${requiredToolCase.satisfied}`, async () => {
+      const workspaceId = `soft-stop-required-${requiredToolCase.requiredTool}-${requiredToolCase.output.ok}`;
+      const events: TurnEngineEvent[] = [];
+      const managerRef: { current?: StreamManager } = {};
+      let releaseToolResult!: () => void;
+      const toolResultGate = new Promise<void>((resolve) => {
+        releaseToolResult = resolve;
+      });
+      const started = await startWithStreamResult({
+        workspaceId,
+        messageId: "soft-stop-required-message",
+        stepBudget: 5,
+        toolPolicy: [{ regex_match: requiredToolCase.requiredTool, action: "require" }],
+        sink: (event) => {
+          events.push(event);
+          if (event.type === "tool-call-end") {
+            // AgentSession asks for the soft stop from this event, synchronously.
+            void managerRef.current?.stopStream(workspaceId, {
+              soft: true,
+              abortReason: "queued-message",
+            });
+          }
+        },
+        createStreamResult: (_request, abortController) =>
+          createStreamResultForTests(
+            (async function* () {
+              // Armed before the tool result: the soft stop aborts while that result is handled.
+              const aborted = new Promise<void>((resolve) => {
+                abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+              });
+              yield { type: "start-step" };
+              yield {
+                type: "tool-call",
+                toolCallId: "call-1",
+                toolName: "web_search",
+                input: { query: "x" },
+                providerExecuted: true,
+              };
+              await toolResultGate;
+              yield {
+                type: "tool-result",
+                toolCallId: "call-1",
+                toolName: "web_search",
+                output: requiredToolCase.output,
+                providerExecuted: true,
+              };
+              await aborted;
+            })()
+          ),
+      });
+      managerRef.current = started.streamManager;
+      releaseToolResult();
+
+      expect(await started.handle.completion).toEqual({
+        status: "aborted",
+        abortReason: "queued-message",
+      });
+      const abort = events.find((event) => event.type === "stream-abort");
+      expect(abort?.type).toBe("stream-abort");
+      if (abort?.type !== "stream-abort") throw new Error("Expected a stream-abort event");
+      expect(abort.metadata?.requiredToolSatisfied).toBe(
+        requiredToolCase.satisfied ? true : undefined
+      );
+      // The cut's remainder rides on the committed partial for a startup retry after a crash.
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.metadata?.stepsRemaining).toBe(4);
+    });
   }
 
   test("pre-start failures return Err while successful startup owns an aborted completion", async () => {
@@ -3087,6 +3384,89 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       expect(ensureOperations[i]).toBe("ensure-start");
       expect(ensureOperations[i + 1]).toBe("ensure-end");
     }
+  });
+
+  test("refuses registration when the caller's admission probe turns stale during setup", async () => {
+    const workspaceId = "test-workspace-refuse-before-create";
+
+    let createCalled = false;
+    let streamStartEmitted = false;
+    let refused = false;
+
+    onTurnEngineEvent(streamManager, "stream-start", () => {
+      streamStartEmitted = true;
+    });
+    Reflect.set(streamManager, "createTempDirForStream", (): Promise<string> => {
+      // A goal Pause lands during startup I/O: nothing aborts the signal, only the probe knows.
+      refused = true;
+      return Promise.resolve("/tmp/mock-stream-temp");
+    });
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => undefined);
+    Reflect.set(streamManager, "createStreamAtomically", (): never => {
+      createCalled = true;
+      throw new Error("createStreamAtomically should not be called");
+    });
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-refuse",
+        model: createTestLanguageModel(),
+        runtime,
+        refuseStreamStart: () => refused,
+        tools: {},
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(createCalled).toBe(false);
+    expect(streamStartEmitted).toBe(false);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
+  test("refuses processing when the admission probe turns stale during the envelope write", async () => {
+    const workspaceId = "test-workspace-refuse-after-construct";
+
+    let processCalled = false;
+    let streamStartEmitted = false;
+    let refused = false;
+
+    onTurnEngineEvent(streamManager, "stream-start", () => {
+      streamStartEmitted = true;
+    });
+    Reflect.set(
+      streamManager,
+      "createTempDirForStream",
+      (): Promise<string> => Promise.resolve("/tmp/mock-stream-temp")
+    );
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => undefined);
+    Reflect.set(streamManager, "processStreamWithCleanup", (): Promise<void> => {
+      processCalled = true;
+      return Promise.resolve();
+    });
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-refuse-after-construct",
+        model: createTestLanguageModel(),
+        runtime,
+        refuseStreamStart: () => refused,
+        // The stream is registered by now; a goal Pause lands while the envelope is written.
+        onStreamConstructed: () => {
+          refused = true;
+          return Promise.resolve();
+        },
+        tools: {},
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(processCalled).toBe(false);
+    expect(streamStartEmitted).toBe(false);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
 
   test("should honor abortSignal before atomic stream creation", async () => {
@@ -3903,6 +4283,100 @@ describe("StreamManager - empty stream completions", () => {
     };
     expect(Object.keys(swappedRequest.tools ?? {})).toEqual(Object.keys(fallbackTools));
     expect(swappedRequest.system).toBe("fallback system");
+  });
+
+  test("a fallback hop runs under the refused stream's remaining step budget, none once spent", async () => {
+    const runRefusalWithFallback = async (stepBudget: number) => {
+      const streamManager = new StreamManager(historyService);
+      const errorEvents: unknown[] = [];
+      onTurnEngineEvent(streamManager, "error", (data) => errorEvents.push(data));
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+
+      const workspaceId = `fallback-step-budget-${stepBudget}-workspace`;
+      const messageId = "fallback-step-budget-message";
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
+
+      const createStreamResult = mock((_request: { stepBudget?: number }) =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "fallback answer" };
+            yield { type: "finish", finishReason: "stop" };
+          })(),
+          { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
+        )
+      );
+      expect(Reflect.set(streamManager, "createStreamResult", createStreamResult)).toBe(true);
+      const prepare = mock((nextModelString: string) =>
+        Promise.resolve(
+          Ok({
+            model: createTestLanguageModel("fallback-model"),
+            modelString: nextModelString,
+            messages: [],
+            system: "fallback system",
+            tools: {},
+            thinkingLevel: "off",
+          })
+        )
+      );
+
+      const startTime = Date.now() - 250;
+      const streamInfo = createStreamInfoForTests({
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            // The refused step is a step the turn spent.
+            yield { type: "start-step" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 30, outputTokens: 0, totalTokens: 30 },
+            };
+            yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+          })(),
+          { inputTokens: 30, outputTokens: 0, totalTokens: 30 }
+        ),
+        messageId,
+        startTime,
+        lastPartTimestamp: startTime,
+        model: KNOWN_MODELS.SONNET.id,
+        metadataModel: KNOWN_MODELS.SONNET.id,
+        historySequence: 1,
+        initialMetadata: { agentId: "plan" },
+        runtime,
+        request: {
+          model: createTestLanguageModel("refused-model"),
+          messages: [],
+          providerOptions: undefined,
+          stepBudget,
+        },
+        modelFallback: {
+          options: { chain: [KNOWN_MODELS.GPT.id], prepare },
+          requestedModel: KNOWN_MODELS.SONNET.id,
+          refusedModels: [],
+          original: { maxOutputTokens: undefined },
+        },
+      });
+
+      await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, 1);
+      return { errorEvents, prepare, createStreamResult };
+    };
+
+    // Three steps allowed and one spent on the refusal: the hop's own loop gets the other two.
+    const hop = await runRefusalWithFallback(3);
+    expect(hop.errorEvents).toHaveLength(0);
+    expect(hop.createStreamResult).toHaveBeenCalledTimes(1);
+    expect(hop.createStreamResult.mock.calls[0]?.[0].stepBudget).toBe(2);
+
+    // The refusal spent the last step: the ceiling ended the turn, so no hop is bought.
+    const spent = await runRefusalWithFallback(1);
+    expect(spent.prepare).not.toHaveBeenCalled();
+    expect(spent.createStreamResult).not.toHaveBeenCalled();
+    expect(spent.errorEvents).toHaveLength(1);
+    expect(spent.errorEvents[0]).toMatchObject({ errorType: "model_refusal" });
   });
 
   test("partial refusal with a configured fallback continues from cloned partial output", async () => {
@@ -5470,6 +5944,7 @@ describe("StreamManager - previousResponseId recovery", () => {
       stepTracker: { latestMessages: stepMessages },
       didRetryPreviousResponseIdAtStep: false,
       currentStepStartIndex: 1,
+      stepCount: 1,
       request: {
         model,
         messages: [{ role: "user", content: "original" }],

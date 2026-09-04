@@ -504,4 +504,154 @@ describe("AgentSession post-compaction context retry", () => {
 
     session.dispose();
   });
+
+  // A revalidated turn's retry is admitted, then the delegated handle is interrupted while the
+  // retry's launch prepares: StreamManager refuses the launch as a startup-aborted Ok. That is
+  // not a started retry; the episode must settle terminal so the owner's waiter is released.
+  test("a revalidated retry refused at the launch boundary settles terminal, not retry-started", async () => {
+    const workspaceId = "ws-launch-refused";
+    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const sessionDir = path.join(sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir);
+    await createPersistedPostCompactionState({
+      filePath: path.join(sessionDir, "post-compaction.json"),
+      diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
+    });
+    const delegatedTurn = {
+      type: "workspace-turn-task",
+      taskHandleId: "wst_wake",
+      ownerWorkspaceId: "owner-ws",
+      turnId: "turn-wake",
+    } as const;
+
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    // An on-send-compacted wake continuation: the stream inherits its delegated turn from the
+    // summary, not from the wake row or the resume options.
+    await historyService.appendToHistory(workspaceId, {
+      id: "compaction-summary",
+      role: "assistant",
+      parts: [{ type: "text", text: "Summary" }],
+      metadata: {
+        timestamp: 1000,
+        compacted: "user",
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Background monitor wake",
+            model: "openai:gpt-4o",
+            agentId: "exec",
+            workspaceTurnMetadata: delegatedTurn,
+          },
+        },
+      },
+    });
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Background monitor wake" }],
+      metadata: { timestamp: 1100, muxMetadata: { type: "bash-monitor-wake", records: [] } },
+    });
+
+    const aiEmitter = new EventEmitter();
+    let retryLaunched!: () => void;
+    const retryLaunch = new Promise<void>((resolve) => {
+      retryLaunched = resolve;
+    });
+    let stale = false;
+    let callCount = 0;
+    const streamMessage = mock((..._args: unknown[]) => {
+      callCount += 1;
+      if (callCount === 1) {
+        aiEmitter.emit("error", {
+          workspaceId,
+          messageId: "assistant-ctx-exceeded",
+          error: "Context length exceeded",
+          errorType: "context_exceeded",
+        });
+        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+      }
+      // The handle is interrupted right before registration: no stream-start, a startup-aborted
+      // handle.
+      stale = true;
+      retryLaunched();
+      return Promise.resolve({
+        success: true as const,
+        data: {
+          messageId: "assistant-retry",
+          completion: Promise.resolve({ status: "aborted" as const, abortReason: "startup" }),
+        },
+      });
+    });
+    const admit = mock((_correlation: unknown) =>
+      Promise.resolve({ admissible: true, admissionStale: () => stale })
+    );
+
+    const session = new AgentSession({
+      workspaceId,
+      config: {
+        rootDir: sessionsDir,
+        sessionsDir,
+        srcDir: "/tmp",
+        loadConfigOrDefault: mock(() => ({})),
+      } as unknown as Config,
+      historyService,
+      aiService: {
+        ...createStreamLifecycleMocks(),
+        on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
+          aiEmitter.on(String(eventName), listener);
+          return this;
+        },
+        off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
+          aiEmitter.off(String(eventName), listener);
+          return this;
+        },
+        streamMessage,
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve({ success: false as const, error: "nope" })
+        ),
+      } as unknown as AIService,
+      initStateManager: {
+        on() {
+          return this;
+        },
+        off() {
+          return this;
+        },
+      } as unknown as InitStateManager,
+      backgroundProcessManager: {
+        setMessageQueued: mock(() => undefined),
+        cleanup: mock(() => Promise.resolve()),
+      } as unknown as BackgroundProcessManager,
+      admitStrandedTurnResume: admit,
+    });
+
+    const resumed = await session.resumeStream(
+      { model: "openai:gpt-4o", agentId: "exec" },
+      { revalidateAdmission: true }
+    );
+    expect(resumed.success).toBe(true);
+
+    const withTimeout = <T>(promise: Promise<T>, label: string): Promise<T> =>
+      Promise.race([
+        promise,
+        new Promise<T>((_, reject) =>
+          setTimeout(() => reject(new Error(`${label} timeout`)), 1000)
+        ),
+      ]);
+    await withTimeout(retryLaunch, "retry launch");
+    expect(
+      await withTimeout(
+        session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded"),
+        "decision"
+      )
+    ).toBe("terminal");
+    expect(session.isPreparingTurn()).toBe(false);
+    expect(callCount).toBe(2);
+    // The retry revalidated against the inherited delegated turn, not just the wake.
+    expect(admit).toHaveBeenCalledTimes(2);
+    expect(admit.mock.calls[1]?.[0]).toEqual(delegatedTurn);
+
+    session.dispose();
+  });
 });

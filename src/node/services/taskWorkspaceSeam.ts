@@ -376,7 +376,10 @@ export interface WorkspaceTurnHost {
     options: SendMessageOptions,
     internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; hardStop?: boolean }
+  ): Result<void>;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
@@ -401,10 +404,10 @@ export interface TurnAdmissionHost {
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   hasPendingAutoRetry(workspaceId: string): boolean;
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
-  hasPendingWorkspaceTurnContinuation(
+  claimWorkspaceTurnContinuation(
     workspaceId: string,
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
   ): boolean;
   hasQueuedWorkspaceTurn(workspaceId: string, handleId: string): boolean;
   removeQueuedWorkspaceTurn(
@@ -532,6 +535,20 @@ export interface AgentTaskIntegration {
     options?: { workflowRunId?: string }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
+  settleWorkspaceTurnContinuationFailure(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    status: "interrupted" | "error",
+    error: string
+  ): Promise<void>;
+  /**
+   * Whether the delegated turn is still active on this workspace, with a probe that turns stale
+   * once a stop lands on the workspace after the read.
+   */
+  getWorkspaceTurnContinuationAdmission(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): Promise<{ admissible: boolean; admissionStale: () => boolean }>;
 }
 
 export interface WorkspaceTurnTaskHost {

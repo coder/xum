@@ -88,6 +88,8 @@ describe("StreamManager - model-only tool notifications", () => {
       lastStepUsage: undefined,
       lastStepProviderMetadata: undefined,
       toolModelUsages: [],
+      request: { messages: [], providerOptions: undefined },
+      stepCount: 0,
     };
 
     const method = Reflect.get(streamManager, "processStreamWithCleanup") as unknown;
@@ -182,6 +184,8 @@ describe("StreamManager - model-only tool notifications", () => {
       lastStepUsage: undefined,
       lastStepProviderMetadata: undefined,
       toolModelUsages: [],
+      request: { messages: [], providerOptions: undefined },
+      stepCount: 0,
     };
 
     const method = Reflect.get(streamManager, "processStreamWithCleanup") as unknown;

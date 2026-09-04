@@ -376,6 +376,75 @@ describe("AgentSession startup auto-retry recovery", () => {
     session.dispose();
   });
 
+  test("startup auto-retry runs a queued-cut row under the remainder it persisted", async () => {
+    const workspaceId = "startup-retry-cut-step-budget";
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("original-user", "user", "Continue the original task", {
+        timestamp: Date.now(),
+      })
+    );
+    // The soft-aborted partial was committed with the cut turn's remainder, then the process
+    // exited before the in-memory resume started.
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-cut", "assistant", "Interrupted response", {
+        timestamp: Date.now(),
+        partial: true,
+        stepsRemaining: 3,
+      })
+    );
+
+    session.ensureStartupAutoRetryCheck();
+    await (session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
+      .startupAutoRetryCheckPromise;
+
+    const retryRequest = (
+      session as unknown as { lastAutoRetryResumeRequest?: { stepBudget?: number } }
+    ).lastAutoRetryResumeRequest;
+    expect(retryRequest?.stepBudget).toBe(3);
+    session.dispose();
+  });
+
+  test("startup auto-retry fails closed on a malformed persisted remainder", async () => {
+    const workspaceId = "startup-retry-cut-step-budget-malformed";
+    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("original-user", "user", "Continue the original task", {
+        timestamp: Date.now(),
+      })
+    );
+    // Raw chat.jsonl is not schema-checked on this path; a corrupt remainder must not read as
+    // absent and hand the cut turn the default ceiling.
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-cut", "assistant", "Interrupted response", {
+        timestamp: Date.now(),
+        partial: true,
+        stepsRemaining: { steps: 3 } as unknown as number,
+      })
+    );
+
+    session.ensureStartupAutoRetryCheck();
+    await (session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
+      .startupAutoRetryCheckPromise;
+
+    expect(events.find((event) => event.type === "auto-retry-abandoned")).toMatchObject({
+      reason: "malformed_step_budget",
+    });
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(
+      (session as unknown as { lastAutoRetryResumeRequest?: unknown }).lastAutoRetryResumeRequest
+    ).toBeUndefined();
+    session.dispose();
+  });
+
   test("hidden completed subagent reports preserve the existing startup retry fallback", async () => {
     const workspaceId = "startup-retry-hidden-subagent-report";
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);

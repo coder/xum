@@ -4072,6 +4072,43 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
+      settleForfeitedWorkspaceTurnContinuation: async (metadata, reason) => {
+        await this.agentTaskIntegration?.settleWorkspaceTurnContinuationFailure(
+          workspaceId,
+          metadata,
+          "interrupted",
+          reason
+        );
+      },
+      // The stranded resume starts a stream from inside the session, so it re-applies the
+      // stream-start guards WorkspaceService.resumeStream enforces (rename, removal, archive)
+      // and, for a delegated turn, checks the owner still has it running: a task_stop or
+      // lifecycle interrupt that found the cut stream already completed had no abort to
+      // withdraw the marker with.
+      admitStrandedTurnResume: async (correlation) => {
+        const workspaceRefused = (): boolean =>
+          this.renamingWorkspaces.has(workspaceId) ||
+          this.removingWorkspaces.has(workspaceId) ||
+          this.archivingWorkspaces.has(workspaceId) ||
+          this.isWorkspaceArchivedInConfig(workspaceId);
+        if (workspaceRefused()) {
+          return { admissible: false };
+        }
+        if (correlation == null || this.agentTaskIntegration == null) {
+          return { admissible: true, admissionStale: workspaceRefused };
+        }
+        const turn = await this.agentTaskIntegration.getWorkspaceTurnContinuationAdmission(
+          workspaceId,
+          correlation
+        );
+        if (!turn.admissible) {
+          return { admissible: false };
+        }
+        return {
+          admissible: true,
+          admissionStale: () => workspaceRefused() || turn.admissionStale(),
+        };
+      },
     });
   }
 
@@ -11869,10 +11906,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void> {
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; hardStop?: boolean }
+  ): Result<void> {
     try {
       const session = this.getOrCreateSession(workspaceId);
-      session.clearQueue(options?.cancelReason);
+      session.clearQueue(options?.cancelReason, { hardStop: options?.hardStop });
       return Ok(undefined);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
@@ -12031,24 +12071,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
-  /**
-   * Whether a bash-monitor-wake continuation is queued next or mid-dispatch.
-   * See AgentSession.hasPendingBashMonitorWakeContinuation for semantics.
-   */
-  hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean {
-    const session = this.sessions.get(workspaceId.trim());
-    return session?.hasPendingBashMonitorWakeContinuation() ?? false;
+  private isWorkspaceArchivedInConfig(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return (
+      entry != null && isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+    );
   }
 
-  /**
-   * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
-   */
-  hasPendingWorkspaceTurnContinuation(
+  /** See AgentSession.claimWorkspaceTurnContinuation for semantics. */
+  claimWorkspaceTurnContinuation(
     workspaceId: string,
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
   ): boolean {
     const session = this.sessions.get(workspaceId.trim());
-    return session?.hasPendingWorkspaceTurnContinuation(metadata) ?? false;
+    return session?.claimWorkspaceTurnContinuation(metadata, streamEndMessageId) ?? false;
   }
 
   /**

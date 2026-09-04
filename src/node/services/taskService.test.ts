@@ -351,8 +351,7 @@ describe("TaskService", () => {
       isStreaming?: ReturnType<typeof mock>;
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
-      hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
-      hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
+      claimWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
@@ -13338,7 +13337,7 @@ describe("TaskService", () => {
       reason: "timed out",
     });
 
-    expect(clearQueue).toHaveBeenCalledWith(childTaskId);
+    expect(clearQueue).toHaveBeenCalledWith(childTaskId, { hardStop: true });
     expect(stopStream).toHaveBeenCalledWith(childTaskId, {
       abandonPartial: true,
       abortReason: "system",
@@ -13656,8 +13655,8 @@ describe("TaskService", () => {
     const interruptedTaskIds = await taskService.terminateAllDescendantAgentTasks(rootWorkspaceId);
     expect(interruptedTaskIds).toEqual([childTaskId, parentTaskId]);
 
-    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId);
-    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId);
+    expect(clearQueue).toHaveBeenNthCalledWith(1, childTaskId, { hardStop: true });
+    expect(clearQueue).toHaveBeenNthCalledWith(2, parentTaskId, { hardStop: true });
     expect(stopStream).toHaveBeenNthCalledWith(
       1,
       childTaskId,
@@ -25321,11 +25320,11 @@ describe("TaskService", () => {
     // A queued bash-monitor wake cuts the correlated stream at a tool boundary
     // (finishReason "tool-calls") while the child seamlessly continues the
     // same turn — the handle must stay running.
-    const hasPendingBashMonitorWakeContinuation = mock(
+    const claimWorkspaceTurnContinuation = mock(
       (workspaceId: string) => workspaceId === "childworkspace"
     );
     const { parentId, taskService } = await startWorkspaceTurnForTest({
-      hasPendingBashMonitorWakeContinuation,
+      claimWorkspaceTurnContinuation,
     });
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
@@ -25348,6 +25347,12 @@ describe("TaskService", () => {
     const running = await workspaceTurnSnapshot(taskService, parentId);
     expect(running).toMatchObject({ status: "running", workspaceId: "childworkspace" });
     expect(running?.error).toBeUndefined();
+    // The claim is bound to the exact cut it settles.
+    expect(claimWorkspaceTurnContinuation).toHaveBeenCalledWith(
+      "childworkspace",
+      correlation,
+      "msg_queue_cut"
+    );
 
     // The continuation stream inherits the correlation metadata (see
     // AgentSession.inheritOpenWorkspaceTurnMetadata); its terminal stream-end
@@ -25373,8 +25378,41 @@ describe("TaskService", () => {
     });
   });
 
+  test("workspace-turn continuation admission tracks the handle and later stops", async () => {
+    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const correlation = workspaceTurnMuxMetadata(parentId);
+
+    // Running handle on this workspace: admitted, and the probe stays fresh until a stop lands.
+    const admitted = await taskService.getWorkspaceTurnContinuationAdmission(
+      "childworkspace",
+      correlation
+    );
+    expect(admitted.admissible).toBe(true);
+    expect(admitted.admissionStale()).toBe(false);
+
+    // A stop on the workspace after the read (interruptWorkspaceTurn bumps the stop epoch inside
+    // its settlement boundary) turns the earlier probe stale and refuses a fresh read.
+    const stopped = await workspaceTurnManagerFor(taskService).interruptWorkspaceTurn(
+      parentId,
+      correlation.taskHandleId
+    );
+    expect(stopped.success).toBe(true);
+    expect(admitted.admissionStale()).toBe(true);
+    const refused = await taskService.getWorkspaceTurnContinuationAdmission(
+      "childworkspace",
+      correlation
+    );
+    expect(refused.admissible).toBe(false);
+
+    // A different workspace or turn never matches the handle.
+    expect(
+      (await taskService.getWorkspaceTurnContinuationAdmission("otherworkspace", correlation))
+        .admissible
+    ).toBe(false);
+  });
+
   test("nested agent progress preserves workspace-turn correlation", async () => {
-    const hasPendingWorkspaceTurnContinuation = mock(
+    const claimWorkspaceTurnContinuation = mock(
       (
         workspaceId: string,
         metadata: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
@@ -25384,7 +25422,7 @@ describe("TaskService", () => {
         metadata.turnId === "turn"
     );
     const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      hasPendingWorkspaceTurnContinuation,
+      claimWorkspaceTurnContinuation,
     });
     const correlation = workspaceTurnMuxMetadata(parentId);
 

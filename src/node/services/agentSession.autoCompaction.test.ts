@@ -1160,8 +1160,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
-  test("hides default follow-up sentinel in mid-stream auto-compaction prompts", async () => {
+  test("mid-stream auto-compaction hides the default follow-up sentinel and hands over the interrupted turn's remainder", async () => {
     const workspaceId = "ws-auto-compaction-mid-stream-sentinel";
+    // The interrupted stream had already moved down its fallback chain and spent steps.
+    const interruptedProgress = {
+      requestedModel: "openai:gpt-4o",
+      refusedModels: ["openai:gpt-4o"],
+      chain: ["openai:gpt-4o-fallback"],
+    };
 
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
@@ -1211,6 +1217,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         workspaceId,
         messageId: "assistant-mid-stream",
         abortReason: "system",
+        metadata: {
+          model: "openai:gpt-4o-fallback",
+          stepsRemaining: 7,
+          modelFallbackProgress: interruptedProgress,
+        },
       });
 
       return Promise.resolve(Ok(undefined));
@@ -1275,14 +1286,18 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       ownerWorkspaceId: "parent-mid-stream-compaction",
       turnId: "turn-mid-stream-compaction",
     } as const;
-    const result = await session.sendMessage(
-      "hello",
+    // The interrupted turn is a revalidated resume (a stranded delegated turn's continuation).
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-hello", "user", "hello", { timestamp: Date.now() })
+    );
+    const result = await session.resumeStream(
       {
         model: "openai:gpt-4o",
         agentId: "exec",
         muxMetadata: workspaceTurnMetadata,
       },
-      { agentInitiated: true }
+      { agentInitiated: true, revalidateAdmission: true }
     );
 
     expect(result.success).toBe(true);
@@ -1309,6 +1324,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       workspaceTurnMetadata
     );
     expect(compactionRequestMetadata.parsed.followUpContent?.agentInitiated).toBe(true);
+    // The follow-up continues the interrupted turn: on the model it reached, under what it had
+    // left of the ceiling, with the refusals so far.
+    expect(compactionRequestMetadata.parsed.followUpContent).toMatchObject({
+      model: "openai:gpt-4o-fallback",
+      stepBudget: 7,
+      modelFallbackProgress: interruptedProgress,
+      revalidateAdmission: true,
+    });
 
     const compactionRequestText =
       compactionRequestMessage?.parts.find((part) => part.type === "text")?.text ?? "";

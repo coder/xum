@@ -252,6 +252,35 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     return { config, service, events, cleanup };
   }
 
+  test("a rename refuses the stranded resume at read and at the launch boundary", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "renaming-resume-owner";
+    await config.addWorkspace("/tmp/renaming-resume-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "renaming-resume-project",
+      projectPath: "/tmp/renaming-resume-project",
+      runtimeConfig: { type: "local" },
+    });
+    try {
+      const session = service.getOrCreateSession(workspaceId);
+      const admit = Reflect.get(session, "admitStrandedTurnResume") as (
+        correlation: undefined
+      ) => Promise<{ admissible: boolean; admissionStale?: () => boolean }>;
+      const admitted = await admit(undefined);
+      expect(admitted.admissible).toBe(true);
+      expect(admitted.admissionStale?.()).toBe(false);
+
+      // rename() sees no registered stream while the resume is still in its pre-stream window
+      // and proceeds; the resume must not launch against paths being moved.
+      addToRenamingWorkspaces(service, workspaceId);
+      expect(admitted.admissionStale?.()).toBe(true);
+      expect((await admit(undefined)).admissible).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);

@@ -5,7 +5,11 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
-import { AgentSession, type AgentSessionAIService } from "@/node/services/agentSession";
+import {
+  AgentSession,
+  type AgentSessionAIService,
+  type AgentSessionOptions,
+} from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -110,6 +114,9 @@ export interface AgentSessionHarnessOptions {
   workspaceGoalService?: WorkspaceGoalService;
   mcpServerManager?: MCPServerManager;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
+  hasExternalSendPreflight?: () => boolean;
+  settleForfeitedWorkspaceTurnContinuation?: AgentSessionOptions["settleForfeitedWorkspaceTurnContinuation"];
+  admitStrandedTurnResume?: AgentSessionOptions["admitStrandedTurnResume"];
   captureEvents?: boolean;
 }
 
@@ -154,6 +161,9 @@ export async function createAgentSessionHarness(
     workspaceGoalService: options.workspaceGoalService,
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
+    hasExternalSendPreflight: options.hasExternalSendPreflight,
+    settleForfeitedWorkspaceTurnContinuation: options.settleForfeitedWorkspaceTurnContinuation,
+    admitStrandedTurnResume: options.admitStrandedTurnResume,
   });
 
   const events: WorkspaceChatMessage[] = [];

@@ -56,6 +56,7 @@ import type { StreamManager } from "./streamManager";
 import {
   markProviderMetadataCostsIncluded,
   type ModelFallbackOptions,
+  type QueuedMessageStop,
   type StreamTextOnChunk,
   type TurnCompletion,
   type TurnExecutionOptions,
@@ -227,7 +228,7 @@ export function resolveXumToolScope(
 }
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
-import type { ErrorEvent } from "@/common/types/stream";
+import type { ErrorEvent, ModelFallbackProgress } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
@@ -280,6 +281,20 @@ export interface StreamMessageOptions {
   workspaceGoalService?: WorkspaceGoalService;
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /** Fires when the model loop stops solely on behalf of a queued tool-end message. */
+  onQueuedMessageStop?: (stop: QueuedMessageStop) => void;
+  /** Step ceiling for this stream; a stream resuming a cut turn runs under the cut's remainder. */
+  stepBudget?: number;
+  /**
+   * Fallback chain of the cut turn this stream continues, used in place of the chain `model`
+   * would resolve: the resumed model may be a fallback whose own chain is unrelated.
+   */
+  modelFallbackProgress?: ModelFallbackProgress;
+  /**
+   * Pull-based startup refusal (a goal admission probe with no push into abortSignal), rechecked
+   * by StreamManager right before the stream registers.
+   */
+  refuseStreamStart?: () => boolean;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -744,6 +759,10 @@ export class TurnRequestBuilder {
       workspaceGoalService,
       disableWorkspaceAgents,
       hasQueuedMessages,
+      onQueuedMessageStop,
+      stepBudget,
+      modelFallbackProgress,
+      refuseStreamStart,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -2760,13 +2779,16 @@ export class TurnRequestBuilder {
     // a cross-typed Coder instance (coder:openai/x, type anthropic) must use
     // its own gateway-scoped chain, never the direct provider's. Task
     // children can opt out via taskOnRefusal: "fail" (see
-    // resolveWorkspaceModelFallbackChain).
-    const modelFallbackChain = resolveWorkspaceModelFallbackChain(
-      this.dependencies.config.loadConfigOrDefault(),
-      workspaceId,
-      modelString,
-      this.dependencies.providerService.getConfig()
-    );
+    // resolveWorkspaceModelFallbackChain). A stream continuing a cut turn keeps that turn's
+    // chain instead.
+    const modelFallbackChain =
+      modelFallbackProgress?.chain ??
+      resolveWorkspaceModelFallbackChain(
+        this.dependencies.config.loadConfigOrDefault(),
+        workspaceId,
+        modelString,
+        this.dependencies.providerService.getConfig()
+      );
 
     // Lazily rebuilds the per-model slice of this pipeline (model creation,
     // provider-specific message prep, provider options, headers, parameter
@@ -2912,6 +2934,10 @@ export class TurnRequestBuilder {
       toolPolicy: effectiveToolPolicy,
       providedStreamToken: streamToken,
       hasQueuedMessages,
+      onQueuedMessageStop,
+      stepBudget,
+      modelFallbackProgress,
+      refuseStreamStart,
       workspaceName: metadata.name,
       thinkingLevel: streamThinkingLevel,
       headers: requestHeaders,

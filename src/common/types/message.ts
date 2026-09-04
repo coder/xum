@@ -9,6 +9,7 @@ import type {
 } from "@/common/constants/contextBoundary";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { ModelFallbackProgress } from "./stream";
 import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
@@ -220,6 +221,14 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   goalId?: string;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
+  /**
+   * What the turn interrupted for mid-stream compaction had left of its step ceiling, the
+   * fallback chain state it reached, and whether it ran under admission revalidation: the
+   * follow-up continues that turn, not a fresh one.
+   */
+  stepBudget?: number;
+  modelFallbackProgress?: ModelFallbackProgress;
+  revalidateAdmission?: boolean;
   /**
    * Open delegated workspace-turn correlation captured before on-send
    * compaction consumed this follow-up (e.g. a bash-monitor wake continuing a
@@ -928,6 +937,8 @@ export interface MuxMetadata {
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
   partial?: boolean; // Whether this message was interrupted and is incomplete
+  /** Steps a queued-message cut left under the turn's ceiling; a startup retry runs under it. */
+  stepsRemaining?: number;
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
    * For queue-dispatched user turns: when the user last added to the queued

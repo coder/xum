@@ -14,8 +14,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     hasQueuedMessages: () => false,
     hasPendingQueuedOrPreparingTurn: () => false,
     hasPendingAutoRetry: () => false,
-    hasPendingBashMonitorWakeContinuation: () => false,
-    hasPendingWorkspaceTurnContinuation: () => false,
+    claimWorkspaceTurnContinuation: () => false,
     hasQueuedWorkspaceTurn: () => false,
     removeQueuedWorkspaceTurn: () => Ok(true),
     removeQueuedMessagesByDedupeKeyPrefix: () => Ok(0),
@@ -75,6 +74,9 @@ export function makeAgentTaskIntegrationFake(
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
+    settleWorkspaceTurnContinuationFailure: () => Promise.resolve(),
+    getWorkspaceTurnContinuationAdmission: () =>
+      Promise.resolve({ admissible: true, admissionStale: () => false }),
     ...overrides,
   };
 }

@@ -190,6 +190,10 @@ export const MuxMessageSchema = z.object({
       retrySendOptions: z.any().optional(),
       agentId: AgentIdSchema.optional().catch(undefined),
       partial: z.boolean().optional(),
+      // Steps the cut turn had left under its ceiling when a queued message interrupted it
+      // (stamped on the committed partial): a startup retry of that turn runs under this budget
+      // instead of a fresh ceiling. Self-healing read path: a malformed value reads as absent.
+      stepsRemaining: z.number().int().nonnegative().optional().catch(undefined),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),
       // RLM keep-recent floor: sanitized post-boundary copy of a pre-compaction row.

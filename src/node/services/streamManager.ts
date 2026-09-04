@@ -35,6 +35,7 @@ import type {
   ReasoningDeltaEvent,
   ReasoningEndEvent,
   CompletedMessagePart,
+  ModelFallbackProgress,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
 
@@ -114,6 +115,8 @@ const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
   "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
 const MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS = 1;
+/** Hard per-stream step cap; the practical limit is the model's own finish. */
+const MAX_STREAM_STEPS = 100_000;
 
 /** Drop reason for a partial that never reaches chat.jsonl. */
 type DroppedStreamSource = "aborted_stream" | "errored_stream";
@@ -204,7 +207,21 @@ export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<voi
 export type TurnCompletion =
   | { status: "completed" }
   | { status: "aborted"; abortReason: StreamAbortReason }
-  | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
+  | {
+      status: "failed";
+      streamError: StreamErrorPayload & { errorType: StreamErrorType };
+      /**
+       * Steps left under the stream's ceiling after the failed attempt; a retry runs under it.
+       * Absent when the attempt failed before its loop ran a step.
+       */
+      stepsRemaining?: number;
+      /**
+       * Model the failed attempt ran on and the fallback chain state it reached (a refusal may
+       * have moved it down the chain); a retry continues from there rather than repeating hops.
+       */
+      modelString?: string;
+      modelFallbackProgress?: ModelFallbackProgress;
+    };
 
 export interface TurnStreamHandle {
   messageId: string;
@@ -232,6 +249,17 @@ export function createTurnCompletionController(): TurnCompletionController {
   };
 }
 
+/**
+ * What a stream reports when its loop stops on behalf of a queued tool-end message: the model
+ * that reached the cut (a configured fallback may have swapped mid-turn), the steps left under
+ * its ceiling, and the fallback chain it was running under, for the resumed stream to continue.
+ */
+export interface QueuedMessageStop {
+  modelString: string;
+  stepsRemaining: number;
+  modelFallbackProgress?: ModelFallbackProgress;
+}
+
 // Request-construction options shared by the primary turn and model-fallback
 // hops (fallbacks rebuild these from the prepared fallback request).
 interface StreamRequestOptions {
@@ -245,6 +273,9 @@ interface StreamRequestOptions {
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  onQueuedMessageStop?: (stop: QueuedMessageStop) => void;
+  stepBudget?: number;
+  modelFallbackProgress?: ModelFallbackProgress;
   headers?: Record<string, string | undefined>;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
@@ -262,6 +293,8 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
   runtime: Runtime;
   messageId: string;
   abortSignal?: AbortSignal;
+  /** Startup-only admission probe; a true answer at registration time refuses the stream like an abort. */
+  refuseStreamStart?: () => boolean;
   initialMetadata?: Partial<MuxMetadata>;
   providedStreamToken?: StreamToken;
   workspaceName?: string;
@@ -280,6 +313,8 @@ interface StepMessageTracker {
 }
 interface StreamRequestConfig {
   model: LanguageModel;
+  /** Canonical model string of `model` (the fallback's once a fallback request replaces this). */
+  modelString: string;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
   system?: string | SystemModelMessage;
@@ -290,6 +325,23 @@ interface StreamRequestConfig {
   maxOutputTokens?: number;
   streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  /**
+   * Invoked when the loop stops on behalf of a queued tool-end message (and not
+   * because a required tool completed). The session uses it to resume the turn
+   * if that queued message is later withdrawn instead of starting a turn.
+   */
+  onQueuedMessageStop?: (stop: QueuedMessageStop) => void;
+  /**
+   * Step ceiling for this stream instead of MAX_STREAM_STEPS. A stream resuming a turn cut
+   * for a queued message inherits the cut stream's remaining steps, so cut plus resumes
+   * share one turn's ceiling; without it, every resume would restart the full cap.
+   */
+  stepBudget?: number;
+  /**
+   * Fallback chain state this request runs under (the fallback's request replaces the
+   * original's), reported at a queued-message cut so the resumed stream continues the chain.
+   */
+  modelFallbackProgress?: ModelFallbackProgress;
   /** Optional hook for callers that need chunk-level visibility during streaming. */
   onChunk?: StreamTextOnChunk;
   /** Optional hook for callers that need the live prepared step transcript. */
@@ -407,6 +459,19 @@ export interface ModelFallbackOptions {
     nextModelString: string,
     options?: ModelFallbackPrepareOptions
   ) => Promise<Result<PreparedModelFallback, string>>;
+}
+
+/** Snapshot of a stream's fallback chain state for a resumed stream to continue from. */
+function modelFallbackProgressOf(
+  state: WorkspaceStreamInfo["modelFallback"]
+): ModelFallbackProgress | undefined {
+  return state == null
+    ? undefined
+    : {
+        requestedModel: state.requestedModel,
+        refusedModels: [...state.refusedModels],
+        chain: state.options.chain,
+      };
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -595,6 +660,29 @@ function zeroTokenUsage(): LanguageModelV2Usage {
   return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 }
 
+/**
+ * Completion-tool success check: completion/routing tools use explicit success/ok markers
+ * (agent_report, propose_plan). When a marker is present, respect it (success:false means the tool
+ * should be retried, so the turn goes on). When no marker is present (MCP tools, arbitrary
+ * required tools), treat non-null object results as successful completion unless error-shaped.
+ */
+function isSuccessfulRequiredToolOutput(output: unknown): boolean {
+  if (typeof output !== "object" || output === null) {
+    return false;
+  }
+  const parsedOutput = output as Record<string, unknown>;
+  if ("success" in parsedOutput) {
+    return parsedOutput.success === true;
+  }
+  if ("ok" in parsedOutput) {
+    return parsedOutput.ok === true;
+  }
+  if (parsedOutput.error != null || parsedOutput.isError === true) {
+    return false;
+  }
+  return true;
+}
+
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
@@ -622,6 +710,16 @@ interface WorkspaceStreamInfo {
   // Needed for reconnect replay filtering because dynamic-tool parts keep their
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
+
+  // Steps started by the current SDK loop, the in-progress one included: the budget left at
+  // an abort counts a step the model already began. Reset when the loop restarts under
+  // request.stepBudget (restartStepBudget).
+  stepCount: number;
+
+  // A required completion tool (request.toolPolicy) succeeded in the step in progress. The
+  // step-end stop condition would end the turn on it, so a queued-message soft stop that lands
+  // first (after a provider-executed tool result) owes the turn no continuation.
+  requiredToolSatisfied?: boolean;
 
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
   // attachment and apply it as soon as the matching dynamic-tool part lands.
@@ -1932,12 +2030,21 @@ export class StreamManager {
       streamInfo
     );
 
+    // A queued-message cut owes the turn a continuation under what it left of the ceiling. The
+    // committed partial is that remainder's only durable carrier: a process exit before the
+    // in-memory resume starts leaves startup recovery to retry the row from history.
+    const stepsRemaining =
+      abortReason === "queued-message" ? this.remainingStepBudget(streamInfo) : undefined;
+
     // Stamp the aborted turn's usage onto the partial message BEFORE emitting
     // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
     // prices history rows from metadata.usage, so without this every
     // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
     // would ingest as $0 even though the provider billed all completed steps.
-    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+    if (
+      !abandonPartial &&
+      (usage !== undefined || streamInfo.toolModelUsages.length > 0 || stepsRemaining !== undefined)
+    ) {
       try {
         await this.awaitPendingPartialWrite(streamInfo);
         const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
@@ -1950,6 +2057,7 @@ export class StreamManager {
             ...(streamInfo.toolModelUsages.length > 0
               ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
               : {}),
+            ...(stepsRemaining !== undefined ? { stepsRemaining } : {}),
           },
         });
         await this.historyService.writePartial(workspaceId as string, partialMessage);
@@ -1995,7 +2103,17 @@ export class StreamManager {
     const abortDelivery = this.emitStreamAbort(
       workspaceId,
       streamInfo.messageId,
-      { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      {
+        usage,
+        contextUsage,
+        duration,
+        providerMetadata,
+        contextProviderMetadata,
+        model: streamInfo.model,
+        stepsRemaining: this.remainingStepBudget(streamInfo),
+        modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
+        ...(streamInfo.requiredToolSatisfied === true ? { requiredToolSatisfied: true } : {}),
+      },
       abortReason,
       abandonPartial,
       streamInfo.initialMetadata?.acpPromptId
@@ -2133,6 +2251,9 @@ export class StreamManager {
       callSettingsOverrides,
       toolPolicy,
       hasQueuedMessages,
+      onQueuedMessageStop,
+      stepBudget,
+      modelFallbackProgress,
       headers,
       onChunk,
       onStepMessages,
@@ -2172,6 +2293,7 @@ export class StreamManager {
 
     return {
       model,
+      modelString,
       messages,
       system,
       // Keep provider-level parallel tool planning enabled, but serialize sibling
@@ -2183,6 +2305,9 @@ export class StreamManager {
       streamCallSettings:
         Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
       hasQueuedMessages,
+      onQueuedMessageStop,
+      stepBudget,
+      modelFallbackProgress,
       onChunk,
       onStepMessages,
       toolPolicy,
@@ -2195,31 +2320,17 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<StreamRequestConfig, "hasQueuedMessages" | "toolPolicy">
+    request: Pick<
+      StreamRequestConfig,
+      | "hasQueuedMessages"
+      | "onQueuedMessageStop"
+      | "toolPolicy"
+      | "modelString"
+      | "stepBudget"
+      | "modelFallbackProgress"
+    >
   ): Array<ReturnType<typeof stepCountIs>> {
-    // Completion-tool stop check: completion/routing tools use explicit
-    // success/ok markers (agent_report, propose_plan).
-    // When a marker is present, respect it — success:false means the tool
-    // should be retried, so don't stop. When no marker is present (e.g.,
-    // MCP tools, arbitrary required tools), treat non-null object results
-    // as successful completion unless the result is error-shaped.
-    const isSuccessfulOutput = (output: unknown): boolean => {
-      if (typeof output !== "object" || output === null) {
-        return false;
-      }
-      const parsedOutput = output as Record<string, unknown>;
-      if ("success" in parsedOutput) {
-        return parsedOutput.success === true;
-      }
-      if ("ok" in parsedOutput) {
-        return parsedOutput.ok === true;
-      }
-      if (parsedOutput.error != null || parsedOutput.isError === true) {
-        return false;
-      }
-      return true;
-    };
-
+    const stepBudget = request.stepBudget ?? MAX_STREAM_STEPS;
     const requiredPatterns = buildRequiredToolPatterns(request.toolPolicy);
 
     const hasSuccessfulRequiredToolResult: ReturnType<typeof stepCountIs> = ({ steps }) => {
@@ -2231,19 +2342,33 @@ export class StreamManager {
         lastStep?.toolResults?.some(
           (toolResult) =>
             requiredPatterns.some((pattern) => pattern.test(toolResult.toolName)) &&
-            isSuccessfulOutput(toolResult.output)
+            isSuccessfulRequiredToolOutput(toolResult.output)
         ) ?? false
       );
     };
 
-    return [
-      stepCountIs(100000),
-      // The SDK evaluates stop conditions only after every sibling tool result in the
-      // model's current step settles. Do not move this to individual tool-call-end events:
-      // that would abort the remaining calls the model emitted in the same batch.
-      () => request.hasQueuedMessages?.("tool-end") ?? false,
-      hasSuccessfulRequiredToolResult,
-    ];
+    // The SDK evaluates stop conditions only after every sibling tool result in the
+    // model's current step settles. Do not move this to individual tool-call-end events:
+    // that would abort the remaining calls the model emitted in the same batch.
+    const hasQueuedToolEndMessage: ReturnType<typeof stepCountIs> = (state) => {
+      if (!(request.hasQueuedMessages?.("tool-end") ?? false)) {
+        return false;
+      }
+      // The step cap and a successful required tool result each end the turn on their
+      // own; only a stop made purely for the queued message may need resuming later. A cut
+      // spends at least one step, so a chain of cuts and resumes always runs the budget down.
+      const stepsSpent = Math.max(1, state.steps.length);
+      if (stepsSpent < stepBudget && !hasSuccessfulRequiredToolResult(state)) {
+        request.onQueuedMessageStop?.({
+          modelString: request.modelString,
+          stepsRemaining: stepBudget - stepsSpent,
+          modelFallbackProgress: request.modelFallbackProgress,
+        });
+      }
+      return true;
+    };
+
+    return [stepCountIs(stepBudget), hasQueuedToolEndMessage, hasSuccessfulRequiredToolResult];
   }
 
   /**
@@ -2441,8 +2566,23 @@ export class StreamManager {
     } = options;
     const stepTracker: StepMessageTracker = {};
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
+    // A stream continuing a cut turn picks the chain up where the cut left it: the requested
+    // model and refusals are the cut turn's, and a refusal here moves on to the next entry.
+    const carried = options.modelFallbackProgress;
+    const modelFallbackState: WorkspaceStreamInfo["modelFallback"] =
+      modelFallback && modelFallback.chain.length > 0
+        ? {
+            options: modelFallback,
+            requestedModel: carried?.requestedModel ?? normalizeToCanonical(modelString),
+            refusedModels: [...(carried?.refusedModels ?? [])],
+            // Pre-wrap inputs (NOT request.maxOutputTokens, which may already
+            // carry call-settings overrides for the original model).
+            original: { maxOutputTokens },
+          }
+        : undefined;
     const request = this.buildStreamRequestConfig({
       ...options,
+      modelFallbackProgress: modelFallbackProgressOf(modelFallbackState),
       onToolExecutionStart: (toolCallId) =>
         this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
     });
@@ -2469,28 +2609,29 @@ export class StreamManager {
       startTime,
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
+      stepCount: 0,
       pendingWorkflowRunAttachments: new Map(),
       pendingNestedCalls: new Map(),
       pendingToolExecutionStarts: new Map(),
       model: modelString,
       metadataModel,
       thinkingLevel,
-      initialMetadata,
+      // The resumed message answers on a fallback because the cut turn's requested model
+      // refused; record that as the swap would have.
+      initialMetadata:
+        modelFallbackState != null && modelFallbackState.refusedModels.length > 0
+          ? {
+              ...initialMetadata,
+              modelFallback: {
+                requestedModel: modelFallbackState.requestedModel,
+                refusedModels: [...modelFallbackState.refusedModels],
+              },
+            }
+          : initialMetadata,
       toolModelUsages: [],
       didRetryPreviousResponseIdAtStep: false,
       didRetryAfterEmptyOutput: false,
-      ...(modelFallback && modelFallback.chain.length > 0
-        ? {
-            modelFallback: {
-              options: modelFallback,
-              requestedModel: normalizeToCanonical(modelString),
-              refusedModels: [],
-              // Pre-wrap inputs (NOT request.maxOutputTokens, which may already
-              // carry call-settings overrides for the original model).
-              original: { maxOutputTokens },
-            },
-          }
-        : {}),
+      ...(modelFallbackState != null ? { modelFallback: modelFallbackState } : {}),
       stepTracker,
       receivedTerminalEvent: false,
       currentStepStartIndex: 0,
@@ -2623,6 +2764,15 @@ export class StreamManager {
       output,
       providerExecuted
     );
+    if (
+      streamInfo.requiredToolSatisfied !== true &&
+      isSuccessfulRequiredToolOutput(output) &&
+      buildRequiredToolPatterns(streamInfo.request.toolPolicy).some((pattern) =>
+        pattern.test(toolName)
+      )
+    ) {
+      streamInfo.requiredToolSatisfied = true;
+    }
     await this.checkSoftCancelStream(workspaceId, streamInfo);
   }
 
@@ -3159,6 +3309,14 @@ export class StreamManager {
       };
     }
 
+    const stepBudget = this.restartStepBudget(streamInfo);
+    if (stepBudget == null) {
+      return {
+        kind: "terminal",
+        terminalNote: "Model fallback was skipped because the turn's step budget is spent.",
+      };
+    }
+
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     // A throw out of prepare() must not escape to the generic stream-error path:
     // it would be categorized as a retryable api/unknown error and re-enter the
@@ -3220,6 +3378,9 @@ export class StreamManager {
       callSettingsOverrides: prepared.data.callSettingsOverrides,
       toolPolicy: streamInfo.request.toolPolicy,
       hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      onQueuedMessageStop: streamInfo.request.onQueuedMessageStop,
+      stepBudget,
+      modelFallbackProgress: modelFallbackProgressOf(fallbackState),
       headers: prepared.data.headers,
       onChunk: streamInfo.request.onChunk,
       onStepMessages: streamInfo.request.onStepMessages,
@@ -3310,10 +3471,21 @@ export class StreamManager {
     // refused model (e.g. an OpenAI WS transport socket) would leak per hop.
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
+    streamInfo.stepCount = 0;
     streamInfo.streamResult = nextStreamResult;
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
 
     return { kind: "swapped" };
+  }
+
+  /**
+   * Step ceiling for an SDK loop restarted under this stream (fallback swap, same-model
+   * retry): the new loop counts its steps from zero, so it inherits what the stream has
+   * left rather than a fresh ceiling. Undefined when the budget is spent.
+   */
+  private restartStepBudget(streamInfo: WorkspaceStreamInfo): number | undefined {
+    const remaining = (streamInfo.request.stepBudget ?? MAX_STREAM_STEPS) - streamInfo.stepCount;
+    return remaining > 0 ? remaining : undefined;
   }
 
   private async handleTruncatedStreamCompletion(
@@ -3366,6 +3538,11 @@ export class StreamManager {
       return false;
     }
 
+    const stepBudget = this.restartStepBudget(streamInfo);
+    if (stepBudget == null) {
+      return false;
+    }
+
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     workspaceLog.warn("Retrying stream after empty-output completion", {
       messageId: streamInfo.messageId,
@@ -3381,6 +3558,8 @@ export class StreamManager {
       workspaceLog,
     });
     streamInfo.currentStepStartIndex = 0;
+    streamInfo.request = { ...streamInfo.request, stepBudget };
+    streamInfo.stepCount = 0;
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
@@ -3436,6 +3615,8 @@ export class StreamManager {
             switch (part.type) {
               case "start-step": {
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
+                streamInfo.stepCount += 1;
+                streamInfo.requiredToolSatisfied = false;
                 break;
               }
 
@@ -4190,7 +4371,21 @@ export class StreamManager {
 
     const errorPayload = this.buildStreamErrorPayload(streamInfo, error);
     const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+    streamInfo.terminalCompletion = {
+      status: "failed",
+      streamError: persistedPayload,
+      stepsRemaining: this.remainingStepBudget(streamInfo),
+      modelString: streamInfo.model,
+      modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
+    };
+  }
+
+  /** Steps left under the stream's ceiling when it ends early; the step it was in is spent. */
+  private remainingStepBudget(streamInfo: WorkspaceStreamInfo): number {
+    return Math.max(
+      0,
+      (streamInfo.request.stepBudget ?? MAX_STREAM_STEPS) - Math.max(1, streamInfo.stepCount)
+    );
   }
 
   private buildStreamErrorPayload(
@@ -4561,6 +4756,11 @@ export class StreamManager {
       return false;
     }
 
+    const stepBudget = this.restartStepBudget(streamInfo);
+    if (stepBudget == null) {
+      return false;
+    }
+
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     this.recordLostResponseIdIfApplicable(workspaceId, error, streamInfo, workspaceLog);
 
@@ -4590,7 +4790,9 @@ export class StreamManager {
       ...streamInfo.request,
       ...(stepMessages ? { messages: stepMessages } : {}),
       providerOptions,
+      stepBudget,
     };
+    streamInfo.stepCount = 0;
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
@@ -4814,6 +5016,7 @@ export class StreamManager {
       runtime,
       messageId,
       abortSignal,
+      refuseStreamStart,
       providedStreamToken,
       providedRuntimeTempDir,
       onStreamConstructed,
@@ -4905,7 +5108,9 @@ export class StreamManager {
           )
         );
 
-        if (streamAbortController.signal.aborted) {
+        // The caller's pull-based admission probe (goal state) has no signal to abort; this is
+        // its last read before the stream becomes real.
+        if (streamAbortController.signal.aborted || refuseStreamStart?.() === true) {
           return settleStartupAbort();
         }
 
@@ -4946,10 +5151,12 @@ export class StreamManager {
         // stream may already occupy this workspace's slot. Launching
         // processing now would emit stream-start after the abort and its
         // cleanup would later delete that replacement. Bail out; the finally
-        // block releases this never-processed stream's resources.
+        // block releases this never-processed stream's resources. The caller's
+        // admission probe has no signal to abort with, so it is re-read here too.
         if (
           streamAbortController.signal.aborted ||
-          this.workspaceStreams.get(typedWorkspaceId) !== streamInfo
+          this.workspaceStreams.get(typedWorkspaceId) !== streamInfo ||
+          refuseStreamStart?.() === true
         ) {
           if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo) {
             this.workspaceStreams.delete(typedWorkspaceId);
@@ -5530,7 +5737,13 @@ export class StreamManager {
     });
     // Debug-injected failures bypass handleStreamFailure, so record the failed
     // completion here or cleanup would never settle the turn handle.
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+    streamInfo.terminalCompletion = {
+      status: "failed",
+      streamError: persistedPayload,
+      stepsRemaining: this.remainingStepBudget(streamInfo),
+      modelString: streamInfo.model,
+      modelFallbackProgress: modelFallbackProgressOf(streamInfo.modelFallback),
+    };
 
     // Wait for the stream processing to complete (cleanup)
     await streamInfo.processingPromise;

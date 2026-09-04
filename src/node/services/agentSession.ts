@@ -45,7 +45,7 @@ import {
   SendMessageOptionsSchema,
   SkillNameSchema,
 } from "@/common/orpc/schemas";
-import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import { ModelFallbackProgressSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -103,6 +103,7 @@ import {
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
+  parseWorkspaceTurnTaskCorrelation,
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
 } from "@/common/types/message";
@@ -116,9 +117,10 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
-import type { QueueCutCutter } from "./messageQueue";
+import type { QueueClearCallbacks, QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
+  type ModelFallbackProgress,
   type RuntimeStatusEvent,
   type StreamAbortReason,
   type StreamEndEvent,
@@ -237,6 +239,17 @@ interface CompactionRequestMetadata {
 
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 
+/** Consumed continuation cuts kept for a late owner claim (see consumedContinuationCuts). */
+const MAX_RETAINED_CONTINUATION_CUTS = 8;
+
+interface OwedForfeitSettlement {
+  key: string;
+  correlation: WorkspaceTurnMuxMetadata;
+  reason: string;
+  /** The attempt under way; resolves true once the owner has the record, false when it failed. */
+  inFlight?: Promise<boolean>;
+}
+
 interface AutoRetryResumeRequest {
   // Same-session auto-retry must preserve the full normalized request because
   // ACP correlation/delegation lives in transient send options that are
@@ -246,6 +259,16 @@ interface AutoRetryResumeRequest {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
   goalId?: string;
+  stepBudget?: number;
+  /** The retried stream was admitted under resumeStream's revalidation; the retry repeats it. */
+  revalidateAdmission?: boolean;
+  modelFallbackProgress?: ModelFallbackProgress;
+  /**
+   * Delegated turn the retried stream continues when `options.muxMetadata` does not carry it (a
+   * bash-monitor wake inherits its correlation from history), so revalidation still reaches the
+   * owner's handle.
+   */
+  workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -365,6 +388,89 @@ type WorkspaceTurnMuxMetadata = Extract<MuxMessageMetadata, { type: "workspace-t
 function getWorkspaceTurnMuxMetadata(muxMetadata: unknown): WorkspaceTurnMuxMetadata | undefined {
   const metadata = muxMetadata as MuxMessageMetadata | undefined;
   return metadata?.type === "workspace-turn-task" ? metadata : undefined;
+}
+
+interface StrandedTurnResume {
+  options: SendMessageOptions;
+  /** Assistant message id of the stream the cut ended (claimWorkspaceTurnContinuation). */
+  cutMessageId: string;
+  /** The owner already deferred on this cut's stream-end; no late claim is coming for it. */
+  claimed?: boolean;
+  /**
+   * Steps the cut stream had left under its ceiling; the resumed stream runs under this budget
+   * so a chain of cuts and resumes spends one turn's steps, not a fresh cap per resume.
+   */
+  stepBudget?: number;
+  /**
+   * Fallback chain the cut stream ran under, with the refusals so far: the resumed stream continues
+   * it, rather than the chain its own (possibly fallback) model would resolve.
+   */
+  modelFallbackProgress?: ModelFallbackProgress;
+  agentInitiated?: boolean;
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
+}
+
+/**
+ * Continuation for a turn stranded by a withdrawn queued message: the interrupted stream's
+ * request configuration (the same retry-safe whitelist startup recovery resumes with) and goal
+ * attribution. Anything that replays the original dispatch is dropped: edit target, queue
+ * dispatch mode, per-message metadata (compaction, skill, wake), and the ACP prompt binding,
+ * whose turn completion the first stream-end already resolved, so a delegated tool call on the
+ * resumed stream would wait on a prompt nobody answers. Only the workspace-turn correlation
+ * survives, taken from the resolved stream context because a wake-started continuation
+ * inherits it from history rather than from its own send options.
+ */
+function buildStrandedTurnResume(context: {
+  /** Model that reached the cut: a configured fallback may differ from the requested one. */
+  modelString: string;
+  cutMessageId: string;
+  stepBudget?: number;
+  modelFallbackProgress?: ModelFallbackProgress;
+  options?: SendMessageOptions;
+  agentInitiated?: boolean;
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
+  workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+  /**
+   * Level a mid-turn thinking change left in effect at the cut: still pending when the boundary
+   * was cut during a tool call (no prepareStep consumed it), else the last applied one. The
+   * request's own level is stale then; streamWithHistory re-clamps against the model floor.
+   */
+  thinkingLevelAtCut?: ThinkingLevel;
+}): StrandedTurnResume {
+  const resumeOptions = pickStartupRetrySendOptions(
+    context.options ?? { model: context.modelString, agentId: WORKSPACE_DEFAULTS.agentId }
+  );
+  return {
+    options: {
+      ...resumeOptions,
+      // Not durable retry state (the picker omits it), but this continuation is the same turn in
+      // memory: the resumed stream must see the live scratchpad snapshot the cut stream did, not
+      // whatever the renderer's save had persisted by then.
+      ...(context.options?.additionalSystemContext != null
+        ? { additionalSystemContext: context.options.additionalSystemContext }
+        : {}),
+      model: context.modelString,
+      ...(context.thinkingLevelAtCut != null ? { thinkingLevel: context.thinkingLevelAtCut } : {}),
+      muxMetadata:
+        context.workspaceTurnMetadata ?? getWorkspaceTurnMuxMetadata(context.options?.muxMetadata),
+    },
+    cutMessageId: context.cutMessageId,
+    ...(context.stepBudget != null ? { stepBudget: context.stepBudget } : {}),
+    ...(context.modelFallbackProgress != null
+      ? { modelFallbackProgress: context.modelFallbackProgress }
+      : {}),
+    ...(context.agentInitiated != null ? { agentInitiated: context.agentInitiated } : {}),
+    ...(context.goalKind != null ? { goalKind: context.goalKind } : {}),
+    ...(context.goalId != null ? { goalId: context.goalId } : {}),
+  };
+}
+
+/** A persisted correlation (unchecked chat.jsonl) is used only when well formed. */
+function parsePersistedWorkspaceTurnMetadata(value: unknown): WorkspaceTurnMuxMetadata | undefined {
+  const correlation = parseWorkspaceTurnTaskCorrelation(value);
+  return correlation == null ? undefined : { type: "workspace-turn-task", ...correlation };
 }
 
 function hasSameWorkspaceTurnCorrelation(
@@ -521,6 +627,15 @@ const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
+/**
+ * Retry bound for a stranded resume that keeps failing before its stream starts (pricing gate,
+ * history read, refused admission): after this many attempts with no stream the marker is
+ * dropped. Resumes that do start are not counted; each later stranding follows a completed
+ * model step of real work and is a fresh obligation, so a legitimate turn that awaits several
+ * monitored processes in a row resumes every time.
+ */
+const MAX_CONSECUTIVE_STRANDED_TURN_RESUMES = 3;
+const FORFEIT_SETTLEMENT_RETRY_DELAY_MS = 1_000;
 
 export interface AgentSessionChatEvent {
   workspaceId: string;
@@ -584,7 +699,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   ): XumToolScope;
 }
 
-interface AgentSessionOptions {
+export interface AgentSessionOptions {
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
@@ -626,6 +741,23 @@ interface AgentSessionOptions {
    * to yield to a manual send that is still awaiting pricing/settings.
    */
   hasExternalSendPreflight?: () => boolean;
+  /**
+   * Settles a delegated workspace turn whose owner deferred its stream-end because this session
+   * advertised an owed continuation that is now forfeited without a successor stream (goal no
+   * longer admits it, resume retry cap): no later stream-end will arrive for that turn.
+   */
+  settleForfeitedWorkspaceTurnContinuation?: (
+    metadata: WorkspaceTurnMuxMetadata,
+    reason: string
+  ) => Promise<void>;
+  /**
+   * Admission for a stranded resume, read once the turn is claimed: the workspace still accepts
+   * streams (not being removed or archived) and, for a delegated turn, its owner still has the
+   * turn running. The probe reports a stop that lands after the read (workspace stop epoch).
+   */
+  admitStrandedTurnResume?: (
+    correlation: WorkspaceTurnMuxMetadata | undefined
+  ) => Promise<{ admissible: boolean; admissionStale?: () => boolean }>;
 }
 
 enum TurnPhase {
@@ -667,6 +799,8 @@ export class AgentSession {
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
+  private readonly settleForfeitedWorkspaceTurnContinuation?: AgentSessionOptions["settleForfeitedWorkspaceTurnContinuation"];
+  private readonly admitStrandedTurnResume?: AgentSessionOptions["admitStrandedTurnResume"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -699,6 +833,26 @@ export class AgentSession {
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedProviderToolEndAbortInFlight = false;
   private readonly activeToolCallIds = new Set<string>();
+  // The model loop stops at a tool boundary on behalf of a queued tool-end message. If that
+  // message never starts a turn (canceled wake, cleared queue, pre-stream failure), the stop
+  // would strand the turn on an unanswered tool result, so the continuation is owed here from
+  // the moment the stop is decided until a stream actually starts (setTurnPhase STREAMING).
+  // Recorded synchronously so the delegating owner's stream-end settlement can see it.
+  private strandedTurnResume?: StrandedTurnResume;
+  // Set while the sweep's resume is running (claim through stream end); aborting it cancels only
+  // the pre-stream window, since StreamManager unlinks the signal once a stream registers.
+  private strandedTurnResumeInFlight: AbortController | null = null;
+  /**
+   * Cuts of delegated turns whose continuation already ran, keyed by the cut stream's message id.
+   * The owner settles a correlated tool-calls stream-end under its own event lock, so it can ask
+   * about a cut after the successor stream has come and gone; the successor's own events settle
+   * the turn, and this evidence keeps the late claim from settling it as failed first.
+   */
+  private readonly consumedContinuationCuts = new Map<string, WorkspaceTurnMuxMetadata>();
+  /** Owner settlements for forfeited continuations that have not landed yet (settleOwedForfeit). */
+  private readonly owedForfeitSettlements = new Map<string, OwedForfeitSettlement>();
+  private owedForfeitSettlementRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private consecutiveStrandedResumes = 0;
 
   private idleWaiters: Array<() => void> = [];
   private pendingExternalManualFollowUps = 0;
@@ -782,6 +936,8 @@ export class AgentSession {
 
   /** Tracks the user message id that initiated the currently active stream (for retry guards). */
   private activeStreamUserMessageId?: string;
+  /** Assistant message id of the active stream, from its stream-start event. */
+  private activeStreamMessageId?: string;
 
   /** Track user message ids that already retried without post-compaction injection. */
   private readonly postCompactionRetryAttempts = new Set<string>();
@@ -868,6 +1024,12 @@ export class AgentSession {
     goalKind?: GoalSyntheticMessageKind;
     /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
     goalId?: string;
+    /** Step ceiling this stream runs under when it continues a cut turn (see StrandedTurnResume). */
+    stepBudget?: number;
+    /** Fallback chain this stream continues when it continues a cut turn (see StrandedTurnResume). */
+    modelFallbackProgress?: ModelFallbackProgress;
+    /** Admitted under resumeStream's revalidation; in-session retries of this stream repeat it. */
+    revalidateAdmission?: boolean;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
@@ -907,6 +1069,8 @@ export class AgentSession {
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
       hasExternalSendPreflight,
+      settleForfeitedWorkspaceTurnContinuation,
+      admitStrandedTurnResume,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -935,6 +1099,8 @@ export class AgentSession {
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
+    this.settleForfeitedWorkspaceTurnContinuation = settleForfeitedWorkspaceTurnContinuation;
+    this.admitStrandedTurnResume = admitStrandedTurnResume;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -991,6 +1157,10 @@ export class AgentSession {
 
     this.activePreparedTurnAbortController?.abort();
     this.activePreparedTurnAbortController = null;
+    // A resume parked in its pre-stream I/O passed streamWithHistory's disposed check already;
+    // its abort signal is the only thing that stops it registering a stream after teardown.
+    // Disposal (workspace removal) also produces no successor stream for a deferred delegated turn.
+    this.forfeitStrandedTurnResume("Stranded turn resume discarded: workspace session disposed.");
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -1295,7 +1465,11 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
-    goalId?: string
+    goalId?: string,
+    stepBudget?: number,
+    revalidateAdmission?: boolean,
+    modelFallbackProgress?: ModelFallbackProgress,
+    workspaceTurnMetadata?: WorkspaceTurnMuxMetadata
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1307,6 +1481,10 @@ export class AgentSession {
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(stepBudget != null ? { stepBudget } : {}),
+      ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
+      ...(modelFallbackProgress != null ? { modelFallbackProgress } : {}),
+      ...(workspaceTurnMetadata != null ? { workspaceTurnMetadata } : {}),
     };
   }
 
@@ -1330,6 +1508,11 @@ export class AgentSession {
         this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "missing_retry_options" });
         return;
       }
+      if (request.stepBudget != null && request.stepBudget <= 0) {
+        // The failed attempt spent the turn's last step; the ceiling ends the turn here.
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "step_budget_spent" });
+        return;
+      }
 
       // Archive only interrupts a live stream; a backoff timer armed before it keeps ticking.
       if (this.isWorkspaceArchivedOnDisk()) {
@@ -1341,8 +1524,20 @@ export class AgentSession {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
         goalId: request.goalId,
+        stepBudget: request.stepBudget,
+        revalidateAdmission: request.revalidateAdmission,
+        modelFallbackProgress: request.modelFallbackProgress,
+        workspaceTurnMetadata: request.workspaceTurnMetadata,
       });
       if (result.success) {
+        if (result.data.refusedBy != null) {
+          // The goal or delegated turn ended during the backoff; no retry can readmit it.
+          this.emitRetryEvent({
+            type: "auto-retry-abandoned",
+            reason: `${result.data.refusedBy}_admission_refused`,
+          });
+          return;
+        }
         if (!result.data.started) {
           // resumeStream can defer when a turn is still PREPARING/COMPLETING.
           // Treat this as retriable so auto-retry keeps progressing instead of
@@ -1573,11 +1768,11 @@ export class AgentSession {
     abortReason: StreamAbortReason | undefined,
     userMessageId?: string
   ): Promise<void> {
-    // "system" and "startup" aborts come from backend-orchestrated flows
-    // (for example, mid-stream auto-compaction or canceling a pending startup).
-    // They are not user intent and must not poison startup recovery with a
-    // persisted non-retryable "aborted" marker.
-    if (abortReason === "system" || abortReason === "startup") {
+    // "system", "startup", and "queued-message" aborts come from backend-orchestrated flows
+    // (for example, mid-stream auto-compaction, canceling a pending startup, or the soft stop
+    // for a queued message). They are not user intent and must not poison startup recovery
+    // with a persisted non-retryable "aborted" marker.
+    if (abortReason === "system" || abortReason === "startup" || abortReason === "queued-message") {
       return;
     }
 
@@ -2326,7 +2521,37 @@ export class AgentSession {
       }
 
       const { agentInitiated, goalKind, goalId, ...resumeOptions } = retryRequest;
-      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId);
+      // A row cut for a queued message carries what the turn had left of its ceiling; the retry
+      // continues that turn, so it runs under the remainder (and is abandoned at zero) rather
+      // than a fresh ceiling.
+      const interruptedAssistant =
+        partial?.role === "assistant"
+          ? partial
+          : lastHistoryMessage?.role === "assistant"
+            ? lastHistoryMessage
+            : undefined;
+      // Raw JSON boundary, like the pending follow-up's persisted budget: a present but malformed
+      // remainder fails closed. The row can no longer state the ceiling its turn ran under, and
+      // reading it as absent would hand the turn the default one.
+      const persistedStepsRemaining = interruptedAssistant?.metadata?.stepsRemaining;
+      if (
+        persistedStepsRemaining !== undefined &&
+        !(Number.isInteger(persistedStepsRemaining) && persistedStepsRemaining >= 0)
+      ) {
+        log.warn("Startup auto-retry abandoned: malformed persisted step budget", {
+          workspaceId: this.workspaceId,
+          messageId: interruptedAssistant?.id,
+        });
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "malformed_step_budget" });
+        return "completed";
+      }
+      this.setAutoRetryResumeState(
+        resumeOptions,
+        agentInitiated,
+        goalKind,
+        goalId,
+        persistedStepsRemaining
+      );
     }
 
     // Disk reads above may race with user actions; retry once the current work settles
@@ -3050,6 +3275,20 @@ export class AgentSession {
       /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
       goalId?: string;
       startStreamInBackground?: boolean;
+      /** For a send continuing an interrupted turn: what that turn had left of its ceiling. */
+      stepBudget?: number;
+      /** For a send continuing an interrupted turn: the fallback chain state it reached. */
+      modelFallbackProgress?: ModelFallbackProgress;
+      /** For a send continuing an interrupted turn: it ran under resumeStream's revalidation. */
+      revalidateAdmission?: boolean;
+      /** For a send continuing a delegated turn its `muxMetadata` does not carry (a wake). */
+      workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+      /**
+       * Launch-boundary admission probe (goal and delegated-turn state), rechecked by
+       * StreamManager right before the stream registers; unlike admissionStale it must not
+       * observe this send's own turn.
+       */
+      refuseStreamStart?: () => boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
@@ -3155,6 +3394,31 @@ export class AgentSession {
           (messageId) => !historyResult.data.some((message) => message.id === messageId)
         )
       );
+    };
+    const rollbackRefusedLaunchRows = async (): Promise<void> => {
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      const historySequences = historyResult.success
+        ? historyResult.data
+            .filter((message) => persistedCancelableMessageIds.includes(message.id))
+            .map((message) => message.metadata?.historySequence)
+            .filter((sequence): sequence is number => isNonNegativeInteger(sequence))
+        : [];
+      if (!(await rollbackPersistedTurnRows())) {
+        return;
+      }
+      if (historySequences.length > 0) {
+        this.emitChatEvent({ type: "delete", historySequences });
+      }
+      try {
+        await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
+      } catch (error) {
+        log.warn("Failed to resync goal state after a refused launch", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
     };
     let cancellationHandled = false;
     let cancellationDisabled = false;
@@ -3948,6 +4212,8 @@ export class AgentSession {
     // leaves no trace for a later human resume to replay into provider context. Past this point
     // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
+    // The one exception is a synthetic continuation refused by its own launch probe
+    // (rollbackRefusedLaunchRows), which re-derives goal state after removing its rows.
     if (internal?.admissionStale?.() === true) {
       const rolledBack = await rollbackPersistedTurnRows();
       // Probe-carrying sends are peer messages whose caller already returned success when the
@@ -3978,6 +4244,14 @@ export class AgentSession {
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
+    }
+    // The durable row of anything but a continuation of the cut turn (a wake, or the same
+    // delegated turn) supersedes the owed continuation from here on: a failure below leaves the
+    // row in place, and the cut turn must not resume over it with its own identity.
+    if (!this.continuesOwedTurn(typedMuxMetadata)) {
+      this.forfeitStrandedTurnResume(
+        "Stranded turn resume dropped: superseded by a later durable message."
+      );
     }
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
@@ -4071,7 +4345,16 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      agentInitiated,
+      goalKind,
+      internal?.goalId,
+      internal?.stepBudget,
+      internal?.revalidateAdmission,
+      internal?.modelFallbackProgress,
+      internal?.workspaceTurnMetadata
+    );
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -4155,7 +4438,11 @@ export class AgentSession {
           preparedTurnAbortController.signal,
           goalKind,
           internal?.goalId,
-          turnThinkingOverride
+          turnThinkingOverride,
+          internal?.refuseStreamStart,
+          internal?.stepBudget,
+          internal?.revalidateAdmission,
+          internal?.modelFallbackProgress
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4163,6 +4450,19 @@ export class AgentSession {
               "Accepted stream startup was canceled during preparation."
             )
           );
+        }
+        // The send's own launch probe refused the turn at the boundary (Ok with the turn still
+        // PREPARING, nothing registered): the goal or delegated turn this synthetic continuation
+        // served ended during startup. Its rows would otherwise sit at the tail as a prompt the
+        // next unrelated request replays, so they go with the launch; goal state re-derives from
+        // the tail they leave (the one rollback past goal sync, see the horizon note above).
+        if (
+          streamResult.success &&
+          this.turnPhase === TurnPhase.PREPARING &&
+          !hasPreTurnMessages &&
+          internal?.refuseStreamStart?.() === true
+        ) {
+          await rollbackRefusedLaunchRows();
         }
         return streamResult;
       } finally {
@@ -4224,8 +4524,26 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
-  ): Promise<AgentSessionResult<{ started: boolean }>> {
+    internal?: {
+      agentInitiated?: boolean;
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
+      /** Cancels the pre-stream window (admission gates, history reads) once the resume is withdrawn. */
+      abortSignal?: AbortSignal;
+      /**
+       * Revalidate the resume once the turn is claimed: a goal turn against durable goal state
+       * (the same veto durable goal redispatches apply) and the workspace plus delegated turn
+       * through admitStrandedTurnResume; a refusal reports `refusedBy`.
+       */
+      revalidateAdmission?: boolean;
+      /** Step ceiling for the resumed stream when it continues a cut turn (StrandedTurnResume). */
+      stepBudget?: number;
+      /** Fallback chain the resumed stream continues when it continues a cut turn. */
+      modelFallbackProgress?: ModelFallbackProgress;
+      /** Delegated turn to revalidate against when `options.muxMetadata` does not carry it. */
+      workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+    }
+  ): Promise<AgentSessionResult<{ started: boolean; refusedBy?: "goal" | "workspace-turn" }>> {
     this.assertNotDisposed("resumeStream");
 
     assert(options, "resumeStream requires options");
@@ -4240,16 +4558,6 @@ export class AgentSession {
     // still waiting for init hooks to complete (or while completion cleanup is running).
     if (this.isBusy()) {
       return Ok({ started: false });
-    }
-
-    if (this.workspaceGoalService) {
-      const pricingGate = await this.workspaceGoalService.assertPricedModelForBudgetedGoal(
-        this.workspaceId,
-        modelForStream
-      );
-      if (!pricingGate.success) {
-        return Err(pricingGate.error);
-      }
     }
 
     // r40: refuse resume admission while a context-discarding mutation is
@@ -4269,8 +4577,15 @@ export class AgentSession {
       optionsForStream,
       internal?.agentInitiated,
       internal?.goalKind,
-      internal?.goalId
+      internal?.goalId,
+      internal?.stepBudget,
+      internal?.revalidateAdmission,
+      internal?.modelFallbackProgress,
+      internal?.workspaceTurnMetadata
     );
+    // Claim the turn before any await: the admission gates below do I/O, and a manual send
+    // entering meanwhile must see a busy session rather than start a stream this resume
+    // would then collide with.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
     // Open the mid-turn thinking override window for the resumed turn (after
@@ -4278,6 +4593,44 @@ export class AgentSession {
     const turnThinkingOverride: ActiveTurnThinkingOverride = {};
     this.activeTurnThinkingOverride = turnThinkingOverride;
     try {
+      const withdrawn = (): boolean => internal?.abortSignal?.aborted === true;
+      if (this.workspaceGoalService) {
+        const pricingGate = await this.workspaceGoalService.assertPricedModelForBudgetedGoal(
+          this.workspaceId,
+          modelForStream
+        );
+        if (!pricingGate.success) {
+          return Err(pricingGate.error);
+        }
+      }
+      if (withdrawn()) {
+        return Ok({ started: false });
+      }
+      let refuseStreamStart: (() => boolean) | undefined;
+      let launchRefusedBy: () => "goal" | "workspace-turn" | undefined = () => undefined;
+      if (internal?.revalidateAdmission === true) {
+        const admission = await this.admitResumeLaunch({
+          goalKind: internal.goalKind,
+          goalId: internal.goalId,
+          muxMetadata: optionsForStream.muxMetadata,
+          workspaceTurnMetadata: internal.workspaceTurnMetadata,
+        });
+        if (!admission.admissible) {
+          return Ok({ started: false, refusedBy: admission.refusedBy });
+        }
+        refuseStreamStart = admission.refuseStreamStart;
+        launchRefusedBy = admission.refusedBy;
+      }
+      // Last admission check before the stream's own pre-start I/O, like sendMessage's PREPARING
+      // gate: a withdrawal that landed during the awaits above refuses the turn here; the abort
+      // signal covers the history reads that follow.
+      if (withdrawn()) {
+        return Ok({ started: false });
+      }
+      if (refuseStreamStart?.() === true) {
+        return Ok({ started: false, refusedBy: launchRefusedBy() });
+      }
+
       // Must await here so the finally block runs after streaming completes,
       // not immediately when the Promise is returned.
       const result = await this.streamWithHistory(
@@ -4286,21 +4639,86 @@ export class AgentSession {
         undefined,
         undefined,
         internal?.agentInitiated,
-        undefined,
+        internal?.abortSignal,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        refuseStreamStart,
+        internal?.stepBudget,
+        internal?.revalidateAdmission,
+        internal?.modelFallbackProgress
       );
       if (!result.success) {
         return result;
       }
+      const refusedBy = launchRefusedBy();
+      if (refusedBy != null) {
+        return Ok({ started: false, refusedBy });
+      }
 
-      return Ok({ started: true });
+      // A withdrawal inside streamWithHistory returns Ok before any stream registers, so the
+      // turn is still PREPARING here; after a real stream it has moved on.
+      return Ok({ started: !(withdrawn() && this.turnPhase === TurnPhase.PREPARING) });
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
         this.setTurnPhase(TurnPhase.IDLE);
       }
     }
+  }
+
+  /**
+   * Revalidates a resume against durable goal state (the veto durable goal redispatches apply)
+   * and the workspace plus delegated turn (admitStrandedTurnResume). The probes ride along to
+   * the stream-admission boundary: a Pause, goal replacement, or workspace stop landing during
+   * the history reads and request construction has no stream to interrupt, so the launch itself
+   * rechecks them (StreamManager last, right before registration). Sticky about what refused it.
+   */
+  private async admitResumeLaunch(input: {
+    goalKind?: GoalSyntheticMessageKind;
+    goalId?: string;
+    muxMetadata: unknown;
+    /** The delegated turn when `muxMetadata` does not carry it (an inherited correlation). */
+    workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+  }): Promise<
+    | { admissible: false; refusedBy: "goal" | "workspace-turn" }
+    | {
+        admissible: true;
+        refuseStreamStart?: () => boolean;
+        refusedBy: () => "goal" | "workspace-turn" | undefined;
+      }
+  > {
+    let goalAdmissionStale: (() => boolean) | undefined;
+    if (input.goalKind != null && input.goalId != null && this.workspaceGoalService) {
+      const admission = await this.workspaceGoalService.buildGoalRedispatchAdmission(
+        this.workspaceId,
+        input.goalId,
+        input.goalKind
+      );
+      if (!admission.admissible) {
+        return { admissible: false, refusedBy: "goal" };
+      }
+      goalAdmissionStale = admission.admissionStale;
+    }
+    let turnAdmissionStale: (() => boolean) | undefined;
+    if (this.admitStrandedTurnResume) {
+      const admission = await this.admitStrandedTurnResume(
+        getWorkspaceTurnMuxMetadata(input.muxMetadata) ?? input.workspaceTurnMetadata
+      );
+      if (!admission.admissible) {
+        return { admissible: false, refusedBy: "workspace-turn" };
+      }
+      turnAdmissionStale = admission.admissionStale;
+    }
+    let refusedBy: "goal" | "workspace-turn" | undefined;
+    const refuseStreamStart =
+      goalAdmissionStale != null || turnAdmissionStale != null
+        ? (): boolean => {
+            refusedBy ??= goalAdmissionStale?.() === true ? "goal" : undefined;
+            refusedBy ??= turnAdmissionStale?.() === true ? "workspace-turn" : undefined;
+            return refusedBy != null;
+          }
+        : undefined;
+    return { admissible: true, refuseStreamStart, refusedBy: () => refusedBy };
   }
 
   async setAutoRetryEnabled(
@@ -4552,12 +4970,20 @@ export class AgentSession {
     goalId?: string;
     muxMetadata?: MuxMessageMetadata;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+    stepBudget?: number;
+    modelFallbackProgress?: ModelFallbackProgress;
+    revalidateAdmission?: boolean;
   }): CompactionFollowUpRequest {
     const followUp: CompactionFollowUpRequest = {
       text: params.messageText,
       model: params.modelForStream,
       agentId: params.options.agentId,
       ...pickPreservedSendOptions(params.options),
+      ...(params.stepBudget != null ? { stepBudget: params.stepBudget } : {}),
+      ...(params.modelFallbackProgress != null
+        ? { modelFallbackProgress: params.modelFallbackProgress }
+        : {}),
+      ...(params.revalidateAdmission === true ? { revalidateAdmission: true } : {}),
     };
 
     if (params.agentInitiated === true) {
@@ -4838,6 +5264,10 @@ export class AgentSession {
         goalId: streamContext.goalId,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
+        // The abort handler left the interrupted stream's remainder on this context.
+        stepBudget: streamContext.stepBudget,
+        modelFallbackProgress: streamContext.modelFallbackProgress,
+        revalidateAdmission: streamContext.revalidateAdmission,
       });
       // Waterfall hook point: see the on-send compaction.prepare run above.
       await eventSpine.run("compaction.prepare", {
@@ -4919,8 +5349,12 @@ export class AgentSession {
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
 
-    // Explicit user interruption should immediately stop any pending auto-retry loop.
+    // Explicit user interruption should immediately stop any pending auto-retry loop and
+    // withdraw any continuation owed to a stranded turn, including a resume still in its
+    // pre-stream window, which StreamManager has no stream to abort for (the stream-abort
+    // handler repeats this for a stop that lands mid-step).
     this.retryManager.cancel();
+    this.withdrawStrandedTurnResume();
 
     if (options?.soft !== true) {
       this.queuedProviderToolEndAbortInFlight = false;
@@ -5004,6 +5438,42 @@ export class AgentSession {
         // A disposed session must not persist retry/goal state post-teardown.
         if (outcome.status !== "failed" || this.disposed) return;
 
+        // A retry continues the same logical turn: it runs under what the failed attempt left
+        // of the ceiling, not the budget the attempt started with (auto-retry and the in-session
+        // context_exceeded retries alike).
+        if (outcome.stepsRemaining != null) {
+          const retryRequest = this.lastAutoRetryResumeRequest;
+          if (retryRequest?.stepBudget != null) {
+            this.lastAutoRetryResumeRequest = {
+              ...retryRequest,
+              stepBudget: outcome.stepsRemaining,
+            };
+          }
+          if (this.activeStreamContext?.stepBudget != null) {
+            this.activeStreamContext.stepBudget = outcome.stepsRemaining;
+          }
+        }
+        // Likewise the chain: an attempt that moved down its fallback chain hands the retry the
+        // model it reached and the refusals so far, so no refused hop is attempted again.
+        const progress = outcome.modelFallbackProgress;
+        if (progress != null && progress.refusedModels.length > 0 && outcome.modelString != null) {
+          const retryRequest = this.lastAutoRetryResumeRequest;
+          if (retryRequest != null) {
+            this.lastAutoRetryResumeRequest = {
+              ...retryRequest,
+              options: { ...retryRequest.options, model: outcome.modelString },
+              modelFallbackProgress: progress,
+            };
+          }
+          const context = this.activeStreamContext;
+          if (context != null) {
+            context.modelString = outcome.modelString;
+            context.modelFallbackProgress = progress;
+            if (context.options != null) {
+              context.options = { ...context.options, model: outcome.modelString };
+            }
+          }
+        }
         try {
           await this.handleStreamError(outcome.streamError);
         } finally {
@@ -5030,13 +5500,22 @@ export class AgentSession {
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
-    activeTurnThinkingOverride?: ActiveTurnThinkingOverride
+    activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
+    // Pull-based admission probe (goal state) with no push into abortSignal; checked wherever
+    // the signal is, and by StreamManager right before the stream registers.
+    refuseStreamStart?: () => boolean,
+    stepBudget?: number,
+    revalidateAdmission?: boolean,
+    modelFallbackProgress?: ModelFallbackProgress
   ): Promise<AgentSessionResult<void>> {
     // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
     // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
     // detection, or history reads, and must not reach the provider afterwards.
     const isStreamStartAborted = (): boolean =>
-      this.disposed || this.shuttingDown || abortSignal?.aborted === true;
+      this.disposed ||
+      this.shuttingDown ||
+      abortSignal?.aborted === true ||
+      refuseStreamStart?.() === true;
 
     if (isStreamStartAborted()) {
       return Ok(undefined);
@@ -5056,6 +5535,9 @@ export class AgentSession {
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
+      ...(stepBudget != null ? { stepBudget } : {}),
+      ...(modelFallbackProgress != null ? { modelFallbackProgress } : {}),
+      ...(revalidateAdmission === true ? { revalidateAdmission: true } : {}),
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
@@ -5125,6 +5607,7 @@ export class AgentSession {
     // [CONTINUE] sentinel so the model has a valid conversation to respond to. This is
     // defense-in-depth; callers should prefer sendMessage() which persists a real user message.
     const lastMsg = requestMessages[requestMessages.length - 1];
+    let sentinelMessageId: string | undefined;
     if (lastMsg?.role === "assistant" && !lastMsg.metadata?.partial) {
       log.warn("streamWithHistory: trailing non-partial assistant detected, injecting [CONTINUE]", {
         workspaceId: this.workspaceId,
@@ -5135,11 +5618,29 @@ export class AgentSession {
         synthetic: true,
       });
       await this.historyService.appendToHistory(this.workspaceId, sentinelMessage);
+      sentinelMessageId = sentinelMessage.id;
       const refreshed = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (refreshed.success) {
         requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
       }
     }
+    // A launch refused or withdrawn after the sentinel landed would leave it as an orphan that the
+    // next unrelated turn sends to the provider; it goes with the launch it was appended for.
+    const abortStartup = async (): Promise<AgentSessionResult<void>> => {
+      if (sentinelMessageId != null) {
+        const removed = await this.historyService.deleteMessage(
+          this.workspaceId,
+          sentinelMessageId
+        );
+        if (!removed.success) {
+          log.warn("Failed to remove the [CONTINUE] sentinel of a refused launch", {
+            workspaceId: this.workspaceId,
+            error: removed.error,
+          });
+        }
+      }
+      return Ok(undefined);
+    };
 
     // Capture the current user message id so retries are stable across assistant message ids.
     // Retry-eligible rows only: startup recovery matches this persisted ID
@@ -5159,7 +5660,7 @@ export class AgentSession {
     );
 
     if (isStreamStartAborted()) {
-      return Ok(undefined);
+      return await abortStartup();
     }
 
     // Check if post-compaction attachments should be injected.
@@ -5168,7 +5669,7 @@ export class AgentSession {
         ? null
         : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
     if (isStreamStartAborted()) {
-      return Ok(undefined);
+      return await abortStartup();
     }
 
     this.activeStreamHadPostCompactionInjection =
@@ -5241,6 +5742,9 @@ export class AgentSession {
       workspaceId: this.workspaceId,
       modelString,
       abortSignal,
+      refuseStreamStart,
+      stepBudget,
+      modelFallbackProgress,
       thinkingLevel: effectiveThinkingLevel,
       // Orthogonal to thinking level; buildRequestHeaders gates it per model.
       reasoningMode: options?.reasoningMode,
@@ -5268,6 +5772,19 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      onQueuedMessageStop: (stop) => {
+        if (this.activeStreamContext != null && this.activeStreamMessageId != null) {
+          this.strandedTurnResume = buildStrandedTurnResume({
+            ...this.activeStreamContext,
+            modelString: stop.modelString,
+            cutMessageId: this.activeStreamMessageId,
+            stepBudget: stop.stepsRemaining,
+            modelFallbackProgress: stop.modelFallbackProgress,
+            thinkingLevelAtCut:
+              activeTurnThinkingOverride?.pending ?? activeTurnThinkingOverride?.applied,
+          });
+        }
+      },
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the
       // send-time level above (single source of truth for the floor).
@@ -5284,6 +5801,11 @@ export class AgentSession {
       );
     }
 
+    // stream-start moves the turn to STREAMING synchronously inside startStream, so a turn still
+    // PREPARING here was refused or withdrawn at the launch boundary and registered nothing.
+    if (this.turnPhase === TurnPhase.PREPARING && isStreamStartAborted()) {
+      return await abortStartup();
+    }
     this.consumeTurnCompletion(streamResult.data);
     return Ok(undefined);
   }
@@ -5435,6 +5957,82 @@ export class AgentSession {
     return provider === "openai" && modelName?.toLowerCase().startsWith("gpt-");
   }
 
+  /**
+   * Gate for the in-session context_exceeded retries, which relaunch through streamWithHistory
+   * directly: a stream admitted under resumeStream's revalidation is revalidated again (a Pause,
+   * Stop, or delegated-turn interrupt that landed during the cleanup awaits ends the turn rather
+   * than the retry restarting tool-enabled work), and a spent step budget ends it too. Undefined
+   * when the retry must not run; otherwise the launch-boundary probe to pass along.
+   */
+  private async admitInSessionRetry(input: {
+    stepBudget?: number;
+    revalidateAdmission?: boolean;
+    goalKind?: GoalSyntheticMessageKind;
+    goalId?: string;
+    muxMetadata: unknown;
+    workspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
+    retryLabel: string;
+  }): Promise<{ refuseStreamStart?: () => boolean } | undefined> {
+    if (input.stepBudget != null && input.stepBudget <= 0) {
+      log.info(`Skipping ${input.retryLabel}: the turn's step budget is spent`, {
+        workspaceId: this.workspaceId,
+      });
+      return undefined;
+    }
+    if (input.revalidateAdmission !== true) {
+      return {};
+    }
+    const admission = await this.admitResumeLaunch(input);
+    if (!admission.admissible) {
+      log.info(`Skipping ${input.retryLabel}: no longer admitted`, {
+        workspaceId: this.workspaceId,
+        refusedBy: admission.refusedBy,
+      });
+      return undefined;
+    }
+    return { refuseStreamStart: admission.refuseStreamStart };
+  }
+
+  /**
+   * Runs an in-session retry's launch under PREPARING. False when no stream registered: an Err,
+   * or a launch refused at the boundary, which returns Ok before any stream registers (like a
+   * refused resumeStream). Either way the recovery decision stays pending: the terminal path in
+   * handleStreamError resolves it once settlement state is final, so waiters (task/workspace-turn
+   * settlement) never observe a transient "retry preparing" that already ended before startup.
+   */
+  private async launchInSessionRetry(
+    retryLabel: string,
+    refuseStreamStart: (() => boolean) | undefined,
+    launch: () => Promise<Result<void, SendMessageError>>
+  ): Promise<boolean> {
+    try {
+      const result = await launch();
+      if (!result.success) {
+        log.error(`${retryLabel} failed to start`, {
+          workspaceId: this.workspaceId,
+          error: result.error,
+        });
+        return false;
+      }
+      // stream-start moves the turn to STREAMING synchronously inside startStream, so a turn
+      // still PREPARING here registered nothing.
+      if (
+        this.turnPhase === TurnPhase.PREPARING &&
+        (refuseStreamStart?.() === true || this.disposed || this.shuttingDown)
+      ) {
+        log.info(`${retryLabel} refused at the launch boundary`, {
+          workspaceId: this.workspaceId,
+        });
+        return false;
+      }
+      return true;
+    } finally {
+      if (this.turnPhase === TurnPhase.PREPARING) {
+        this.setTurnPhase(TurnPhase.IDLE);
+      }
+    }
+  }
+
   private async maybeRetryCompactionOnContextExceeded(data: {
     messageId: string;
     errorType?: string;
@@ -5491,6 +6089,10 @@ export class AgentSession {
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
+    const retryStepBudget = this.activeStreamContext?.stepBudget;
+    const retryModelFallbackProgress = this.activeStreamContext?.modelFallbackProgress;
+    const retryRevalidateAdmission = this.activeStreamContext?.revalidateAdmission;
+    const retryWorkspaceTurnMetadata = this.activeStreamContext?.workspaceTurnMetadata;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -5509,43 +6111,54 @@ export class AgentSession {
       });
       return false;
     }
+    const retryAdmission = await this.admitInSessionRetry({
+      stepBudget: retryStepBudget,
+      revalidateAdmission: retryRevalidateAdmission,
+      goalKind: retryGoalKind,
+      goalId: retryGoalId,
+      muxMetadata: retryOptionsForResume.muxMetadata,
+      workspaceTurnMetadata: retryWorkspaceTurnMetadata,
+      retryLabel: "compaction retry",
+    });
+    if (retryAdmission == null) {
+      return false;
+    }
 
     this.setAutoRetryResumeState(
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
-      retryGoalId
+      retryGoalId,
+      retryStepBudget,
+      retryRevalidateAdmission,
+      retryModelFallbackProgress,
+      retryWorkspaceTurnMetadata
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
     );
     this.setTurnPhase(TurnPhase.PREPARING);
-    let retryResult: Result<void, SendMessageError>;
-    try {
-      retryResult = await this.streamWithHistory(
-        context.modelString,
-        retryOptions,
-        isGptClass ? "auto" : undefined,
-        undefined,
-        retryAgentInitiated,
-        undefined,
-        retryGoalKind,
-        retryGoalId
-      );
-    } finally {
-      if (this.turnPhase === TurnPhase.PREPARING) {
-        this.setTurnPhase(TurnPhase.IDLE);
-      }
-    }
-    if (!retryResult.success) {
-      // Leave the recovery decision pending: the terminal path in
-      // handleStreamError resolves it once settlement state is final, so
-      // waiters (task/workspace-turn settlement) never observe a transient
-      // "retry preparing" that already failed before stream startup.
-      log.error("Compaction retry failed to start", {
-        workspaceId: this.workspaceId,
-        error: retryResult.error,
-      });
+    const retryStarted = await this.launchInSessionRetry(
+      "Compaction retry",
+      retryAdmission.refuseStreamStart,
+      () =>
+        this.streamWithHistory(
+          context.modelString,
+          retryOptions,
+          isGptClass ? "auto" : undefined,
+          undefined,
+          retryAgentInitiated,
+          undefined,
+          retryGoalKind,
+          retryGoalId,
+          undefined,
+          retryAdmission.refuseStreamStart,
+          retryStepBudget,
+          retryRevalidateAdmission,
+          retryModelFallbackProgress
+        )
+    );
+    if (!retryStarted) {
       return false;
     }
 
@@ -5623,36 +6236,43 @@ export class AgentSession {
       );
       return false;
     }
+    const retryAdmission = await this.admitInSessionRetry({
+      stepBudget: context.stepBudget,
+      revalidateAdmission: context.revalidateAdmission,
+      goalKind: context.goalKind,
+      goalId: context.goalId,
+      muxMetadata: context.options?.muxMetadata,
+      workspaceTurnMetadata: context.workspaceTurnMetadata,
+      retryLabel: "post-compaction retry",
+    });
+    if (retryAdmission == null) {
+      return false;
+    }
 
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
-    let retryResult: Result<void, SendMessageError>;
-    try {
-      retryResult = await this.streamWithHistory(
-        context.modelString,
-        context.options,
-        context.openaiTruncationModeOverride,
-        true,
-        context.agentInitiated,
-        undefined,
-        context.goalKind,
-        context.goalId
-      );
-    } finally {
-      if (this.turnPhase === TurnPhase.PREPARING) {
-        this.setTurnPhase(TurnPhase.IDLE);
-      }
-    }
-
-    if (!retryResult.success) {
-      // Leave the recovery decision pending: the terminal path in
-      // handleStreamError resolves it once settlement state is final (see
-      // maybeRetryCompactionOnContextExceeded).
-      log.error("Post-compaction retry failed to start", {
-        workspaceId: this.workspaceId,
-        error: retryResult.error,
-      });
+    const retryStarted = await this.launchInSessionRetry(
+      "Post-compaction retry",
+      retryAdmission.refuseStreamStart,
+      () =>
+        this.streamWithHistory(
+          context.modelString,
+          context.options,
+          context.openaiTruncationModeOverride,
+          true,
+          context.agentInitiated,
+          undefined,
+          context.goalKind,
+          context.goalId,
+          undefined,
+          retryAdmission.refuseStreamStart,
+          context.stepBudget,
+          context.revalidateAdmission,
+          context.modelFallbackProgress
+        )
+    );
+    if (!retryStarted) {
       return false;
     }
 
@@ -5766,6 +6386,7 @@ export class AgentSession {
     this.activeToolCallIds.clear();
     this.activeStreamContext = undefined;
     this.activeStreamUserMessageId = undefined;
+    this.activeStreamMessageId = undefined;
     this.activeStreamStartedAtMs = undefined;
     this.activeStreamHadPostCompactionInjection = false;
     this.activeStreamHadAnyDelta = false;
@@ -5776,6 +6397,9 @@ export class AgentSession {
     this.setTurnPhase(TurnPhase.COMPLETING);
 
     this.queuedProviderToolEndAbortInFlight = false;
+    // A stop decided for a queued message can still end as a stream error; the error path
+    // (auto-retry or a terminal error row) owns what happens next, not the stranded resume.
+    this.withdrawStrandedTurnResume();
     this.clearLiveUsageState();
     const hadCompactionRequest = this.activeCompactionRequest !== undefined;
     if (
@@ -5847,6 +6471,7 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
+        this.activeStreamMessageId = payload.messageId;
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
         // setGoal deferral meaningful again — clear the goal service's settled
@@ -6000,6 +6625,15 @@ export class AgentSession {
         });
 
         const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+        // A hard stop with no registered stream (task_stop / interrupt cascade through
+        // aiService.stopStream while a stranded resume is still in its pre-stream I/O) must
+        // withdraw that resume here: StreamManager had nothing to abort, and the STREAMING
+        // branch below never runs for it. Only the queued-message soft stop keeps its obligation.
+        if (
+          !(preStreamAbortReason === "queued-message" && this.queuedProviderToolEndAbortInFlight)
+        ) {
+          this.withdrawStrandedTurnResume();
+        }
         if (this.turnPhase === TurnPhase.PREPARING) {
           this.clearPreparingRuntimeStatus();
           this.setTerminalStreamLifecycle("interrupted", {
@@ -6022,7 +6656,9 @@ export class AgentSession {
       }
 
       this.setTurnPhase(TurnPhase.COMPLETING);
-      const activeModelForAbort = this.activeStreamContext?.modelString;
+      // Price the abort against the model that produced the usage (a configured fallback may
+      // differ from the requested one), as stream-end does; the context still names the request.
+      const activeModelForAbort = payload.metadata?.model ?? this.activeStreamContext?.modelString;
       if (activeModelForAbort) {
         this.updateUsageStateFromModelUsage({
           model: activeModelForAbort,
@@ -6036,9 +6672,33 @@ export class AgentSession {
 
       const failedUserMessageId = this.activeStreamUserMessageId;
       const hadCompactionRequest = this.activeCompactionRequest !== undefined;
+      const abortedStreamContext = this.activeStreamContext;
+      // Whoever continues the interrupted turn from this context (mid-stream compaction holds a
+      // reference to it) continues under what the aborted stream left of the ceiling and from
+      // the chain state it reached, as a resume or retry would.
+      if (abortedStreamContext != null) {
+        if (payload.metadata?.stepsRemaining != null) {
+          abortedStreamContext.stepBudget = payload.metadata.stepsRemaining;
+        }
+        const abortedProgress = payload.metadata?.modelFallbackProgress;
+        if (abortedProgress != null && payload.metadata?.model != null) {
+          abortedStreamContext.modelFallbackProgress = abortedProgress;
+          abortedStreamContext.modelString = payload.metadata.model;
+        }
+      }
       const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
+      // The soft stop is recognized by its own reason, not by the in-flight flag alone: a hard
+      // "system" stop (task_stop, interrupt cascade, workflow timeout) can land while the soft
+      // stop is pending. The flag still gates it so a hard user interrupt that reset it cancels
+      // the dispatch even when the soft stop wins the event race.
       const isQueuedProviderToolEndAbort =
-        this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
+        abortReason === "queued-message" && this.queuedProviderToolEndAbortInFlight;
+      // Only the queued-message soft stop owes the cut turn a continuation (rebuilt below from
+      // the aborted context). A user Stop must leave the session idle even though the queue it
+      // restores to the composer pokes the resume sweep; other aborts belong to auto-retry.
+      if (!isQueuedProviderToolEndAbort) {
+        this.withdrawStrandedTurnResume();
+      }
       if (abortReason === "user") {
         await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
       }
@@ -6075,10 +6735,21 @@ export class AgentSession {
       }
       await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
       this.emitChatEvent(payload);
-      const dispatchedQueuedMessage =
-        this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
+      // Re-read the in-flight flag: a hard stop that landed during the awaits above (synthetic
+      // system abort while COMPLETING, or a task hard stop clearing the queue) reset it and
+      // withdrew the marker, so the soft stop sampled at entry no longer owes a continuation.
+      const dispatchedQueuedMessage = this.dispatchQueuedProviderToolEndMessageAfterAbort(
+        isQueuedProviderToolEndAbort && this.queuedProviderToolEndAbortInFlight,
+        abortedStreamContext,
+        payload.metadata?.model,
+        payload.messageId,
+        payload.metadata?.stepsRemaining,
+        payload.metadata?.modelFallbackProgress,
+        payload.metadata?.requiredToolSatisfied
+      );
       if (!dispatchedQueuedMessage) {
         this.setTurnPhase(TurnPhase.IDLE);
+        this.resumeStrandedTurnIfIdle();
       }
     });
     forward("runtime-status", (payload) => {
@@ -6197,12 +6868,24 @@ export class AgentSession {
           // Clear the queued-message signal while the edit flow owns the next dispatch.
           this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
           // Do not dispatch stream-end follow-ups while the edit flow is waiting
-          // for IDLE; truncation must run before any synthetic turn resumes.
+          // for IDLE; truncation must run before any synthetic turn resumes. The edit
+          // rewrites the interrupted turn, so nothing is owed to it either.
+          this.withdrawStrandedTurnResume();
         } else {
+          if (handled) {
+            this.strandedTurnResume = undefined;
+          }
+          // The queued dispatch below normally consumes the owed continuation (STREAMING
+          // transition); it stays owed only when that message does not start a turn.
           this.sendQueuedMessages();
         }
 
-        if (!handled && !this.deferQueuedFlushUntilAfterEdit && !hadQueuedMessages) {
+        if (
+          !handled &&
+          !this.deferQueuedFlushUntilAfterEdit &&
+          !hadQueuedMessages &&
+          this.strandedTurnResume == null
+        ) {
           const sendOptions = activeStreamOptions ?? {
             model: streamEndPayload.metadata.model,
             agentId: WORKSPACE_DEFAULTS.agentId,
@@ -6258,6 +6941,7 @@ export class AgentSession {
         if (this.turnPhase === TurnPhase.COMPLETING) {
           this.resetActiveStreamState();
           this.setTurnPhase(TurnPhase.IDLE);
+          this.resumeStrandedTurnIfIdle();
           if (goalContinuationRequest != null) {
             await this.workspaceGoalService?.requestContinuationAfterStreamEnd({
               workspaceId: this.workspaceId,
@@ -6341,6 +7025,25 @@ export class AgentSession {
 
     this.emitStreamLifecycleIfChanged();
 
+    if (next === TurnPhase.STREAMING) {
+      // Any stream that actually starts is the continuation the stranded turn was waiting
+      // for. PREPARING is not enough: a dequeued entry can still be canceled before acceptance.
+      const consumed = this.strandedTurnResume;
+      const consumedCorrelation = getWorkspaceTurnMuxMetadata(consumed?.options.muxMetadata);
+      if (consumed != null && consumed.claimed !== true && consumedCorrelation != null) {
+        this.consumedContinuationCuts.set(consumed.cutMessageId, consumedCorrelation);
+        // Bounded like the recovery decisions: unclaimed cuts (owner gone) must not accumulate.
+        for (const key of this.consumedContinuationCuts.keys()) {
+          if (this.consumedContinuationCuts.size <= MAX_RETAINED_CONTINUATION_CUTS) break;
+          this.consumedContinuationCuts.delete(key);
+        }
+      }
+      this.strandedTurnResume = undefined;
+      // "Consecutive" counts only resume attempts that never got this far: a stream that starts
+      // (the resume's own included) consumed the marker, so a later stranding is new work.
+      this.consecutiveStrandedResumes = 0;
+    }
+
     if (next === TurnPhase.IDLE) {
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
@@ -6401,6 +7104,11 @@ export class AgentSession {
   async discardAutoRetryForContextMutation(): Promise<Result<void>> {
     this.retryManager.cancel();
     this.setAutoRetryResumeState(undefined);
+    // The discarded transcript yields no successor stream, so a delegated turn whose stream-end
+    // the owner deferred on the owed continuation is settled here rather than left running.
+    this.forfeitStrandedTurnResume(
+      "Stranded turn resume discarded: workspace context was mutated."
+    );
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
     if (!deleteResult.success) {
       return Err(deleteResult.error);
@@ -6438,14 +7146,14 @@ export class AgentSession {
         // Entries left queued while the block was held have no stream-end
         // drain to dispatch them (the session stayed idle throughout) —
         // drain now, mirroring the edit-admission release. Only when entries
-        // exist: releases from a session that never queued must stay
-        // side-effect free.
-        if (
-          this.turnAdmissionBlocks === 0 &&
-          this.turnPhase === TurnPhase.IDLE &&
-          !this.messageQueue.isEmpty()
-        ) {
-          this.sendQueuedMessages();
+        // (or an owed stranded resume) exist: releases from a session that
+        // never queued must stay side-effect free.
+        if (this.turnAdmissionBlocks === 0 && this.turnPhase === TurnPhase.IDLE) {
+          if (!this.messageQueue.isEmpty()) {
+            this.sendQueuedMessages();
+          } else {
+            this.resumeStrandedTurnIfIdle();
+          }
         }
       },
     };
@@ -6594,15 +7302,29 @@ export class AgentSession {
     return nextDispatchableMode ?? null;
   }
 
-  clearQueue(cancelReason = "Queued message cleared before dispatch."): void {
+  clearQueue(
+    cancelReason = "Queued message cleared before dispatch.",
+    options?: { hardStop?: boolean }
+  ): void {
     this.assertNotDisposed("clearQueue");
+    // A task hard stop (task_stop, interrupt cascade, workflow timeout) clears the queue and
+    // then stops the stream through StreamManager directly. That stop emits nothing when the
+    // stream has already completed or has not registered yet, so the queue clear is the only
+    // session-visible boundary at which the owed continuation and a pending provider-tool soft
+    // stop can be forfeited. A user clearing the queue keeps them: the cut turn still resumes.
+    // Forfeit rather than withdraw: with the stream already completed, the owner that deferred on
+    // the marker gets no stream event, so this settles the delegated turn (a no-op when the stop
+    // already did).
+    if (options?.hardStop === true) {
+      this.queuedProviderToolEndAbortInFlight = false;
+      this.forfeitStrandedTurnResume("Stranded turn resume dropped: task hard stop.");
+    }
+    const heldOwedContinuation = this.queueHoldsOwedTurnContinuation();
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
-    for (const callbacks of callbackSets) {
-      this.notifyQueuedMessageCleared(callbacks, cancelReason);
-    }
+    this.cancelRemovedEntries(callbackSets, cancelReason, heldOwedContinuation);
   }
 
   setQueuedMessageDispatchMode(mode: "tool-end" | "turn-end"): boolean {
@@ -6628,7 +7350,7 @@ export class AgentSession {
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
     },
     cancelReason: string
-  ): void {
+  ): Promise<void> {
     const notify = async () => {
       if (callbacks.onCanceled != null) {
         await callbacks.onCanceled(cancelReason);
@@ -6636,7 +7358,7 @@ export class AgentSession {
       }
       await callbacks.onAcceptedPreStreamFailure?.(createUnknownSendMessageError(cancelReason));
     };
-    notify().catch((error: unknown) => {
+    return notify().catch((error: unknown) => {
       log.error("Queued message clear callback failed", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
@@ -6644,9 +7366,58 @@ export class AgentSession {
     });
   }
 
+  /**
+   * Whether the queue holds an entry continuing the owed marker's delegated turn. The owner
+   * defers that turn's settlement on such an entry (claimWorkspaceTurnContinuation), and the
+   * entry's onCanceled settles the handle if it is removed unstarted.
+   */
+  private queueHoldsOwedTurnContinuation(): boolean {
+    const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
+    return correlation != null && this.messageQueue.hasWorkspaceTurn(correlation.taskHandleId);
+  }
+
+  /**
+   * Whether a send with this metadata continues the owed cut turn (a wake inherits its
+   * correlation from history; a workspace-turn entry must carry the same correlation) rather than
+   * supersede it. Vacuously true when nothing is owed.
+   */
+  private continuesOwedTurn(muxMetadata: MuxMessageMetadata | undefined): boolean {
+    const owed = this.strandedTurnResume;
+    if (owed == null || muxMetadata?.type === "bash-monitor-wake") {
+      return true;
+    }
+    return hasSameWorkspaceTurnCorrelation(
+      getWorkspaceTurnMuxMetadata(muxMetadata),
+      getWorkspaceTurnMuxMetadata(owed.options.muxMetadata)
+    );
+  }
+
+  /**
+   * Runs removed entries' cancellation and sweeps for the owed continuation only once it has
+   * settled, as the dequeue path does: a canceled workspace-turn entry settles its handle in
+   * onCanceled, and a sweep admitted before that lands would resume against an interrupted
+   * handle. An entry that continued the owed turn was that turn's terminal path, so the
+   * continuation is forfeited before its cancellation runs.
+   */
+  private cancelRemovedEntries(
+    callbackSets: QueueClearCallbacks[],
+    cancelReason: string,
+    heldOwedContinuation: boolean
+  ): void {
+    if (heldOwedContinuation && !this.queueHoldsOwedTurnContinuation()) {
+      this.forfeitStrandedTurnResume(
+        "Stranded turn resume dropped: its queued continuation was canceled."
+      );
+    }
+    void Promise.all(
+      callbackSets.map((callbacks) => this.notifyQueuedMessageCleared(callbacks, cancelReason))
+    ).then(() => this.resumeStrandedTurnIfIdle());
+  }
+
   removeQueuedMessagesByDedupeKeyPrefix(prefix: string, cancelReason: string): number {
     this.assertNotDisposed("removeQueuedMessagesByDedupeKeyPrefix");
     assert(prefix.length > 0, "removeQueuedMessagesByDedupeKeyPrefix requires prefix");
+    const heldOwedContinuation = this.queueHoldsOwedTurnContinuation();
     const removal = this.messageQueue.removeByDedupeKeyPrefix(prefix);
     if (removal.removedCount === 0) {
       return 0;
@@ -6656,9 +7427,7 @@ export class AgentSession {
       this.workspaceId,
       this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
-    for (const callbacks of removal.callbacks) {
-      this.notifyQueuedMessageCleared(callbacks, cancelReason);
-    }
+    this.cancelRemovedEntries(removal.callbacks, cancelReason, heldOwedContinuation);
     return removal.removedCount;
   }
 
@@ -6675,6 +7444,7 @@ export class AgentSession {
   removeQueuedWorkspaceTurn(handleId: string, cancelReason: string): boolean {
     this.assertNotDisposed("removeQueuedWorkspaceTurn");
     assert(handleId.length > 0, "removeQueuedWorkspaceTurn requires handleId");
+    const heldOwedContinuation = this.queueHoldsOwedTurnContinuation();
     const callbacks = this.messageQueue.removeWorkspaceTurn(handleId);
     if (callbacks == null) {
       return false;
@@ -6684,7 +7454,7 @@ export class AgentSession {
       this.workspaceId,
       this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
-    this.notifyQueuedMessageCleared(callbacks, cancelReason);
+    this.cancelRemovedEntries([callbacks], cancelReason, heldOwedContinuation);
     return true;
   }
 
@@ -6740,13 +7510,12 @@ export class AgentSession {
    * Whether a bash-monitor-wake continuation is pending dispatch: the next
    * queued entry is a wake, or a dequeued wake is mid-dispatch (dequeue →
    * stream start). Wake sends are the only input that inherits an open
-   * delegated workspace turn's correlation, so TaskService uses this — not
-   * generic queued/preparing state — to decide whether a correlated
-   * "tool-calls" queue cut will be continued rather than superseded. Once the
-   * wake's stream starts, TaskService matches the active stream's inherited
-   * correlation instead (see hasSameTurnWakeContinuation).
+   * delegated workspace turn's correlation, so claimWorkspaceTurnContinuation
+   * treats one as the turn's continuation rather than a superseding entry. Once
+   * the wake's stream starts, the owner matches the active stream's inherited
+   * correlation instead.
    */
-  hasPendingBashMonitorWakeContinuation(): boolean {
+  private hasPendingBashMonitorWakeContinuation(): boolean {
     if (this.messageQueue.isNextEntryBashMonitorWake()) {
       return true;
     }
@@ -6755,10 +7524,29 @@ export class AgentSession {
   }
 
   /**
-   * Whether a queued or dispatching entry continues the exact workspace-turn correlation.
+   * The delegated turn owner's settlement decision for a correlated "tool-calls" stream-end:
+   * true when a continuation of that exact turn is pending (the owner defers), false when the
+   * cut superseded it (the owner settles the turn now). A false answer binds the owed
+   * continuation: the marker for that cut is voided here, so the turn cannot resume as orphaned
+   * work no matter how the superseding entry later leaves the queue. The owner reads under its
+   * own event lock, so this is the only point where its view and the marker are the same.
    */
-  hasPendingWorkspaceTurnContinuation(
-    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  claimWorkspaceTurnContinuation(
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
+  ): boolean {
+    const deferred = this.answerWorkspaceTurnContinuationClaim(metadata, streamEndMessageId);
+    // The owner claims each stream-end once, so a cut it deferred on here needs no evidence
+    // retained for a late claim (consumedContinuationCuts).
+    if (deferred && this.strandedTurnResume?.cutMessageId === streamEndMessageId) {
+      this.strandedTurnResume.claimed = true;
+    }
+    return deferred;
+  }
+
+  private answerWorkspaceTurnContinuationClaim(
+    metadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    streamEndMessageId: string
   ): boolean {
     if (hasSameWorkspaceTurnCorrelation(this.preparingWorkspaceTurnMetadata, metadata)) {
       return true;
@@ -6775,12 +7563,177 @@ export class AgentSession {
     }
 
     const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
-    return (
+    if (
       dispatching?.type === "workspace-turn-task" &&
       dispatching.taskHandleId === metadata.taskHandleId &&
       dispatching.ownerWorkspaceId === metadata.ownerWorkspaceId &&
       dispatching.turnId === metadata.turnId
+    ) {
+      return true;
+    }
+
+    // A wake send inherits the open delegated turn's correlation from history, so a wake at
+    // the queue head continues the turn even though the entry carries no correlation itself.
+    if (this.hasPendingBashMonitorWakeContinuation()) {
+      return true;
+    }
+
+    // The continuation of this exact cut already ran (and may already have ended): its own
+    // stream events settle the turn, so the late claim defers rather than settling it as failed.
+    const consumedCorrelation = this.consumedContinuationCuts.get(streamEndMessageId);
+    if (consumedCorrelation != null) {
+      this.consumedContinuationCuts.delete(streamEndMessageId);
+      if (hasSameWorkspaceTurnCorrelation(consumedCorrelation, metadata)) {
+        return true;
+      }
+    }
+
+    const owed = this.strandedTurnResume;
+    if (
+      owed == null ||
+      !hasSameWorkspaceTurnCorrelation(
+        getWorkspaceTurnMuxMetadata(owed.options.muxMetadata),
+        metadata
+      )
+    ) {
+      return false;
+    }
+    // A marker from a later cut of this turn proves a continuation already ran after the
+    // stream-end being settled (the owner is processing an older event): defer, and leave the
+    // newer cut's continuation to its own stream-end.
+    if (owed.cutMessageId !== streamEndMessageId) {
+      return true;
+    }
+    // Past the retry cap the marker is no longer advertised; the sweep forfeits it.
+    if (this.owedStrandedTurnResume() == null) {
+      return false;
+    }
+    // Nothing dispatchable queued to take the turn (withdrawn entries drain as no-ops): the
+    // stranded resume will carry this correlation.
+    if (this.messageQueue.getNextDispatchableMode() == null && !this.dispatchingQueuedEntry) {
+      return true;
+    }
+    // A queued or dispatching entry that failed the checks above supersedes the turn; the
+    // owner settles it on this answer, so the continuation must not outlive that entry.
+    this.withdrawStrandedTurnResume();
+    return false;
+  }
+
+  /**
+   * The continuation still owed to a stranded turn. Past the retry cap the marker is
+   * forfeited: nothing may advertise it (the owner would defer settlement for a resume that
+   * never starts) and the next sweep drops it.
+   */
+  private owedStrandedTurnResume(): StrandedTurnResume | undefined {
+    return this.consecutiveStrandedResumes < MAX_CONSECUTIVE_STRANDED_TURN_RESUMES
+      ? this.strandedTurnResume
+      : undefined;
+  }
+
+  /**
+   * The continuation is given up with no successor stream (sweep cap or goal refusal, context
+   * discard, session disposal). A delegated turn's owner may have deferred its stream-end on the
+   * strength of this marker (claimWorkspaceTurnContinuation), and no later stream-end will
+   * arrive for it, so the owner settles that turn here.
+   */
+  private forfeitStrandedTurnResume(reason: string): void {
+    const correlation = getWorkspaceTurnMuxMetadata(this.strandedTurnResume?.options.muxMetadata);
+    // Retain the owner's only terminal path before dropping the marker that advertised it.
+    const owed = this.recordOwedForfeit(correlation, reason);
+    this.withdrawStrandedTurnResume();
+    if (owed != null) {
+      void this.settleOwedForfeit(owed);
+    }
+  }
+
+  /**
+   * A delegated turn given up outside the marker (a dropped compaction follow-up that continued
+   * it): the same settlement, since nothing else will end the turn for its owner. Resolves true
+   * once the owner has the terminal record (or nothing was owed), false when the attempt failed
+   * and the settlement stays owed.
+   */
+  private forfeitWorkspaceTurnContinuation(
+    correlation: WorkspaceTurnMuxMetadata | undefined,
+    reason: string
+  ): Promise<boolean> {
+    const owed = this.recordOwedForfeit(correlation, reason);
+    return owed == null ? Promise.resolve(true) : this.settleOwedForfeit(owed);
+  }
+
+  private recordOwedForfeit(
+    correlation: WorkspaceTurnMuxMetadata | undefined,
+    reason: string
+  ): OwedForfeitSettlement | undefined {
+    if (correlation == null || this.settleForfeitedWorkspaceTurnContinuation == null) {
+      return undefined;
+    }
+    const owed: OwedForfeitSettlement = {
+      key: `${correlation.ownerWorkspaceId}/${correlation.taskHandleId}/${correlation.turnId}`,
+      correlation,
+      reason,
+    };
+    this.owedForfeitSettlements.set(owed.key, owed);
+    return owed;
+  }
+
+  private settleOwedForfeits(): void {
+    for (const owed of this.owedForfeitSettlements.values()) {
+      void this.settleOwedForfeit(owed);
+    }
+  }
+
+  /**
+   * The settlement is the owner's only remaining path to a terminal record for that turn, so a
+   * failed attempt (task store I/O) stays owed and retries on its own (including after session
+   * disposal) as well as from idle sweeps. Settlement is idempotent on the owner's side.
+   */
+  private settleOwedForfeit(owed: OwedForfeitSettlement): Promise<boolean> {
+    if (owed.inFlight != null) {
+      return owed.inFlight;
+    }
+    const settle = this.settleForfeitedWorkspaceTurnContinuation;
+    assert(settle != null, "an owed forfeit settlement requires a settler");
+    owed.inFlight = settle(owed.correlation, owed.reason).then(
+      () => {
+        if (this.owedForfeitSettlements.get(owed.key) === owed) {
+          this.owedForfeitSettlements.delete(owed.key);
+        }
+        return true;
+      },
+      (error: unknown) => {
+        owed.inFlight = undefined;
+        log.warn("Failed to settle forfeited workspace turn continuation; retrying", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+        this.scheduleOwedForfeitSettlementRetry();
+        return false;
+      }
     );
+    return owed.inFlight;
+  }
+
+  private scheduleOwedForfeitSettlementRetry(): void {
+    if (this.owedForfeitSettlementRetryTimer != null) {
+      return;
+    }
+    // Do not cancel this on dispose: workspace removal is itself one of the boundaries that can
+    // forfeit a delegated turn, and its owner still requires the terminal task-store write.
+    this.owedForfeitSettlementRetryTimer = setTimeout(() => {
+      this.owedForfeitSettlementRetryTimer = null;
+      this.settleOwedForfeits();
+    }, FORFEIT_SETTLEMENT_RETRY_DELAY_MS);
+    this.owedForfeitSettlementRetryTimer.unref();
+  }
+
+  /**
+   * Nothing is owed anymore (user Stop, superseding input): drop the marker and cancel a resume
+   * still in its pre-stream window, which already copied the marker. The owner of a delegated
+   * turn learns of it from the stream event or hard stop that caused the withdrawal.
+   */
+  private withdrawStrandedTurnResume(): void {
+    this.strandedTurnResume = undefined;
+    this.strandedTurnResumeInFlight?.abort();
   }
 
   /**
@@ -6842,7 +7795,7 @@ export class AgentSession {
     this.queuedProviderToolEndAbortInFlight = true;
     const result = await this.streamManager.stopStream(this.workspaceId, {
       soft: true,
-      abortReason: "system",
+      abortReason: "queued-message",
     });
     if (!result.success) {
       this.queuedProviderToolEndAbortInFlight = false;
@@ -6854,25 +7807,158 @@ export class AgentSession {
   }
 
   private dispatchQueuedProviderToolEndMessageAfterAbort(
-    abortReason: StreamAbortReason | undefined
+    isQueuedProviderToolEndAbort: boolean,
+    abortedStreamContext: AgentSession["activeStreamContext"],
+    abortedModelString: string | undefined,
+    abortedMessageId: string,
+    abortedStepsRemaining: number | undefined,
+    abortedModelFallbackProgress: ModelFallbackProgress | undefined,
+    abortedRequiredToolSatisfied: boolean | undefined
   ): boolean {
-    if (!this.queuedProviderToolEndAbortInFlight) {
+    this.queuedProviderToolEndAbortInFlight = false;
+    if (!isQueuedProviderToolEndAbort || this.deferQueuedFlushUntilAfterEdit) {
       return false;
     }
 
-    // Physical check: withdrawn entries must still drain so their onCanceled fires.
-    const shouldDispatch =
-      abortReason !== "user" &&
-      !this.deferQueuedFlushUntilAfterEdit &&
-      !this.messageQueue.isEmpty();
-    this.queuedProviderToolEndAbortInFlight = false;
-
-    if (!shouldDispatch) {
+    // The soft stop was made on behalf of the queued message; if that message has been
+    // withdrawn (or is withdrawn after dequeue), the interrupted turn must resume instead.
+    // Only under the steps the cut stream had left: at zero the ceiling ended the turn, and an
+    // abort that reports no budget must not hand the resume a fresh one. A successful required
+    // tool in the cut step ended the turn too (the loop's stop condition would have, one tool
+    // result later), as in the loop's own queued-message stop.
+    if (
+      abortedStreamContext != null &&
+      abortedStepsRemaining != null &&
+      abortedStepsRemaining > 0 &&
+      abortedRequiredToolSatisfied !== true
+    ) {
+      this.strandedTurnResume = buildStrandedTurnResume({
+        ...abortedStreamContext,
+        modelString: abortedModelString ?? abortedStreamContext.modelString,
+        cutMessageId: abortedMessageId,
+        stepBudget: abortedStepsRemaining,
+        modelFallbackProgress: abortedModelFallbackProgress,
+        thinkingLevelAtCut:
+          this.activeTurnThinkingOverride?.pending ?? this.activeTurnThinkingOverride?.applied,
+      });
+    }
+    // Physical check: withdrawn entries must still drain so their onCanceled fires; that drain's
+    // idle transition is what sweeps the continuation registered above.
+    if (this.messageQueue.isEmpty()) {
       return false;
     }
 
     this.sendQueuedMessages();
     return true;
+  }
+
+  /**
+   * One idempotent sweep for the owed continuation (see strandedTurnResume). Cheap enough to
+   * run from every idle transition and queue removal; only the first eligible call acts.
+   */
+  private resumeStrandedTurnIfIdle(): void {
+    this.settleOwedForfeits();
+    const resume = this.owedStrandedTurnResume();
+    if (resume == null) {
+      if (this.strandedTurnResume != null) {
+        log.warn("Leaving stranded turn idle: consecutive resume cap reached", {
+          workspaceId: this.workspaceId,
+          cap: MAX_CONSECUTIVE_STRANDED_TURN_RESUMES,
+        });
+        this.forfeitStrandedTurnResume("Stranded turn resume gave up: retry cap reached.");
+      }
+      return;
+    }
+    if (
+      this.strandedTurnResumeInFlight ||
+      this.disposed ||
+      this.turnAdmissionBlocks > 0 ||
+      this.hasActiveOrPendingTurnWork() ||
+      !this.messageQueue.isEmpty() ||
+      this.hasPendingAutoRetry() ||
+      this.deferQueuedFlushUntilAfterEdit ||
+      // A manual send inside WorkspaceService preflight is not queued yet and the session
+      // reads idle; the user's message supersedes the owed continuation (it drains here
+      // through drainQueuedMessagesIfIdle if it settles without a turn).
+      this.hasExternalSendPreflight?.() === true
+    ) {
+      return;
+    }
+
+    this.consecutiveStrandedResumes += 1;
+    log.info("Resuming turn stranded by a withdrawn queued message", {
+      workspaceId: this.workspaceId,
+      attempt: this.consecutiveStrandedResumes,
+    });
+
+    // The owed continuation is cleared by the STREAMING transition, not here: a resume that
+    // fails before its stream starts (pricing gate, history read) stays owed for the next
+    // sweep, bounded by the cap above.
+    const inFlight = new AbortController();
+    this.strandedTurnResumeInFlight = inFlight;
+    this.resumeStream(resume.options, {
+      agentInitiated: resume.agentInitiated,
+      goalKind: resume.goalKind,
+      goalId: resume.goalId,
+      abortSignal: inFlight.signal,
+      revalidateAdmission: true,
+      stepBudget: resume.stepBudget,
+      modelFallbackProgress: resume.modelFallbackProgress,
+    })
+      .then((result) => {
+        if (!result.success) {
+          log.warn("Stranded turn resume failed", {
+            workspaceId: this.workspaceId,
+            error: result.error,
+          });
+          return false;
+        }
+        if (result.data.refusedBy != null) {
+          // A Pause or terminal goal transition, or a stop on the workspace or delegated turn,
+          // landed while the cut turn waited: nothing is owed to it anymore.
+          log.info("Dropping stranded turn: no longer admitted", {
+            workspaceId: this.workspaceId,
+            refusedBy: result.data.refusedBy,
+            goalKind: resume.goalKind,
+          });
+          this.forfeitStrandedTurnResume(
+            result.data.refusedBy === "goal"
+              ? "Stranded turn resume dropped: goal no longer admits it."
+              : "Stranded turn resume dropped: workspace or delegated turn no longer admits it."
+          );
+          return false;
+        }
+        if (!result.data.started) {
+          log.warn("Stranded turn resume did not start", { workspaceId: this.workspaceId });
+          return false;
+        }
+        return true;
+      })
+      .catch((error: unknown) => {
+        log.warn("Stranded turn resume threw", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+        return false;
+      })
+      .then((started) => {
+        this.strandedTurnResumeInFlight = null;
+        // resumeStream settles only after its stream ends, so a stranding of that resumed
+        // stream can find the flag still set; sweep again once it clears. A resume that failed
+        // before its stream is swept again too: an idle session gets no later poke, and the cap's
+        // forfeit settles a delegated owner instead of leaving it waiting on a resume that never
+        // runs. Anything queued behind the failed PREPARING claim has no stream end to wait for.
+        this.resumeStrandedTurnIfIdle();
+        if (!started) {
+          this.dispatchQueuedMessagesIfIdle();
+        }
+      })
+      .catch((error: unknown) => {
+        log.error("Stranded turn resume sweep failed", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
   }
 
   async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
@@ -6983,6 +8069,11 @@ export class AgentSession {
    * failed-startup drains elsewhere in this file.
    */
   drainQueuedMessagesIfIdle(): void {
+    this.resumeStrandedTurnIfIdle();
+    this.dispatchQueuedMessagesIfIdle();
+  }
+
+  private dispatchQueuedMessagesIfIdle(): void {
     if (
       this.hasActiveOrPendingTurnWork() ||
       this.deferQueuedFlushUntilAfterEdit ||
@@ -7087,6 +8178,8 @@ export class AgentSession {
           }
           this.sendQueuedMessages();
         });
+    } else {
+      this.resumeStrandedTurnIfIdle();
     }
   }
 
@@ -7252,6 +8345,26 @@ export class AgentSession {
       imageParts?: FilePart[];
     };
 
+    // The delegated turn this follow-up continues, if any: stamped on the follow-up itself by
+    // mid-stream compaction, or beside a wake follow-up by on-send compaction. Every drop below
+    // settles it, since the compaction abort and the compact stream end it for nobody.
+    const continuedTurn =
+      parsePersistedWorkspaceTurnMetadata(followUp.muxMetadata) ??
+      parsePersistedWorkspaceTurnMetadata(followUp.workspaceTurnMetadata);
+    const dropFollowUp = async (reason: string): Promise<false> => {
+      // The owner's terminal record lands before the follow-up leaves history: the owed
+      // settlement is memory, so a crash between the two would strand the handle for good. A
+      // failed attempt keeps the follow-up pending for the next startup to re-drop and re-settle.
+      const settled = await this.forfeitWorkspaceTurnContinuation(
+        continuedTurn,
+        `Compaction follow-up dropped: ${reason}`
+      );
+      if (settled) {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+      }
+      return false;
+    };
+
     // Compaction summaries are unchecked chat.jsonl. Reject malformed persisted
     // goal attribution instead of forwarding it into goal-service assertions or
     // repeatedly crashing startup recovery on the same row.
@@ -7265,8 +8378,7 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
       });
-      await this.clearPendingFollowUpFromSummary(lastMessage);
-      return false;
+      return dropFollowUp("malformed goal attribution.");
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cS8Bq): pre-upgrade summaries persisted
@@ -7282,8 +8394,39 @@ export class AgentSession {
         summaryMessageId: lastMessage.id,
         goalKind: persistedGoalKind,
       });
-      await this.clearPendingFollowUpFromSummary(lastMessage);
-      return false;
+      return dropFollowUp("legacy goal follow-up without goal identity.");
+    }
+
+    // Same raw JSON boundary. A present but malformed remainder fails closed: the interrupted turn
+    // ran under a ceiling this row can no longer state, and an absent-legacy reading would hand a
+    // nearly spent autonomous turn the default ceiling instead. The chain state is only a
+    // preference order, so a malformed one falls back to the model's own chain.
+    const persistedStepBudget = followUp.stepBudget;
+    if (
+      persistedStepBudget !== undefined &&
+      !(Number.isInteger(persistedStepBudget) && persistedStepBudget >= 0)
+    ) {
+      log.warn("Discarding pending follow-up with a malformed persisted step budget", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      return dropFollowUp("malformed persisted step budget.");
+    }
+    const persistedFallbackProgress =
+      followUp.modelFallbackProgress != null
+        ? ModelFallbackProgressSchema.safeParse(followUp.modelFallbackProgress)
+        : undefined;
+    // A follow-up continuing a delegated turn is admitted and retried like a stranded resume even
+    // when the interrupted turn itself was not one (a delegated turn's first compaction).
+    const revalidateAdmission = followUp.revalidateAdmission === true || continuedTurn != null;
+    // The interrupted turn spent its last step before compaction: the ceiling ended it, and the
+    // loop's stop condition is only evaluated after a step, so a follow-up would run one more.
+    if (persistedStepBudget === 0) {
+      log.info("Discarding pending follow-up: the interrupted turn's step budget is spent", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      return dropFollowUp("the interrupted turn's step budget is spent.");
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): goal-loop follow-ups were originally
@@ -7346,10 +8489,28 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           goalKind: persistedGoalKind,
         });
-        await this.clearPendingFollowUpFromSummary(lastMessage);
-        return false;
+        return dropFollowUp("goal no longer admits it.");
       }
       goalAdmissionStale = admission.admissionStale;
+    }
+
+    // Admitted like a stranded resume (admitResumeLaunch): the workspace must still accept
+    // streams and a delegated turn's owner must still have it running. The probe rides along to
+    // the launch boundary below.
+    let turnAdmissionStale: (() => boolean) | undefined;
+    if (revalidateAdmission && this.admitStrandedTurnResume) {
+      const admission = await this.admitStrandedTurnResume(continuedTurn);
+      if (!admission.admissible) {
+        log.info(
+          "Skipping pending follow-up: the workspace or delegated turn no longer admits it",
+          {
+            workspaceId: this.workspaceId,
+            summaryMessageId: lastMessage.id,
+          }
+        );
+        return dropFollowUp("the workspace or delegated turn no longer admits it.");
+      }
+      turnAdmissionStale = admission.admissionStale;
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cQt3j): the queue/busy sample above ages
@@ -7364,9 +8525,14 @@ export class AgentSession {
           this.hasExternalSendPreflight?.() === true ||
           (this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING)
       : undefined;
+    // Launch-safe probes only (the idle rule would trip on this send's own PREPARING turn).
+    const launchAdmissionStale =
+      goalAdmissionStale != null || turnAdmissionStale != null
+        ? () => goalAdmissionStale?.() === true || turnAdmissionStale?.() === true
+        : undefined;
     const followUpAdmissionStale =
-      idleRuleStale != null || goalAdmissionStale != null
-        ? () => idleRuleStale?.() === true || goalAdmissionStale?.() === true
+      idleRuleStale != null || launchAdmissionStale != null
+        ? () => idleRuleStale?.() === true || launchAdmissionStale?.() === true
         : undefined;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
@@ -7454,7 +8620,11 @@ export class AgentSession {
       options,
       followUp.agentInitiated,
       persistedGoalKind,
-      persistedGoalId
+      persistedGoalId,
+      persistedStepBudget,
+      revalidateAdmission,
+      persistedFallbackProgress?.success ? persistedFallbackProgress.data : undefined,
+      continuedTurn
     );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
@@ -7474,11 +8644,32 @@ export class AgentSession {
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: followUpAdmissionStale,
+      refuseStreamStart: launchAdmissionStale,
+      stepBudget: persistedStepBudget,
+      modelFallbackProgress: persistedFallbackProgress?.success
+        ? persistedFallbackProgress.data
+        : undefined,
+      revalidateAdmission,
+      // The wake's own metadata does not carry the delegated turn; its retries must still
+      // revalidate against that turn's handle.
+      workspaceTurnMetadata: continuedTurn,
     });
+    // The goal, the workspace, or the delegated turn stopped admitting the follow-up during its
+    // preflight (an Err) or at the launch boundary (StreamManager refuses as a startup-aborted Ok
+    // handle, like a refused stranded resume): no successor stream, so the turn is settled and
+    // the follow-up dropped.
+    if (launchAdmissionStale?.() === true) {
+      log.info("Pending follow-up refused at admission: goal, workspace, or delegated turn", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+        goalRefused: goalAdmissionStale?.() === true,
+      });
+      return dropFollowUp("no longer admitted by its goal, workspace, or delegated turn.");
+    }
     if (!sendResult.success) {
-      // A stale-admission refusal is the idle rule (or a goal transition)
-      // working as intended, not a recovery failure: route it through the
-      // same skip path as the pre-send check instead of throwing.
+      // A stale-admission refusal is the idle rule working as intended, not a
+      // recovery failure: route it through the same skip path as the pre-send
+      // check instead of throwing.
       if (followUpAdmissionStale?.() === true) {
         log.info("Pending follow-up refused at send admission; skipping it", {
           workspaceId: this.workspaceId,

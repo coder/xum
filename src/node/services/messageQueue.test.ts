@@ -604,6 +604,61 @@ describe("MessageQueue", () => {
       ).toBe(false);
     });
 
+    it("ignores withdrawn predecessors when checking that every entry continues the turn", () => {
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        { synthetic: true, agentInitiated: true, cancelSignal: withdrawn.signal }
+      );
+      queue.add("Follow up", { model: "gpt-4", agentId: "exec", muxMetadata: metadata });
+
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(false);
+
+      // Withdrawn but not yet drained: no longer pending work, so it supersedes nothing.
+      withdrawn.abort();
+      expect(
+        queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+    });
+
+    it("reads the next entry past withdrawn ones for wake, correlation, and cut candidate", () => {
+      const withdrawn = new AbortController();
+      queue.add(
+        "withdrawn wake",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+          queueDispatchMode: "tool-end",
+        },
+        { synthetic: true, agentInitiated: true, cancelSignal: withdrawn.signal }
+      );
+      expect(queue.isNextEntryBashMonitorWake()).toBe(true);
+
+      withdrawn.abort();
+      expect(queue.isNextEntryBashMonitorWake()).toBe(false);
+      expect(queue.getNextQueueCutCandidate()).toBeUndefined();
+
+      queue.add("Follow up", {
+        model: "gpt-4",
+        agentId: "exec",
+        muxMetadata: metadata,
+        queueDispatchMode: "turn-end",
+      });
+      expect(queue.isNextEntryBashMonitorWake()).toBe(false);
+      expect(
+        queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+      ).toBe(true);
+      expect(queue.getNextQueueCutCandidate()?.dispatchMode).toBe("turn-end");
+    });
+
     it("exposes the head entry's metadata and dispatch mode as the queue-cut candidate", () => {
       expect(queue.getNextQueueCutCandidate()).toBeUndefined();
 
