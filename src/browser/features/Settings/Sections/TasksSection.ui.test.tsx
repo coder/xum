@@ -189,12 +189,19 @@ describe("TasksSection Exec subagent defaults", () => {
     [true, false],
     [true, true],
   ])("gates the Intuition card on parent=%s and intuition=%s", async (memory, intuition) => {
+    advisorExperimentEnabled = true;
     experimentValues = {
       [EXPERIMENT_IDS.MEMORY]: memory,
       [EXPERIMENT_IDS.MEMORY_INTUITION]: intuition,
     };
     const view = renderTasksSection({
-      agentAiDefaults: { intuition: { modelString: "openai:gpt-5.6-sol" } },
+      agentAiDefaults: {
+        intuition: {
+          modelString: "openai:gpt-5.6-sol",
+          advisorEnabled: true,
+          thinkingLevel: "high",
+        },
+      },
     });
     await view.findByText("Name Workspace");
     if (!memory || !intuition) {
@@ -205,6 +212,15 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
       "openai:gpt-5.6-sol"
     );
+    expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
+    expect(within(card).getAllByRole("switch")).toHaveLength(1);
+    expect(within(card).getAllByRole("combobox")).toHaveLength(1);
+    expect(within(card).getAllByRole("button")).toHaveLength(1);
+    expect(
+      within(getAgentCardByName(view, "Name Workspace")).getByLabelText(
+        "Toggle name_workspace advisor"
+      )
+    ).toBeTruthy();
     expect(within(card).queryByRole("button", { name: "Reasoning" })).toBeNull();
     expect(within(card).queryByText("Reasoning")).toBeNull();
     expect(

@@ -1229,8 +1229,9 @@ export class TurnRequestBuilder {
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH) ===
         true;
     const memoryIntuitionExperimentEnabled =
+      experiments?.memoryIntuition ??
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
-      true;
+        true;
     const memoryHotSetExperimentEnabled =
       this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) ===
       true;
@@ -2015,7 +2016,8 @@ export class TurnRequestBuilder {
                 this.dependencies.config,
                 workspaceId,
                 "intuition",
-                modelString
+                modelString,
+                intuitionDefinition?.frontmatter.ai
               ),
               maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
               usesThisTurn: 0,

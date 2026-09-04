@@ -64,7 +64,9 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
-import { parseAgentDefinitionMarkdown } from "@/node/services/agentDefinitions/parseAgentDefinitionMarkdown";
+import { resolveAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
@@ -120,15 +122,16 @@ interface ModelFactoryLike {
 /**
  * Resolve a headless agent model — the inherit cascade from PRD #3534
  * (uniform with other agents): per-workspace agent override → global agent
- * default → pinned selected model (or legacy workspace session fallback) → app
- * default. Interactive callers supply their fully resolved model so unrelated
+ * default → definition AI defaults → pinned selected model (or legacy workspace
+ * session fallback) → app default. Interactive callers supply their fully resolved model so unrelated
  * agent buckets cannot change the route. Shared with the debug CLI.
  */
 export function resolveHeadlessAgentModelString(
   config: Config,
   workspaceId: string,
   agentId: string,
-  selectedModel?: string
+  selectedModel?: string,
+  definitionAiDefaults?: AgentDefinitionPackage["frontmatter"]["ai"]
 ): string {
   const cfg = config.loadConfigOrDefault();
   const workspace = config.findWorkspace(workspaceId);
@@ -158,6 +161,7 @@ export function resolveHeadlessAgentModelString(
     targetAgentId: agentId,
     profile: "interactive",
     agentAiDefaults: cfg.agentAiDefaults,
+    targetDefinitionAiDefaults: definitionAiDefaults,
     targetWorkspaceSettings: agentBucket ? { model: agentBucket.model } : undefined,
     fallbacks: fallbackModels.length > 0 ? fallbackModels.map((model) => ({ model })) : undefined,
     defaultModel,
@@ -176,35 +180,25 @@ export function resolveHeadlessAgentModelString(
 export async function resolveHeadlessAgentDefinition(
   muxRoot: string,
   agentId: string
-): Promise<ReturnType<typeof parseAgentDefinitionMarkdown> | null> {
+): Promise<AgentDefinitionPackage | null> {
   assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
-  const overridePath = path.join(muxRoot, "agents", `${agentId}.md`);
-  const builtIn = getBuiltInAgentDefinitions().find((definition) => definition.id === agentId);
   try {
-    const content = await fsPromises.readFile(overridePath, "utf-8");
-    const parsed = parseAgentDefinitionMarkdown({
-      content,
-      byteSize: Buffer.byteLength(content, "utf8"),
+    const definition = await resolveAgentDefinition(new LocalRuntime(muxRoot), muxRoot, agentId, {
+      // Headless tools have no live checkout: never consult repo overrides or plugins.
+      roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
     });
-    const body = parsed.body.trim();
-    if (body.length > 0) return { frontmatter: parsed.frontmatter, body };
-    log.warn("[HeadlessAgent] override has an empty body; using built-in", {
-      overridePath,
-    });
-    // A frontmatter-only override can disable an agent while retaining its built-in body.
-    return builtIn ? { frontmatter: parsed.frontmatter, body: builtIn.body } : null;
+    const body = definition.body.trim();
+    // Preserve legacy frontmatter-only overrides without discarding their effective metadata.
+    const fallbackBody = getBuiltInAgentDefinitions().find((entry) => entry.id === agentId)?.body;
+    return { ...definition, body: body || (fallbackBody ?? "") };
   } catch (error) {
-    // Missing override is the normal case; anything else (malformed
-    // frontmatter, permissions) deserves a warning instead of a silent
-    // fallback the user cannot debug.
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("[HeadlessAgent] failed to read override; using built-in", {
-        overridePath,
-        error: getErrorMessage(error),
-      });
-    }
+    // Invalid inheritance must not silently send memory using another definition/model.
+    log.warn("[HeadlessAgent] failed to resolve definition", {
+      agentId,
+      error: getErrorMessage(error),
+    });
+    return null;
   }
-  return builtIn ?? null;
 }
 
 export async function resolveHeadlessAgentBody(

@@ -888,6 +888,7 @@ export function TasksSection() {
 
   const renderAgentDefaults = (agent: AgentDefinitionDescriptor) => {
     const entry = agentAiDefaults[agent.id];
+    const modelOnly = agent.id === "intuition";
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
     const enabledOverride = entry?.enabled;
@@ -1021,7 +1022,7 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {advisorToolEnabled ? (
+            {advisorToolEnabled && !modelOnly ? (
               <div className="flex items-center gap-3">
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -1058,7 +1059,7 @@ export function TasksSection() {
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
           // Intuition is model-only; persisted thinking values never affect its requests.
-          modelOnly={agent.id === "intuition"}
+          modelOnly={modelOnly}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}

@@ -847,22 +847,16 @@ function deepMergeAgentFrontmatter(
 }
 
 /**
- * Resolve an agent's effective frontmatter by overlaying its base chain (base first, then child).
- *
- * Unlike prompt body inheritance, frontmatter inheritance is always applied when `base` is set.
- * This prevents same-name overrides (e.g. project exec.md with base: exec) from accidentally
- * dropping important base config like subagent.runnable or subagent.append_prompt.
+ * Resolve prompt and frontmatter in one base-chain walk so callers authorize
+ * and execute the same definition snapshot. Frontmatter always inherits when
+ * `base` is set, even when the child replaces the base prompt.
  */
-export async function resolveAgentFrontmatter(
+export async function resolveAgentDefinition(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: {
-    roots?: AgentDefinitionsRoots;
-    includeAgentPlugins?: boolean;
-    skipScopesAbove?: AgentDefinitionScope;
-  }
-): Promise<AgentDefinitionPackage["frontmatter"]> {
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
   }
@@ -896,7 +890,7 @@ export async function resolveAgentFrontmatter(
     id: AgentId,
     depth: number,
     skipScopesAbove?: AgentDefinitionScope
-  ): Promise<AgentDefinitionPackage["frontmatter"]> {
+  ): Promise<AgentDefinitionPackage> {
     if (depth > MAX_INHERITANCE_DEPTH) {
       throw new Error(
         `Agent inheritance depth exceeded for '${id}' (max: ${MAX_INHERITANCE_DEPTH})`
@@ -917,16 +911,16 @@ export async function resolveAgentFrontmatter(
 
     const baseId = pkg.frontmatter.base;
     if (!baseId) {
-      return pkg.frontmatter;
+      return pkg;
     }
 
-    const baseFrontmatter = await resolve(
+    const base = await resolve(
       baseId,
       depth + 1,
       mergeSkipScopesAbove(skipScopesAbove, computeBaseSkipScope(baseId, id, pkg.scope))
     );
 
-    const mergedRaw = deepMergeAgentFrontmatter(baseFrontmatter, pkg.frontmatter, []);
+    const mergedRaw = deepMergeAgentFrontmatter(base.frontmatter, pkg.frontmatter, []);
     const merged = AgentDefinitionFrontmatterSchema.safeParse(mergedRaw);
     if (!merged.success) {
       throw new Error(
@@ -934,10 +928,25 @@ export async function resolveAgentFrontmatter(
       );
     }
 
-    return merged.data;
+    const separator = base.body.trim() && pkg.body.trim() ? "\n\n" : "";
+    return {
+      ...pkg,
+      frontmatter: merged.data,
+      body:
+        pkg.frontmatter.prompt?.append === false ? pkg.body : `${base.body}${separator}${pkg.body}`,
+    };
   }
 
   return resolve(agentId, 0, options?.skipScopesAbove);
+}
+
+export async function resolveAgentFrontmatter(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage["frontmatter"]> {
+  return (await resolveAgentDefinition(runtime, workspacePath, agentId, options)).frontmatter;
 }
 
 export type AgentDefinitionsContext = Pick<

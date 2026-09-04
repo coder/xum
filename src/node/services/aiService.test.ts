@@ -1640,6 +1640,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       ...definition,
     })),
     {
+      name: "per-send false overriding host true",
+      memory: true,
+      intuition: true,
+      memoryIntuitionOverride: false,
+      child: false,
+      service: true,
+      eligible: false,
+    },
+    {
+      name: "per-send true overriding host false",
+      memory: true,
+      intuition: false,
+      memoryIntuitionOverride: true,
+      child: false,
+      service: true,
+      eligible: true,
+    },
+    {
+      name: "per-send true still gated by parent memory",
+      memory: false,
+      intuition: false,
+      memoryIntuitionOverride: true,
+      child: false,
+      service: true,
+      eligible: false,
+    },
+    {
+      name: "per-send true still gated in subagents",
+      memory: true,
+      intuition: false,
+      memoryIntuitionOverride: true,
+      child: true,
+      service: true,
+      eligible: false,
+    },
+    {
       name: "disabled memory",
       memory: false,
       intuition: true,
@@ -1714,7 +1750,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { memory: scenario.memory },
+        experiments: {
+          memory: scenario.memory,
+          memoryIntuition:
+            "memoryIntuitionOverride" in scenario ? scenario.memoryIntuitionOverride : undefined,
+        },
       });
       expect(result.success).toBe(true);
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
@@ -1735,48 +1775,63 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   }
 
-  it("pins intuition to the resolved parent selection when no intuition override exists", async () => {
-    using xumHome = new DisposableTempDir("ai-intuition-selected-route");
-    const metadata = createLocalWorkspaceMetadata("intuition-selected-route", xumHome.path);
-    const experimentsService = new ExperimentsService({
-      telemetryService: new TelemetryService(xumHome.path),
-      xumHome: xumHome.path,
-    });
-    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
-    );
-    const harness = createHarness(xumHome.path, metadata, { experimentsService });
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(xumHome.path)
-    );
-    const selected = "private:exec-global";
-    await harness.config.editConfig((cfg) => {
-      cfg.agentAiDefaults = { exec: { modelString: selected } };
-      cfg.projects.set(metadata.projectPath, {
-        workspaces: [
-          {
-            path: metadata.projectPath,
-            id: metadata.id,
-            agentId: "exec",
-            aiSettingsByAgent: { plan: { model: "openai:stale-plan", thinkingLevel: "off" } },
-          },
-        ],
+  it.each([false, true])(
+    "pins intuition to the resolved definition route before its parent fallback (definition override=%s)",
+    async (definitionOverride) => {
+      using xumHome = new DisposableTempDir("ai-intuition-selected-route");
+      const metadata = createLocalWorkspaceMetadata("intuition-selected-route", xumHome.path);
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
       });
-      return cfg;
-    });
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("user", "user", "hello")],
-      workspaceId: metadata.id,
-      modelString: selected,
-      thinkingLevel: "off",
-      experiments: { memory: true },
-    });
-    expect(result.success).toBe(true);
-    expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
-      selected
-    );
-  });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const harness = createHarness(xumHome.path, metadata, { experimentsService });
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      const selected = "private:exec-global";
+      if (definitionOverride) {
+        const agents = path.join(xumHome.path, "agents");
+        await fs.mkdir(agents, { recursive: true });
+        await fs.writeFile(
+          path.join(agents, "intuition.md"),
+          "---\nname: Intuition\nbase: private-base\n---\nLocal guidance."
+        );
+        await fs.writeFile(
+          path.join(agents, "private-base.md"),
+          "---\nname: Private base\nai:\n  model: private:definition-route\n---\nPrivate guidance."
+        );
+      }
+      await harness.config.editConfig((cfg) => {
+        cfg.agentAiDefaults = { exec: { modelString: selected } };
+        cfg.projects.set(metadata.projectPath, {
+          workspaces: [
+            {
+              path: metadata.projectPath,
+              id: metadata.id,
+              agentId: "exec",
+              aiSettingsByAgent: { plan: { model: "openai:stale-plan", thinkingLevel: "off" } },
+            },
+          ],
+        });
+        return cfg;
+      });
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: selected,
+        thinkingLevel: "off",
+        experiments: { memory: true },
+      });
+      expect(result.success).toBe(true);
+      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
+        definitionOverride ? "private:definition-route" : selected
+      );
+    }
+  );
 
   for (const denied of ["memory", "intuition"]) {
     it(`strips intuition and its guidance when policy denies ${denied}`, async () => {

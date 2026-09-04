@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
@@ -13,6 +13,7 @@ import {
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentBody,
+  resolveAgentDefinition,
   resolveAgentFrontmatter,
 } from "./agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
@@ -692,6 +693,44 @@ Project body.
     expect(frontmatter.tools?.add).toEqual(["baseAdd"]);
     expect(frontmatter.tools?.remove).toEqual(["baseRemove"]);
   });
+
+  test.each([true, false])(
+    "resolves body and inherited metadata in one read per layer (append=%s)",
+    async (append) => {
+      using tempDir = new DisposableTempDir("agent-definition-snapshot");
+      const root = path.join(tempDir.path, "agents");
+      await fs.mkdir(root);
+      await fs.writeFile(
+        path.join(root, "base.md"),
+        "---\nname: Base\ndisabled: true\nai:\n  model: private:base\n---\nBase protocol."
+      );
+      await fs.writeFile(
+        path.join(root, "child.md"),
+        `---\nname: Child\nbase: base\nprompt:\n  append: ${append}\n---\nChild instructions.`
+      );
+      const runtime = new LocalRuntime(tempDir.path);
+      const read = spyOn(runtime, "readFile");
+      try {
+        const resolved = await resolveAgentDefinition(runtime, tempDir.path, "child", {
+          roots: { projectRoots: [], globalRoot: root },
+        });
+        expect(resolved).toMatchObject({
+          id: "child",
+          scope: "global",
+          frontmatter: { disabled: true, ai: { model: "private:base" } },
+        });
+        expect(resolved.body).toBe(
+          append ? "Base protocol.\n\nChild instructions." : "Child instructions."
+        );
+        expect(read.mock.calls.map(([file]) => file)).toEqual([
+          path.join(root, "child.md"),
+          path.join(root, "base.md"),
+        ]);
+      } finally {
+        read.mockRestore();
+      }
+    }
+  );
 
   test("resolveAgentFrontmatter preserves explicit falsy overrides", async () => {
     using tempDir = new DisposableTempDir("agent-frontmatter-falsy");
