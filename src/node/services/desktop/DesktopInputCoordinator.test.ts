@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Workspace } from "@/common/types/project";
 import { Config } from "@/node/config";
-import { DesktopInputCoordinator } from "./DesktopInputCoordinator";
+import {
+  DesktopInputCoordinator,
+  settleArchivedSharedDesktopTask,
+} from "./DesktopInputCoordinator";
 
 function deferred() {
   let resolve!: () => void;
@@ -164,6 +167,65 @@ describe("DesktopInputCoordinator", () => {
         );
       }
     });
+  });
+
+  test("an archived borrower with a stale active status neither holds nor blocks the desktop", async () => {
+    await withCoordinator(async (coordinator, write) => {
+      const archivedAt = "2026-09-01T00:00:00Z";
+      for (const stale of [
+        { taskStatus: "queued" as const },
+        { taskExecutionStatus: "running" as const },
+      ]) {
+        await write([owner, borrower("child", { ...stale, archivedAt }), borrower("other")]);
+        // Codex P1: the stale row was counted as a borrower and then failed the archived check,
+        // wedging every owner input and admission until the child was unarchived.
+        expect(await coordinator.withInput("owner", () => Promise.resolve("input"))).toBe("input");
+        expect(await coordinator.withAdmission("other", () => Promise.resolve("admit"))).toBe(
+          "admit"
+        );
+        expect(
+          await coordinator.withReservation("owner", "next", () => Promise.resolve("reserved"))
+        ).toBe("reserved");
+        // The archived requester itself stays denied.
+        expect(coordinator.withInput("child", () => Promise.resolve())).rejects.toThrow("archived");
+        expect(coordinator.withAdmission("child", () => Promise.resolve())).rejects.toThrow(
+          "archived"
+        );
+      }
+      // Control is only released by archival: the same stale row unarchived blocks again.
+      await write([
+        owner,
+        borrower("child", {
+          taskStatus: "queued",
+          archivedAt,
+          unarchivedAt: "2026-09-02T00:00:00Z",
+        }),
+        borrower("other"),
+      ]);
+      expect(coordinator.withInput("owner", () => Promise.resolve())).rejects.toThrow(
+        "controlled by"
+      );
+    });
+  });
+
+  test("settleArchivedSharedDesktopTask interrupts only bound active children and keeps queued briefs", () => {
+    for (const taskStatus of ["queued", "starting", "running", "awaiting_report"] as const) {
+      const child = borrower("child", { taskStatus, taskPrompt: "brief" });
+      expect(settleArchivedSharedDesktopTask(child)).toBe(true);
+      expect(child.taskStatus).toBe("interrupted");
+      expect(child.taskPrompt).toBe("brief");
+    }
+    const untouched: Workspace[] = [
+      borrower("reported"),
+      borrower("interrupted", { taskStatus: "interrupted" }),
+      workspace("isolated", { parentWorkspaceId: "owner", taskStatus: "queued" }),
+      workspace("owner-running", { taskStatus: "running" }),
+    ];
+    for (const entry of untouched) {
+      const before = { ...entry };
+      expect(settleArchivedSharedDesktopTask(entry)).toBe(false);
+      expect(entry).toEqual(before);
+    }
   });
 
   test("an open input holds admission, then persisted admission blocks later owner input", async () => {

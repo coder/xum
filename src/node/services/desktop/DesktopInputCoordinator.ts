@@ -13,6 +13,29 @@ export interface DesktopTarget {
 export class UnsupportedDesktopRuntimeError extends Error {}
 
 /**
+ * Archive/unarchive settle a bound child's stale active task status to `interrupted` (task_stop
+ * semantics) inside the same config edit that flips its archived state: an archived row must not
+ * stay an active borrower, and a record archived before this settlement existed must not resurface
+ * as a second active controller the moment it becomes visible again. Queued briefs stay in
+ * taskPrompt for the ordinary interrupted-task reawaken path. Returns whether the entry changed.
+ */
+export function settleArchivedSharedDesktopTask(workspace: Workspace): boolean {
+  if (workspace.taskDesktopOwnerWorkspaceId === undefined || workspace.parentWorkspaceId == null) {
+    return false;
+  }
+  if (
+    workspace.taskStatus !== "queued" &&
+    workspace.taskStatus !== "starting" &&
+    workspace.taskStatus !== "running" &&
+    workspace.taskStatus !== "awaiting_report"
+  ) {
+    return false;
+  }
+  workspace.taskStatus = "interrupted";
+  return true;
+}
+
+/**
  * Delegation changes the operator, not the computer; checkout isolation is separate.
  * The gate covers input and durable admission together. Config task statuses are the
  * only ownership ledger, so completion/restart never depends on an in-memory lease.
@@ -114,7 +137,12 @@ export class DesktopInputCoordinator {
       for (const workspace of project.workspaces) {
         if (
           workspace.taskDesktopOwnerWorkspaceId !== ownerWorkspaceId ||
-          !this.isActive(workspace)
+          !this.isActive(workspace) ||
+          // An archived row can never be admitted (resolve refuses archived requesters), so it
+          // must not count as a controller either: a stale active status on a manually archived
+          // child (legacy records, or an execution mirror the archive could not settle) would
+          // otherwise throw here and wedge every owner input and admission until unarchive.
+          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
         ) {
           continue;
         }

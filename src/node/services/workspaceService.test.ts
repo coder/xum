@@ -13047,16 +13047,27 @@ describe("WorkspaceService remove desktop session cleanup", () => {
   });
 
   test("remove() closes desktop sessions on success", async () => {
-    const close = mock(() => Promise.resolve(undefined));
+    let guard: ((workspaceId: string) => boolean) | undefined;
+    const guardDuringClose: { value?: boolean } = {};
+    const close = mock(() => {
+      // Desktop startups consult this guard synchronously; a borrower bridge connecting between
+      // the close and the awaited config deletion must be refused just like during archive.
+      guardDuringClose.value = guard?.(workspaceId);
+      return Promise.resolve(undefined);
+    });
     const desktopSessionManager = {
       close,
-      setWorkspaceArchiveGuard: () => undefined,
+      setWorkspaceArchiveGuard: (next: (workspaceId: string) => boolean) => {
+        guard = next;
+      },
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
+    expect(guard?.(workspaceId)).toBe(false);
 
     const result = await workspaceService.remove(workspaceId);
 
     expect(result.success).toBe(true);
+    expect(guardDuringClose.value).toBe(true);
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });
@@ -13957,6 +13968,33 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(hasActiveDescendantAgentTasksForWorkspace).toHaveBeenCalledWith(workspaceId);
     expect(editConfigSpy).not.toHaveBeenCalled();
   });
+
+  test.each([
+    ["shared", "interrupted", "owner"],
+    ["isolated", "queued", undefined],
+  ] as const)(
+    "archiving a %s queued child leaves its task status %s",
+    async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
+      const project = configState.projects.get(projectPath);
+      if (!project) throw new Error("project fixture must exist");
+      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
+      Object.assign(project.workspaces[1]!, {
+        parentWorkspaceId: "owner",
+        taskStatus: "queued",
+        taskPrompt: "brief",
+        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      });
+
+      expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+      // A shared child must not stay an active borrower of the owner's desktop while archived;
+      // the queued brief survives for the reawaken path.
+      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      expect(entry?.archivedAt).toBeTruthy();
+      expect(entry?.taskStatus).toBe(expectedStatus);
+      expect(entry?.taskPrompt).toBe("brief");
+    }
+  );
 
   test("returns Err and does not persist archivedAt when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
@@ -14958,6 +14996,31 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
   afterEach(async () => {
     await cleanupHistory();
   });
+
+  test.each([
+    ["shared", "interrupted", "owner"],
+    ["isolated", "queued", undefined],
+  ] as const)(
+    "unarchiving a legacy archived %s queued child leaves its task status %s",
+    async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
+      const project = configState.projects.get(projectPath);
+      if (!project) throw new Error("project fixture must exist");
+      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
+      Object.assign(project.workspaces[1]!, {
+        parentWorkspaceId: "owner",
+        taskStatus: "queued",
+        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      });
+
+      expect(await workspaceService.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+      // Records archived before archive-time settlement must not resurface as a second active
+      // controller in the same edit that makes them visible again.
+      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      expect(entry?.unarchivedAt).toBeTruthy();
+      expect(entry?.taskStatus).toBe(expectedStatus);
+    }
+  );
 
   test("persists unarchivedAt and runs afterUnarchive hooks (best-effort)", async () => {
     const hooks = new WorkspaceLifecycleHooks();

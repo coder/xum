@@ -1,4 +1,7 @@
-import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
+import {
+  DesktopInputCoordinator,
+  settleArchivedSharedDesktopTask,
+} from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -2928,8 +2931,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // Archive admission pairing for desktop startups (mirrors setTerminalService above):
     // ensureStarted checks this guard in the same synchronous block that registers its startup
     // promise, so whichever of {archive gate, desktop startup entry} runs first is observed by
-    // the other.
-    manager.setWorkspaceArchiveGuard((workspaceId) => this.archivingWorkspaces.has(workspaceId));
+    // the other. Removal latches removingWorkspaces before closing the desktop and only then
+    // awaits config deletion, so a borrower bridge connecting in that window must be refused
+    // by the same guard rather than start a session the removal never closes.
+    manager.setWorkspaceArchiveGuard(
+      (workspaceId) =>
+        this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)
+    );
   }
 
   private async closeDesktopSessionBestEffort(
@@ -8715,6 +8723,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           if (workspaceEntry) {
             // Just set archivedAt - archived state is derived from archivedAt > unarchivedAt.
             workspaceEntry.archivedAt = new Date().toISOString();
+            // A shared-desktop child releases the owner's desktop in the same edit.
+            settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.
             delete workspaceEntry.pinnedAt;
             if (capturedWorktreeSnapshot) {
@@ -8884,6 +8894,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               previousUnarchivedAt = workspaceEntry.unarchivedAt;
               persistedUnarchivedAt = new Date().toISOString();
               workspaceEntry.unarchivedAt = persistedUnarchivedAt;
+              // Records archived before archive-time settlement must reappear as interrupted,
+              // never as a competing active desktop controller.
+              settleArchivedSharedDesktopTask(workspaceEntry);
               didUnarchive = true;
             }
           }
