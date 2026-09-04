@@ -260,7 +260,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
             // A reconnected socket may belong to a newer server than this loaded bundle.
             if (hasConnectedRef.current && connectionId === connectionIdRef.current) {
               try {
-                const response = await fetch(new URL(getBrowserBackendBaseUrl() + "/version"), {
+                const response = await fetch(`${getBrowserBackendBaseUrl()}/version`, {
                   cache: "no-store",
                   signal: AbortSignal.timeout(SERVER_VERSION_CHECK_TIMEOUT_MS),
                 });

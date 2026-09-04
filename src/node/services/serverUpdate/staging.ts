@@ -31,20 +31,11 @@ export async function verifyStagedPackage(dir: string, version: string): Promise
     throw new Error("Staged package version does not match the requested update");
   const entry = path.join(packageDir, "dist/cli/index.js");
   if (!(await fs.stat(entry)).isFile()) throw new Error("Staged CLI entry is not a file");
-  const bin = path.join(dir, "node_modules/.bin/mux");
-  await fs.access(bin);
-  // pnpm emits shell shims; a direct link keeps the next launch identifiable by realpath.
-  if (!(await fs.lstat(bin)).isSymbolicLink()) {
-    await fs.unlink(bin);
-    await fs.symlink(entry, bin);
-  }
-  if ((await fs.realpath(bin)) !== (await fs.realpath(entry)))
-    throw new Error("Staged launcher does not resolve to the CLI entry");
-  using smoke = execFileAsync("node", [entry, "--version"], {
+  using smoke = execFileAsync(process.execPath, [entry, "--version"], {
     timeoutMs: SERVER_UPDATE_SMOKE_TIMEOUT_MS,
   });
   await smoke.result;
-  return bin;
+  return entry;
 }
 
 async function runInstall(file: string, args: string[], cwd: string): Promise<void> {

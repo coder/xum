@@ -15,6 +15,8 @@ describeIntegration("Server update IPC", () => {
       await client.update.check({ source: "manual" });
       await client.update.download();
       await client.update.install();
+      // An unsupported install must not have started the restart path: the server still answers.
+      expect(await client.update.getChannel()).toBe("stable");
     } finally {
       controller.abort();
       await cleanupTestEnvironment(env);

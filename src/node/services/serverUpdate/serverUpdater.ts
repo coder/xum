@@ -26,7 +26,7 @@ export class ServerUpdater {
   private readonly layout: InstallLayout | null;
   private readonly subscribers = new Set<(status: UpdateStatus) => void>();
   private availableVersion: string | null = null;
-  private stagedBin: string | null = null;
+  private stagedEntry: string | null = null;
   private installing = false;
 
   constructor(
@@ -71,7 +71,7 @@ export class ServerUpdater {
       throw new Error("An update operation is in progress");
     this.channel = channel;
     this.availableVersion = null;
-    this.stagedBin = null;
+    this.stagedEntry = null;
     this.setStatus({ type: "idle" });
   }
 
@@ -81,7 +81,7 @@ export class ServerUpdater {
       this.installing ||
       this.status.type === "checking" ||
       this.status.type === "downloading" ||
-      this.stagedBin
+      this.stagedEntry
     )
       return;
     const previous = this.status;
@@ -108,7 +108,7 @@ export class ServerUpdater {
     if (
       !this.layout ||
       !this.availableVersion ||
-      this.stagedBin ||
+      this.stagedEntry ||
       this.installing ||
       this.status.type === "checking" ||
       this.status.type === "downloading"
@@ -116,7 +116,7 @@ export class ServerUpdater {
       return;
     this.setStatus({ type: "downloading", percent: null });
     try {
-      this.stagedBin = await (this.deps.runInstall ?? stageUpdate)(
+      this.stagedEntry = await (this.deps.runInstall ?? stageUpdate)(
         this.layout,
         this.availableVersion
       );
@@ -127,10 +127,12 @@ export class ServerUpdater {
   }
 
   async installUpdate(): Promise<void> {
-    if (!this.layout || !this.stagedBin || !this.availableVersion || this.installing) return;
+    if (!this.layout || !this.stagedEntry || !this.availableVersion || this.installing) return;
+    this.installing = true;
     try {
       const blockers = this.deps.collectBlockers();
       if (blockers.length) {
+        this.installing = false;
         this.setStatus({
           type: "install-blocked",
           info: { version: this.availableVersion },
@@ -139,10 +141,10 @@ export class ServerUpdater {
         return;
       }
       // No await between the idle snapshot, atomic swap, and the CLI's shutdown latch.
-      (this.deps.activate ?? activateUpdate)(this.layout, this.stagedBin);
-      this.installing = true;
+      (this.deps.activate ?? activateUpdate)(this.layout, this.stagedEntry);
       await this.deps.restart();
     } catch (error) {
+      this.installing = false;
       this.setStatus({ type: "error", phase: "install", message: getErrorMessage(error) });
     }
   }

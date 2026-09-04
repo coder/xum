@@ -54,9 +54,8 @@ export function resolveInstallLayout(
       throw new Error("Server updates require a supervisor configured to restart after exit");
     }
     const running = argv[1];
-    const binary = resolveXumEnvironmentValue("BINARY", env) ?? running;
-    if (!running || !binary) throw new Error("Cannot identify the server launcher");
-    const launcher = path.resolve(binary);
+    if (!running) throw new Error("Cannot identify the server launcher");
+    const launcher = path.resolve(resolveXumEnvironmentValue("BINARY", env) ?? running);
     if (!lstatSync(launcher).isSymbolicLink()) throw new Error("Server launcher must be a symlink");
     const entry = realpathSync(running);
     if (realpathSync(launcher) !== entry)
@@ -86,7 +85,9 @@ export function resolveInstallLayout(
     if (launcher.startsWith(workdir + path.sep))
       throw new Error("Server launcher must be outside the package installation");
     const registry =
-      env.XUM_UPDATE_REGISTRY_URL ?? env.npm_config_registry ?? "https://registry.npmjs.org";
+      resolveXumEnvironmentValue("UPDATE_REGISTRY_URL", env) ??
+      env.npm_config_registry ??
+      "https://registry.npmjs.org";
     const url = new URL(registry);
     if (
       !["https:", "http:"].includes(url.protocol) ||

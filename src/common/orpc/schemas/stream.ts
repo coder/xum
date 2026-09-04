@@ -721,7 +721,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
 ]);
 
 // Update Status
-const RestartBlockerSchema = z.object({
+export const RestartBlockerSchema = z.object({
   kind: z.enum([
     "active-streams",
     "pending-turns",

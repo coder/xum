@@ -2,20 +2,25 @@ import { lstatSync, realpathSync, renameSync, symlinkSync, unlinkSync } from "no
 import { randomUUID } from "node:crypto";
 import type { InstallLayout } from "./installLayout";
 
-export function activateUpdate(layout: InstallLayout, stagedBin: string): void {
+export function activateUpdate(layout: InstallLayout, stagedEntry: string): void {
   if (
     !lstatSync(layout.launcher).isSymbolicLink() ||
     realpathSync(layout.launcher) !== layout.entry
   ) {
     throw new Error("Server launcher changed since startup");
   }
-  realpathSync(stagedBin);
+  // A dangling launcher would brick the next start, so refuse a missing target before the swap.
+  realpathSync(stagedEntry);
   const temporary = `${layout.launcher}.${randomUUID()}.tmp`;
-  symlinkSync(stagedBin, temporary);
+  symlinkSync(stagedEntry, temporary);
   try {
     renameSync(temporary, layout.launcher);
   } catch (error) {
-    unlinkSync(temporary);
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Report the failed swap, not the cleanup of its temporary link.
+    }
     throw error;
   }
 }

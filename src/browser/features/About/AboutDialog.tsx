@@ -241,7 +241,7 @@ export function AboutDialog() {
                           handleChannelChange(next);
                         }
                       }}
-                      disabled={channelLoading || isChecking || pendingAction === "install"}
+                      disabled={channelLoading || isChecking || pendingAction !== null}
                       aria-label="Update channel"
                       size="sm"
                     >

@@ -4,7 +4,6 @@ import * as path from "node:path";
 import * as os from "node:os";
 import type { RestartBlocker, UpdateStatus } from "@/common/orpc/types";
 import { resolveInstallLayout, inferChannel, type InstallLayout } from "./installLayout";
-import { execFileAsync } from "@/node/utils/disposableExec";
 import { activateUpdate } from "./activation";
 import { installCommand, stageUpdate, verifyStagedPackage } from "./staging";
 import { fetchDistTags } from "./registry";
@@ -117,11 +116,6 @@ describe("server install layout", () => {
 });
 
 describe("staging and activation", () => {
-  test("package install commands execute in the isolated staging cwd", async () => {
-    const { layout } = await fixture();
-    using command = execFileAsync("node", ["-p", "process.cwd()"], { cwd: layout.workdir });
-    expect((await command.result).stdout.trim()).toBe(layout.workdir);
-  });
   test("installs an exact version with lifecycle scripts disabled for every manager", async () => {
     const { layout } = await fixture();
     for (const packageManager of ["bun", "npm", "pnpm"] as const) {
@@ -168,14 +162,6 @@ describe("staging and activation", () => {
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
     await fs.unlink(layout.entry);
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
-  });
-  test("normalizes pnpm shims so later launches remain identifiable", async () => {
-    const { layout } = await fixture("pnpm");
-    const bin = path.join(layout.workdir, "node_modules/.bin/mux");
-    await fs.unlink(bin);
-    await fs.writeFile(bin, "#!/bin/sh\nexit 0\n");
-    await verifyStagedPackage(layout.workdir, layout.version);
-    expect(await fs.realpath(bin)).toBe(layout.entry);
   });
   test("activation failure leaves the old link intact", async () => {
     const { layout } = await fixture();

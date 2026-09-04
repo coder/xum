@@ -2382,8 +2382,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   getRunningProcessCount(): number {
-    return Array.from(this.processes.values()).filter((process) => process.status === "running")
-      .length;
+    let count = 0;
+    for (const process of this.processes.values()) {
+      if (process.status === "running") count++;
+    }
+    return count;
   }
 
   /**

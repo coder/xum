@@ -4112,7 +4112,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   public getOrCreateSession(workspaceId: string): AgentSession {
-    if (this.shuttingDown) throw new Error("Server is shutting down");
     assert(typeof workspaceId === "string", "workspaceId must be a string");
     const trimmed = workspaceId.trim();
     assert(trimmed.length > 0, "workspaceId must not be empty");
