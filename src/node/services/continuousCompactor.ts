@@ -380,39 +380,44 @@ export class ContinuousCompactor {
     assert(head !== null, "Validated rolling head disappeared");
     context = await this.withAttachmentEstimate(head, context);
     if (staged.generation !== this.generation) return false;
-    await this.deps.compactionHandler.preparePendingStateFromMessages(head);
-    // Pending-state persistence yields; a reset/edit during it must still invalidate this job.
-    rows = await this.readSnapshot();
-    if (!rows || !this.isValid(staged, rows)) return false;
-    assert(
-      !this.deps.streamManager.isStreaming(this.deps.workspaceId),
-      "Stream started during continuous apply"
-    );
-    const partial = await this.deps.historyService.readPartial(this.deps.workspaceId);
-    assert(!partial, "Continuous apply requires the partial to be committed first");
-    if (staged.generation !== this.generation) return false;
-    if (!this.wouldFit(staged, rows, context)) return false;
-    const tail = this.materializeTail(staged, rows);
-    const snapshotFingerprint = fingerprint(rows);
-    const applied = await this.deps.compactionHandler.persistContinuousCompaction({
-      shouldPersist: (currentRows) => {
-        const current = sliceMessagesFromLatestCompactionBoundary(currentRows);
-        return (
-          staged.generation === this.generation &&
-          !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
-          this.isValid(staged, current) &&
-          fingerprint(current) === snapshotFingerprint
+    return this.deps.compactionHandler.withContinuousPendingState(
+      head,
+      async (boundaryMessageId) => {
+        // Pending-state persistence yields; a reset/edit during it must still invalidate this job.
+        rows = await this.readSnapshot();
+        if (!rows || !this.isValid(staged, rows)) return false;
+        assert(
+          !this.deps.streamManager.isStreaming(this.deps.workspaceId),
+          "Stream started during continuous apply"
         );
-      },
-      messages: rows,
-      text: staged.text,
-      model: staged.model,
-      tail,
-      systemMessageTokens: context.systemMessageTokens ?? 0,
-      attachmentTokens: context.attachmentTokens ?? 0,
-      pendingFollowUp,
-    });
-    if (applied) this.reset("applied");
-    return applied;
+        const partial = await this.deps.historyService.readPartial(this.deps.workspaceId);
+        assert(!partial, "Continuous apply requires the partial to be committed first");
+        if (staged.generation !== this.generation) return false;
+        if (!this.wouldFit(staged, rows, context)) return false;
+        const tail = this.materializeTail(staged, rows);
+        const snapshotFingerprint = fingerprint(rows);
+        const applied = await this.deps.compactionHandler.persistContinuousCompaction({
+          boundaryMessageId,
+          shouldPersist: (currentRows) => {
+            const current = sliceMessagesFromLatestCompactionBoundary(currentRows);
+            return (
+              staged.generation === this.generation &&
+              !this.deps.streamManager.isStreaming(this.deps.workspaceId) &&
+              this.isValid(staged, current) &&
+              fingerprint(current) === snapshotFingerprint
+            );
+          },
+          messages: rows,
+          text: staged.text,
+          model: staged.model,
+          tail,
+          systemMessageTokens: context.systemMessageTokens ?? 0,
+          attachmentTokens: context.attachmentTokens ?? 0,
+          pendingFollowUp,
+        });
+        if (applied) this.reset("applied");
+        return applied;
+      }
+    );
   }
 }

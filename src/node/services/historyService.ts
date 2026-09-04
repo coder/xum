@@ -1,5 +1,6 @@
 import * as path from "path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { renameSync } from "node:fs";
 import * as fs from "fs/promises";
 import writeFileAtomic from "write-file-atomic";
 import assert from "node:assert";
@@ -2699,9 +2700,21 @@ export class HistoryService {
             messages.push(copy);
           }
 
-          if (shouldPersist && !shouldPersist(sourceMessages))
-            return Err("Compaction snapshot changed");
-          await writeFileAtomic(historyPath, this.serializeHistoryEntries(messages, workspaceId));
+          const serialized = this.serializeHistoryEntries(messages, workspaceId);
+          if (shouldPersist) {
+            const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
+            try {
+              await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+              // Bulk I/O remains asynchronous, but the final generation check and
+              // publication must not yield to reset(), abandonment, or a new stream.
+              if (!shouldPersist(sourceMessages)) return Err("Compaction snapshot changed");
+              renameSync(stagedPath, historyPath);
+            } finally {
+              await fs.rm(stagedPath, { force: true });
+            }
+          } else {
+            await writeFileAtomic(historyPath, serialized);
+          }
 
           // Seal the previous epoch only after boundary + tail are durable.
           await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedSummary);

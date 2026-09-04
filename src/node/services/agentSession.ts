@@ -198,6 +198,8 @@ import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
+import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
+import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
@@ -998,6 +1000,26 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           reason: "continuous-eager",
         }),
+      estimateAttachmentTokens: async (head) => {
+        const pending = await this.compactionHandler.peekPendingState();
+        const attachments = await this.buildAttachmentsFromContext({
+          diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
+          loadedSkills: mergeLoadedSkillSnapshots([
+            ...this.postCompactionLoadedSkills,
+            ...(pending?.loadedSkills ?? []),
+            ...extractLoadedSkillSnapshotsFromMessages(head),
+          ]),
+          readFilePaths: mergeReadFilePaths(this.postCompactionReadFilePaths, [
+            ...(pending?.readFiles ?? []),
+            ...extractReadFilePaths(head),
+          ]),
+          reportsCompletedBeforeMs: Date.now(),
+        });
+        return injectPostCompactionAttachments([], attachments).reduce(
+          (sum, row) => sum + estimateMuxMessageTokens(row),
+          0
+        );
+      },
       summarize: (head, signal, context: SessionCompactionContext) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.buildAutoCompactionRequest({

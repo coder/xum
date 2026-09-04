@@ -5992,7 +5992,7 @@ describe("StreamManager - getStreamInfo", () => {
       model: "claude-sonnet-4",
       historySequence: 1,
       startTime: 4_321,
-      initialMetadata: {},
+      initialMetadata: { systemMessageTokens: 2_048 },
       currentStepStartIndex: 0,
       stepStartIndices: [0],
       parts: [],
@@ -6003,6 +6003,7 @@ describe("StreamManager - getStreamInfo", () => {
 
     expect(streamInfo?.messageId).toBe("msg-starting");
     expect(streamInfo?.startTime).toBe(4_321);
+    expect(streamInfo?.initialMetadata?.systemMessageTokens).toBe(2_048);
     expect(streamInfo?.currentStepStartIndex).toBe(0);
     expect(streamInfo?.stepStartIndices).toEqual([0]);
     streamInfo?.stepStartIndices.push(5);

@@ -5327,6 +5327,7 @@ export class StreamManager {
         parts: CompletedMessagePart[];
         currentStepStartIndex: number;
         stepStartIndices: number[];
+        initialMetadata?: { systemMessageTokens?: number };
         toolCompletionTimestamps: Map<string, number>;
         muxMetadata?: unknown;
       }
@@ -5348,6 +5349,7 @@ export class StreamManager {
         parts: streamInfo.parts,
         currentStepStartIndex: streamInfo.currentStepStartIndex,
         stepStartIndices: streamInfo.stepStartIndices.slice(),
+        initialMetadata: { systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens },
         // Correlation metadata for delegated work (e.g. workspace-turn
         // continuations); lets TaskService match a live continuation stream
         // to its still-open workspace-turn handle.

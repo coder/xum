@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdir, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -17,6 +18,41 @@ describe("continuous compaction provider replay", () => {
   });
   afterEach(async () => {
     await store.cleanup();
+  });
+
+  it("preserves previously pending attachments when a newer fold is abandoned or crashes", async () => {
+    const sessionDir = path.join(store.tempDir, "pending");
+    await mkdir(sessionDir, { recursive: true });
+    const diffs = [{ path: "/tmp/prior.ts", diff: "prior change", truncated: false }];
+    await writeFile(
+      path.join(sessionDir, "post-compaction.json"),
+      JSON.stringify({
+        version: 1,
+        createdAt: 1,
+        diffs,
+        loadedSkills: [],
+        readFiles: [],
+      })
+    );
+    const makeHandler = () =>
+      new CompactionHandler({
+        workspaceId,
+        historyService: store.historyService,
+        sessionDir,
+        emitter: new EventEmitter(),
+      });
+    const handler = makeHandler();
+    expect((await handler.peekPendingState())?.diffs).toEqual(diffs);
+    expect(
+      await handler.withContinuousPendingState([], async () => {
+        // New preparation has no boundary: a restart must load the preceding
+        // pending snapshot, not treat the uncommitted one as a completed fold.
+        expect((await makeHandler().peekPendingState())?.diffs).toEqual(diffs);
+        return false;
+      })
+    ).toBe(false);
+    expect((await handler.peekPendingState())?.diffs).toEqual(diffs);
+    expect((await makeHandler().peekPendingState())?.diffs).toEqual(diffs);
   });
 
   for (const provider of ["anthropic", "openai"]) {

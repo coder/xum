@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import * as atomicWrite from "write-file-atomic";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
@@ -417,8 +418,8 @@ describe("ContinuousCompactor", () => {
     const entered = deferred();
     const release = deferred();
     const original = handler.preparePendingStateFromMessages.bind(handler);
-    spyOn(handler, "preparePendingStateFromMessages").mockImplementation(async (messages) => {
-      await original(messages);
+    spyOn(handler, "preparePendingStateFromMessages").mockImplementation(async (...args) => {
+      await original(...args);
       entered.resolve();
       await release.promise;
     });
@@ -431,6 +432,70 @@ describe("ContinuousCompactor", () => {
     expect(summarize).toHaveBeenCalledTimes(1);
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(completed).not.toHaveBeenCalled();
+    expect((await rows())[0].id).toBe("old-user");
+  });
+
+  it("does not publish after reset during the staged history file write", async () => {
+    await seedConversation();
+    await stage();
+    const entered = deferred();
+    const release = deferred();
+    const original = atomicWrite.default;
+    spyOn(atomicWrite, "default").mockImplementation(
+      Object.assign(
+        async (
+          filename: string,
+          data: string | Buffer,
+          options?: atomicWrite.Options | BufferEncoding | ((error?: Error) => void),
+          callback?: (error?: Error) => void
+        ) => {
+          await original(filename, data, typeof options === "function" ? undefined : options);
+          if (filename.includes(".continuous-")) {
+            entered.resolve();
+            await release.promise;
+          }
+          if (typeof options === "function") options();
+          else callback?.();
+        },
+        { sync: original.sync }
+      )
+    );
+    const applying = compactor.observe(context.thresholdPercent, context);
+    await entered.promise;
+    compactor.reset("abandon");
+    release.resolve();
+    expect(await applying).toBe("none");
+    expect((await rows())[0].id).toBe("old-user");
+    expect(completed).not.toHaveBeenCalled();
+    expect(await handler.peekPendingState()).toBeNull();
+    const restarted = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    expect(await restarted.peekPendingState()).toBeNull();
+  });
+
+  it("ignores provisional pending state on restart until its boundary is durable", async () => {
+    await seedConversation();
+    await stage();
+    const original = store.historyService.persistBoundaryWithTailCopies.bind(store.historyService);
+    spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(
+      async (...args) => {
+        const restarted = new CompactionHandler({
+          workspaceId,
+          historyService: store.historyService,
+          sessionDir: path.join(store.tempDir, "pending"),
+          emitter: new EventEmitter(),
+        });
+        expect(await restarted.peekPendingState()).toBeNull();
+        // Simulate the crash by rejecting the publication after testing its orphan snapshot.
+        compactor.reset("crash before boundary");
+        return original(...args);
+      }
+    );
+    expect(await compactor.observe(context.thresholdPercent, context)).toBe("none");
     expect((await rows())[0].id).toBe("old-user");
   });
 
@@ -572,6 +637,21 @@ describe("ContinuousCompactor", () => {
     );
     expect(boundary.metadata?.usage).toBeUndefined();
     expect(completed).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the interrupted marker when a user-stopped committed partial folds without Continue", async () => {
+    const answer = await seedLiveTurn();
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect((await store.historyService.writePartial(workspaceId, answer)).success).toBe(true);
+    expect((await store.historyService.commitPartial(workspaceId)).success).toBe(true);
+    live = undefined;
+    streaming = false;
+    expect(await compactor.observe(context.thresholdPercent, context)).toBe("applied");
+    const persisted = await rows();
+    expect(persisted.at(-1)?.metadata?.partial).toBe(true);
+    expect(persisted[0].metadata?.muxMetadata).not.toHaveProperty("pendingFollowUp");
   });
 
   it("uses finish-step's completed end even before the next start-step arrives", async () => {
