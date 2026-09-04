@@ -4092,6 +4092,21 @@ export class StreamManager {
           }
           break;
         } catch (error) {
+          // A cancellation may surface as an iterator rejection instead of a
+          // clean close (provider/transport dependent). The canceller that
+          // aborted the signal owns the terminal bookkeeping (cleanupAbortedStream
+          // after processingPromise resolves: stream-abort, partial commit,
+          // settle), so recording this as a provider failure would turn a user
+          // stop or a shutdown abort into an error event and — via the
+          // lost-race guard in cleanupAbortedStream — suppress the abort. Take
+          // the same exit as the clean-close abort path instead.
+          if (streamInfo.abortController.signal.aborted) {
+            workspaceLog.debug("Stream iterator rejected after abort; treating as cancellation", {
+              error: getErrorMessage(error),
+            });
+            await this.flushPartialWrite(workspaceId, streamInfo);
+            break;
+          }
           let handledError: unknown = error;
           let retried = false;
           try {
@@ -4915,6 +4930,11 @@ export class StreamManager {
 
         streamInfo.unlinkAbortSignal = unlinkAbortSignal;
         streamRegistered = true;
+        // Supervise from registration on: a shutdown landing during the envelope
+        // write below must find this STARTING stream and cancel it inside the
+        // scope close (the hard-interrupt path documented after the await),
+        // not after teardown has moved past the bridges.
+        this.superviseEngine(typedWorkspaceId, streamInfo);
 
         // Stream constructed + registered: durable request-describing side
         // effects (turn envelope) may be recorded now.
@@ -4947,8 +4967,6 @@ export class StreamManager {
         ).catch((error) => {
           log.error("Unexpected error in stream processing:", error);
         });
-        // After the assignment: the supervisor wraps the already-started promise.
-        this.superviseEngine(typedWorkspaceId, streamInfo);
 
         return Ok(handle);
       } finally {
@@ -4964,6 +4982,10 @@ export class StreamManager {
     } catch (error) {
       // Guaranteed cleanup on any failure
       this.workspaceStreams.delete(typedWorkspaceId);
+      // No handle is handed out on this path, so the completion is observed only
+      // by a supervisor forked at registration: settle it so that fiber exits
+      // instead of cancelling this never-started stream at shutdown.
+      completionController.settle({ status: "aborted", abortReason: "startup" });
       // Convert to strongly-typed error
       return Err(this.convertToSendMessageError(error));
     }
@@ -4971,19 +4993,23 @@ export class StreamManager {
 
   /**
    * Make the engine scope (`AppFiberScope`) supervise this stream: one fiber
-   * per stream that waits on the already-running `processingPromise` and, when
-   * interrupted by the scope closing during shutdown, cancels the stream through
-   * the user-stop path (`cancelStreamSafely`, abort reason `"system"`) and waits
-   * for the turn to settle — i.e. for the partial to be flushed with usage,
-   * `stream-abort` delivered (AIService commits the partial into chat.jsonl and
-   * deletes partial.json) and `completion` resolved. `closeScopeBounded`
-   * awaits that finalizer, so dispose() proceeds to tear down bridges and
-   * sessions only once every in-flight stream is durably settled.
+   * per stream that lives exactly as long as the turn is unsettled (it waits on
+   * `completionController.promise`) and, when interrupted by the scope closing
+   * during shutdown, cancels the stream through the user-stop path
+   * (`cancelStreamSafely`, abort reason `"system"`) and waits for the turn to
+   * settle — i.e. for the partial to be flushed with usage, `stream-abort`
+   * delivered (AIService commits the partial into chat.jsonl and deletes
+   * partial.json) and `completion` resolved. `closeScopeBounded` awaits that
+   * finalizer, so dispose() proceeds to tear down bridges and sessions only once
+   * every in-flight stream is durably settled. Supervision starts at
+   * registration (before the awaited turn-envelope write), so a STARTING stream
+   * is covered too: cancelling it takes the same hard-interrupt path a user stop
+   * takes during that write.
    *
    * The fiber is the ownership unit only; the stream's AbortSignal stays the
    * sole cancellation transport (the loop, the AI SDK, soft interrupts and
    * `stopStream` all key off it), so interruption meets the stream at exactly
-   * one point — this finalizer. A stream that completes on its own resolves the
+   * one point — this finalizer. A turn that settles on its own resolves the
    * promise and the fiber exits, which removes its finalizer from the scope
    * (no per-stream residue). A stream started after the scope closed is
    * interrupted synchronously by `forkIn` and thus aborted right away (pinned in
@@ -4999,7 +5025,7 @@ export class StreamManager {
     // Zero-arity thunk on purpose: Effect.promise allocates an internal
     // AbortController only when the thunk declares a `signal` parameter; the
     // stream's own controller must stay the only signal in play.
-    const supervisor = Effect.promise(() => streamInfo.processingPromise).pipe(
+    const supervisor = Effect.promise(() => streamInfo.completionController.promise).pipe(
       Effect.onInterrupt(() =>
         // Finalizers already run uninterruptibly; explicit per house doctrine so
         // the cancel → settle sequence is visibly atomic under a second interrupt.

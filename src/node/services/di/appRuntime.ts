@@ -87,8 +87,9 @@
  *   by `closeScopeBounded` early in `dispose()`, while every dependency they
  *   might touch during finalization is still alive. Occupant: the stream
  *   engine (`StreamManager.superviseEngine`, Wave 4 PR 1) — one supervisor
- *   fiber per stream wrapping the already-running processing promise; the
- *   stream's AbortSignal stays the cancellation transport and interruption
+ *   fiber per stream, forked at registration and living until the turn's
+ *   completion settles; the stream's AbortSignal stays the cancellation
+ *   transport and interruption
  *   routes through the user-stop path (`"system"` abort, partial committed,
  *   `completion` settled) before the close resolves. **Rule for occupants:**
  *   tolerate interruption at any suspension point, do not depend on resources

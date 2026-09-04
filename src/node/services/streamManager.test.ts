@@ -1458,6 +1458,87 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
 
+  test("closing the engine scope while the turn-envelope write is pending cancels the STARTING stream inside the close", async () => {
+    // startStream registers the stream, then awaits onStreamConstructed (the
+    // durable turn-envelope write) before launching processing. Supervision
+    // starts at registration, so a shutdown landing inside that await cancels
+    // the STARTING stream through the same hard-interrupt path a user stop
+    // takes there — before closeScopeBounded resolves, not after teardown has
+    // moved on and the envelope write finally returns.
+    const workspaceId = "supervised-starting-window-workspace";
+    const { streamManager, events, engineScope } =
+      createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const messageId = `${workspaceId}-msg`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    let releaseEnvelope!: () => void;
+    const envelopeWritten = new Promise<void>((resolve) => {
+      releaseEnvelope = resolve;
+    });
+    const startPromise = streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        onStreamConstructed: () => envelopeWritten,
+      })
+    );
+    const workspaceStreams = getWorkspaceStreamsForTests(streamManager);
+    const deadline = Date.now() + 5_000;
+    while (!workspaceStreams.has(workspaceId)) {
+      if (Date.now() > deadline) throw new Error("stream never registered");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await closeScopeBounded(engineScope);
+
+    // Cancelled inside the close: abort delivered, registry cleared, no
+    // stream-start ever emitted for it.
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+    expect((terminalEvents(events)[0] as StreamAbortEvent).abortReason).toBe("system");
+    expect(workspaceStreams.size).toBe(0);
+
+    releaseEnvelope();
+    const result = await startPromise;
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("expected Ok");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
+    expect(terminalEvents(events)).toHaveLength(1);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
+
+  test("a provider whose iterator rejects on abort is still recorded as an abort, not a failure", async () => {
+    // Some transports surface a cancellation as an iterator rejection rather
+    // than a clean close. The canceller owns the terminal bookkeeping, so the
+    // loop must not record that rejection as a provider failure — otherwise the
+    // lost-race guard would suppress the stream-abort and the partial commit.
+    const workspaceId = "abort-as-rejection-workspace";
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      (signal) =>
+        (async function* () {
+          yield { type: "text-delta", text: "hello" };
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) return resolve();
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          throw new Error("connection reset after abort");
+        })(),
+      { supervised: false }
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await waitForPartialText(workspaceId, "hello");
+
+    expect(await streamManager.stopStream(workspaceId, { abortReason: "user" })).toEqual(
+      Ok(undefined)
+    );
+
+    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+    expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+  });
+
   test("completed streams leave no supervisor residue: closing the scope after 50 completions aborts nothing", async () => {
     const workspaceId = "supervised-residue-workspace";
     const { streamManager, events, engineScope } = createSupervisedStreamManagerForTests(() =>
