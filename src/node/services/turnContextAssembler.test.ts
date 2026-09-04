@@ -21,6 +21,7 @@ import {
   buildPlanInstructions,
   buildStreamSystemContext,
   prepareProviderRequestMessages,
+  removeIntuitionGuidance,
 } from "./turnContextAssembler";
 
 class TestRuntime extends LocalRuntime {
@@ -559,6 +560,18 @@ describe("buildStreamSystemContext", () => {
     const after = memorySection(withIntuition.systemMessage);
     expect(after).toHaveLength(before.length);
     expect(after.filter((line, i) => line !== before[i])).toHaveLength(1);
+    const pluginContext = "\nPlugin-specific context to preserve.";
+    const lateFiltered = removeIntuitionGuidance(withIntuition.systemMessage + pluginContext, true);
+    expect(lateFiltered).not.toContain("<intuition-guidance>");
+    expect(memorySection(lateFiltered)).toEqual(before);
+    expect(lateFiltered).toContain(pluginContext);
+    const lateMemoryDenied = removeIntuitionGuidance(
+      withIntuition.systemMessage + pluginContext,
+      false
+    );
+    expect(lateMemoryDenied).not.toContain("<intuition-guidance>");
+    expect(lateMemoryDenied).not.toContain("<memory-tool-guidance>");
+    expect(lateMemoryDenied).toContain(pluginContext);
     const deniedMemory = await buildSystemContextForTest({
       ...buildArgs,
       intuitionToolAvailable: true,

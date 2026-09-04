@@ -228,6 +228,7 @@ export async function runMemoryIntuition(args: {
   const signal = controller.signal;
   try {
     validateBudgets();
+    assert(args.cue.trim().length > 0, "intuition requires a non-empty cue");
     const cue = args.cue
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS)
       .replace(/<\/cue\s*>/gi, "&lt;/cue&gt;")

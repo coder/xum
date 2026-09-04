@@ -223,6 +223,23 @@ describe("intuition tool", () => {
     expect((await f.meta.getEntries()).size).toBe(0);
   });
 
+  it("returns committed recall when cancellation races with metadata persistence", async () => {
+    using f = await fixture();
+    const recordRecall = f.memoryService.recordRecall.bind(f.memoryService);
+    const recall = spyOn(f.memoryService, "recordRecall").mockImplementation(async (ctx, path) => {
+      await recordRecall(ctx, path);
+      f.controller.abort();
+    });
+    try {
+      const result = await execute(createIntuitionTool(f.config));
+      expect(result).toMatchObject({ kind: "recognized", memories: [memory] });
+      expect(recall).toHaveBeenCalledTimes(1);
+      expect((await f.meta.getEntries()).get("global:remembered.md")?.accessCount).toBe(1);
+    } finally {
+      recall.mockRestore();
+    }
+  });
+
   it(
     "maps an internal timeout to uncertainty, not cancellation",
     async () => {

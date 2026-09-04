@@ -205,6 +205,20 @@ describe("classifyIntuitionReport", () => {
 });
 
 describe("runMemoryIntuition", () => {
+  it("rejects a blank cue before creating a model", async () => {
+    using f = await fixture({ "locks.md": "Use explicit locks." });
+    const createModel = mock(() => Promise.resolve(scriptedModel([])));
+    const result = await runMemoryIntuition({
+      ...f,
+      cue: " \n ",
+      modelString: "mock:test",
+      createModel,
+      resolveAgentBody: body,
+    });
+    expect(result.kind).toBe("error");
+    expect(createModel).not.toHaveBeenCalled();
+  });
+
   it("does not create a model, resolve a body, or record usage for an empty index", async () => {
     using f = await fixture();
     const createModel = mock(() => Promise.resolve(scriptedModel([])));

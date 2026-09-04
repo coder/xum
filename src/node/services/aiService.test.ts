@@ -1,3 +1,4 @@
+import { eventSpine } from "./events/eventSpine";
 // Bun test file - doesn't support Jest mocking, so we skip this test for now
 // These tests would need to be rewritten to work with Bun's test runner
 // For now, the commandProcessor tests demonstrate our testing approach
@@ -1725,6 +1726,54 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, denied !== "memory"]);
     });
   }
+
+  it.each(["memory", "intuition", "restore-denied"])(
+    "keeps recall policy enforced after request middleware: %s",
+    async (mode) => {
+      using xumHome = new DisposableTempDir("ai-intuition-middleware");
+      const metadata = createLocalWorkspaceMetadata("intuition-middleware", xumHome.path);
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+      const harness = createHarness(xumHome.path, metadata, {
+        experimentsService,
+        allTools: { memory: stubTool, intuition: stubTool },
+        ...(mode === "restore-denied" ? { postPolicyTools: { memory: stubTool } } : {}),
+      });
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+        if (ctx.workspaceId !== metadata.id) return;
+        if (mode === "restore-denied") ctx.tools.intuition = stubTool;
+        else delete ctx.tools[mode];
+        ctx.systemMessage += "\nPreserved plugin context.";
+      });
+      try {
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("user", "user", "hello")],
+          workspaceId: metadata.id,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+          experiments: { memory: true },
+        });
+        expect(result.success).toBe(true);
+        expect(harness.startStreamCalls[0]?.tools?.intuition).toBeUndefined();
+        expect(harness.startStreamCalls[0]?.tools?.memory !== undefined).toBe(mode !== "memory");
+        expect(JSON.stringify(harness.startStreamCalls[0]?.system)).toContain(
+          "Preserved plugin context."
+        );
+      } finally {
+        removeHook();
+      }
+    }
+  );
 
   it("does not upgrade memory context when the hot-set sub-experiment is disabled", async () => {
     using xumHome = new DisposableTempDir("ai-service-memory-hot-set-disabled");

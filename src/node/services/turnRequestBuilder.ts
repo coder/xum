@@ -177,6 +177,7 @@ import {
   buildStreamSystemContext,
   formatMcpWarningPrefix,
   prepareProviderRequestMessages,
+  removeIntuitionGuidance,
 } from "./turnContextAssembler";
 export { prepareProviderRequestMessages };
 import {
@@ -2348,6 +2349,17 @@ export class TurnRequestBuilder {
               toolPolicy: effectiveToolPolicy,
               ptcEnabled,
             }).tools;
+          }
+          // Middleware may filter tools too, but must not restore policy-denied
+          // recall or leave its private memory reader available without memory.
+          if (!intuitionToolAvailable || attemptTools.memory === undefined) {
+            delete attemptTools.intuition;
+          }
+          if (attemptTools.intuition === undefined) {
+            assembleCtx.systemMessage = removeIntuitionGuidance(
+              assembleCtx.systemMessage,
+              attemptTools.memory !== undefined
+            );
           }
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;

@@ -78,12 +78,12 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
         const fields = { cue, model, stats: result.stats };
         if (result.kind === "report") {
           if (result.memories.length > 0) {
-            // Scanning is not recall: only verified memories returned to the caller
-            // update usage metadata, once per path even if the report repeats it.
+            // Commit point: cancellation was checked above. Once recall metadata
+            // starts persisting it cannot be rolled back; return the recognized
+            // result rather than an error with already-recorded side effects.
             for (const path of new Set(result.memories.map((memory) => memory.path))) {
               await memoryService.recordRecall(ctx, path);
             }
-            if (signal.aborted) return cancelled();
             return {
               kind: "recognized",
               ...fields,
