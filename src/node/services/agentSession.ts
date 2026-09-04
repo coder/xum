@@ -2530,12 +2530,27 @@ export class AgentSession {
           : lastHistoryMessage?.role === "assistant"
             ? lastHistoryMessage
             : undefined;
+      // Raw JSON boundary, like the pending follow-up's persisted budget: a present but malformed
+      // remainder fails closed. The row can no longer state the ceiling its turn ran under, and
+      // reading it as absent would hand the turn the default one.
+      const persistedStepsRemaining = interruptedAssistant?.metadata?.stepsRemaining;
+      if (
+        persistedStepsRemaining !== undefined &&
+        !(Number.isInteger(persistedStepsRemaining) && persistedStepsRemaining >= 0)
+      ) {
+        log.warn("Startup auto-retry abandoned: malformed persisted step budget", {
+          workspaceId: this.workspaceId,
+          messageId: interruptedAssistant?.id,
+        });
+        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "malformed_step_budget" });
+        return "completed";
+      }
       this.setAutoRetryResumeState(
         resumeOptions,
         agentInitiated,
         goalKind,
         goalId,
-        interruptedAssistant?.metadata?.stepsRemaining
+        persistedStepsRemaining
       );
     }
 
@@ -7927,12 +7942,12 @@ export class AgentSession {
       .then((started) => {
         this.strandedTurnResumeInFlight = null;
         // resumeStream settles only after its stream ends, so a stranding of that resumed
-        // stream can find the flag still set; sweep again once it clears. A resume that never
-        // started stays owed for the next natural poke rather than retrying in a tight loop,
-        // but anything queued behind its PREPARING claim has no stream end to wait for.
-        if (started) {
-          this.resumeStrandedTurnIfIdle();
-        } else {
+        // stream can find the flag still set; sweep again once it clears. A resume that failed
+        // before its stream is swept again too: an idle session gets no later poke, and the cap's
+        // forfeit settles a delegated owner instead of leaving it waiting on a resume that never
+        // runs. Anything queued behind the failed PREPARING claim has no stream end to wait for.
+        this.resumeStrandedTurnIfIdle();
+        if (!started) {
           this.dispatchQueuedMessagesIfIdle();
         }
       })
