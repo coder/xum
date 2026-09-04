@@ -42,9 +42,9 @@ export interface AgentAiDefinitionDefaults {
  * Buckets always carry model + thinkingLevel, and an absent reasoningMode
  * means "standard" (see WorkspaceAISettingsSchema), so an existing bucket owns
  * the reasoning choice outright: lower tiers must not re-inject a configured
- * pro default over a workspace deliberately running standard. Fallback (tier
- * 7) layers built from OTHER workspaces' buckets must not use this mapping;
- * there, absent reasoning falls through to the next layer.
+ * pro default over a workspace deliberately running standard. Calling-chat Exec
+ * inheritance also preserves this choice. Generic fallback (tier 7) layers must
+ * not use this mapping; there, absent reasoning falls through to the next layer.
  */
 export function targetWorkspaceBucketToLayer(bucket: {
   model?: string;

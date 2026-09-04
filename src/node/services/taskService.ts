@@ -1955,7 +1955,10 @@ export class TaskService implements AgentTaskIntegration {
         model: coerceNonEmptyString(params.modelString) ?? undefined,
         thinkingLevel: params.thinkingLevel ?? undefined,
       },
-      parentWorkspaceExecSettings,
+      // A saved workspace's omitted reasoning mode means Standard, not inheritance.
+      parentWorkspaceExecSettings: parentWorkspaceExecSettings
+        ? targetWorkspaceBucketToLayer(parentWorkspaceExecSettings)
+        : undefined,
       parentRuntime: params.parentRuntimeAiSettings
         ? {
             model: coerceNonEmptyString(params.parentRuntimeAiSettings.modelString) ?? undefined,

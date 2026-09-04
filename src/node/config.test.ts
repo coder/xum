@@ -1909,6 +1909,22 @@ describe("Config", () => {
   });
 
   describe("agent AI defaults canonical shape", () => {
+    it("round-trips explicit Exec overrides even when they equal global defaults", async () => {
+      const profile = {
+        modelString: "openai:gpt-5.6-sol",
+        thinkingLevel: "high" as const,
+        reasoningMode: "standard" as const,
+      };
+      await config.updateAgentAiDefaults({ exec: { ...profile, subagent: profile } });
+      expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults?.exec?.subagent).toEqual(
+        profile
+      );
+      await config.editConfig((cfg) => cfg);
+      expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults?.exec?.subagent).toEqual(
+        profile
+      );
+    });
+
     it("preserves explicit gateway-scoped model strings in nested AI defaults", async () => {
       await config.editConfig((cfg) => {
         cfg.agentAiDefaults = {

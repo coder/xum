@@ -6478,7 +6478,11 @@ describe("TaskService", () => {
     );
     const child = findWorkspaceInConfig(config, created.data.taskId);
     expect(child?.taskModelString).toBe("openai:gpt-6-astra");
-    expect(child?.aiSettings).toEqual({ model: "openai:gpt-6-astra", thinkingLevel: "high" });
+    expect(child?.aiSettings).toEqual({
+      model: "openai:gpt-6-astra",
+      thinkingLevel: "high",
+      reasoningMode: "standard",
+    });
   }, 20_000);
 
   test.each([
@@ -6659,6 +6663,84 @@ describe("TaskService", () => {
       "openai:gpt-5.3-codex"
     );
   }, 20_000);
+
+  test.each([false, true])(
+    "Exec inheritance preserves omitted Standard reasoning (legacy: %s)",
+    async (legacy) => {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5.6-sol", reasoningMode: "pro" } },
+      });
+      await config.editConfig((cfg) => {
+        const parent = cfg.projects.get(projectPath)!.workspaces[0];
+        parent.agentId = "exec";
+        const settings = { model: "openai:gpt-5.6-sol", thinkingLevel: "high" as const };
+        if (legacy) parent.aiSettings = settings;
+        else parent.aiSettingsByAgent = { exec: settings };
+        return cfg;
+      });
+      const initStateManager = new RealInitStateManager(config);
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService,
+        initStateManager,
+      });
+      const created = await createAgentTask(taskService, parentId, "inherit Standard", {
+        agentType: "exec",
+      });
+      assert(created.success);
+      await initStateManager.waitForInit(created.data.taskId);
+      expect(findWorkspaceInConfig(config, created.data.taskId)?.aiSettings?.reasoningMode).toBe(
+        "standard"
+      );
+      expect(sendMessage).toHaveBeenCalledWith(
+        created.data.taskId,
+        "inherit Standard",
+        expect.objectContaining({ reasoningMode: "standard" }),
+        { agentInitiated: true }
+      );
+    }
+  );
+
+  test("explicit Exec overrides equal to global defaults still beat the calling chat", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const profile = {
+      modelString: "openai:gpt-5.6-sol",
+      thinkingLevel: "high" as const,
+      reasoningMode: "standard" as const,
+    };
+    await config.updateAgentAiDefaults({ exec: { ...profile, subagent: profile } });
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces[0].aiSettingsByAgent = {
+        exec: { model: "openai:gpt-5.2", thinkingLevel: "medium", reasoningMode: "pro" },
+      };
+      return cfg;
+    });
+    const initStateManager = new RealInitStateManager(config);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService,
+      initStateManager,
+    });
+    const created = await createAgentTask(taskService, parentId, "keep explicit overrides", {
+      agentType: "exec",
+    });
+    assert(created.success);
+    await initStateManager.waitForInit(created.data.taskId);
+    const expected = {
+      model: profile.modelString,
+      thinkingLevel: profile.thinkingLevel,
+      reasoningMode: profile.reasoningMode,
+    };
+    expect(findWorkspaceInConfig(config, created.data.taskId)?.aiSettings).toEqual(expected);
+    expect(sendMessage).toHaveBeenCalledWith(
+      created.data.taskId,
+      "keep explicit overrides",
+      expect.objectContaining(expected),
+      { agentInitiated: true }
+    );
+  });
 
   test("exec subagent uses subagentAiDefaults exec when present", async () => {
     const config = await createTestConfig(rootDir);
