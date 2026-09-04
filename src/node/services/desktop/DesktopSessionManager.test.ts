@@ -445,6 +445,7 @@ describe("DesktopSessionManager", () => {
         expect(manager.getLiveSessionConnection("child")).toEqual(
           manager.getLiveSessionConnection("owner")
         );
+        expect(manager.getLiveSessionConnection("child")?.ownerWorkspaceId).toBe("owner");
 
         await config.editConfig((current) => {
           const child = current.projects

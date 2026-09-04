@@ -1,6 +1,13 @@
 import * as http from "node:http";
 import * as net from "node:net";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { Config } from "@/node/config";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import { DesktopSessionManager } from "./DesktopSessionManager";
 import { WebSocket, type RawData } from "ws";
 import { DesktopBridgeServer } from "./DesktopBridgeServer";
 import { DesktopTokenManager } from "./DesktopTokenManager";
@@ -24,15 +31,18 @@ interface UpgradeHarness {
 interface Deferred<T> {
   promise: Promise<T>;
   reject: (reason?: unknown) => void;
+  resolve: (value: T) => void;
 }
 
 function createDeferred<T>(): Deferred<T> {
   let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((_innerResolve, innerReject) => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((innerResolve, innerReject) => {
+    resolve = innerResolve;
     reject = innerReject;
   });
   void promise.catch(() => undefined);
-  return { promise, reject };
+  return { promise, reject, resolve };
 }
 
 function createBridgeServer(options: {
@@ -52,11 +62,15 @@ function createBridgeServer(options: {
         ),
     },
     desktopSessionManager: {
-      getLiveSessionConnection:
-        options.getLiveSessionConnection ??
-        mock((workspaceId: string) =>
-          workspaceId === VALID_WORKSPACE_ID ? { sessionId: VALID_SESSION_ID, vncPort: 5900 } : null
-        ),
+      getLiveSessionConnection: (workspaceId) => {
+        const live = options.getLiveSessionConnection
+          ? options.getLiveSessionConnection(workspaceId)
+          : workspaceId === VALID_WORKSPACE_ID
+            ? { sessionId: VALID_SESSION_ID, vncPort: 5900 }
+            : null;
+        return live ? { ...live, ownerWorkspaceId: workspaceId } : null;
+      },
+      onWorkspaceClose: () => () => undefined,
     },
   });
 }
@@ -304,17 +318,189 @@ async function waitForTcpData(socket: net.Socket, timeoutMs = 2_000): Promise<Bu
   });
 }
 
+async function withSharedBridge(
+  run: (harness: {
+    manager: DesktopSessionManager;
+    bridge: DesktopBridgeServer;
+    connect: (workspaceId: string, waitForVnc?: boolean) => Promise<WebSocket>;
+  }) => Promise<void>
+): Promise<void> {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "desktop-bridge-revocation-"));
+  const config = new Config(rootDir);
+  await config.editConfig((current) => {
+    current.projects.set(rootDir, {
+      workspaces: ["owner", "child", "sibling", "unrelated"].map((id) => ({
+        id,
+        name: id,
+        path: path.join(rootDir, id),
+        ...(["child", "sibling"].includes(id)
+          ? { parentWorkspaceId: "owner", taskDesktopOwnerWorkspaceId: "owner" }
+          : {}),
+      })),
+    });
+    return current;
+  });
+  const experimentsService: Partial<ExperimentsService> = { isExperimentEnabled: () => true };
+  const workspaceService: Partial<WorkspaceService> = { getInfo: () => Promise.resolve(null) };
+  const manager = new DesktopSessionManager({
+    config,
+    experimentsService: experimentsService as ExperimentsService,
+    workspaceService: workspaceService as WorkspaceService,
+  });
+  const tcp = await listenTcpServer();
+  tcp.server.on("connection", (socket) => {
+    socket.on("data", (data) => {
+      socket.write(data, (error) => {
+        if (error) socket.destroy(error);
+      });
+    });
+    socket.write(Buffer.from([0]));
+  });
+  const connection = spyOn(manager, "getLiveSessionConnection").mockImplementation(
+    (workspaceId) => {
+      try {
+        const { ownerWorkspaceId } = manager.resolveTarget(workspaceId);
+        return { ownerWorkspaceId, sessionId: `session:${ownerWorkspaceId}`, vncPort: tcp.port };
+      } catch {
+        return null;
+      }
+    }
+  );
+  const tokens = new DesktopTokenManager();
+  const bridge = new DesktopBridgeServer({
+    desktopSessionManager: manager,
+    desktopTokenManager: tokens,
+  });
+  const upgrade = await listenUpgradeServer(bridge);
+  const clients: WebSocket[] = [];
+  try {
+    await run({
+      manager,
+      bridge,
+      connect: async (workspaceId, waitForVnc = true) => {
+        const live = manager.getLiveSessionConnection(workspaceId);
+        if (!live) throw new Error("Expected live test connection");
+        const token = tokens.mint(workspaceId, live.sessionId);
+        const ws = new WebSocket(`ws://127.0.0.1:${upgrade.port}/?token=${token}`);
+        clients.push(ws);
+        ws.on("message", (_data, isBinary) => expect(isBinary).toBe(true));
+        const greeting = waitForVnc ? waitForWebSocketMessage(ws) : null;
+        await waitForWebSocketOpen(ws);
+        if (greeting) expect(await greeting).toEqual(Buffer.from([0]));
+        return ws;
+      },
+    });
+  } finally {
+    await bridge.stop();
+    await Promise.all(clients.map(closeWebSocket));
+    await upgrade.close();
+    await tcp.close();
+    tokens.dispose();
+    connection.mockRestore();
+    await manager.closeAll();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+}
+
+async function expectEcho(ws: WebSocket): Promise<void> {
+  const echoed = waitForWebSocketMessage(ws);
+  ws.send(Buffer.from([1, 2, 3]));
+  expect(await echoed).toEqual(Buffer.from([1, 2, 3]));
+}
+
 describe("DesktopBridgeServer", () => {
+  for (const closingWorkspaceId of ["child", "owner"]) {
+    test(`closing ${closingWorkspaceId} revokes established affected bridges only`, async () => {
+      await withSharedBridge(async ({ manager, connect }) => {
+        const clients = new Map<string, WebSocket>();
+        for (const workspaceId of ["owner", "child", "sibling", "unrelated"]) {
+          const ws = await connect(workspaceId);
+          await expectEcho(ws);
+          clients.set(workspaceId, ws);
+        }
+        const revoked = closingWorkspaceId === "owner" ? ["owner", "child", "sibling"] : ["child"];
+        const results = [...clients].map(([workspaceId, ws]) => ({
+          workspaceId,
+          ws,
+          response: waitForWebSocketMessage(ws).then(
+            () => "message",
+            () => "closed"
+          ),
+          closed: revoked.includes(workspaceId) ? waitForWebSocketClose(ws) : null,
+        }));
+        await manager.close(closingWorkspaceId);
+        // A post-cleanup input frame exposes the old bug deterministically: an unrevoked
+        // connection echoes it instead of closing, without a polling or timeout assertion.
+        for (const { ws } of results) ws.send(Buffer.from([4, 5, 6]));
+        for (const result of results) {
+          expect(await result.response).toBe(result.closed ? "closed" : "message");
+          if (result.closed) expect((await result.closed).code).toBe(4002);
+        }
+        const unrelated = clients.get("unrelated");
+        if (!unrelated) throw new Error("Missing unrelated test viewer");
+        await expectEcho(unrelated);
+      });
+    });
+  }
+
+  for (const cleanup of ["child", "owner", "all", "guard"] as const) {
+    test(`${cleanup} cleanup refuses a late TCP connection without leaking a subscription`, async () => {
+      await withSharedBridge(async ({ manager, bridge, connect }) => {
+        interface ConnectingBridge {
+          connectToVnc: (port: number, signal: AbortSignal) => Promise<net.Socket>;
+        }
+        const internal = bridge as unknown as ConnectingBridge;
+        const connectToVnc = internal.connectToVnc.bind(bridge);
+        const connected = createDeferred<net.Socket>();
+        const release = createDeferred<void>();
+        const pending = spyOn(internal, "connectToVnc").mockImplementation(async (port, signal) => {
+          const tcp = await connectToVnc(port, signal);
+          connected.resolve(tcp);
+          await release.promise;
+          return tcp;
+        });
+        try {
+          const ws = await connect("child", false);
+          const tcp = await connected.promise;
+          const tcpClosed = new Promise<void>((resolve) => tcp.once("close", () => resolve()));
+          const closed = waitForWebSocketClose(ws);
+          if (cleanup === "guard") {
+            manager.setWorkspaceArchiveGuard((workspaceId) => workspaceId === "child");
+          } else if (cleanup === "all") {
+            await manager.closeAll();
+          } else {
+            await manager.close(cleanup);
+          }
+          release.resolve();
+          expect((await closed).code).toBe(4002);
+          await tcpClosed;
+          expect(tcp.destroyed).toBe(true);
+          const listeners: unknown = Reflect.get(manager, "closeListeners");
+          expect(listeners).toBeInstanceOf(Set);
+          if (!(listeners instanceof Set)) throw new Error("Expected close subscriptions");
+          expect(listeners.size).toBe(0);
+          pending.mockRestore();
+          await expectEcho(await connect("unrelated"));
+        } finally {
+          release.resolve();
+          pending.mockRestore();
+        }
+      });
+    });
+  }
+
   test("shared tokens authorize the requester and bind its owner's session", async () => {
     const tcpHarness = await listenTcpServer();
     const tokens = new DesktopTokenManager();
     const token = tokens.mint("child", "owner-session");
     const getLiveSessionConnection = mock((workspaceId: string) =>
-      workspaceId === "child" ? { sessionId: "owner-session", vncPort: tcpHarness.port } : null
+      workspaceId === "child"
+        ? { ownerWorkspaceId: "owner", sessionId: "owner-session", vncPort: tcpHarness.port }
+        : null
     );
     const bridgeServer = new DesktopBridgeServer({
       desktopTokenManager: tokens,
-      desktopSessionManager: { getLiveSessionConnection },
+      desktopSessionManager: { getLiveSessionConnection, onWorkspaceClose: () => () => undefined },
     });
     const upgradeHarness = await listenUpgradeServer(bridgeServer);
     let ws: WebSocket | null = null;

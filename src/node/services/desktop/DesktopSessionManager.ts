@@ -22,6 +22,7 @@ export class DesktopSessionManager {
   private readonly sessions = new Map<string, PortableDesktopSession>();
   private readonly startupPromises = new Map<string, Promise<PortableDesktopSession>>();
   private readonly inputCoordinator: DesktopInputCoordinator;
+  private readonly closeListeners = new Set<(workspaceId: string | null) => void>();
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
 
   /**
@@ -50,7 +51,9 @@ export class DesktopSessionManager {
     const target = this.inputCoordinator.resolveTarget(workspaceId);
     for (const id of new Set([workspaceId, target.ownerWorkspaceId])) {
       if (this.workspaceArchiveGuard?.(id) === true) {
-        throw new Error(`Workspace is being archived: ${id}. Unarchive it before using a desktop.`);
+        throw new Error(
+          `Workspace is being archived or removed: ${id}. Wait for cleanup to finish.`
+        );
       }
     }
     return target;
@@ -231,7 +234,15 @@ export class DesktopSessionManager {
     );
   }
 
+  /** A null workspace ID revokes all viewers, including pending bridge connections. */
+  onWorkspaceClose(listener: (workspaceId: string | null) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
+  }
+
   async close(workspaceId: string): Promise<void> {
+    // A shared borrower has no owned session, but cleanup must still revoke its viewers.
+    for (const listener of this.closeListeners) listener(workspaceId);
     const session = this.sessions.get(workspaceId);
     const startupPromise = this.startupPromises.get(workspaceId);
 
@@ -256,6 +267,7 @@ export class DesktopSessionManager {
   }
 
   async closeAll(): Promise<void> {
+    for (const listener of this.closeListeners) listener(null);
     const sessions = Array.from(this.sessions.values());
     const startupPromises = Array.from(this.startupPromises.values());
 
@@ -275,7 +287,11 @@ export class DesktopSessionManager {
    * Returns null if no live session exists for the workspace.
    * Used by DesktopBridgeServer to resolve token→VNC-port mappings.
    */
-  getLiveSessionConnection(workspaceId: string): { sessionId: string; vncPort: number } | null {
+  getLiveSessionConnection(workspaceId: string): {
+    ownerWorkspaceId: string;
+    sessionId: string;
+    vncPort: number;
+  } | null {
     let ownerWorkspaceId: string;
     try {
       ownerWorkspaceId = this.resolveTarget(workspaceId).ownerWorkspaceId;
@@ -298,6 +314,7 @@ export class DesktopSessionManager {
     }
 
     return {
+      ownerWorkspaceId,
       sessionId: sessionInfo.sessionId ?? `desktop:${ownerWorkspaceId}`,
       vncPort: sessionInfo.vncPort,
     };
