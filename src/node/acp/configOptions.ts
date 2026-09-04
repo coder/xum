@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { AgentDefinitionFrontmatter } from "@/common/types/agentDefinition";
@@ -350,11 +351,15 @@ export async function handleSetConfigOption(
       (await resolveCurrentAiSettings(client, workspace, trimmedWorkspaceId, currentAgentId));
 
     if (trimmedConfigId === MODEL_CONFIG_ID) {
+      const model = normalizeSelectedModel(trimmedValue).trim();
+      if (!isValidModelFormat(model)) {
+        throw new Error(`Invalid model format: ${trimmedValue}`);
+      }
       // The send path re-gates pro mode for the selected model and route.
       nextAiSettings = {
         ...currentAiSettings,
-        model: trimmedValue,
-        thinkingLevel: enforceThinkingPolicy(trimmedValue, currentAiSettings.thinkingLevel),
+        model,
+        thinkingLevel: enforceThinkingPolicy(model, currentAiSettings.thinkingLevel),
       };
     } else if (trimmedConfigId === THINKING_LEVEL_CONFIG_ID) {
       if (!isThinkingLevel(trimmedValue)) {

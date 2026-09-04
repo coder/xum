@@ -520,7 +520,7 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
-  test.each(["unchanged", "mode", "model"])("hydrates saved selections: %s", async (change) => {
+  test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
     const changed = change !== "unchanged";
     const nextAgentId = change === "mode" ? "auto" : "plan";
     const workspaceId = "ws-agent-main";
@@ -584,10 +584,8 @@ describe("WorkspaceContext", () => {
     await waitFor(() =>
       expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
-    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe(changed ? nextAgentId : "exec");
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(
-      changed ? "openai:gpt-5.3-codex" : "anthropic:claude-opus-4-6"
-    );
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("anthropic:claude-opus-4-6");
   });
 
   test("child workspace metadata still seeds the locked backend agent", async () => {

@@ -279,6 +279,23 @@ describe("ACP config options", () => {
     expect(harness.updateAgentCalls).toHaveLength(0);
   });
 
+  it.each(["bogus", "openai:", ":gpt-5.2"])(
+    "rejects malformed local model choices (%s)",
+    async (model) => {
+      const harness = createHarness({
+        agentId: "exec",
+        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "off" },
+        aiSettingsByAgent: {},
+      });
+      await expect(
+        handleSetConfigOption(harness.client, "ws-1", "model", model, {
+          onAgentModeChanged: harness.onAgentModeChanged,
+        })
+      ).rejects.toThrow();
+      expect(harness.onAgentModeChanged).not.toHaveBeenCalled();
+    }
+  );
+
   it("clamps local thinking level when model changes", async () => {
     const harness = createHarness({
       agentId: "exec",

@@ -169,14 +169,8 @@ function seedWorkspaceLocalStorageFromBackend(
   metadata: FrontendWorkspaceMetadata,
   previous?: FrontendWorkspaceMetadata
 ): void {
-  // Unchanged server settings must not overwrite choices the user hasn't sent yet.
-  if (
-    metadata.parentWorkspaceId == null &&
-    previous &&
-    resolvePersistedAgentId(metadata, "") === resolvePersistedAgentId(previous, "") &&
-    JSON.stringify(metadata.aiSettingsByAgent) === JSON.stringify(previous.aiSettingsByAgent) &&
-    JSON.stringify(metadata.aiSettings) === JSON.stringify(previous.aiSettings)
-  ) {
+  // Restore on initial load only; later send echoes must not overwrite unsent choices.
+  if (metadata.parentWorkspaceId == null && previous != null) {
     return;
   }
   // Cache keyed by agentId (string) - includes exec, plan, and custom agents
