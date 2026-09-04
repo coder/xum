@@ -24370,9 +24370,12 @@ describe("TaskService", () => {
     const hasOutstandingBashMonitorWake = mock((workspaceId: string) =>
       Promise.resolve(workspaceId === "childworkspace")
     );
-    const { parentId, taskService } = await startWorkspaceTurnForTest({
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
       hasOutstandingBashMonitorWake,
     });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
+      stage: "bash-monitor-wake" as const,
+    }));
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
@@ -24417,6 +24420,43 @@ describe("TaskService", () => {
       messageId: "msg_continuation_final",
       reportMarkdown: "Final review report",
     });
+  });
+
+  test("a manual tool-end head owns the cut even while the wake level is high", async () => {
+    // The session attributes the cut to the queued entry (hasPendingToolEndInput: a queue
+    // head arbitrates alone), which runs first and breaks correlation inheritance; the wake
+    // behind it is not this turn's continuation. Deferring on the level would leave the
+    // handle running with no correlated stream-end to come (Codex P2 PRRT_kwDOPxxmWM6fOH50).
+    const hasOutstandingBashMonitorWake = mock(() => Promise.resolve(true));
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      hasOutstandingBashMonitorWake,
+    });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
+      stage: "queued" as const,
+      muxMetadata: undefined,
+      dispatchMode: "tool-end" as const,
+    }));
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_manual_cut",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: workspaceTurnMuxMetadata(parentId),
+      },
+      parts: [{ type: "text", text: "Kicked off verification" }],
+    });
+
+    expect(hasOutstandingBashMonitorWake).not.toHaveBeenCalled();
+    const settled = await workspaceTurnSnapshot(taskService, parentId);
+    expect(settled?.status).not.toBe("running");
+    expect(settled).toMatchObject({ messageId: "msg_manual_cut" });
   });
 
   test("a wake retracted after the cut settles the handle as a wake cut instead of deferring", async () => {

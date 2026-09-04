@@ -4327,7 +4327,8 @@ export class WorkspaceTurnManager {
    */
   private async hasSameTurnContinuation(
     event: StreamEndEvent,
-    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string }
+    correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
+    queueCutSnapshot: QueueCutAttributionSnapshot
   ): Promise<boolean> {
     if (
       this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
@@ -4337,21 +4338,28 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    // A stream that ended with "tool-calls" while a wake is outstanding yielded to that
-    // wake; the wake turn inherits this correlation (inheritOpenWorkspaceTurnMetadata).
-    // The probe is advisory: if its I/O fails, settle through the normal path rather
-    // than leave the handle running with its terminal stream-end already consumed (a
-    // late correlated continuation can still self-heal it) (Codex P2 PRRT_kwDOPxxmWM6fEQIr).
-    try {
-      if (await this.workspaceService.hasOutstandingBashMonitorWake(event.workspaceId)) {
-        return true;
+    // A stream that yielded to the wake level continues through the wake turn, which
+    // inherits this correlation from history (inheritOpenWorkspaceTurnMetadata). Only the
+    // event-time attribution says whether the level was the cutter: a manual tool-end head
+    // arbitrates the cut even while the level is high, runs first and breaks inheritance, so
+    // the wake behind it is not this turn's continuation and the handle must settle here
+    // instead of waiting on a stream-end that may never correlate (Codex P2
+    // PRRT_kwDOPxxmWM6fOH50). Whether the wake still arrives is then read live: the probe is
+    // advisory, so if its I/O fails settle through the normal path rather than leave the
+    // handle running with its terminal stream-end already consumed (a late correlated
+    // continuation can still self-heal it) (Codex P2 PRRT_kwDOPxxmWM6fEQIr).
+    if (queueCutSnapshot.cutter?.stage === "bash-monitor-wake") {
+      try {
+        if (await this.workspaceService.hasOutstandingBashMonitorWake(event.workspaceId)) {
+          return true;
+        }
+      } catch (error) {
+        log.warn("Bash monitor wake probe failed during workspace turn settlement", {
+          workspaceId: event.workspaceId,
+          taskHandleId: correlation.taskHandleId,
+          error,
+        });
       }
-    } catch (error) {
-      log.warn("Bash monitor wake probe failed during workspace turn settlement", {
-        workspaceId: event.workspaceId,
-        taskHandleId: correlation.taskHandleId,
-        error,
-      });
     }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
     if (activeStream == null || activeStream.messageId === event.messageId) {
@@ -4522,7 +4530,7 @@ export class WorkspaceTurnManager {
     // must settle the old outcome here.
     if (
       event.metadata.finishReason === "tool-calls" &&
-      (await this.hasSameTurnContinuation(event, metadata))
+      (await this.hasSameTurnContinuation(event, metadata, queueCutSnapshot))
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;

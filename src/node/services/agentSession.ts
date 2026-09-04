@@ -3963,7 +3963,20 @@ export class AgentSession {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
     } catch (error) {
       if (finalizeDurableWakeOnFailure) {
+        // Consuming the signal is what stops the reconciler from re-deriving this wake, so
+        // from that moment the durable row is the only carrier of the turn and nothing
+        // upstream can resend it. Arm the same in-session resume a failed stream start uses
+        // BEFORE consuming, then schedule it: auto-retry resumes the durable row without
+        // appending a second one, so the row (and any delegated turn waiting on its
+        // continuation) no longer depends on an application restart. With auto-retry
+        // disabled by the user this stays a startup-recovery row like every other
+        // pre-stream failure (Codex P2 PRRT_kwDOPxxmWM6fOH54).
+        this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
         await internal?.onAccepted?.();
+        await this.handleStreamFailureForAutoRetry({
+          type: "unknown",
+          message: getErrorMessage(error),
+        });
       }
       throw error;
     }
@@ -7589,6 +7602,17 @@ export class AgentSession {
       return;
     }
 
+    // Every discard path funnels here, so this is the one place that knows the delegated
+    // turn's continuation is gone for good (Codex P2 PRRT_kwDOPxxmWM6fGVxG). Settle BEFORE
+    // erasing the follow-up: the durable record is the only carrier of the correlation, so
+    // a settlement failure must leave it in place for the next dispatch attempt (or startup
+    // recovery) to retry — settlement is idempotent, a lost record is not recoverable
+    // (Codex P2 PRRT_kwDOPxxmWM6fOH59).
+    const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
+    if (workspaceTurnMetadata != null) {
+      await this.onWorkspaceTurnContinuationAbandoned?.(workspaceTurnMetadata);
+    }
+
     const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;
     const updateResult = await this.historyService.updateHistory(this.workspaceId, {
       ...summaryMessage,
@@ -7599,12 +7623,6 @@ export class AgentSession {
     });
     if (!updateResult.success) {
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
-    }
-    // Every discard path funnels here, so this is the one place that knows the delegated
-    // turn's continuation is gone for good (Codex P2 PRRT_kwDOPxxmWM6fGVxG).
-    const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
-    if (workspaceTurnMetadata != null) {
-      await this.onWorkspaceTurnContinuationAbandoned?.(workspaceTurnMetadata);
     }
   }
 

@@ -1025,6 +1025,20 @@ describe("AgentSession queued message tool-call dispatch", () => {
     try {
       const canceledReasons: string[] = [];
       let accepted = false;
+      // Acceptance consumes the reconciler signal, so an in-session resume must already be
+      // armed by then: nothing upstream can resend the durable row (Codex P2
+      // PRRT_kwDOPxxmWM6fOH54).
+      let resumeArmedAtAcceptance = false;
+      const chatEventTypes: string[] = [];
+      const unsubscribe = session.onChatEvent((event) => {
+        chatEventTypes.push(event.message.type);
+      });
+      const readResumeRequest = () =>
+        (
+          session as unknown as {
+            lastAutoRetryResumeRequest?: { options: { muxMetadata?: unknown } };
+          }
+        ).lastAutoRetryResumeRequest;
       const sendPromise = session.sendMessage(
         "Background monitor wake",
         {
@@ -1040,11 +1054,13 @@ describe("AgentSession queued message tool-call dispatch", () => {
           },
           onAccepted: () => {
             accepted = true;
+            resumeArmedAtAcceptance = readResumeRequest() != null;
           },
         }
       );
 
       await syncStarted;
+      expect(readResumeRequest()).toBeUndefined();
       releaseSync();
       let syncError: unknown;
       try {
@@ -1052,11 +1068,18 @@ describe("AgentSession queued message tool-call dispatch", () => {
       } catch (error) {
         syncError = error;
       }
+      unsubscribe();
       expect(syncError).toBeInstanceOf(Error);
       expect((syncError as Error).message).toContain("injected goal sync failure");
 
       expect(accepted).toBe(true);
       expect(canceledReasons).toEqual([]);
+      expect(resumeArmedAtAcceptance).toBe(true);
+      expect(readResumeRequest()?.options.muxMetadata).toEqual({
+        type: "bash-monitor-wake",
+        records: [],
+      });
+      expect(chatEventTypes).toContain("auto-retry-scheduled");
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
       if (history.success) {

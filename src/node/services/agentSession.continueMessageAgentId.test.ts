@@ -379,9 +379,10 @@ describe("AgentSession continue-message agentId fallback", () => {
       workspaceTurnMetadata,
       dispatchOptions: { requireIdle: true },
     };
+    let settlementError: Error | undefined = new Error("task handle store unavailable");
     const abandoned = mock(
       (_metadata: NonNullable<CompactionFollowUpRequest["workspaceTurnMetadata"]>) =>
-        Promise.resolve()
+        settlementError != null ? Promise.reject(settlementError) : Promise.resolve()
     );
     const { session, historyService, internals } = await createSession(
       [compactionSummaryMessage("summary-wake", wakeFollowUp)],
@@ -391,10 +392,30 @@ describe("AgentSession continue-message agentId fallback", () => {
     (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
       () => true;
 
-    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+    // Settlement runs BEFORE the follow-up is erased: a failure keeps the durable record (the
+    // only carrier of the correlation) so the next attempt retries it (Codex P2
+    // PRRT_kwDOPxxmWM6fOH59).
+    let dispatchError: unknown;
+    try {
+      await internals.dispatchPendingFollowUp();
+    } catch (error) {
+      dispatchError = error;
+    }
+    expect(dispatchError).toBeInstanceOf(Error);
+    expect((dispatchError as Error).message).toContain("task handle store unavailable");
     expect(internals.sendMessage).not.toHaveBeenCalled();
     expect(abandoned).toHaveBeenCalledTimes(1);
-    expect(abandoned).toHaveBeenCalledWith(workspaceTurnMetadata);
+    const retained = await historyService.getLastMessages("ws", 1);
+    expect(retained.success && retained.data[0]?.metadata?.muxMetadata).toMatchObject({
+      type: "compaction-summary",
+      pendingFollowUp: { workspaceTurnMetadata },
+    });
+
+    settlementError = undefined;
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+    expect(abandoned).toHaveBeenCalledTimes(2);
+    expect(abandoned).toHaveBeenLastCalledWith(workspaceTurnMetadata);
     const lastMessages = await historyService.getLastMessages("ws", 1);
     expect(lastMessages.success && lastMessages.data[0]?.metadata?.muxMetadata).toEqual({
       type: "compaction-summary",
@@ -409,7 +430,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     );
     expect(await internals.dispatchPendingFollowUp()).toBe(true);
     expect(internals.sendMessage).toHaveBeenCalledTimes(1);
-    expect(abandoned).toHaveBeenCalledTimes(1);
+    expect(abandoned).toHaveBeenCalledTimes(2);
   });
 
   test("dispatchPendingFollowUp removes heartbeat reset boundaries when idle-only follow-ups are skipped", async () => {
