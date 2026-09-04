@@ -13978,7 +13978,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       const project = configState.projects.get(projectPath);
       if (!project) throw new Error("project fixture must exist");
       project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
-      Object.assign(project.workspaces[1]!, {
+      Object.assign(project.workspaces[1], {
         parentWorkspaceId: "owner",
         taskStatus: "queued",
         taskPrompt: "brief",
@@ -15006,7 +15006,7 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
       const project = configState.projects.get(projectPath);
       if (!project) throw new Error("project fixture must exist");
       project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
-      Object.assign(project.workspaces[1]!, {
+      Object.assign(project.workspaces[1], {
         parentWorkspaceId: "owner",
         taskStatus: "queued",
         ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
