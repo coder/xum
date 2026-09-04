@@ -14,7 +14,7 @@ import {
   MEMORY_INTUITION_TIMEOUT_MS,
   MEMORY_MAX_FILE_BYTES,
 } from "@/common/constants/memory";
-import { MemoryToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+import { MemoryToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { IntuitionReportToolArgs } from "@/common/types/tools";
 import { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -298,6 +298,250 @@ describe("runMemoryIntuition", () => {
     expect(resolveAgentBody).not.toHaveBeenCalled();
     expect(recordUsage).not.toHaveBeenCalled();
   });
+  it("authorizes index metadata before model creation and prevents guessed denied-path reads", async () => {
+    using f = await fixture({
+      "denied.md": "---\ndescription: confidential metadata\n---\nclassified content",
+      "allowed.md": "---\ndescription: public metadata\n---\nallowed evidence",
+    });
+    const reads = spyOn(f.memoryService, "readFileWithSha");
+    const calls: LanguageModelV3CallOptions[] = [];
+    const createModel = mock(() => {
+      expect(reads).not.toHaveBeenCalled();
+      return Promise.resolve(
+        pinned(
+          scriptedModel(
+            [
+              [read("denied.md"), read("allowed.md")],
+              [
+                report([
+                  item("allowed.md", 0.9, "allowed evidence"),
+                  item("denied.md", 1, "classified content"),
+                ]),
+              ],
+            ],
+            (options) => calls.push(options)
+          )
+        )
+      );
+    });
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      if (TOOL_DEFINITIONS.memory.schema.parse(ctx.args).path === entry("denied.md").path) {
+        ctx.blocked = { result: { error: "denied" } };
+        return;
+      }
+      await next();
+    });
+    try {
+      const result = await runMemoryIntuition({
+        ...f,
+        cue: "metadata",
+        modelString: "mock:test",
+        createModel,
+        resolveAgentBody: body,
+        hooks: {
+          runtime: new LocalRuntime(f.root),
+          cwd: f.root,
+          runtimeTempDir: f.root,
+          workspaceId: f.ctx.workspaceId,
+        },
+      });
+      expect(JSON.stringify(calls[0].prompt)).not.toContain("denied.md");
+      expect(JSON.stringify(calls[0].prompt)).not.toContain("confidential metadata");
+      expect(JSON.stringify(calls[0].prompt)).toContain("public metadata");
+      expect(reads.mock.calls.map((call) => call[1])).toEqual([entry("allowed.md").path]);
+      expect(result).toMatchObject({
+        kind: "report",
+        memories: [item("allowed.md", 0.9, "allowed evidence")],
+        candidates: [],
+        stats: { indexEntriesConsidered: 2, indexEntriesOmitted: 1 },
+      });
+      expect((await f.meta.getEntries()).size).toBe(0);
+    } finally {
+      unregister();
+    }
+  });
+
+  it.each(["deny", "throw", "invalid", "path", "command", "offset", "limit", "spoof"])(
+    "omits every metadata row on %s without creating a model",
+    async (mode) => {
+      using f = await fixture({ "a.md": "alpha", "b.md": "bravo" });
+      const reads = spyOn(f.memoryService, "readFileWithSha");
+      const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+      const resolveAgentBody = mock(body);
+      const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+        if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        const input = TOOL_DEFINITIONS.memory.schema.parse(ctx.args);
+        if (mode === "deny") {
+          ctx.blocked = { result: { error: "denied" } };
+          return;
+        }
+        if (mode === "throw") throw new Error("hook failed");
+        if (mode === "path" || mode === "spoof")
+          ctx.args = {
+            ...input,
+            path: input.path === entry("a.md").path ? entry("b.md").path : entry("a.md").path,
+          };
+        if (mode === "command") ctx.args = { ...input, command: "delete" };
+        if (mode === "offset") ctx.args = { ...input, offset: 1 };
+        if (mode === "limit") ctx.args = { ...input, limit: 1 };
+        await next();
+        if (mode === "invalid") ctx.result = { success: true };
+        if (mode === "spoof") ctx.result = { success: true, output: "fabricated metadata" };
+      });
+      try {
+        const result = await runMemoryIntuition({
+          ...f,
+          cue: "alpha",
+          modelString: "mock:test",
+          createModel,
+          resolveAgentBody,
+          hooks: {
+            runtime: new LocalRuntime(f.root),
+            cwd: f.root,
+            runtimeTempDir: f.root,
+            workspaceId: f.ctx.workspaceId,
+          },
+        });
+        expect(result).toMatchObject({
+          kind: "no_report",
+          stats: { indexEntriesConsidered: 2, indexEntriesOmitted: 2, filesRead: 0 },
+        });
+        expect(createModel).not.toHaveBeenCalled();
+        expect(resolveAgentBody).not.toHaveBeenCalled();
+        expect(reads).not.toHaveBeenCalled();
+      } finally {
+        unregister();
+      }
+    }
+  );
+
+  it("uses only post-hook descriptions and reapplies the index budget after expansion", async () => {
+    using f = await fixture();
+    const entries = Array.from({ length: 230 }, (_, i) => entry(`${i}.md`, "private metadata"));
+    const list = spyOn(f.memoryService, "listIndexEntries").mockResolvedValue(entries);
+    const reads = spyOn(f.memoryService, "readFileWithSha");
+    let probes = 0;
+    let prompt = "";
+    const createModel = mock(() =>
+      Promise.resolve(
+        pinned(
+          scriptedModel([[report([])]], (options) => {
+            for (const message of options.prompt)
+              if (message.role === "user")
+                for (const part of message.content) if (part.type === "text") prompt += part.text;
+          })
+        )
+      )
+    );
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      probes++;
+      await next();
+      ctx.result = { success: true, output: "permitted metadata ".repeat(400) };
+    });
+    try {
+      const result = await runMemoryIntuition({
+        ...f,
+        cue: "metadata",
+        modelString: "mock:test",
+        createModel,
+        resolveAgentBody: body,
+        hooks: {
+          runtime: new LocalRuntime(f.root),
+          cwd: f.root,
+          runtimeTempDir: f.root,
+          workspaceId: f.ctx.workspaceId,
+        },
+      });
+      expect(probes).toBe(MEMORY_INTUITION_MAX_INDEX_ENTRIES);
+      expect(reads).not.toHaveBeenCalled();
+      expect(prompt).not.toContain("private metadata");
+      const json = prompt.slice(prompt.indexOf("[{"));
+      const rows = JSON.parse(json) as Array<{ path: string; description: string }>;
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.length).toBeLessThan(MEMORY_INTUITION_MAX_INDEX_ENTRIES);
+      expect(Buffer.byteLength(json)).toBeLessThanOrEqual(MEMORY_INTUITION_MAX_INDEX_BYTES);
+      expect(rows.every((row) => row.description.startsWith("permitted metadata"))).toBe(true);
+      expect(result.stats.indexEntriesOmitted).toBe(entries.length - rows.length);
+    } finally {
+      unregister();
+      list.mockRestore();
+    }
+  });
+
+  it("bounds metadata probe concurrency and fails closed when the shared deadline expires", async () => {
+    using f = await fixture();
+    const list = spyOn(f.memoryService, "listIndexEntries").mockResolvedValue(
+      Array.from({ length: 20 }, (_, i) => entry(`${i}.md`))
+    );
+    const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+    const reads = spyOn(f.memoryService, "readFileWithSha");
+    let active = 0;
+    let total = 0;
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      total++;
+      active++;
+      if (active === 4) ready();
+      await blocked;
+      try {
+        await next();
+      } finally {
+        active--;
+        if (active === 0) finish();
+      }
+    });
+    const timer = spyOn(globalThis, "setTimeout");
+    const pending = runMemoryIntuition({
+      ...f,
+      cue: "metadata",
+      modelString: "mock:test",
+      createModel,
+      resolveAgentBody: body,
+      hooks: {
+        runtime: new LocalRuntime(f.root),
+        cwd: f.root,
+        runtimeTempDir: f.root,
+        workspaceId: f.ctx.workspaceId,
+      },
+    });
+    try {
+      await started;
+      expect(active).toBe(4);
+      const expire = timer.mock.calls.find(
+        ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+      )?.[0];
+      if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+      expire();
+      expect(await pending).toMatchObject({
+        kind: "no_report",
+        stats: { timedOut: true, filesRead: 0 },
+      });
+      expect(createModel).not.toHaveBeenCalled();
+      expect(reads).not.toHaveBeenCalled();
+      expect(total).toBe(4);
+    } finally {
+      release();
+      await finished;
+      timer.mockRestore();
+      unregister();
+      list.mockRestore();
+    }
+  });
+
   it("runs the narrow tool loop, caches reads, verifies reports, and records all-step nested usage", async () => {
     using f = await fixture({ "locks.md": "Use explicit locks." });
     const calls: LanguageModelV3CallOptions[] = [];
@@ -394,8 +638,13 @@ describe("runMemoryIntuition", () => {
       const audit: string[] = [];
       let uses = 0;
       const reads = spyOn(f.memoryService, "readFileWithSha");
+      let metadataProbes = 0;
       const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
         if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        if (calls.length === 0) {
+          metadataProbes++;
+          return next();
+        }
         audit.push("pre");
         const denied = ++uses > 1;
         if (denied && mode === "deny") {
@@ -447,6 +696,7 @@ describe("runMemoryIntuition", () => {
         );
         expect(reads).toHaveBeenCalledTimes(1);
         expect((await f.meta.getEntries()).size).toBe(0);
+        expect(metadataProbes).toBe(1);
       } finally {
         unregister();
       }
@@ -498,9 +748,15 @@ describe("runMemoryIntuition", () => {
   it("shares physical reads by rewritten authorized path while applying hooks to each request", async () => {
     using f = await fixture({ "a.md": "alpha", "b.md": "bravo", "c.md": "shared content" });
     const requests: unknown[] = [];
+    let modelStarted = false;
+    let metadataProbes = 0;
     const reads = spyOn(f.memoryService, "readFileWithSha");
     const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
       if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      if (!modelStarted) {
+        metadataProbes++;
+        return next();
+      }
       requests.push(ctx.args);
       ctx.args = { command: "view", path: entry("c.md").path };
       await next();
@@ -511,8 +767,12 @@ describe("runMemoryIntuition", () => {
         cue: "shared",
         modelString: "mock:test",
         resolveAgentBody: body,
-        createModel: () =>
-          Promise.resolve(pinned(scriptedModel([[read("a.md"), read("b.md")], [report([])]]))),
+        createModel: () => {
+          modelStarted = true;
+          return Promise.resolve(
+            pinned(scriptedModel([[read("a.md"), read("b.md")], [report([])]]))
+          );
+        },
         hooks: {
           runtime: new LocalRuntime(f.root),
           cwd: f.root,
@@ -520,6 +780,7 @@ describe("runMemoryIntuition", () => {
           workspaceId: f.ctx.workspaceId,
         },
       });
+      expect(metadataProbes).toBe(3);
       expect(requests).toHaveLength(2);
       expect(requests).toContainEqual({ command: "view", path: entry("a.md").path });
       expect(requests).toContainEqual({ command: "view", path: entry("b.md").path });
@@ -535,8 +796,13 @@ describe("runMemoryIntuition", () => {
       using f = await fixture({ "a.md": "alpha secret" });
       const calls: LanguageModelV3CallOptions[] = [];
       const large = "oversized-hook-output" + "x".repeat(MEMORY_INTUITION_MAX_READ_BYTES);
+      let metadataProbes = 0;
       const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
         if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        if (calls.length === 0) {
+          metadataProbes++;
+          return next();
+        }
         if (mode === "blocked-error") {
           ctx.blocked = { result: { error: large } };
           return;
@@ -570,6 +836,7 @@ describe("runMemoryIntuition", () => {
           { success: false, error: "Memory read budget exhausted" },
         ]);
         expect(JSON.stringify(calls[1].prompt)).not.toContain("oversized-hook-output");
+        expect(metadataProbes).toBe(1);
       } finally {
         unregister();
       }
@@ -610,7 +877,8 @@ describe("runMemoryIntuition", () => {
         kind: "report",
         memories: [item("a.md", 0.9, "alpha secret")],
       });
-      expect(audits).toBe(2);
+      // One metadata probe, one provider read, and one private report verification.
+      expect(audits).toBe(3);
     } finally {
       unregister();
     }
@@ -675,8 +943,13 @@ describe("runMemoryIntuition", () => {
       using f = await fixture({ "a.md": "alpha secret", "b.md": "hidden\nbravo\nhidden" });
       const reads = spyOn(f.memoryService, "readFileWithSha");
       const prompts: string[] = [];
+      let metadataProbes = 0;
       const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
         if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+        if (prompts.length === 0) {
+          metadataProbes++;
+          return next();
+        }
         expect(ctx.args).toMatchObject({ command: "view", path: entry("a.md").path });
         if (mode === "rewrite")
           ctx.args = { command: "view", path: entry("b.md").path, offset: 2, limit: 1 };
@@ -751,6 +1024,7 @@ describe("runMemoryIntuition", () => {
         expect(await fs.readFile(path.join(f.root, "memory/global/a.md"), "utf8")).toBe(
           "alpha secret"
         );
+        expect(metadataProbes).toBe(2);
       } finally {
         unregister();
       }

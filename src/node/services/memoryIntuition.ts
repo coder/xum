@@ -10,6 +10,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import assert from "@/common/utils/assert";
 import {
   MEMORY_INTUITION_CANDIDATE_THRESHOLD,
+  MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY,
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
   MEMORY_INTUITION_MAX_INDEX_BYTES,
@@ -200,6 +201,7 @@ function validateBudgets(): void {
     MEMORY_INTUITION_MAX_EXCERPT_CHARS,
     MEMORY_INTUITION_MAX_INDEX_BYTES,
     MEMORY_INTUITION_MAX_INDEX_ENTRIES,
+    MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY,
     MEMORY_INTUITION_MAX_OUTPUT_TOKENS,
     MEMORY_INTUITION_MAX_READ_BYTES,
     MEMORY_INTUITION_MAX_RESULTS,
@@ -228,6 +230,70 @@ function untilAborted<T>(signal: AbortSignal, work: () => PromiseLike<T>): Promi
       .then(resolve, reject)
       .finally(() => signal.removeEventListener("abort", onAbort));
   });
+}
+
+async function authorizeIntuitionIndex(
+  entries: readonly MemoryIndexEntry[],
+  hooks: HookConfig,
+  signal: AbortSignal
+): Promise<MemoryIndexEntry[]> {
+  const authorized = new Array<MemoryIndexEntry | undefined>(entries.length);
+  let cursor = 0;
+  await Promise.all(
+    Array.from(
+      { length: Math.min(entries.length, MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY) },
+      async () => {
+        while (!signal.aborted) {
+          const index = cursor++;
+          const entry = entries[index];
+          if (!entry) return;
+          let exactView = false;
+          try {
+            // Like mux.load's summary gate, disclose only the metadata being sent,
+            // not full files: index authorization must not consume the physical read budget.
+            const input: MemoryToolArgs = { command: "view", path: entry.path };
+            const outcome = await untilAborted(signal, () =>
+              runThroughToolHookPipeline({
+                toolName: "memory",
+                args: input,
+                config: hooks,
+                abortSignal: signal,
+                execute: (current): Promise<MemoryToolResult> => {
+                  const parsed = TOOL_DEFINITIONS.memory.schema.safeParse(current);
+                  if (
+                    signal.aborted ||
+                    !parsed.success ||
+                    parsed.data.command !== "view" ||
+                    parsed.data.path !== entry.path ||
+                    parsed.data.offset != null ||
+                    parsed.data.limit != null
+                  )
+                    return Promise.resolve({
+                      success: false,
+                      error: "Index authorization requires the original memory view",
+                    });
+                  exactView = true;
+                  return Promise.resolve({ success: true, output: entry.description });
+                },
+              })
+            );
+            const result = MemoryToolResultSchema.safeParse(outcome.result);
+            if (
+              !outcome.blocked &&
+              exactView &&
+              result.success &&
+              result.data.success &&
+              !signal.aborted
+            )
+              authorized[index] = { ...entry, description: result.data.output };
+          } catch {
+            // Missing, invalid, failed, or timed-out authorization never discloses the row.
+          }
+        }
+      }
+    )
+  );
+  return authorized.filter((entry): entry is MemoryIndexEntry => entry !== undefined);
 }
 
 /** Headless, read-only recall. The public tool records recalls only for recognized paths it returns. */
@@ -275,12 +341,22 @@ export async function runMemoryIntuition(args: {
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS)
       .replace(/<\/cue\s*>/gi, "&lt;/cue&gt;")
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS);
-    const selection = selectIndexForCue(
+    let selection = selectIndexForCue(
       await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx)),
       cue
     );
     stats.indexEntriesConsidered = selection.indexEntriesConsidered;
     stats.indexEntriesOmitted = selection.indexEntriesOmitted;
+    const hooks = args.hooks;
+    if (hooks && selection.entries.length > 0) {
+      stats.indexEntriesOmitted = stats.indexEntriesConsidered;
+      const authorized = await untilAborted(signal, () =>
+        authorizeIntuitionIndex(selection.entries, hooks, signal)
+      );
+      // Re-budget post-hook metadata; redaction/expansion can change both rank and byte size.
+      selection = selectIndexForCue(authorized, cue);
+      stats.indexEntriesOmitted = stats.indexEntriesConsidered - selection.entries.length;
+    }
     if (selection.entries.length === 0) return { kind: "no_report", stats };
     const { model, optionsModelString, optionsProvidersConfig } = await untilAborted(
       signal,
