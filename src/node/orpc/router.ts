@@ -108,8 +108,6 @@ import {
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
-import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
-import { collectDefinitionLayers } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import assert from "node:assert/strict";
@@ -1828,28 +1826,14 @@ export const router = (authToken?: string) => {
           const resolved = await Promise.all(
             descriptors.map(async (descriptor) => {
               try {
-                const skipScopesAbove = getSkipScopesAboveForKnownScope(descriptor.scope);
-                const [resolvedFrontmatter, agentDefinition] = await Promise.all([
-                  resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
-                    includeAgentPlugins,
-                    skipScopesAbove,
-                  }),
-                  readAgentDefinition(runtime, discoveryPath, descriptor.id, {
-                    includeAgentPlugins,
-                    skipScopesAbove,
-                  }),
-                ]);
-                const inheritanceChain = await resolveAgentInheritanceChain({
+                const resolvedFrontmatter = await resolveAgentFrontmatter(
                   runtime,
-                  workspacePath: discoveryPath,
-                  agentId: descriptor.id,
-                  agentDefinition,
-                  workspaceId: input.workspaceId ?? discoveryPath,
-                  includeAgentPlugins,
-                });
-                const { targetDefinitionAiDefaults, ancestors } = collectDefinitionLayers(
+                  discoveryPath,
                   descriptor.id,
-                  inheritanceChain
+                  {
+                    includeAgentPlugins,
+                    skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
+                  }
                 );
 
                 const effectivelyDisabled = isAgentEffectivelyDisabled({
@@ -1874,8 +1858,6 @@ export const router = (authToken?: string) => {
                   kind: "resolved" as const,
                   descriptor,
                   resolvedFrontmatter,
-                  targetDefinitionAiDefaults,
-                  ancestors,
                   uiSelectableBase,
                 };
               } catch {
@@ -1889,7 +1871,7 @@ export const router = (authToken?: string) => {
               return [];
             }
             if (entry.kind === "fallback") {
-              return [{ ...entry.descriptor, ownAiDefaults: entry.descriptor.aiDefaults }];
+              return [entry.descriptor];
             }
 
             return [
@@ -1902,8 +1884,6 @@ export const router = (authToken?: string) => {
                 subagentRunnable: entry.resolvedFrontmatter.subagent?.runnable ?? false,
                 base: entry.resolvedFrontmatter.base,
                 aiDefaults: entry.resolvedFrontmatter.ai,
-                ownAiDefaults: entry.targetDefinitionAiDefaults,
-                aiAncestors: entry.ancestors,
                 tools: entry.resolvedFrontmatter.tools,
               },
             ];
@@ -4709,7 +4689,7 @@ export const router = (authToken?: string) => {
           return context.workspaceService.updateAgentAISettings(
             input.workspaceId,
             input.agentId,
-            input.aiSettings ?? null,
+            input.aiSettings,
             { persistSelectedAgentId: input.persistSelectedAgentId === true }
           );
         }),

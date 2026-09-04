@@ -13,40 +13,18 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getModelKey,
   getProjectScopeId,
   getDisableWorkspaceAgentsKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import {
-  resolveWorkspaceAiSettingsForAgent,
-  type WorkspaceAISettingsCache,
-} from "@/browser/utils/workspaceModeAi";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import { getErrorMessage } from "@/common/utils/errors";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
-import {
-  clearPendingWorkspaceAgentId,
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAgentId,
-  markPendingWorkspaceAiSettings,
-  revertRejectedAgentSwitch,
-  updateWorkspaceAgentAISettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export interface AgentContextValue {
@@ -104,7 +82,6 @@ function AgentProviderWithState(props: {
 }) {
   const { api } = useAPI();
   const { workspaceMetadata } = useWorkspaceMetadata();
-  const workspaceStore = useWorkspaceStoreRaw();
   const currentMeta = props.workspaceId ? workspaceMetadata.get(props.workspaceId) : undefined;
 
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
@@ -143,168 +120,22 @@ function AgentProviderWithState(props: {
     }
   }, [disableWorkspaceAgents, setDisableWorkspaceAgents]);
 
-  // Child/subagent workspaces keep the backend-assigned agent; their selection
-  // is locked, so local changes must never be written back.
-  const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
-
-  const workspaceId = props.workspaceId;
-
-  // Declared before setAgentId: switches resolve the target agent's settings
-  // (base-chain aware) to persist them with the selection.
-  const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [loadFailed, setLoadFailed] = useState(false);
-
   const setAgentId: Dispatch<SetStateAction<string>> = useCallback(
     (value) => {
-      // usePersistedState runs the updater synchronously, so `next` is
-      // available right after the call.
-      let next: string | null = null;
-      let previous: string | null = null;
       setAgentIdRaw((prev) => {
         const explicitPrevAgentId =
           typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
-        previous = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
-        next = coerceAgentId(typeof value === "function" ? value(previous) : value);
-        return next;
+        const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
+        const next = typeof value === "function" ? value(previousAgentId) : value;
+        return coerceAgentId(next);
       });
-
-      // Persist workspace mode changes so the selection is remembered
-      // per-workspace across clients, not just in this client's localStorage.
-      if (
-        !api ||
-        !workspaceId ||
-        isCurrentAgentLocked ||
-        next == null ||
-        previous == null ||
-        next === previous
-      ) {
-        return;
-      }
-      const nextAgentId: string = next;
-      const previousAgentId: string = previous;
-
-      // Read the carried-over settings before WorkspaceModeAISync reacts to
-      // the optimistic switch; they seed the resolver as the previously
-      // active values.
-      const modelKey = getModelKey(workspaceId);
-      const thinkingKey = getThinkingLevelKey(workspaceId);
-      const reasoningKey = getReasoningModeKey(workspaceId);
-      const previousModel = readPersistedState<string>(modelKey, getDefaultModel());
-      const previousThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
-      const previousReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
-
-      // Resolve the switch's effective settings exactly as WorkspaceModeAISync
-      // will apply them locally, and persist them with the selection: an
-      // agent-only write leaves a fresh client with nothing to hydrate when
-      // the target agent has no bucket or configured default, diverging from
-      // the originating client's carried-over model until the next send.
-      const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
-      const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        {}
-      );
-      const resolvedSettings = resolveWorkspaceAiSettingsForAgent({
-        agentId: nextAgentId,
-        agentAiDefaults,
-        workspaceByAgent,
-        fallbackModel: getDefaultModel(),
-        existingModel: previousModel,
-        existingThinking: previousThinking,
-        existingReasoningMode: previousReasoning,
-        agents,
-        mode: "explicit-switch",
-      });
-      if (!resolvedSettings) {
-        setAgentIdRaw(previousAgentId);
-        return;
-      }
-      const { resolvedModel, resolvedThinking, resolvedReasoningMode } = resolvedSettings;
-
-      // The local update above is authoritative for this client and the write
-      // below is best-effort: every send carries the selection and re-persists
-      // it backend-side (maybePersistAISettingsFromOptions), so a transport
-      // failure self-heals on the next send instead of triggering a local
-      // rollback. A typed rejection cannot self-heal that way: the backend
-      // evaluated and refused this selection (e.g. the budgeted-goal pricing
-      // gate) and the same gate refuses sends before they re-persist settings,
-      // so a rejection restores the backend-authoritative (or pre-switch)
-      // selection instead (revertRejectedAgentSwitch).
-
-      // The picker closes on selection, so a rejected switch would otherwise
-      // be silent (e.g. budgeted-goal pricing gate).
-      const notifySwitchRejected = (message: string) => {
-        window.dispatchEvent(
-          createCustomEvent(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, {
-            workspaceId,
-            message:
-              message.trim().length > 0 ? message : `Failed to switch to the ${nextAgentId} agent.`,
-          })
-        );
-      };
-
-      const revertRejectedSwitch = () => {
-        revertRejectedAgentSwitch({
-          workspaceId,
-          rejectedAgentId: nextAgentId,
-          applied: {
-            model: resolvedModel,
-            thinkingLevel: resolvedThinking,
-            reasoningMode: resolvedReasoningMode,
-          },
-          previous: {
-            agentId: previousAgentId,
-            model: previousModel,
-            thinkingLevel: previousThinking,
-            reasoningMode: previousReasoning,
-          },
-          backendMetadata: workspaceStore.getWorkspaceMetadata(workspaceId),
-        });
-      };
-
-      const nextAiSettings = {
-        model: resolvedModel,
-        thinkingLevel: resolvedThinking,
-        ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
-      };
-      markPendingWorkspaceAgentId(workspaceId, nextAgentId);
-      markPendingWorkspaceAiSettings(workspaceId, nextAgentId, nextAiSettings);
-      updateWorkspaceAgentAISettings(api, {
-        workspaceId,
-        agentId: nextAgentId,
-        aiSettings: nextAiSettings,
-        persistSelectedAgentId: true,
-      })
-        .then((result) => {
-          if (!result.success) {
-            notifySwitchRejected(typeof result.error === "string" ? result.error : "");
-            revertRejectedSwitch();
-          }
-          // Release the guards on every settled write: no-op writes (backend
-          // already on these values) and failed writes emit no metadata echo,
-          // and stuck guards would block future backend seeds. For changed
-          // writes the echo is ordered after any stale broadcast, so releasing
-          // on the response cannot strand stale values.
-          clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
-          clearPendingWorkspaceAiSettings(workspaceId, nextAgentId);
-        })
-        .catch((error) => {
-          notifySwitchRejected(getErrorMessage(error));
-          clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
-          clearPendingWorkspaceAiSettings(workspaceId, nextAgentId);
-        });
     },
-    [
-      agents,
-      api,
-      globalDefaultAgentId,
-      isCurrentAgentLocked,
-      isProjectScope,
-      setAgentIdRaw,
-      workspaceId,
-      workspaceStore,
-    ]
+    [globalDefaultAgentId, isProjectScope, setAgentIdRaw]
   );
+
+  const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const isMountedRef = useRef(true);
 
@@ -399,8 +230,11 @@ function AgentProviderWithState(props: {
     }
   }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
 
-  // Project-scoped providers inherit the global default agent until a
-  // project-scoped preference is explicitly set.
+  // Project-scoped providers should inherit the global default agent until a
+  // project-scoped preference is explicitly set. Child/subagent workspaces keep
+  // the backend-assigned agent so local persisted overrides cannot drift.
+  const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
+
   // For locked workspaces, use the backend-assigned agent — persisted localStorage
   // may contain a stale selection from before locking, and the picker is disabled
   // so there's no in-UI recovery path.

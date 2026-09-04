@@ -65,10 +65,7 @@ export async function resolveAcpAgentAiSettings(
 
   const agentDef = agents.find((agent) => agent.id === trimmedAgentId);
   const agentDefsById = new Map<string, AgentAncestorDescriptor>(
-    agents.map((agent) => [
-      agent.id,
-      { base: agent.base, definitionAiDefaults: agent.ownAiDefaults },
-    ])
+    agents.map((agent) => [agent.id, { base: agent.base, definitionAiDefaults: agent.aiDefaults }])
   );
 
   return resolveAgentAiSettingsShared({
@@ -77,7 +74,7 @@ export async function resolveAcpAgentAiSettings(
     explicit: extras?.explicit,
     targetWorkspaceSettings: extras?.targetWorkspaceSettings,
     agentAiDefaults: config.agentAiDefaults,
-    targetDefinitionAiDefaults: agentDef?.ownAiDefaults,
+    targetDefinitionAiDefaults: agentDef?.aiDefaults,
     ancestors: collectDeclaredAncestorLayers(trimmedAgentId, agentDefsById),
     parentRuntime: extras?.parentRuntime,
   });

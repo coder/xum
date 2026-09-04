@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import type { AgentAncestorDescriptor } from "@/common/utils/ai/agentAncestorLayers";
-import {
-  getCreationWorkspaceAiSyncState,
-  resolveWorkspaceAiSettingsForAgent,
-} from "./workspaceModeAi";
+import { resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -44,7 +40,7 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses workspace-by-agent fallback when explicitly enabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "high" } },
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
@@ -61,155 +57,14 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     });
   });
 
-  test("a saved workspace bucket beats configured defaults on explicit switches", () => {
+  test("ignores workspace-by-agent fallback when disabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {
-        exec: { modelString: "openai:configured-default", thinkingLevel: "medium" },
-      },
-      workspaceByAgent: {
-        exec: { model: "anthropic:workspace-bucket", thinkingLevel: "high" },
-      },
-      useWorkspaceByAgentFallback: true,
-      fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "anthropic:claude-opus-4-6",
-      existingThinking: "off",
-    });
-
-    // Matches backend dispatch/ACP layering: the workspace's own bucket
-    // precedes configured defaults, so switching away and back cannot
-    // overwrite the workspace's last-used settings with a global default.
-    expect(result.resolvedModel).toBe("anthropic:workspace-bucket");
-    expect(result.resolvedThinking).toBe("high");
-  });
-
-  test("uses target definition defaults before carried-over settings", () => {
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "researcher",
-      agentAiDefaults: {},
-      fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "anthropic:claude-opus-4-6",
-      existingThinking: "off",
-      agentDescriptorById: new Map<string, AgentAncestorDescriptor>([
-        [
-          "researcher",
-          {
-            base: "exec",
-            definitionAiDefaults: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
-          },
-        ],
-      ]),
-    });
-
-    expect(result.resolvedModel).toBe("openai:gpt-5.6-sol");
-    expect(result.resolvedThinking).toBe("high");
-  });
-
-  test("a saved workspace bucket beats target definition defaults", () => {
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "researcher",
-      agentAiDefaults: {},
-      workspaceByAgent: {
-        researcher: { model: "anthropic:claude-opus-4-6", thinkingLevel: "medium" },
-      },
-      useWorkspaceByAgentFallback: true,
-      fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "openai:gpt-5.3-codex",
-      existingThinking: "off",
-      agentDescriptorById: new Map<string, AgentAncestorDescriptor>([
-        [
-          "researcher",
-          {
-            base: "exec",
-            definitionAiDefaults: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
-          },
-        ],
-      ]),
-    });
-
-    expect(result.resolvedModel).toBe("anthropic:claude-opus-4-6");
-    expect(result.resolvedThinking).toBe("medium");
-  });
-
-  test("configured overrides beat target definition defaults", () => {
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "researcher",
-      agentAiDefaults: {
-        researcher: { modelString: "anthropic:claude-opus-4-6", thinkingLevel: "medium" },
-      },
-      fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "openai:gpt-5.3-codex",
-      existingThinking: "off",
-      agentDescriptorById: new Map<string, AgentAncestorDescriptor>([
-        [
-          "researcher",
-          {
-            base: "exec",
-            definitionAiDefaults: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
-          },
-        ],
-      ]),
-    });
-
-    expect(result.resolvedModel).toBe("anthropic:claude-opus-4-6");
-    expect(result.resolvedThinking).toBe("medium");
-  });
-
-  test("inherits missing definition fields from the declared ancestor chain", () => {
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "researcher",
-      agentAiDefaults: {},
-      fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "anthropic:claude-opus-4-6",
-      existingThinking: "off",
-      agentDescriptorById: new Map<string, AgentAncestorDescriptor>([
-        ["researcher", { base: "analysis", definitionAiDefaults: { model: "openai:gpt-5.6-sol" } }],
-        ["analysis", { base: "exec", definitionAiDefaults: { thinkingLevel: "high" } }],
-      ]),
-    });
-
-    expect(result.resolvedModel).toBe("openai:gpt-5.6-sol");
-    expect(result.resolvedThinking).toBe("high");
-  });
-
-  test("uses embedded defaults from a non-selectable declared ancestor", () => {
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "researcher",
-      agentAiDefaults: {},
-      fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "anthropic:claude-opus-4-6",
-      existingThinking: "off",
-      agents: [
-        {
-          id: "researcher",
-          base: "analysis",
-          aiAncestors: [
-            {
-              agentId: "analysis",
-              definitionAiDefaults: {
-                model: "openai:gpt-5.6-sol",
-                thinkingLevel: "high",
-              },
-            },
-            { agentId: "exec" },
-          ],
-        },
-      ],
-      mode: "explicit-switch",
-    });
-
-    expect(result?.resolvedModel).toBe("openai:gpt-5.6-sol");
-    expect(result?.resolvedThinking).toBe("high");
-  });
-
-  test("ignores workspace buckets during creation sync", () => {
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "high" } },
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
-      mode: "creation-sync",
+      useWorkspaceByAgentFallback: false,
       fallbackModel: "openai:gpt-5.2-mini",
       existingModel: "anthropic:claude-opus-4-6",
       existingThinking: "off",
@@ -424,31 +279,21 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     expect(result.resolvedReasoningMode).toBe("pro");
   });
 
-  test("a hydrated bucket owns background sync over configured defaults", () => {
+  test("inherits the workspace's current pro mode during background sync", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {
-        exec: {
-          modelString: "anthropic:claude-haiku-4-5",
-          thinkingLevel: "off",
-          reasoningMode: "pro",
-        },
-      },
+      agentAiDefaults: {},
       workspaceByAgent: {
-        exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "medium" },
+        exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "medium", reasoningMode: "standard" },
       },
       useWorkspaceByAgentFallback: false,
       fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "anthropic:claude-haiku-4-5",
+      existingModel: "openai:gpt-5.6-sol",
       existingThinking: "off",
       existingReasoningMode: "pro",
     });
 
-    expect(result).toEqual({
-      resolvedModel: "openai:gpt-5.6-sol",
-      resolvedThinking: "medium",
-      resolvedReasoningMode: "standard",
-    });
+    expect(result.resolvedReasoningMode).toBe("pro");
   });
 
   test("defaults legacy per-agent entries without reasoningMode to standard on explicit switches", () => {
@@ -521,45 +366,6 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     expect(result).toEqual({
       resolvedModel: "openai:gpt-5.2",
       resolvedThinking: "off",
-      resolvedReasoningMode: "standard",
-    });
-  });
-
-  test("preserves a creation model chosen before descriptors arrive", () => {
-    const initial = getCreationWorkspaceAiSyncState({
-      previousAgentId: null,
-      previousScopeId: null,
-      agentId: "exec",
-      scopeId: "project:/repo",
-    });
-    const descriptorArrival = getCreationWorkspaceAiSyncState({
-      previousAgentId: "exec",
-      previousScopeId: "project:/repo",
-      agentId: "exec",
-      scopeId: "project:/repo",
-    });
-
-    expect(initial.mode).toBe("creation-sync");
-    expect(descriptorArrival.mode).toBe("background-sync");
-
-    const result = resolveWorkspaceAiSettingsForAgent({
-      agentId: "exec",
-      agentAiDefaults: {},
-      fallbackModel: "openai:gpt-5.2",
-      existingModel: "anthropic:claude-opus-4-6",
-      existingThinking: "high",
-      agents: [
-        {
-          id: "exec",
-          ownAiDefaults: { model: "openai:gpt-5.3-codex", thinkingLevel: "off" },
-        },
-      ],
-      mode: descriptorArrival.mode,
-    });
-
-    expect(result).toEqual({
-      resolvedModel: "anthropic:claude-opus-4-6",
-      resolvedThinking: "high",
       resolvedReasoningMode: "standard",
     });
   });

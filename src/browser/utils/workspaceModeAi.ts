@@ -1,7 +1,5 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { isBuiltInSelectableAgentId } from "@/browser/utils/agents";
-import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import { targetWorkspaceBucketToLayer, type AiSettingSource } from "@/common/types/agentAiSettings";
+import type { AiSettingSource } from "@/common/types/agentAiSettings";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -9,10 +7,7 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
-import {
-  collectDeclaredAncestorLayers,
-  type AgentAncestorDescriptor,
-} from "@/common/utils/ai/agentAncestorLayers";
+import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 
 export type WorkspaceAISettingsCache = Partial<
@@ -63,156 +58,84 @@ export function resolveConfiguredAiDefaults(
   };
 }
 
-type WorkspaceAiResolutionMode = "explicit-switch" | "background-sync" | "creation-sync";
-
-type WorkspaceAgentDescriptor = Pick<
-  AgentDefinitionDescriptor,
-  "id" | "base" | "ownAiDefaults" | "aiAncestors"
->;
-
-interface WorkspaceAiResolutionArgs {
+// Keep agent -> model/thinking precedence in one place so mode switches that send immediately
+// (like propose_plan Implement / Continue in Auto) resolve the same settings as sync effects.
+export function resolveWorkspaceAiSettingsForAgent(args: {
   agentId: string;
   agentAiDefaults: AgentAiDefaults;
   workspaceByAgent?: WorkspaceAISettingsCache;
+  useWorkspaceByAgentFallback?: boolean;
   fallbackModel: string;
   existingModel: string;
   existingThinking: ThinkingLevel;
   existingReasoningMode?: OpenAIReasoningMode;
-  agents?: readonly WorkspaceAgentDescriptor[];
-  /** Compatibility inputs for pure resolver tests and non-UI adapters. */
-  useWorkspaceByAgentFallback?: boolean;
+  /** Agent id -> base id, for base-chain reasoning-mode inheritance (custom agents). */
   agentBaseById?: ReadonlyMap<string, string | undefined>;
-  agentDescriptorById?: ReadonlyMap<string, AgentAncestorDescriptor>;
-  mode?: WorkspaceAiResolutionMode;
-}
-
-interface ResolvedWorkspaceAiSettings {
+}): {
   resolvedModel: string;
   resolvedThinking: ThinkingLevel;
   resolvedReasoningMode: OpenAIReasoningMode;
-}
-
-function buildAgentDescriptorLookup(
-  args: WorkspaceAiResolutionArgs,
-  includeDefinitionDefaults: boolean
-): Map<string, AgentAncestorDescriptor> {
-  const descriptors = new Map<string, AgentAncestorDescriptor>();
-  for (const agent of args.agents ?? []) {
-    descriptors.set(agent.id, {
-      base: agent.base,
-      ...(includeDefinitionDefaults && agent.ownAiDefaults
-        ? { definitionAiDefaults: agent.ownAiDefaults }
-        : {}),
-    });
-  }
-  for (const [id, descriptor] of args.agentDescriptorById ?? []) {
-    descriptors.set(id, {
-      base: descriptor.base,
-      ...(includeDefinitionDefaults && descriptor.definitionAiDefaults
-        ? { definitionAiDefaults: descriptor.definitionAiDefaults }
-        : {}),
-    });
-  }
-  for (const [id, base] of args.agentBaseById ?? []) {
-    descriptors.set(id, { ...descriptors.get(id), base });
-  }
-  return descriptors;
-}
-
-export function hasWorkspaceAiTargetDescriptor(
-  agentId: string,
-  agents: readonly WorkspaceAgentDescriptor[]
-): boolean {
-  const normalizedAgentId = normalizeAgentId(agentId);
-  return agents.some((agent) => normalizeAgentId(agent.id) === normalizedAgentId);
-}
-
-interface CreationWorkspaceAiSyncState {
-  isExplicitAgentSwitch: boolean;
-  mode: "creation-sync" | "background-sync";
-}
-
-export function getCreationWorkspaceAiSyncState(args: {
-  previousAgentId: string | null;
-  previousScopeId: string | null;
-  agentId: string;
-  scopeId: string;
-}): CreationWorkspaceAiSyncState {
-  const hasPriorSelection = args.previousAgentId !== null && args.previousScopeId === args.scopeId;
-  const isExplicitAgentSwitch = hasPriorSelection && args.previousAgentId !== args.agentId;
-
-  return {
-    isExplicitAgentSwitch,
-    // Definition defaults seed the initial selection and explicit switches only.
-    // Later descriptor arrival must preserve any model the user already selected.
-    mode: !hasPriorSelection || isExplicitAgentSwitch ? "creation-sync" : "background-sync",
-  };
-}
-
-// Keep agent -> model/thinking precedence in one place so explicit switches,
-// background sync, and workspace creation agree on descriptor availability.
-export function resolveWorkspaceAiSettingsForAgent(
-  args: WorkspaceAiResolutionArgs & { mode: "explicit-switch" }
-): ResolvedWorkspaceAiSettings | null;
-export function resolveWorkspaceAiSettingsForAgent(
-  args: WorkspaceAiResolutionArgs & { mode?: "background-sync" | "creation-sync" }
-): ResolvedWorkspaceAiSettings;
-export function resolveWorkspaceAiSettingsForAgent(
-  args: WorkspaceAiResolutionArgs
-): ResolvedWorkspaceAiSettings;
-export function resolveWorkspaceAiSettingsForAgent(
-  args: WorkspaceAiResolutionArgs
-): ResolvedWorkspaceAiSettings | null {
+} {
   const normalizedAgentId = normalizeAgentId(args.agentId);
-  const mode =
-    args.mode ??
-    (args.useWorkspaceByAgentFallback === true
-      ? "explicit-switch"
-      : args.useWorkspaceByAgentFallback === false
-        ? "background-sync"
-        : "creation-sync");
-  if (
-    mode === "explicit-switch" &&
-    args.agents != null &&
-    !hasWorkspaceAiTargetDescriptor(normalizedAgentId, args.agents) &&
-    !isBuiltInSelectableAgentId(normalizedAgentId)
-  ) {
-    return null;
-  }
-
   const workspaceOverride = args.workspaceByAgent?.[normalizedAgentId];
-  const includeDefinitionDefaults = mode !== "background-sync";
-  const descriptorsById = buildAgentDescriptorLookup(args, includeDefinitionDefaults);
-  const targetDescriptor = args.agents?.find(
-    (agent) => normalizeAgentId(agent.id) === normalizedAgentId
+
+  // Field-wise across the agent's own entry then its base chain: an agent
+  // inheriting GPT-5.6 + pro from its base must resolve both together even
+  // when the active workspace runs a different provider's model.
+  const configuredDefaults = resolveConfiguredAiDefaults(
+    normalizedAgentId,
+    args.agentAiDefaults,
+    args.agentBaseById
   );
-  const ancestors =
-    includeDefinitionDefaults && targetDescriptor?.aiAncestors
-      ? targetDescriptor.aiAncestors
-      : collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById);
-  const resolved = resolveAgentAiSettings({
-    targetAgentId: normalizedAgentId,
-    profile: "interactive",
-    targetWorkspaceSettings:
-      mode !== "creation-sync" && workspaceOverride != null
-        ? targetWorkspaceBucketToLayer(workspaceOverride)
-        : undefined,
-    agentAiDefaults: args.agentAiDefaults,
-    targetDefinitionAiDefaults: descriptorsById.get(normalizedAgentId)?.definitionAiDefaults,
-    ancestors,
-    parentRuntime: {
-      model: typeof args.existingModel === "string" ? args.existingModel : undefined,
-      thinkingLevel: coerceThinkingLevel(args.existingThinking),
-      reasoningMode: coerceOpenAIReasoningMode(args.existingReasoningMode),
-    },
-    defaultModel: args.fallbackModel,
-  });
+  const configuredModel = workspaceOverride ? undefined : configuredDefaults.modelString;
+  const workspaceOverrideModel =
+    args.useWorkspaceByAgentFallback && typeof workspaceOverride?.model === "string"
+      ? workspaceOverride.model
+      : undefined;
+  const inheritedModelCandidate =
+    workspaceOverrideModel ??
+    (typeof args.existingModel === "string" ? args.existingModel : undefined) ??
+    "";
+  const inheritedModel = inheritedModelCandidate.trim();
+  const resolvedModel =
+    configuredModel && configuredModel.length > 0
+      ? configuredModel
+      : inheritedModel.length > 0
+        ? inheritedModel
+        : args.fallbackModel;
 
-  const resolvedReasoningMode = resolved.selected.reasoningMode ?? "standard";
+  // Persisted workspace settings can be stale/corrupt; re-validate inherited values
+  // so mode sync keeps self-healing behavior instead of propagating invalid options.
+  const workspaceOverrideThinking = args.useWorkspaceByAgentFallback
+    ? coerceThinkingLevel(workspaceOverride?.thinkingLevel)
+    : undefined;
+  const inheritedThinking = workspaceOverrideThinking ?? coerceThinkingLevel(args.existingThinking);
+  const resolvedThinking =
+    (workspaceOverride ? undefined : configuredDefaults.thinkingLevel) ??
+    inheritedThinking ??
+    "off";
 
-  return {
-    resolvedModel: resolved.selected.model,
-    resolvedThinking: resolved.selected.thinkingLevel,
-    resolvedReasoningMode,
-  };
+  // An existing per-agent bucket owns the reasoning choice outright (matching
+  // targetWorkspaceBucketToLayer): a configured Pro default must not re-inject
+  // itself over a workspace deliberately toggled to Standard (every composer
+  // change rewrites the bucket, so its presence marks a workspace-level pick).
+  // Explicit switches restore the bucket's saved mode; background sync trusts
+  // the live workspace mode, which hydration seeds from the backend bucket.
+  // Absent reasoningMode on an existing entry (legacy entry saved before pro
+  // mode shipped) means "standard", matching the WorkspaceContext seeding
+  // semantics, instead of inheriting a possibly-pro workspace mode from the
+  // previously active agent.
+  // Without a bucket entry, configured defaults (and the base chain) apply,
+  // matching ACP resolution and the Settings card display, else the
+  // workspace's current mode carries over.
+  const resolvedReasoningMode =
+    workspaceOverride != null
+      ? args.useWorkspaceByAgentFallback
+        ? (coerceOpenAIReasoningMode(workspaceOverride.reasoningMode) ?? "standard")
+        : (coerceOpenAIReasoningMode(args.existingReasoningMode) ?? "standard")
+      : (configuredDefaults.reasoningMode ??
+        coerceOpenAIReasoningMode(args.existingReasoningMode) ??
+        "standard");
+
+  return { resolvedModel, resolvedThinking, resolvedReasoningMode };
 }

@@ -74,7 +74,6 @@ import {
   getStagedAttachments,
 } from "@/browser/features/ChatInput/stagedAttachments";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { sendWorkspaceMessage } from "@/browser/utils/workspaceAiSettingsSync";
 
 // ============================================================================
 // Workspace Creation
@@ -153,13 +152,15 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const sendMessageOptions = options.sendMessageOptions;
   if (startMessage && sendMessageOptions) {
     requestAnimationFrame(() => {
-      sendWorkspaceMessage(client, {
-        workspaceId: result.metadata.id,
-        message: startMessage,
-        options: sendMessageOptions,
-      }).catch(() => {
-        // Best-effort: the user can send the message manually if this fails.
-      });
+      client.workspace
+        .sendMessage({
+          workspaceId: result.metadata.id,
+          message: startMessage,
+          options: sendMessageOptions,
+        })
+        .catch(() => {
+          // Best-effort: the user can send the message manually if this fails.
+        });
     });
   }
 
@@ -530,7 +531,7 @@ export async function processSlashCommand(
       // Keep workflow outputs model-visible but UI-hidden: rawCommand drives transcript display,
       // while the XML block below gives the main agent the completed workflow result.
       setWorkflowSendingState(true);
-      const sendResult = await sendWorkspaceMessage(activeClient, {
+      const sendResult = await activeClient.workspace.sendMessage({
         workspaceId,
         message: workflowResultMessage,
         options: {
@@ -1545,13 +1546,15 @@ export async function createNewWorkspace(
   const client = options.client;
   if (startMessage && sendMessageOptions) {
     requestAnimationFrame(() => {
-      sendWorkspaceMessage(client, {
-        workspaceId: result.metadata.id,
-        message: startMessage,
-        options: sendMessageOptions,
-      }).catch(() => {
-        // Best-effort: the user can send the message manually if this fails.
-      });
+      client.workspace
+        .sendMessage({
+          workspaceId: result.metadata.id,
+          message: startMessage,
+          options: sendMessageOptions,
+        })
+        .catch(() => {
+          // Best-effort: the user can send the message manually if this fails.
+        });
     });
   }
 
@@ -1681,7 +1684,7 @@ export async function executeCompaction(
 ): Promise<CompactionResult> {
   const { messageText, metadata, sendOptions } = prepareCompactionMessage(options);
 
-  const result = await sendWorkspaceMessage(options.api, {
+  const result = await options.api.workspace.sendMessage({
     workspaceId: options.workspaceId,
     message: messageText,
     options: {

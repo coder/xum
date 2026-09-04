@@ -14,7 +14,6 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { shouldApplyWorkspaceAgentIdFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
@@ -60,33 +59,11 @@ interface MockApi {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
     }) => Promise<ResultVoid>;
-    sendMessage: (
-      args: SendMessageArgs
-    ) => Promise<
-      { success: true; data: Record<string, never> } | { success: false; error: string }
-    >;
-    updateAgentAISettings: (args: {
-      workspaceId: string;
-      agentId: string;
-      aiSettings: { model: string; thinkingLevel: string; reasoningMode?: string } | null;
-      persistSelectedAgentId?: boolean;
-    }) => Promise<{ success: boolean; error?: string }>;
+    sendMessage: (args: SendMessageArgs) => Promise<{ success: true; data: undefined }>;
   };
 }
 
-let updateAgentAISettingsCalls: Array<{
-  workspaceId: string;
-  agentId: string;
-  aiSettings: { model: string; thinkingLevel: string; reasoningMode?: string } | null;
-  persistSelectedAgentId?: boolean;
-}> = [];
-
 let mockApi: MockApi | null = null;
-// Workspace metadata visible to the component (useOptionalWorkspaceContext mock).
-let mockWorkspaceMetadataByWorkspace = new Map<
-  string,
-  { runtimeConfig?: unknown; agentId?: string; agentType?: string }
->();
 
 let startHereCalls: Array<{
   workspaceId: string | undefined;
@@ -140,10 +117,7 @@ async function installProposePlanModuleMocks() {
   await mock.module("@/browser/contexts/WorkspaceContext", () => ({
     ...actualWorkspaceContextModule,
     useWorkspaceContext: () => ({
-      workspaceMetadata: mockWorkspaceMetadataByWorkspace,
-    }),
-    useOptionalWorkspaceContext: () => ({
-      workspaceMetadata: mockWorkspaceMetadataByWorkspace,
+      workspaceMetadata: new Map<string, { runtimeConfig?: unknown }>(),
     }),
   }));
   await mock.module("@/browser/hooks/useReviews", () => ({
@@ -229,34 +203,27 @@ function createTestAgent(
     uiSelectable: true,
     subagentRunnable: true,
     aiDefaults: { model, thinkingLevel },
-    ownAiDefaults: { model, thinkingLevel },
   };
 }
 
 const TEST_AGENTS = [
   createTestAgent("exec", "Exec", "openai:gpt-5.2", "low"),
   createTestAgent("plan", "Plan", "anthropic:claude-sonnet-4-5", "high"),
-  createTestAgent("auto", "Auto", "openai:gpt-5.6-sol", "medium"),
 ];
 
 const noop = () => {
   // intentional noop for tests
 };
 
-function renderToolCall(
-  content: JSX.Element,
-  agentId = "plan",
-  agents: AgentDefinitionDescriptor[] = TEST_AGENTS,
-  loaded = true
-) {
+function renderToolCall(content: JSX.Element, agentId = "plan") {
   return render(
     <AgentProvider
       value={{
         agentId,
         setAgentId: noop,
-        currentAgent: agents.find((entry) => entry.id === agentId),
-        agents,
-        loaded,
+        currentAgent: TEST_AGENTS.find((entry) => entry.id === agentId),
+        agents: TEST_AGENTS,
+        loaded: true,
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
@@ -277,7 +244,6 @@ function createMockApi(
     getPlanContent?: MockApi["workspace"]["getPlanContent"];
     replaceChatHistory?: MockApi["workspace"]["replaceChatHistory"];
     sendMessage?: MockApi["workspace"]["sendMessage"];
-    updateAgentAISettings?: MockApi["workspace"]["updateAgentAISettings"];
   } = {}
 ): MockApi {
   return {
@@ -292,13 +258,8 @@ function createMockApi(
           })),
       replaceChatHistory:
         overrides.replaceChatHistory ?? (() => Promise.resolve({ success: true, data: undefined })),
-      sendMessage: overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: {} })),
-      updateAgentAISettings: (args) => {
-        updateAgentAISettingsCalls.push(args);
-        return overrides.updateAgentAISettings
-          ? overrides.updateAgentAISettings(args)
-          : Promise.resolve({ success: true });
-      },
+      sendMessage:
+        overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: undefined })),
     },
   };
 }
@@ -328,7 +289,7 @@ function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLev
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
   return (args) => {
     calls.push(args);
-    return Promise.resolve({ success: true, data: {} });
+    return Promise.resolve({ success: true, data: undefined });
   };
 }
 
@@ -352,9 +313,7 @@ describe("ProposePlanToolCall", () => {
   beforeEach(async () => {
     startHereCalls = [];
     selectableDiffRendererCalls = [];
-    updateAgentAISettingsCalls = [];
     mockApi = null;
-    mockWorkspaceMetadataByWorkspace = new Map();
     cleanupDom = installDom();
     await installProposePlanModuleMocks();
   });
@@ -518,33 +477,6 @@ describe("ProposePlanToolCall", () => {
     expect(view.getAllByRole("button", { name: "Annotate" }).length).toBe(2);
   });
 
-  test("disables Implement until the exec descriptor is available", async () => {
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    const sendMessageCalls: SendMessageArgs[] = [];
-    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
-
-    const view = renderToolCall(
-      <ProposePlanToolCall
-        args={{}}
-        workspaceId={WORKSPACE_ID}
-        status="completed"
-        result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
-        isLatest
-      />,
-      "plan",
-      [],
-      false
-    );
-
-    const implement = view.getByRole("button", { name: "Implement" });
-    expect(implement.hasAttribute("disabled")).toBe(true);
-    fireEvent.click(implement);
-    await Promise.resolve();
-
-    expect(sendMessageCalls).toHaveLength(0);
-    expect(updateAgentAISettingsCalls).toHaveLength(0);
-  });
-
   test("switches to exec and sends a message when clicking Implement", async () => {
     const execModel = "openai:gpt-5.2";
     const execThinking = "low";
@@ -586,127 +518,6 @@ describe("ProposePlanToolCall", () => {
       expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
-
-    // The send itself carries and persists the switch backend-side; the
-    // component must not issue a separate settings write that could clobber
-    // a newer selection.
-    expect(updateAgentAISettingsCalls).toHaveLength(0);
-    // Guard released after the send settles so backend agent updates apply.
-    await waitFor(() =>
-      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
-    );
-  });
-
-  test("uses exec definition defaults for Implement without saved overrides", async () => {
-    const execModel = "openai:gpt-5.2";
-    const execThinking = "low";
-
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
-
-    const sendMessageCalls: SendMessageArgs[] = [];
-    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
-
-    const view = renderCompletedPlan();
-    fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
-    expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
-    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
-    expect(sendMessageCalls[0]?.options.thinkingLevel).toBe(execThinking);
-  });
-
-  test("typed rejection reverts the optimistic Implement switch", async () => {
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-
-    const sendMessageCalls: SendMessageArgs[] = [];
-    mockApi = createMockApi({
-      sendMessage: (args) => {
-        sendMessageCalls.push(args);
-        return Promise.resolve({ success: false as const, error: "send rejected" });
-      },
-    });
-
-    const view = renderCompletedPlan();
-
-    fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
-
-    // A typed rejection cannot self-heal: the same gate refuses the next send
-    // before it can re-persist the switch, so the optimistic switch reverts
-    // to the pre-click selection.
-    await waitFor(() =>
-      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
-    );
-    expect(JSON.parse(window.localStorage.getItem(getModelKey(WORKSPACE_ID))!)).toBe(
-      "anthropic:claude-sonnet-4-5"
-    );
-    expect(JSON.parse(window.localStorage.getItem(getThinkingLevelKey(WORKSPACE_ID))!)).toBe(
-      "high"
-    );
-    // The guard must be released: a differing backend agent update has to
-    // apply again instead of being rejected forever (probing with a
-    // non-matching agent does not mutate).
-    await waitFor(() =>
-      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
-    );
-    // No compensating backend write.
-    expect(updateAgentAISettingsCalls).toHaveLength(0);
-  });
-
-  test("rejected Implement restores the backend agent over a pending picker agent", async () => {
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    // Backend still stores plan; a rejected-in-flight picker switch left the
-    // local selection on "review" — the captured pre-action agent is NOT what
-    // the backend stores.
-    mockWorkspaceMetadataByWorkspace.set(WORKSPACE_ID, { agentId: "plan" });
-    window.localStorage.setItem(getAgentIdKey(WORKSPACE_ID), JSON.stringify("review"));
-
-    const sendMessageCalls: SendMessageArgs[] = [];
-    mockApi = createMockApi({
-      sendMessage: (args) => {
-        sendMessageCalls.push(args);
-        return Promise.resolve({ success: false as const, error: "send rejected" });
-      },
-    });
-
-    const view = renderCompletedPlan();
-
-    fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
-
-    // The revert lands on the backend-authoritative agent, not the captured
-    // optimistic "review" selection the backend never accepted.
-    await waitFor(() =>
-      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
-    );
-  });
-
-  test("transport-failed Implement send keeps the optimistic switch", async () => {
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-
-    const sendMessageCalls: SendMessageArgs[] = [];
-    mockApi = createMockApi({
-      sendMessage: (args) => {
-        sendMessageCalls.push(args);
-        return Promise.reject(new Error("network down"));
-      },
-    });
-
-    const view = renderCompletedPlan();
-
-    fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
-    await waitFor(() =>
-      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
-    );
-    // Transport failures self-heal (the next successful send re-persists the
-    // selection), so the switch stays.
-    expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("exec");
-    expect(updateAgentAISettingsCalls).toHaveLength(0);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {
@@ -757,7 +568,7 @@ describe("ProposePlanToolCall", () => {
       sendMessage: (args) => {
         calls.push("sendMessage");
         sendMessageCalls.push(args);
-        return Promise.resolve({ success: true, data: {} });
+        return Promise.resolve({ success: true, data: undefined });
       },
     });
 

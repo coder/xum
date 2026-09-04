@@ -16,16 +16,11 @@ import {
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
   getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { RecursivePartial } from "@/browser/testUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  clearPendingWorkspaceAgentId,
-  markPendingWorkspaceAgentId,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -525,165 +520,32 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
-  test("backend agentId seeds a main workspace agent selection", async () => {
+  test.each(["unchanged", "mode", "model"])("hydrates saved selections: %s", async (change) => {
+    const changed = change !== "unchanged";
+    const nextAgentId = change === "mode" ? "auto" : "plan";
     const workspaceId = "ws-agent-main";
-
-    createMockAPI({
-      workspace: {
-        list: () =>
-          Promise.resolve([createWorkspaceMetadata({ id: workspaceId, agentId: "plan" })]),
-      },
-      localStorage: {
-        // Backend value wins over a stale local selection from another client.
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
-      },
+    const saved = createWorkspaceMetadata({
+      id: workspaceId,
+      agentId: "plan",
+      aiSettingsByAgent: { plan: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
     });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "plan"
-    );
-  });
-
-  test("does not hydrate another agent's settings when the active agent has no bucket", async () => {
-    const workspaceId = "ws-agent-no-bucket";
-
-    createMockAPI({
-      workspace: {
-        list: () =>
-          Promise.resolve([
-            createWorkspaceMetadata({
-              id: workspaceId,
-              agentId: "custom",
-              aiSettingsByAgent: {
-                exec: { model: "openai:gpt-5.2", thinkingLevel: "low" },
-              },
-            }),
-          ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("custom"),
-        // Locally resolved settings for the bucket-less active agent.
-        [getModelKey(workspaceId)]: JSON.stringify("openai:custom-model"),
-        [getThinkingLevelKey(workspaceId)]: JSON.stringify("high"),
-      },
-    });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    // exec's bucket must not overwrite the active agent's resolved settings.
-    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey(workspaceId))!)).toBe(
-      "openai:custom-model"
-    );
-    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey(workspaceId))!)).toBe(
-      "high"
-    );
-  });
-
-  test("legacy shared aiSettings hydrate a custom active agent", async () => {
-    const workspaceId = "ws-agent-legacy-custom";
-
-    createMockAPI({
-      workspace: {
-        list: () =>
-          Promise.resolve([
-            createWorkspaceMetadata({
-              id: workspaceId,
-              agentId: "custom",
-              // Legacy metadata: shared settings only, no per-agent buckets.
-              aiSettings: { model: "openai:legacy-model", thinkingLevel: "low" },
-            }),
-          ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("custom"),
-        [getModelKey(workspaceId)]: JSON.stringify("openai:local-default"),
-      },
-    });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    // Backend dispatch resolution treats legacy shared settings as a fallback
-    // for whichever agent is selected; the composer must agree instead of
-    // staying on the local default model.
-    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey(workspaceId))!)).toBe(
-      "openai:legacy-model"
-    );
-    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey(workspaceId))!)).toBe(
-      "low"
-    );
-  });
-
-  test("legacy shared aiSettings fill a missing active bucket in a partial modern map", async () => {
-    const workspaceId = "ws-agent-legacy-coexist";
-
-    createMockAPI({
-      workspace: {
-        list: () =>
-          Promise.resolve([
-            createWorkspaceMetadata({
-              id: workspaceId,
-              agentId: "custom",
-              // Upgraded workspace: another agent already wrote a modern
-              // bucket, but the active custom agent has none.
-              aiSettings: { model: "openai:legacy-model", thinkingLevel: "low" },
-              aiSettingsByAgent: {
-                exec: { model: "openai:gpt-5.2", thinkingLevel: "high" },
-              },
-            }),
-          ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("custom"),
-        [getModelKey(workspaceId)]: JSON.stringify("openai:local-default"),
-      },
-    });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    // The active agent hydrates from the legacy fallback, matching backend
-    // dispatch resolution...
-    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey(workspaceId))!)).toBe(
-      "openai:legacy-model"
-    );
-    // ...while real per-agent buckets are preserved, not overwritten.
-    const byAgent = JSON.parse(
-      globalThis.localStorage.getItem(getWorkspaceAISettingsByAgentKey(workspaceId))!
-    ) as Record<string, { model: string }>;
-    expect(byAgent.exec?.model).toBe("openai:gpt-5.2");
-    expect(byAgent.custom?.model).toBe("openai:legacy-model");
-  });
-
-  test("stale metadata does not clobber a pending local agent switch", async () => {
-    const workspaceId = "ws-agent-pending";
     let emitMetadata:
       | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
       | null = null;
 
     createMockAPI({
       workspace: {
-        list: () => Promise.resolve([createWorkspaceMetadata({ id: workspaceId })]),
+        list: () => Promise.resolve([saved]),
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
-              while (true) {
-                const event = await new Promise<{
-                  workspaceId: string;
-                  metadata: FrontendWorkspaceMetadata | null;
-                }>((resolve) => {
-                  emitMetadata = resolve;
-                });
-                emitMetadata = null;
-                yield event;
-              }
+              const event = await new Promise<{
+                workspaceId: string;
+                metadata: FrontendWorkspaceMetadata | null;
+              }>((resolve) => {
+                emitMetadata = resolve;
+              });
+              yield event;
             })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
           ),
       },
@@ -692,49 +554,39 @@ describe("WorkspaceContext", () => {
       },
     });
 
-    // Simulate a local mode switch whose backend write hasn't echoed yet.
-    markPendingWorkspaceAgentId(workspaceId, "exec");
-
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
-    // A stale broadcast carrying the previous agent must not revert the switch.
     act(() => {
+      updatePersistedState(getAgentIdKey(workspaceId), "exec");
+      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-opus-4-6");
       emitMetadata?.({
         workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+        metadata: {
+          ...saved,
+          title: "Updated title",
+          ...(changed
+            ? {
+                agentId: nextAgentId,
+                aiSettingsByAgent: {
+                  [nextAgentId]: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" },
+                },
+              }
+            : {}),
+        },
       });
     });
-    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "exec"
-    );
 
-    // The backend echo applies, but the guard remains until its write settles.
-    await waitFor(() => expect(emitMetadata).toBeTruthy());
-    act(() => {
-      emitMetadata?.({
-        workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "exec" }),
-      });
-    });
-    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("exec"));
-    clearPendingWorkspaceAgentId(workspaceId, "exec");
-
-    // Once the write settles, later backend updates apply again.
-    await waitFor(() => expect(emitMetadata).toBeTruthy());
-    act(() => {
-      emitMetadata?.({
-        workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
-      });
-    });
     await waitFor(() =>
-      expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-        "plan"
-      )
+      expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
+    );
+    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe(changed ? nextAgentId : "exec");
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(
+      changed ? "openai:gpt-5.3-codex" : "anthropic:claude-opus-4-6"
     );
   });
 

@@ -141,7 +141,6 @@ const mockInitStateManager: Partial<InitStateManager> = {
   clearInMemoryState: mock(() => undefined),
 };
 const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
-  getSnapshot: mock(() => Promise.resolve(null)),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),
@@ -8390,11 +8389,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     (
       workspaceService as unknown as {
-        maybePersistAISettingsFromOptions: (
-          workspaceId: string,
-          options: unknown,
-          source: "send" | "resume"
-        ) => Promise<void>;
+        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       }
     ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
   });
@@ -8402,6 +8397,27 @@ describe("WorkspaceService sendMessage status clearing", () => {
   afterEach(async () => {
     await cleanupHistory();
   });
+
+  test.each(["send", "synthetic", "resume"] as const)(
+    "only a user message updates remembered settings (%s)",
+    async (kind) => {
+      const persist = mock(() => Promise.resolve());
+      (
+        workspaceService as unknown as {
+          maybePersistAISettingsFromOptions: typeof persist;
+        }
+      ).maybePersistAISettingsFromOptions = persist;
+      const options = { model: "openai:gpt-5.2", agentId: "plan", thinkingLevel: "high" as const };
+      const result =
+        kind === "resume"
+          ? await workspaceService.resumeStream("test-workspace", options)
+          : await workspaceService.sendMessage("test-workspace", "hello", options, {
+              synthetic: kind === "synthetic",
+            });
+      expect(result.success).toBe(true);
+      expect(persist).toHaveBeenCalledTimes(kind === "send" ? 1 : 0);
+    }
+  );
 
   test("delegates manual pricing rejections to AgentSession so user input is preserved", async () => {
     fakeSession.isBusy.mockReturnValue(false);
@@ -9408,11 +9424,7 @@ describe("WorkspaceService pending auto-title", () => {
 
     (
       workspaceService as unknown as {
-        maybePersistAISettingsFromOptions: (
-          workspaceId: string,
-          options: unknown,
-          source: "send" | "resume"
-        ) => Promise<void>;
+        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       }
     ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
   });
@@ -11583,269 +11595,22 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
 
-  test("refuses agent-only switch to an unpriced stored agent for budgeted goals", async () => {
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
-    ).config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/proj",
-          {
-            workspaces: [
-              {
-                id: "ws",
-                path: "/tmp/proj/ws",
-                name: "ws",
-                aiSettingsByAgent: {
-                  reviewer: { model: "openai:not-priced-model", thinkingLevel: "off" },
-                },
-              },
-            ],
-          },
-        ],
-      ]),
-    }));
-
-    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
-      persistSelectedAgentId: true,
-    });
-
-    expect(result).toEqual({
-      success: false,
-      error: "Target model has no pricing data. Pick a priced model before switching.",
-    });
-  });
-
-  test("refuses agent-only switch when the configured agent default is unpriced", async () => {
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
-    ).config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        ["/tmp/proj", { workspaces: [{ id: "ws", path: "/tmp/proj/ws", name: "ws" }] }],
-      ]),
-      // No workspace bucket: continuation dispatch would resolve this
-      // configured default, so the switch must gate on it too.
-      agentAiDefaults: { reviewer: { modelString: "openai:not-priced-model" } },
-    }));
-
-    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
-      persistSelectedAgentId: true,
-    });
-
-    expect(result).toEqual({
-      success: false,
-      error: "Target model has no pricing data. Pick a priced model before switching.",
-    });
-  });
-
-  test("refuses switch to plan when plan's stored model is unpriced even though exec is priced", async () => {
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
-    ).config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/proj",
-          {
-            workspaces: [
-              {
-                id: "ws",
-                path: "/tmp/proj/ws",
-                name: "ws",
-                aiSettingsByAgent: {
-                  // Goal continuations remap plan -> exec (priced), but
-                  // heartbeats dispatch the persisted plan agent as-is.
-                  exec: { model: "openai:gpt-4o-mini", thinkingLevel: "off" },
-                  plan: { model: "openai:not-priced-model", thinkingLevel: "off" },
-                },
-              },
-            ],
-          },
-        ],
-      ]),
-    }));
-
-    const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
-      persistSelectedAgentId: true,
-    });
-
-    expect(result).toEqual({
-      success: false,
-      error: "Target model has no pricing data. Pick a priced model before switching.",
-    });
-  });
-
-  test("refuses agent-only switch when only the activity snapshot model is unpriced", async () => {
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    // No bucket, configured default, or legacy settings for the target agent:
-    // heartbeats then fall back to the activity snapshot's last-used model,
-    // so the gate must reject when that fallback is unpriced.
-    (
-      workspaceService as unknown as {
-        extensionMetadata: Pick<ExtensionMetadataService, "getSnapshot">;
-      }
-    ).extensionMetadata = {
-      getSnapshot: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: "openai:not-priced-model",
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-    } as unknown as ExtensionMetadataService;
-
-    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
-      persistSelectedAgentId: true,
-    });
-
-    expect(result).toEqual({
-      success: false,
-      error: "Target model has no pricing data. Pick a priced model before switching.",
-    });
-  });
-
-  test("refuses mode switch with settings when the remapped continuation bucket is unpriced", async () => {
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
-    ).config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/proj",
-          {
-            workspaces: [
-              {
-                id: "ws",
-                path: "/tmp/proj/ws",
-                name: "ws",
-                aiSettingsByAgent: {
-                  // Continuations remap the persisted plan agent to exec — a
-                  // bucket the submitted plan settings do not cover.
-                  exec: { model: "openai:not-priced-model", thinkingLevel: "off" },
-                },
-              },
-            ],
-          },
-        ],
-      ]),
-    }));
-
-    const result = await workspaceService.updateAgentAISettings(
-      "ws",
-      "plan",
-      { model: "openai:gpt-4o-mini", thinkingLevel: "off" },
-      { persistSelectedAgentId: true }
-    );
-
-    expect(result).toEqual({
-      success: false,
-      error: "Target model has no pricing data. Pick a priced model before switching.",
-    });
-  });
-
-  test("allows mode switch whose submitted settings replace the unpriced stored bucket", async () => {
-    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
-    ).config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/proj",
-          {
-            workspaces: [
-              {
-                id: "ws",
-                path: "/tmp/proj/ws",
-                name: "ws",
-                aiSettingsByAgent: {
-                  // Stale stored bucket: the submitted priced settings are
-                  // about to overwrite it, so the gate must resolve post-write
-                  // state instead of rejecting against this value.
-                  exec: { model: "openai:not-priced-model", thinkingLevel: "off" },
-                },
-              },
-            ],
-          },
-        ],
-      ]),
-    }));
-    (
-      workspaceService as unknown as {
-        persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
-      }
-    ).persistWorkspaceAISettingsForAgent = persistSpy;
-
-    const result = await workspaceService.updateAgentAISettings(
-      "ws",
-      "exec",
-      { model: "openai:gpt-4o-mini", thinkingLevel: "off" },
-      { persistSelectedAgentId: true }
-    );
-
-    expect(result.success).toBe(true);
-    expect(persistSpy).toHaveBeenCalledTimes(1);
-  });
-
-  test("allows agent-only switch when the target agent has no stored model", async () => {
-    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
-    workspaceService.setWorkspaceGoalService({
-      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
-    } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as {
-        persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
-      }
-    ).persistWorkspaceAISettingsForAgent = persistSpy;
-
-    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
-      persistSelectedAgentId: true,
-    });
-
-    expect(result.success).toBe(true);
-    expect(persistSpy).toHaveBeenCalledTimes(1);
-  });
-
   test("persists agent AI settings for custom agent", async () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 
     interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (
-        workspaceId: string,
-        options: unknown,
-        context: "send" | "resume"
-      ) => Promise<void>;
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
     svc.persistWorkspaceAISettingsForAgent = persistSpy;
 
-    await svc.maybePersistAISettingsFromOptions(
-      "ws",
-      {
-        agentId: "reviewer",
-        model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
-      },
-      "send"
-    );
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "reviewer",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
 
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
@@ -11854,26 +11619,18 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 
     interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (
-        workspaceId: string,
-        options: unknown,
-        context: "send" | "resume"
-      ) => Promise<void>;
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
     svc.persistWorkspaceAISettingsForAgent = persistSpy;
 
-    await svc.maybePersistAISettingsFromOptions(
-      "ws",
-      {
-        agentId: "exec",
-        model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
-      },
-      "send"
-    );
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "exec",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
 
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
@@ -11882,11 +11639,7 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 
     interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (
-        workspaceId: string,
-        options: unknown,
-        context: "send" | "resume"
-      ) => Promise<void>;
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
       config: {
         findWorkspace: (
@@ -11924,15 +11677,11 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
       ]),
     }));
 
-    await svc.maybePersistAISettingsFromOptions(
-      "ws",
-      {
-        agentId: "exec",
-        model: "openai:gpt-4o-mini",
-        thinkingLevel: "off",
-      },
-      "send"
-    );
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "exec",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
 
     expect(persistSpy).toHaveBeenCalledTimes(1);
     expect(persistSpy).toHaveBeenCalledWith(
@@ -17224,7 +16973,7 @@ describe("WorkspaceService fork", () => {
     }
   });
 
-  test("forks inherit the latest persisted agent settings after setup", async () => {
+  test("auto-generated fork names normalize legacy fork families before the validation fallback", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -17236,28 +16985,7 @@ describe("WorkspaceService fork", () => {
       projectName: "project",
       runtimeConfig: { type: "local" },
       namedWorkspacePath: path.join(sourceProjectPath, "Feature-fork-2"),
-      agentType: " Researcher ",
-      aiSettingsByAgent: {
-        researcher: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
-        exec: { model: "anthropic:claude-sonnet-4-6", thinkingLevel: "medium" },
-      },
-      aiSettings: { model: "google:gemini-2.5-pro", thinkingLevel: "low" },
     };
-    const latestAgentId = "exec";
-    const latestAiSettingsByAgent = {
-      exec: { model: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" as const },
-    };
-    const latestAiSettings = {
-      model: "anthropic:claude-opus-4-6",
-      thinkingLevel: "high" as const,
-    };
-    const latestSourceMetadata: FrontendWorkspaceMetadata = {
-      ...sourceMetadata,
-      agentId: latestAgentId,
-      aiSettingsByAgent: latestAiSettingsByAgent,
-      aiSettings: latestAiSettings,
-    };
-    let metadataReads = 0;
     const forkedWorkspacePath = path.join(sourceProjectPath, "feature-1");
 
     await fsPromises.mkdir(sourceProjectPath, { recursive: true });
@@ -17273,9 +17001,7 @@ describe("WorkspaceService fork", () => {
 
     const mockAIService = {
       isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve(Ok(metadataReads++ === 0 ? sourceMetadata : latestSourceMetadata))
-      ),
+      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -17346,18 +17072,6 @@ describe("WorkspaceService fork", () => {
       expect(result.data.metadata.name).toBe("feature-1");
       expect(result.data.metadata.forkFamilyBaseName).toBe("Feature");
       expect(result.data.metadata.namedWorkspacePath).toBe(forkedWorkspacePath);
-      expect(result.data.metadata.agentId).toBe(latestAgentId);
-      expect(result.data.metadata.aiSettingsByAgent).toEqual(latestAiSettingsByAgent);
-      expect(result.data.metadata.aiSettings).toEqual(latestAiSettings);
-
-      const persistedMetadata = (await config.getAllWorkspaceMetadata()).find(
-        (workspace) => workspace.id === newWorkspaceId
-      );
-      expect(persistedMetadata).toMatchObject({
-        agentId: latestAgentId,
-        aiSettingsByAgent: latestAiSettingsByAgent,
-        aiSettings: latestAiSettings,
-      });
     } finally {
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();

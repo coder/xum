@@ -5,7 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { resumeWorkspaceStream } from "@/browser/utils/workspaceAiSettingsSync";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
@@ -534,7 +533,7 @@ export function AskUserQuestionToolCall(props: {
           }
         }
 
-        const resumeResult = await resumeWorkspaceStream(api, {
+        const resumeResult = await api.workspace.resumeStream({
           workspaceId,
           options: sendOptions,
         });

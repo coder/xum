@@ -101,20 +101,6 @@ export const AgentDefinitionDescriptorSchema = z
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
-    // This agent ID's defaults merged field-wise across same-ID scope refinements.
-    // Named base-agent defaults remain separate hops; aiDefaults is effective UI display data.
-    ownAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
-    // Complete declared base chain, including non-selectable ancestors omitted from discovery.
-    aiAncestors: z
-      .array(
-        z
-          .object({
-            agentId: AgentIdSchema,
-            definitionAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
-          })
-          .strict()
-      )
-      .optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),
     // Agent Plugins: contributing plugin name (absent for non-plugin agents)

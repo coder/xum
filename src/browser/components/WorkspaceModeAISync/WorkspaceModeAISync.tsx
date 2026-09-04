@@ -54,8 +54,9 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     prevAgentIdRef.current = normalizedAgentId;
     prevWorkspaceIdRef.current = workspaceId;
 
-    // Read at call time rather than subscribing: every model/thinking/pro-mode change
-    // rewrites this cache, so a subscription would re-run the effect on its own updates.
+    // Read at call time rather than subscribing: this cache only feeds explicit agent
+    // switches, yet every model/thinking/pro-mode change rewrites it, so a subscription
+    // would re-run this effect and re-apply the mode default over the user's own pick.
     const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
       getWorkspaceAISettingsByAgentKey(workspaceId),
       {}
@@ -66,19 +67,21 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     const reasoningKey = getReasoningModeKey(workspaceId);
     const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
 
-    const resolvedSettings = resolveWorkspaceAiSettingsForAgent({
-      agentId: normalizedAgentId,
-      agentAiDefaults,
-      workspaceByAgent,
-      fallbackModel,
-      existingModel,
-      existingThinking,
-      existingReasoningMode: existingReasoning,
-      agents,
-      mode: isExplicitAgentSwitch ? "explicit-switch" : "background-sync",
-    });
-    if (!resolvedSettings) return;
-    const { resolvedModel, resolvedThinking, resolvedReasoningMode } = resolvedSettings;
+    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
+      resolveWorkspaceAiSettingsForAgent({
+        agentId: normalizedAgentId,
+        agentAiDefaults,
+        // Keep deterministic handoff behavior: background sync should trust the
+        // currently active workspace model, but explicit mode switches should
+        // restore the selected agent's per-workspace override (if any).
+        workspaceByAgent,
+        useWorkspaceByAgentFallback: isExplicitAgentSwitch,
+        fallbackModel,
+        existingModel,
+        existingThinking,
+        existingReasoningMode: existingReasoning,
+        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+      });
 
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(

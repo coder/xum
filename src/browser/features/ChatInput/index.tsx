@@ -53,16 +53,7 @@ import {
 } from "@/browser/utils/additionalSystemContextStore";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-  sendWorkspaceMessage,
-  updateWorkspaceAgentAISettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
-import {
-  getCreationWorkspaceAiSyncState,
-  resolveWorkspaceAiSettingsForAgent,
-} from "@/browser/utils/workspaceModeAi";
+import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
   getReasoningModeKey,
@@ -945,42 +936,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             prev && typeof prev === "object" ? prev : {};
           return {
             ...record,
-            // Include reasoningMode so a model change cannot wipe the persisted
-            // pro-mode choice (backend replaces the agent's settings wholesale).
             [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
           };
         },
         {}
       );
-
-      // Workspace variant: persist to backend for cross-device consistency.
-      if (!api) {
-        return;
-      }
-
-      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-        model: selectedModel,
-        thinkingLevel,
-        reasoningMode,
-      });
-
-      updateWorkspaceAgentAISettings(api, {
-        workspaceId,
-        agentId: normalizedAgentId,
-        aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
-      })
-        .then((result) => {
-          if (!result.success) {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          }
-        })
-        .catch(() => {
-          clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          // Best-effort only. If offline or backend is old, sendMessage will persist.
-        });
     },
     [
-      api,
       agentId,
       creationParentProjectPath,
       ensureModelInSettings,
@@ -1284,12 +1246,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
 
-    const { isExplicitAgentSwitch, mode } = getCreationWorkspaceAiSyncState({
-      previousAgentId: prevCreationAgentIdRef.current,
-      previousScopeId: prevCreationScopeIdRef.current,
-      agentId: normalizedAgentId,
-      scopeId,
-    });
+    const isExplicitAgentSwitch =
+      prevCreationAgentIdRef.current !== null &&
+      prevCreationScopeIdRef.current === scopeId &&
+      prevCreationAgentIdRef.current !== normalizedAgentId;
 
     // Update refs for the next run (even if no model changes).
     prevCreationAgentIdRef.current = normalizedAgentId;
@@ -1315,8 +1275,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingModel,
       existingThinking,
       existingReasoningMode: existingReasoning,
-      agents,
-      mode,
+      agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
     });
 
     if (existingModel !== resolvedModel) {
@@ -2176,25 +2135,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
-  }, [variant, workspaceId, pushToast]);
-
-  // Surface rejected agent switches (e.g. budgeted-goal pricing gate): the
-  // mode picker closes immediately, so the snap-back needs an explanation.
-  useEffect(() => {
-    if (variant !== "workspace") return;
-
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<{ workspaceId: string; message: string }>).detail;
-      if (detail?.workspaceId !== workspaceId || !detail.message) {
-        return;
-      }
-
-      pushToast({ type: "error", message: detail.message });
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, handler as EventListener);
-    return () =>
-      window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, handler as EventListener);
   }, [variant, workspaceId, pushToast]);
 
   // Show toast feedback for analytics rebuild command palette action.
@@ -3209,7 +3149,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        const result = await sendWorkspaceMessage(api, {
+        const result = await api.workspace.sendMessage({
           workspaceId: props.workspaceId,
           message: finalMessageText,
           options: sendOptions,

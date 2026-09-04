@@ -1447,9 +1447,7 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       agentId: AgentIdSchema,
-      // Null persists only the selected agent (with persistSelectedAgentId),
-      // leaving the agent's stored model/thinking settings untouched.
-      aiSettings: WorkspaceAISettingsSchema.nullish(),
+      aiSettings: WorkspaceAISettingsSchema,
       persistSelectedAgentId: z.boolean().nullish(),
     }),
     output: ResultSchema(z.void(), z.string()),

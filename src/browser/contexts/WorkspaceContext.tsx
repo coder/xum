@@ -65,10 +65,6 @@ import {
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { reassignPinnedTimestamps } from "@/common/utils/pin";
-import {
-  shouldApplyWorkspaceAgentIdFromBackend,
-  shouldApplyWorkspaceAiSettingsFromBackend,
-} from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -169,7 +165,20 @@ function migrateLocalGatewayPrefsToBackend(
  *
  * This keeps a workspace's model/thinking consistent across devices/browsers.
  */
-function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadata): void {
+function seedWorkspaceLocalStorageFromBackend(
+  metadata: FrontendWorkspaceMetadata,
+  previous?: FrontendWorkspaceMetadata
+): void {
+  // Unchanged server settings must not overwrite choices the user hasn't sent yet.
+  if (
+    metadata.parentWorkspaceId == null &&
+    previous &&
+    resolvePersistedAgentId(metadata, "") === resolvePersistedAgentId(previous, "") &&
+    JSON.stringify(metadata.aiSettingsByAgent) === JSON.stringify(previous.aiSettingsByAgent) &&
+    JSON.stringify(metadata.aiSettings) === JSON.stringify(previous.aiSettings)
+  ) {
+    return;
+  }
   // Cache keyed by agentId (string) - includes exec, plan, and custom agents
   type WorkspaceAISettingsByAgentCache = Partial<
     Record<
@@ -180,56 +189,24 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
 
   const workspaceId = metadata.id;
 
-  // Seed the active agent from backend metadata so the last used mode follows
-  // the workspace across clients. Child/task workspaces are backend-defined and
-  // locked, so they always re-seed; main workspaces persist local mode changes
-  // to the backend and are protected from stale broadcasts by the pending-echo
-  // guard (shouldApplyWorkspaceAgentIdFromBackend).
   const metadataAgentId = resolvePersistedAgentId(metadata, "");
   if (metadataAgentId.length > 0) {
+    const key = getAgentIdKey(workspaceId);
     const normalized = normalizeAgentId(metadataAgentId);
-    const isLockedChildWorkspace = metadata.parentWorkspaceId != null;
-    if (isLockedChildWorkspace || shouldApplyWorkspaceAgentIdFromBackend(workspaceId, normalized)) {
-      const key = getAgentIdKey(workspaceId);
-      const existing = readPersistedState<string | undefined>(key, undefined);
-      if (existing !== normalized) {
-        updatePersistedState(key, normalized);
-      }
+    const existing = readPersistedState<string | undefined>(key, undefined);
+    if (existing !== normalized) {
+      updatePersistedState(key, normalized);
     }
   }
 
-  // Read after the backend agent-id seeding above so a metadata-driven agent
-  // selection applies before settings hydration keys off of it.
-  const activeAgentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-
-  // Legacy-only metadata predates per-agent buckets. Backend dispatch
-  // resolution (resolveNodeAgentAiSettings) treats the shared legacy blob as a
-  // fallback layer for whichever agent is selected — including custom agents —
-  // so synthesize a bucket for the active agent too, not just plan/exec.
-  // Otherwise a fresh client hydrating a legacy workspace with a custom active
-  // agent sits on the local default model while backend dispatches (heartbeats,
-  // continuations) keep resolving the legacy settings. Real per-agent buckets
-  // are never borrowed across agents.
-  const modernByAgent = metadata.aiSettingsByAgent;
-  const aiByAgent = modernByAgent
-    ? metadata.aiSettings && !modernByAgent[activeAgentId]
-      ? // Coexistence: a partial modern map can lack the active agent while
-        // the legacy shared blob exists (e.g. only another agent wrote a
-        // modern bucket). Backend resolvers still fall back to the legacy
-        // workspaceEntry.aiSettings for the selected agent, so overlay it for
-        // the active agent only, preserving every real per-agent entry.
-        { ...modernByAgent, [activeAgentId]: metadata.aiSettings }
-      : modernByAgent
-    : metadata.aiSettings
+  const aiByAgent =
+    metadata.aiSettingsByAgent ??
+    (metadata.aiSettings
       ? {
           plan: metadata.aiSettings,
           exec: metadata.aiSettings,
-          [activeAgentId]: metadata.aiSettings,
         }
-      : undefined;
+      : undefined);
 
   if (!aiByAgent) {
     return;
@@ -244,17 +221,6 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
     if (!entry) continue;
     if (typeof entry.model !== "string" || entry.model.length === 0) continue;
 
-    // Protect newer local preferences from stale metadata updates (e.g., rapid thinking toggles).
-    if (
-      !shouldApplyWorkspaceAiSettingsFromBackend(workspaceId, agentKey, {
-        model: entry.model,
-        thinkingLevel: entry.thinkingLevel,
-        reasoningMode: entry.reasoningMode,
-      })
-    ) {
-      continue;
-    }
-
     nextByAgent[agentKey] = {
       model: entry.model,
       thinkingLevel: entry.thinkingLevel,
@@ -267,11 +233,11 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   }
 
   // Seed the active agent into the existing keys to avoid UI flash.
-  // Only hydrate from the ACTIVE agent's own bucket. Falling back to another
-  // agent's bucket would overwrite the locally resolved settings of an agent
-  // that has no persisted bucket yet (e.g. right after an agent-only switch),
-  // and WorkspaceModeAISync does not re-run to correct such an overwrite.
-  const active = nextByAgent[activeAgentId];
+  const activeAgentId = readPersistedState<string>(
+    getAgentIdKey(workspaceId),
+    WORKSPACE_DEFAULTS.agentId
+  );
+  const active = nextByAgent[activeAgentId] ?? nextByAgent.exec ?? nextByAgent.plan;
   if (!active) {
     return;
   }
@@ -290,9 +256,7 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
 
   // Absent reasoningMode means "standard": seed it explicitly so switching to
   // an agent whose settings never carried the field cannot inherit another
-  // agent's "pro" from the shared workspace-scoped key. Newer local choices
-  // are already protected by the pending-settings guard above
-  // (shouldApplyWorkspaceAiSettingsFromBackend).
+  // agent's "pro" from the shared workspace-scoped key.
   const reasoningKey = getReasoningModeKey(workspaceId);
   const nextReasoning = active.reasoningMode ?? "standard";
   const existingReasoning = readPersistedState<OpenAIReasoningMode | undefined>(
@@ -1080,7 +1044,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         ensureCreatedAt(metadata);
         // Use stable workspace ID as key (not path, which can change)
-        seedWorkspaceLocalStorageFromBackend(metadata);
+        seedWorkspaceLocalStorageFromBackend(
+          metadata,
+          workspaceMetadataRef.current.get(metadata.id)
+        );
         metadataMap.set(metadata.id, metadata);
       }
 
@@ -1249,7 +1216,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // 1. ALWAYS normalize incoming metadata first - this is the critical data update.
           if (meta !== null) {
             ensureCreatedAt(meta);
-            seedWorkspaceLocalStorageFromBackend(meta);
+            seedWorkspaceLocalStorageFromBackend(meta, workspaceMetadataRef.current.get(meta.id));
           }
 
           const isNowArchived =
@@ -1407,7 +1374,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         // Update metadata immediately to avoid race condition with validation effect
         ensureCreatedAt(result.metadata);
-        seedWorkspaceLocalStorageFromBackend(result.metadata);
+        seedWorkspaceLocalStorageFromBackend(
+          result.metadata,
+          workspaceMetadataRef.current.get(result.metadata.id)
+        );
         setWorkspaceMetadata((prev) => {
           const updated = new Map(prev);
           updated.set(result.metadata.id, result.metadata);
@@ -1771,7 +1741,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const metadata = await api.workspace.getInfo({ workspaceId });
       if (metadata) {
         ensureCreatedAt(metadata);
-        seedWorkspaceLocalStorageFromBackend(metadata);
+        seedWorkspaceLocalStorageFromBackend(
+          metadata,
+          workspaceMetadataRef.current.get(metadata.id)
+        );
       }
       return metadata;
     },

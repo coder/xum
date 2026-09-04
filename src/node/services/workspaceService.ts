@@ -230,7 +230,7 @@ import {
   coerceThinkingLevel,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_DEFAULT_CONTEXT_MODE,
@@ -9890,14 +9890,9 @@ export class WorkspaceService extends EventEmitter {
     );
   }
 
-  /**
-   * Best-effort persist AI settings from send/resume options.
-   * Skips requests explicitly marked to avoid persistence.
-   */
   private async maybePersistAISettingsFromOptions(
     workspaceId: string,
-    options: SendMessageOptions | undefined,
-    context: "send" | "resume"
+    options: SendMessageOptions | undefined
   ): Promise<void> {
     if (options?.skipAiSettingsPersistence) {
       // One-shot/compaction sends shouldn't overwrite workspace defaults.
@@ -9913,14 +9908,13 @@ export class WorkspaceService extends EventEmitter {
       agentId,
       extractedSettings,
       {
-        // Normal sends/resumes also persist the selected agent so future backend heartbeat
-        // dispatches can reuse the same workspace default after reloads and reconnects.
+        // Save the selected agent so heartbeats can reuse it after reloads and reconnects.
         persistSelectedAgentId: true,
         ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       }
     );
     if (!persistResult.success) {
-      log.debug(`Failed to persist workspace AI settings from ${context} options`, {
+      log.debug("Failed to persist workspace AI settings from user message", {
         workspaceId,
         error: persistResult.error,
       });
@@ -10065,19 +10059,13 @@ export class WorkspaceService extends EventEmitter {
   async updateAgentAISettings(
     workspaceId: string,
     agentId: string,
-    // Null persists only the selected agent (with persistSelectedAgentId),
-    // leaving the agent's stored settings untouched.
-    aiSettings: WorkspaceAISettings | null,
+    aiSettings: WorkspaceAISettings,
     options?: { persistSelectedAgentId?: boolean }
   ): Promise<Result<void, string>> {
     try {
-      let normalizedSettings: WorkspaceAISettings | null = null;
-      if (aiSettings != null) {
-        const normalized = this.normalizeWorkspaceAISettings(aiSettings);
-        if (!normalized.success) {
-          return Err(normalized.error);
-        }
-        normalizedSettings = normalized.data;
+      const normalized = this.normalizeWorkspaceAISettings(aiSettings);
+      if (!normalized.success) {
+        return Err(normalized.error);
       }
 
       if (this.workspaceGoalService) {
@@ -10087,58 +10075,23 @@ export class WorkspaceService extends EventEmitter {
         // un-pauses or raises the budget. Letting them switch to an unpriced
         // model in the meantime silently records 0 cost on the next stream
         // and budget enforcement quietly stops working.
-        if (hasBudgetedResumableGoal(goal)) {
-          // Selected-agent changes redirect backend dispatches even when
-          // settings are supplied (ACP mode switches), so gate every dispatch
-          // surface's fully resolved model: goal continuations remap
-          // plan/compact to exec — a bucket the submitted settings do not
-          // cover — while heartbeats resolve the persisted agent as-is and
-          // add the activity snapshot's last-used model as a fallback layer.
-          // Overlay the about-to-be-written bucket so a priced submission is
-          // not rejected against its own stale stored bucket.
-          const gatedModels: string[] = [];
-          if (normalizedSettings != null) {
-            gatedModels.push(normalizedSettings.model);
-          }
-          if (options?.persistSelectedAgentId === true) {
-            const pendingBucket =
-              normalizedSettings != null
-                ? {
-                    agentId: normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId),
-                    settings: normalizedSettings,
-                  }
-                : null;
-            const kickoff = await this.resolveContinuationKickoffSendOptionsForAgent(
-              workspaceId,
-              agentId,
-              pendingBucket
-            );
-            if (kickoff?.model != null && !gatedModels.includes(kickoff.model)) {
-              gatedModels.push(kickoff.model);
-            }
-            const heartbeat = await this.resolveHeartbeatAiSettings(
-              workspaceId,
-              agentId,
-              pendingBucket
-            );
-            if (!gatedModels.includes(heartbeat.resolved.selected.model)) {
-              gatedModels.push(heartbeat.resolved.selected.model);
-            }
-          }
-          const providersConfig =
+        if (
+          hasBudgetedResumableGoal(goal) &&
+          !modelHasPricingData(
+            normalized.data.model,
             typeof this.config.loadProvidersConfig === "function"
               ? this.config.loadProvidersConfig()
-              : null;
-          if (gatedModels.some((model) => !modelHasPricingData(model, providersConfig))) {
-            return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);
-          }
+              : null
+          )
+        ) {
+          return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);
         }
       }
 
       const persistResult = await this.persistWorkspaceAISettingsForAgent(
         workspaceId,
         agentId,
-        normalizedSettings,
+        normalized.data,
         {
           emitMetadata: true,
           ...(options?.persistSelectedAgentId === true ? { persistSelectedAgentId: true } : {}),
@@ -10156,7 +10109,7 @@ export class WorkspaceService extends EventEmitter {
           status: "completed",
           data: {
             agentId,
-            model: normalizedSettings?.model,
+            model: normalized.data.model,
             mode: parsedMode.success ? parsedMode.data : undefined,
           },
         });
@@ -10568,15 +10521,6 @@ export class WorkspaceService extends EventEmitter {
 
       // Compute namedWorkspacePath for frontend metadata
       const namedWorkspacePath = targetRuntime.getWorkspacePath(foundProjectPath, resolvedName);
-      // Fork setup can take long enough for the source selection to change. Snapshot
-      // persisted settings immediately before registering the fork, not before cloning.
-      const latestSourceMetadataResult =
-        await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
-      const latestSourceMetadata =
-        latestSourceMetadataResult.success && latestSourceMetadataResult.data.kind !== "scratch"
-          ? latestSourceMetadataResult.data
-          : sourceMetadata;
-      const sourceAgentId = resolvePersistedAgentId(latestSourceMetadata, "");
 
       const metadata: FrontendWorkspaceMetadata = {
         id: newWorkspaceId,
@@ -10587,14 +10531,6 @@ export class WorkspaceService extends EventEmitter {
         createdAt: new Date().toISOString(),
         runtimeConfig: forkedRuntimeConfig,
         namedWorkspacePath,
-        // Persist the source selection so other clients and background continuations hydrate the fork identically.
-        ...(sourceAgentId === "" ? {} : { agentId: sourceAgentId }),
-        ...(latestSourceMetadata.aiSettingsByAgent == null
-          ? {}
-          : { aiSettingsByAgent: { ...latestSourceMetadata.aiSettingsByAgent } }),
-        ...(latestSourceMetadata.aiSettings == null
-          ? {}
-          : { aiSettings: { ...latestSourceMetadata.aiSettings } }),
         // Preserve sub-project cwd/prompt context when forking via /fork.
         subProjectPath: sourceMetadata.subProjectPath,
         // Forks with a continue message stay pending until the first accepted user send
@@ -11296,8 +11232,10 @@ export class WorkspaceService extends EventEmitter {
         return Err(pricingGate.error);
       }
 
-      // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
+      // Synthetic turns must not replace the user's remembered model and mode.
+      if (internal?.synthetic !== true) {
+        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
+      }
 
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
 
@@ -11757,9 +11695,6 @@ export class WorkspaceService extends EventEmitter {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
-
-      // Persist last-used model + thinking level for cross-device consistency.
-      await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "resume");
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so TaskService stream-end
@@ -14241,26 +14176,6 @@ export class WorkspaceService extends EventEmitter {
       workspaceId.trim().length > 0,
       "getGoalContinuationKickoffSendOptions requires workspaceId"
     );
-    return this.resolveContinuationKickoffSendOptionsForAgent(workspaceId, null);
-  }
-
-  /**
-   * Send options a goal-continuation kickoff would use for the given selected
-   * agent — or for the persisted selected agent when `overrideAgentId` is
-   * null. Also backs the budgeted-goal pricing gate for agent-only switches,
-   * which must gate the same fully resolved model (bucket,
-   * configured/definition defaults, legacy fallback) that dispatch selects.
-   * Heartbeats resolve differently (no plan/compact→exec remap plus an
-   * activity-snapshot fallback), so the gate probes that surface via
-   * resolveHeartbeatAiSettings instead.
-   */
-  private async resolveContinuationKickoffSendOptionsForAgent(
-    workspaceId: string,
-    overrideAgentId: string | null,
-    // Bucket an in-flight updateAgentAISettings is about to write: the
-    // pricing gate passes it so resolution reflects post-write state.
-    pendingBucket?: { agentId: string; settings: WorkspaceAISettings } | null
-  ): Promise<SendMessageOptions | null> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
     if (!workspaceMatch) {
@@ -14275,18 +14190,12 @@ export class WorkspaceService extends EventEmitter {
     // sendMessage call runs, so resolve kickoff options from the persisted selected
     // agent instead of assuming the default exec agent. Plan/compact are UI modes,
     // not continuation-capable agents, so fall back to exec for the actual kickoff.
-    const persistedAgentId = normalizeAgentId(
-      overrideAgentId ?? workspaceEntry?.agentId,
-      WORKSPACE_DEFAULTS.agentId
-    );
+    const persistedAgentId = normalizeAgentId(workspaceEntry?.agentId, WORKSPACE_DEFAULTS.agentId);
     const agentId =
       persistedAgentId === "plan" || persistedAgentId === "compact"
         ? WORKSPACE_DEFAULTS.agentId
         : persistedAgentId;
-    const selectedAgentSettings =
-      pendingBucket?.agentId === agentId
-        ? pendingBucket.settings
-        : workspaceEntry?.aiSettingsByAgent?.[agentId];
+    const selectedAgentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
 
     // Unified interactive resolution: the workspace's own bucket, then
     // configured/definition defaults and the declared base chain, then the
@@ -14845,23 +14754,12 @@ export class WorkspaceService extends EventEmitter {
       : String(error);
   }
 
-  /**
-   * Heartbeat-surface AI settings for the given selected agent — or for the
-   * persisted selected agent when `overrideAgentId` is null. Unlike goal
-   * continuations, heartbeats keep plan/compact as-is and fall back to the
-   * activity snapshot's last-used model. The budgeted-goal pricing gate for
-   * agent-only switches probes this exact resolution so gated models cannot
-   * drift from what heartbeats actually dispatch.
-   */
-  private async resolveHeartbeatAiSettings(
-    workspaceId: string,
-    overrideAgentId: string | null,
-    // Bucket an in-flight updateAgentAISettings is about to write: the
-    // pricing gate passes it so resolution reflects post-write state.
-    pendingBucket?: { agentId: string; settings: WorkspaceAISettings } | null
-  ): Promise<{
-    agentId: string;
-    resolved: Awaited<ReturnType<typeof resolveNodeAgentAiSettings>>;
+  private async buildHeartbeatSendOptions(workspaceId: string): Promise<{
+    sendOptions: SendMessageOptions;
+    heartbeatMessage: string | undefined;
+    contextMode: HeartbeatContextMode;
+    schedulePolicy: HeartbeatSchedulePolicy;
+    intervalMs: number;
   }> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -14878,18 +14776,13 @@ export class WorkspaceService extends EventEmitter {
 
     const activity = await this.extensionMetadata.getSnapshot(workspaceId);
 
-    const agentId = normalizeAgentId(
-      overrideAgentId ?? workspaceEntry?.agentId,
-      WORKSPACE_DEFAULTS.agentId
-    );
-    const agentSettings =
-      pendingBucket?.agentId === agentId
-        ? pendingBucket.settings
-        : workspaceEntry?.aiSettingsByAgent?.[agentId];
+    const rawAgentId = workspaceEntry?.agentId;
+    const agentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
+    const agentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
 
-    // Unified interactive resolution for the selected agent: its bucket,
-    // configured/definition defaults and the declared base chain, then the
-    // legacy workspace settings and activity snapshot as fallback layers.
+    // Unified interactive resolution for the workspace's selected agent: its
+    // bucket, configured/definition defaults and the declared base chain, then
+    // the legacy workspace settings and activity snapshot as fallback layers.
     const resolved = await resolveNodeAgentAiSettings({
       agentId,
       profile: "interactive",
@@ -14917,31 +14810,6 @@ export class WorkspaceService extends EventEmitter {
       defaultModel: WORKSPACE_DEFAULTS.model,
       definitionContext: await this.getAgentDefinitionContext(workspaceId),
     });
-
-    return { agentId, resolved };
-  }
-
-  private async buildHeartbeatSendOptions(workspaceId: string): Promise<{
-    sendOptions: SendMessageOptions;
-    heartbeatMessage: string | undefined;
-    contextMode: HeartbeatContextMode;
-    schedulePolicy: HeartbeatSchedulePolicy;
-    intervalMs: number;
-  }> {
-    const config = this.config.loadConfigOrDefault();
-    const workspaceMatch = this.config.findWorkspace(workspaceId);
-
-    const workspaceEntry = workspaceMatch
-      ? (() => {
-          const project = config.projects.get(workspaceMatch.projectPath);
-          return (
-            project?.workspaces.find((workspace) => workspace.id === workspaceId) ??
-            project?.workspaces.find((workspace) => workspace.path === workspaceMatch.workspacePath)
-          );
-        })()
-      : undefined;
-
-    const { agentId, resolved } = await this.resolveHeartbeatAiSettings(workspaceId, null);
 
     return {
       sendOptions: {
