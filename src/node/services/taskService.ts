@@ -6135,6 +6135,16 @@ export class TaskService implements AgentTaskIntegration {
     }
   }
 
+  async settleSupersededWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): Promise<void> {
+    await this.getWorkspaceTurnManager().settleSupersededWorkspaceTurnContinuation(
+      workspaceId,
+      muxMetadata
+    );
+  }
+
   /**
    * Reject all foreground task waiters for a workspace that opted into backgrounding
    * when a new message is queued. Returns the number of waiters signaled.

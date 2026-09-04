@@ -2389,6 +2389,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // The level drives the same tool-boundary side effects a queued tool-end message
         // does: long-polling bash reads return early and foreground agent-task waits are
         // backgrounded so the stream can reach the boundary where it yields to the wake.
+        // The session arbitrates the level against its queue head and fires the yield
+        // edge (onToolEndYieldRequested) when the lever actually becomes effective.
         const session = this.sessions.get(ownerWorkspaceId);
         if (session != null) {
           session.setBashMonitorWakeOutstanding(outstanding);
@@ -2400,18 +2402,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // No session, no queue: the flag can only be a stale mirror (e.g. reconciler
           // disposal after the session went away), so drop it directly.
           this.backgroundProcessManager.setMessageQueued(ownerWorkspaceId, false);
-        }
-        // Background foreground waits only when the level actually pulls the yield lever:
-        // the session's mirror applies the queue-head arbitration (a turn-end head means
-        // the stream will not cut for this wake, so ending the wait early would just hand
-        // the agent another model step) (Codex P2 PRRT_kwDOPxxmWM6fFJ4Q).
-        if (
-          outstanding &&
-          session != null &&
-          typeof this.backgroundProcessManager.hasQueuedMessage === "function" &&
-          this.backgroundProcessManager.hasQueuedMessage(ownerWorkspaceId)
-        ) {
-          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(ownerWorkspaceId);
         }
       },
     });
@@ -4053,6 +4043,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
       hasOutstandingBashMonitorWake: () =>
         this.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId),
+      // The stream will cut at its next tool boundary; a foreground task_await that would
+      // outlive it is backgrounded so the boundary is reached. Waits registered while the
+      // lever is already high are backgrounded at registration
+      // (TaskService.backgroundForegroundWaitIfQueued → isToolEndYieldRequested).
+      onToolEndYieldRequested: () => {
+        this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
+      },
+      onWorkspaceTurnContinuationAbandoned: async (metadata) => {
+        await this.agentTaskIntegration?.settleSupersededWorkspaceTurnContinuation(
+          workspaceId,
+          metadata
+        );
+      },
     });
   }
 
@@ -10977,10 +10980,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
-        }
-
-        if (effectiveQueueDispatchMode === "tool-end") {
-          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
         }
 
         return Ok(undefined);

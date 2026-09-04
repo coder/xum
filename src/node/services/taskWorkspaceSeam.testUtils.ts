@@ -70,6 +70,7 @@ export function makeAgentTaskIntegrationFake(
     getAgentTaskStatus: () => undefined,
     resetAutoResumeCount: () => undefined,
     backgroundForegroundWaitsForWorkspace: () => 0,
+    settleSupersededWorkspaceTurnContinuation: () => Promise.resolve(),
     markInterruptedTaskRunning: () => Promise.resolve(false),
     restoreInterruptedTaskAfterResumeFailure: () => Promise.resolve(),
     markParentWorkspaceInterrupted: () => undefined,

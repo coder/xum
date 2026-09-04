@@ -803,6 +803,58 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("the tool-end yield edge fires once per rising transition, whatever raises it", async () => {
+    // Foreground task waits are backgrounded on this edge, so it must track the *effective*
+    // lever (queue-head arbitration ∪ level), not the events that happen to feed it
+    // (Codex P2 PRRT_kwDOPxxmWM6fGVw_).
+    const workspaceId = "queue-dispatch-yield-edge";
+    const edges = mock(() => undefined);
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      onToolEndYieldRequested: edges,
+    });
+    const turnEnd = { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "turn-end" as const };
+    const toolEnd = { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" as const };
+    try {
+      // A turn-end head does not pull the lever; a tool-end enqueue does, once.
+      session.queueMessage("later", turnEnd);
+      expect(edges).not.toHaveBeenCalled();
+      session.queueMessage("sooner", toolEnd);
+      expect(edges).toHaveBeenCalledTimes(1);
+      session.queueMessage("sooner still", toolEnd);
+      expect(edges).toHaveBeenCalledTimes(1);
+      session.clearQueue();
+
+      // The GVw_ case: the level is high behind a turn-end head (no edge), then the head is
+      // cleared with no enqueue and no level publish in between — the lever becomes
+      // effective and the edge must fire from that queue transition alone.
+      session.queueMessage("later", turnEnd);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(edges).toHaveBeenCalledTimes(1);
+      session.clearQueue();
+      expect(edges).toHaveBeenCalledTimes(2);
+
+      // Republishing a high level is not an edge; lowering and raising it is.
+      session.setBashMonitorWakeOutstanding(true);
+      expect(edges).toHaveBeenCalledTimes(2);
+      session.setBashMonitorWakeOutstanding(false);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(edges).toHaveBeenCalledTimes(3);
+      session.setBashMonitorWakeOutstanding(false);
+
+      // tool-end is sticky within an entry: a turn-end queued behind it neither lowers the
+      // lever nor re-fires the edge.
+      session.queueMessage("sooner", toolEnd);
+      expect(edges).toHaveBeenCalledTimes(4);
+      session.queueMessage("later", turnEnd);
+      expect(edges).toHaveBeenCalledTimes(4);
+      expect(session.hasQueuedMessages()).toBe(true);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("disposing a session lowers the mirrored wake level", async () => {
     // The flag lives in BackgroundProcessManager keyed by workspace id and outlives the
     // session; a stale true would make a re-created session's bash reads return early.

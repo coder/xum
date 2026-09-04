@@ -514,6 +514,15 @@ export interface AgentTaskIntegration {
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
+  /**
+   * The workspace dropped the continuation of a delegated turn (a compaction follow-up that
+   * carried the correlation was abandoned instead of dispatched). No later send inherits the
+   * correlation, so the owner's waiter is settled as superseded. Idempotent.
+   */
+  settleSupersededWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+  ): Promise<void>;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
   restoreInterruptedTaskAfterResumeFailure(workspaceId: string): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;

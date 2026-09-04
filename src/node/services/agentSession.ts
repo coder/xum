@@ -629,6 +629,20 @@ interface AgentSessionOptions {
    * queued as messages, so this is the only way a stream learns one is pending.
    */
   hasOutstandingBashMonitorWake?: () => Promise<boolean>;
+  /**
+   * The tool-end yield lever rose (false → true): the next tool boundary will cut the
+   * stream for a tool-end queue head or the wake level. Fired on every rising edge, whatever
+   * caused it (enqueue, queue-head clear/promote, wake level), so foreground waits that
+   * would outlive the boundary can be backgrounded exactly when the yield becomes effective.
+   */
+  onToolEndYieldRequested?: () => void;
+  /**
+   * A compaction follow-up carrying a delegated turn's correlation was abandoned instead of
+   * dispatched (idle-rule skip, inadmissible summary/goal). Nothing else settles that turn
+   * — the compaction stream-end is not correlated and no later send inherits the metadata —
+   * so the owner is told the turn was superseded.
+   */
+  onWorkspaceTurnContinuationAbandoned?: (metadata: WorkspaceTurnMuxMetadata) => Promise<void>;
 }
 
 enum TurnPhase {
@@ -671,11 +685,17 @@ export class AgentSession {
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly hasOutstandingBashMonitorWake?: () => Promise<boolean>;
+  private readonly onToolEndYieldRequested?: () => void;
+  private readonly onWorkspaceTurnContinuationAbandoned?: (
+    metadata: WorkspaceTurnMuxMetadata
+  ) => Promise<void>;
   /**
    * Last published wake level (see setBashMonitorWakeOutstanding). Feeds the
    * tool-end yield flag together with the queue head.
    */
   private bashMonitorWakeOutstanding = false;
+  /** Last value pushed to the tool-end yield lever; edge detection for onToolEndYieldRequested. */
+  private toolEndYieldRequested = false;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -933,6 +953,8 @@ export class AgentSession {
       onPostCompactionStateChange,
       hasExternalSendPreflight,
       hasOutstandingBashMonitorWake,
+      onToolEndYieldRequested,
+      onWorkspaceTurnContinuationAbandoned,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -962,6 +984,8 @@ export class AgentSession {
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.hasOutstandingBashMonitorWake = hasOutstandingBashMonitorWake;
+    this.onToolEndYieldRequested = onToolEndYieldRequested;
+    this.onWorkspaceTurnContinuationAbandoned = onWorkspaceTurnContinuationAbandoned;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -6620,14 +6644,22 @@ export class AgentSession {
    * Tool-end yield flag = queue head is tool-end ∪ (queue empty ∧ wake level), mirroring
    * hasPendingToolEndInput's arbitration. `queueHeadToolEnd` lets stream-end / clear paths
    * assert the queue contribution is gone before the queue itself is observed empty.
+   *
+   * This is the single place the effective flag is computed, so it also owns the rising
+   * edge: a turn-end head that is cleared, removed, or promoted while the wake level is high
+   * makes the lever effective without any enqueue or level publish, and the consequence
+   * (backgrounding foreground waits) must follow that edge, not those events (Codex P2
+   * PRRT_kwDOPxxmWM6fGVw_).
    */
   private syncToolEndYieldRequested(
     queueHeadToolEnd = this.messageQueue.getNextDispatchableMode() === "tool-end"
   ): void {
-    this.backgroundProcessManager.setMessageQueued(
-      this.workspaceId,
-      queueHeadToolEnd || (this.bashMonitorWakeOutstanding && this.messageQueue.isEmpty())
-    );
+    const requested =
+      queueHeadToolEnd || (this.bashMonitorWakeOutstanding && this.messageQueue.isEmpty());
+    const rising = requested && !this.toolEndYieldRequested;
+    this.toolEndYieldRequested = requested;
+    this.backgroundProcessManager.setMessageQueued(this.workspaceId, requested);
+    if (rising) this.onToolEndYieldRequested?.();
   }
 
   /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
@@ -7496,6 +7528,12 @@ export class AgentSession {
     });
     if (!updateResult.success) {
       throw new Error(`Failed to clear skipped pending follow-up: ${updateResult.error}`);
+    }
+    // Every discard path funnels here, so this is the one place that knows the delegated
+    // turn's continuation is gone for good (Codex P2 PRRT_kwDOPxxmWM6fGVxG).
+    const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
+    if (workspaceTurnMetadata != null) {
+      await this.onWorkspaceTurnContinuationAbandoned?.(workspaceTurnMetadata);
     }
   }
 

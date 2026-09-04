@@ -1147,6 +1147,35 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("routes the session's tool-end yield edge to backgroundForegroundWaitsForWorkspace", async () => {
+    // Which transitions raise the edge is the session's business
+    // (agentSession.queueDispatch.test.ts); the service only routes it.
+    const { service, cleanup } = await createWakeWiringService();
+    const workspaceId = "yield-edge-owner";
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ backgroundForegroundWaitsForWorkspace })
+    );
+    const session = service.getOrCreateSession(workspaceId);
+    try {
+      session.queueMessage("later", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      expect(backgroundForegroundWaitsForWorkspace).not.toHaveBeenCalled();
+      session.queueMessage("sooner", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        queueDispatchMode: "tool-end",
+      });
+      expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith(workspaceId);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("a high level backgrounds foreground waits only when it pulls the yield lever", async () => {
     // A turn-end queue head suppresses the wake cut (hasPendingToolEndInput arbitration), so
     // the same level must not end a foreground task_await early either: the stream would
@@ -1187,9 +1216,13 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(await internal.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId)).toBe(true);
       expect(backgroundForegroundWaitsForWorkspace).not.toHaveBeenCalled();
 
+      // Clearing the turn-end head makes the (still high) level effective with no enqueue
+      // and no level publish in between: the session's yield edge alone must background the
+      // waits (Codex P2 PRRT_kwDOPxxmWM6fGVw_).
       session.clearQueue();
-      expect(await internal.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId)).toBe(true);
       expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith(workspaceId);
+      expect(await internal.bashMonitorWakeReconciler.hasOutstandingWake(workspaceId)).toBe(true);
+      expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledTimes(1);
     } finally {
       session.dispose();
       await cleanup();
@@ -9696,63 +9729,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(askUserQuestionManager.getLatestPending("test-workspace")).toBeNull();
     expect(await settled).toBeInstanceOf(Error);
   });
-
-  // The sticky case: incoming mode is turn-end but the queue's effective mode is
-  // tool-end from a prior enqueue, so the wait still backgrounds.
-  test.each([
-    [
-      "backgrounds foreground task waits when queuing a tool-end message",
-      "tool-end",
-      "hello",
-      undefined,
-      true,
-    ],
-    [
-      "does not background foreground task waits when queuing a turn-end message",
-      "turn-end",
-      "hello",
-      "turn-end",
-      false,
-    ],
-    [
-      "does not background foreground task waits when queueMessage enqueues nothing",
-      null,
-      "   ",
-      undefined,
-      false,
-    ],
-    [
-      "backgrounds foreground task waits when effective queue mode is tool-end despite incoming turn-end",
-      "tool-end",
-      "hello",
-      "turn-end",
-      true,
-    ],
-  ] as const)(
-    "%s",
-    async (_name, effectiveQueueMode, message, queueDispatchMode, expectBackgrounded) => {
-      fakeSession.isBusy.mockReturnValue(true);
-      fakeSession.queueMessage.mockReturnValue(effectiveQueueMode);
-
-      const backgroundForegroundWaitsForWorkspace = mock(() => 0);
-      workspaceService.setAgentTaskIntegration(
-        makeAgentTaskIntegrationFake({ backgroundForegroundWaitsForWorkspace })
-      );
-
-      const result = await workspaceService.sendMessage("test-workspace", message, {
-        model: "openai:gpt-4o-mini",
-        agentId: "exec",
-        queueDispatchMode,
-      });
-
-      expect(result.success).toBe(true);
-      if (expectBackgrounded) {
-        expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace");
-      } else {
-        expect(backgroundForegroundWaitsForWorkspace).not.toHaveBeenCalled();
-      }
-    }
-  );
 
   test("registerSession clears persisted agent status for accepted user chat events", () => {
     const updateAgentStatus = spyOn(

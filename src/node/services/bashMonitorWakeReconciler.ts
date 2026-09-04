@@ -5,12 +5,14 @@ import * as path from "node:path";
 
 import type { MuxMessageMetadata } from "@/common/types/message";
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import { BASH_MONITOR_WAKE_HEADINGS } from "@/common/utils/machineTurnPrompts";
 import type {
   BashMonitorLostSummary,
   BashMonitorRegistryRecord,
   BashMonitorTerminalSummary,
 } from "@/node/services/bashMonitorRegistryStore";
+import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -163,7 +165,14 @@ interface DerivedSignal {
   retired: boolean;
 }
 
-/** A wake handed to `onWake` whose acceptance/deferral has not settled yet. */
+/**
+ * The one wake handed to `onWake` for an owner at a time. Lifecycle: an *offered* dispatch leaves the slot
+ * either by withdrawal (defer / forgetDispatchFor / consumeCurrent) or by acceptance; an
+ * *accepted* dispatch leaves the slot only once its signals are durably consumed — by the
+ * reconcile pass that acknowledges them, by consumeCurrent, or by dispose. Withdrawal never
+ * applies to an accepted dispatch: its prompt row is already durable, so the signals are
+ * consumed whether or not the durability write has landed yet (Codex P2 PRRT_kwDOPxxmWM6fGVxB).
+ */
 interface DispatchState {
   signals: readonly DerivedSignal[];
   accepted: boolean;
@@ -483,7 +492,13 @@ export class BashMonitorWakeReconciler {
   ): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, () => {
       const state = this.states.get(ownerWorkspaceId);
-      if (state?.dispatch?.signals.some(covers) === true) state.dispatch = undefined;
+      if (
+        state?.dispatch != null &&
+        !state.dispatch.accepted &&
+        state.dispatch.signals.some(covers)
+      ) {
+        state.dispatch = undefined;
+      }
       return Promise.resolve();
     });
     this.scheduleReconcile(ownerWorkspaceId);
@@ -554,6 +569,10 @@ export class BashMonitorWakeReconciler {
 
   private async reconcileOnce(ownerWorkspaceId: string): Promise<void> {
     const dispatch = await this.locks.withLock(ownerWorkspaceId, async () => {
+      // An acknowledgment that failed at acceptance is retried first: on a throw the slot
+      // stays occupied and accepted, the loop's catch schedules the backoff retry, and no
+      // second wake is handed out meanwhile.
+      await this.acknowledgeAccepted(ownerWorkspaceId);
       const collected = await this.collect(ownerWorkspaceId, true);
       for (const readSettled of collected.deferredReads) {
         void readSettled.finally(() => this.scheduleReconcile(ownerWorkspaceId));
@@ -562,9 +581,9 @@ export class BashMonitorWakeReconciler {
       await this.cleanup(collected.autoConsumed);
 
       const state = this.state(ownerWorkspaceId);
-      // A wake already handed to the owner settles on its own (accept → watermarks advance
-      // and a reconcile is scheduled; defer → the owner re-arms a reconcile). Handing out a
-      // second one meanwhile could only duplicate or supersede the first.
+      // A wake already handed to the owner settles on its own (accept → acknowledged, and a
+      // reconcile is scheduled; defer → the owner re-arms a reconcile). Handing out a second
+      // one meanwhile could only duplicate or supersede the first.
       if (collected.signals.length === 0 || state.dispatch != null) return undefined;
       const next: DispatchState = { signals: collected.signals, accepted: false };
       state.dispatch = next;
@@ -601,19 +620,48 @@ export class BashMonitorWakeReconciler {
       return Promise.resolve();
     });
   }
+  /**
+   * The prompt row is durable: the dispatch's signals are consumed from here on, even if a
+   * full-history clear or process discard forgot the dispatch meanwhile. The flag flips first
+   * (collect() overlays an accepted dispatch onto the watermarks, so the level reads low and
+   * no duplicate derives whether or not the acknowledgment has landed); the acknowledgment
+   * itself is attempted inline and, if it throws, retried by the reconcile passes until it
+   * lands. Never throws: the caller is the owner's send, whose row already landed (Codex P2
+   * PRRT_kwDOPxxmWM6fGVxB).
+   */
   private async accept(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
-      // The prompt reached the model, so its signals are consumed even if a full-history
-      // clear or process discard forgot this dispatch meanwhile.
+      // Second call (onAcceptedPreStreamFailure): already consumed; any pending retry is the
+      // reconcile pass's.
       if (dispatch.accepted) return;
       dispatch.accepted = true;
-      const watermarks = await this.readWatermarks(ownerWorkspaceId);
-      await this.advanceWatermarks(ownerWorkspaceId, watermarks, dispatch.signals);
-      await this.cleanup(dispatch.signals);
       const state = this.state(ownerWorkspaceId);
-      if (state.dispatch === dispatch) state.dispatch = undefined;
+      // Withdrawn between the send's last admission gate and its row becoming durable
+      // (forgetDispatchFor / consumeCurrent take only this lock): re-occupy the slot so the
+      // acknowledgment covers these signals instead of re-deriving them into a duplicate wake.
+      state.dispatch ??= dispatch;
+      await this.acknowledgeAccepted(ownerWorkspaceId).catch((error: unknown) => {
+        log.warn("Bash monitor wake acknowledgment failed; the reconcile pass retries it", {
+          ownerWorkspaceId,
+          error: getErrorMessage(error),
+        });
+      });
     });
     this.scheduleReconcile(ownerWorkspaceId);
+  }
+
+  /**
+   * Durably consume the accepted dispatch's signals and free the slot. Caller holds the owner
+   * lock. Throws when durability fails, leaving the slot occupied and accepted for a retry.
+   */
+  private async acknowledgeAccepted(ownerWorkspaceId: string): Promise<void> {
+    const state = this.states.get(ownerWorkspaceId);
+    const dispatch = state?.dispatch;
+    if (state == null || dispatch?.accepted !== true) return;
+    const watermarks = await this.readWatermarks(ownerWorkspaceId);
+    await this.advanceWatermarks(ownerWorkspaceId, watermarks, dispatch.signals);
+    await this.cleanup(dispatch.signals);
+    if (state.dispatch === dispatch) state.dispatch = undefined;
   }
 
   private async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
@@ -684,6 +732,12 @@ export class BashMonitorWakeReconciler {
       }
     }
     if (pruned) await this.writeWatermarks(ownerWorkspaceId, watermarks);
+
+    // An accepted dispatch is consumed whether or not its acknowledgment has been written yet
+    // (the write may have failed and be awaiting retry). Overlaying it makes derive() treat
+    // those signals as delivered, so level reads stay low and nothing re-derives a duplicate.
+    const accepted = this.states.get(ownerWorkspaceId)?.dispatch;
+    if (accepted?.accepted === true) applySignalsToWatermarks(watermarks, accepted.signals);
 
     const signals: DerivedSignal[] = [];
     const autoConsumed: DerivedSignal[] = [];
@@ -948,29 +1002,7 @@ export class BashMonitorWakeReconciler {
     signals: readonly DerivedSignal[]
   ): Promise<void> {
     if (signals.length === 0) return;
-    for (const signal of signals) {
-      const previous = watermarks.get(signal.key);
-      watermarks.set(signal.key, {
-        processId: signal.processId,
-        createdAt: signal.createdAt,
-        ...(signal.matchOffset != null
-          ? {
-              matchedThroughOffset: Math.max(
-                signal.matchOffset,
-                previous?.matchedThroughOffset ?? -1
-              ),
-            }
-          : previous?.matchedThroughOffset != null
-            ? { matchedThroughOffset: previous.matchedThroughOffset }
-            : {}),
-        ...(signal.terminal != null
-          ? { terminalSettledAt: signal.terminal.settledAt }
-          : previous?.terminalSettledAt != null
-            ? { terminalSettledAt: previous.terminalSettledAt }
-            : {}),
-        ...(signal.kind === "monitor-lost" || previous?.lost === true ? { lost: true } : {}),
-      });
-    }
+    applySignalsToWatermarks(watermarks, signals);
     await this.writeWatermarks(ownerWorkspaceId, watermarks);
   }
 
@@ -1066,5 +1098,35 @@ export class BashMonitorWakeReconciler {
     } catch {
       // Best-effort compatibility cleanup must not block live wake delivery.
     }
+  }
+}
+
+/** Fold delivered signals into the in-memory watermark map (idempotent per signal). */
+function applySignalsToWatermarks(
+  watermarks: Map<string, WatermarkEntry>,
+  signals: readonly DerivedSignal[]
+): void {
+  for (const signal of signals) {
+    const previous = watermarks.get(signal.key);
+    watermarks.set(signal.key, {
+      processId: signal.processId,
+      createdAt: signal.createdAt,
+      ...(signal.matchOffset != null
+        ? {
+            matchedThroughOffset: Math.max(
+              signal.matchOffset,
+              previous?.matchedThroughOffset ?? -1
+            ),
+          }
+        : previous?.matchedThroughOffset != null
+          ? { matchedThroughOffset: previous.matchedThroughOffset }
+          : {}),
+      ...(signal.terminal != null
+        ? { terminalSettledAt: signal.terminal.settledAt }
+        : previous?.terminalSettledAt != null
+          ? { terminalSettledAt: previous.terminalSettledAt }
+          : {}),
+      ...(signal.kind === "monitor-lost" || previous?.lost === true ? { lost: true } : {}),
+    });
   }
 }

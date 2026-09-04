@@ -150,7 +150,13 @@ describe("AgentSession continue-message agentId fallback", () => {
     historyCleanup = undefined;
   });
 
-  const createSession = async (messages: MuxMessage[] = []) => {
+  const createSession = async (
+    messages: MuxMessage[] = [],
+    hooks: Pick<
+      ConstructorParameters<typeof AgentSession>[0],
+      "onWorkspaceTurnContinuationAbandoned"
+    > = {}
+  ) => {
     const { historyService, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     for (const message of messages) {
@@ -164,6 +170,7 @@ describe("AgentSession continue-message agentId fallback", () => {
       aiService: createAiService(),
       initStateManager: createInitStateManager(),
       backgroundProcessManager: createBackgroundProcessManager(),
+      ...hooks,
     });
     sessions.push(session);
 
@@ -311,6 +318,58 @@ describe("AgentSession continue-message agentId fallback", () => {
       throw new Error(`Expected history read to succeed: ${lastMessages.error}`);
     }
     expect(lastMessages.data[0]?.metadata?.muxMetadata).toEqual({ type: "compaction-summary" });
+  });
+
+  test("abandoning a follow-up that carries a delegated turn settles that turn", async () => {
+    // A bash-monitor wake cut a delegated turn; the wake's on-send compaction stamped the
+    // correlation on its follow-up. If a manual send wins the idle race, nothing else can
+    // settle the owner's waiter (the compaction stream-end is uncorrelated and no later send
+    // inherits the metadata), so the discard itself must (Codex P2 PRRT_kwDOPxxmWM6fGVxG).
+    const workspaceTurnMetadata = {
+      type: "workspace-turn-task",
+      taskHandleId: "wst_abandoned",
+      ownerWorkspaceId: "parent-abandoned",
+      turnId: "turn-abandoned",
+    } as const;
+    const wakeFollowUp: CompactionFollowUpRequest = {
+      text: "monitor matched",
+      model: "openai:gpt-4o",
+      agentId: "exec",
+      muxMetadata: { type: "bash-monitor-wake", records: [] },
+      workspaceTurnMetadata,
+      dispatchOptions: { requireIdle: true },
+    };
+    const abandoned = mock(
+      (_metadata: NonNullable<CompactionFollowUpRequest["workspaceTurnMetadata"]>) =>
+        Promise.resolve()
+    );
+    const { session, historyService, internals } = await createSession(
+      [compactionSummaryMessage("summary-wake", wakeFollowUp)],
+      { onWorkspaceTurnContinuationAbandoned: abandoned }
+    );
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => true;
+
+    expect(await internals.dispatchPendingFollowUp()).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+    expect(abandoned).toHaveBeenCalledTimes(1);
+    expect(abandoned).toHaveBeenCalledWith(workspaceTurnMetadata);
+    const lastMessages = await historyService.getLastMessages("ws", 1);
+    expect(lastMessages.success && lastMessages.data[0]?.metadata?.muxMetadata).toEqual({
+      type: "compaction-summary",
+    });
+
+    // A follow-up that is dispatched is the continuation itself: nothing to settle.
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => false;
+    await historyService.appendToHistory(
+      "ws",
+      compactionSummaryMessage("summary-wake-2", wakeFollowUp)
+    );
+    expect(await internals.dispatchPendingFollowUp()).toBe(true);
+    expect(internals.sendMessage).toHaveBeenCalledTimes(1);
+    expect(abandoned).toHaveBeenCalledTimes(1);
   });
 
   test("dispatchPendingFollowUp removes heartbeat reset boundaries when idle-only follow-ups are skipped", async () => {

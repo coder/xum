@@ -111,6 +111,7 @@ export interface AgentSessionHarnessOptions {
   mcpServerManager?: MCPServerManager;
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   hasOutstandingBashMonitorWake?: () => Promise<boolean>;
+  onToolEndYieldRequested?: () => void;
   captureEvents?: boolean;
 }
 
@@ -156,6 +157,7 @@ export async function createAgentSessionHarness(
     backgroundProcessManager,
     onCompactionComplete: options.onCompactionComplete,
     hasOutstandingBashMonitorWake: options.hasOutstandingBashMonitorWake,
+    onToolEndYieldRequested: options.onToolEndYieldRequested,
   });
 
   const events: WorkspaceChatMessage[] = [];

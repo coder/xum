@@ -4678,6 +4678,27 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * The target workspace abandoned the continuation carrying this correlation (a wake's
+   * compaction follow-up skipped for a racing manual send, or an inadmissible summary).
+   * Nothing downstream can settle the turn: the compaction stream-end is ignored by
+   * finalizeWorkspaceTurnFromStreamEnd and no later send inherits the correlation, so the
+   * owner would wait until restart. Settle it as superseded now; if the manual turn does run,
+   * its uncorrelated stream-end finds the record already settled (Codex P2
+   * PRRT_kwDOPxxmWM6fGVxG).
+   */
+  async settleSupersededWorkspaceTurnContinuation(
+    workspaceId: string,
+    muxMetadata: WorkspaceTurnMuxMetadata
+  ): Promise<void> {
+    await this.settleWorkspaceTurnContinuationFailure(
+      workspaceId,
+      muxMetadata,
+      "interrupted",
+      WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR
+    );
+  }
+
   // A queued report can defer the preceding stream-end. If dispatch then fails, settle that
   // exact turn here because no replacement stream-end can arrive.
   async settleWorkspaceTurnContinuationFailure(

@@ -24181,6 +24181,57 @@ describe("TaskService", () => {
     });
   });
 
+  test("settleSupersededWorkspaceTurnContinuation settles the abandoned continuation and wakes the waiter", async () => {
+    // The target abandoned a compaction follow-up carrying this correlation (a manual send
+    // won the idle race): no stream-end will ever carry the correlation again, so the
+    // abandonment itself settles the handle (Codex P2 PRRT_kwDOPxxmWM6fGVxG).
+    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const waited = workspaceTurnManagerFor(taskService)
+      .waitForWorkspaceTurn("wst_handle", { requestingWorkspaceId: parentId, timeoutMs: 5_000 })
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+
+    await taskService.settleSupersededWorkspaceTurnContinuation(
+      "childworkspace",
+      workspaceTurnMuxMetadata(parentId)
+    );
+
+    const error = await waited;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("superseded by new input");
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "interrupted",
+      error:
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+    });
+
+    // Idempotent on a settled record, and a no-op for a correlation that is not this turn.
+    await taskService.settleSupersededWorkspaceTurnContinuation(
+      "childworkspace",
+      workspaceTurnMuxMetadata(parentId)
+    );
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "interrupted",
+    });
+  });
+
+  test("settleSupersededWorkspaceTurnContinuation ignores a stale correlation", async () => {
+    const { parentId, taskService } = await startWorkspaceTurnForTest();
+
+    await taskService.settleSupersededWorkspaceTurnContinuation(
+      "childworkspace",
+      workspaceTurnMuxMetadata(parentId, "wst_handle", "some-other-turn")
+    );
+    await taskService.settleSupersededWorkspaceTurnContinuation(
+      "someone-else",
+      workspaceTurnMuxMetadata(parentId)
+    );
+
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({ status: "running" });
+  });
+
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";
 
   function ownerFollowUpCutter(ownerWorkspaceId: string, successorHandleId: string) {

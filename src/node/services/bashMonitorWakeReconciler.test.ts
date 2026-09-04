@@ -56,6 +56,7 @@ describe("BashMonitorWakeReconciler", () => {
   let dispatches: BashMonitorWakeDispatch[];
   let dispatchOutcome: "in-flight" | "deferred";
   let acknowledged: Array<{ processId: string; matchedThroughOffset?: number }>;
+  let acknowledgeError: Error | undefined;
   let removed: string[];
   let removedOwners: string[];
   let dropped: string[];
@@ -70,16 +71,18 @@ describe("BashMonitorWakeReconciler", () => {
     dispatches = [];
     dispatchOutcome = "in-flight";
     acknowledged = [];
+    acknowledgeError = undefined;
     removed = [];
     removedOwners = [];
     dropped = [];
     droppedGenerations = [];
-    reconciler = new BashMonitorWakeReconciler({
+    const current = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
         pullMonitorWakeSignals: () => live,
         getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
         acknowledgeMonitorWake: (processId, _generation, matchedThroughOffset) => {
+          if (acknowledgeError != null) throw acknowledgeError;
           acknowledged.push({
             processId,
             ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
@@ -108,10 +111,14 @@ describe("BashMonitorWakeReconciler", () => {
         recordTerminal: () => undefined,
       },
       onWake: (dispatch) => {
+        // A pass scheduled by the previous test's acceptance may still be draining; keep its
+        // hand-outs from leaking into this test's `dispatches`.
+        if (reconciler !== current) return "deferred";
         dispatches.push(dispatch);
         return dispatchOutcome;
       },
     });
+    reconciler = current;
   });
 
   afterEach(async () => {
@@ -234,6 +241,41 @@ describe("BashMonitorWakeReconciler", () => {
     await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
     await reconciler.outputShown(OWNER, "proc");
     expect(dispatches[0].isCurrent()).toBe(true);
+  });
+
+  test("a failed acknowledgment keeps the accepted wake consumed and retries it", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+
+    // The owner's row is durable, so acceptance must not fail the send: it resolves, and the
+    // wake reads as consumed (level low, no duplicate hand-out) while durability is pending.
+    acknowledgeError = new Error("disk full");
+    await dispatches[0].onAccepted();
+    expect(dispatches[0].isCurrent()).toBe(true);
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+    await expect(reconciler.reconcile(OWNER)).rejects.toThrow("disk full");
+    expect(dispatches).toHaveLength(1);
+
+    // Withdrawals never apply to an accepted dispatch: dropping it here would re-derive the
+    // same signals into a second prompt once the store recovers.
+    await reconciler.outputShown(OWNER, "proc");
+    await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
+    await expect(reconciler.reconcile(OWNER)).rejects.toThrow("disk full");
+    expect(dispatches).toHaveLength(1);
+
+    acknowledgeError = undefined;
+    await reconciler.reconcile(OWNER);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    expect(dispatches).toHaveLength(1);
+
+    // The slot is free again: a newer match dispatches normally.
+    live = [
+      liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
+    ];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].prompt).toContain("READY again");
   });
 
   test("disposal lowers the published level and retires the in-flight wake", async () => {
