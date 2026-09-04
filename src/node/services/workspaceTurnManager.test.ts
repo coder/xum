@@ -308,6 +308,77 @@ describe("WorkspaceTurnManager", () => {
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
 
+  test("shared desktop execution mirror rejects stale active and terminal callbacks", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push(
+        projectWorkspace(projectPath, "child", "child", {
+          parentWorkspaceId: parentId,
+          taskStatus: "reported",
+          runtimeConfig: { type: "local" },
+          taskDesktopOwnerWorkspaceId: parentId,
+          taskExecutionId: "new",
+          taskExecutionStatus: "running",
+        })
+      );
+      return cfg;
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    const internals = taskService as unknown as {
+      activeWorkspaceTurnHandleByWorkspaceId: Map<
+        string,
+        { handleId: string; ownerWorkspaceId: string; accepted: boolean }
+      >;
+    };
+    internals.activeWorkspaceTurnHandleByWorkspaceId.set("child", {
+      handleId: "new",
+      ownerWorkspaceId: parentId,
+      accepted: true,
+    });
+    for (const status of ["queued", "starting", "running", "completed", null] as const) {
+      await taskService.updateAgentTaskExecutionState("child", "old", status);
+      expect(findWorkspaceInConfig(config, "child")?.taskExecutionId).toBe("new");
+      expect(findWorkspaceInConfig(config, "child")?.taskExecutionStatus).toBe("running");
+    }
+    await taskService.updateAgentTaskExecutionState("child", "new", "completed");
+    await taskService.updateAgentTaskExecutionState("child", "old", "running");
+    await taskService.updateAgentTaskExecutionState("child", "new", "running");
+    expect(findWorkspaceInConfig(config, "child")?.taskExecutionStatus).toBe("completed");
+  });
+
+  test("shared desktop active mirror refuses a missing target or competing child", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push(
+        ...["missing", "child", "competitor"].map((id) =>
+          projectWorkspace(projectPath, id, id, {
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            taskStatus: id === "competitor" ? "running" : "reported",
+            runtimeConfig: { type: "local" },
+            taskDesktopOwnerWorkspaceId: id === "missing" ? "deleted" : parentId,
+            taskExecutionId: id,
+            taskExecutionStatus: "completed",
+          })
+        )
+      );
+      return cfg;
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    // Exercise admission itself deterministically; startup normalization may settle dead streams.
+    for (const id of ["missing", "child"]) {
+      const failure = await taskService.updateAgentTaskExecutionState(id, id, "running").then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect(findWorkspaceInConfig(config, id)?.taskExecutionStatus).toBe("completed");
+    }
+    expect(taskService.getLiveWorkspaceTurnRegistration("child")).toBeUndefined();
+  });
+
   async function startWorkspaceTurnForTest(
     options: {
       stableIds?: string[];
@@ -3151,67 +3222,93 @@ describe("WorkspaceTurnManager", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
-  test("internal workspace-turn execution can continue a reported descendant agent workspace", async () => {
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["followuphandle", "followupturn"]);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    const childWorkspaceId = "reported-child-workspace";
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push({
-        path: path.join(projectPath, "reported-child"),
-        id: childWorkspaceId,
-        name: "agent_explore_reported_child",
-        parentWorkspaceId: parentId,
-        agentType: "explore",
-        taskStatus: "reported",
-        reportedAt: "2026-06-19T00:00:00.000Z",
-        aiSettingsByAgent: {
-          explore: { model: "anthropic:claude-sonnet-4-6", thinkingLevel: "medium" },
-        },
-        taskModelString: "openai:gpt-5.2",
-        taskThinkingLevel: "high",
-        runtimeConfig: { type: "local" },
+  test.each(["isolated", "shared", "busy"] as const)(
+    "internal workspace-turn reported child continuation (%s desktop)",
+    async (desktop) => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["followuphandle", "followupturn"]);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const childWorkspaceId = "reported-child-workspace";
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push({
+          path: path.join(projectPath, "reported-child"),
+          id: childWorkspaceId,
+          name: "agent_explore_reported_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          taskDesktopOwnerWorkspaceId: desktop === "isolated" ? undefined : parentId,
+          reportedAt: "2026-06-19T00:00:00.000Z",
+          aiSettingsByAgent: {
+            explore: { model: "anthropic:claude-sonnet-4-6", thinkingLevel: "medium" },
+          },
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "high",
+          runtimeConfig: { type: "local" },
+        });
+        if (desktop === "busy") {
+          project.workspaces.push(
+            projectWorkspace(projectPath, "competitor", "competitor", {
+              parentWorkspaceId: parentId,
+              agentId: "explore",
+              taskStatus: "running",
+              taskDesktopOwnerWorkspaceId: parentId,
+              runtimeConfig: { type: "local" },
+            })
+          );
+        }
+        return cfg;
       });
-      return cfg;
-    });
 
-    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
-      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
-      await internal?.onAccepted?.();
-      return Ok(undefined);
-    });
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createWorkspaceTurnManagerHarness(config, { workspaceService });
+      const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await internal?.onAccepted?.();
+        return Ok(undefined);
+      });
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const { taskService } = createWorkspaceTurnManagerHarness(config, { workspaceService });
 
-    const result = await taskService.createWorkspaceTurn({
-      ownerWorkspaceId: parentId,
-      prompt: "Investigate the follow-up root cause",
-      title: "Continue reported child",
-      allowAgentWorkspace: true,
-      workspace: { mode: "existing", workspaceId: childWorkspaceId },
-    });
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "Investigate the follow-up root cause",
+        title: "Continue reported child",
+        allowAgentWorkspace: true,
+        workspace: { mode: "existing", workspaceId: childWorkspaceId },
+      });
 
-    expect(result).toEqual(
-      Ok({
-        taskId: "wst_followuphandle",
-        kind: "workspace_turn",
-        status: "running",
-        workspaceId: childWorkspaceId,
-      })
-    );
-    expect(sendMessage).toHaveBeenCalledWith(
-      childWorkspaceId,
-      "Investigate the follow-up root cause",
-      expect.objectContaining({
-        model: "anthropic:claude-sonnet-4-6",
-        agentId: "explore",
-        thinkingLevel: "medium",
-      }),
-      expect.objectContaining({ requireIdle: true })
-    );
-  });
+      if (desktop === "busy") {
+        expect(result.success).toBe(false);
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(findWorkspaceInConfig(config, childWorkspaceId)?.taskExecutionId).toBeUndefined();
+        expect(await new TaskHandleStore(config).listAllWorkspaceTurns()).toHaveLength(0);
+        return;
+      }
+      expect(findWorkspaceInConfig(config, childWorkspaceId)?.taskDesktopOwnerWorkspaceId).toBe(
+        desktop === "isolated" ? undefined : parentId
+      );
+      expect(findWorkspaceInConfig(config, childWorkspaceId)?.taskExecutionStatus).toBe("running");
+      expect(result).toEqual(
+        Ok({
+          taskId: "wst_followuphandle",
+          kind: "workspace_turn",
+          status: "running",
+          workspaceId: childWorkspaceId,
+        })
+      );
+      expect(sendMessage).toHaveBeenCalledWith(
+        childWorkspaceId,
+        "Investigate the follow-up root cause",
+        expect.objectContaining({
+          model: "anthropic:claude-sonnet-4-6",
+          agentId: "explore",
+          thinkingLevel: "medium",
+        }),
+        expect.objectContaining({ requireIdle: true })
+      );
+    }
+  );
 
   test("late direct-parent snapshot consumption suppresses duplicate continuation delivery", async () => {
     const config = await createTestConfig(rootDir);

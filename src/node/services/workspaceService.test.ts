@@ -9206,6 +9206,31 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   });
 
+  test.each(["sendMessage", "resumeStream"] as const)(
+    "%s refuses the stream when desktop task admission fails",
+    async (operation) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          markInterruptedTaskRunning: mock(() =>
+            Promise.reject(new Error("Desktop is controlled by another child"))
+          ),
+          restoreInterruptedTaskAfterResumeFailure,
+        })
+      );
+      const options = { model: "openai:gpt-4o-mini", agentId: "exec" };
+      const result =
+        operation === "sendMessage"
+          ? await workspaceService.sendMessage("test-workspace", "hello", options)
+          : await workspaceService.resumeStream("test-workspace", options);
+      expect(result.success).toBe(false);
+      expect(fakeSession.sendMessage).not.toHaveBeenCalled();
+      expect(fakeSession.resumeStream).not.toHaveBeenCalled();
+      expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
+    }
+  );
+
   // Send outcome drives interrupted-task rollback: a successful send keeps the
   // restored running status; a failed or thrown send rolls it back.
   test.each([
@@ -9241,7 +9266,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     if (expectSuccess) {
       expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
     } else {
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+        "test-workspace",
+        undefined
+      );
     }
   });
 
@@ -9287,7 +9315,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(markInterruptedTaskRunning).toHaveBeenCalledWith("test-workspace");
 
     await startupFailureHandled.promise;
-    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+      "test-workspace",
+      undefined
+    );
   });
 
   // Resume outcome drives interrupted-task rollback: only a resume that actually
@@ -9325,7 +9356,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     if (resumeOutcome === "started") {
       expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
     } else {
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+        "test-workspace",
+        undefined
+      );
     }
   });
 
