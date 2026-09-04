@@ -425,11 +425,58 @@ describe("ContinuousCompactor", () => {
     summarize.mockResolvedValue(null);
     release.resolve();
     expect(await applying).toBe("none");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(completed).not.toHaveBeenCalled();
+    expect((await rows())[0].id).toBe("old-user");
+  });
+
+  it.each(["reset", "append"] as const)(
+    "rejects %s while waiting for the actual history write",
+    async (mutation) => {
+      await seedConversation();
+      await stage();
+      const entered = deferred();
+      const release = deferred();
+      const original = store.historyService.persistBoundaryWithTailCopies.bind(
+        store.historyService
+      );
+      spyOn(store.historyService, "persistBoundaryWithTailCopies").mockImplementationOnce(
+        async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return original(...args);
+        }
+      );
+      const applying = compactor.observe(context.thresholdPercent, context);
+      await entered.promise;
+      if (mutation === "reset") compactor.reset("archive");
+      else await seed(createMuxMessage("new-user", "user", "New information must survive"));
+      summarize.mockResolvedValue(null);
+      release.resolve();
+      expect(await applying).toBe("none");
+      if (mutation === "append") {
+        const job = eagerJob(compactor);
+        jobs.push(job);
+        await job;
+      }
+      expect((await rows())[0].id).toBe("old-user");
+      expect(completed).not.toHaveBeenCalled();
+      if (mutation === "append") expect((await rows()).at(-1)?.id).toBe("new-user");
+    }
+  );
+
+  it("does not stage a summary that itself exhausts the force budget", async () => {
+    await seedConversation();
+    summarize.mockResolvedValue({ ...summary, text: "x".repeat(context.contextWindowTokens * 4) });
+    await stage();
+    summarize.mockResolvedValue(null);
+    expect(await compactor.observe(forcePercent, context)).toBe("fallback");
     const job = eagerJob(compactor);
     jobs.push(job);
     await job;
-    expect(completed).not.toHaveBeenCalled();
     expect((await rows())[0].id).toBe("old-user");
+    expect(fastApply).not.toHaveBeenCalled();
   });
 
   async function seedLiveTurn() {
@@ -539,6 +586,52 @@ describe("ContinuousCompactor", () => {
     assert(summarizedAnswer, "The earlier completed step should be in the summarized head");
     expect(summarizedAnswer.parts).toEqual(answer.parts.slice(0, 1));
     expect(head.flatMap((row) => row.parts)).not.toContainEqual(answer.parts[1]);
+  });
+
+  it("retains the complete live assistant when its first exact step is the cut", async () => {
+    const answer = await seedLiveTurn();
+    const seeded = await rows();
+    const old = seeded.find((row) => row.id === "old-answer")!;
+    old.parts = [{ type: "text", text: "x".repeat(28_000) }];
+    expect((await store.historyService.updateHistory(workspaceId, old)).success).toBe(true);
+    const prompt = seeded.find((row) => row.id === "live-user")!;
+    prompt.parts = [{ type: "text", text: "y".repeat(8_000) }];
+    expect((await store.historyService.updateHistory(workspaceId, prompt)).success).toBe(true);
+    assert(live, "Expected an active stream");
+    live.parts = [{ type: "text", text: "one completed step" }];
+    live.stepStartIndices = [0];
+    live.currentStepStartIndex = 1;
+    const updated = {
+      ...answer,
+      parts: live.parts,
+      metadata: { ...answer.metadata, stepStartPartIndices: [0] },
+    };
+    expect((await store.historyService.updateHistory(workspaceId, updated)).success).toBe(true);
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(
+      await compactor.observe(context.thresholdPercent, { ...context, phase: "mid-stream" })
+    ).toBe("applied");
+    expect((await rows()).at(-1)?.parts).toEqual(updated.parts);
+  });
+
+  it("does not stop a live stream when the staged tail has already outgrown the force budget", async () => {
+    await seedLiveTurn();
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    assert(live, "Expected an active stream");
+    live.parts.push({ type: "text", text: "x".repeat(context.contextWindowTokens * 4) });
+    summarize.mockResolvedValue(null);
+    expect(await compactor.observe(forcePercent, { ...context, phase: "mid-stream" })).toBe(
+      "fallback"
+    );
+    const job = eagerJob(compactor);
+    jobs.push(job);
+    await job;
+    expect(fastApply).not.toHaveBeenCalled();
+    expect(streaming).toBe(true);
   });
 
   it("waits for the first completed live step instead of summarizing an unfinished turn", async () => {

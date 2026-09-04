@@ -80,6 +80,7 @@ describe("continuous compaction provider replay", () => {
       ];
       expect(
         await handler.persistContinuousCompaction({
+          shouldPersist: () => true,
           messages: before.data,
           text: "The bug is fixed; verification is in progress.",
           model: `${provider}:test-model`,
