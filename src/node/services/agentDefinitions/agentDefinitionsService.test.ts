@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import { describe, expect, spyOn, test } from "bun:test";
 
+import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -10,6 +11,8 @@ import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   discoverAgentDefinitions,
+  listAgentDefinitions,
+  type AgentDefinitionsContext,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentBody,
@@ -186,6 +189,71 @@ class TrackingRemotePathMappedRuntime extends RemotePathMappedRuntime {
 }
 
 describe("agentDefinitionsService", () => {
+  test.each([true, false])(
+    "Settings lists global-only Intuition despite conflicting project metadata (global disabled=%s)",
+    async (disabled) => {
+      using project = new DisposableTempDir("intuition-settings-project");
+      using home = new DisposableTempDir("intuition-settings-home");
+      const globalRoot = path.join(home.path, "agents");
+      const projectRoot = path.join(project.path, ".xum", "agents");
+      await fs.mkdir(globalRoot, { recursive: true });
+      await fs.mkdir(projectRoot, { recursive: true });
+      await fs.writeFile(
+        path.join(globalRoot, "global-base.md"),
+        `---\nname: Global base\ndisabled: ${disabled}\nai:\n  model: private:global-inherited\n---\nGlobal protocol.`
+      );
+      await fs.writeFile(
+        path.join(globalRoot, "intuition.md"),
+        "---\nname: Intuition\nbase: global-base\n---\nGlobal recall."
+      );
+      await fs.writeFile(
+        path.join(projectRoot, "intuition.md"),
+        `---\nname: Wrong project intuition\ndisabled: ${!disabled}\nai:\n  model: public:project-only\n---\nProject recall.`
+      );
+      await fs.writeFile(
+        path.join(projectRoot, "exec.md"),
+        "---\nname: Project Exec\nai:\n  model: private:project-exec\n---\nProject execution."
+      );
+      const config = new Config(home.path);
+      // Project-only listing does not use workspace initialization or AI services.
+      const context: AgentDefinitionsContext = {
+        config,
+        experimentsService: { isExperimentEnabled: () => false },
+        aiService: {
+          getWorkspaceMetadata: () => {
+            throw new Error("Unexpected workspace lookup");
+          },
+        },
+        initStateManager: {
+          waitForInit: () => {
+            throw new Error("Unexpected workspace initialization");
+          },
+        },
+      };
+      const list = (includeDisabled = false) =>
+        listAgentDefinitions(context, { projectPath: project.path, includeDisabled });
+      const all = await list(true);
+      expect(all.find((agent) => agent.id === "intuition")).toMatchObject({
+        name: "Intuition",
+        scope: "global",
+        aiDefaults: { model: "private:global-inherited" },
+      });
+      expect(all.find((agent) => agent.id === "exec")).toMatchObject({
+        name: "Project Exec",
+        scope: "project",
+        aiDefaults: { model: "private:project-exec" },
+      });
+      expect((await list()).some((agent) => agent.id === "intuition")).toBe(!disabled);
+      for (const enabled of [true, false]) {
+        await config.editConfig((cfg) => {
+          cfg.agentAiDefaults = { intuition: { enabled } };
+          return cfg;
+        });
+        expect((await list()).some((agent) => agent.id === "intuition")).toBe(enabled);
+      }
+    }
+  );
+
   test("project agents override global agents", async () => {
     using project = new DisposableTempDir("agent-defs-project");
     using global = new DisposableTempDir("agent-defs-global");

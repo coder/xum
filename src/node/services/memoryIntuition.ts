@@ -58,18 +58,26 @@ const STOP_WORDS = new Set(
   "and are but for from have into not that the their then there these this with you your".split(" ")
 );
 
+const cueSegmenter = new Intl.Segmenter("und", { granularity: "word" });
+
 function cueTokens(text: string): Set<string> {
-  // Adjacent Han/Kana characters match phrases embedded in unsegmented prose.
-  // Keep the existing Latin word/stopword rules rather than creating short-word noise.
-  const tokens = (text.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []).filter(
-    (token) => token.length >= 3 && !STOP_WORDS.has(token)
+  const normalized = text.toLowerCase();
+  // Keep filename stems and the existing Latin/numeric minimum and stopwords.
+  const tokens = new Set(
+    (normalized.match(/[\p{L}\p{N}_]+/gu) ?? []).filter(
+      (token) => token.length >= 3 && !STOP_WORDS.has(token)
+    )
   );
-  for (const run of text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ー]+/gu) ??
-    []) {
-    const characters = [...run];
-    for (let i = 1; i < characters.length; i++) tokens.push(characters[i - 1] + characters[i]);
+  // Unicode dictionary segmentation handles scripts without spaces, not just Han/Kana.
+  for (const { segment, isWordLike } of cueSegmenter.segment(normalized)) {
+    if (
+      isWordLike &&
+      !STOP_WORDS.has(segment) &&
+      (segment.length >= 3 || !/[\p{Script=Latin}\p{N}_]/u.test(segment))
+    )
+      tokens.add(segment);
   }
-  return new Set(tokens);
+  return tokens;
 }
 
 /** Rank the entire index before applying either prompt budget; zero-score rows fill spare space. */

@@ -137,9 +137,19 @@ describe("selectIndexForCue", () => {
     expect(selected.indexEntriesConsidered).toBe(many.length);
     expect(selected.indexEntriesOmitted).toBe(many.length - selected.entries.length);
   });
+  it("keeps matching Latin filename stems when Unicode word segmentation retains extensions", () => {
+    const target = entry("migration.md", "", "project");
+    const rows = [...Array.from({ length: 230 }, (_, i) => entry(`${i}.md`)), target];
+    expect(selectIndexForCue(rows, "migration").entries[0]).toEqual(target);
+  });
+
   it.each([
     ["数据库迁移", "数据库迁移要使用锁"],
     ["データベース移行", "データベース移行にはロックが必要"],
+    ["ฐานข้อมูล", "ฐานข้อมูลต้องใช้ล็อกก่อนย้าย"],
+    ["ຖານຂໍ້ມູນ", "ຖານຂໍ້ມູນຕ້ອງໃຊ້ການລັອກ"],
+    ["ទិន្នន័យ", "ទិន្នន័យត្រូវការចាក់សោមុនផ្ទេរ"],
+    ["ဒေတာဘေ့စ်", "ဒေတာဘေ့စ်ကိုရွှေ့မည်ဆိုလျှင်သော့ခတ်ပါ"],
   ])("retains no-whitespace cue %s behind a full unrelated global index", (cue, description) => {
     const target = entry("last.md", description, "project");
     const rows = [...Array.from({ length: 230 }, (_, i) => entry(`${i}.md`)), target];

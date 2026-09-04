@@ -63,10 +63,8 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
-import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
-import { resolveAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { resolveHeadlessAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import type { AgentDefinitionPackage } from "@/common/types/agentDefinition";
-import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { log } from "@/node/services/log";
 import type { HistoryService } from "@/node/services/historyService";
 import { runMemoryHarvest } from "@/node/services/memoryHarvest";
@@ -168,38 +166,7 @@ export function resolveHeadlessAgentModelString(
   }).selected.model;
 }
 
-/**
- * Resolve a headless agent definition: a user override at <muxRoot>/agents/<agentId>.md
- * (global agent scope) shadows the built-in definition, like any other agent.
- * `muxRoot` is Config.rootDir — NOT a hardcoded ~/.xum — so dev builds
- * (~/.xum-dev), MUX_ROOT sandboxes, and tests all stay isolated.
- * Host-side read only — headless runs are runtime-independent, so project-scope
- * agent overrides (which need a live checkout) are intentionally not resolved.
- * Shared with the debug CLI.
- */
-export async function resolveHeadlessAgentDefinition(
-  muxRoot: string,
-  agentId: string
-): Promise<AgentDefinitionPackage | null> {
-  assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
-  try {
-    const definition = await resolveAgentDefinition(new LocalRuntime(muxRoot), muxRoot, agentId, {
-      // Headless tools have no live checkout: never consult repo overrides or plugins.
-      roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
-    });
-    const body = definition.body.trim();
-    // Preserve legacy frontmatter-only overrides without discarding their effective metadata.
-    const fallbackBody = getBuiltInAgentDefinitions().find((entry) => entry.id === agentId)?.body;
-    return { ...definition, body: body || (fallbackBody ?? "") };
-  } catch (error) {
-    // Invalid inheritance must not silently send memory using another definition/model.
-    log.warn("[HeadlessAgent] failed to resolve definition", {
-      agentId,
-      error: getErrorMessage(error),
-    });
-    return null;
-  }
-}
+export { resolveHeadlessAgentDefinition };
 
 export async function resolveHeadlessAgentBody(
   muxRoot: string,

@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -413,14 +414,12 @@ async function readAgentDescriptorFromFile(
   }
 }
 
-function buildBuiltInAgentDescriptor(
-  pkg: ReturnType<typeof getBuiltInAgentDefinitions>[number]
-): AgentDefinitionDescriptor {
+function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescriptor {
   const { selectable } = resolveAgentVisibility(pkg.frontmatter.ui);
 
   return {
     id: pkg.id,
-    scope: "built-in",
+    scope: pkg.scope,
     name: pkg.frontmatter.name,
     description: pkg.frontmatter.description,
     uiSelectable: selectable,
@@ -523,12 +522,12 @@ export async function discoverAgentDefinitions(
   for (const pkg of getBuiltInAgentDefinitions()) {
     if (dedupeById) {
       if (!byId.has(pkg.id)) {
-        byId.set(pkg.id, buildBuiltInAgentDescriptor(pkg));
+        byId.set(pkg.id, buildAgentDescriptor(pkg));
       }
       continue;
     }
 
-    discovered.push(buildBuiltInAgentDescriptor(pkg));
+    discovered.push(buildAgentDescriptor(pkg));
   }
 
   // Return all discovered agents (including those disabled by front-matter).
@@ -949,10 +948,44 @@ export async function resolveAgentFrontmatter(
   return (await resolveAgentDefinition(runtime, workspacePath, agentId, options)).frontmatter;
 }
 
-export type AgentDefinitionsContext = Pick<
-  ORPCContext,
-  "config" | "aiService" | "experimentsService" | "initStateManager"
->;
+/**
+ * Resolve a headless agent definition: a user override at <muxRoot>/agents/<agentId>.md
+ * (global agent scope) shadows the built-in definition, like any other agent.
+ * `muxRoot` is Config.rootDir — NOT a hardcoded ~/.xum — so dev builds
+ * (~/.xum-dev), MUX_ROOT sandboxes, and tests all stay isolated.
+ * Host-side read only — headless runs are runtime-independent, so project-scope
+ * agent overrides (which need a live checkout) are intentionally not resolved.
+ * Shared with the debug CLI.
+ */
+export async function resolveHeadlessAgentDefinition(
+  muxRoot: string,
+  agentId: string
+): Promise<AgentDefinitionPackage | null> {
+  assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
+  try {
+    const definition = await resolveAgentDefinition(new LocalRuntime(muxRoot), muxRoot, agentId, {
+      // Headless tools have no live checkout: never consult repo overrides or plugins.
+      roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
+    });
+    const body = definition.body.trim();
+    // Preserve legacy frontmatter-only overrides without discarding their effective metadata.
+    const fallbackBody = getBuiltInAgentDefinitions().find((entry) => entry.id === agentId)?.body;
+    return { ...definition, body: body || (fallbackBody ?? "") };
+  } catch (error) {
+    // Invalid inheritance must not silently send memory using another definition/model.
+    log.warn("[HeadlessAgent] failed to resolve definition", {
+      agentId,
+      error: getErrorMessage(error),
+    });
+    return null;
+  }
+}
+
+export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
+  aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata">;
+  experimentsService: Pick<ORPCContext["experimentsService"], "isExperimentEnabled">;
+  initStateManager: Pick<ORPCContext["initStateManager"], "waitForInit">;
+};
 
 export async function resolveAgentDiscoveryContext(
   context: AgentDefinitionsContext,
@@ -999,17 +1032,23 @@ export async function listAgentDefinitions(
   });
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
-    descriptors.map(async (descriptor) => {
+    descriptors.map(async (listedDescriptor) => {
+      let descriptor = listedDescriptor;
       try {
-        const resolvedFrontmatter = await resolveAgentFrontmatter(
-          runtime,
-          discoveryPath,
-          descriptor.id,
-          {
+        // Settings must show the same host-only Intuition definition used for paid recall,
+        // regardless of a selected workspace's project or plugin overrides.
+        const headless =
+          descriptor.id === "intuition"
+            ? await resolveHeadlessAgentDefinition(context.config.rootDir, descriptor.id)
+            : undefined;
+        if (headless === null) return null;
+        if (headless) descriptor = buildAgentDescriptor(headless);
+        const resolvedFrontmatter =
+          headless?.frontmatter ??
+          (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
             includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
-          }
-        );
+          }));
         if (
           isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
           input.includeDisabled !== true
