@@ -13733,7 +13733,6 @@ describe("WorkspaceService reorderPinned across projects", () => {
 
     const mockConfig: Partial<Config> = {
       srcDir: "/tmp/src",
-      getSessionDir: mock(() => "/tmp/test/sessions"),
       findWorkspace: mock((id: string) => {
         const found = findEntry(id);
         if (!found) return null;
