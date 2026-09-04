@@ -908,7 +908,9 @@ export const router = (authToken?: string) => {
       subscribeLogs: t
         .input(schemas.general.subscribeLogs.input)
         .output(schemas.general.subscribeLogs.output)
-        .handler(({ input, signal }) => subscribeLogs(input.level ?? "info", signal)),
+        .handler(({ context, input, signal }) =>
+          subscribeLogs(context, input.level ?? "info", signal)
+        ),
       restartApp: t
         .input(schemas.general.restartApp.input)
         .output(schemas.general.restartApp.output)

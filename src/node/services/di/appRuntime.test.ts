@@ -1,5 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Scheduler, Scope } from "effect";
 import { log } from "@/node/services/log";
 import { disposeAppRuntime, makeAppRuntime } from "./appRuntime";
 
@@ -13,6 +13,17 @@ describe("makeAppRuntime", () => {
     expect(app.managed.cachedContext).toBeDefined();
     expect(app.get(ProbeA).name).toBe("a");
     expect(Context.get(app.context, ProbeA)).toBe(app.get(ProbeA));
+  });
+
+  it("exports a context without build-fiber artifacts for subscription pulls", async () => {
+    const app = makeAppRuntime(Layer.succeed(ProbeA)({ name: "a" }));
+    try {
+      for (const key of [Scope.Scope, Layer.CurrentMemoMap, Scheduler.Scheduler]) {
+        expect(app.context.mapUnsafe.has(key.key)).toBe(false);
+      }
+    } finally {
+      await disposeAppRuntime(app.managed);
+    }
   });
 
   it("throws synchronously when a layer body suspends", () => {

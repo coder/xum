@@ -9,6 +9,9 @@
  * error propagation), not implementation literals.
  */
 import { describe, expect, test } from "bun:test";
+import { Context, Effect } from "effect";
+import { TestClock } from "effect/testing";
+import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import { EventEmitter } from "node:events";
 import { subscriptionIterable, type SubscriptionEmit } from "./streamBridge";
 
@@ -30,11 +33,12 @@ async function collect<T>(iterable: AsyncGenerator<T>, count: number): Promise<T
   return values;
 }
 
-describe("subscriptionIterable teardown", () => {
+describe.each([undefined, Context.empty()])("subscriptionIterable teardown (%p)", (context) => {
   test("listener count returns to baseline after client abort", async () => {
     const emitter = new EventEmitter();
     const controller = new AbortController();
     const iterable = subscriptionIterable<number>({
+      context,
       signal: controller.signal,
       subscribe: (emit) => {
         emitter.on("value", emit.push);
@@ -54,12 +58,15 @@ describe("subscriptionIterable teardown", () => {
 
     // Abort completes the generator normally (no throw) and detaches.
     await consumed;
+    await iterable.return(undefined);
+    await iterable.return(undefined);
     expect(emitter.listenerCount("value")).toBe(0);
   });
 
   test("consumer break (generator return) detaches the listener", async () => {
     const emitter = new EventEmitter();
     const iterable = subscriptionIterable<number>({
+      context,
       subscribe: (emit) => {
         emitter.on("value", emit.push);
         return () => emitter.off("value", emit.push);
@@ -80,6 +87,7 @@ describe("subscriptionIterable teardown", () => {
     const emitter = new EventEmitter();
     const boom = new Error("bootstrap failed");
     const iterable = subscriptionIterable<number>({
+      context,
       subscribe: (emit) => {
         emitter.on("value", emit.push);
         return () => emitter.off("value", emit.push);
@@ -100,6 +108,7 @@ describe("subscriptionIterable teardown", () => {
     const emitter = new EventEmitter();
     const controller = new AbortController();
     const iterable = subscriptionIterable<number>({
+      context,
       signal: controller.signal,
       subscribe: (emit) => {
         emitter.on("value", emit.push);
@@ -118,6 +127,7 @@ describe("subscriptionIterable teardown", () => {
   test("take completes the stream and detaches immediately", async () => {
     const emitter = new EventEmitter();
     const iterable = subscriptionIterable<number>({
+      context,
       subscribe: (emit) => {
         emitter.on("exit", emit.push);
         return () => emitter.off("exit", emit.push);
@@ -138,6 +148,7 @@ describe("subscriptionIterable teardown", () => {
     controller.abort();
     let subscribed = false;
     const iterable = subscriptionIterable<number>({
+      context,
       signal: controller.signal,
       subscribe: (emit) => {
         subscribed = true;
@@ -194,22 +205,30 @@ describe("subscriptionIterable ordering and buffering", () => {
   });
 
   test("initial value is delivered before events buffered while it was computed", async () => {
-    let emitHandle: SubscriptionEmit<string> | undefined;
-    const iterable = subscriptionIterable<string>({
-      subscribe: (emit) => {
-        emitHandle = emit;
-        return () => undefined;
-      },
-      initial: async () => {
-        // Event fires between attach and snapshot completion — it must not be
-        // lost, and it must arrive after the snapshot.
-        emitHandle?.push("during-initial");
-        await new Promise((resolve) => setTimeout(resolve, 1));
-        return "snapshot";
-      },
-    });
+    const app = makeAppRuntime(TestClock.layer());
+    try {
+      let emitHandle: SubscriptionEmit<string> | undefined;
+      const iterable = subscriptionIterable<string>({
+        context: app.context,
+        subscribe: (emit) => {
+          emitHandle = emit;
+          return () => undefined;
+        },
+        initial: async () => {
+          // Event fires between attach and snapshot completion — it must not be
+          // lost, and it must arrive after the snapshot.
+          emitHandle?.push("during-initial");
+          await app.managed.runPromise(Effect.sleep(1));
+          return "snapshot";
+        },
+      });
 
-    expect(await collect(iterable, 2)).toEqual(["snapshot", "during-initial"]);
+      const consumed = collect(iterable, 2);
+      await app.managed.runPromise(TestClock.adjust(1));
+      expect(await consumed).toEqual(["snapshot", "during-initial"]);
+    } finally {
+      await disposeAppRuntime(app.managed);
+    }
   });
 
   test("emit.end drains buffered values, then onEnd error surfaces", async () => {
@@ -237,23 +256,53 @@ describe("subscriptionIterable ordering and buffering", () => {
   });
 
   test("heartbeat values are injected while the subscription is idle", async () => {
+    const app = makeAppRuntime(TestClock.layer());
+    const controller = new AbortController();
+    let detached = 0;
+    const values: string[] = [];
+    const intervalMs = 1_000;
     const iterable = subscriptionIterable<string>({
-      heartbeat: { value: "heartbeat", intervalMs: 10 },
-      subscribe: () => () => undefined,
+      context: app.context,
+      signal: controller.signal,
+      heartbeat: { value: "heartbeat", intervalMs },
+      subscribe: () => () => {
+        detached += 1;
+      },
     });
-    expect(await collect(iterable, 2)).toEqual(["heartbeat", "heartbeat"]);
+    const consumed = (async () => {
+      for await (const value of iterable) values.push(value);
+    })();
+    try {
+      const startedAt = performance.now();
+      await app.managed.runPromise(TestClock.adjust(3 * intervalMs));
+      expect(values).toEqual(["heartbeat", "heartbeat", "heartbeat"]);
+      expect(performance.now() - startedAt).toBeLessThan(50);
+    } finally {
+      controller.abort();
+      await consumed;
+      await iterable.return(undefined);
+      await iterable.return(undefined);
+      await disposeAppRuntime(app.managed);
+    }
+    expect(detached).toBe(1);
   });
 
   test("nothing runs until the consumer starts pulling", async () => {
-    let subscribed = false;
-    const iterable = subscriptionIterable<number>({
-      subscribe: () => {
-        subscribed = true;
-        return () => undefined;
-      },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(subscribed).toBe(false);
-    await iterable.return(undefined);
+    const app = makeAppRuntime(TestClock.layer());
+    try {
+      let subscribed = false;
+      const iterable = subscriptionIterable<number>({
+        context: app.context,
+        subscribe: () => {
+          subscribed = true;
+          return () => undefined;
+        },
+      });
+      await app.managed.runPromise(TestClock.adjust(10));
+      expect(subscribed).toBe(false);
+      await iterable.return(undefined);
+    } finally {
+      await disposeAppRuntime(app.managed);
+    }
   });
 });
