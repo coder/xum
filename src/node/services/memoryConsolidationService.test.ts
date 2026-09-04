@@ -20,6 +20,9 @@ import {
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
+  resolveHeadlessAgentModelString,
+  resolveHeadlessAgentBody,
+  resolveHeadlessAgentDefinition,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { HistoryService } from "./historyService";
@@ -1502,6 +1505,183 @@ describe("MemoryConsolidationService", () => {
     // workspace in an endless multi-launch feedback loop.
     await fixture.service.runLaunchSweep(new Map([["ws-other", dayAgo]]));
     expect(fixture.modelCalls).toHaveLength(1);
+  });
+
+  it("resolves intuition independently through workspace override, global default, selected route, and app default", async () => {
+    using fixture = await createFixture();
+    const resolve = () => resolveHeadlessAgentModelString(fixture.config, "ws-dream", "intuition");
+    expect(resolve()).toBe(resolveDreamModelString(fixture.config, "ws-dream"));
+    await fixture.config.editConfig((cfg) => {
+      const workspace = cfg.projects.get("/projects/demo")!.workspaces[0];
+      workspace.agentId = "exec";
+      workspace.aiSettingsByAgent = {
+        exec: { model: "coder:private-route", thinkingLevel: "off" },
+      };
+      workspace.aiSettings = { model: "anthropic:stale-route", thinkingLevel: "off" };
+      cfg.agentAiDefaults = { dream: { modelString: "openai:dream-only" } };
+      return cfg;
+    });
+    expect(resolve()).toBe("coder:private-route");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults!.intuition = { modelString: "openai:global-intuition" };
+      return cfg;
+    });
+    expect(resolve()).toBe("openai:global-intuition");
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent!.intuition = {
+        model: "coder:workspace-intuition",
+        thinkingLevel: "off",
+      };
+      return cfg;
+    });
+    expect(resolve()).toBe("coder:workspace-intuition");
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("openai:dream-only");
+  });
+
+  it.each([false, true])(
+    "pins the resolved selected agent route ahead of stale buckets (Plan bucket: %s)",
+    async (stalePlan) => {
+      using fixture = await createFixture();
+      const selected = "private:exec-global";
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get("/projects/demo")!.workspaces[0];
+        workspace.agentId = "exec";
+        workspace.aiSettingsByAgent = stalePlan
+          ? { plan: { model: "openai:stale-plan", thinkingLevel: "off" } }
+          : {};
+        delete workspace.aiSettings;
+        cfg.agentAiDefaults = { exec: { modelString: selected } };
+        return cfg;
+      });
+      const resolve = () =>
+        resolveHeadlessAgentModelString(fixture.config, "ws-dream", "intuition", selected);
+      expect(resolve()).toBe(selected);
+      await fixture.config.editConfig((cfg) => {
+        cfg.agentAiDefaults!.intuition = { modelString: "openai:intuition-global" };
+        return cfg;
+      });
+      expect(resolve()).toBe("openai:intuition-global");
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent!.intuition = {
+          model: "private:intuition-workspace",
+          thinkingLevel: "off",
+        };
+        return cfg;
+      });
+      expect(resolve()).toBe("private:intuition-workspace");
+    }
+  );
+
+  it.each([true, false])(
+    "resolves headless self-inheritance with append=%s without reading project overrides",
+    async (append) => {
+      using fixture = await createFixture();
+      const builtin = await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition");
+      if (!builtin) throw new Error("Expected built-in intuition");
+      const globals = path.join(fixture.xumHome, "agents");
+      const projects = path.join(fixture.xumHome, ".xum", "agents");
+      await fsPromises.mkdir(globals, { recursive: true });
+      await fsPromises.mkdir(projects, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(projects, "intuition.md"),
+        "---\nname: Untrusted\nai:\n  model: public:wrong-route\n---\nProject prompt must not load."
+      );
+      await fsPromises.writeFile(
+        path.join(globals, "intuition.md"),
+        `---\nname: Intuition\nbase: intuition\ndisabled: true\nprompt:\n  append: ${append}\nai:\n  model: private:intuition\n---\nLocal memory guidance.`
+      );
+      const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition");
+      expect(resolved?.body).toBe(
+        append ? `${builtin.body}\n\nLocal memory guidance.` : "Local memory guidance."
+      );
+      expect(resolved?.frontmatter).toMatchObject({
+        disabled: true,
+        ai: { model: "private:intuition" },
+      });
+      expect(
+        resolveHeadlessAgentModelString(
+          fixture.config,
+          "ws-dream",
+          "intuition",
+          "openai:parent",
+          resolved?.frontmatter.ai
+        )
+      ).toBe("private:intuition");
+    }
+  );
+
+  it("resolves headless inherited AI and enablement with workspace/config/definition/parent precedence", async () => {
+    using fixture = await createFixture();
+    const globals = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(globals, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(globals, "private-base.md"),
+      "---\nname: Private base\ndisabled: true\nai:\n  model: private:inherited\n---\nInherited protocol."
+    );
+    await fsPromises.writeFile(
+      path.join(globals, "intuition.md"),
+      "---\nname: Intuition\nbase: private-base\n---\nLocal guidance."
+    );
+    const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition");
+    expect(resolved?.body).toBe("Inherited protocol.\n\nLocal guidance.");
+    expect(resolved?.frontmatter.disabled).toBe(true);
+    const resolveModel = () =>
+      resolveHeadlessAgentModelString(
+        fixture.config,
+        "ws-dream",
+        "intuition",
+        "openai:parent",
+        resolved?.frontmatter.ai
+      );
+    expect(resolveModel()).toBe("private:inherited");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { intuition: { modelString: "private:configured", enabled: true } };
+      return cfg;
+    });
+    expect(resolveModel()).toBe("private:configured");
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent = {
+        intuition: { model: "private:workspace", thinkingLevel: "off" },
+      };
+      return cfg;
+    });
+    expect(resolveModel()).toBe("private:workspace");
+  });
+
+  it("fails closed on headless inheritance cycles rather than falling back to another model", async () => {
+    using fixture = await createFixture();
+    const globals = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(globals, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(globals, "intuition.md"),
+      "---\nname: Intuition\nbase: loop\n---\nChild."
+    );
+    await fsPromises.writeFile(
+      path.join(globals, "loop.md"),
+      "---\nname: Loop\nbase: intuition\nai:\n  model: private:cycle\n---\nBase."
+    );
+    expect(await resolveHeadlessAgentDefinition(fixture.xumHome, "intuition")).toBeNull();
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "intuition")).toBeNull();
+  });
+
+  it("resolves intuition global body overrides without changing dream or accepting traversal", async () => {
+    using fixture = await createFixture();
+    const builtin = await resolveHeadlessAgentBody(fixture.xumHome, "intuition");
+    expect(builtin).not.toBeNull();
+    const dream = await resolveDreamAgentBody(fixture.xumHome);
+    const agents = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(agents, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(agents, "intuition.md"),
+      "---\nname: Custom\n---\nCustom recall policy"
+    );
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "intuition")).toBe(
+      "Custom recall policy"
+    );
+    expect(await resolveDreamAgentBody(fixture.xumHome)).toBe(dream);
+    await fsPromises.writeFile(path.join(agents, "intuition.md"), "---\nname: Empty\n---\n");
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "intuition")).toBe(builtin);
+    expect(resolveHeadlessAgentBody(fixture.xumHome, "../outside")).rejects.toThrow();
   });
 
   it("resolves the dream model via the inherit cascade", async () => {

@@ -59,6 +59,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const advisorTool = useExperimentOverrideValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
+  const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
   const toolSearch = useExperimentOverrideValue(EXPERIMENT_IDS.TOOL_SEARCH);
 
   // Prefer metadata over the global default until workspace localStorage seeding catches up.
@@ -81,6 +82,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
       advisorTool,
       dynamicWorkflows,
       memory,
+      memoryIntuition,
       toolSearch,
     },
     disableWorkspaceAgents,

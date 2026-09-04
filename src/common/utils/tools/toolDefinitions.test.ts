@@ -14,6 +14,45 @@ import {
 } from "./toolDefinitions";
 
 describe("TOOL_DEFINITIONS", () => {
+  it("only advertises intuition with both recall and memory enabled, never its internal tools", () => {
+    for (const enableMemory of [false, true]) {
+      for (const enableIntuition of [false, true]) {
+        const tools = getAvailableTools("openai:test", { enableMemory, enableIntuition });
+        expect(tools.includes("intuition")).toBe(enableMemory && enableIntuition);
+        expect(tools).not.toContain("memory_read");
+        expect(tools).not.toContain("intuition_report");
+      }
+    }
+  });
+
+  it("bounds intuition cues and confidence reports without requiring evidence for uncertain leads", () => {
+    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "" }).success).toBe(false);
+    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "x".repeat(2001) }).success).toBe(
+      false
+    );
+    expect(TOOL_DEFINITIONS.intuition.schema.safeParse({ cue: "Relevant task" }).success).toBe(
+      true
+    );
+    const item = {
+      path: "/memories/global/test.md",
+      relevance: 0.5,
+      excerpt: "",
+      why: "Potential lead",
+    };
+    expect(TOOL_DEFINITIONS.intuition_report.schema.safeParse({ items: [item] }).success).toBe(
+      true
+    );
+    expect(
+      TOOL_DEFINITIONS.intuition_report.schema.safeParse({ items: [{ ...item, relevance: 1.1 }] })
+        .success
+    ).toBe(false);
+    expect(
+      TOOL_DEFINITIONS.intuition_report.schema.safeParse({
+        items: Array.from({ length: 7 }, () => item),
+      }).success
+    ).toBe(false);
+  });
+
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
     const parsed = TaskToolArgsSchema.safeParse({
       subagent_type: "potato",

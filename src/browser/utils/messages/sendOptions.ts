@@ -97,6 +97,7 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
       advisorTool: isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
       dynamicWorkflows: isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS),
       memory: isExperimentEnabled(EXPERIMENT_IDS.MEMORY),
+      memoryIntuition: isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION),
       toolSearch: isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH),
     },
   });

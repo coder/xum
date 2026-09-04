@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { AgentReportToolCall } from "../AgentReportToolCall";
 import { GenericToolCall } from "../GenericToolCall";
+import { IntuitionToolCall } from "../IntuitionToolCall";
 import { GoogleSearchToolCall } from "../GoogleSearchToolCall";
 import { ToolSearchToolCall } from "../ToolSearchToolCall";
 import { WorkspaceLifecycleToolCall } from "../WorkspaceLifecycleToolCall";
@@ -62,6 +63,14 @@ describe("getToolComponent", () => {
     expect(getToolComponent("server:GOOGLE_SEARCH_WEB", { queries: "not-an-array" })).toBe(
       GenericToolCall
     );
+  });
+
+  test("uses the intuition card only for valid cue arguments", () => {
+    expect(getToolComponent("intuition", { cue: "Recall deployment constraints" })).toBe(
+      IntuitionToolCall
+    );
+    expect(getToolComponent("intuition", { cue: "" })).toBe(GenericToolCall);
+    expect(getToolComponent("intuition", { cue: { nested: true } })).toBe(GenericToolCall);
   });
 
   test("renders legacy tool_search transcript calls", () => {
