@@ -203,9 +203,11 @@ describe("ServiceContainer", () => {
     const workspace = services.workspaceService as unknown as {
       preflightSendCounts: Map<string, number>;
       preflightExecCounts: Map<string, number>;
+      initSettlementPromises: Map<string, Promise<void>>;
     };
     try {
       streams.workspaceStreams.set("streaming", {});
+      workspace.initSettlementPromises.set("initializing", new Promise<void>(() => undefined));
       terminals.pendingSessionCreations.set("terminal-starting", 2);
       processes.processes.set("running", { status: "running", isForeground: false });
       processes.processes.set("foreground", { status: "running", isForeground: true });
@@ -214,6 +216,7 @@ describe("ServiceContainer", () => {
       workspace.preflightExecCounts.set("executing", 1);
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
+        { kind: "workspace-inits", count: 1 },
         { kind: "background-processes", count: 3 },
         { kind: "active-streams", count: 1 },
         { kind: "terminals", count: 2 },
@@ -224,6 +227,7 @@ describe("ServiceContainer", () => {
       processes.processes.clear();
       workspace.preflightSendCounts.clear();
       workspace.preflightExecCounts.clear();
+      workspace.initSettlementPromises.clear();
     }
     expect(services.collectRestartBlockers()).toEqual([]);
   });

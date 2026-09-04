@@ -299,6 +299,7 @@ async function main(): Promise<void> {
         }
       : resolveInstallLayout(process.env, process.argv);
   await serviceContainer.updateService.enableServerUpdater(updateLayout, {
+    refreshBlockers: () => serviceContainer.refreshRestartBlockers(),
     collectBlockers: () => serviceContainer.collectRestartBlockers(),
     restart: cleanup,
   });

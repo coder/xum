@@ -93,8 +93,11 @@ export function resolveInstallLayout(
       env.npm_config_registry ??
       "https://registry.npmjs.org";
     const url = new URL(registry);
+    // The staged package is executed by the smoke run, so a registry reachable over the network
+    // must be TLS-protected; plaintext is tolerated only on loopback, where no path exists to hijack.
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
     if (
-      !["https:", "http:"].includes(url.protocol) ||
+      !(url.protocol === "https:" || (url.protocol === "http:" && loopback)) ||
       url.username ||
       url.password ||
       url.search ||

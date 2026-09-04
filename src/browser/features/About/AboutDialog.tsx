@@ -18,6 +18,7 @@ import {
 const blockerLabels: Record<RestartBlocker["kind"], string> = {
   "active-streams": "Active streams",
   "pending-turns": "Pending turns",
+  "workspace-inits": "Workspaces still initializing",
   "queued-messages": "Sessions with queued messages",
   "auto-retries": "Pending auto-retries",
   terminals: "Open terminals",

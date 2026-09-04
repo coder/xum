@@ -13,6 +13,8 @@ import { fetchDistTags } from "./registry";
 import { stageUpdate } from "./staging";
 
 export interface ServerUpdaterDeps {
+  /** Refreshes lazily updated blocker sources; the snapshot that follows stays synchronous. */
+  refreshBlockers?: () => Promise<void>;
   collectBlockers: () => RestartBlocker[];
   restart: () => Promise<void>;
   fetchDistTags?: typeof fetchDistTags;
@@ -130,6 +132,7 @@ export class ServerUpdater {
     if (!this.layout || !this.stagedEntry || !this.availableVersion || this.installing) return;
     this.installing = true;
     try {
+      await this.deps.refreshBlockers?.();
       const blockers = this.deps.collectBlockers();
       if (blockers.length) {
         this.installing = false;

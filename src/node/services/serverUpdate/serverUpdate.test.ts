@@ -104,6 +104,15 @@ describe("server install layout", () => {
       argv
     );
     expect(result.supported && result.layout.registry).toBe("https://registry.example.com");
+    for (const [registry, supported] of [
+      ["http://registry.example.com", false],
+      ["http://127.0.0.1:4873", true],
+      ["https://user:secret@registry.example.com", false],
+    ] as const) {
+      expect(
+        resolveInstallLayout({ ...env, XUM_UPDATE_REGISTRY_URL: registry }, argv).supported
+      ).toBe(supported);
+    }
   });
   test("fails closed for missing or conflicting lockfiles and malformed package metadata", async () => {
     const { env, argv, layout } = await fixture();
@@ -255,7 +264,14 @@ describe("server updater", () => {
     let blockers: RestartBlocker[] = [{ kind: "terminals", count: 1 }];
     let activationFails = true;
     const updater = new ServerUpdater({ supported: true, layout }, undefined, {
-      collectBlockers: () => blockers,
+      refreshBlockers: () => {
+        events.push("refresh");
+        return Promise.resolve();
+      },
+      collectBlockers: () => {
+        events.push("snapshot");
+        return blockers;
+      },
       restart: () => {
         events.push("restart");
         return Promise.resolve();
@@ -271,14 +287,16 @@ describe("server updater", () => {
     await updater.downloadUpdate();
     await updater.installUpdate();
     expect(updater.getStatus()).toMatchObject({ type: "install-blocked", blockers });
-    expect(events).toEqual([]);
+    expect(events).toEqual(["refresh", "snapshot"]);
     blockers = [];
+    events.length = 0;
     await updater.installUpdate();
     expect(updater.getStatus()).toMatchObject({ type: "error", phase: "install" });
-    expect(events).toEqual([]);
+    expect(events).toEqual(["refresh", "snapshot"]);
     activationFails = false;
+    events.length = 0;
     await Promise.all([updater.installUpdate(), updater.installUpdate()]);
-    expect(events).toEqual(["activate", "restart"]);
+    expect(events).toEqual(["refresh", "snapshot", "activate", "restart"]);
   });
   test("serializes checks and downloads and refuses channel changes while busy", async () => {
     const { layout } = await fixture();

@@ -725,6 +725,7 @@ export const RestartBlockerSchema = z.object({
   kind: z.enum([
     "active-streams",
     "pending-turns",
+    "workspace-inits",
     "queued-messages",
     "auto-retries",
     "terminals",

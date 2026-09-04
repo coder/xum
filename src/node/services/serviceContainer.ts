@@ -543,6 +543,11 @@ export class ServiceContainer {
     this.terminalService.setTerminalWindowManager(manager);
   }
 
+  /** Background process statuses refresh lazily, so refresh them before a blocker snapshot. */
+  async refreshRestartBlockers(): Promise<void> {
+    await this.backgroundProcessManager.list();
+  }
+
   collectRestartBlockers(): RestartBlocker[] {
     const blockers = this.workspaceService.collectRestartBlockers();
     const counts: Array<[RestartBlocker["kind"], number]> = [
