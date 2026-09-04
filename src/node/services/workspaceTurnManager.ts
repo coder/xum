@@ -4840,9 +4840,7 @@ export class WorkspaceTurnManager {
               : referenced;
         const record = selected?.record;
         if (record == null) {
-          if (task.taskExecutionId != null) {
-            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
-          }
+          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId);
           continue;
         }
 
@@ -4858,9 +4856,7 @@ export class WorkspaceTurnManager {
           continue;
         }
         if (normalized?.workspaceId !== task.id) {
-          if (task.taskExecutionId != null) {
-            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
-          }
+          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId);
           continue;
         }
 
@@ -4919,6 +4915,36 @@ export class WorkspaceTurnManager {
           error,
         });
       }
+    }
+  }
+
+  /**
+   * Startup repair for an execution mirror with no backing handle record. With an ID the normal
+   * generation-guarded clear applies. Without one, the mirror is an orphan: every settlement path
+   * matches on taskExecutionId, so a stray active taskExecutionStatus could never settle — yet the
+   * desktop ledger reads it as live control of the owner's desktop. Only the mirror is dropped;
+   * the stable taskStatus is a separate activity source owned by TaskService recovery.
+   */
+  private async clearUnbackedAgentTaskExecutionMirror(
+    workspaceId: string,
+    taskExecutionId: string | undefined
+  ): Promise<void> {
+    if (taskExecutionId != null) {
+      await this.updateAgentTaskExecutionState(workspaceId, taskExecutionId, null);
+      return;
+    }
+    let clearedOrphan = false;
+    await this.taskHost.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (workspace.taskExecutionId != null || workspace.taskExecutionStatus == null) return;
+        delete workspace.taskExecutionStatus;
+        clearedOrphan = true;
+      },
+      { allowMissing: true }
+    );
+    if (clearedOrphan) {
+      await this.taskHost.emitWorkspaceMetadata(workspaceId);
     }
   }
 

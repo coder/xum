@@ -12,6 +12,7 @@ import {
 } from "@/node/services/taskHandleStore";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { Ok, Err, type Result } from "@/common/types/result";
@@ -345,6 +346,55 @@ describe("WorkspaceTurnManager", () => {
     await taskService.updateAgentTaskExecutionState("child", "old", "running");
     await taskService.updateAgentTaskExecutionState("child", "new", "running");
     expect(findWorkspaceInConfig(config, "child")?.taskExecutionStatus).toBe("completed");
+  });
+
+  test("startup clears an orphan execution mirror that has no handle ID and no handle record", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push(
+        // Codex P2: a bound child whose persisted mirror lost its ID (and whose handle record is
+        // gone) reads as live desktop control forever — the ID-guarded clear never matches it.
+        projectWorkspace(projectPath, "shared-orphan", "shared-orphan", {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          taskStatus: "reported",
+          runtimeConfig: { type: "local" },
+          taskDesktopOwnerWorkspaceId: parentId,
+          taskExecutionStatus: "running",
+        }),
+        // The stable task status is a separate activity source and must survive the repair.
+        projectWorkspace(projectPath, "running-orphan", "running-orphan", {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          taskStatus: "running",
+          runtimeConfig: { type: "local" },
+          taskExecutionStatus: "starting",
+        })
+      );
+      return cfg;
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config);
+    const desktop = new DesktopInputCoordinator(config);
+    const ownerInput = () =>
+      desktop
+        .withInput(parentId, () => Promise.resolve("clicked"))
+        .then(
+          (value) => value,
+          (error: unknown) => (error instanceof Error ? error.message : String(error))
+        );
+    expect(await ownerInput()).toContain("active borrower shared-orphan");
+
+    await taskService.reconcileAgentTaskExecutionIds();
+
+    for (const id of ["shared-orphan", "running-orphan"]) {
+      expect(findWorkspaceInConfig(config, id)?.taskExecutionStatus).toBeUndefined();
+      expect(findWorkspaceInConfig(config, id)?.taskExecutionId).toBeUndefined();
+      expect(taskService.getLiveWorkspaceTurnRegistration(id)).toBeUndefined();
+    }
+    expect(findWorkspaceInConfig(config, "shared-orphan")?.taskStatus).toBe("reported");
+    expect(findWorkspaceInConfig(config, "running-orphan")?.taskStatus).toBe("running");
+    expect(await ownerInput()).toBe("clicked");
   });
 
   test("shared desktop active mirror refuses a missing target or competing child", async () => {
