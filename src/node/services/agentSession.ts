@@ -445,10 +445,9 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
 }
 
 /**
- * Whether admitted send metadata carries a bash-monitor wake: the wake itself, or an on-send
- * compaction request whose follow-up is the wake. The compaction row is what the turn shows
- * (optionsForStream.muxMetadata, the stream's metadata), so the wake identity has to be read
- * through it (Codex P1 PRRT_kwDOPxxmWM6fOf9G).
+ * Whether send metadata carries a bash-monitor wake: the wake itself, or an on-send
+ * compaction request whose follow-up is the wake (the compaction row is what that turn
+ * shows, so the wake identity has to be read through it).
  */
 function carriesBashMonitorWake(muxMetadata: unknown): boolean {
   const meta = muxMetadata as MuxMessageMetadata | undefined;
@@ -599,7 +598,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   ): XumToolScope;
 }
 
-interface AgentSessionOptions {
+export interface AgentSessionOptions {
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
@@ -642,9 +641,10 @@ interface AgentSessionOptions {
    */
   hasExternalSendPreflight?: () => boolean;
   /**
-   * The bash-monitor wake level for this workspace (BashMonitorWakeReconciler
-   * .hasOutstandingWake). Read live at every tool boundary; wakes are never
-   * queued as messages, so this is the only way a stream learns one is pending.
+   * Live read of the bash-monitor wake level for this workspace
+   * (BashMonitorWakeReconciler.hasOutstandingWake). Consulted at tool boundaries only; the
+   * published mirror (setBashMonitorWakeOutstanding) lags a shown frontier, so cutting on
+   * the mirror alone would yield for lines the step just displayed.
    */
   hasOutstandingBashMonitorWake?: () => Promise<boolean>;
   /**
@@ -655,13 +655,27 @@ interface AgentSessionOptions {
    */
   onToolEndYieldRequested?: () => void;
   /**
-   * A compaction follow-up carrying a delegated turn's correlation was abandoned instead of
-   * dispatched (idle-rule skip, inadmissible summary/goal). Nothing else settles that turn
-   * — the compaction stream-end is not correlated and no later send inherits the metadata —
-   * so the owner is told the turn was superseded.
+   * This session will never continue the delegated turn identified by `correlation`:
+   * the continuation it owed (see wakeContinuationDebt) was voided, or a compaction
+   * follow-up carrying the correlation was abandoned. Nothing else settles that turn — no
+   * correlated stream-end follows — so the owner settles it now. Called as a tracked
+   * promise from synchronous transitions; must be idempotent.
    */
-  onWorkspaceTurnContinuationAbandoned?: (metadata: WorkspaceTurnMuxMetadata) => Promise<void>;
+  onWorkspaceTurnContinuationVoided?: (
+    correlation: WorkspaceTurnMuxMetadata,
+    reason: WorkspaceTurnContinuationVoidReason
+  ) => Promise<void>;
 }
+
+/**
+ * Why a session stopped owing a delegated turn's continuation.
+ * - `retracted`: the stream yielded to a bash-monitor wake that then went away (monitor
+ *   canceled, output shown, history cleared, send failed with no retry) before any wake turn
+ *   could show it.
+ * - `superseded`: other input was admitted in its place.
+ * - `abandoned`: a compaction follow-up carrying the correlation was dropped undispatched.
+ */
+export type WorkspaceTurnContinuationVoidReason = "retracted" | "superseded" | "abandoned";
 
 enum TurnPhase {
   IDLE = "idle",
@@ -704,12 +718,11 @@ export class AgentSession {
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly hasOutstandingBashMonitorWake?: () => Promise<boolean>;
   private readonly onToolEndYieldRequested?: () => void;
-  private readonly onWorkspaceTurnContinuationAbandoned?: (
-    metadata: WorkspaceTurnMuxMetadata
-  ) => Promise<void>;
+  private readonly onWorkspaceTurnContinuationVoided?: AgentSessionOptions["onWorkspaceTurnContinuationVoided"];
   /**
-   * Last published wake level (see setBashMonitorWakeOutstanding). Feeds the
-   * tool-end yield flag together with the queue head.
+   * Mirror of the reconciler's wake level (setBashMonitorWakeOutstanding): a wake this
+   * workspace has not seen yet. Feeds the tool-end yield lever together with the queue head
+   * and is the sync input to hasPendingToolEndInput.
    */
   private bashMonitorWakeOutstanding = false;
   /** Last value pushed to the tool-end yield lever; edge detection for onToolEndYieldRequested. */
@@ -905,27 +918,39 @@ export class AgentSession {
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
   /**
-   * The turn in flight carries a bash-monitor wake: the admitted send is the wake itself, or
-   * an on-send compaction whose follow-up is (carriesBashMonitorWake). The wake's `onAccepted`
-   * lowers the reconciler level once its row is durable, so from admission on this marker is
-   * the only thing that keeps the continuation visible to delegated-turn settlement until a
-   * stream that shows it exists. A direct wake stream shows it through its inherited
-   * correlation, so the marker drops at that stream's start; a compaction stream does not
-   * (its metadata is the compaction request), so the marker outlives it until the follow-up
-   * dispatches in COMPLETING or the turn ends (Codex P1 PRRT_kwDOPxxmWM6fOf9G).
+   * Bash-monitor wake continuation model.
+   *
+   * A stream that yields to the wake level (hasPendingToolEndInput) takes out a DEBT: this
+   * session owes the delegated turn it cut a continuation. The debt records the cut stream's
+   * correlation and is settled exactly once — REDEEMED when a stream that shows the wake
+   * starts, or VOIDED when no wake turn can come, in which case the owner is told
+   * (onWorkspaceTurnContinuationVoided). Settlement never probes the wake level: the debt is
+   * the only thing delegated-turn settlement reads (getQueueCutCutter), and it is sync.
+   *
+   * `wakeTurnInFlight` says a wake turn is somewhere inside this session — from sendMessage /
+   * resumeStream entry (raised synchronously, before any await, because the wake's
+   * `onAccepted` lowers the level as soon as its row is durable) until the stream that shows
+   * it starts or the send returns with no stream and no auto-retry armed for its durable row.
+   *
+   * Transitions — each is the only place its consequence is computed:
+   *
+   *   hasPendingToolEndInput yields for the level   → debt = { active stream's correlation }
+   *   wake send / resume / queue dispatch begins    → wakeTurnInFlight = true
+   *   stream-start whose request carries the wake   → redeem (in-flight false, debt cleared);
+   *     (direct wake, or a compaction FOLLOW-UP)       a compaction stream itself does not
+   *   wake send returns without a stream            → in-flight stays true only while an
+   *                                                   auto-retry resume of its durable row is
+   *                                                   armed; otherwise false → maybeVoid
+   *   level lowered (cancel / shown / clear)        → maybeVoid
+   *   maybeVoid: debt ∧ ¬inFlight ∧ ¬level          → void "retracted"
+   *   non-wake input admitted (enterPreparing)      → void "superseded"
+   *   compaction follow-up with the correlation     → void "abandoned" (before the erase)
+   *     dropped (clearPendingFollowUpFromSummary)
+   *   dispose / IDLE                                → in-flight false (IDLE keeps the debt:
+   *                                                   the wake dispatcher needs an idle session)
    */
-  private turnCarriesBashMonitorWake = false;
-  /**
-   * The last stream cut itself for the wake level (hasPendingToolEndInput returned true
-   * from the level) and no turn has been admitted since. This is cut *attribution*
-   * (getQueueCutCutter), not a continuation marker: whether the wake still arrives is read
-   * live from the level / the admitted wake turn. An operator canceling the monitor between
-   * the cut and the stream-end handler lowers the level with no wake turn to follow, so
-   * settlement must not defer on it (the parent's wait would hang until timeout); the
-   * attribution lets it settle the "tool-calls" end as a wake cut instead of a truncation
-   * failure (Codex P2 PRRT_kwDOPxxmWM6fDmpR, PRRT_kwDOPxxmWM6fEQIf).
-   */
-  private streamYieldedToBashMonitorWake = false;
+  private wakeContinuationDebt?: { correlation?: WorkspaceTurnMuxMetadata };
+  private wakeTurnInFlight = false;
 
   /** Context needed to retry the current stream (cleared on stream end/abort/error). */
   private activeStreamContext?: {
@@ -978,7 +1003,7 @@ export class AgentSession {
       hasExternalSendPreflight,
       hasOutstandingBashMonitorWake,
       onToolEndYieldRequested,
-      onWorkspaceTurnContinuationAbandoned,
+      onWorkspaceTurnContinuationVoided,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1009,7 +1034,7 @@ export class AgentSession {
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.hasOutstandingBashMonitorWake = hasOutstandingBashMonitorWake;
     this.onToolEndYieldRequested = onToolEndYieldRequested;
-    this.onWorkspaceTurnContinuationAbandoned = onWorkspaceTurnContinuationAbandoned;
+    this.onWorkspaceTurnContinuationVoided = onWorkspaceTurnContinuationVoided;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -1076,6 +1101,10 @@ export class AgentSession {
       this.bashMonitorWakeOutstanding = false;
       this.syncToolEndYieldRequested(false);
     }
+    // No wake turn can come from a disposed session; the debt dies with it silently
+    // (workspace teardown settles delegated turns through its own path).
+    this.wakeTurnInFlight = false;
+    this.wakeContinuationDebt = undefined;
 
     // Ensure any callers blocked on waitForIdle() can continue during teardown.
     this.setTurnPhase(TurnPhase.IDLE);
@@ -1295,6 +1324,9 @@ export class AgentSession {
       this.autoRetryStarting = false;
     }
     this.emitRetryEvent(event);
+    // A retry given up (exhausted, non-retryable, disabled by the user) was the last thing
+    // that could still bring a durable wake row's stream.
+    if (event.type === "auto-retry-abandoned") this.settleWakeTurnInFlight();
   }
 
   private emitRetryEvent(event: RetryStatusEvent): void {
@@ -1462,6 +1494,9 @@ export class AgentSession {
       );
     } finally {
       this.autoRetryStarting = false;
+      // The resume either started its stream (redeeming a wake it carried), re-armed a
+      // retry, or gave up — only the last leaves a carried wake with no way to arrive.
+      this.settleWakeTurnInFlight();
     }
   }
 
@@ -3124,7 +3159,25 @@ export class AgentSession {
     this.emitMetadata(metadata);
   }
 
+  /**
+   * Public send entry. A send carrying a bash-monitor wake marks the wake turn in flight
+   * synchronously — before the first await, hence before its `onAccepted` can lower the
+   * level — and settles the marker when it returns without a stream (see
+   * wakeContinuationDebt).
+   */
   async sendMessage(
+    ...args: Parameters<AgentSession["sendMessageInner"]>
+  ): Promise<AgentSessionResult<void>> {
+    const wake = carriesBashMonitorWake(args[1]?.muxMetadata);
+    if (wake) this.wakeTurnInFlight = true;
+    try {
+      return await this.sendMessageInner(...args);
+    } finally {
+      if (wake) this.settleWakeTurnInFlight();
+    }
+  }
+
+  private async sendMessageInner(
     message: string,
     options?: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: {
@@ -3990,7 +4043,7 @@ export class AgentSession {
         // appending a second one, so the row (and any delegated turn waiting on its
         // continuation) no longer depends on an application restart. With auto-retry
         // disabled by the user this stays a startup-recovery row like every other
-        // pre-stream failure (Codex P2 PRRT_kwDOPxxmWM6fOH54).
+        // pre-stream failure, and the wake turn leaves flight (see settleWakeTurnInFlight).
         this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
         await internal?.onAccepted?.();
         await this.handleStreamFailureForAutoRetry({
@@ -4226,7 +4279,20 @@ export class AgentSession {
     return await startPreparedStream();
   }
 
+  /** Like sendMessage, marks a carried wake in flight for the duration of the resume. */
   async resumeStream(
+    ...args: Parameters<AgentSession["resumeStreamInner"]>
+  ): Promise<AgentSessionResult<{ started: boolean }>> {
+    const wake = carriesBashMonitorWake(args[0].muxMetadata);
+    if (wake) this.wakeTurnInFlight = true;
+    try {
+      return await this.resumeStreamInner(...args);
+    } finally {
+      if (wake) this.settleWakeTurnInFlight();
+    }
+  }
+
+  private async resumeStreamInner(
     options: SendMessageOptions,
     internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
@@ -4586,8 +4652,7 @@ export class AgentSession {
       // message queued or in preflight during the compaction stream still wins over the
       // wake continuation (dispatchPendingFollowUp). A skipped wake follow-up is lost — its
       // signals were consumed at acceptance — which is the bounded cost of letting the
-      // user's correction go first; the process output stays readable via task_await
-      // (Codex P2 PRRT_kwDOPxxmWM6fFJ4N).
+      // user's correction go first; the process output stays readable via task_await.
       if (params.muxMetadata.type === "bash-monitor-wake") {
         followUp.dispatchOptions = { ...followUp.dispatchOptions, requireIdle: true };
       }
@@ -5856,11 +5921,16 @@ export class AgentSession {
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
-        // A compaction stream's metadata does not show the wake its follow-up carries; keep
-        // the marker until the follow-up dispatches (see turnCarriesBashMonitorWake).
-        if (this.activeCompactionRequest == null) this.turnCarriesBashMonitorWake = false;
-        // A live stream is the continuation (or a superseding turn) the cut waited for.
-        this.streamYieldedToBashMonitorWake = false;
+        // A stream that shows the wake redeems the continuation debt (see
+        // wakeContinuationDebt). Only the wake row's own stream qualifies: an on-send
+        // compaction stream's request is the compaction row, and the wake follows it.
+        const streamMetadata = this.activeStreamContext?.options?.muxMetadata as
+          | MuxMessageMetadata
+          | undefined;
+        if (streamMetadata?.type === "bash-monitor-wake") {
+          this.wakeTurnInFlight = false;
+          this.wakeContinuationDebt = undefined;
+        }
         this.activeStreamStartedAtMs = payload.startTime;
         // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
         // setGoal deferral meaningful again — clear the goal service's settled
@@ -6359,7 +6429,7 @@ export class AgentSession {
       this.dispatchingQueuedEntry = false;
       this.dispatchingQueuedEntryMuxMetadata = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
-      this.turnCarriesBashMonitorWake = false;
+      this.settleWakeTurnInFlight();
       // Turn ended: expire any mid-turn thinking override. Safe unconditionally
       // because a replacement turn (e.g. an edit) only creates its holder after
       // the preempted turn has already been transitioned to IDLE.
@@ -6702,7 +6772,12 @@ export class AgentSession {
    *
    * A non-empty queue arbitrates alone: its head runs next whatever the level says (the
    * wake dispatcher waits for an empty queue), so cutting for the wake behind a turn-end
-   * head would only promote that entry to tool-end (Codex P2 PRRT_kwDOPxxmWM6fDmpV).
+   * head would only promote that entry to tool-end. A message queued during the level read
+   * arbitrates the same way.
+   *
+   * The SDK only asks when the loop would otherwise continue, so a true from the level IS
+   * the cut: the continuation debt is taken here, in the same synchronous step as the
+   * decision (see wakeContinuationDebt).
    */
   async hasPendingToolEndInput(): Promise<boolean> {
     const nextMode = this.messageQueue.getNextDispatchableMode();
@@ -6710,13 +6785,13 @@ export class AgentSession {
     if (this.hasOutstandingBashMonitorWake == null) return false;
     try {
       const outstanding = await this.hasOutstandingBashMonitorWake();
-      // A message queued during the level read arbitrates the same way: the stream-end
-      // drain would dispatch it whatever the level says (Codex P2 PRRT_kwDOPxxmWM6fEQIk).
       const modeAfterRead = this.messageQueue.getNextDispatchableMode();
       if (modeAfterRead != null) return modeAfterRead === "tool-end";
-      // The SDK only asks when the loop would otherwise continue, so a true here IS the cut.
-      if (outstanding) this.streamYieldedToBashMonitorWake = true;
-      return outstanding;
+      if (!outstanding) return false;
+      this.wakeContinuationDebt ??= {
+        correlation: this.activeStreamContext?.workspaceTurnMetadata,
+      };
+      return true;
     } catch (error) {
       log.debug("hasPendingToolEndInput: wake level read failed; not yielding", {
         workspaceId: this.workspaceId,
@@ -6729,11 +6804,74 @@ export class AgentSession {
   /**
    * Mirror the reconciler's wake level. While high, long-polling bash reads return early
    * so the stream reaches a tool boundary (same lever a queued tool-end message pulls).
+   * Lowered with no wake turn in flight, an owed continuation can no longer arrive.
    */
   setBashMonitorWakeOutstanding(outstanding: boolean): void {
     if (this.bashMonitorWakeOutstanding === outstanding) return;
     this.bashMonitorWakeOutstanding = outstanding;
     this.syncToolEndYieldRequested();
+    if (!outstanding) this.maybeVoidWakeContinuation();
+  }
+
+  /** A wake turn is inside this session (see wakeContinuationDebt). */
+  hasPendingBashMonitorWakeTurn(): boolean {
+    return this.wakeTurnInFlight;
+  }
+
+  /**
+   * A stream that yielded to the wake level will still be continued by a wake turn: the
+   * debt is outstanding (its wake not yet dispatched) or the wake turn is already in flight.
+   * Delegated-turn settlement reads this instead of probing the reconciler.
+   */
+  hasBashMonitorWakeContinuation(): boolean {
+    return this.wakeContinuationDebt != null || this.wakeTurnInFlight;
+  }
+
+  /**
+   * A wake send / resume returned, the turn went idle, or a retry was given up: the wake
+   * turn is still in flight only while something inside this session can still start its
+   * stream — a turn in progress (its stream, or a compaction whose follow-up is the wake),
+   * or an auto-retry armed for its durable row.
+   */
+  private settleWakeTurnInFlight(): void {
+    if (!this.wakeTurnInFlight) return;
+    if (this.turnPhase !== TurnPhase.IDLE) return;
+    if (
+      this.hasPendingAutoRetry() &&
+      carriesBashMonitorWake(this.lastAutoRetryResumeRequest?.options.muxMetadata)
+    ) {
+      return;
+    }
+    this.wakeTurnInFlight = false;
+    this.maybeVoidWakeContinuation();
+  }
+
+  private maybeVoidWakeContinuation(): void {
+    if (
+      this.wakeContinuationDebt != null &&
+      !this.wakeTurnInFlight &&
+      !this.bashMonitorWakeOutstanding
+    ) {
+      this.voidWakeContinuation("retracted");
+    }
+  }
+
+  /**
+   * Sync transition; the owner hook runs as a tracked promise (never awaited here — callers
+   * sit inside admission and phase transitions).
+   */
+  private voidWakeContinuation(reason: WorkspaceTurnContinuationVoidReason): void {
+    const debt = this.wakeContinuationDebt;
+    this.wakeContinuationDebt = undefined;
+    const correlation = debt?.correlation;
+    if (correlation == null || this.onWorkspaceTurnContinuationVoided == null) return;
+    this.onWorkspaceTurnContinuationVoided(correlation, reason).catch((error: unknown) => {
+      log.error("Voided bash-monitor wake continuation could not be settled", {
+        workspaceId: this.workspaceId,
+        reason,
+        error: getErrorMessage(error),
+      });
+    });
   }
 
   /**
@@ -6744,8 +6882,7 @@ export class AgentSession {
    * This is the single place the effective flag is computed, so it also owns the rising
    * edge: a turn-end head that is cleared, removed, or promoted while the wake level is high
    * makes the lever effective without any enqueue or level publish, and the consequence
-   * (backgrounding foreground waits) must follow that edge, not those events (Codex P2
-   * PRRT_kwDOPxxmWM6fGVw_).
+   * (backgrounding foreground waits) must follow that edge, not those events.
    */
   private syncToolEndYieldRequested(
     queueHeadToolEnd = this.messageQueue.getNextDispatchableMode() === "tool-end"
@@ -6800,26 +6937,27 @@ export class AgentSession {
     return false;
   }
 
-  /** Claim PREPARING for a send and record what kind of input it carries. */
+  /**
+   * Claim PREPARING for a send and record what kind of input it carries. Admitting anything
+   * but the wake while a continuation debt is outstanding settles that debt: a turn with the
+   * same correlation continues the delegated turn itself (its stream-end settles it), any
+   * other input supersedes it.
+   */
   private enterPreparing(muxMetadata: unknown): void {
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(muxMetadata);
-    this.turnCarriesBashMonitorWake = carriesBashMonitorWake(muxMetadata);
-    // Whatever is admitted now (the wake turn, or input superseding it) settles the cut.
-    this.streamYieldedToBashMonitorWake = false;
+    if (!carriesBashMonitorWake(muxMetadata) && this.wakeContinuationDebt != null) {
+      if (
+        hasSameWorkspaceTurnCorrelation(
+          this.preparingWorkspaceTurnMetadata,
+          this.wakeContinuationDebt.correlation
+        )
+      ) {
+        this.wakeContinuationDebt = undefined;
+      } else {
+        this.voidWakeContinuation("superseded");
+      }
+    }
     this.setTurnPhase(TurnPhase.PREPARING);
-  }
-
-  /**
-   * A bash-monitor wake turn admitted but not yet shown by a correlated stream: a direct wake
-   * send in PREPARING, a dequeued wake entry, or an on-send compaction turn (preparing,
-   * streaming, or dispatching its follow-up) that consumed the wake. The reconciler level is
-   * already low here — `onAccepted` ran when the durable row landed — so delegated-turn
-   * settlement must read the continuation from this marker.
-   */
-  hasPendingBashMonitorWakeTurn(): boolean {
-    if (this.turnCarriesBashMonitorWake) return true;
-    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
-    return dispatching?.type === "bash-monitor-wake";
   }
 
   /**
@@ -6873,9 +7011,9 @@ export class AgentSession {
     }
     const candidate = this.messageQueue.getNextQueueCutCandidate();
     if (candidate != null) return { stage: "queued", ...candidate };
-    // No input holds the session: the stream itself yielded to the wake level. Settlement
-    // reads whether the wake still arrives from the level; this only names the cause.
-    return this.streamYieldedToBashMonitorWake ? { stage: "bash-monitor-wake" } : undefined;
+    // No input holds the session: the stream itself yielded to the wake level and the
+    // continuation is still owed (see wakeContinuationDebt).
+    return this.wakeContinuationDebt != null ? { stage: "bash-monitor-wake" } : undefined;
   }
 
   /** Whether a message queued with this dedupe key is still pending (see MessageQueue.addOnce). */
@@ -7625,14 +7763,22 @@ export class AgentSession {
     }
 
     // Every discard path funnels here, so this is the one place that knows the delegated
-    // turn's continuation is gone for good (Codex P2 PRRT_kwDOPxxmWM6fGVxG). Settle BEFORE
-    // erasing the follow-up: the durable record is the only carrier of the correlation, so
-    // a settlement failure must leave it in place for the next dispatch attempt (or startup
-    // recovery) to retry — settlement is idempotent, a lost record is not recoverable
-    // (Codex P2 PRRT_kwDOPxxmWM6fOH59).
+    // turn's continuation is gone for good. Settle BEFORE erasing the follow-up: the durable
+    // record is the only carrier of the correlation, so a settlement failure must leave it in
+    // place for the next dispatch attempt (or startup recovery) to retry — settlement is
+    // idempotent, a lost record is not recoverable. A wake follow-up also carried the
+    // continuation debt of the stream it cut; that debt is settled by this same void.
     const workspaceTurnMetadata = muxMeta.pendingFollowUp.workspaceTurnMetadata;
     if (workspaceTurnMetadata != null) {
-      await this.onWorkspaceTurnContinuationAbandoned?.(workspaceTurnMetadata);
+      if (
+        hasSameWorkspaceTurnCorrelation(
+          this.wakeContinuationDebt?.correlation,
+          workspaceTurnMetadata
+        )
+      ) {
+        this.wakeContinuationDebt = undefined;
+      }
+      await this.onWorkspaceTurnContinuationVoided?.(workspaceTurnMetadata, "abandoned");
     }
 
     const { pendingFollowUp: _pendingFollowUp, ...muxMetadataWithoutFollowUp } = muxMeta;

@@ -5,6 +5,7 @@ import { Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
+import type { AgentSession } from "./agentSession";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 const WORKSPACE_TURN_CORRELATION = {
@@ -34,6 +35,25 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
     model: TEST_MODEL,
     startTime: Date.now(),
   };
+}
+
+const DELEGATED_TURN: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }> = {
+  type: "workspace-turn-task",
+  taskHandleId: "wst_delegated",
+  ownerWorkspaceId: "owner-workspace",
+  turnId: "turn-1",
+};
+
+/** The correlation the active stream runs under; a wake cut records it as the debt's owner. */
+function setActiveStreamCorrelation(
+  session: AgentSession,
+  workspaceTurnMetadata: typeof DELEGATED_TURN | undefined
+): void {
+  (
+    session as unknown as {
+      activeStreamContext?: { workspaceTurnMetadata?: typeof DELEGATED_TURN };
+    }
+  ).activeStreamContext = { workspaceTurnMetadata };
 }
 
 function streamAbortEvent(
@@ -665,12 +685,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("a stream cut for the wake level is attributed as the cutter until a turn is admitted", async () => {
-    // Settlement of a delegated turn runs after the cut; an operator canceling the monitor in
-    // between lowers the level, so the cut itself must name its cause. It is attribution
-    // only: a continuation is read live (hasPendingBashMonitorWakeTurn stays false), so a
-    // retracted wake settles the handle instead of deferring it forever.
-    const workspaceId = "queue-dispatch-wake-cut-latch";
+  test("a stream cut for the wake level takes a continuation debt until other input supersedes it", async () => {
+    // Settlement of a delegated turn runs after the cut and reads the debt (the cutter and
+    // hasBashMonitorWakeContinuation), never the level: an operator canceling the monitor in
+    // between must not be able to hide that the cut happened.
+    const workspaceId = "queue-dispatch-wake-cut-debt";
     let level = false;
     let markStreamRequested: () => void = () => undefined;
     const streamRequested = new Promise<void>((resolve) => {
@@ -680,9 +699,14 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const streamRelease = new Promise<void>((resolve) => {
       releaseStream = resolve;
     });
+    const voided: Array<[MuxMessageMetadata, string]> = [];
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId,
       hasOutstandingBashMonitorWake: () => Promise.resolve(level),
+      onWorkspaceTurnContinuationVoided: (correlation, reason) => {
+        voided.push([correlation, reason]);
+        return Promise.resolve();
+      },
       aiServiceOverrides: {
         streamMessage: mock(async () => {
           markStreamRequested();
@@ -693,22 +717,82 @@ describe("AgentSession queued message tool-call dispatch", () => {
     });
     let disposed = false;
     try {
+      // The cut stream's correlation is what the debt records.
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
       expect(session.getQueueCutCutter()).toBeUndefined();
       level = true;
       expect(await session.hasPendingToolEndInput()).toBe(true);
       level = false;
       expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
+      expect(session.hasBashMonitorWakeContinuation()).toBe(true);
       expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
-      // Reading a low level later does not retract the recorded cut.
+      // Reading a low level later neither retracts the debt nor takes a second one.
       expect(await session.hasPendingToolEndInput()).toBe(false);
       expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
+      expect(voided).toEqual([]);
 
-      // Whatever turn is admitted next settles the cut — here a manual send, which is not
-      // itself a wake turn.
+      // Input that is not the wake supersedes the continuation: the owner is told once, at
+      // admission, and the cutter is now the admitted input.
       const sendPromise = session.sendMessage("hello", { model: TEST_MODEL, agentId: "exec" });
       await streamRequested;
       expect(session.isBusy()).toBe(true);
+      expect(voided).toEqual([[DELEGATED_TURN, "superseded"]]);
+      expect(session.hasBashMonitorWakeContinuation()).toBe(false);
       expect(session.getQueueCutCutter()).toEqual({ stage: "preparing", muxMetadata: undefined });
+      session.dispose();
+      disposed = true;
+      releaseStream();
+      await sendPromise;
+      expect(voided).toHaveLength(1);
+    } finally {
+      releaseStream();
+      if (!disposed) session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a correlated turn admitted after the cut continues the debt without settling it", async () => {
+    // The delegated turn's own continuation (e.g. a queued same-turn message) supersedes
+    // nothing: its stream-end settles the turn, so the owner is not told.
+    const workspaceId = "queue-dispatch-wake-cut-same-turn";
+    let level = true;
+    let markStreamRequested: () => void = () => undefined;
+    const streamRequested = new Promise<void>((resolve) => {
+      markStreamRequested = resolve;
+    });
+    let releaseStream: () => void = () => undefined;
+    const streamRelease = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const voided: unknown[] = [];
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(level),
+      onWorkspaceTurnContinuationVoided: (...args) => {
+        voided.push(args);
+        return Promise.resolve();
+      },
+      aiServiceOverrides: {
+        streamMessage: mock(async () => {
+          markStreamRequested();
+          await streamRelease;
+          return Ok(createStartedTurnHandle("test-assistant-message"));
+        }),
+      },
+    });
+    let disposed = false;
+    try {
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      level = false;
+      const sendPromise = session.sendMessage("continue", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        muxMetadata: DELEGATED_TURN,
+      });
+      await streamRequested;
+      expect(session.hasBashMonitorWakeContinuation()).toBe(false);
+      expect(voided).toEqual([]);
       session.dispose();
       disposed = true;
       releaseStream();
@@ -716,6 +800,180 @@ describe("AgentSession queued message tool-call dispatch", () => {
     } finally {
       releaseStream();
       if (!disposed) session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("the level lowering with no wake turn in flight voids the debt as retracted", async () => {
+    const workspaceId = "queue-dispatch-wake-retracted";
+    const voided: Array<[MuxMessageMetadata, string]> = [];
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+      onWorkspaceTurnContinuationVoided: (correlation, reason) => {
+        voided.push([correlation, reason]);
+        return Promise.resolve();
+      },
+    });
+    try {
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
+
+      // Republishing high changes nothing; lowering it (monitor canceled, output shown,
+      // history cleared) leaves no wake to continue the cut stream.
+      session.setBashMonitorWakeOutstanding(true);
+      expect(voided).toEqual([]);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(voided).toEqual([[DELEGATED_TURN, "retracted"]]);
+      expect(session.getQueueCutCutter()).toBeUndefined();
+      expect(session.hasBashMonitorWakeContinuation()).toBe(false);
+
+      // A cut with no correlation (manual stream) still records the cutter but has no
+      // owner to tell.
+      setActiveStreamCorrelation(session, undefined);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      session.setBashMonitorWakeOutstanding(false);
+      expect(session.getQueueCutCutter()).toBeUndefined();
+      expect(voided).toHaveLength(1);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake send is in flight from its first synchronous step until its stream starts", async () => {
+    // The wake's onAccepted lowers the level as soon as its row is durable, which is before
+    // PREPARING and long before a stream exists. Only the in-flight marker keeps the debt
+    // from being voided in that window.
+    const workspaceId = "queue-dispatch-wake-in-flight";
+    let markStreamRequested: () => void = () => undefined;
+    const streamRequested = new Promise<void>((resolve) => {
+      markStreamRequested = resolve;
+    });
+    let releaseStream: () => void = () => undefined;
+    const streamRelease = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const voided: unknown[] = [];
+    const { session, aiEmitter, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+      onWorkspaceTurnContinuationVoided: (...args) => {
+        voided.push(args);
+        return Promise.resolve();
+      },
+      aiServiceOverrides: {
+        streamMessage: mock(async () => {
+          markStreamRequested();
+          await streamRelease;
+          return Ok(createStartedTurnHandle("test-assistant-message"));
+        }),
+      },
+    });
+
+    let disposed = false;
+    try {
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+      setActiveStreamCorrelation(session, undefined);
+
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      let accepted = false;
+      const sendPromise = session.sendMessage(
+        "Background monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          onAccepted: () => {
+            accepted = true;
+            // The reconciler consumes the signals and publishes low here.
+            session.setBashMonitorWakeOutstanding(false);
+          },
+        }
+      );
+      // Synchronously at entry, before any admission await.
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+
+      await streamRequested;
+      expect(accepted).toBe(true);
+      expect(session.isBusy()).toBe(true);
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+      expect(session.hasBashMonitorWakeContinuation()).toBe(true);
+      expect(voided).toEqual([]);
+
+      // The wake stream shows the wake: debt redeemed, nothing to tell the owner.
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      expect(session.hasBashMonitorWakeContinuation()).toBe(false);
+      expect(session.getQueueCutCutter()).toBeUndefined();
+      expect(voided).toEqual([]);
+
+      session.dispose();
+      disposed = true;
+      releaseStream();
+      await sendPromise;
+      expect(voided).toEqual([]);
+    } finally {
+      releaseStream();
+      if (!disposed) session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("a wake send refused before its row is durable leaves the debt to the next dispatch", async () => {
+    // Pre-commit refusals (stale admission) do not lower the level, so the debt is still
+    // owed and the reconciler re-dispatches; only a level drop voids it.
+    const workspaceId = "queue-dispatch-wake-refused";
+    const voided: Array<[MuxMessageMetadata, string]> = [];
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId,
+      hasOutstandingBashMonitorWake: () => Promise.resolve(true),
+      onWorkspaceTurnContinuationVoided: (correlation, reason) => {
+        voided.push([correlation, reason]);
+        return Promise.resolve();
+      },
+    });
+    try {
+      setActiveStreamCorrelation(session, DELEGATED_TURN);
+      session.setBashMonitorWakeOutstanding(true);
+      expect(await session.hasPendingToolEndInput()).toBe(true);
+
+      let accepted = false;
+      const result = await session.sendMessage(
+        "Background monitor wake",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "bash-monitor-wake", records: [] },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          admissionStale: () => true,
+          onAccepted: () => {
+            accepted = true;
+          },
+        }
+      );
+      expect(result.success).toBe(false);
+      expect(accepted).toBe(false);
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
+      expect(session.getQueueCutCutter()).toEqual({ stage: "bash-monitor-wake" });
+      expect(voided).toEqual([]);
+
+      session.setBashMonitorWakeOutstanding(false);
+      expect(voided).toEqual([[DELEGATED_TURN, "retracted"]]);
+    } finally {
+      session.dispose();
       await cleanup();
     }
   });
@@ -879,67 +1137,6 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
-  test("a wake send in PREPARING is a pending wake turn until it streams or ends", async () => {
-    const workspaceId = "queue-dispatch-preparing-wake-turn";
-    let markStreamRequested: () => void = () => undefined;
-    const streamRequested = new Promise<void>((resolve) => {
-      markStreamRequested = resolve;
-    });
-    let releaseStream: () => void = () => undefined;
-    const streamRelease = new Promise<void>((resolve) => {
-      releaseStream = resolve;
-    });
-    const { session, cleanup } = await createAgentSessionHarness({
-      workspaceId,
-      aiServiceOverrides: {
-        // Blocks at the provider call: the user row is durable (onAccepted has run, so the
-        // reconciler level is already low) but no stream is observable yet.
-        streamMessage: mock(async () => {
-          markStreamRequested();
-          await streamRelease;
-          return Ok(createStartedTurnHandle("test-assistant-message"));
-        }),
-      },
-    });
-
-    let disposed = false;
-    try {
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
-      let accepted = false;
-      const sendPromise = session.sendMessage(
-        "Background monitor wake",
-        {
-          model: TEST_MODEL,
-          agentId: "exec",
-          muxMetadata: { type: "bash-monitor-wake", records: [] },
-        },
-        {
-          synthetic: true,
-          agentInitiated: true,
-          onAccepted: () => {
-            accepted = true;
-          },
-        }
-      );
-
-      await streamRequested;
-      expect(accepted).toBe(true);
-      expect(session.isBusy()).toBe(true);
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
-
-      // Turn end (here: teardown to IDLE) clears it.
-      session.dispose();
-      disposed = true;
-      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
-      releaseStream();
-      await sendPromise;
-    } finally {
-      releaseStream();
-      if (!disposed) session.dispose();
-      await cleanup();
-    }
-  });
-
   test("disposed sessions finalize durable wakes after goal sync completes", async () => {
     const workspaceId = "queue-dispatch-disposed-after-goal-sync";
     let markSyncStarted: () => void = () => undefined;
@@ -1080,6 +1277,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
         records: [],
       });
       expect(chatEventTypes).toContain("auto-retry-scheduled");
+      // The armed resume is what will bring the wake's stream, so the wake turn stays in
+      // flight (a debt it carries is not voided) until that retry is given up.
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(true);
+      await session.setAutoRetryEnabled(false, { persist: false });
+      expect(session.hasPendingBashMonitorWakeTurn()).toBe(false);
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
       if (history.success) {

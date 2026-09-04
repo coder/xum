@@ -2587,8 +2587,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // park this wake behind it, out of reach of the level (a later monitor cancel
           // could not retract it). requireIdle turns that race into a skip (Err), and the
           // admission probe re-validates the wake at every gate before the user row is
-          // durable; both fall through to the after-idle re-arm below (Codex P2
-          // PRRT_kwDOPxxmWM6fDmpJ).
+          // durable; both fall through to the after-idle re-arm below.
           requireIdle: true,
           admissionStale: () => !dispatch.isCurrent(),
           onAccepted: async () => {
@@ -4081,10 +4080,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       onToolEndYieldRequested: () => {
         this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace(workspaceId);
       },
-      onWorkspaceTurnContinuationAbandoned: async (metadata) => {
-        await this.agentTaskIntegration?.settleSupersededWorkspaceTurnContinuation(
+      onWorkspaceTurnContinuationVoided: async (correlation, reason) => {
+        await this.agentTaskIntegration?.settleVoidedWorkspaceTurnContinuation(
           workspaceId,
-          metadata
+          correlation,
+          reason
         );
       },
     });
@@ -11967,20 +11967,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     );
   }
 
-  /**
-   * The bash-monitor wake level: a wake the workspace has not seen yet, or a wake turn
-   * admitted but not yet shown by a correlated stream — including an on-send compaction
-   * that consumed it (AgentSession.hasPendingBashMonitorWakeTurn — the reconciler level is
-   * already consumed there). A stream that ended with "tool-calls"
-   * while this is high yielded to the wake and will be continued by it. Deliberately not
-   * the session's cut latch: a wake retracted after the cut (monitor canceled) has no
-   * continuation, and settlement must not defer on it (AgentSession.getQueueCutCutter
-   * names the cause instead).
-   */
-  async hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean> {
-    const id = workspaceId.trim();
-    if (this.sessions.get(id)?.hasPendingBashMonitorWakeTurn() === true) return true;
-    return this.bashMonitorWakeReconciler.hasOutstandingWake(id);
+  /** See AgentSession.hasBashMonitorWakeContinuation. */
+  hasBashMonitorWakeContinuation(workspaceId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.hasBashMonitorWakeContinuation() === true;
   }
 
   /**

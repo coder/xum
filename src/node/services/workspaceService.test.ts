@@ -1128,19 +1128,20 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("a wake turn in PREPARING keeps the outstanding level visible to turn settlement", async () => {
+  test("a wake continuation owed or in flight in the session is visible to turn settlement", async () => {
     const { service, cleanup } = await createWakeWiringService();
     const workspaceId = "preparing-wake-owner";
     const session = service.getOrCreateSession(workspaceId);
     const sessionInternal = session as unknown as {
-      hasPendingBashMonitorWakeTurn(): boolean;
+      hasBashMonitorWakeContinuation(): boolean;
     };
     try {
-      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(false);
+      expect(service.hasBashMonitorWakeContinuation(workspaceId)).toBe(false);
       // The reconciler level is already low here (onAccepted ran at row persistence);
-      // the session marker is what keeps the continuation visible until stream start.
-      sessionInternal.hasPendingBashMonitorWakeTurn = () => true;
-      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(true);
+      // the session's own debt / in-flight state is what settlement reads.
+      sessionInternal.hasBashMonitorWakeContinuation = () => true;
+      expect(service.hasBashMonitorWakeContinuation(workspaceId)).toBe(true);
+      expect(service.hasBashMonitorWakeContinuation("no-such-session")).toBe(false);
     } finally {
       session.dispose();
       await cleanup();
@@ -1266,10 +1267,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         Promise.resolve({ status: "settled", shownThroughOffset, terminalStatusShown: false })
       );
 
-      // task_await showed the lines before the SDK asked: no yield, no wake turn.
+      // task_await showed the lines before the SDK asked: no yield, no debt.
       expect(await session.hasPendingToolEndInput()).toBe(false);
       expect(processManager.setMessageQueued).not.toHaveBeenCalledWith(workspaceId, true);
-      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(false);
+      expect(service.hasBashMonitorWakeContinuation(workspaceId)).toBe(false);
       expect(session.hasQueuedMessages()).toBe(false);
 
       // A queued tool-end message still yields on its own.
@@ -1286,7 +1287,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       shownThroughOffset = 0;
       expect(await session.hasPendingToolEndInput()).toBe(true);
       expect(processManager.setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
-      expect(await service.hasOutstandingBashMonitorWake(workspaceId)).toBe(true);
+      expect(service.hasBashMonitorWakeContinuation(workspaceId)).toBe(true);
+      expect(service.getQueueCutCutter(workspaceId)).toEqual({ stage: "bash-monitor-wake" });
     } finally {
       session.dispose();
       await cleanup();

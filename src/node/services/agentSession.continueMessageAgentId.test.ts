@@ -154,7 +154,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     messages: MuxMessage[] = [],
     hooks: Pick<
       ConstructorParameters<typeof AgentSession>[0],
-      "onWorkspaceTurnContinuationAbandoned"
+      "onWorkspaceTurnContinuationVoided"
     > = {},
     config = createConfig()
   ) => {
@@ -364,7 +364,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     // A bash-monitor wake cut a delegated turn; the wake's on-send compaction stamped the
     // correlation on its follow-up. If a manual send wins the idle race, nothing else can
     // settle the owner's waiter (the compaction stream-end is uncorrelated and no later send
-    // inherits the metadata), so the discard itself must (Codex P2 PRRT_kwDOPxxmWM6fGVxG).
+    // inherits the metadata), so the discard itself voids the continuation.
     const workspaceTurnMetadata = {
       type: "workspace-turn-task",
       taskHandleId: "wst_abandoned",
@@ -381,20 +381,21 @@ describe("AgentSession continue-message agentId fallback", () => {
     };
     let settlementError: Error | undefined = new Error("task handle store unavailable");
     const abandoned = mock(
-      (_metadata: NonNullable<CompactionFollowUpRequest["workspaceTurnMetadata"]>) =>
-        settlementError != null ? Promise.reject(settlementError) : Promise.resolve()
+      (
+        _metadata: NonNullable<CompactionFollowUpRequest["workspaceTurnMetadata"]>,
+        _reason: string
+      ) => (settlementError != null ? Promise.reject(settlementError) : Promise.resolve())
     );
     const { session, historyService, internals } = await createSession(
       [compactionSummaryMessage("summary-wake", wakeFollowUp)],
-      { onWorkspaceTurnContinuationAbandoned: abandoned }
+      { onWorkspaceTurnContinuationVoided: abandoned }
     );
     internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
     (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
       () => true;
 
     // Settlement runs BEFORE the follow-up is erased: a failure keeps the durable record (the
-    // only carrier of the correlation) so the next attempt retries it (Codex P2
-    // PRRT_kwDOPxxmWM6fOH59).
+    // only carrier of the correlation) so the next attempt retries it.
     let dispatchError: unknown;
     try {
       await internals.dispatchPendingFollowUp();
@@ -415,7 +416,7 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(await internals.dispatchPendingFollowUp()).toBe(false);
     expect(internals.sendMessage).not.toHaveBeenCalled();
     expect(abandoned).toHaveBeenCalledTimes(2);
-    expect(abandoned).toHaveBeenLastCalledWith(workspaceTurnMetadata);
+    expect(abandoned).toHaveBeenLastCalledWith(workspaceTurnMetadata, "abandoned");
     const lastMessages = await historyService.getLastMessages("ws", 1);
     expect(lastMessages.success && lastMessages.data[0]?.metadata?.muxMetadata).toEqual({
       type: "compaction-summary",

@@ -5,7 +5,11 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
-import { AgentSession, type AgentSessionAIService } from "@/node/services/agentSession";
+import {
+  AgentSession,
+  type AgentSessionAIService,
+  type AgentSessionOptions,
+} from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -112,6 +116,7 @@ export interface AgentSessionHarnessOptions {
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   hasOutstandingBashMonitorWake?: () => Promise<boolean>;
   onToolEndYieldRequested?: () => void;
+  onWorkspaceTurnContinuationVoided?: AgentSessionOptions["onWorkspaceTurnContinuationVoided"];
   captureEvents?: boolean;
 }
 
@@ -158,6 +163,7 @@ export async function createAgentSessionHarness(
     onCompactionComplete: options.onCompactionComplete,
     hasOutstandingBashMonitorWake: options.hasOutstandingBashMonitorWake,
     onToolEndYieldRequested: options.onToolEndYieldRequested,
+    onWorkspaceTurnContinuationVoided: options.onWorkspaceTurnContinuationVoided,
   });
 
   const events: WorkspaceChatMessage[] = [];

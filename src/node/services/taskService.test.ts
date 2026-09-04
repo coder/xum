@@ -347,7 +347,7 @@ describe("TaskService", () => {
       isStreaming?: ReturnType<typeof mock>;
       hasQueuedMessages?: ReturnType<typeof mock>;
       hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
-      hasOutstandingBashMonitorWake?: ReturnType<typeof mock>;
+      hasBashMonitorWakeContinuation?: ReturnType<typeof mock>;
       hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
@@ -24363,15 +24363,15 @@ describe("TaskService", () => {
     expect(snapshot?.reportMarkdown).toBeUndefined();
   });
 
-  test("workspace-turn tool-calls stream-end defers to an outstanding wake", async () => {
-    // An outstanding bash-monitor wake makes the correlated stream yield at a tool
-    // boundary (finishReason "tool-calls"); the wake turn then continues the same
-    // turn — the handle must stay running.
-    const hasOutstandingBashMonitorWake = mock((workspaceId: string) =>
-      Promise.resolve(workspaceId === "childworkspace")
+  test("workspace-turn tool-calls stream-end defers to an owed wake continuation", async () => {
+    // The correlated stream yielded at a tool boundary (finishReason "tool-calls") to a
+    // bash-monitor wake; the session still owes that continuation, so the wake turn will
+    // continue the same turn — the handle must stay running.
+    const hasBashMonitorWakeContinuation = mock(
+      (workspaceId: string) => workspaceId === "childworkspace"
     );
     const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      hasOutstandingBashMonitorWake,
+      hasBashMonitorWakeContinuation,
     });
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       stage: "bash-monitor-wake" as const,
@@ -24425,11 +24425,11 @@ describe("TaskService", () => {
   test("a manual tool-end head owns the cut even while the wake level is high", async () => {
     // The session attributes the cut to the queued entry (hasPendingToolEndInput: a queue
     // head arbitrates alone), which runs first and breaks correlation inheritance; the wake
-    // behind it is not this turn's continuation. Deferring on the level would leave the
-    // handle running with no correlated stream-end to come (Codex P2 PRRT_kwDOPxxmWM6fOH50).
-    const hasOutstandingBashMonitorWake = mock(() => Promise.resolve(true));
+    // behind it is not this turn's continuation. Deferring on the wake would leave the
+    // handle running with no correlated stream-end to come.
+    const hasBashMonitorWakeContinuation = mock(() => true);
     const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      hasOutstandingBashMonitorWake,
+      hasBashMonitorWakeContinuation,
     });
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       stage: "queued" as const,
@@ -24453,7 +24453,7 @@ describe("TaskService", () => {
       parts: [{ type: "text", text: "Kicked off verification" }],
     });
 
-    expect(hasOutstandingBashMonitorWake).not.toHaveBeenCalled();
+    expect(hasBashMonitorWakeContinuation).not.toHaveBeenCalled();
     const settled = await workspaceTurnSnapshot(taskService, parentId);
     expect(settled?.status).not.toBe("running");
     expect(settled).toMatchObject({ messageId: "msg_manual_cut" });
@@ -24461,11 +24461,12 @@ describe("TaskService", () => {
 
   test("a wake retracted after the cut settles the handle as a wake cut instead of deferring", async () => {
     // The stream yielded to the wake level, then the operator canceled the monitor before
-    // this stream-end was processed: the level is low and no wake turn was admitted, so no
-    // continuation will ever arrive. Deferring would hang the owner's wait; the session's
-    // cut attribution settles it as a wake cut (not a truncation failure).
+    // this stream-end was processed: the session voided its continuation debt (the void's
+    // own settlement found the record not yet deferred), so no continuation will ever
+    // arrive. The event-time cut attribution still names the wake, so the record settles as
+    // a wake cut (not a truncation failure) rather than deferring forever.
     const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      hasOutstandingBashMonitorWake: mock(() => Promise.resolve(false)),
+      hasBashMonitorWakeContinuation: mock(() => false),
     });
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       stage: "bash-monitor-wake" as const,
@@ -24495,34 +24496,6 @@ describe("TaskService", () => {
       error:
         "Workspace turn yielded at a tool boundary to a bash-monitor wake that was retracted before delivery; the target workspace is idle and this delegated turn did not complete",
     });
-  });
-
-  test("a failing wake probe settles the handle instead of leaving it running", async () => {
-    // The probe is advisory: its I/O failing must not escape finalization with the terminal
-    // stream-end already consumed (the handle would stay running until the waiter timed out).
-    const { parentId, taskService } = await startWorkspaceTurnForTest({
-      hasOutstandingBashMonitorWake: mock(() => Promise.reject(new Error("watermark read failed"))),
-    });
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-
-    await internal.handleStreamEnd({
-      type: "stream-end",
-      workspaceId: "childworkspace",
-      messageId: "msg_probe_failed",
-      metadata: {
-        model: "anthropic:claude-opus-4-6",
-        agentId: "exec",
-        finishReason: "tool-calls",
-        muxMetadata: workspaceTurnMuxMetadata(parentId),
-      },
-      parts: [{ type: "text", text: "Kicked off verification" }],
-    });
-
-    const settled = await workspaceTurnSnapshot(taskService, parentId);
-    expect(settled?.status).not.toBe("running");
-    expect(settled).toMatchObject({ messageId: "msg_probe_failed" });
   });
 
   test("nested agent progress preserves workspace-turn correlation", async () => {
@@ -24732,10 +24705,10 @@ describe("TaskService", () => {
     });
   });
 
-  test("settleSupersededWorkspaceTurnContinuation settles the abandoned continuation and wakes the waiter", async () => {
+  test("settleVoidedWorkspaceTurnContinuation settles an abandoned continuation and wakes the waiter", async () => {
     // The target abandoned a compaction follow-up carrying this correlation (a manual send
     // won the idle race): no stream-end will ever carry the correlation again, so the
-    // abandonment itself settles the handle (Codex P2 PRRT_kwDOPxxmWM6fGVxG).
+    // abandonment itself settles the handle, deferred or not.
     const { parentId, taskService } = await startWorkspaceTurnForTest();
     const waited = workspaceTurnManagerFor(taskService)
       .waitForWorkspaceTurn("wst_handle", { requestingWorkspaceId: parentId, timeoutMs: 5_000 })
@@ -24744,9 +24717,10 @@ describe("TaskService", () => {
         (error: unknown) => error
       );
 
-    await taskService.settleSupersededWorkspaceTurnContinuation(
+    await taskService.settleVoidedWorkspaceTurnContinuation(
       "childworkspace",
-      workspaceTurnMuxMetadata(parentId)
+      workspaceTurnMuxMetadata(parentId),
+      "abandoned"
     );
 
     const error = await waited;
@@ -24758,29 +24732,87 @@ describe("TaskService", () => {
         "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
     });
 
-    // Idempotent on a settled record, and a no-op for a correlation that is not this turn.
-    await taskService.settleSupersededWorkspaceTurnContinuation(
+    // Idempotent on a settled record.
+    await taskService.settleVoidedWorkspaceTurnContinuation(
       "childworkspace",
-      workspaceTurnMuxMetadata(parentId)
+      workspaceTurnMuxMetadata(parentId),
+      "abandoned"
     );
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
       status: "interrupted",
     });
   });
 
-  test("settleSupersededWorkspaceTurnContinuation ignores a stale correlation", async () => {
+  test("settleVoidedWorkspaceTurnContinuation ignores a stale correlation", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
 
-    await taskService.settleSupersededWorkspaceTurnContinuation(
+    await taskService.settleVoidedWorkspaceTurnContinuation(
       "childworkspace",
-      workspaceTurnMuxMetadata(parentId, "wst_handle", "some-other-turn")
+      workspaceTurnMuxMetadata(parentId, "wst_handle", "some-other-turn"),
+      "abandoned"
     );
-    await taskService.settleSupersededWorkspaceTurnContinuation(
+    await taskService.settleVoidedWorkspaceTurnContinuation(
       "someone-else",
-      workspaceTurnMuxMetadata(parentId)
+      workspaceTurnMuxMetadata(parentId),
+      "abandoned"
     );
 
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({ status: "running" });
+  });
+
+  test("a retracted or superseded void settles only a record the stream-end already deferred", async () => {
+    // A record still running has its stream-end handler queued behind the void on the same
+    // workspace lock; that handler reads the cleared debt and settles the turn itself, so
+    // the void must not pre-empt it with a wake-cut outcome the handler may not agree with.
+    const hasBashMonitorWakeContinuation = mock(() => true);
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      hasBashMonitorWakeContinuation,
+    });
+    const correlation = workspaceTurnMuxMetadata(parentId);
+
+    await taskService.settleVoidedWorkspaceTurnContinuation(
+      "childworkspace",
+      correlation,
+      "retracted"
+    );
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({ status: "running" });
+
+    // The stream-end defers on the owed continuation ...
+    workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
+      stage: "bash-monitor-wake" as const,
+    }));
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_deferred_cut",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "tool-calls",
+        muxMetadata: correlation,
+      },
+      parts: [{ type: "text", text: "Waiting on the build" }],
+    });
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+      deferredMessageIds: ["msg_deferred_cut"],
+    });
+
+    // ... and the continuation is then retracted: the deferred record is the one this void
+    // exists for.
+    await taskService.settleVoidedWorkspaceTurnContinuation(
+      "childworkspace",
+      correlation,
+      "retracted"
+    );
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "interrupted",
+      error:
+        "Workspace turn yielded at a tool boundary to a bash-monitor wake that was retracted before delivery; the target workspace is idle and this delegated turn did not complete",
+    });
   });
 
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";

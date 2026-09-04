@@ -18,6 +18,7 @@ import {
   type WorkspaceLifecycleResult,
   type WorkspaceTurnManagerHost,
 } from "@/node/services/taskWorkspaceSeam";
+import type { WorkspaceTurnContinuationVoidReason } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import {
@@ -4325,11 +4326,11 @@ export class WorkspaceTurnManager {
    * Whether a continuation of this exact delegated turn is pending or streaming.
    * Pending entries must carry the same correlation metadata as the ended stream.
    */
-  private async hasSameTurnContinuation(
+  private hasSameTurnContinuation(
     event: StreamEndEvent,
     correlation: { taskHandleId: string; ownerWorkspaceId: string; turnId: string },
     queueCutSnapshot: QueueCutAttributionSnapshot
-  ): Promise<boolean> {
+  ): boolean {
     if (
       this.workspaceService.hasPendingWorkspaceTurnContinuation(event.workspaceId, {
         type: "workspace-turn-task",
@@ -4342,24 +4343,16 @@ export class WorkspaceTurnManager {
     // inherits this correlation from history (inheritOpenWorkspaceTurnMetadata). Only the
     // event-time attribution says whether the level was the cutter: a manual tool-end head
     // arbitrates the cut even while the level is high, runs first and breaks inheritance, so
-    // the wake behind it is not this turn's continuation and the handle must settle here
-    // instead of waiting on a stream-end that may never correlate (Codex P2
-    // PRRT_kwDOPxxmWM6fOH50). Whether the wake still arrives is then read live: the probe is
-    // advisory, so if its I/O fails settle through the normal path rather than leave the
-    // handle running with its terminal stream-end already consumed (a late correlated
-    // continuation can still self-heal it) (Codex P2 PRRT_kwDOPxxmWM6fEQIr).
-    if (queueCutSnapshot.cutter?.stage === "bash-monitor-wake") {
-      try {
-        if (await this.workspaceService.hasOutstandingBashMonitorWake(event.workspaceId)) {
-          return true;
-        }
-      } catch (error) {
-        log.warn("Bash monitor wake probe failed during workspace turn settlement", {
-          workspaceId: event.workspaceId,
-          taskHandleId: correlation.taskHandleId,
-          error,
-        });
-      }
+    // the wake behind it is not this turn's continuation and the handle must settle here.
+    // Whether the wake can still arrive is the session's continuation debt, read live and
+    // synchronously: a void that landed before this handler (same per-workspace lock) has
+    // already cleared it, and one landing after finds the record deferred and settles it
+    // itself (settleVoidedWorkspaceTurnContinuation).
+    if (
+      queueCutSnapshot.cutter?.stage === "bash-monitor-wake" &&
+      this.workspaceService.hasBashMonitorWakeContinuation(event.workspaceId)
+    ) {
+      return true;
     }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
     if (activeStream == null || activeStream.messageId === event.messageId) {
@@ -4530,7 +4523,7 @@ export class WorkspaceTurnManager {
     // must settle the old outcome here.
     if (
       event.metadata.finishReason === "tool-calls" &&
-      (await this.hasSameTurnContinuation(event, metadata, queueCutSnapshot))
+      this.hasSameTurnContinuation(event, metadata, queueCutSnapshot)
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
@@ -4687,23 +4680,28 @@ export class WorkspaceTurnManager {
   }
 
   /**
-   * The target workspace abandoned the continuation carrying this correlation (a wake's
-   * compaction follow-up skipped for a racing manual send, or an inadmissible summary).
-   * Nothing downstream can settle the turn: the compaction stream-end is ignored by
-   * finalizeWorkspaceTurnFromStreamEnd and no later send inherits the correlation, so the
-   * owner would wait until restart. Settle it as superseded now; if the manual turn does run,
-   * its uncorrelated stream-end finds the record already settled (Codex P2
-   * PRRT_kwDOPxxmWM6fGVxG).
+   * The target session will never continue the delegated turn identified by `muxMetadata`
+   * (AgentSession.onWorkspaceTurnContinuationVoided). `retracted` / `superseded` void a
+   * continuation debt: only a record the stream-end handler already DEFERRED on that debt
+   * needs settling here — a record still running has its handler queued behind this call on
+   * the workspace event lock, and that handler reads the (now cleared) debt live and settles
+   * the turn itself. `abandoned` drops a compaction follow-up carrying the correlation: the
+   * record may still be running behind the compaction stream (whose stream-end is
+   * uncorrelated and settles nothing), so any active record settles.
    */
-  async settleSupersededWorkspaceTurnContinuation(
+  async settleVoidedWorkspaceTurnContinuation(
     workspaceId: string,
-    muxMetadata: WorkspaceTurnMuxMetadata
+    muxMetadata: WorkspaceTurnMuxMetadata,
+    reason: WorkspaceTurnContinuationVoidReason
   ): Promise<void> {
     await this.settleWorkspaceTurnContinuationFailure(
       workspaceId,
       muxMetadata,
       "interrupted",
-      WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR
+      reason === "retracted"
+        ? WORKSPACE_TURN_YIELDED_TO_RETRACTED_WAKE_ERROR
+        : WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR,
+      { deferredOnly: reason !== "abandoned" }
     );
   }
 
@@ -4713,7 +4711,8 @@ export class WorkspaceTurnManager {
     workspaceId: string,
     muxMetadata: WorkspaceTurnMuxMetadata,
     status: "interrupted" | "error",
-    error: string
+    error: string,
+    options?: { deferredOnly: boolean }
   ): Promise<void> {
     const record = await this.taskHandleStore.getWorkspaceTurn(
       muxMetadata.ownerWorkspaceId,
@@ -4722,7 +4721,8 @@ export class WorkspaceTurnManager {
     if (
       record?.workspaceId !== workspaceId ||
       record?.turnId !== muxMetadata.turnId ||
-      !isActiveWorkspaceTurnTaskStatus(record?.status)
+      !isActiveWorkspaceTurnTaskStatus(record?.status) ||
+      (options?.deferredOnly === true && (record.deferredMessageIds?.length ?? 0) === 0)
     ) {
       return;
     }

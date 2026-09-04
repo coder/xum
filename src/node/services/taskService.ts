@@ -48,6 +48,7 @@ import {
   type WorkspaceLifecycleResult,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskCreateArgs, TaskKind } from "@/node/services/taskWorkspaceSeam";
+import type { WorkspaceTurnContinuationVoidReason } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -6209,14 +6210,23 @@ export class TaskService implements AgentTaskIntegration {
     }
   }
 
-  async settleSupersededWorkspaceTurnContinuation(
+  /**
+   * Under the same per-workspace lock as handleStreamEnd, so "the finalizer deferred on the
+   * debt" and "the debt was voided" are ordered: whichever runs second sees the other's
+   * result (see WorkspaceTurnManager.settleVoidedWorkspaceTurnContinuation).
+   */
+  async settleVoidedWorkspaceTurnContinuation(
     workspaceId: string,
-    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    reason: WorkspaceTurnContinuationVoidReason
   ): Promise<void> {
-    await this.getWorkspaceTurnManager().settleSupersededWorkspaceTurnContinuation(
-      workspaceId,
-      muxMetadata
-    );
+    await this.workspaceEventLocks.withLock(workspaceId, async () => {
+      await this.getWorkspaceTurnManager().settleVoidedWorkspaceTurnContinuation(
+        workspaceId,
+        muxMetadata,
+        reason
+      );
+    });
   }
 
   /**

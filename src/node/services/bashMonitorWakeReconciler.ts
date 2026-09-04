@@ -114,12 +114,13 @@ export interface BashMonitorWakeDispatch {
   prompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }>;
   /**
-   * False once a full-history clear, disposal, monitor cancel, or shown-frontier advance
-   * retired the signals behind this wake while it was in the receiver's hands — until
-   * `onAccepted` runs, after which it stays true (the prompt is durable and the signals
-   * consumed). The receiver re-checks it after taking its own locks (the clear runs under
-   * the same history lock), before sending, and at every send-admission gate, so a stale
-   * prompt is never appended to history and an accepted one always gets its stream.
+   * False once the lease behind this wake was released while it was in the receiver's
+   * hands (full-history clear, disposal, monitor cancel, shown-frontier advance, or an
+   * earlier wake committing meanwhile). Stays true from `onAccepted` on: the prompt is
+   * durable and the signals consumed. The receiver re-checks it after taking its own locks
+   * (the clear runs under the same history lock), before sending, and at every
+   * send-admission gate, so a stale prompt is never appended to history and an accepted one
+   * always gets its stream.
    */
   isCurrent(): boolean;
   onAccepted(): Promise<void>;
@@ -166,23 +167,42 @@ interface DerivedSignal {
 }
 
 /**
- * The one wake handed to `onWake` for an owner at a time. Lifecycle: an *offered* dispatch leaves the slot
- * either by withdrawal (defer / forgetDispatchFor / consumeCurrent) or by acceptance; an
- * *accepted* dispatch leaves the slot only once its signals are durably consumed — by the
- * reconcile pass that acknowledges them, by consumeCurrent, or by dispose. Withdrawal never
- * applies to an accepted dispatch: its prompt row is already durable, so the signals are
- * consumed whether or not the durability write has landed yet (Codex P2 PRRT_kwDOPxxmWM6fGVxB).
+ * A wake handed to the owner is a LEASE on the signal set it describes.
+ *
+ * Lifecycle (one transition each, all under the owner lock):
+ *
+ *   offered ──release──▶ released      the owner did not send it: `onDeferred`, `onWake`
+ *                                       threw, or the signals were withdrawn under it (cancel,
+ *                                       shown frontier, full-history clear). `isCurrent()` turns
+ *                                       false so the owner drops it at its next admission gate;
+ *                                       whatever still derives is re-leased by the next reconcile.
+ *   offered ──commit───▶ committed     the owner's prompt row is durable (`onAccepted`). The
+ *   released ─commit───▶ committed     signals are consumed from here on regardless of what
+ *                                       happened to the offer meanwhile (a release can land in
+ *                                       the send's last pre-durability await): withdrawal never
+ *                                       applies to a committed lease, and a replacement offered
+ *                                       into the emptied slot is released because it re-describes
+ *                                       signals this row already delivered.
+ *   committed ─acknowledge─▶ (gone)    watermarks advanced + monitors cleaned up for exactly the
+ *                                       leased signals, by identity. Attempted inline at commit
+ *                                       and retried by every reconcile pass until it lands; while
+ *                                       pending, `collect()` overlays the committed signals so the
+ *                                       level reads low and nothing re-derives a duplicate.
+ *
+ * Invariant: at most one offered and at most one committed lease per owner, and nothing is
+ * offered while either exists — a second wake meanwhile could only duplicate or supersede it.
  */
-interface DispatchState {
+interface Lease {
   signals: readonly DerivedSignal[];
-  accepted: boolean;
+  status: "offered" | "committed" | "released";
 }
 
 interface ReconcileState {
   requested: boolean;
   scheduled: boolean;
   promise?: Promise<void>;
-  dispatch?: DispatchState;
+  offered?: Lease;
+  committed?: Lease;
 }
 
 function signalKey(processId: string, createdAt: string): string {
@@ -402,7 +422,8 @@ export class BashMonitorWakeReconciler {
   /**
    * The wake level: whether the owner has a wake it has not seen yet. Same-process
    * blocking reads (deferredReads) are not outstanding — the read shows the lines itself.
-   * Consumers: the stream's tool-boundary stop condition and delegated-turn settlement.
+   * Consumer: the stream's tool-boundary stop condition (AgentSession.hasPendingToolEndInput);
+   * delegated-turn settlement reads the session's continuation debt instead.
    */
   async hasOutstandingWake(ownerWorkspaceId: string): Promise<boolean> {
     if (this.defunctWorkspaces.has(ownerWorkspaceId)) return false;
@@ -475,12 +496,10 @@ export class BashMonitorWakeReconciler {
 
   /**
    * A model-visible read advanced this process's shown frontier (or showed its terminal
-   * status). A wake already handed to the owner may now describe lines the owner has seen:
-   * the owner could have run a manual turn and returned idle while the wake was still
-   * resolving send options, so the reconcile that would re-derive it is queued behind that
-   * very hand-off. Forget the dispatch so its isCurrent() turns false at every admission
-   * gate; whatever still derives is re-handed by the reconcile scheduled here (Codex P2
-   * PRRT_kwDOPxxmWM6fEQIa).
+   * status). An offered wake may now describe lines the owner has seen (the owner could have
+   * run a manual turn and returned idle while the wake was still resolving send options, so
+   * the reconcile that would re-derive it is queued behind that very hand-off): release it
+   * and let the reconcile scheduled here re-lease whatever still derives.
    */
   async outputShown(ownerWorkspaceId: string, processId: string): Promise<void> {
     await this.forgetDispatchFor(ownerWorkspaceId, (signal) => signal.processId === processId);
@@ -492,16 +511,17 @@ export class BashMonitorWakeReconciler {
   ): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, () => {
       const state = this.states.get(ownerWorkspaceId);
-      if (
-        state?.dispatch != null &&
-        !state.dispatch.accepted &&
-        state.dispatch.signals.some(covers)
-      ) {
-        state.dispatch = undefined;
-      }
+      if (state?.offered?.signals.some(covers)) this.releaseOffered(state);
       return Promise.resolve();
     });
     this.scheduleReconcile(ownerWorkspaceId);
+  }
+
+  /** Caller holds the owner lock. */
+  private releaseOffered(state: ReconcileState): void {
+    if (state.offered == null) return;
+    state.offered.status = "released";
+    state.offered = undefined;
   }
 
   async beginFullHistoryClear(ownerWorkspaceId: string): Promise<BashMonitorFullHistoryClearToken> {
@@ -517,6 +537,11 @@ export class BashMonitorWakeReconciler {
     this.defunctWorkspaces.add(ownerWorkspaceId);
     this.resetRetry(ownerWorkspaceId);
     await this.locks.withLock(ownerWorkspaceId, () => {
+      const state = this.states.get(ownerWorkspaceId);
+      if (state != null) {
+        this.releaseOffered(state);
+        if (state.committed != null) state.committed.status = "released";
+      }
       this.states.delete(ownerWorkspaceId);
       return Promise.resolve();
     });
@@ -568,11 +593,11 @@ export class BashMonitorWakeReconciler {
   }
 
   private async reconcileOnce(ownerWorkspaceId: string): Promise<void> {
-    const dispatch = await this.locks.withLock(ownerWorkspaceId, async () => {
-      // An acknowledgment that failed at acceptance is retried first: on a throw the slot
-      // stays occupied and accepted, the loop's catch schedules the backoff retry, and no
-      // second wake is handed out meanwhile.
-      await this.acknowledgeAccepted(ownerWorkspaceId);
+    const lease = await this.locks.withLock(ownerWorkspaceId, async () => {
+      // A commit whose acknowledgment failed is retried first: on a throw the loop's catch
+      // schedules the backoff retry and nothing is leased meanwhile.
+      const committed = this.states.get(ownerWorkspaceId)?.committed;
+      if (committed != null) await this.acknowledge(ownerWorkspaceId, committed);
       const collected = await this.collect(ownerWorkspaceId, true);
       for (const readSettled of collected.deferredReads) {
         void readSettled.finally(() => this.scheduleReconcile(ownerWorkspaceId));
@@ -581,66 +606,57 @@ export class BashMonitorWakeReconciler {
       await this.cleanup(collected.autoConsumed);
 
       const state = this.state(ownerWorkspaceId);
-      // A wake already handed to the owner settles on its own (accept → acknowledged, and a
-      // reconcile is scheduled; defer → the owner re-arms a reconcile). Handing out a second
-      // one meanwhile could only duplicate or supersede the first.
-      if (collected.signals.length === 0 || state.dispatch != null) return undefined;
-      const next: DispatchState = { signals: collected.signals, accepted: false };
-      state.dispatch = next;
+      if (collected.signals.length === 0 || state.offered != null || state.committed != null) {
+        return undefined;
+      }
+      const next: Lease = { signals: collected.signals, status: "offered" };
+      state.offered = next;
       return next;
     });
-    if (dispatch == null) return;
+    if (lease == null) return;
 
     try {
       const outcome = await this.args.onWake({
         ownerWorkspaceId,
-        prompt: buildPrompt(dispatch.signals),
-        muxMetadata: buildMetadata(dispatch.signals),
-        // Validity freezes at acceptance: the prompt row is durable and the signals are
-        // consumed, so a cancel/shown/clear landing in the owner's remaining pre-stream
-        // awaits must let the turn finish admission (refusing there would leave the row
-        // in history with no stream, to be replayed by a later manual turn) (Codex P2
-        // PRRT_kwDOPxxmWM6fFJ4K).
-        isCurrent: () =>
-          dispatch.accepted || this.states.get(ownerWorkspaceId)?.dispatch === dispatch,
-        onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
-        onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
+        prompt: buildPrompt(lease.signals),
+        muxMetadata: buildMetadata(lease.signals),
+        isCurrent: () => lease.status !== "released",
+        onAccepted: async () => this.commit(ownerWorkspaceId, lease),
+        onDeferred: async () => this.release(ownerWorkspaceId, lease),
       });
-      if (outcome === "deferred") await this.defer(ownerWorkspaceId, dispatch);
+      if (outcome === "deferred") await this.release(ownerWorkspaceId, lease);
     } catch (error) {
-      await this.defer(ownerWorkspaceId, dispatch);
+      await this.release(ownerWorkspaceId, lease);
       throw error;
     }
   }
 
-  private async defer(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
+  private async release(ownerWorkspaceId: string, lease: Lease): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, () => {
       const state = this.state(ownerWorkspaceId);
-      if (state.dispatch === dispatch && !dispatch.accepted) state.dispatch = undefined;
+      if (state.offered === lease) this.releaseOffered(state);
       return Promise.resolve();
     });
   }
+
   /**
-   * The prompt row is durable: the dispatch's signals are consumed from here on, even if a
-   * full-history clear or process discard forgot the dispatch meanwhile. The flag flips first
-   * (collect() overlays an accepted dispatch onto the watermarks, so the level reads low and
-   * no duplicate derives whether or not the acknowledgment has landed); the acknowledgment
-   * itself is attempted inline and, if it throws, retried by the reconcile passes until it
-   * lands. Never throws: the caller is the owner's send, whose row already landed (Codex P2
-   * PRRT_kwDOPxxmWM6fGVxB).
+   * The owner's prompt row is durable. Never throws: the caller is the owner's send, whose
+   * row already landed; a failed acknowledgment is retried by the reconcile passes.
    */
-  private async accept(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
+  private async commit(ownerWorkspaceId: string, lease: Lease): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
-      // Second call (onAcceptedPreStreamFailure): already consumed; any pending retry is the
-      // reconcile pass's.
-      if (dispatch.accepted) return;
-      dispatch.accepted = true;
+      // Second call (onAcceptedPreStreamFailure), or the owner is gone.
+      if (lease.status === "committed" || this.defunctWorkspaces.has(ownerWorkspaceId)) return;
+      // A lease released while the send was between its last admission gate and durability
+      // still commits: the row exists, so its signals are consumed either way.
       const state = this.state(ownerWorkspaceId);
-      // Withdrawn between the send's last admission gate and its row becoming durable
-      // (forgetDispatchFor / consumeCurrent take only this lock): re-occupy the slot so the
-      // acknowledgment covers these signals instead of re-deriving them into a duplicate wake.
-      state.dispatch ??= dispatch;
-      await this.acknowledgeAccepted(ownerWorkspaceId).catch((error: unknown) => {
+      // The offered slot holds either this lease or a replacement offered after the signals
+      // were withdrawn under it; either way it empties (see the Lease lifecycle).
+      if (state.offered === lease) state.offered = undefined;
+      else this.releaseOffered(state);
+      lease.status = "committed";
+      state.committed = lease;
+      await this.acknowledge(ownerWorkspaceId, lease).catch((error: unknown) => {
         log.warn("Bash monitor wake acknowledgment failed; the reconcile pass retries it", {
           ownerWorkspaceId,
           error: getErrorMessage(error),
@@ -651,28 +667,32 @@ export class BashMonitorWakeReconciler {
   }
 
   /**
-   * Durably consume the accepted dispatch's signals and free the slot. Caller holds the owner
-   * lock. Throws when durability fails, leaving the slot occupied and accepted for a retry.
+   * Durably consume exactly the committed lease's signals. Caller holds the owner lock.
+   * Throws when durability fails, leaving the lease committed for a retry.
    */
-  private async acknowledgeAccepted(ownerWorkspaceId: string): Promise<void> {
-    const state = this.states.get(ownerWorkspaceId);
-    const dispatch = state?.dispatch;
-    if (state == null || dispatch?.accepted !== true) return;
+  private async acknowledge(ownerWorkspaceId: string, lease: Lease): Promise<void> {
     const watermarks = await this.readWatermarks(ownerWorkspaceId);
-    await this.advanceWatermarks(ownerWorkspaceId, watermarks, dispatch.signals);
-    await this.cleanup(dispatch.signals);
-    if (state.dispatch === dispatch) state.dispatch = undefined;
+    await this.advanceWatermarks(ownerWorkspaceId, watermarks, lease.signals);
+    await this.cleanup(lease.signals);
+    const state = this.states.get(ownerWorkspaceId);
+    if (state?.committed === lease) state.committed = undefined;
   }
 
   private async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
-      // A wake already handed to the owner describes signals this consume retires;
-      // forgetting it flips its isCurrent() so the owner drops it instead of sending.
-      this.state(ownerWorkspaceId).dispatch = undefined;
+      const state = this.state(ownerWorkspaceId);
+      // An offered wake describes signals this consume retires: release it so the owner
+      // drops it instead of sending. A committed one is consumed along with everything else.
+      this.releaseOffered(state);
       const collected = await this.collect(ownerWorkspaceId, false);
-      const consumed = [...collected.signals, ...collected.autoConsumed];
+      const consumed = [
+        ...collected.signals,
+        ...collected.autoConsumed,
+        ...(state.committed?.signals ?? []),
+      ];
       await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
       await this.cleanup(consumed);
+      state.committed = undefined;
       // Everything collected is consumed, so the level is low by construction; publish it
       // here because no read follows a consume.
       this.args.onOutstandingChanged?.(ownerWorkspaceId, false);
@@ -733,11 +753,11 @@ export class BashMonitorWakeReconciler {
     }
     if (pruned) await this.writeWatermarks(ownerWorkspaceId, watermarks);
 
-    // An accepted dispatch is consumed whether or not its acknowledgment has been written yet
-    // (the write may have failed and be awaiting retry). Overlaying it makes derive() treat
-    // those signals as delivered, so level reads stay low and nothing re-derives a duplicate.
-    const accepted = this.states.get(ownerWorkspaceId)?.dispatch;
-    if (accepted?.accepted === true) applySignalsToWatermarks(watermarks, accepted.signals);
+    // A committed lease is consumed whether or not its acknowledgment has landed yet.
+    // Overlaying it makes derive() treat those signals as delivered, so level reads stay low
+    // and nothing re-derives a duplicate.
+    const committed = this.states.get(ownerWorkspaceId)?.committed;
+    if (committed != null) applySignalsToWatermarks(watermarks, committed.signals);
 
     const signals: DerivedSignal[] = [];
     const autoConsumed: DerivedSignal[] = [];

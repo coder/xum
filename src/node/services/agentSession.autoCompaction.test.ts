@@ -1533,11 +1533,11 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     fixture.session.dispose();
   });
 
-  test("a wake consumed by on-send compaction stays a pending wake turn until its follow-up streams", async () => {
-    // The wake's onAccepted lowers the reconciler level, and the compaction turn's metadata is
-    // the compaction request — so while the compaction prepares/streams and until the follow-up
-    // dispatches, this marker is the only thing that tells delegated-turn settlement the wake
-    // continuation is still coming (Codex P1 PRRT_kwDOPxxmWM6fOf9G).
+  test("a wake consumed by on-send compaction stays in flight until its follow-up streams", async () => {
+    // The wake's onAccepted lowers the reconciler level, and the compaction stream's request is
+    // the compaction row, not the wake — so the compaction stream must not redeem the wake:
+    // the wake turn stays in flight through the compaction and is redeemed only by the
+    // follow-up's own stream (see AgentSession.wakeContinuationDebt).
     const observed: Array<[number, "preparing" | "streaming", boolean]> = [];
     const fixtureRef: { session?: AgentSession } = {};
     const fixture = await createGuidanceHarness({

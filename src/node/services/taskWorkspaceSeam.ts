@@ -11,7 +11,10 @@ import type {
   WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
-import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
+import type {
+  StreamErrorRecoveryOutcome,
+  WorkspaceTurnContinuationVoidReason,
+} from "@/node/services/agentSession";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
@@ -396,8 +399,11 @@ export interface TurnAdmissionHost {
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   hasPendingAutoRetry(workspaceId: string): boolean;
-  /** Bash-monitor wake level (see WorkspaceService.hasOutstandingBashMonitorWake). */
-  hasOutstandingBashMonitorWake(workspaceId: string): Promise<boolean>;
+  /**
+   * The session still owes, or already holds, a bash-monitor wake continuation (see
+   * AgentSession.hasBashMonitorWakeContinuation). Sync, no I/O.
+   */
+  hasBashMonitorWakeContinuation(workspaceId: string): boolean;
   /** Pending input (queued tool-end message or outstanding wake) wants a tool boundary. */
   isToolEndYieldRequested(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(
@@ -519,13 +525,14 @@ export interface AgentTaskIntegration {
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   /**
-   * The workspace dropped the continuation of a delegated turn (a compaction follow-up that
-   * carried the correlation was abandoned instead of dispatched). No later send inherits the
-   * correlation, so the owner's waiter is settled as superseded. Idempotent.
+   * The workspace will never continue the delegated turn `muxMetadata` identifies
+   * (AgentSession.onWorkspaceTurnContinuationVoided). Runs under the workspace event lock;
+   * idempotent. See WorkspaceTurnManager.settleVoidedWorkspaceTurnContinuation.
    */
-  settleSupersededWorkspaceTurnContinuation(
+  settleVoidedWorkspaceTurnContinuation(
     workspaceId: string,
-    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    muxMetadata: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>,
+    reason: WorkspaceTurnContinuationVoidReason
   ): Promise<void>;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
   restoreInterruptedTaskAfterResumeFailure(workspaceId: string): Promise<void>;

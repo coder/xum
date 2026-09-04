@@ -243,7 +243,48 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[0].isCurrent()).toBe(true);
   });
 
-  test("a failed acknowledgment keeps the accepted wake consumed and retries it", async () => {
+  test("a wake withdrawn under the send still commits and retires its replacement", async () => {
+    // Two processes; only `proc`'s lines get shown (shownThroughOffset 12 < other's offset).
+    const other = liveSnapshot({
+      processId: "other",
+      taskId: "bash:other",
+      match: { throughOffset: 40, lines: ["READY other"], totalMatches: 1 },
+    });
+    live = [liveSnapshot(), other];
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    const first = dispatches[0];
+
+    // The owner's send is past its last admission gate when a manual read shows `proc`'s
+    // output: the lease is released and a replacement (only `other`) is offered.
+    deliveryState = { status: "settled", shownThroughOffset: 12, terminalStatusShown: false };
+    await reconciler.outputShown(OWNER, "proc");
+    expect(first.isCurrent()).toBe(false);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    const replacement = dispatches[1];
+    expect(replacement.muxMetadata.records.map((record) => record.processId)).toEqual(["other"]);
+    expect(replacement.isCurrent()).toBe(true);
+
+    // The first send's row lands: its commit consumes exactly its own signals (both
+    // processes), and the replacement — which re-describes `other` — is released so the
+    // owner drops it at its next gate instead of sending a duplicate.
+    acknowledged = [];
+    await first.onAccepted();
+    expect(first.isCurrent()).toBe(true);
+    expect(replacement.isCurrent()).toBe(false);
+    expect(acknowledged).toEqual([
+      { processId: "other", matchedThroughOffset: 40 },
+      { processId: "proc", matchedThroughOffset: 12 },
+    ]);
+
+    // Nothing is left to derive: no third wake, level low.
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(await reconciler.hasOutstandingWake(OWNER)).toBe(false);
+  });
+
+  test("a failed acknowledgment keeps the committed wake consumed and retries it", async () => {
     live = [liveSnapshot()];
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(1);
@@ -257,7 +298,7 @@ describe("BashMonitorWakeReconciler", () => {
     await expect(reconciler.reconcile(OWNER)).rejects.toThrow("disk full");
     expect(dispatches).toHaveLength(1);
 
-    // Withdrawals never apply to an accepted dispatch: dropping it here would re-derive the
+    // Withdrawals never apply to a committed lease: dropping it here would re-derive the
     // same signals into a second prompt once the store recovers.
     await reconciler.outputShown(OWNER, "proc");
     await reconciler.discardProcess(OWNER, "proc", CREATED_AT);
