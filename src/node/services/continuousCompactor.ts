@@ -43,6 +43,7 @@ interface Dependencies {
     isStreaming(workspaceId: string): boolean;
   };
   prepare(): Promise<void>;
+  estimateAttachmentTokens?(head: MuxMessage[]): Promise<number>;
   // Includes usage recording: the generation fence must be AFTER the last await.
   summarize(
     head: MuxMessage[],
@@ -62,6 +63,7 @@ interface StagedSummary {
   headFingerprint: string;
   text: string;
   model: string;
+  attachmentTokens: number;
 }
 
 /** Only durable request-affecting metadata participates: committing a partial is not an edit. */
@@ -239,6 +241,8 @@ export class ContinuousCompactor {
       if (index < 0) return;
       rows[index] = { ...rows[index], parts: structuredClone(live.parts.slice(0, completedEnd)) };
     }
+    context = await this.withAttachmentEstimate(rows, context);
+    if (job.generation !== this.generation) return;
     const cut = selectRollingCut(rows, live ?? null, {
       contextWindowTokens: context.contextWindowTokens,
       // Before the model call only the system/attachment cost is known. Reject
@@ -266,7 +270,7 @@ export class ContinuousCompactor {
     const summary = await this.deps.summarize(cut.head, job.abort.signal, context);
     if (!summary || job.generation !== this.generation || job.abort.signal.aborted) return;
     assert(summary.text.trim().length > 0, "Continuous summarizer returned empty text");
-    const staged = { ...stagedBase, ...summary };
+    const staged = { ...stagedBase, ...summary, attachmentTokens: context.attachmentTokens ?? 0 };
     if (!this.wouldFit(staged, rows, context)) return;
     this.staged = staged;
     log.debug("[continuous-compaction] staged", {
@@ -327,6 +331,19 @@ export class ContinuousCompactor {
     });
   }
 
+  private async withAttachmentEstimate(
+    head: MuxMessage[],
+    context: ContinuousCompactionContext
+  ): Promise<ContinuousCompactionContext> {
+    if (!this.deps.estimateAttachmentTokens) return context;
+    const attachmentTokens = await this.deps.estimateAttachmentTokens(head);
+    assert(
+      Number.isFinite(attachmentTokens) && attachmentTokens >= 0,
+      "Invalid attachment token estimate"
+    );
+    return { ...context, attachmentTokens };
+  }
+
   private wouldFit(
     staged: StagedSummary,
     rows: MuxMessage[],
@@ -339,7 +356,7 @@ export class ContinuousCompactor {
     const tokens =
       summaryTokens +
       (context.systemMessageTokens ?? 0) +
-      (context.attachmentTokens ?? 0) +
+      Math.max(context.attachmentTokens ?? 0, staged.attachmentTokens) +
       tail.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
     return (
       tokens <
@@ -361,6 +378,8 @@ export class ContinuousCompactor {
     if (!rows || !this.isValid(staged, rows)) return false;
     const head = this.headFromRows(staged, rows);
     assert(head !== null, "Validated rolling head disappeared");
+    context = await this.withAttachmentEstimate(head, context);
+    if (staged.generation !== this.generation) return false;
     await this.deps.compactionHandler.preparePendingStateFromMessages(head);
     // Pending-state persistence yields; a reset/edit during it must still invalidate this job.
     rows = await this.readSnapshot();

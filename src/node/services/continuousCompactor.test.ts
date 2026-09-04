@@ -64,6 +64,7 @@ describe("ContinuousCompactor", () => {
   let streaming: boolean;
   let prepare: ReturnType<typeof mock<Dependencies["prepare"]>>;
   let summarize: ReturnType<typeof mock<Dependencies["summarize"]>>;
+  let estimateAttachments: ReturnType<typeof mock<(head: MuxMessage[]) => Promise<number>>>;
   let fastApply: ReturnType<typeof mock<Dependencies["fastApply"]>>;
   let completed: ReturnType<typeof mock>;
   const jobs: Array<Promise<void>> = [];
@@ -86,6 +87,7 @@ describe("ContinuousCompactor", () => {
       return Promise.resolve();
     });
     summarize = mock(() => Promise.resolve(summary));
+    estimateAttachments = mock(() => Promise.resolve(context.attachmentTokens ?? 0));
     fastApply = mock(async (apply) => {
       streaming = false;
       live = undefined;
@@ -98,6 +100,7 @@ describe("ContinuousCompactor", () => {
       streamManager: { getStreamInfo: () => live, isStreaming: () => streaming },
       prepare,
       summarize,
+      estimateAttachmentTokens: estimateAttachments,
       fastApply,
     });
   });
@@ -586,6 +589,23 @@ describe("ContinuousCompactor", () => {
     assert(summarizedAnswer, "The earlier completed step should be in the summarized head");
     expect(summarizedAnswer.parts).toEqual(answer.parts.slice(0, 1));
     expect(head.flatMap((row) => row.parts)).not.toContainEqual(answer.parts[1]);
+  });
+
+  it("counts actual post-compaction attachments before starting a live summary", async () => {
+    await seedLiveTurn();
+    estimateAttachments.mockResolvedValue(context.contextWindowTokens);
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(estimateAttachments).toHaveBeenCalledTimes(1);
+    expect(summarize).not.toHaveBeenCalled();
+    expect(await compactor.observe(forcePercent, { ...context, phase: "mid-stream" })).toBe(
+      "fallback"
+    );
+    const job = eagerJob(compactor);
+    jobs.push(job);
+    await job;
+    expect(fastApply).not.toHaveBeenCalled();
   });
 
   it("retains the complete live assistant when its first exact step is the cut", async () => {
