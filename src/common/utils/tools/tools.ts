@@ -16,6 +16,7 @@ import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit
 // DISABLED: import { createFileEditReplaceLinesTool } from "@/node/services/tools/file_edit_replace_lines";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
+import { createIntuitionTool } from "@/node/services/tools/intuition";
 import { createAdvisorTool } from "@/node/services/tools/advisor";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
@@ -315,6 +316,14 @@ export interface ToolConfiguration {
   /** Analytics service for raw SQL queries against DuckDB analytics data */
   analyticsService?: {
     executeRawQuery(sql: string): Promise<unknown>;
+  };
+  /** Pinned, host-only recall runtime; present only for eligible parent turns. */
+  intuitionRuntime?: {
+    modelString: string;
+    maxUsesPerTurn: number;
+    createModel: (modelString: string) => Promise<{ model: LanguageModel }>;
+    resolveAgentBody: () => Promise<string | null>;
+    abortSignal: AbortSignal;
   };
   /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
   advisorRuntime?: {
@@ -853,6 +862,7 @@ export async function getToolsForModel(
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
     ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
+    ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService && config.experiments?.timeline
@@ -1028,6 +1038,7 @@ export async function getToolsForModel(
         config.workflowService && config.experiments?.dynamicWorkflows
       ),
       enableAdvisor: Boolean(config.advisorRuntime),
+      enableIntuition: Boolean(config.intuitionRuntime),
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),
       enableTimelineEvent: Boolean(config.timelineService && config.experiments?.timeline),
       enableToolSearch: Boolean(config.toolSearchRuntime),
