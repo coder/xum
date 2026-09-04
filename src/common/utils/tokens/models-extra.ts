@@ -442,6 +442,40 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2026-02-16",
   },
 
+  // GPT-6 Astra - Released September 3, 2026 (OpenAI's frontier tier above the
+  // GPT-5.6 family). Model page: 1.05M context window, 128K max output, Apr 30
+  // 2026 cutoff. Base pricing: $10/M input, $50/M output, $1/M cached input;
+  // cache writes billed at 1.25x the active input rate ($12.50/M base). Prompts
+  // above 272K input tokens bill the full request at 2x input / 1.5x output:
+  // $20/M input, $75/M output, $2/M cached input, $25/M cache writes.
+  // supports_function_calling holds for the default Responses wire format only:
+  // Astra is served on Chat Completions too, but OpenAI's reasoning guide states
+  // tool calling requires the Responses API there, so the `chatCompletions`
+  // wireFormat opt-in loses tools for this model.
+  // Ref: https://developers.openai.com/api/docs/models/gpt-6-astra
+  // Ref: https://developers.openai.com/api/docs/pricing
+  // Ref: https://developers.openai.com/api/docs/guides/reasoning#reasoning-effort
+  "gpt-6-astra": {
+    max_input_tokens: 1050000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00001, // $10 per million input tokens (<272K prompt tokens)
+    input_cost_per_token_above_200k_tokens: 0.00002, // $20 per million input tokens (>272K)
+    output_cost_per_token: 0.00005, // $50 per million output tokens (<272K prompt tokens)
+    output_cost_per_token_above_200k_tokens: 0.000075, // $75 per million output tokens (>272K)
+    cache_read_input_token_cost: 0.000001, // $1 per million cached input tokens (<272K)
+    cache_read_input_token_cost_above_200k_tokens: 0.000002, // $2 per million cached input tokens (>272K)
+    cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25x input)
+    cache_creation_input_token_cost_above_200k_tokens: 0.000025, // $25 per million tokens (1.25x long-context input)
+    tiered_pricing_threshold_tokens: 272000, // OpenAI's published boundary is 272K (field names say 200K)
+    litellm_provider: "openai",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    knowledge_cutoff: "2026-04-30",
+  },
+
   // GPT-5.5 Pro - Released April 23, 2026
   // Native 1.05M context, 128K max output; Responses API only.
   // Base pricing: $30/M input, $180/M output; OpenAI has not published cached-input pricing.

@@ -122,6 +122,19 @@ const MODEL_DEFINITIONS = {
     aliases: ["luna"],
     tokenizerOverride: "openai/gpt-5",
   },
+  // GPT-6 Astra - Released September 3, 2026; OpenAI's frontier tier above the
+  // GPT-5.6 family (API id `gpt-6-astra`, no bare `gpt-6` alias). The bare `gpt`
+  // alias stays on Sol: Astra bills 2x Sol's rates, and ordering after the GPT-5.6
+  // tiers keeps Sol as the first 1.05M-context candidate for compaction "switch
+  // model" suggestions. Not warmed: its tokenizer override is already warmed via GPT.
+  GPT_6_ASTRA: {
+    provider: "openai",
+    providerModelId: "gpt-6-astra",
+    aliases: ["astra", "gpt-6-astra"],
+    // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate
+    // counting (same approach as the GPT-5.6 family).
+    tokenizerOverride: "openai/gpt-5",
+  },
   // GPT Pro alias tracks the latest GPT-5 Pro tier.
   GPT_PRO: {
     provider: "openai",

@@ -71,6 +71,7 @@ describe("getModelStats", () => {
     ["openai:gpt-5.6-sol", 0.000005, 0.00003, 0.0000005, 0.00000625],
     ["openai:gpt-5.6-terra", 0.000002, 0.000012, 0.0000002, 0.0000025],
     ["openai:gpt-5.6-luna", 0.0000002, 0.0000012, 0.00000002, 0.00000025],
+    ["openai:gpt-6-astra", 0.00001, 0.00005, 0.000001, 0.0000125],
   ] as const)(
     "resolves %s with the GA pricing and limits",
     (model, input, output, cacheRead, cacheCreation) => {
@@ -96,6 +97,14 @@ describe("getModelStats", () => {
       );
     }
   );
+
+  test("resolves GPT-6 Astra by alias, dated snapshot, and gateway prefix", () => {
+    const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
+    expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
+    expect(expectStats("mux-gateway:openai/gpt-6-astra")).toEqual(astra);
+    // OpenAI has published no Astra variants; do not resolve unknown ids to it.
+    expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
+  });
 
   test("resolves GPT-5.4 nano with the published limits and pricing", () => {
     const stats = expectStats(KNOWN_MODELS.GPT_54_NANO.id);
