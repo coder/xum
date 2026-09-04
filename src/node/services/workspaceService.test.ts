@@ -306,8 +306,27 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       );
       expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toEqual([wakeRecord]);
 
+      // An acknowledgment that kept failing while the accepted wake turn ran leaves the row
+      // behind however many rows that turn produced; a fixed tail depth would miss it and the
+      // restarted reconciler would redeliver the output. Bury the row deep and cross a
+      // compaction boundary on the way.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("boundary", "assistant", "compacted summary", {
+          timestamp: 1_200,
+          compacted: "user",
+        })
+      );
+      for (let i = 0; i < 300; i++) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`tool-step-${i}`, "assistant", `step ${i}`, { timestamp: 2_000 + i })
+        );
+      }
+      expect(await internal.readLastBashMonitorWakeRecords(workspaceId)).toEqual([wakeRecord]);
+
       // "Could not read" is not "no row": the reconciler consults this once per owner.
-      const readSpy = spyOn(historyService, "getLastMessages").mockImplementationOnce(() =>
+      const readSpy = spyOn(historyService, "iterateFullHistory").mockImplementationOnce(() =>
         Promise.resolve(Err("history unavailable"))
       );
       try {

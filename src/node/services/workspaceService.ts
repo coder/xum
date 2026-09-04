@@ -377,13 +377,6 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 /**
- * How far back readLastBashMonitorWakeRecords looks for the last durable wake row. A commit
- * lost to a restart leaves that row at the tail; anything older had a running process (and
- * its in-memory acknowledgment retries) behind it.
- */
-const LAST_BASH_MONITOR_WAKE_ROW_SCAN_DEPTH = 50;
-
-/**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
  * (`workspace-1`, `workspace-2`, ...) come from {@link generateForkBranchName}
  * so the existing fork-style numbering helpers stay the single source of truth.
@@ -12078,29 +12071,41 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    */
   /**
    * Records of the most recent durable bash-monitor wake row (BashMonitorWakeReconciler
-   * readDeliveredWakeRecords). Only the history tail is scanned: the row this recovers was
-   * committed right before a restart, so it is at or near the end.
+   * readDeliveredWakeRecords). Scans backward from the tail and stops at the first wake row:
+   * usually that row is at or near the end (committed right before the restart), but the state
+   * this repairs — an acknowledgment that kept failing while the accepted wake turn ran — can
+   * push it behind an arbitrarily long tool-heavy turn, so no fixed depth is safe. The scan
+   * also crosses compaction boundaries: the wake stays acknowledged by its row wherever the
+   * row sits, and a summary over it must not turn into a redelivery.
    */
   private async readLastBashMonitorWakeRecords(
     ownerWorkspaceId: string
   ): Promise<readonly BashMonitorWakeDisplayRecord[] | undefined> {
-    const tail = await this.historyService.getLastMessages(
+    let records: readonly BashMonitorWakeDisplayRecord[] | undefined;
+    const iterateResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
-      LAST_BASH_MONITOR_WAKE_ROW_SCAN_DEPTH
+      "backward",
+      (messages) => {
+        // Chunks arrive newest-first, as do the rows within a chunk.
+        for (const message of messages) {
+          // A wake diverted through on-send compaction is durable as the compaction row that
+          // carries it as follow-up; that row is the acknowledgment too.
+          const wake = getCarriedBashMonitorWake(message.metadata?.muxMetadata);
+          if (wake != null) {
+            records = wake.records;
+            return false;
+          }
+        }
+        return true;
+      }
     );
     // Distinguish "no row" from "could not read": the reconciler recovers once per owner, so a
     // read failure swallowed here would let the reconcile dispatch a duplicate of a wake the
     // row already delivered. Throwing fails this reconcile; its retry reads again.
-    if (!tail.success) {
-      throw new Error(`Failed to read the last bash-monitor wake row: ${tail.error}`);
+    if (!iterateResult.success) {
+      throw new Error(`Failed to read the last bash-monitor wake row: ${iterateResult.error}`);
     }
-    for (const message of tail.data.toReversed()) {
-      // A wake diverted through on-send compaction is durable as the compaction row that
-      // carries it as follow-up; that row is the acknowledgment too.
-      const wake = getCarriedBashMonitorWake(message.metadata?.muxMetadata);
-      if (wake != null) return wake.records;
-    }
-    return undefined;
+    return records;
   }
 
   hasPendingWorkspaceTurnContinuation(
