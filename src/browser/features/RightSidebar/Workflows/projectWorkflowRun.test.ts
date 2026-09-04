@@ -38,6 +38,75 @@ function makeRun(overrides: Partial<WorkflowRunRecord>): WorkflowRunRecord {
   };
 }
 
+describe("planned stage argument projection", () => {
+  test("preserves order, duplicate names, optional fields and the entire frozen input", () => {
+    const stages = Object.freeze([
+      Object.freeze({
+        name: " foundation ",
+        role: "Architect",
+        brief: "Build the base",
+        extra: 42,
+      }),
+      Object.freeze({ name: " foundation " }),
+      Object.freeze({ name: "implement", role: undefined, brief: undefined }),
+      Object.freeze({ name: "verify", role: "", brief: "" }),
+    ] as const);
+    const args = Object.freeze({ contract: "No regressions", stages });
+    const run = makeRun({ args });
+    const before = JSON.stringify(run);
+    const view = projectWorkflowRun(run);
+    expect(view.argEntries.map((entry) => entry.key)).toEqual(["contract", "stages"]);
+    expect(view.argEntries[0]).toEqual({ key: "contract", value: args.contract });
+    const entry = view.argEntries[1];
+    expect(entry.stages?.map((stage) => stage.name)).toEqual(stages.map((stage) => stage.name));
+    expect(entry.stages?.[0]).toEqual({
+      name: stages[0].name,
+      role: stages[0].role,
+      brief: stages[0].brief,
+    });
+    expect(entry.value).toBe(JSON.stringify(stages));
+    expect(run.args).toBe(args);
+    expect(JSON.stringify(run)).toBe(before);
+    expect(view.phases).toEqual([]);
+    expect(view.stats.total).toBe(0);
+  });
+
+  test.each(
+    [
+      null,
+      {},
+      [],
+      '[{"name":"foundation"}]',
+      ["foundation"],
+      [{ name: "valid" }, null],
+      [{ name: "valid" }, []],
+      [{ name: "valid" }, {}],
+      [{ name: "valid" }, { name: "  " }],
+      [{ name: "valid" }, { name: 123 }],
+      [{ name: "valid" }, { name: "invalid", role: null }],
+      [{ name: "invalid", role: 1 }],
+      [{ name: "invalid", brief: null }],
+      [{ name: "invalid", brief: [] }],
+      Array.from({ length: 2 }, (_, index) => (index === 0 ? { name: "valid" } : undefined)),
+      Object.assign(new Array<unknown>(2), { 0: { name: "valid" } }),
+    ].map((stages) => ({ stages }))
+  )("falls back for the entire unsupported value: %j", ({ stages }) => {
+    const entry = projectWorkflowRun(makeRun({ args: { stages } })).argEntries[0];
+    expect(entry).not.toHaveProperty("stages");
+    expect(entry.value).toBe(
+      stages == null ? "" : typeof stages === "string" ? stages : JSON.stringify(stages)
+    );
+  });
+
+  test("does not specialize other keys or positional arrays", () => {
+    const stages = [{ name: "foundation" }];
+    const named = projectWorkflowRun(makeRun({ args: { steps: stages } }));
+    const positional = projectWorkflowRun(makeRun({ args: stages }));
+    expect(named.argEntries).toEqual([{ key: "steps", value: JSON.stringify(stages) }]);
+    expect(positional.argEntries).toEqual([{ key: null, value: JSON.stringify(stages) }]);
+  });
+});
+
 // A representative in-flight deep-research run: scope → search-fetch (fan-out)
 // → verify (one still running) → synthesize (announced, no steps yet).
 function makeRunningResearchRun(): WorkflowRunRecord {
