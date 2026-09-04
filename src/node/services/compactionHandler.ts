@@ -41,7 +41,10 @@ import {
   sliceMessagesFromLatestCompactionBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
-import { getKeepRecentTailStartHistorySequence } from "@/common/utils/messages/keepRecentTail";
+import {
+  estimateMuxMessageTokens,
+  getKeepRecentTailStartHistorySequence,
+} from "@/common/utils/messages/keepRecentTail";
 import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -58,7 +61,7 @@ import {
  * A valid compaction summary should be prose text describing the conversation,
  * not a JSON blob. This general check catches any tool that might leak through.
  */
-function looksLikeRawJsonObject(text: string): boolean {
+export function looksLikeRawJsonObject(text: string): boolean {
   const trimmed = text.trim();
 
   // Must be a JSON object (not array, not primitive)
@@ -631,7 +634,7 @@ export class CompactionHandler {
     }
   }
 
-  private async preparePendingStateFromMessages(messages: MuxMessage[]): Promise<void> {
+  async preparePendingStateFromMessages(messages: MuxMessage[]): Promise<void> {
     await this.loadPersistedPendingStateIfNeeded();
 
     const latestCompactionEpochMessages = sliceMessagesFromLatestCompactionBoundary(messages);
@@ -1098,6 +1101,86 @@ export class CompactionHandler {
    * 3. Prefer updating the streamed summary in-place, otherwise append a fallback summary
    * 4. Emit summary message to frontend
    */
+  /** The rolling summarizer already paid for this text; applying it must not start another turn. */
+  async persistContinuousCompaction(params: {
+    messages: MuxMessage[];
+    text: string;
+    model: string;
+    tail: MuxMessage[];
+    systemMessageTokens: number;
+    attachmentTokens: number;
+    pendingFollowUp?: CompactionFollowUpRequest;
+  }): Promise<boolean> {
+    assert(params.text.trim().length > 0, "Continuous compaction requires a summary");
+    const boundary = createMuxMessage(
+      createCompactionSummaryMessageId(),
+      "assistant",
+      params.text,
+      {
+        timestamp: Date.now(),
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: getNextCompactionEpoch(params.messages),
+        model: params.model,
+        systemMessageTokens: params.systemMessageTokens,
+        muxMetadata: {
+          type: "compaction-summary",
+          strategy: "continuous",
+          pendingFollowUp: params.pendingFollowUp,
+        },
+      }
+    );
+    const idMap = new Map(params.tail.map((row) => [row.id, createPreservedTailCopyMessageId()]));
+    const copies = params.tail.map((row) => {
+      const copy = this.buildPreservedTailCopy(row, idMap);
+      // Continuous compaction prunes the just-finished answer too. Keep recent pages
+      // visible below the boundary while retaining RLM's usage/snapshot sanitizer.
+      copy.metadata = { ...copy.metadata, uiVisible: true };
+      delete copy.metadata.partial;
+      return copy;
+    });
+    const inputTokens =
+      params.systemMessageTokens +
+      params.attachmentTokens +
+      estimateMuxMessageTokens(boundary) +
+      copies.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
+    assert(boundary.metadata !== undefined, "Continuous boundary requires metadata");
+    boundary.metadata.contextUsage = {
+      inputTokens,
+      outputTokens: 0,
+      totalTokens: inputTokens,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+    };
+    const result = await this.historyService.persistBoundaryWithTailCopies(
+      this.workspaceId,
+      boundary,
+      copies,
+      false
+    );
+    if (!result.success) {
+      log.warn("[continuous-compaction] persist failed", result.error);
+      return false;
+    }
+    this.postCompactionAttachmentsPending = true;
+    this.emitChatEvent({ ...boundary, type: "message" });
+    for (const copy of copies) this.emitChatEvent({ ...copy, type: "message" });
+    const sequence = boundary.metadata.historySequence;
+    const epoch = boundary.metadata.compactionEpoch;
+    assert(isNonNegativeInteger(sequence), "Continuous boundary requires a persisted sequence");
+    assert(isPositiveInteger(epoch), "Continuous boundary requires an epoch");
+    this.onCompactionComplete?.({
+      workspaceId: this.workspaceId,
+      summaryMessageId: boundary.id,
+      summaryHistorySequence: sequence,
+      compactionEpoch: epoch,
+      previousBoundaryHistorySequence: getLatestBoundaryHistorySequence(params.messages),
+      compactionRequestMessageId: boundary.id,
+      preservedTailMessageCount: copies.length,
+    });
+    return true;
+  }
+
   private async performCompaction(
     summary: string,
     metadata: {
@@ -1414,6 +1497,9 @@ export class CompactionHandler {
         ...(source?.model !== undefined ? { model: source.model } : {}),
         ...(source?.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),
         ...(source?.agentId !== undefined ? { agentId: source.agentId } : {}),
+        ...(source?.stepStartPartIndices !== undefined
+          ? { stepStartPartIndices: source.stepStartPartIndices }
+          : {}),
         // Preserve partial so interrupted-tool sentinels keep applying.
         ...(source?.partial !== undefined ? { partial: source.partial } : {}),
         // muxMetadata drives provider-side filtering (workflow display rows),

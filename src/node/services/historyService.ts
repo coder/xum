@@ -2615,7 +2615,11 @@ export class HistoryService {
     tailCopies: readonly MuxMessage[],
     updateExisting: boolean
   ): Promise<Result<void>> {
-    assert(tailCopies.length > 0, "persistBoundaryWithTailCopies requires at least one tail copy");
+    // Continuous compaction may intentionally keep no tail when no complete turn fits.
+    assert(
+      isDurableContextBoundaryMarker(summaryMessage),
+      "Expected a durable compaction boundary"
+    );
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
