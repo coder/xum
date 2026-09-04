@@ -2716,9 +2716,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     />
                   </div>
 
+                  {/* Inset outlines preserve the boundary over hover backgrounds and in forced colors. */}
                   <div
                     className={cn(
-                      "border-border-light flex min-w-0 items-center gap-1.5 rounded-md border px-1.5 py-0.5",
+                      "outline-border-light flex min-w-0 items-center gap-1.5 rounded-md px-1.5 outline-1 -outline-offset-1",
                       COMPOSER_CONTROL_HEIGHT_CLASS
                     )}
                     data-component="ModelSelectorGroup"
