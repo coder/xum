@@ -48,6 +48,7 @@ type MockWorkspaceUnreadState = ReturnType<typeof WorkspaceUnreadModule.useWorks
 type MockWorkspaceSidebarState = ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>;
 
 let mockWorkspaceHeartbeatsEnabled = false;
+let latestUseDragSpec: (() => { item?: () => Record<string, unknown> }) | null = null;
 let mockWorkspaceUnreadState: MockWorkspaceUnreadState;
 let mockWorkspaceSidebarState: MockWorkspaceSidebarState;
 
@@ -141,6 +142,14 @@ function installAgentListItemTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(((props: { children: ReactNode }) => (
     <>{props.children}</>
   )) as unknown as typeof TooltipModule.TooltipContent);
+  spyOn(TooltipModule, "TooltipIfPresent").mockImplementation(((props: {
+    children: ReactNode;
+    tooltip?: string;
+  }) => (
+    <span data-testid="badge-tooltip" data-tooltip-content={props.tooltip}>
+      {props.children}
+    </span>
+  )) as unknown as typeof TooltipModule.TooltipIfPresent);
   spyOn(WorkspaceStatusIndicatorModule, "WorkspaceStatusIndicator").mockImplementation(((props: {
     workspaceId: string;
   }) => (
@@ -172,7 +181,10 @@ function installAgentListItemTestDoubles() {
 
   void mock.module("react-dnd", () => ({
     ...actualReactDnd,
-    useDrag: () => [{ isDragging: false }, passthroughRef, () => undefined] as const,
+    useDrag: (spec: () => { item?: () => Record<string, unknown> }) => {
+      latestUseDragSpec = spec;
+      return [{ isDragging: false }, passthroughRef, () => undefined] as const;
+    },
     useDrop: () => [{ isPinnedReorderTarget: false }, passthroughRef] as const,
   }));
 
@@ -275,6 +287,7 @@ function renderWorkspaceItem(
     completedChildrenExpanded?: boolean;
     onToggleCompletedChildren?: (workspaceId: string) => void;
     onSelectWorkspace?: (selection: WorkspaceSelection) => void;
+    projectBadgeName?: string;
   } = {}
 ) {
   const metadata = options.metadata ?? createMetadata();
@@ -283,6 +296,7 @@ function renderWorkspaceItem(
       metadata={metadata}
       projectPath={metadata.projectPath}
       projectName={metadata.projectName}
+      projectBadgeName={options.projectBadgeName}
       isSelected={options.isSelected ?? false}
       isArchiving={options.isArchiving}
       depth={options.depth ?? options.rowRenderMeta?.depth}
@@ -336,6 +350,29 @@ describe("AgentListItem", () => {
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
+  });
+
+  test("exposes the full project badge label through the shared tooltip", () => {
+    // The badge's width cap end-truncates hierarchical "Parent / Sub" names,
+    // so the shared tooltip wrapper must carry the full label.
+    const badgeName = "Parent Project With A Long Name / Frontend";
+    const { view } = renderWorkspaceItem({ projectBadgeName: badgeName });
+
+    const badge = view.getByTestId(`workspace-project-badge-${TEST_WORKSPACE_ID}`);
+    const tooltip = badge.closest('[data-testid="badge-tooltip"]');
+    expect(tooltip?.getAttribute("data-tooltip-content")).toBe(badgeName);
+  });
+
+  test("falls back to the row's sub-project scope for drag section identity", () => {
+    // Flat rows omit the sectionId prop (it also drives section indentation),
+    // so the drag item must carry metadata.subProjectPath instead; drop zones
+    // rely on it to treat same-section drops as no-ops.
+    renderWorkspaceItem({
+      metadata: createMetadata({ subProjectPath: "/tmp/project/features" }),
+    });
+    const item = latestUseDragSpec?.().item?.();
+    expect(item?.workspaceId).toBe(TEST_WORKSPACE_ID);
+    expect(item?.currentSectionId).toBe("/tmp/project/features");
   });
 
   test("suppresses best-of member titles that repeat the group header (D8)", () => {

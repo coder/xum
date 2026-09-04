@@ -13606,6 +13606,44 @@ describe("WorkspaceService setPinned", () => {
     expect(emittedMetadata[1].metadata?.pinnedAt).toBeUndefined();
   });
 
+  test("corrupted boundary pinnedAt on another chat cannot block pinning", async () => {
+    // A parseable boundary timestamp has no representable +1ms successor; the
+    // global monotonic scan must ignore it rather than fail every future pin.
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = "+275760-09-13T00:00:00.000Z";
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const pinnedAt = getEntry(rootId)?.pinnedAt;
+    expect(pinnedAt).toBeDefined();
+    // The assigned timestamp is a normal near-now value, not a successor of
+    // the corrupted boundary.
+    expect(new Date(pinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
+  test("pinning heals a saturated boundary timestamp so keys stay unique", async () => {
+    // An existing pin at the sane cap has no strictly-greater sane successor;
+    // the write path renumbers pins instead of minting a duplicate key.
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = saneMax;
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const rootPinnedAt = getEntry(rootId)?.pinnedAt;
+    const otherPinnedAt = getEntry(otherRootId)?.pinnedAt;
+    expect(rootPinnedAt).toBeDefined();
+    expect(otherPinnedAt).toBeDefined();
+    expect(rootPinnedAt).not.toBe(otherPinnedAt);
+    // The healed pin sorts before the new pin and both are near-now values.
+    expect(new Date(otherPinnedAt ?? "").getTime()).toBeLessThan(
+      new Date(rootPinnedAt ?? "").getTime()
+    );
+    expect(new Date(rootPinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
   test("pin-when-pinned and unpin-when-unpinned are no-ops without event churn", async () => {
     const first = await workspaceService.setPinned(rootId, true);
     expect(first.success).toBe(true);
@@ -13841,9 +13879,10 @@ describe("WorkspaceService reorderPinned", () => {
     expect(emittedMetadata).toHaveLength(0);
   });
 
-  test("drops stale/unpinned/duplicate ids and appends omitted pins in current order", async () => {
+  test("drops stale/unpinned/duplicate ids and keeps omitted pins in place", async () => {
     // Client sends duplicates, an unpinned id, a sub-agent, an archived chat,
-    // and a ghost id, and omits B and C entirely.
+    // and a ghost id, and omits B entirely: C and A swap within the slots
+    // they occupy while omitted B keeps its position.
     const result = await workspaceService.reorderPinned([
       idC,
       idC,
@@ -13851,10 +13890,10 @@ describe("WorkspaceService reorderPinned", () => {
       childId,
       archivedId,
       "ws-ghost",
+      idA,
     ]);
     expect(result.success).toBe(true);
-    // C first, then omitted pins A, B keep their relative order.
-    expect(pinnedOrder()).toEqual([idC, idA, idB]);
+    expect(pinnedOrder()).toEqual([idC, idB, idA]);
     // Ineligible ids never gain pinnedAt.
     expect(getEntry(unpinnedId)?.pinnedAt).toBeUndefined();
     expect(getEntry(childId)?.pinnedAt).toBeUndefined();
@@ -13896,6 +13935,153 @@ describe("WorkspaceService reorderPinned", () => {
     const values = [idB, idC, idA].map((id) => Date.parse(getEntry(id)?.pinnedAt ?? ""));
     expect(values[0]).toBeLessThan(values[1]);
     expect(values[1]).toBeLessThan(values[2]);
+  });
+});
+
+describe("WorkspaceService reorderPinned across projects", () => {
+  const projectA = "/tmp/project-a";
+  const projectB = "/tmp/project-b";
+  const idA1 = "ws-a1";
+  const idA2 = "ws-a2";
+  const idA3 = "ws-a3";
+  const idB1 = "ws-b1";
+  const idB2 = "ws-b2";
+
+  let workspaceService: WorkspaceService;
+  let configState: ProjectsConfig;
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+
+  const findEntry = (id: string) => {
+    for (const [projectPath, project] of configState.projects) {
+      const entry = project.workspaces.find((w) => w.id === id);
+      if (entry) return { projectPath, entry };
+    }
+    return undefined;
+  };
+
+  /** Pinned ids across all projects in effective order (pinnedAt asc), as the flat sidebar sorts them. */
+  const globalPinnedOrder = () =>
+    [...configState.projects.values()]
+      .flatMap((project) => project.workspaces)
+      .filter((w) => w.id && w.pinnedAt && !w.parentWorkspaceId && !w.archivedAt)
+      .sort((a, b) => Date.parse(a.pinnedAt ?? "") - Date.parse(b.pinnedAt ?? ""))
+      .map((w) => w.id);
+
+  beforeEach(async () => {
+    // Interleaved global pin order: a1, b1, a2, b2.
+    configState = {
+      projects: new Map([
+        [
+          projectA,
+          {
+            workspaces: [
+              { path: `${projectA}/${idA1}`, id: idA1, pinnedAt: "2026-01-01T00:00:00.000Z" },
+              { path: `${projectA}/${idA2}`, id: idA2, pinnedAt: "2026-01-01T00:00:20.000Z" },
+              { path: `${projectA}/${idA3}`, id: idA3 },
+            ],
+          },
+        ],
+        [
+          projectB,
+          {
+            workspaces: [
+              { path: `${projectB}/${idB1}`, id: idB1, pinnedAt: "2026-01-01T00:00:10.000Z" },
+              { path: `${projectB}/${idB2}`, id: idB2, pinnedAt: "2026-01-01T00:00:30.000Z" },
+            ],
+          },
+        ],
+      ]),
+    };
+
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      findWorkspace: mock((id: string) => {
+        const found = findEntry(id);
+        if (!found) return null;
+        return {
+          projectPath: found.projectPath,
+          workspacePath: found.entry.path,
+          parentWorkspaceId: found.entry.parentWorkspaceId,
+        };
+      }),
+      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+        configState = fn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+
+    workspaceService = createWorkspaceServiceForTest({
+      config: mockConfig,
+      historyService,
+    });
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("persists a flat-mode reorder spanning project buckets", async () => {
+    const maxBefore = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+
+    // Drag b1 above a1 in the unified pinned block.
+    const result = await workspaceService.reorderPinned([idB1, idA1, idA2, idB2]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idB1, idA1, idA2, idB2]);
+
+    // The timestamp pool is re-dealt, not inflated.
+    const maxAfter = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+    expect(maxAfter).toBe(maxBefore);
+  });
+
+  test("setPinned appends after the global pinned max, not just its own bucket's", async () => {
+    // Give the other bucket the newest pin so a bucket-local max would sort the
+    // new pin above it in the flat sidebar's unified block.
+    const future = new Date(Date.now() + 60_000).toISOString();
+    findEntry(idB2)!.entry.pinnedAt = future;
+
+    expect((await workspaceService.setPinned(idA3, true)).success).toBe(true);
+    expect(globalPinnedOrder().at(-1)).toBe(idA3);
+  });
+
+  test("partial cross-bucket reorder keeps omitted pins in their global slots", async () => {
+    // The grouped multi-project section sends only its own pinned ids, which
+    // can live in different project buckets. Swapping b1 and a2 must not
+    // displace the ordinary pins a1 and b2 in the flat global order.
+    const a1Before = findEntry(idA1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idB1]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idA1, idA2, idB1, idB2]);
+    // The untouched slots keep their exact timestamps.
+    expect(findEntry(idA1)?.entry.pinnedAt).toBe(a1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
+  });
+
+  test("grouped-mode reorder of one bucket leaves other buckets' timestamps untouched", async () => {
+    const b1Before = findEntry(idB1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idA1]);
+    expect(result.success).toBe(true);
+
+    // Project A flipped within its own timestamp pool.
+    const a1 = Date.parse(findEntry(idA1)?.entry.pinnedAt ?? "");
+    const a2 = Date.parse(findEntry(idA2)?.entry.pinnedAt ?? "");
+    expect(a2).toBeLessThan(a1);
+    // Project B was not referenced, so its entries are byte-identical.
+    expect(findEntry(idB1)?.entry.pinnedAt).toBe(b1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
   });
 });
 

@@ -12,7 +12,7 @@ import {
 import { AIService } from "@/node/services/aiService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
-import { AppFiberScopeLive } from "@/node/services/di/appFiberScope";
+import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AI,
@@ -90,16 +90,18 @@ export class CoreOptionsTag extends Context.Service<CoreOptionsTag, CoreOptions>
 
 /**
  * What the roots must provide beneath `CoreLive`: the stores, the options,
- * the runtime's `EffectRunner` (the base seam in both roots; StreamManager's
- * clock-driven fibers run through it), and the two always-present
- * collaborators the desktop builds elsewhere (`MemoryMetaLive`;
- * `WorkspaceMcpOverrides` from `CrossCuttingLive`). CLI roots supply the
- * defaults (`MemoryMetaLive`, `WorkspaceMcpOverridesDefaultLive`).
+ * the runtime seams (the base of both roots: `EffectRunner`, through which
+ * StreamManager's clock-driven fibers run, and `AppFiberScope`, which
+ * supervises its stream engine), and the two always-present collaborators the
+ * desktop builds elsewhere (`MemoryMetaLive`; `WorkspaceMcpOverrides` from
+ * `CrossCuttingLive`). CLI roots supply the defaults (`MemoryMetaLive`,
+ * `WorkspaceMcpOverridesDefaultLive`).
  */
 export type CoreInputTags =
   | StoreTags
   | CoreOptionsTag
   | EffectRunnerTag
+  | AppFiberScopeTag
   | MemoryMeta
   | WorkspaceMcpOverrides;
 
@@ -233,7 +235,11 @@ export const StreamManagerLive = Layer.effect(
       () => providerService.getConfig(),
       // Default event sink: AIService installs itself as the sink (S3).
       undefined,
-      yield* EffectRunnerTag
+      yield* EffectRunnerTag,
+      // The stream engine is the AppFiberScope's occupant: dispose() closes the
+      // scope before the explicit teardown steps, which aborts and awaits every
+      // in-flight stream (StreamManager.superviseEngine).
+      yield* AppFiberScopeTag
     );
   })
 );
